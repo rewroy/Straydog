@@ -22,6 +22,11 @@ use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Weights, CONTEXT_LIMIT};
 
 pub const MAX_DRAFTS: usize = 3;
+/// Rows per verification pass: a token and its drafts.
+const VERIFY_ROWS: usize = MAX_DRAFTS + 1;
+/// Longest fully resident prompt that runs as verification passes (about 27 ms per four rows)
+/// rather than as a batched prefill, whose fixed cost is about 110 ms on two R9700s.
+const VERIFIED_PREFILL: usize = 16;
 const END_TOKENS: [u32; 2] = [248044, 248046];
 const IM_START: u32 = 248045;
 const IM_END: u32 = 248046;
@@ -595,7 +600,16 @@ impl Model {
         let embeddings = self.token_embeddings(tokens)?;
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
-        let hidden = if tokens.len() > 1 {
+        let hidden = if tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL {
+            let start = self.history.len();
+            let rows = self.prefill_verified(tokens)?;
+            // forward records the tokens below, after the MTP layer has read the prompt.
+            self.history.truncate(start);
+            if self.speculative > 0 {
+                self.mtp_prompt(tokens, &rows, previous)?;
+            }
+            rows
+        } else if tokens.len() > 1 {
             // With another device to keep them on, the prompt's rows never leave the GPUs.
             let stash = self.speculative > 0 && self.group.mtp_stash();
             let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash)? else { return Ok(None) };
@@ -800,6 +814,25 @@ impl Model {
     #[allow(clippy::type_complexity)]
     fn verify(&mut self, tokens: &[u32], sampling: bool)
               -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
+        let (first, embeddings, hidden) = self.verify_rows(tokens)?;
+        let (targets, scores) =
+            self.with_operands(Model::head_operands, |group, operands| group.output_head(operands, &hidden, sampling))?;
+        Ok((first, embeddings, hidden, targets, scores))
+    }
+
+    /// A short prompt through the verification spans, up to four rows per pass and every row
+    /// kept: its fixed cost is that of a few decode steps rather than of a batched prefill.
+    fn prefill_verified(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut rows = Vec::with_capacity(tokens.len() * WIDTH);
+        for chunk in tokens.chunks(VERIFY_ROWS) {
+            let (first, embeddings, hidden) = self.verify_rows(chunk)?;
+            self.commit(chunk, chunk.len(), &first, &embeddings)?;
+            rows.extend_from_slice(&hidden);
+        }
+        Ok(rows)
+    }
+
+    fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let position = self.history.len() as u64;
         let hidden = tile(&self.token_embeddings(tokens)?);
         let first = self.group.verify_span(0, 1, &hidden, position)?;
@@ -811,9 +844,7 @@ impl Model {
         for (begin, end) in self.group.decoder_spans(1) {
             hidden = self.group.verify_span(begin, end, &hidden, position)?;
         }
-        let (targets, scores) =
-            self.with_operands(Model::head_operands, |group, operands| group.output_head(operands, &hidden, sampling))?;
-        Ok((first, embeddings, hidden, targets, scores))
+        Ok((first, embeddings, hidden))
     }
 
     /// Keep the first `kept` verified tokens; replay DeltaNet and PLE state for the rest.

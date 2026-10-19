@@ -1,7 +1,7 @@
 //! Time fresh prefills of real text in-process (no sandbox), for a profiler to wrap.
 //!
 //! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
-//!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N]
+//!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer]
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, and "+N"
@@ -39,13 +39,19 @@ fn main() -> Result<(), String> {
     let generate: usize = option("--generate").map_or(1, |count| count.parse().unwrap());
     let corpus_file = option("--corpus").map(PathBuf::from);
     let gemm_min_batch: u64 = option("--gemm-min-batch").map_or(2, |count| count.parse().unwrap());
+    // --gemm f32: batched projections in F32 throughout (the numerical reference for FP16 GEMMs).
+    let half_gemm = option("--gemm").as_deref() != Some("f32");
+    let split = match option("--split").as_deref() {
+        Some("layer") => SplitMode::Layer,
+        _ => SplitMode::Experts,
+    };
     let [model, quant, devices, vram, context, lengths @ ..] = &args[..] else {
         return Err("usage: prefill MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR]".into());
     };
     let devices: Vec<usize> = devices.split(',').map(|device| device.parse().unwrap()).collect();
     let budget = (vram.parse::<f64>().unwrap() * (1u64 << 30) as f64) as u64;
-    let group = Group::new(&devices, budget, SplitMode::Experts)?;
-    group.configure_gemm(gemm_min_batch, true)?;
+    let group = Group::new(&devices, budget, split)?;
+    group.configure_gemm(gemm_min_batch, half_gemm)?;
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: batch.unwrap_or(4096),
