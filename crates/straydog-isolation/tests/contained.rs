@@ -69,8 +69,9 @@ fn run(args: &[OsString]) {
     }
 }
 
-/// The worker: echo one line of standard input, then report what it can reach, one `key=value`
-/// line each. `args`: a loopback port, then paths to read.
+/// The worker: echo one line of standard input, then report what it can reach and its
+/// environment, one `key=value` line each. `args`: a loopback port, the home directory outside
+/// the sandbox, then paths to read.
 fn probe(args: &[OsString]) {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).unwrap();
@@ -80,17 +81,17 @@ fn probe(args: &[OsString]) {
     let network = TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok();
     println!("network={}", if network { "open" } else { "closed" });
     println!("cwd={}", std::env::current_dir().map(|path| path.display().to_string()).unwrap_or_default());
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
-    println!("home={}", home.to_string_lossy());
-    for (name, directory) in [("write-cwd", PathBuf::from(".")), ("write-home", PathBuf::from(&home))] {
-        let path = directory.join("straydog-probe.txt");
-        let written = std::fs::write(&path, "x").is_ok();
-        let _ = std::fs::remove_file(&path);
+    for (name, directory) in [("write-cwd", PathBuf::from(".")), ("write-home", PathBuf::from(&args[1]))] {
+        // Left in place: the test looks for it outside.
+        let written = std::fs::write(directory.join(PROBE_FILE), "x").is_ok();
         println!("{name}={}", if written { "written" } else { "denied" });
     }
-    for path in &args[1..] {
+    for path in &args[2..] {
         let content = std::fs::read_to_string(path).unwrap_or_else(|_| "denied".into());
         println!("read {}={content}", path.to_string_lossy());
+    }
+    for (name, value) in std::env::vars_os() {
+        println!("env {}={}", name.to_string_lossy(), value.to_string_lossy());
     }
 }
 
@@ -129,6 +130,26 @@ fn sleeper(args: &[OsString]) {
 fn report(output: &str) -> Vec<(String, String)> {
     output.lines().filter_map(|line| line.split_once('=')).map(|(key, value)| (key.into(), value.into())).collect()
 }
+
+/// What `probe` writes in its working directory and the home directory.
+const PROBE_FILE: &str = "straydog-probe.txt";
+
+/// Whether the probe's file reached any of `directories` outside the sandbox (removing it).
+fn written_outside(directories: &[&Path]) -> bool {
+    directories
+        .iter()
+        .map(|directory| std::fs::remove_file(directory.join(PROBE_FILE)).is_ok())
+        .fold(false, |a, b| a | b)
+}
+
+/// The names of the variables `probe` reported.
+fn variables(report: &[(String, String)]) -> Vec<&str> {
+    report.iter().filter_map(|(key, _)| key.strip_prefix("env ")).collect()
+}
+
+/// Variables a server's environment may hold that must never reach the worker.
+const SECRET_VARIABLES: [(&str, &str); 3] =
+    [("STRAYDOG_API_KEY", "sk-test"), ("FOO_TOKEN", "token"), ("HTTPS_PROXY", "http://user:password@proxy")];
 
 fn value<'a>(report: &'a [(String, String)], key: &str) -> &'a str {
     report
@@ -234,11 +255,11 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-/// Spawn `program args` the way the server spawns its worker, write `input`, and collect what
-/// it prints until it exits.
+/// Spawn `program args` the way the server spawns its worker, with the secret variables a
+/// server's environment may hold, write `input`, and collect what it prints until it exits.
 fn run_contained(program: &Path, args: &[OsString], input: &[u8]) -> (bool, String, String) {
     let mut command = Command::new(program);
-    command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.args(args).envs(SECRET_VARIABLES).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     prepare(&mut command);
     let mut child = command.spawn().unwrap();
     let _tree = ProcessTree::new(&child).unwrap();
@@ -279,23 +300,39 @@ fn the_contained_worker_reads_only_what_is_exposed() {
     let args: Vec<OsString> = vec![
         "probe".into(),
         port.to_string().into(),
+        home.clone().into(),
         exposed.clone().into(),
         hidden.clone().into(),
         outside.clone().into(),
     ];
-    let (program, args) = worker_command(&args, &exposure).unwrap();
+    // A GPU runtime variable of the server's passes; the harness runs its tests one at a time.
+    std::env::set_var("HIP_VISIBLE_DEVICES", "1");
+    let command = worker_command(&args, &exposure);
+    std::env::remove_var("HIP_VISIBLE_DEVICES");
+    let (program, args) = command.unwrap();
     let (success, output, errors) = run_contained(&program, &args, b"over the private pipe\n");
     assert!(success, "{errors}");
     let report = report(&output);
     assert_eq!(value(&report, "echo"), "over the private pipe");
     assert_eq!(value(&report, "network"), "closed");
     assert_eq!(value(&report, "cwd"), model.display().to_string());
-    assert_eq!(value(&report, "home"), "/tmp");
+    assert_eq!(value(&report, "env HOME"), "/tmp");
+    assert_eq!(value(&report, "env HIP_VISIBLE_DEVICES"), "1");
+    for (secret, _) in SECRET_VARIABLES {
+        assert!(!variables(&report).contains(&secret), "{secret} reached the worker");
+    }
+    // bubblewrap names the working directory itself (PWD), after clearing the rest.
+    assert_eq!(value(&report, "env PWD"), model.display().to_string());
+    let allowed = ["HOME", "TMPDIR", "PWD", "PATH", "LANG", "TZ", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"];
+    let allowed = [allowed.as_slice(), &["CUDA_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION"]].concat();
+    for name in variables(&report) {
+        assert!(allowed.contains(&name), "{name} reached the worker");
+    }
     assert_eq!(value(&report, &format!("read {}", exposed.display())), "exposed");
     assert_eq!(value(&report, &format!("read {}", hidden.display())), "denied");
     assert_eq!(value(&report, &format!("read {}", outside.display())), "denied");
-    // The working directory is writable only in the sandbox's own memory: nothing reached the host.
-    assert!(!model.join("straydog-probe.txt").exists());
+    // The working and home directories are writable only in the sandbox's own memory.
+    assert!(!written_outside(&[&model, &home]), "the probe wrote outside the sandbox");
     assert_eq!(std::fs::read_dir(&model).unwrap().count(), 2);
 }
 
@@ -344,9 +381,9 @@ fn carrying(args: &[&str]) -> Vec<u32> {
 fn the_worker_runs_contained_over_the_server_pipes() {
     assert_eq!(unavailable_reason(), None);
     let scratch = Scratch::under(&std::env::temp_dir(), "straydog-isolation-appcontainer");
-    // A copy of this executable in a directory of its own: the launcher grants the whole directory.
-    let executable = scratch.0.join("bin/straydog.exe");
-    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    // A copy of this executable among other files: the launcher grants the executable, not its directory.
+    let executable = scratch.0.join("downloads/straydog.exe");
+    let neighbour = scratch.file("downloads/tax-return.txt", "private");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     let exposed = scratch.file("model/a.gguf", "exposed");
     let hidden = scratch.file("model/not exposed.txt", "hidden");
@@ -361,12 +398,15 @@ fn the_worker_runs_contained_over_the_server_pipes() {
         working_directory: model.clone(),
         secrets: vec![scratch.file("api-key", "secret")],
     };
+    let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
     let args: Vec<OsString> = vec![
         "probe".into(),
         port.to_string().into(),
+        home.clone().into(),
         exposed.clone().into(),
         hidden.clone().into(),
         outside.clone().into(),
+        neighbour.clone().into(),
     ];
     let (program, args) = worker_command(&args, &exposure).unwrap();
     let (success, output, errors) = run_contained(&program, &args, b"over the private pipe\n");
@@ -375,10 +415,17 @@ fn the_worker_runs_contained_over_the_server_pipes() {
     assert_eq!(value(&report, "echo"), "over the private pipe");
     assert_eq!(value(&report, "network"), "closed");
     assert_eq!(value(&report, "cwd").to_lowercase(), model.display().to_string().to_lowercase());
+    assert!(!written_outside(&[&model, &home]), "the probe wrote outside its AppContainer");
     assert_eq!(value(&report, "write-cwd"), "denied");
     assert_eq!(value(&report, "write-home"), "denied");
     assert_eq!(value(&report, &format!("read {}", exposed.display())), "exposed");
     assert_eq!(value(&report, &format!("read {}", hidden.display())), "denied");
     assert_eq!(value(&report, &format!("read {}", outside.display())), "denied");
+    assert_eq!(value(&report, &format!("read {}", neighbour.display())), "denied");
+    let names = variables(&report);
+    assert!(names.iter().any(|name| name.eq_ignore_ascii_case("SystemRoot")) && !value(&report, "env TEMP").is_empty());
+    for (secret, _) in SECRET_VARIABLES {
+        assert!(!names.iter().any(|name| name.eq_ignore_ascii_case(secret)), "{secret} reached the worker");
+    }
     drop(listener);
 }
