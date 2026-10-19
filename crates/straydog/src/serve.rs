@@ -77,12 +77,14 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs()),
         };
         let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
-        let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor));
+        let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor.clone()));
         let address = format!("{}:{}", settings.host, settings.port);
         let listener = tokio::net::TcpListener::bind(&address).await.map_err(|exc| format!("{address}: {exc}"))?;
         tracing::info!("Straydog listening on http://{address}");
         let served = axum::serve(listener, router).with_graceful_shutdown(shutdown()).await.map_err(|exc| exc.to_string());
-        // The router is gone; the worker exits before the server does.
+        monitor.stop().await;
+        drop(monitor);
+        // The router and the sampler are gone; the worker exits before the server does.
         if let Some(engine) = Arc::into_inner(engine) {
             engine.close().await;
         }

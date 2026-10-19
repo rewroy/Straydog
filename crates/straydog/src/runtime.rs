@@ -102,13 +102,16 @@ impl Activity {
         self.recent.push_back(entry);
     }
 
-    fn snapshot(&self) -> Value {
-        let live = self.live.as_ref().map(|live| {
+    fn snapshot_live(&self) -> Value {
+        self.live.as_ref().map_or(Value::Null, |live| {
             let decoding = live.first_token.map_or(0.0, |first| first.elapsed().as_secs_f64());
             json!({"seconds": live.started.elapsed().as_secs_f64(), "prefill_done": live.prefill.0,
                    "prefill_total": live.prefill.1, "tokens": live.tokens, "decode_seconds": decoding})
-        });
-        json!({"live": live, "recent": self.recent, "requests": self.requests, "failed": self.failed,
+        })
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({"live": self.snapshot_live(), "recent": self.recent, "requests": self.requests, "failed": self.failed,
                "prompt_tokens": self.prompt_tokens, "cached_tokens": self.cached_tokens,
                "completion_tokens": self.completion_tokens})
     }
@@ -330,6 +333,11 @@ impl Runtime {
         snapshot["queued"] = self.shared.jobs.load(Ordering::SeqCst).saturating_sub(running).into();
         snapshot["activity"] = activity.snapshot();
         snapshot
+    }
+
+    /// The running generation as [`Runtime::snapshot`] shows it, or null.
+    pub fn live(&self) -> Value {
+        self.shared.activity.lock().unwrap().snapshot_live()
     }
 
     /// Finish the queued generations, stop the worker and wait until it has exited (its

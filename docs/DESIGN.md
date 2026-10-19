@@ -175,11 +175,15 @@ There is no setup command: a model is fetched once, then given by path.
   a request whose client disconnects is cancelled.
 - Dashboard: `GET /dashboard` is a page compiled into the executable (its script,
   style and icon beside it, a strict CSP, no other origin). It reads
-  `GET /dashboard/status` (settings without the key, engine state and placement,
-  GPU telemetry, the running generation, the latest 120 finished ones with their
-  speeds, host and process figures) and `GET /dashboard/logs?after=N` (the latest
-  2000 log lines), and chats through `/v1/chat/completions`. The page needs no key;
-  the data and the chat need it once one is set.
+  `GET /dashboard/status?since=T` (settings without the key, engine state and
+  placement, the running generation, the latest 120 finished ones with their speeds,
+  host, process and GPU sensor figures, and the one-second samples after T for its
+  charts) and `GET /dashboard/logs?after=N` (the latest 2000 log lines), and chats
+  through `/v1/chat/completions`. The page needs no key; the data and the chat need it
+  once one is set. Sensors are read only while a dashboard is open: sampling starts
+  with a status request and stops, its samples dropped, 15 s after the last one. GPU
+  sensors come from amdgpu's sysfs (Linux) or NVML (CUDA builds, loaded at run time),
+  matched to the engine's devices by PCI address.
 - One principal: every client that holds the key shares the engine and its
   conversation cache, so whether a prompt prefix was seen before is observable
   (`cached_tokens`, first-token latency). Users who must not see each other's prompts

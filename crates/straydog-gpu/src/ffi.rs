@@ -19,6 +19,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_device_pci(
+        ordinal: ::std::os::raw::c_int,
+        domain: *mut ::std::os::raw::c_int,
+        bus: *mut ::std::os::raw::c_int,
+        device: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_create(ordinal: ::std::os::raw::c_int, budget: u64) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {

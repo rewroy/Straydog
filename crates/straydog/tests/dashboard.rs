@@ -58,7 +58,8 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
     let runtime = Arc::new(Runtime::start(&settings, (PathBuf::from("/nonexistent/straydog-worker"), Vec::new())));
     let logs = Arc::new(LogBuffer::default());
     std::io::Write::write_all(&mut LogSink(logs.clone()), b"2026-10-19T00:00:00Z  INFO hello\n").unwrap();
-    let router = dashboard::router(Arc::new(Dashboard::new(runtime.clone(), logs, &settings)));
+    let dashboard = Arc::new(Dashboard::new(runtime.clone(), logs, &settings));
+    let router = dashboard::router(dashboard.clone());
 
     for (path, kind) in [("/dashboard", "text/html"), ("/dashboard/app.js", "text/javascript"),
                          ("/dashboard/app.css", "text/css"), ("/dashboard/icon.svg", "image/svg+xml")] {
@@ -72,6 +73,7 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
         assert_eq!(get(&router, path, Some("sk-wrong")).await.0, StatusCode::UNAUTHORIZED, "{path}");
     }
 
+    // Nothing is sampled until a dashboard asks; the first request waits for the first sample.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let (status, headers, body) = get(&router, "/dashboard/status", Some("sk-dashboard")).await;
     assert_eq!(status, StatusCode::OK);
@@ -83,11 +85,19 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
     assert_eq!(status["engine"]["state"], "failed");
     assert_eq!(status["engine"]["activity"]["requests"], 0);
     assert!(status["host"]["memory_total"].as_u64().unwrap() > 0);
+    let samples = status["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0]["decode"], 0.0);
+    let since = samples[0]["time"].as_f64().unwrap();
+    let (_, _, body) = get(&router, &format!("/dashboard/status?since={since}"), Some("sk-dashboard")).await;
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["samples"], serde_json::json!([]));
 
     let (_, _, body) = get(&router, "/dashboard/logs?after=0", Some("sk-dashboard")).await;
     let logs: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(logs["next"], 1);
     assert_eq!(logs["lines"][0], "2026-10-19T00:00:00Z  INFO hello");
     drop(router);
+    dashboard.stop().await;
+    drop(dashboard);
     Arc::into_inner(runtime).unwrap().close().await;
 }

@@ -17,6 +17,8 @@ extern "C" {
 const char* sd_error(void);
 int sd_device_count(void);
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes);
+/* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
+int sd_device_pci(int ordinal, int* domain, int* bus, int* device);
 void* sd_create(int ordinal, uint64_t budget);
 void sd_destroy(void* handle);
 int sd_memory(void* handle, uint64_t* used, uint64_t* budget);

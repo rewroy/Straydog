@@ -1156,6 +1156,16 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_device_pci(int ordinal, int* domain, int* bus, int* device) {
+    try {
+        if (!domain || !bus || !device) throw std::runtime_error("invalid PCI buffers");
+        hipDeviceProp_t prop{};
+        check(hipGetDeviceProperties(&prop, ordinal));
+        *domain = prop.pciDomainID; *bus = prop.pciBusID; *device = prop.pciDeviceID;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 void* sd_create(int ordinal, uint64_t budget) {
     try {
         auto value = std::make_unique<Device>(ordinal);

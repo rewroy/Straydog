@@ -127,9 +127,23 @@ fn simulate() {
     }
 }
 
+/// The host's AMD GPUs, so that the simulated devices meet real sensors on the dashboard.
+fn pci_addresses() -> Vec<String> {
+    let mut addresses: Vec<String> = std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten()
+        .filter(|card| card.file_name().to_string_lossy().starts_with("card") && !card.file_name().to_string_lossy().contains('-'))
+        .filter_map(|card| std::fs::canonicalize(card.path().join("device")).ok())
+        .filter(|device| std::fs::read_to_string(device.join("vendor")).is_ok_and(|vendor| vendor.trim() == "0x1002"))
+        .filter_map(|device| Some(device.file_name()?.to_string_lossy().to_lowercase()))
+        .collect();
+    addresses.sort();
+    addresses
+}
+
 fn gpu_info() -> Value {
-    let device = |ordinal: u64| json!({"name": "Simulated GPU", "device": ordinal, "free_bytes": 3 * GIB,
-                                       "total_bytes": 32 * GIB, "allocated_bytes": 28 * GIB, "budget_bytes": 30 * GIB});
+    let addresses = pci_addresses();
+    let device = |ordinal: u64| json!({"name": "Simulated GPU", "device": ordinal,
+                                       "pci": addresses.get(ordinal as usize).cloned().unwrap_or_else(|| format!("0000:{:02x}:00.0", ordinal + 1)),
+                                       "free_bytes": 3 * GIB, "total_bytes": 32 * GIB, "allocated_bytes": 28 * GIB, "budget_bytes": 30 * GIB});
     json!({"name": "Simulated GPU + Simulated GPU", "device": 0, "free_bytes": 6 * GIB, "total_bytes": 64 * GIB,
            "allocated_bytes": 56 * GIB, "budget_bytes": 60 * GIB, "devices": [device(0), device(1)]})
 }

@@ -58,6 +58,15 @@ pub fn device_info(ordinal: usize) -> Result<(String, u64, u64)> {
     Ok((name, free, total))
 }
 
+/// A device's PCI address as `domain:bus:device.0` in lower-case hex, the form Linux's sysfs
+/// and NVML use.
+pub fn pci_address(ordinal: usize) -> Result<String> {
+    let (mut domain, mut bus, mut device): (c_int, c_int, c_int) = (0, 0, 0);
+    // SAFETY: three out-parameters.
+    check(unsafe { ffi::sd_device_pci(ordinal as c_int, &mut domain, &mut bus, &mut device) })?;
+    Ok(format!("{domain:04x}:{bus:02x}:{device:02x}.0"))
+}
+
 /// One GPU with a VRAM budget the library enforces.
 pub struct Device {
     handle: NonNull<c_void>,

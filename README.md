@@ -79,10 +79,12 @@ report the context, and `GET /health` the loading progress.
 
 ## Dashboard
 
-Open http://127.0.0.1:8080/dashboard in a browser. It shows the engine's state, prefill
-and decode speed per request and live during a generation, the GPUs' memory, the
-host, the settings and the service log, and has a chat. With an API key set, the page
-asks for it and keeps it in that tab.
+Open http://127.0.0.1:8080/dashboard in a browser. On one screen: each GPU's load,
+temperatures, power and memory, the CPU's and the memory's, as charts of the last two
+minutes; prefill and decode speed live and per request; the engine's state. The
+environment and the service log are tabs, and a chat opens over the page. Sensors are
+read only while a dashboard is open. With an API key set, the page asks for it and
+keeps it in that tab.
 
 ## Development
 

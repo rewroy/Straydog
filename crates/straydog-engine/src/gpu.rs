@@ -795,6 +795,7 @@ impl Backend {
     /// Telemetry: the device, its memory, GEMM and graph counters, partial-residency counters.
     pub fn info(&self) -> Result<serde_json::Value> {
         let (name, free, total) = straydog_gpu::device_info(self.ordinal).map_err(|error| error.to_string())?;
+        let pci = straydog_gpu::pci_address(self.ordinal).map_err(|error| error.to_string())?;
         let (used, budget) = self.memory()?;
         let (mut gemms, mut vectors, mut graphs, mut replays, mut plans) = (0, 0, 0, 0, 0);
         // SAFETY: out-parameters.
@@ -802,7 +803,7 @@ impl Backend {
         check(unsafe { ffi::sd_execution_counts(self.handle, &mut graphs, &mut replays, &mut plans) })?;
         let hybrid = self.hybrid_counts()?;
         let mut info = serde_json::json!({
-            "name": name, "free_bytes": free, "total_bytes": total, "allocated_bytes": used, "budget_bytes": budget,
+            "name": name, "pci": pci, "free_bytes": free, "total_bytes": total, "allocated_bytes": used, "budget_bytes": budget,
             "device": self.ordinal, "gemm_calls": gemms, "gemm_vectors": vectors, "cached_graphs": graphs,
             "graph_replays": replays, "resident_moe_plans": plans, "decoder_layers": self.decoder_layers.len(),
         });

@@ -12,147 +12,148 @@
 <body>
   <div class="backdrop" aria-hidden="true"><i></i><i></i><i></i></div>
 
-  <header class="topbar glass">
-    <div class="brand">
-      <img src="/dashboard/icon.svg" alt="" width="34" height="34">
-      <div>
-        <strong>Straydog</strong>
-        <small id="model-line">—</small>
-      </div>
-    </div>
-    <div class="status" id="status" data-state="connecting">
-      <span class="dot"></span>
-      <span id="status-text" data-i18n="connecting"></span>
-      <span class="status-progress"><span id="status-bar"></span></span>
-    </div>
-    <div class="topbar-meta">
-      <span><small data-i18n="uptime"></small> <b id="uptime">—</b></span>
-      <button class="ghost icon-button" id="key-button" type="button" data-i18n-title="apiKey" aria-label="API key">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 14a4 4 0 1 1 3.87-5H21v3h-2v3h-3v-3h-5.13A4 4 0 0 1 7 14Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg>
-      </button>
-    </div>
-  </header>
-
-  <main class="layout">
-    <section class="tiles" aria-label="Speed">
-      <article class="tile glass" data-series="decode">
-        <header><span data-i18n="decode"></span><em id="decode-note"></em></header>
-        <p><b id="decode-value">—</b><small>tok/s</small></p>
-        <svg class="spark" id="decode-spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-      </article>
-      <article class="tile glass" data-series="prefill">
-        <header><span data-i18n="prefill"></span><em id="prefill-note"></em></header>
-        <p><b id="prefill-value">—</b><small>tok/s</small></p>
-        <svg class="spark" id="prefill-spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-      </article>
-      <article class="tile glass" data-series="ttft">
-        <header><span data-i18n="firstToken"></span><em id="ttft-note"></em></header>
-        <p><b id="ttft-value">—</b><small>s</small></p>
-        <svg class="spark" id="ttft-spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-      </article>
-      <article class="tile glass" data-series="mtp">
-        <header><span data-i18n="mtp"></span><em id="mtp-note"></em></header>
-        <p><b id="mtp-value">—</b><small>%</small></p>
-        <svg class="spark" id="mtp-spark" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-      </article>
-    </section>
-
-    <section class="card glass throughput">
-      <header class="card-head">
-        <h2 data-i18n="throughput"></h2>
-        <span class="legend"><i class="decode"></i><span data-i18n="decode"></span><i class="prefill"></i><span data-i18n="prefill"></span></span>
-      </header>
-      <div class="live" id="live" data-phase="idle">
-        <div class="live-text">
-          <span class="pulse"></span>
-          <b id="live-phase" data-i18n="idle"></b>
-          <span id="live-detail"></span>
+  <div class="app">
+    <header class="topbar glass">
+      <div class="brand">
+        <img src="/dashboard/icon.svg" alt="" width="34" height="34">
+        <div>
+          <strong>Straydog</strong>
+          <small id="model-line">—</small>
         </div>
-        <div class="live-bar"><span id="live-bar"></span></div>
-        <svg class="live-spark" id="live-spark" viewBox="0 0 300 36" preserveAspectRatio="none" aria-hidden="true"></svg>
       </div>
-      <div class="chart" id="decode-chart">
-        <div class="chart-label"><span data-i18n="decodePerRequest"></span><b id="decode-axis"></b></div>
-        <svg viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="status" id="status" data-state="connecting">
+        <span class="dot"></span>
+        <span id="status-text"></span>
+        <span class="status-progress"><span id="status-bar"></span></span>
       </div>
-      <div class="chart" id="prefill-chart">
-        <div class="chart-label"><span data-i18n="prefillPerRequest"></span><b id="prefill-axis"></b></div>
-        <svg viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <nav class="tabs" role="tablist">
+        <button type="button" role="tab" data-tab="overview" data-i18n="overview"></button>
+        <button type="button" role="tab" data-tab="environment" data-i18n="environment"></button>
+        <button type="button" role="tab" data-tab="logs" data-i18n="logsTab"></button>
+      </nav>
+      <div class="topbar-meta">
+        <span><small data-i18n="uptime"></small> <b id="uptime">—</b></span>
+        <button class="ghost icon-button" id="key-button" type="button" data-i18n-title="apiKey">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 14a4 4 0 1 1 3.87-5H21v3h-2v3h-3v-3h-5.13A4 4 0 0 1 7 14Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg>
+        </button>
       </div>
-      <div class="tooltip" id="tooltip" hidden></div>
-      <p class="empty" id="chart-empty" data-i18n="noRequests"></p>
-    </section>
+    </header>
 
-    <section class="card glass chat">
-      <header class="card-head">
-        <h2 data-i18n="chat"></h2>
-        <div class="chat-controls">
-          <label><span data-i18n="effort"></span>
-            <select id="effort">
-              <option value="none" data-i18n="effortNone"></option>
-              <option value="low" data-i18n="effortLow"></option>
-              <option value="medium" data-i18n="effortMedium"></option>
-              <option value="high" data-i18n="effortHigh"></option>
-            </select>
-          </label>
-          <label><span data-i18n="temperature"></span><input id="temperature" type="number" min="0" max="2" step="0.1" inputmode="decimal"></label>
-          <label><span data-i18n="maxTokens"></span><input id="max-tokens" type="number" min="1" step="1" inputmode="numeric"></label>
-          <button class="ghost" id="clear" type="button" data-i18n="clear"></button>
+    <main>
+      <section class="panel overview" id="tab-overview" role="tabpanel">
+        <div class="hardware" id="hardware"></div>
+
+        <div class="speed-row">
+          <article class="card glass speed">
+            <header class="card-head">
+              <h2 data-i18n="throughput"></h2>
+              <span class="live" id="live" data-phase="idle"><span class="pulse"></span><b id="live-phase"></b><span id="live-detail"></span></span>
+              <span class="legend"><i class="decode"></i><span data-i18n="decode"></span><i class="prefill"></i><span data-i18n="prefill"></span></span>
+            </header>
+            <div class="stats">
+              <div class="stat" data-series="decode"><small data-i18n="decode"></small><p><b id="decode-value">—</b><span>tok/s</span></p><em id="decode-note"></em></div>
+              <div class="stat" data-series="prefill"><small data-i18n="prefill"></small><p><b id="prefill-value">—</b><span>tok/s</span></p><em id="prefill-note"></em></div>
+              <div class="stat" data-series="ttft"><small data-i18n="firstToken"></small><p><b id="ttft-value">—</b><span>s</span></p><em id="ttft-note"></em></div>
+              <div class="stat" data-series="mtp"><small data-i18n="mtp"></small><p><b id="mtp-value">—</b><span>%</span></p><em id="mtp-note"></em></div>
+            </div>
+            <div class="timechart" id="speed-chart">
+              <canvas></canvas>
+              <span class="axis left" id="speed-axis-left"></span>
+              <span class="axis right" id="speed-axis-right"></span>
+            </div>
+            <div class="live-bar"><span id="live-bar"></span></div>
+          </article>
+
+          <article class="card glass requests">
+            <header class="card-head"><h2 data-i18n="requests"></h2><span class="chip" id="request-count"></span></header>
+            <div class="chart" id="decode-chart">
+              <div class="chart-label"><span data-i18n="decodePerRequest"></span><b id="decode-axis"></b></div>
+              <svg viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+            </div>
+            <div class="chart" id="prefill-chart">
+              <div class="chart-label"><span data-i18n="prefillPerRequest"></span><b id="prefill-axis"></b></div>
+              <svg viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+            </div>
+            <div class="tooltip" id="tooltip" hidden></div>
+            <p class="empty" id="chart-empty" data-i18n="noRequests"></p>
+          </article>
         </div>
-      </header>
-      <div class="messages" id="messages" aria-live="polite">
-        <p class="empty" id="chat-empty" data-i18n="chatEmpty"></p>
+
+        <div class="engine-strip glass" id="engine-strip"></div>
+      </section>
+
+      <section class="panel environment" id="tab-environment" role="tabpanel" hidden>
+        <article class="card glass">
+          <header class="card-head"><h2 data-i18n="host"></h2><span class="chip" id="host-chip"></span></header>
+          <dl class="facts" id="host-facts"></dl>
+        </article>
+        <article class="card glass">
+          <header class="card-head"><h2 data-i18n="gpus"></h2><span class="chip" id="gpu-summary"></span></header>
+          <div id="gpu-facts" class="gpu-facts"></div>
+        </article>
+        <article class="card glass">
+          <header class="card-head"><h2 data-i18n="settings"></h2><span class="chip" id="version-chip"></span></header>
+          <dl class="facts" id="settings-facts"></dl>
+        </article>
+      </section>
+
+      <section class="panel logs" id="tab-logs" role="tabpanel" hidden>
+        <article class="card glass">
+          <header class="card-head">
+            <h2 data-i18n="logs"></h2>
+            <div class="log-controls">
+              <input id="log-filter" type="search" data-i18n-placeholder="filter">
+              <label class="toggle"><input id="log-warnings" type="checkbox"><span data-i18n="warningsOnly"></span></label>
+              <label class="toggle"><input id="log-follow" type="checkbox" checked><span data-i18n="follow"></span></label>
+            </div>
+          </header>
+          <ol class="log" id="log"></ol>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <button class="chat-fab" id="chat-open" type="button" aria-controls="chat">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm3 6a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm5 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm5 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/></svg>
+    <span data-i18n="chat"></span>
+  </button>
+
+  <aside class="chat-panel glass" id="chat" aria-hidden="true">
+    <header class="chat-head">
+      <h2 data-i18n="chat"></h2>
+      <div class="chat-controls">
+        <label><span data-i18n="effort"></span>
+          <select id="effort">
+            <option value="none" data-i18n="effortNone"></option>
+            <option value="low" data-i18n="effortLow"></option>
+            <option value="medium" data-i18n="effortMedium"></option>
+            <option value="high" data-i18n="effortHigh"></option>
+          </select>
+        </label>
+        <label><span data-i18n="temperature"></span><input id="temperature" type="number" min="0" max="2" step="0.1" inputmode="decimal"></label>
+        <label><span data-i18n="maxTokens"></span><input id="max-tokens" type="number" min="1" step="1" inputmode="numeric"></label>
       </div>
-      <form class="composer" id="composer">
-        <textarea id="prompt" rows="2" data-i18n-placeholder="promptPlaceholder"></textarea>
-        <button class="primary" id="send" type="submit" data-i18n="send"></button>
-      </form>
-    </section>
-
-    <div class="stack left-stack">
-    <section class="card glass gpus">
-      <header class="card-head"><h2 data-i18n="gpus"></h2><span class="chip" id="gpu-summary"></span></header>
-      <div id="gpu-list" class="gpu-list"><p class="empty" data-i18n="waiting"></p></div>
-    </section>
-
-    <section class="card glass host">
-      <header class="card-head"><h2 data-i18n="host"></h2><span class="chip" id="host-chip"></span></header>
-      <div class="gauges">
-        <div class="gauge" id="cpu-gauge"><svg viewBox="0 0 80 80" aria-hidden="true"><circle class="track" cx="40" cy="40" r="32"/><circle class="value" cx="40" cy="40" r="32"/></svg><b>—</b><small data-i18n="cpu"></small></div>
-        <div class="gauge" id="memory-gauge"><svg viewBox="0 0 80 80" aria-hidden="true"><circle class="track" cx="40" cy="40" r="32"/><circle class="value" cx="40" cy="40" r="32"/></svg><b>—</b><small data-i18n="memory"></small></div>
-        <div class="gauge" id="server-gauge"><svg viewBox="0 0 80 80" aria-hidden="true"><circle class="track" cx="40" cy="40" r="32"/><circle class="value" cx="40" cy="40" r="32"/></svg><b>—</b><small data-i18n="serverMemory"></small></div>
+      <div class="chat-actions">
+        <button class="ghost" id="clear" type="button" data-i18n="clear"></button>
+        <button class="ghost icon-button" id="chat-expand" type="button" data-i18n-title="expand">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v2H7.4l4.3 4.3-1.4 1.4L6 7.4V10H4V4Zm16 16h-6v-2h2.6l-4.3-4.3 1.4-1.4 4.3 4.3V14h2v6Z"/></svg>
+        </button>
+        <button class="ghost icon-button" id="chat-close" type="button" data-i18n-title="close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.4 5 12 10.6 17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+        </button>
       </div>
-      <dl class="facts" id="host-facts"></dl>
-    </section>
+    </header>
+    <div class="messages" id="messages" aria-live="polite">
+      <p class="empty" id="chat-empty" data-i18n="chatEmpty"></p>
     </div>
-
-    <div class="stack right-stack">
-    <section class="card glass engine">
-      <header class="card-head"><h2 data-i18n="engine"></h2><span class="chip" id="engine-chip"></span></header>
-      <dl class="facts" id="engine-facts"></dl>
-    </section>
-
-    <section class="card glass settings">
-      <header class="card-head"><h2 data-i18n="settings"></h2><span class="chip" id="version-chip"></span></header>
-      <dl class="facts" id="settings-facts"></dl>
-    </section>
-    </div>
-
-    <section class="card glass logs">
-      <header class="card-head">
-        <h2 data-i18n="logs"></h2>
-        <div class="log-controls">
-          <input id="log-filter" type="search" data-i18n-placeholder="filter">
-          <label class="toggle"><input id="log-warnings" type="checkbox"><span data-i18n="warningsOnly"></span></label>
-          <label class="toggle"><input id="log-follow" type="checkbox" checked><span data-i18n="follow"></span></label>
-        </div>
-      </header>
-      <ol class="log" id="log"></ol>
-    </section>
-  </main>
+    <form class="composer" id="composer">
+      <textarea id="prompt" rows="2" data-i18n-placeholder="promptPlaceholder"></textarea>
+      <button class="primary" id="send" type="submit" data-i18n="send"></button>
+    </form>
+  </aside>
 
   <dialog class="glass key-dialog" id="key-dialog">
-    <form method="dialog" id="key-form">
+    <form id="key-form">
       <h2 data-i18n="apiKey"></h2>
       <p data-i18n="apiKeyHelp"></p>
       <input id="key-input" type="password" autocomplete="off" spellcheck="false">
