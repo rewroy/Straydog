@@ -51,8 +51,10 @@ uv run straydog fetch-mtp --root ~/.straydog/models/mtp --gpu-library src/strayd
 ## Native builds
 
 ```bash
-# The Rust crates (the executable arrives in phase R4)
-ROCM_PATH=/opt/rocm/core-10.0 cargo test --features straydog-gpu/hip
+# The Rust crates (the executable arrives in phase R4); STRAYDOG_MODEL enables the golden chat tests
+STRAYDOG_MODEL=~/.straydog/models/IQ3_S ROCM_PATH=/opt/rocm/core-10.0 cargo test --features straydog-gpu/hip
+# After changing the reference's template handling: regenerate the golden files
+uv run python scripts/golden.py --model ~/.straydog/models/IQ3_S
 # The reference's shared library
 uv run straydog build --backend HIP --architecture gfx1201 --prefix /opt/rocm/core-10.0
 # After changing gpu/ or crates/straydog-gguf: rebuild both packaged builds

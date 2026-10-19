@@ -79,6 +79,18 @@ class StraydogWorker:
         effort: str = "medium",
     ) -> list[int]:
         """Render the authenticated official template and encode locally."""
+        return self.tokenizer.encode(self.render(messages, tools, thinking=thinking, effort=effort),
+                                     add_special_tokens=False).ids
+
+    def render(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        thinking: bool = False,
+        effort: str = "medium",
+    ) -> str:
+        """The prompt text the official template renders for a request."""
         if not isinstance(messages, list) or not messages or len(messages) > 4096:
             raise ValueError("invalid Straydog messages")
         for message in messages:
@@ -96,7 +108,7 @@ class StraydogWorker:
         )
         if len(text.encode()) > _FRAME_BYTES:
             raise ValueError("Straydog rendered prompt exceeds the IPC limit")
-        return self.tokenizer.encode(text, add_special_tokens=False).ids
+        return text
 
     def _generate(self, request: dict[str, Any]) -> None:
         request_id = request["id"]
@@ -295,7 +307,9 @@ def _template_message(message: dict[str, Any]) -> dict[str, Any]:
         return message
     decoded = []
     for call in calls:
-        function = call.get("function") if isinstance(call, dict) else None
+        # The template reads ``call.function`` when present, else the call itself.
+        wrapped = isinstance(call, dict) and isinstance(call.get("function"), dict)
+        function = call["function"] if wrapped else call
         arguments = function.get("arguments") if isinstance(function, dict) else None
         if isinstance(function, dict) and isinstance(arguments, str):
             try:
@@ -304,7 +318,8 @@ def _template_message(message: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("Straydog tool-call arguments are not valid JSON") from exc
             if not isinstance(arguments, dict):
                 raise ValueError("Straydog tool-call arguments must be a JSON object")
-            call = {**call, "function": {**function, "arguments": arguments}}
+            function = {**function, "arguments": arguments}
+            call = {**call, "function": function} if wrapped else function
         decoded.append(call)
     return {**message, "tool_calls": decoded}
 

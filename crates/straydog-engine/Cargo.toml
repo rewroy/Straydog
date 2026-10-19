@@ -1,0 +1,15 @@
+[package]
+name = "straydog-engine"
+description = "The Straydog inference engine: tokenizer, chat template, weights, placement and the generation loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minijinja = { version = "2.24", features = ["preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"

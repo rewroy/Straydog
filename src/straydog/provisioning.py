@@ -329,7 +329,8 @@ def native_source_digest(source_root: Path) -> str:
     """
     crate = source_root / "crates/straydog-gguf"
     digest = hashlib.sha256()
-    for path in [crate / "Cargo.toml", *sorted((source_root / "gpu").glob("*")), *sorted((crate / "src").glob("*"))]:
+    gpu = [path for path in sorted((source_root / "gpu").glob("*")) if path.suffix in {".cpp", ".hpp", ".h", ".txt"}]
+    for path in [crate / "Cargo.toml", *gpu, *sorted((crate / "src").glob("*"))]:
         if path.is_file():
             data = path.read_bytes().replace(b"\r\n", b"\n")
             digest.update(f"{path.relative_to(source_root).as_posix()}\0{len(data)}\0".encode() + data)

@@ -1,7 +1,7 @@
 # Straydog — design
 
-Status: phase R1 done (the GPU library builds statically into Rust and runs). Updated:
-2026-10-19.
+Status: phases R1 and R2 done (the GPU library builds statically into Rust; renders and
+token ids equal the reference's). Updated: 2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API, shipped as one executable per GPU backend.
@@ -190,9 +190,10 @@ Other commands:
   provisioning and tests, passing in this repository.
 - **R1** (done): workspace, `straydog-gpu` (all `sd_*` bindings, static HIP and CUDA
   builds), the gguf reader. The kernel tests run against the same CMake build.
-- **R2**: tokenizer and template, with golden files from the reference: token ids
-  and renders over a corpus of conversations (tools, reasoning, tool results,
-  Japanese text). Equal byte for byte.
+- **R2** (done): tokenizer and template, with golden files from the reference
+  (`scripts/golden.py`): token ids and renders over a corpus of conversations (tools,
+  reasoning, tool results, Japanese text, 150 seeded random ones), the template's
+  errors, decoding, JSON and float formatting. Equal byte for byte.
 - **R3**: weights, authentication, placement and the generation loop (prefill,
   decode, verification, MTP, conversation checkpoints, partial residency). Gate:
   for a fixed prompt set, every logit vector and every greedy token equals the
