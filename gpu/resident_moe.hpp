@@ -541,8 +541,8 @@ void run_with_helper(Device& d,size_t begin,size_t end,size_t tokens,Owner&& own
 }
 void finish_with_helper(Device& d) {
     Device& h=*d.link.peer;
-    on_device(h.ordinal,[&]() { check(hipStreamSynchronize(h.stream)); });
-    check(hipStreamSynchronize(d.stream));
+    on_device(h.ordinal,[&]() { check(hipStreamSynchronize(h.stream)); check(hipStreamSynchronize(h.helper_stream)); });
+    check(hipStreamSynchronize(d.stream)); check(hipStreamSynchronize(d.helper_stream));
     peer_settle(d);
 }
 // Prefill workspace: routes in the prefill layout (moe_route_output), the probabilities,
@@ -577,12 +577,11 @@ StepMoe step_moe(Device& d,void* handle,size_t steps) {
     return moe;
 }
 // Route `steps` rows and evaluate every route whose expert this device holds.
-void moe_steps_experts(Device& d,const StepMoe& moe,size_t steps,const float* source) {
+// The routing of `steps` rows: router, mix and the top ten into moe.selected and moe.probabilities.
+void moe_steps_route(Device& d,const StepMoe& moe,size_t steps,const float* source) {
     const ResidentMoe& plan=*moe.plan;
-    const size_t experts=plan.experts,routes=steps*11,max_tiles=moe.max_tiles;
+    const size_t experts=plan.experts;
     const Matrix router=plan.weights[(experts+1)*3],mix=plan.weights[(experts+1)*3+1];
-    float* gate_up=moe.gate_up; float* product=gate_up+routes*1280; float* outputs=moe.outputs;
-    MoeGroup* groups=moe.groups; MoeTile* tiles=moe.tiles; unsigned* total=moe.total;
     Matrix descriptors[max_batch]{};
     if (steps==1) {
         Matrix projections[2]={router,mix};
@@ -593,6 +592,14 @@ void moe_steps_experts(Device& d,const StepMoe& moe,size_t steps,const float* so
         resident_mix<<<unsigned(steps),256,0,d.stream>>>(mix,source,d.output+steps*experts);
     }
     resident_route<<<unsigned(steps),256,0,d.stream>>>(d.output,d.output+steps*experts,experts,moe.selected,moe.probabilities);
+}
+// Every routed row whose expert this device holds, from moe.selected. Only the plan's own
+// workspace and table: a helper stream can run it beside the device's other work.
+void moe_steps_compute(Device& d,const StepMoe& moe,size_t steps,const float* source) {
+    const ResidentMoe& plan=*moe.plan;
+    const size_t experts=plan.experts,routes=steps*11,max_tiles=moe.max_tiles;
+    float* gate_up=moe.gate_up; float* product=gate_up+routes*1280; float* outputs=moe.outputs;
+    MoeGroup* groups=moe.groups; MoeTile* tiles=moe.tiles; unsigned* total=moe.total;
     if (steps==1) {
         resident_expert_launch(d,plan,groups,moe.selected,false,source,gate_up);
         moe_product<<<unsigned((routes*640+255)/256),256,0,d.stream>>>(gate_up,routes,product);
@@ -616,6 +623,10 @@ void moe_steps_experts(Device& d,const StepMoe& moe,size_t steps,const float* so
         }
         grouped_moe<<<dim3(40,unsigned(max_tiles),1),256,0,d.stream>>>(groups,tiles+max_tiles,moe.positions,steps,true,product,outputs,total+1);
     }
+}
+void moe_steps_experts(Device& d,const StepMoe& moe,size_t steps,const float* source) {
+    moe_steps_route(d,moe,steps,source);
+    moe_steps_compute(d,moe,steps,source);
 }
 void resident_moe(Device& d,void* handle,size_t steps,const float* input,float* output,bool device_io=false) {
     if (!input || !output) throw std::runtime_error("invalid resident MoE execution");
@@ -649,14 +660,31 @@ void resident_moe_parts(Device& d,void* handle,size_t layer,size_t steps,const f
     Device& h=*d.link.peer;
     auto helper=h.helper_moe.find(layer);
     if (helper==h.helper_moe.end()) throw std::runtime_error("no resident MoE part helps this layer");
+    // The owner routes; its top ten go with the rows, so the helper needs no router (and none of
+    // the device scratch a router uses) and runs on its helper stream beside its own batch.
+    moe_steps_route(d,moe,steps,input);
+    check(hipMemcpyAsync(d.link.peer_routes,moe.selected,steps*10*4,hipMemcpyDefault,d.stream));
+    check(hipMemcpyAsync(d.link.peer_routes+steps*10,moe.probabilities,steps*11*4,hipMemcpyDefault,d.stream));
     peer_send_rows(d,input,steps,2560);
-    moe_steps_experts(d,moe,steps,input);
+    moe_steps_compute(d,moe,steps,input);
     on_device(h.ordinal,[&]() {
-        const StepMoe part=step_moe(h,helper->second,steps);
+        StreamScope helping(h,h.helper_stream);
         peer_receive_rows(h);
-        moe_steps_experts(h,part,steps,peer_inputs(h.link));
-        moe_partial<<<unsigned((steps*2560+255)/256),256,0,h.stream>>>(part.outputs,part.probabilities,part.selected,
-            part.groups,steps,true,peer_remote_partials(h.link));
+        // A help workspace smaller than the batch takes it in pieces: every row's experts are
+        // its own, so the partial sums are those of one pass.
+        const ResidentMoe& plan=*h.resident.find(helper->second)->second;
+        const int32_t* selected=h.link.routes;
+        const float* probabilities=reinterpret_cast<const float*>(h.link.routes+steps*10);
+        for (size_t first=0;first<steps;first+=plan.capacity) {
+            const size_t count=std::min(plan.capacity,steps-first);
+            StepMoe part=step_moe(h,helper->second,count);
+            // The piece's routes in the piece's layout: its top ten, then its probabilities.
+            check(hipMemcpyAsync(part.selected,selected+first*10,count*10*4,hipMemcpyDeviceToDevice,h.stream));
+            check(hipMemcpyAsync(part.probabilities,probabilities+first*11,count*11*4,hipMemcpyDeviceToDevice,h.stream));
+            moe_steps_compute(h,part,count,peer_inputs(h.link)+first*2560);
+            moe_partial<<<unsigned((count*2560+255)/256),256,0,h.stream>>>(part.outputs,part.probabilities,part.selected,
+                part.groups,count,true,peer_remote_partials(h.link)+first*2560);
+        }
         peer_signal_peer(h);
         check(hipGetLastError());
     });

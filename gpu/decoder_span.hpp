@@ -318,7 +318,7 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
     }
     const bool parts=span_has_parts(d,begin,end);
-    if (d.prefill_deferred && !output_rows && !timings && !parts) {
+    if (d.prefill_deferred && !output_rows && !timings) {
         decoder_nonfinite<<<256,256,0,d.stream>>>(hidden,steps*10240,d.flags+1);
         check(hipGetLastError());
         return;

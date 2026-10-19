@@ -46,6 +46,9 @@
 #define hipEventElapsedTime cudaEventElapsedTime
 #define hipStream_t cudaStream_t
 #define hipStreamCreate cudaStreamCreate
+#define hipStreamCreateWithPriority cudaStreamCreateWithPriority
+#define hipDeviceGetStreamPriorityRange cudaDeviceGetStreamPriorityRange
+#define hipStreamDefault cudaStreamDefault
 #define hipStreamDestroy cudaStreamDestroy
 #define hipStreamSynchronize cudaStreamSynchronize
 #define hipMalloc cudaMalloc
@@ -310,6 +313,8 @@ struct PeerLink {
     uint32_t* flag=nullptr;      // raised by the peer, once per message
     uint32_t* peer_flag=nullptr;
     uint32_t* counters=nullptr;  // [0] messages sent, [1] received, [2] nonzero after a wait gave up
+    int32_t* routes=nullptr;     // after the inbox: the owner's top ten (rows x 10) then probabilities (rows x 11)
+    int32_t* peer_routes=nullptr;
     size_t rows=0;
     bool direct=false;           // inbox and flag in this device's VRAM (peer access), else host memory
     void* host=nullptr;          // the page-locked allocation when !direct
@@ -334,6 +339,8 @@ struct Device {
     bool await_watchdog = false;
     uint64_t await_timeout = 0;   // hybrid_await's limit in GPU timer ticks
     hipStream_t stream = nullptr;
+    // Expert-parallel help for the peer's batch, beside this device's own (resident_moe_parts).
+    hipStream_t helper_stream = nullptr;
     PeerLink link;
     std::unordered_map<size_t, void*> helper_moe;   // layer -> this device's expert part, when it helps the owner
     uint8_t* io = nullptr;   // page-locked staging for caller-memory transfers (host_io.hpp)
@@ -400,6 +407,7 @@ struct Device {
         cleanup(hipSetDevice(ordinal));
         copier.reset();
         if (stream) cleanup(hipStreamSynchronize(stream));
+        if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -440,6 +448,7 @@ struct Device {
         if (link.peer) link.peer->link.peer=nullptr;
         for (auto event : io_halves) if (event) cleanup(hipEventDestroy(event));
         if (stream) cleanup(hipStreamDestroy(stream));
+        if (helper_stream) cleanup(hipStreamDestroy(helper_stream));
     }
 };
 
@@ -1085,7 +1094,9 @@ int sd_prefill_settle(void* handle) {
         Device& d=device(handle);
         unsigned flag=0;
         download(d,&flag,d.flags+1,4);
+        check(hipStreamSynchronize(d.helper_stream));
         d.prefill_deferred=false;
+        if (d.link.peer) peer_settle(d);
         if (flag) throw std::runtime_error("Straydog GPU produced non-finite decoder state");
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -1431,6 +1442,10 @@ void* sd_create(int ordinal, uint64_t budget) {
             throw std::runtime_error("Straydog VRAM budget is unavailable");
         value->budget = size_t(budget);
         check(hipStreamCreate(&value->stream));
+        // The peer's owner waits on this device's help: it runs ahead of the device's own work.
+        int least = 0, greatest = 0;
+        check(hipDeviceGetStreamPriorityRange(&least, &greatest));
+        check(hipStreamCreateWithPriority(&value->helper_stream, hipStreamDefault, greatest));
         check(hipHostMalloc(reinterpret_cast<void**>(&value->io), io_arena_bytes, hipHostMallocDefault));
         for (auto& event : value->io_halves) check(hipEventCreateWithFlags(&event, hipEventDisableTiming));
         check(hipEventCreateWithFlags(&value->handoff, hipEventDisableTiming));

@@ -30,16 +30,26 @@ impl Group {
         if devices.is_empty() || devices.len() > 4 || distinct.len() != devices.len() {
             return Err("Straydog requires one to four distinct GPU ordinals".into());
         }
-        let mut backends = devices.iter().map(|&device| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
-        if backends.len() == 2 {
-            let parallel = split_mode == SplitMode::Experts
-                && backends.iter().map(Backend::hybrid_supported).collect::<Result<Vec<_>>>()?.into_iter().all(|on| on);
-            backends[1].keeps_mtp_rows = !parallel;
-        }
+        let backends = devices.iter().map(|&device| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
-        Ok(Group { backends, starts, baseline, split_mode, linked: false })
+        let mut group = Group { backends, starts, baseline, split_mode, linked: false };
+        group.assign_roles()?;
+        Ok(group)
+    }
+
+    /// With two devices, what each plans for: help in a workspace of its own under expert
+    /// parallelism (which needs the GEMM options), and the second's kept MTP rows.
+    fn assign_roles(&mut self) -> Result<()> {
+        if self.backends.len() == 2 {
+            let parallel = self.expert_parallel()?;
+            for backend in &mut self.backends {
+                backend.expert_parallel = parallel;
+            }
+            self.backends[1].keeps_mtp_rows = true;
+        }
+        Ok(())
     }
 
     /// Whether a fully resident model splits every layer's routed experts across the two
@@ -105,6 +115,25 @@ impl Group {
         Ok(())
     }
 
+    /// The second device's first layer, with two devices.
+    pub fn split(&self) -> Option<usize> {
+        (self.backends.len() == 2).then(|| self.starts[1])
+    }
+
+    /// Move the boundary between two devices' layers; only before anything is placed.
+    pub fn set_split(&mut self, first: usize) -> Result<()> {
+        if self.backends.len() != 2 || !(1..48).contains(&first) {
+            return Err("invalid Straydog layer split".into());
+        }
+        for (backend, baseline) in self.backends.iter().zip(&self.baseline) {
+            if backend.memory()?.0 != *baseline {
+                return Err("Straydog layers must be split before placement".into());
+            }
+        }
+        self.starts = vec![0, first];
+        Ok(())
+    }
+
     pub fn batch_capacity(&self) -> usize {
         self.backends.iter().map(|backend| backend.batch_capacity).min().unwrap()
     }
@@ -117,8 +146,9 @@ impl Group {
         self.backends.iter().map(|backend| backend.logical_capacity).min().unwrap()
     }
 
-    pub fn configure_gemm(&self, minimum_batch: u64, half: bool) -> Result<()> {
-        self.backends.iter().try_for_each(|backend| backend.configure_gemm(minimum_batch, half))
+    pub fn configure_gemm(&mut self, minimum_batch: u64, half: bool) -> Result<()> {
+        self.backends.iter().try_for_each(|backend| backend.configure_gemm(minimum_batch, half))?;
+        self.assign_roles()
     }
 
     /// The device owning a layer's tensors (or a key naming one); the head, embeddings and
@@ -457,7 +487,7 @@ impl Group {
     pub fn planned_state_bytes(&self, context: u64, prefill: u64, drafter: bool, host_attention: bool)
                                -> Result<Vec<u64>> {
         // Expert parallelism links the GPUs with inboxes of two prefill batches each (peer VRAM).
-        let inbox = if self.expert_parallel()? { context.min(prefill) * 2560 * 2 * 4 + 256 } else { 0 };
+        let inbox = if self.expert_parallel()? { context.min(prefill) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
         (0..self.backends.len())
             .map(|index| {
                 let layers = self.owned_layers(index, drafter);

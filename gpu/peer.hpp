@@ -64,6 +64,15 @@ __global__ void peer_wait(uint32_t* counters, uint32_t* flag, uint64_t timeout) 
     __threadfence_system();
 }
 
+// Work queued on `stream` instead of the device's own while in scope.
+struct StreamScope {
+    Device& d; hipStream_t saved;
+    StreamScope(Device& device, hipStream_t stream) : d(device), saved(device.stream) { d.stream = stream; }
+    ~StreamScope() { d.stream = saved; }
+    StreamScope(const StreamScope&) = delete;
+    StreamScope& operator=(const StreamScope&) = delete;
+};
+
 inline float* peer_inputs(PeerLink& link) { return link.inbox; }
 inline float* peer_partials(PeerLink& link) { return link.inbox + link.rows * 2560; }
 inline float* peer_remote_partials(PeerLink& link) { return link.peer_inbox + link.rows * 2560; }
@@ -127,7 +136,8 @@ void attach_peer(Device& a, Device& b, size_t rows) {
     check(hipDeviceCanAccessPeer(&ab, a.ordinal, b.ordinal));
     check(hipDeviceCanAccessPeer(&ba, b.ordinal, a.ordinal));
     const bool direct = ab && ba;
-    const size_t inbox_bytes = rows * 2560 * 2 * 4;
+    // Inputs, partial sums, then the owner's routes (rows x 21 words).
+    const size_t inbox_bytes = rows * (2560 * 2 + 21) * 4;
     auto enable = [](int from, int to) {
         on_device(from, [&]() {
             const hipError_t state = hipDeviceEnablePeerAccess(to, 0);
@@ -161,4 +171,6 @@ void attach_peer(Device& a, Device& b, size_t rows) {
     a.link.index = 0; b.link.index = 1;
     a.link.peer_inbox = b.link.inbox; b.link.peer_inbox = a.link.inbox;
     a.link.peer_flag = b.link.flag; b.link.peer_flag = a.link.flag;
+    for (Device* side : {&a, &b}) side->link.routes = reinterpret_cast<int32_t*>(side->link.inbox + rows * 2560 * 2);
+    a.link.peer_routes = b.link.routes; b.link.peer_routes = a.link.routes;
 }

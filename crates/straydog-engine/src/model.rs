@@ -232,8 +232,11 @@ impl Model {
         // GPU kernels read over the bus.
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
-            (host, batch) = resident_placement(&weights, &group, context64, settings.prefill_batch_size, drafting, fits,
-                                               (host, batch))?;
+            if let Some((_, resident_host, resident_batch)) =
+                working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?
+            {
+                (host, batch) = (resident_host, resident_batch);
+            }
         }
         let gpu_attention = fits || host;
         if !gpu_attention {
@@ -888,11 +891,11 @@ impl Model {
         Ok(Some(output))
     }
 
-    /// Whether a prompt's batches overlap on two GPUs that split the layers: the first device
-    /// starts batch n+1 while the second finishes batch n, nothing waiting on the host between.
+    /// Whether a prompt's batches overlap on two GPUs: the first device starts batch n+1 on its
+    /// layers while the second finishes batch n on its own, nothing waiting on the host between
+    /// (with experts split, each also helps the other's batch on its helper stream).
     fn pipelined_prefill(&self, tokens: usize) -> Result<bool> {
         Ok(self.resident && (self.speculative == 0 || self.group.keeps_mtp_rows()) && self.group.backends.len() == 2
-           && !self.group.expert_parallel()?
            && tokens > self.prefill_batch_size)
     }
 
@@ -1133,11 +1136,38 @@ impl Model {
     }
 }
 
-/// (K/V in host memory, prefill batch) that lets every weight live on the GPUs, else
-/// `default`. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
+/// The first layer of the second GPU when experts are split, as far as the placement allows:
+/// a pipelined prompt runs both GPUs' layers at once, so the one owning more (attention and
+/// dense work on top of its expert half) sets the pace. Balancing bytes gives the first GPU the
+/// layers the second's head and MTP layer make room for (33 of 48 at IQ3_S on two R9700s);
+/// 25 balanced their work there (20000 tokens 10.2 -> 9.0 s, decode unchanged).
+const EVEN_SPLIT: usize = 25;
+
+/// The layer split and its full-residency placement (see [`resident_placement`]): the split
+/// balancing bytes moves toward [`EVEN_SPLIT`] while the placement stays as good.
+fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
+                 -> Result<Option<(bool, bool, usize)>> {
+    let placed = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
+    let (Some(baseline), Some(balanced)) = (placed, group.split()) else { return Ok(placed) };
+    if !group.expert_parallel()? || balanced <= EVEN_SPLIT {
+        return Ok(placed);
+    }
+    let as_good = |(keep, host, batch): (bool, bool, usize)| keep >= baseline.0 && (!host || baseline.1) && batch >= baseline.2;
+    for split in EVEN_SPLIT..balanced {
+        group.set_split(split)?;
+        if let Some(placement) = resident_placement(weights, group, context, prefill, drafting, vram_kv)?.filter(|p| as_good(*p)) {
+            return Ok(Some(placement));
+        }
+    }
+    group.set_split(balanced)?;
+    Ok(placed)
+}
+
+/// (drafter kept, K/V in host memory, prefill batch) that lets every weight live on the GPUs,
+/// if any. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
 /// keeping the drafter wins over one that drops it; the configured batch and VRAM K/V first.
-fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool,
-                      default: (bool, usize)) -> Result<(bool, usize)> {
+fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
+                      -> Result<Option<(bool, bool, usize)>> {
     let mut batches = vec![prefill];
     while *batches.last().unwrap() > 1024 {
         batches.push((batches.last().unwrap() / 2).max(1024));
@@ -1150,11 +1180,11 @@ fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: u
             let planned = group.planned_state_bytes(context, *batch as u64, drafting, *host)?;
             let requirements = weights.resident_requirements(*keep && weights.drafter);
             if group.can_pin_model(&requirements, Some(&planned))? {
-                return Ok((*host, *batch));
+                return Ok(Some((*keep, *host, *batch)));
             }
         }
     }
-    Ok(default)
+    Ok(None)
 }
 
 fn validate_geometry(weights: &Weights) -> Result<()> {

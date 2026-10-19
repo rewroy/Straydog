@@ -113,7 +113,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     let split = if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts };
-    let group = Group::new(&args.devices, args.vram_bytes, split)?;
+    let mut group = Group::new(&args.devices, args.vram_bytes, split)?;
     group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16")?;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let weights = Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes,

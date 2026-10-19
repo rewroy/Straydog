@@ -19,6 +19,8 @@ pub type Result<T> = std::result::Result<T, String>;
 /// The native library pads every VRAM allocation (allocation_tail in kernels.cpp).
 pub const ALLOCATION_TAIL: u64 = 64;
 const MOE_ROW: u64 = 11 * 4480 + 22;
+/// Rows of the peer's batch one pass of expert-parallel help takes (see `@moe:helper`).
+const HELP_ROWS: u64 = 2048;
 pub const VERIFY_MAX: usize = 4;
 pub const VOCABULARY: u64 = 248320;
 pub const WIDTH: usize = 10240;
@@ -105,6 +107,9 @@ pub struct Backend {
     /// The last of two devices that split the layers: it keeps a deferred prompt's MTP pairs
     /// (see [`Backend::mtp_keep`]) when it holds the MTP layer.
     pub keeps_mtp_rows: bool,
+    /// One of two devices that split every layer's experts: its help for the peer's batches
+    /// runs in a workspace of its own (`@moe:helper`), beside its own batch.
+    pub expert_parallel: bool,
 }
 
 /// Move prompt rows a span left on `from` (layer `from_layer`'s workspace) to `to`'s
@@ -154,6 +159,7 @@ impl Backend {
             logical_capacity: if budget >= 2 << 30 { 4096 } else { 1024 },
             output_capacity,
             keeps_mtp_rows: false,
+            expert_parallel: false,
         })
     }
 
@@ -263,6 +269,10 @@ impl Backend {
         let mut plan = Vec::new();
         if self.batch_capacity == 256 {
             plan.push(("@moe:workspace".into(), context.min(prefill) * MOE_ROW + 65536, 1, false));
+            if self.expert_parallel {
+                // Help for batches up to 2048 rows at once, longer ones in pieces.
+                plan.push(("@moe:helper".into(), context.min(prefill).min(HELP_ROWS) * MOE_ROW + 65536, 1, false));
+            }
             plan.push(("@scratch:qsa".into(), 256 * (context / 4 + 1), 1, false));
         }
         for &layer in layers {
@@ -335,7 +345,11 @@ impl Backend {
             && i128::from(required) + i128::from(reserved) <= i128::from(budget) - i128::from(used) - i128::from(slack))
     }
 
-    fn moe_workspace(&mut self) -> Result<(Entry, u64)> {
+    fn moe_workspace(&mut self, helper: bool) -> Result<(Entry, u64)> {
+        if helper && self.expert_parallel {
+            let workspace = self.state_entry("@moe:helper")?;
+            return Ok((workspace, (workspace.rows - 65536) / MOE_ROW));
+        }
         let workspace = match self.states.get("@moe:workspace") {
             Some(entry) => *entry,
             None => self.state("@moe:workspace", 1024 * MOE_ROW + 65536, 1, false)?,
@@ -359,7 +373,7 @@ impl Backend {
         {
             return Err("invalid Straydog resident MoE geometry".into());
         }
-        let (workspace, capacity) = self.moe_workspace()?;
+        let (workspace, capacity) = self.moe_workspace(helper)?;
         let mut pointers = Vec::with_capacity(8);
         let mut kinds = Vec::with_capacity(8);
         for (index, operand) in operands.iter().enumerate() {
