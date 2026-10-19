@@ -11,6 +11,8 @@ futures = "0.3"
 getrandom = "0.3"
 serde_json = { version = "1", features = ["preserve_order"] }
 straydog-engine = { path = "../straydog-engine" }
+# Only for its link metadata: the tests link the GPU library through the engine.
+straydog-gpu = { path = "../straydog-gpu" }
 subtle = "2.6"
 
 [dev-dependencies]

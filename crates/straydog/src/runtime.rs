@@ -133,14 +133,35 @@ pub fn ready_summary(ready: &Value) -> String {
         "bounded expert cache"
     };
     let drafts = ready["speculative_drafts"].as_u64().unwrap_or(0);
+    let gib = |value: &Value| value.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
+    let gpu = &ready["gpu"];
+    let names: Vec<&str> = gpu["name"].as_str().unwrap_or("GPU").split(" + ").collect();
+    let devices = if names.len() > 1 && names.iter().all(|name| *name == names[0]) {
+        format!("{}× {}", names.len(), names[0])
+    } else {
+        names.join(" + ")
+    };
     format!(
-        "Straydog ready: {}, context {}, {residency}, {}, K/V in {}, prefill batch {}",
+        "Straydog ready: {}, context {}, {residency}, {}, K/V in {}, prefill batch {}; {devices} using {:.1} of {:.1} GiB",
         ready["quantization"].as_str().unwrap_or("-"),
         ready["context"],
         if drafts > 0 { format!("MTP {drafts}") } else { "no speculation".into() },
         if placement["host_kv"] == true { "host memory" } else { "VRAM" },
         placement["prefill_batch_size"],
+        gib(&gpu["allocated_bytes"]),
+        gib(&gpu["budget_bytes"]),
     )
+}
+
+/// A loading stage as the log names it.
+fn stage_name(stage: &str, total: u64) -> String {
+    let size = if total > 0 { format!(" ({:.1} GB)", total as f64 / 1e9) } else { String::new() };
+    match stage {
+        "authenticate" => format!("authenticating the model files{size}"),
+        "drafter" => format!("authenticating the drafter{size}"),
+        "prepare" => "placing the model on the GPUs".into(),
+        other => format!("{other}{size}"),
+    }
 }
 
 /// One line per finished generation: what was read, what was reused, how fast.
@@ -366,7 +387,10 @@ impl Driver {
             tree,
         };
         self.set(Phase::Loading(json!({})));
-        let deadline = Instant::now() + self.timeout;
+        let started = Instant::now();
+        let deadline = started + self.timeout;
+        // The stage last logged, and the quarter of it reached.
+        let mut logged = (String::new(), 0u64);
         let result = async {
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -375,9 +399,16 @@ impl Driver {
                     .map_err(|_| "Straydog did not load within its startup timeout".to_string())??;
                 if frame["event"] == "loading" {
                     let stage = frame["stage"].as_str().unwrap_or("").chars().take(32).collect::<String>();
-                    tracing::debug!("Straydog loading: {stage}");
-                    self.set(Phase::Loading(json!({"stage": stage, "done": frame["done"].as_u64().unwrap_or(0),
-                                                   "total": frame["total"].as_u64().unwrap_or(0)})));
+                    let (done, total) = (frame["done"].as_u64().unwrap_or(0), frame["total"].as_u64().unwrap_or(0));
+                    let quarter = (done.min(total) * 4).checked_div(total).unwrap_or(0);
+                    if stage != logged.0 {
+                        tracing::info!("Straydog loading: {}", stage_name(&stage, total));
+                        logged = (stage.clone(), 0);
+                    } else if quarter > logged.1 {
+                        tracing::info!("Straydog loading: {} {}%", stage_name(&stage, 0), quarter * 25);
+                        logged.1 = quarter;
+                    }
+                    self.set(Phase::Loading(json!({"stage": stage, "done": done, "total": total})));
                     continue;
                 }
                 let (context, quant) = &self.expected;
@@ -393,7 +424,7 @@ impl Driver {
         .await;
         match result {
             Ok(ready) => {
-                tracing::info!("{}", ready_summary(&ready));
+                tracing::info!("{} (loaded in {:.0} s)", ready_summary(&ready), started.elapsed().as_secs_f64());
                 self.set(Phase::Ready(ready));
                 Ok(process)
             }

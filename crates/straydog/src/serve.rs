@@ -40,6 +40,19 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     let command = straydog_isolation::worker_command(&runtime::worker_args(&settings), &runtime::exposure(&settings)?)?;
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
+        tracing::info!(
+            "Straydog starting: {} from {}, GPU {} with {} GiB each, context {}, prefill batch {}, {}",
+            settings.quant,
+            settings.model.display(),
+            settings.device.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
+            settings.vram,
+            settings.ctx_size,
+            settings.batch_size,
+            match (&settings.model_draft, settings.draft_max) {
+                (Some(_), drafts) if drafts > 0 => format!("MTP drafter with {drafts} drafts"),
+                _ => "no drafter".into(),
+            },
+        );
         let engine = Arc::new(Runtime::start(&settings, command));
         let api = straydog_api::ApiConfig {
             model_id: settings.alias.clone(),

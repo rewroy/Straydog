@@ -1359,6 +1359,7 @@ dependencies = [
  "http-body-util",
  "serde_json",
  "straydog-engine",
+ "straydog-gpu",
  "subtle",
  "tokio",
  "tower",
