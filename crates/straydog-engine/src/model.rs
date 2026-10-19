@@ -150,8 +150,15 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// Each embedding row repeated over the four residual streams.
 fn tile(embeddings: &[f32]) -> Vec<f32> {
-    embeddings.chunks_exact(HIDDEN).flat_map(|row| row.iter().chain(row).chain(row).chain(row).copied()).collect()
+    let mut hidden = Vec::with_capacity(embeddings.len() * 4);
+    for row in embeddings.chunks_exact(HIDDEN) {
+        for _ in 0..4 {
+            hidden.extend_from_slice(row);
+        }
+    }
+    hidden
 }
 
 fn last_row(values: &[f32]) -> &[f32] {
@@ -647,8 +654,8 @@ impl Model {
             spans.extend((*begin..*end).step_by(4).map(|first| (first, (first + 4).min(*end))));
         }
         let transfers: Vec<usize> = boundaries.iter().map(|(_, end)| *end).collect();
-        let mut pending = Some(hidden);
-        let mut output = Vec::new();
+        // The rows the next span uploads (the prompt's, then each device boundary's), if any.
+        let (mut rows_in, mut upload) = (hidden, true);
         for (index, (first, last)) in spans.into_iter().enumerate() {
             if cancelled() {
                 self.reset()?;
@@ -663,10 +670,14 @@ impl Model {
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
             let last_rows = if self.speculative > 0 { steps } else { 1 };
             let rows = if last == 48 { last_rows } else if transfers.contains(&last) { steps } else { 0 };
-            output = self.group.prefill_layers(first, last, pending.as_deref(), position, steps, rows)?;
-            pending = if rows == steps { Some(output.clone()) } else { None };
+            let input = upload.then_some(&rows_in[..]);
+            let output = self.group.prefill_layers(first, last, input, position, steps, rows)?;
+            if rows > 0 {
+                rows_in = output;
+            }
+            upload = rows == steps;
         }
-        Ok(Some(output))
+        Ok(Some(rows_in))
     }
 
     /// Advance the MTP layer's K/V over prologue rows starting at `position`.

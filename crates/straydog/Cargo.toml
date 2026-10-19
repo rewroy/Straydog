@@ -1,0 +1,40 @@
+[package]
+name = "straydog"
+description = "A local inference engine for Qwen3.8-Flash-Next with an OpenAI-compatible server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "straydog"
+path = "src/main.rs"
+
+[[test]]
+name = "runtime_gpu"
+harness = false
+
+[features]
+# The GPU backend linked into the executable.
+hip = ["straydog-engine/hip"]
+cuda = ["straydog-engine/cuda"]
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+straydog-api = { path = "../straydog-api" }
+straydog-engine = { path = "../straydog-engine" }
+# Linked directly so the build script learns where the GPU runtime lives (rpath).
+straydog-gpu = { path = "../straydog-gpu" }
+straydog-isolation = { path = "../straydog-isolation" }
+straydog-provision = { path = "../straydog-provision" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal", "net"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

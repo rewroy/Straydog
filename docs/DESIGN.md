@@ -174,6 +174,10 @@ Other commands:
   required once given (`--api-key`, or `--api-key-file` for a key kept out of the
   process list). One engine serializes generation. The waiting queue is bounded, and
   a request whose client disconnects is cancelled.
+- One principal: every client that holds the key shares the engine and its
+  conversation cache, so whether a prompt prefix was seen before is observable
+  (`cached_tokens`, first-token latency). Users who must not see each other's prompts
+  need separate servers.
 
 ## 7. Build and distribution
 
@@ -212,6 +216,10 @@ Other commands:
   (`crates/straydog`) wires them to the worker and runtime.
 - **R4**: worker, runtime, server, CLI and config. Gate: API tests, including
   streaming, tool calls, stop strings, cancellation on disconnect and errors.
+  `straydog-api` is done (its tests). The worker and runtime run end to end on the GPUs
+  (`crates/straydog/tests/runtime_gpu.rs`); the executable's large host buffers use
+  transparent huge pages, as NumPy's do (a 160 MB prompt buffer otherwise costs some
+  40,000 page faults).
 - **R5**: isolation (bubblewrap, AppContainer) and provisioning (`fetch`, `verify`,
   `fetch-mtp`, `init`). Gate: the drafter built by Rust equals the reference's.
 - **R6**: alternating A/B against the reference on the single-request benchmark and
