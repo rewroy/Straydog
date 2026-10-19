@@ -363,7 +363,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
     values
         .into_iter()
         .map(|(name, value)| {
-            let derived = ["quant", "draft_max", "batch_size", "state_ram", "alias"].contains(&name);
+            let derived = ["quant", "draft_max", "batch_size", "state_ram", "alias", "api_key"].contains(&name);
             let source = sources
                 .iter()
                 .find(|(key, _)| *key == name)

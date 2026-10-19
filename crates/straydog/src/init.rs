@@ -9,6 +9,7 @@ use clap::Args;
 use straydog_engine::bundle;
 
 use crate::config::straydog_home;
+use crate::progress;
 
 #[derive(Debug, Clone, Args)]
 pub struct InitArgs {
@@ -74,14 +75,6 @@ impl Prompt {
 const BUNDLES: [(&str, f64, &str); 4] = [("Q2_0", 66.4, "the fastest"), ("IQ2_XS", 68.0, ""), ("IQ3_XXS", 75.8, ""),
                                          ("IQ3_S", 83.6, "closest to BF16")];
 
-fn progress(stage: &str, done: u64, total: u64) {
-    if total > 0 {
-        eprint!("\r{stage}: {:.1}/{:.1} GB", done as f64 / 1e9, total as f64 / 1e9);
-        if done >= total {
-            eprintln!();
-        }
-    }
-}
 
 /// A fresh API key: 32 random bytes as hex.
 fn new_key() -> Result<String, String> {
@@ -102,6 +95,7 @@ fn write_private(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn main(args: InitArgs) -> Result<(), String> {
     let home = straydog_home().ok_or("cannot find the home directory")?;
+    std::fs::create_dir_all(&home).map_err(|exc| format!("{}: {exc}", home.display()))?;
     let prompt = Prompt { ask: !args.yes };
     let count = straydog_gpu::device_count().map_err(|error| format!("no GPU runtime: {error}"))?;
     if count == 0 {
@@ -162,11 +156,11 @@ pub fn main(args: InitArgs) -> Result<(), String> {
     let key = !args.no_api_key && prompt.yes("Require an API key?", true)?;
 
     std::fs::create_dir_all(&model).map_err(|exc| format!("{}: {exc}", model.display()))?;
-    straydog_provision::fetch(&model, &quant, args.offline, &progress)?;
+    straydog_provision::fetch(&model, &quant, args.offline, &progress::report)?;
     let draft_directory = home.join("models").join("mtp");
     if drafter {
         std::fs::create_dir_all(&draft_directory).map_err(|exc| exc.to_string())?;
-        straydog_provision::fetch_drafter(&draft_directory, false, &progress)?;
+        straydog_provision::fetch_drafter(&draft_directory, false, &progress::report)?;
     }
     let mut config = toml::Table::new();
     let text = |path: &Path| toml::Value::String(path.display().to_string());

@@ -68,5 +68,15 @@
    }
   ],
   "max_tokens": 24
+ },
+ {
+  "name": "essay",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a detailed essay about rivers and how they shape cities, at least 600 words."
+   }
+  ],
+  "max_tokens": 512
  }
 ]

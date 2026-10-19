@@ -1,7 +1,8 @@
 # Straydog — design
 
-Status: phases R1-R3 done (the GPU library builds statically into Rust; renders, token
-ids, weights and generations equal the reference's). Updated: 2026-10-19.
+Status: phases R1-R5 done on Linux (the Rust executable serves the API with its worker
+contained, provisions bundles and builds the drafter byte for byte); R6 measured. Windows
+builds but has not run. Updated: 2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API, shipped as one executable per GPU backend.
@@ -220,11 +221,18 @@ Other commands:
   (`crates/straydog/tests/runtime_gpu.rs`); the executable's large host buffers use
   transparent huge pages, as NumPy's do (a 160 MB prompt buffer otherwise costs some
   40,000 page faults).
-- **R5**: isolation (bubblewrap, AppContainer) and provisioning (`fetch`, `verify`,
-  `fetch-mtp`, `init`). Gate: the drafter built by Rust equals the reference's.
+- **R5** (done on Linux): isolation (bubblewrap, AppContainer) and provisioning (`fetch`,
+  `verify`, `fetch-mtp`, `init`). Gate met: the drafter built by Rust equals the pin byte
+  for byte. The worker runs under bubblewrap with a cleared environment; the AppContainer
+  launcher builds and passes its tests on Linux but has not run on Windows.
 - **R6**: alternating A/B against the reference on the single-request benchmark and
   a multi-turn session; no metric may be slower. Then the Python engine and its
-  packaged builds are removed and the first binaries released.
+  packaged builds are removed and the first binaries released. Measured
+  (`examples/ab.rs`, IQ3_S, two R9700s, 262144, MTP 3; the two engines produce the same
+  tokens): prefill and first-token latency are lower in every case (long prompts
+  1,592 vs 1,549 tokens/s; a multi-turn session's appended prompts 2-4% faster), and
+  the decode medians are equal or higher (128 tokens 122.0 vs 120.3, 512 tokens
+  83.3 vs 81.4 tokens/s). Startup 42-45 s for both.
 - **R7**: clients move onto the server.
 
 ## 9. Decisions (2026-10-19)

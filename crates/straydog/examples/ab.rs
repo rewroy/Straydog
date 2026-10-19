@@ -47,6 +47,12 @@ struct Args {
     /// Skip the multi-turn session
     #[arg(long)]
     no_session: bool,
+    /// Only these cases (names in bench/cases.json)
+    #[arg(long, value_delimiter = ',')]
+    cases: Option<Vec<String>>,
+    /// Measured runs of each case (after one warm-up run)
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
 }
 
 const SESSION_COMMIT: &str = "9ee90c6";
@@ -179,7 +185,11 @@ fn main() {
     };
     let settings = config::resolve(options).unwrap();
     let cases: Vec<Value> =
-        serde_json::from_str(&std::fs::read_to_string(args.repo.join("bench/cases.json")).unwrap()).unwrap();
+        serde_json::from_str::<Vec<Value>>(&std::fs::read_to_string(args.repo.join("bench/cases.json")).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|case| args.cases.as_ref().is_none_or(|names| names.iter().any(|name| case["name"] == name.as_str())))
+            .collect();
     let repo = args.repo.canonicalize().unwrap();
     let mut report = json!({"settings": format!("{settings:?}"), "rounds": []});
     let tokio = tokio::runtime::Runtime::new().unwrap();
@@ -210,10 +220,12 @@ fn main() {
                         body["messages"][0]["content"] = json!(format!("Run {run}.\n{content}"));
                         pyjson::parse(&body.to_string()).unwrap()
                     };
-                    run(&engine, &body(1)).await;
-                    let (text, done) = run(&engine, &body(2)).await;
-                    results.push(json!({"name": case["name"], "content": text, "usage": done["usage"],
-                                        "timings": done["timings"]}));
+                    run(&engine, &body(0)).await;
+                    for repeat in 1..=args.repeat {
+                        let (text, done) = run(&engine, &body(repeat)).await;
+                        results.push(json!({"name": case["name"], "content": text, "usage": done["usage"],
+                                            "timings": done["timings"]}));
+                    }
                 }
                 let mut turns = Vec::new();
                 if !args.no_session {

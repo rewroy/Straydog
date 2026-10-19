@@ -2,5 +2,6 @@
 
 pub mod config;
 pub mod init;
+pub mod progress;
 pub mod runtime;
 pub mod worker;

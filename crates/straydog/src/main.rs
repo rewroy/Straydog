@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use straydog::{config, init, worker};
+use straydog::{config, init, progress, worker};
 
 #[cfg(not(any(feature = "hip", feature = "cuda")))]
 compile_error!("the straydog executable links one GPU backend: build it with --features hip or --features cuda");
@@ -77,14 +77,6 @@ enum Command {
     },
 }
 
-fn progress(stage: &str, done: u64, total: u64) {
-    if total > 0 {
-        eprint!("\r{stage}: {:.1}/{:.1} GB", done as f64 / 1e9, total as f64 / 1e9);
-        if done >= total {
-            eprintln!();
-        }
-    }
-}
 
 fn main() -> ExitCode {
     let cli = Cli::parse_from(config::expand_short_options(std::env::args_os()));
@@ -97,10 +89,10 @@ fn main() -> ExitCode {
             serve::main(matches, config.as_deref(), print_config)
         }
         Command::Init(args) => init::main(args),
-        Command::Fetch { model, quant, offline } => straydog_provision::fetch(&model, &quant, offline, &progress),
-        Command::Verify { model, quant } => straydog_provision::verify(&model, &quant, &progress),
+        Command::Fetch { model, quant, offline } => straydog_provision::fetch(&model, &quant, offline, &progress::report),
+        Command::Verify { model, quant } => straydog_provision::verify(&model, &quant, &progress::report),
         Command::FetchMtp { directory, keep_source } => {
-            straydog_provision::fetch_drafter(&directory, keep_source, &progress)
+            straydog_provision::fetch_drafter(&directory, keep_source, &progress::report)
                 .map(|path| println!("verified {}", path.display()))
         }
         Command::Worker(args) => worker::main(args),
