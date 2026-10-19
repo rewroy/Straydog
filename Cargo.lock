@@ -1337,6 +1337,10 @@ dependencies = [
 [[package]]
 name = "straydog-isolation"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "straydog-provision"
