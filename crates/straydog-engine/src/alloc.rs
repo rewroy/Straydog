@@ -8,6 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 
 pub struct HugePages;
 
+#[cfg(target_os = "linux")]
 const HUGE_THRESHOLD: usize = 4 << 20;
 
 unsafe impl GlobalAlloc for HugePages {

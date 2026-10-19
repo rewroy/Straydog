@@ -8,6 +8,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 pub const HASH_CHUNK: usize = 8 << 20;
+#[cfg(target_os = "linux")]
 const HASH_AHEAD: u64 = 256 << 20;
 pub const HINT_STEP: u64 = 128 << 10;
 
