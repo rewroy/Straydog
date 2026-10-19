@@ -1,6 +1,6 @@
 # Straydog — design
 
-Status: phase 1 in progress. Updated: 2026-10-19.
+Status: phase 1 done, phase 2 in progress. Updated: 2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API.
@@ -54,7 +54,7 @@ src/straydog/
   cli.py         straydog serve | init | fetch | verify | build | bundle
   platform/      process groups, environment, Windows helpers
 native/          Rust inspector crate and the C++/HIP/CUDA GPU library
-scripts/         benchmarks (single requests, a multi-turn agent session)
+scripts/         benchmarks
 tests/
 docs/
 ```
@@ -75,7 +75,7 @@ setting, the name is the same.
 | `-dev, --device LIST` | GPU ordinals, e.g. `0,1` | `0` |
 | `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` when possible |
 | `--vram GIB` | VRAM budget per GPU | 6 |
-| `--state-ram GIB` | host memory for sequence state | 13 |
+| `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |

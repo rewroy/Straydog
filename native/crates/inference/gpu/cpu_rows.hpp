@@ -1,0 +1,467 @@
+// Fused multi-row kernels for the block-decoded CPU expert formats (included by
+// cpu_experts.cpp on x86). Every row keeps the decoded path's arithmetic exactly:
+// each value is the block decoder's F32 value, one 16-lane accumulator per row takes
+// acc[k] = fma(value, x, acc[k]) in order, and reduce16 sums the lanes. Lattice rows
+// come from F32 copies of the gguf grids (no gathers or integer conversions), and up
+// to four rows run together so their accumulation chains overlap and share the
+// activations.
+
+// Sixteen values of a lattice format: two 8-value grid rows (IQ1, IQ2) or four
+// 4-value rows (IQ3), one scale, sixteen sign bits (IQ1: two deltas instead).
+struct GridChunk {
+    const float* row[4];
+    float scale;
+    uint32_t signs;
+    float delta[2];
+};
+
+template<int kind> struct Block;
+template<> struct Block<16> {   // IQ2_XXS
+    static constexpr size_t values = 256, bytes = 66;
+    static constexpr int grid = 16, width = 8;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, l = 2 * (c % 2);
+        const uint32_t aux = load32(b + 2 + 8 * ib + 4);
+        GridChunk k{};
+        k.row[0] = table + 8 * b[2 + 8 * ib + l]; k.row[1] = table + 8 * b[3 + 8 * ib + l];
+        k.scale = d * (0.5f + float(aux >> 28)) * 0.25f;
+        k.signs = iq_signs_table((aux >> (7 * l)) & 127) | iq_signs_table((aux >> (7 * l + 7)) & 127) << 8;
+        return k;
+    }
+};
+template<> struct Block<17> {   // IQ2_XS
+    static constexpr size_t values = 256, bytes = 74;
+    static constexpr int grid = 17, width = 8;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, h = c % 2, g = 4 * ib + 2 * h;
+        const unsigned q0 = unsigned(b[2 + 2 * g]) | unsigned(b[3 + 2 * g]) << 8;
+        const unsigned q1 = unsigned(b[4 + 2 * g]) | unsigned(b[5 + 2 * g]) << 8;
+        GridChunk k{};
+        k.row[0] = table + 8 * (q0 & 511); k.row[1] = table + 8 * (q1 & 511);
+        k.scale = d * (0.5f + float((b[66 + ib] >> (4 * h)) & 15)) * 0.25f;
+        k.signs = iq_signs_table(q0 >> 9) | iq_signs_table(q1 >> 9) << 8;
+        return k;
+    }
+};
+template<> struct Block<22> {   // IQ2_S
+    static constexpr size_t values = 256, bytes = 82;
+    static constexpr int grid = 22, width = 8;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, h = c % 2, l = 2 * h;
+        GridChunk k{};
+        for (unsigned i = 0; i < 2; ++i)
+            k.row[i] = table + 8 * (b[2 + 4 * ib + l + i] | ((unsigned(b[66 + ib]) << (8 - 2 * (l + i))) & 0x300));
+        k.scale = d * (0.5f + float((b[74 + ib] >> (4 * h)) & 15)) * 0.25f;
+        k.signs = unsigned(b[34 + 4 * ib + l]) | unsigned(b[35 + 4 * ib + l]) << 8;
+        return k;
+    }
+};
+template<> struct Block<18> {   // IQ3_XXS
+    static constexpr size_t values = 256, bytes = 98;
+    static constexpr int grid = 18, width = 4;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, l = 2 * (c % 2);
+        const uint32_t aux = load32(b + 66 + 4 * ib);
+        GridChunk k{};
+        for (unsigned t = 0; t < 4; ++t) k.row[t] = table + 4 * b[2 + 8 * ib + 2 * l + t];
+        k.scale = d * (0.5f + float(aux >> 28)) * 0.5f;
+        k.signs = iq_signs_table((aux >> (7 * l)) & 127) | iq_signs_table((aux >> (7 * l + 7)) & 127) << 8;
+        return k;
+    }
+};
+template<> struct Block<21> {   // IQ3_S
+    static constexpr size_t values = 256, bytes = 110;
+    static constexpr int grid = 21, width = 4;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, l = 2 * (c % 2);
+        GridChunk k{};
+        for (unsigned t = 0; t < 4; ++t) {
+            const unsigned r = 2 * l + t;
+            k.row[t] = table + 4 * (b[2 + 8 * ib + r] | ((unsigned(b[66 + ib]) << (8 - r)) & 256));
+        }
+        k.scale = d * float(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 15));
+        k.signs = unsigned(b[74 + 4 * ib + l]) | unsigned(b[75 + 4 * ib + l]) << 8;
+        return k;
+    }
+};
+template<> struct Block<29> {   // IQ1_M: value = scale * ((grid value) + delta), no signs
+    static constexpr size_t values = 256, bytes = 56;
+    static constexpr int grid = 29, width = 8;
+    const uint8_t* b; float d; uint16_t words[4];
+    void load(const uint8_t* block) { b = block; d = iq1m_scale(block, words); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, h = c % 2;
+        const unsigned high = b[32 + 2 * ib + h];
+        GridChunk k{};
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned nibble = high >> (4 * i);
+            k.row[i] = table + 8 * (b[4 * ib + 2 * h + i] | ((nibble & 7) << 8));
+            k.delta[i] = iq1_delta(nibble);
+        }
+        k.scale = iq1m_group_scale(d, words, int(ib), int(h));
+        return k;
+    }
+};
+// Code formats: sixteen values are the scale times a table entry or an int8.
+template<> struct Block<20> {   // IQ4_NL
+    static constexpr size_t values = 32, bytes = 18;
+    static constexpr int grid = 0;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    const uint8_t* codes(unsigned) const { return b + 2; }
+    int shift(unsigned c) const { return 4 * int(c); }
+    float scale(unsigned) const { return d; }
+};
+template<> struct Block<23> {   // IQ4_XS
+    static constexpr size_t values = 256, bytes = 136;
+    static constexpr int grid = 0;
+    const uint8_t* b; float d; unsigned high;
+    void load(const uint8_t* block) { b = block; d = half_at(block); high = unsigned(block[2]) | unsigned(block[3]) << 8; }
+    const uint8_t* codes(unsigned c) const { return b + 8 + 16 * (c / 2); }
+    int shift(unsigned c) const { return 4 * int(c % 2); }
+    float scale(unsigned c) const {
+        const unsigned g = c / 2;
+        return d * float(int(((b[4 + g / 2] >> (4 * (g % 2))) & 15) | (((high >> (2 * g)) & 3) << 4)) - 32);
+    }
+};
+template<> struct Block<8> {    // Q8_0
+    static constexpr size_t values = 32, bytes = 34;
+    static constexpr int grid = -1;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+};
+
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512 grid16(const GridChunk& k, int width) {
+    if (width == 8) {
+        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(k.row[0])), high = _mm256_castps_pd(_mm256_loadu_ps(k.row[1]));
+        return _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castpd256_pd512(low), high, 1));
+    }
+    __m512 v = _mm512_castps128_ps512(_mm_loadu_ps(k.row[0]));
+    v = _mm512_insertf32x4(v, _mm_loadu_ps(k.row[1]), 1);
+    v = _mm512_insertf32x4(v, _mm_loadu_ps(k.row[2]), 2);
+    return _mm512_insertf32x4(v, _mm_loadu_ps(k.row[3]), 3);
+}
+template<int kind>
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512 values16(const Block<kind>& block, unsigned c, const float* table) {
+    using B = Block<kind>;
+    if constexpr (B::grid > 0) {
+        const GridChunk k = block.chunk(c, table);
+        __m512 v = grid16(k, B::width);
+        if constexpr (kind == 29) {
+            const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(k.delta[0]), _mm512_set1_ps(k.delta[1]));
+            return _mm512_mul_ps(_mm512_set1_ps(k.scale), _mm512_add_ps(v, delta));
+        } else {
+            const __m512i bits = _mm512_castps_si512(_mm512_mul_ps(v, _mm512_set1_ps(k.scale)));
+            return _mm512_castsi512_ps(_mm512_mask_xor_epi32(bits, __mmask16(k.signs), bits, _mm512_set1_epi32(int(0x80000000u))));
+        }
+    } else if constexpr (B::grid == 0) {
+        const __m512 table16 = _mm512_setr_ps(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
+        const __m512i codes = _mm512_and_si512(_mm512_srli_epi32(_mm512_cvtepu8_epi32(bytes), unsigned(block.shift(c))),
+                                               _mm512_set1_epi32(15));
+        return _mm512_mul_ps(_mm512_set1_ps(block.scale(c)), _mm512_permutexvar_ps(codes, table16));
+    } else {
+        const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
+        return _mm512_mul_ps(_mm512_set1_ps(block.d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q)));
+    }
+}
+// Rows of an expert are contiguous: ask for the next N rows' block b while this one computes.
+template<size_t bytes, int N>
+inline void prefetch_next(const uint8_t* row, size_t stride, size_t b) {
+    for (int r = 0; r < N; ++r)
+        for (size_t line = 0; line < bytes; line += 64)
+            _mm_prefetch(reinterpret_cast<const char*>(row + size_t(N + r) * stride + b * bytes + line), _MM_HINT_T0);
+}
+// AVX-512 lattice blocks: one pass over a 256-value block computes, sixteen lanes at a
+// time, every grid row's byte offset in the F32 table, every sixteen values' scale (the
+// same expression and rounding as Block::chunk), the sign bytes and IQ1 deltas, so the
+// per-chunk work is loads, one multiply, a sign flip and the FMA.
+struct Prepared {
+    alignas(64) uint32_t offset[64];   // grid rows: 32 (IQ1, IQ2) or 64 (IQ3)
+    alignas(64) float scale[16];
+    alignas(64) float delta[32];       // IQ1_M
+    alignas(64) uint8_t sign[32];
+    const uint8_t* signs;              // the block's own sign bytes (IQ2_S, IQ3_S), else sign
+};
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512i lanes16(int first = 0) { return _mm512_add_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(first)); }
+// Bytes at p (16 of them) widened to sixteen 32-bit lanes.
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512i bytes16(const uint8_t* p) { return _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))); }
+// Lane i takes (source[select_i] >> shift_i) & mask.
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512i field16(__m512i source, __m512i select, __m512i shift, int mask) {
+    return _mm512_and_si512(_mm512_srlv_epi32(_mm512_permutexvar_epi32(select, source), shift), _mm512_set1_epi32(mask));
+}
+// Seven sign bits plus the parity bit, sixteen groups at a time (as iq_signs).
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512i signs16(__m512i bits) {
+    __m512i parity = _mm512_xor_si512(bits, _mm512_srli_epi32(bits, 4));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
+    return _mm512_or_si512(bits, _mm512_slli_epi32(_mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
+}
+SD_TARGET("avx512f,avx2,f16c")
+inline void store_signs(uint8_t* out, __m512i low, __m512i high) {
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), _mm512_cvtepi32_epi8(low));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16), _mm512_cvtepi32_epi8(high));
+}
+// IQ2 scale per sixteen values c: d * (0.5 + nibble) * 0.25.
+SD_TARGET("avx512f,avx2,f16c")
+inline void iq2_scales(float d, __m512i nibbles, float* out) {
+    const __m512 sum = _mm512_add_ps(_mm512_set1_ps(0.5f), _mm512_cvtepi32_ps(nibbles));
+    _mm512_store_ps(out, _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(d), sum), _mm512_set1_ps(0.25f)));
+}
+template<int kind>
+SD_TARGET("avx512f,avx2,f16c")
+void prepare(const uint8_t* b, Prepared& p) {
+    const __m512i lane = lanes16();
+    if constexpr (kind == 22) {   // IQ2_S: qs[2..34) | 2 bits of qh[66 + ib]; scales nibbles at 74; signs at 34
+        const __m512i qh = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
+        for (int half = 0; half < 2; ++half) {
+            const __m512i g = lanes16(16 * half);
+            const __m512i high = field16(qh, _mm512_srli_epi32(g, 2), _mm512_slli_epi32(_mm512_and_si512(g, _mm512_set1_epi32(3)), 1), 3);
+            const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * half), _mm512_slli_epi32(high, 8));
+            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+        }
+        const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 74)));
+        iq2_scales(half_at(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
+        p.signs = b + 34;
+    } else if constexpr (kind == 16) {   // IQ2_XXS: per ib, four index bytes then aux (signs, scale)
+        const __m512i words = _mm512_loadu_si512(reinterpret_cast<const void*>(b + 2));   // 2ib: indices, 2ib + 1: aux
+        __m512i sign_bits[2];
+        for (int half = 0; half < 2; ++half) {
+            const __m512i g = lanes16(16 * half), l = _mm512_and_si512(g, _mm512_set1_epi32(3));
+            const __m512i word = _mm512_slli_epi32(_mm512_srli_epi32(g, 2), 1);
+            const __m512i index = field16(words, word, _mm512_slli_epi32(l, 3), 255);
+            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(word, _mm512_set1_epi32(1)), words);
+            sign_bits[half] = signs16(_mm512_and_si512(_mm512_srlv_epi32(aux, _mm512_mullo_epi32(l, _mm512_set1_epi32(7))), _mm512_set1_epi32(127)));
+        }
+        store_signs(p.sign, sign_bits[0], sign_bits[1]);
+        const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(_mm512_slli_epi32(_mm512_srli_epi32(lane, 1), 1), _mm512_set1_epi32(1)), words);
+        iq2_scales(half_at(b), _mm512_srli_epi32(aux, 28), p.scale);
+        p.signs = p.sign;
+    } else if constexpr (kind == 17) {   // IQ2_XS: 16-bit q per group (9-bit index, 7 sign bits); scales at 66
+        __m512i sign_bits[2];
+        for (int half = 0; half < 2; ++half) {
+            const __m512i q = _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2 + 32 * half)));
+            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(_mm512_and_si512(q, _mm512_set1_epi32(511)), 5));
+            sign_bits[half] = signs16(_mm512_srli_epi32(q, 9));
+        }
+        store_signs(p.sign, sign_bits[0], sign_bits[1]);
+        const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
+        iq2_scales(half_at(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
+        p.signs = p.sign;
+    } else if constexpr (kind == 29) {   // IQ1_M: qs[0..32) | 3 bits of a qh nibble; nibble bit 3 picks the delta
+        const __m512i qh = bytes16(b + 32);
+        for (int half = 0; half < 2; ++half) {
+            const __m512i g = lanes16(16 * half);
+            const __m512i nibble = field16(qh, _mm512_srli_epi32(g, 1), _mm512_slli_epi32(_mm512_and_si512(g, _mm512_set1_epi32(1)), 2), 15);
+            const __m512i index = _mm512_or_si512(bytes16(b + 16 * half), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(7)), 8));
+            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            const __m512i delta = _mm512_or_si512(_mm512_set1_epi32(0x3E000000), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(8)), 28));
+            _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
+        }
+        uint16_t words[4];
+        const float d = iq1m_scale(b, words);
+        const __m512i word = _mm512_cvtepu16_epi32(_mm256_castsi128_si256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(words))));
+        const __m512i ib = _mm512_srli_epi32(lane, 1);
+        const __m512i shift = _mm512_add_epi32(_mm512_mullo_epi32(_mm512_and_si512(ib, _mm512_set1_epi32(1)), _mm512_set1_epi32(6)),
+                                               _mm512_mullo_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), _mm512_set1_epi32(3)));
+        const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(word, _mm512_srli_epi32(lane, 2), shift, 7), 1), _mm512_set1_epi32(1));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(odd)));
+    } else if constexpr (kind == 18) {   // IQ3_XXS: 64 index bytes; per ib aux at 66 (signs, scale)
+        for (int quarter = 0; quarter < 4; ++quarter)
+            _mm512_store_si512(p.offset + 16 * quarter, _mm512_slli_epi32(bytes16(b + 2 + 16 * quarter), 4));
+        const __m512i aux = _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 66)));
+        __m512i sign_bits[2];
+        for (int half = 0; half < 2; ++half) {
+            const __m512i g = lanes16(16 * half), l = _mm512_and_si512(g, _mm512_set1_epi32(3));
+            sign_bits[half] = signs16(field16(aux, _mm512_srli_epi32(g, 2), _mm512_mullo_epi32(l, _mm512_set1_epi32(7)), 127));
+        }
+        store_signs(p.sign, sign_bits[0], sign_bits[1]);
+        const __m512i scale = _mm512_srli_epi32(_mm512_permutexvar_epi32(_mm512_srli_epi32(lane, 1), aux), 28);
+        const __m512 sum = _mm512_add_ps(_mm512_set1_ps(0.5f), _mm512_cvtepi32_ps(scale));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(half_at(b)), sum), _mm512_set1_ps(0.5f)));
+        p.signs = p.sign;
+    } else {   // IQ3_S: qs[2..66) | bit r of qh[66 + ib]; signs at 74; scales nibbles at 106
+        static_assert(kind == 21);
+        const __m512i qh = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
+        for (int quarter = 0; quarter < 4; ++quarter) {
+            const __m512i t = lanes16(16 * quarter);
+            const __m512i high = field16(qh, _mm512_srli_epi32(t, 3), _mm512_and_si512(t, _mm512_set1_epi32(7)), 1);
+            const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * quarter), _mm512_slli_epi32(high, 8));
+            _mm512_store_si512(p.offset + 16 * quarter, _mm512_slli_epi32(index, 4));
+        }
+        const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 106)));
+        const __m512i ib = _mm512_srli_epi32(lane, 1);
+        const __m512i nibble = field16(scales, _mm512_srli_epi32(ib, 1), _mm512_slli_epi32(_mm512_and_si512(ib, _mm512_set1_epi32(1)), 2), 15);
+        const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(nibble, 1), _mm512_set1_epi32(1));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_cvtepi32_ps(odd)));
+        p.signs = b + 74;
+    }
+}
+template<int kind>
+SD_TARGET("avx512f,avx2,f16c")
+inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
+    __m512 v;
+    if constexpr (Block<kind>::width == 8) {
+        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + p.offset[2 * c])));
+        const __m256d high = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + p.offset[2 * c + 1])));
+        v = _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castpd256_pd512(low), high, 1));
+    } else {
+        v = _mm512_castps128_ps512(_mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c])));
+        v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 1])), 1);
+        v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 2])), 2);
+        v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 3])), 3);
+    }
+    if constexpr (kind == 29) {
+        const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(p.delta[2 * c]), _mm512_set1_ps(p.delta[2 * c + 1]));
+        return _mm512_mul_ps(_mm512_set1_ps(p.scale[c]), _mm512_add_ps(v, delta));
+    } else {
+        const uint32_t signs = uint32_t(p.signs[2 * c]) | uint32_t(p.signs[2 * c + 1]) << 8;
+        const __m512i bits = _mm512_castps_si512(_mm512_mul_ps(v, _mm512_set1_ps(p.scale[c])));
+        return _mm512_castsi512_ps(_mm512_mask_xor_epi32(bits, __mmask16(signs), bits, _mm512_set1_epi32(int(0x80000000u))));
+    }
+}
+template<int kind, int N>
+SD_TARGET("avx512f,avx2,f16c")
+void rows512(const uint8_t* row, size_t stride, const float* x, size_t cols, const float* table, float* out) {
+    using B = Block<kind>;
+    __m512 acc[N];
+    for (int r = 0; r < N; ++r) acc[r] = _mm512_setzero_ps();
+    if constexpr (B::grid > 0) {
+        Prepared prep[N];
+        const char* bytes = reinterpret_cast<const char*>(table);
+        for (size_t b = 0; b < cols / B::values; ++b) {
+            prefetch_next<B::bytes, N>(row, stride, b);
+            for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride + b * B::bytes, prep[r]);
+            for (unsigned c = 0; c < B::values / 16; ++c) {
+                const __m512 xv = _mm512_loadu_ps(x + b * B::values + 16 * c);
+                for (int r = 0; r < N; ++r) acc[r] = _mm512_fmadd_ps(prepared16<kind>(prep[r], c, bytes), xv, acc[r]);
+            }
+        }
+    } else {
+        B block[N];
+        for (size_t b = 0; b < cols / B::values; ++b) {
+            prefetch_next<B::bytes, N>(row, stride, b);
+            for (int r = 0; r < N; ++r) block[r].load(row + size_t(r) * stride + b * B::bytes);
+            for (unsigned c = 0; c < B::values / 16; ++c) {
+                const __m512 xv = _mm512_loadu_ps(x + b * B::values + 16 * c);
+                for (int r = 0; r < N; ++r) acc[r] = _mm512_fmadd_ps(values16(block[r], c, table), xv, acc[r]);
+            }
+        }
+    }
+    for (int r = 0; r < N; ++r) {
+        alignas(64) float lanes[16];
+        _mm512_store_ps(lanes, acc[r]);
+        out[r] = reduce16(lanes);
+    }
+}
+
+// AVX2: the same sixteen values as two halves of eight.
+struct Halves { __m256 low, high; };
+SD_TARGET("avx2,fma,f16c")
+inline __m256 flip8(__m256 v, unsigned signs) {
+    const __m256i moved = _mm256_sllv_epi32(_mm256_set1_epi32(int(signs)), _mm256_setr_epi32(31, 30, 29, 28, 27, 26, 25, 24));
+    return _mm256_xor_ps(v, _mm256_castsi256_ps(_mm256_and_si256(moved, _mm256_set1_epi32(int(0x80000000u)))));
+}
+SD_TARGET("avx2,fma,f16c")
+inline __m256 rows8(const float* first, const float* second, int width) {
+    if (width == 8) return _mm256_loadu_ps(first);
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(first)), _mm_loadu_ps(second), 1);
+}
+SD_TARGET("avx2,fma,f16c")
+inline __m256 nonlinear8(__m128i bytes, int shift, float scale) {
+    const __m256 low = _mm256_setr_ps(-127, -104, -83, -65, -49, -35, -22, -10);
+    const __m256 high = _mm256_setr_ps(1, 13, 25, 38, 53, 69, 89, 113);
+    const __m256i codes = _mm256_and_si256(_mm256_srli_epi32(_mm256_cvtepu8_epi32(bytes), shift), _mm256_set1_epi32(15));
+    const __m256 value = _mm256_blendv_ps(_mm256_permutevar8x32_ps(low, codes), _mm256_permutevar8x32_ps(high, codes),
+                                          _mm256_castsi256_ps(_mm256_slli_epi32(codes, 28)));
+    return _mm256_mul_ps(_mm256_set1_ps(scale), value);
+}
+template<int kind>
+SD_TARGET("avx2,fma,f16c")
+inline Halves values8x2(const Block<kind>& block, unsigned c, const float* table) {
+    using B = Block<kind>;
+    if constexpr (B::grid > 0) {
+        const GridChunk k = block.chunk(c, table);
+        const bool wide = B::width == 8;
+        __m256 low = rows8(k.row[0], k.row[1], B::width), high = wide ? rows8(k.row[1], nullptr, 8) : rows8(k.row[2], k.row[3], 4);
+        if constexpr (kind == 29) {
+            const __m256 scale = _mm256_set1_ps(k.scale);
+            return {_mm256_mul_ps(scale, _mm256_add_ps(low, _mm256_set1_ps(k.delta[0]))),
+                    _mm256_mul_ps(scale, _mm256_add_ps(high, _mm256_set1_ps(k.delta[1])))};
+        } else {
+            const __m256 scale = _mm256_set1_ps(k.scale);
+            return {flip8(_mm256_mul_ps(low, scale), k.signs & 255), flip8(_mm256_mul_ps(high, scale), k.signs >> 8)};
+        }
+    } else if constexpr (B::grid == 0) {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
+        const float scale = block.scale(c);
+        return {nonlinear8(bytes, block.shift(c), scale), nonlinear8(_mm_srli_si128(bytes, 8), block.shift(c), scale)};
+    } else {
+        const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
+        const __m256 d = _mm256_set1_ps(block.d);
+        return {_mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q))),
+                _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q, 8))))};
+    }
+}
+template<int kind, int N>
+SD_TARGET("avx2,fma,f16c")
+void rows256(const uint8_t* row, size_t stride, const float* x, size_t cols, const float* table, float* out) {
+    using B = Block<kind>;
+    __m256 low[N], high[N];
+    B block[N];
+    for (int r = 0; r < N; ++r) low[r] = high[r] = _mm256_setzero_ps();
+    for (size_t b = 0; b < cols / B::values; ++b) {
+        prefetch_next<B::bytes, N>(row, stride, b);
+        for (int r = 0; r < N; ++r) block[r].load(row + size_t(r) * stride + b * B::bytes);
+        for (unsigned c = 0; c < B::values / 16; ++c) {
+            const float* values = x + b * B::values + 16 * c;
+            const __m256 xl = _mm256_loadu_ps(values), xh = _mm256_loadu_ps(values + 8);
+            for (int r = 0; r < N; ++r) {
+                const Halves v = values8x2(block[r], c, table);
+                low[r] = _mm256_fmadd_ps(v.low, xl, low[r]);
+                high[r] = _mm256_fmadd_ps(v.high, xh, high[r]);
+            }
+        }
+    }
+    for (int r = 0; r < N; ++r) {
+        alignas(32) float lanes[16];
+        _mm256_store_ps(lanes, low[r]); _mm256_store_ps(lanes + 8, high[r]);
+        out[r] = reduce16(lanes);
+    }
+}
+
+// count rows of one bank (stride bytes apart) against x; level 2 = AVX-512, 1 = AVX2.
+template<int kind>
+void block_rows(int level, const uint8_t* row, size_t stride, size_t count, const float* x, size_t cols, float* out) {
+    const float* table = Block<kind>::grid > 0 ? iq_float(Block<kind>::grid) : nullptr;
+    const auto run = [&](size_t first, auto rows) {
+        constexpr int n = decltype(rows)::value;
+        if (level == 2) rows512<kind, n>(row + first * stride, stride, x, cols, table, out + first);
+        else rows256<kind, n>(row + first * stride, stride, x, cols, table, out + first);
+    };
+    size_t r = 0;
+    for (; r + 4 <= count; r += 4) run(r, std::integral_constant<int, 4>{});
+    switch (count - r) {
+        case 3: run(r, std::integral_constant<int, 3>{}); break;
+        case 2: run(r, std::integral_constant<int, 2>{}); break;
+        case 1: run(r, std::integral_constant<int, 1>{}); break;
+        default: break;
+    }
+}
