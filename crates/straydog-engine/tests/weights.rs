@@ -1,7 +1,8 @@
-//! Authenticated weights equal to the reference's (design phase R3): block decoding, the
+//! Authenticated weights equal to the Python reference's (design phase R3): block decoding, the
 //! tensor table, vectors, embedding rows and PLE n-gram rows.
 //!
-//! The model cases need the bundle the golden file was made from: set STRAYDOG_MODEL.
+//! The golden file is pinned data: the reference that made it was retired in phase R6. The model
+//! cases need the bundle the golden file was made from: set STRAYDOG_MODEL.
 
 use std::path::PathBuf;
 

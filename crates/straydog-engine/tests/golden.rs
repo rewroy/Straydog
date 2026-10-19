@@ -1,7 +1,8 @@
-//! The reference's renders, token ids and decodes, reproduced byte for byte (design phase R2).
+//! The Python reference's renders, token ids and decodes, reproduced byte for byte (design
+//! phase R2).
 //!
-//! The golden file comes from `scripts/golden.py`. Chat cases need the pinned tokenizer and
-//! template: set STRAYDOG_MODEL to a model bundle directory.
+//! The golden file is pinned data: the reference that made it was retired in phase R6. Chat
+//! cases need the pinned tokenizer and template: set STRAYDOG_MODEL to a model bundle directory.
 
 use std::path::PathBuf;
 

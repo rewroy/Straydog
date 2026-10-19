@@ -1,8 +1,8 @@
 # Straydog — design
 
-Status: phases R1-R5 done on Linux (the Rust executable serves the API with its worker
-contained, provisions bundles and builds the drafter byte for byte); R6 measured. Windows
-builds but has not run. Updated: 2026-10-19.
+Status: phases R1-R6 done on Linux but for the first release (the Rust executable serves
+the API with its worker contained, provisions bundles and builds the drafter byte for byte;
+the Python reference is removed). Windows builds but has not run. Updated: 2026-10-20.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API, shipped as one executable per GPU backend.
@@ -75,21 +75,24 @@ crates/
   straydog-isolation/      bubblewrap and AppContainer containment of the worker
   straydog-provision/      fetch, verify, and the MTP drafter build
 gpu/                       C++/HIP/CUDA kernels; straydog_gpu.h is the C ABI
-src/straydog/              the Python reference implementation, until phase R6 removes it
-tests/                     kernel tests (Python, NumPy references) against a shared build of gpu/
+bench/                     the A/B harness's single-request cases (examples/ab.rs)
 docs/
 ```
 
-The kernel tests stay in Python: NumPy is the reference math, and the tests drive the
-same C ABI the engine uses. They are development tooling, not part of the product.
+The Rust engine is the reference. Its regression oracle is the pinned GPU generations
+(`crates/straydog-engine/tests/model_gpu.rs`): for each placement, every request's greedy
+tokens, metrics, logits and final hidden state, bit for bit. A deliberate numerical change
+is validated against an F32-GEMM run, then re-pinned (`STRAYDOG_GOLDEN_UPDATE=1`). The
+golden files of the tokenizer, template and weights (`tests/golden/chat.json` and
+`weights.json` in the same crate) came from the Python reference and stay as pinned data.
 
-### 4.3 What moves where
+### 4.3 What moved where
 
 | Python reference | Rust | Notes |
 | --- | --- | --- |
 | tokenizers (HF) | `tokenizers` crate | the same implementation; pure-Rust regex backend |
-| jinja2 sandbox | `minijinja` (+ Python-compatible methods) | renders must equal the reference byte for byte |
-| gguf parsing, mmap, SHA-256 | gguf reader (from the inspector crate), `memmap2`, `sha2` | two files hashed at once, as now |
+| jinja2 sandbox | `minijinja` (+ Python-compatible methods) | renders equal the reference's byte for byte |
+| gguf parsing, mmap, SHA-256 | gguf reader (from the inspector crate), `memmap2`, `sha2` | two files hashed at once |
 | placement, residency planning | same algorithms | equal plans for the same budgets |
 | generation loop, MTP control, checkpoints | same algorithms over the C ABI | host steps are copies, integer math and argmax |
 | NumPy layer math (bounded-cache tier) | not ported | see §9, decision 5 |
@@ -216,21 +219,21 @@ There is no setup command: a model is fetched once, then given by path.
 - **R0** (done): the Python reference: engine, native sources, packaged builds,
   provisioning and tests, passing in this repository.
 - **R1** (done): workspace, `straydog-gpu` (all `sd_*` bindings, static HIP and CUDA
-  builds), the gguf reader. The kernel tests run against the same CMake build.
+  builds), the gguf reader. The kernel tests ran against the same CMake build.
 - **R2** (done): tokenizer and template, with golden files from the reference
-  (`scripts/golden.py`): token ids and renders over a corpus of conversations (tools,
+  (`tests/golden/chat.json`): token ids and renders over a corpus of conversations (tools,
   reasoning, tool results, Japanese text, 150 seeded random ones), the template's
   errors, decoding, JSON and float formatting. Equal byte for byte.
 - **R3** (done): weights, authentication, placement and the generation loop (prefill,
   decode, verification, MTP, conversation checkpoints, partial residency). Gate
-  (`scripts/golden_model.py`, `tests/model_gpu.rs`): over a scripted conversation that
-  takes every resume path, every greedy token, request metric, logits vector and final
-  hidden state equals the reference's bitwise, with two GPUs (layer and expert split,
-  with and without MTP, K/V in VRAM and in host memory). Partial residency swaps expert
-  slots asynchronously during decode, so whether an expert runs on the GPU or the CPU
-  depends on timing and the reference does not reproduce its own decode bit for bit;
-  there, requests whose state comes from prefill alone are compared (prompt logits and
-  tokens), and the placement's allocations are equal to the byte.
+  (`tests/model_gpu.rs`): over a scripted conversation that takes every resume path, every
+  greedy token, request metric, logits vector and final hidden state equaled the
+  reference's bitwise, with two GPUs (layer and expert split, with and without MTP, K/V
+  in VRAM and in host memory). Partial residency swaps expert slots asynchronously
+  during decode, so whether an expert runs on the GPU or the CPU depends on timing and
+  the reference does not reproduce its own decode bit for bit; there, requests whose
+  state comes from prefill alone are compared (prompt logits and tokens), and the
+  placement's allocations are equal to the byte.
 - R4 and R5 are built in parallel in their own crates: `straydog-api` (the HTTP API over
   an `Engine` trait), `straydog-isolation` and `straydog-provision`; the executable
   (`crates/straydog`) wires them to the worker and runtime.
@@ -244,14 +247,17 @@ There is no setup command: a model is fetched once, then given by path.
   `verify`, `fetch-mtp`). Gate met: the drafter built by Rust equals the pin byte
   for byte. The worker runs under bubblewrap with a cleared environment; the AppContainer
   launcher builds and passes its tests on Linux but has not run on Windows.
-- **R6**: alternating A/B against the reference on the single-request benchmark and
-  a multi-turn session; no metric may be slower. Then the Python engine and its
-  packaged builds are removed and the first binaries released. Measured
-  (`examples/ab.rs`, IQ3_S, two R9700s, 262144, MTP 3; the two engines produce the same
-  tokens): prefill and first-token latency are lower in every case (long prompts
-  1,592 vs 1,549 tokens/s; a multi-turn session's appended prompts 2-4% faster), and
-  the decode medians are equal or higher (128 tokens 122.0 vs 120.3, 512 tokens
-  83.3 vs 81.4 tokens/s). Startup 42-45 s for both.
+- **R6** (done on Linux, but for the first release): alternating A/B against the
+  reference on the single-request benchmark and a multi-turn session; no metric may be
+  slower. Then the Python engine and its packaged builds are removed and the first
+  binaries released. Measured (`examples/ab.rs`, IQ3_S, two R9700s, 262144, MTP 3; the
+  two engines produce the same tokens): prefill and first-token latency are lower in
+  every case (long prompts 1,592 vs 1,549 tokens/s; a multi-turn session's appended
+  prompts 2-4% faster), and the decode medians are equal or higher (128 tokens 122.0 vs
+  120.3, 512 tokens 83.3 vs 81.4 tokens/s). Startup 42-45 s for both. The Python
+  engine, its kernel tests, golden generators and packaged builds are removed; bitwise
+  parity with it is given up, and the GPU generations are pinned from Straydog itself
+  (§4.2). `examples/ab.rs` now compares two builds.
 - **R7**: clients move onto the server.
 
 ## 9. Decisions (2026-10-19)

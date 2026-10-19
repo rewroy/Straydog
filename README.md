@@ -94,13 +94,11 @@ keeps it in that tab.
 ```bash
 # Rust tests; STRAYDOG_MODEL enables the golden tests on a real bundle
 ROCM_PATH=/opt/rocm/core-10.0 cargo test --workspace --features straydog/hip,straydog-provision/hip
-# GPU tests, one at a time: model parity with the reference, the runtime end to end
+# GPU tests, one at a time: the pinned generations bit for bit, the runtime end to end
 STRAYDOG_MODEL=DIR STRAYDOG_DRAFTER=DIR cargo test -p straydog-engine --features hip --test model_gpu
 STRAYDOG_MODEL=DIR cargo test -p straydog --features hip --test runtime_gpu
-# The Python reference (src/straydog) and its kernel tests
-uv sync && uv run pytest && STRAYDOG_GPU_LIBRARY=$PWD/src/straydog/native/libstraydog_gpu.so uv run pytest -m gpu
-# A/B against the reference
-cargo run --release --features hip --example ab -- --model DIR --drafter DIR --output ab.json
+# A/B of this build against another
+cargo run --release --features hip --example ab -- --baseline BIN --model DIR --drafter DIR --output ab.json
 # The dashboard over a simulated engine (no GPU, no model): http://127.0.0.1:18090/dashboard
 cargo run --release --features hip --example dashboard
 ```

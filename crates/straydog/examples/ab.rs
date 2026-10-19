@@ -1,14 +1,13 @@
-//! Alternating A/B of the Rust engine against the Python reference (design phase R6), both
-//! driven through the same runtime and worker protocol, under the GPU lock:
+//! Alternating A/B of two Straydog builds, a baseline and a candidate, both driven through the
+//! same runtime and worker protocol, under the GPU lock:
 //!
-//! ~/benchlock.sh ab -- cargo run --release --features hip --example ab -- \
+//! ~/benchlock.sh ab -- cargo run --release --features hip --example ab -- --baseline BIN \
 //!   --model DIR [--drafter DIR] --devices 0,1 --vram 30 --ctx 262144 --rounds 2 --output ab.json
 //!
-//! Each round starts each engine in turn (the order alternates), runs the single-request
+//! Each round starts each build in turn (the order alternates), runs the single-request
 //! cases of bench/cases.json twice (the second counts) and a multi-turn agent session over
 //! this repository at a fixed commit, then stops it. Timings are the engines' own.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::time::Duration;
@@ -38,12 +37,15 @@ struct Args {
     rounds: usize,
     #[arg(long)]
     output: PathBuf,
-    /// The repository root (the Python reference lives in src/straydog)
+    /// The repository root (bench/cases.json, and the session's files)
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// The Rust executable to run as the worker
+    /// The executable measured against
+    #[arg(long)]
+    baseline: PathBuf,
+    /// The executable measured
     #[arg(long, default_value = "target/release/straydog")]
-    rust: PathBuf,
+    candidate: PathBuf,
     /// Skip the multi-turn session
     #[arg(long)]
     no_session: bool,
@@ -63,38 +65,6 @@ const SESSION_TURNS: [&str; 3] = [
      steps.",
     "Which file declares the GPU library's C ABI, and how many functions does it declare? Check by reading it.",
 ];
-
-fn python_command(args: &Args, settings: &config::Settings) -> runtime::Command {
-    let repo = args.repo.canonicalize().unwrap();
-    let mut command: Vec<OsString> = ["run", "--no-sync", "--project"].map(OsString::from).to_vec();
-    command.push(repo.as_os_str().into());
-    for item in ["python", "-I", "-m", "straydog.worker"] {
-        command.push(item.into());
-    }
-    let mut push = |name: &str, value: String| {
-        command.push(format!("--{name}").into());
-        command.push(value.into());
-    };
-    push("model-root", settings.model.display().to_string());
-    push("inspector", repo.join(".build/bin/straydog-inspect").display().to_string());
-    push("gpu-library", repo.join("src/straydog/native/libstraydog_gpu.so").display().to_string());
-    push("split-mode", "experts".into());
-    push("context", settings.ctx_size.to_string());
-    push("vram-gib", settings.vram.to_string());
-    push("state-ram-gib", settings.state_ram.to_string());
-    push("prefill-batch-size", settings.batch_size.to_string());
-    push("matmul-precision", "fp16".into());
-    push("gemm-min-batch", "2".into());
-    push("quantization", settings.quant.clone());
-    push("host-memory-bytes", straydog_engine::host::host_memory_bytes().to_string());
-    if let (Some(drafter), true) = (&settings.model_draft, settings.draft_max > 0) {
-        push("drafter-root", drafter.display().to_string());
-        push("speculative", settings.draft_max.to_string());
-    }
-    command.push("--devices".into());
-    command.extend(settings.device.iter().map(|device| OsString::from(device.to_string())));
-    (PathBuf::from(std::env::var_os("UV").unwrap_or_else(|| "uv".into())), command)
-}
 
 async fn run(engine: &Runtime, body: &pyjson::Value) -> (String, Value) {
     let mut generation = engine.generate(body.clone()).await.unwrap();
@@ -194,13 +164,10 @@ fn main() {
     let mut report = json!({"settings": format!("{settings:?}"), "rounds": []});
     let tokio = tokio::runtime::Runtime::new().unwrap();
     for round in 0..args.rounds {
-        let order = if round % 2 == 0 { ["python", "rust"] } else { ["rust", "python"] };
+        let order = if round % 2 == 0 { ["baseline", "candidate"] } else { ["candidate", "baseline"] };
         for engine_name in order {
-            let command = if engine_name == "rust" {
-                (args.rust.canonicalize().unwrap(), runtime::worker_args(&settings))
-            } else {
-                python_command(&args, &settings)
-            };
+            let executable = if engine_name == "baseline" { &args.baseline } else { &args.candidate };
+            let command = (executable.canonicalize().unwrap(), runtime::worker_args(&settings));
             let result = tokio.block_on(async {
                 let started = std::time::Instant::now();
                 let engine = Runtime::start(&settings, command);
