@@ -3,6 +3,7 @@
 // authenticated read-only model mapping, in F32: every value is scale*(code-1)
 // times an F32 activation with F32 accumulation (no activation quantization).
 // Kernels are selected at run time: AVX-512F, AVX2+FMA, or portable scalar.
+#include "straydog_gpu.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>

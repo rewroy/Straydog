@@ -1,6 +1,6 @@
 """Straydog's bounded HIP/CUDA computational backend; no inference-engine dependency.
 
-The ABI is implemented in native/crates/inference/gpu/kernels.cpp. The library
+The ABI is implemented in gpu/kernels.cpp. The library
 path is supplied by the owner; loading never searches PATH or downloads code.
 """
 

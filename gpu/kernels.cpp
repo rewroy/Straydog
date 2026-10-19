@@ -2,6 +2,7 @@
 // HIP and CUDA are selected computational dependencies, not inference engines.
 // Q2_0 format: FP16 scale + 16 packed bytes, 64 LSB-first two-bit values,
 // decoded as scale * (code - 1).
+#include "straydog_gpu.h"
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

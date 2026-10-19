@@ -81,7 +81,7 @@ def _cases(name: str) -> list[dict]:
 def _fingerprints(settings) -> dict:
     root = Path(__file__).resolve().parents[1]
     sources = sorted((root / "src/straydog").glob("*.py"))
-    sources += sorted((root / "native/crates/inference/gpu").glob("*"))
+    sources += sorted((root / "gpu").glob("*"))
     sources += [Path(__file__).resolve()]
     digest = hashlib.sha256()
     for path in sources:

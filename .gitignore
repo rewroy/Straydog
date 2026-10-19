@@ -4,6 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .build/
-native/target/
+target/
 dist/
 *.egg-info/

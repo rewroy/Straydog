@@ -247,7 +247,7 @@ def build_artifacts(
 ) -> tuple[Path, Path]:
     """Build Straydog's native sources and return the built artifact paths."""
     source_root, build_root = source_root.resolve(), build_root.resolve()
-    if not (source_root / "native/Cargo.toml").is_file():
+    if not (source_root / "Cargo.toml").is_file() or not (source_root / "gpu/CMakeLists.txt").is_file():
         raise ValueError("a Straydog source checkout is required; pass --source-root")
     env = build_environment(backend, prefix)
 
@@ -259,7 +259,7 @@ def build_artifacts(
     configure = [
         tool("cmake"),
         "-S",
-        str(source_root / "native/crates/inference/gpu"),
+        str(source_root / "gpu"),
         "-B",
         str(gpu_dir),
         f"-DSTRAYDOG_BACKEND={backend}",
@@ -283,11 +283,11 @@ def build_artifacts(
         "--locked",
         "--release",
         "--manifest-path",
-        str(source_root / "native/Cargo.toml"),
+        str(source_root / "Cargo.toml"),
         "--target-dir",
         str(rust_dir),
         "-p",
-        "straydog",
+        "straydog-gguf",
     ]
     if offline:
         cargo.append("--offline")
@@ -327,9 +327,9 @@ def native_source_digest(source_root: Path) -> str:
     Line endings are hashed as LF, so a Windows checkout (``core.autocrlf``) of
     unchanged sources has the same digest as a Linux one.
     """
-    crate = source_root / "native/crates/inference"
+    crate = source_root / "crates/straydog-gguf"
     digest = hashlib.sha256()
-    for path in [crate / "Cargo.toml", *sorted((crate / "gpu").glob("*")), *sorted((crate / "src").glob("*"))]:
+    for path in [crate / "Cargo.toml", *sorted((source_root / "gpu").glob("*")), *sorted((crate / "src").glob("*"))]:
         if path.is_file():
             data = path.read_bytes().replace(b"\r\n", b"\n")
             digest.update(f"{path.relative_to(source_root).as_posix()}\0{len(data)}\0".encode() + data)

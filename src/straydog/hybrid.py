@@ -3,7 +3,7 @@
 Dense operands, router and shared experts are pinned; routed experts use a bounded
 device slot pool filled from routing statistics. Absent experts are evaluated by
 the CPU expert engine during decode and streamed through staging slots in prefill.
-The ABI is implemented in native/crates/inference/gpu/hybrid_*.hpp.
+The ABI is implemented in gpu/hybrid_*.hpp.
 """
 
 from __future__ import annotations

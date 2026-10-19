@@ -1,6 +1,6 @@
 """Straydog's CPU expert engine for partially resident models.
 
-The native implementation lives in native/crates/inference/gpu/cpu_experts.cpp and
+The native implementation lives in gpu/cpu_experts.cpp and
 is part of the owner-built Straydog library. It evaluates routed experts (Q2_0 and
 the IQ/Q8_0 formats of the IQ3 bundles) in F32 directly from the authenticated
 read-only model mapping.

@@ -1,7 +1,7 @@
 # Straydog — design
 
-Status: Python reference implementation in place (phase R0); the Rust host is being
-designed. Updated: 2026-10-19.
+Status: phase R1 done (the GPU library builds statically into Rust and runs). Updated:
+2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API, shipped as one executable per GPU backend.
@@ -69,8 +69,9 @@ crates/
   straydog/                the executable: cli, config, server, runtime, isolation, provisioning
   straydog-engine/         tokenizer, template, gguf, weights, placement, model, speculative, sampling, worker
   straydog-gpu/            bindings to the C ABI; build.rs compiles gpu/ with CMake (HIP or CUDA)
-gpu/                       C++/HIP/CUDA kernels and the C ABI
-python/                    the reference implementation, until phase R6 removes it
+  straydog-gguf/           GGUF structure checks (and the reference's inspector command)
+gpu/                       C++/HIP/CUDA kernels; straydog_gpu.h is the C ABI
+src/straydog/              the Python reference implementation, until phase R6 removes it
 tests/                     kernel tests (Python, NumPy references) against a shared build of gpu/
 docs/
 ```
@@ -187,7 +188,7 @@ Other commands:
 
 - **R0** (done): the Python reference: engine, native sources, packaged builds,
   provisioning and tests, passing in this repository.
-- **R1**: workspace, `straydog-gpu` (all `sd_*` bindings, static HIP and CUDA
+- **R1** (done): workspace, `straydog-gpu` (all `sd_*` bindings, static HIP and CUDA
   builds), the gguf reader. The kernel tests run against the same CMake build.
 - **R2**: tokenizer and template, with golden files from the reference: token ids
   and renders over a corpus of conversations (tools, reasoning, tool results,

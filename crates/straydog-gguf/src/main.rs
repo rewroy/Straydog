@@ -25,14 +25,14 @@ fn main() -> ExitCode {
                 .take(128 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes),
         ) {
-            (Some(length), Ok(_)) => straydog::inspect_header(&bytes, length),
+            (Some(length), Ok(_)) => straydog_gguf::inspect_header(&bytes, length),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid header input",
             )),
         }
     } else {
-        File::open(&args[1]).and_then(|mut file| straydog::inspect(&mut file))
+        File::open(&args[1]).and_then(|mut file| straydog_gguf::inspect(&mut file))
     };
     match result {
         Ok(header) => {

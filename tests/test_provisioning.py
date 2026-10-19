@@ -185,11 +185,11 @@ def test_packaged_native_build_is_current_and_authenticated(platform_name, names
 
 def test_bundle_places_build_with_manifest_and_lookup_checks_platform_and_hashes(tmp_path, monkeypatch):
     source = tmp_path / "source"
-    crate = source / "native/crates/inference"
-    (crate / "gpu").mkdir(parents=True)
-    (crate / "src").mkdir()
+    crate = source / "crates/straydog-gguf"
+    (source / "gpu").mkdir(parents=True)
+    (crate / "src").mkdir(parents=True)
     (crate / "Cargo.toml").write_text("[package]")
-    (crate / "gpu/kernels.cpp").write_text("kernels")
+    (source / "gpu/kernels.cpp").write_text("kernels")
     built = tmp_path / "built"
     built.mkdir()
     (built / "straydog-inspect").write_bytes(b"inspector")
@@ -208,7 +208,7 @@ def test_bundle_places_build_with_manifest_and_lookup_checks_platform_and_hashes
     assert manifest["source_sha256"] == provision.native_source_digest(source)
     inspector, library, found = provision.packaged_build(target)
     assert inspector.read_bytes() == b"inspector" and library.read_bytes() == b"library" and found == manifest
-    (crate / "gpu/kernels.cpp").write_text("changed")
+    (source / "gpu/kernels.cpp").write_text("changed")
     assert provision.native_source_digest(source) != manifest["source_sha256"]
     monkeypatch.setattr(provision, "_host_platform", lambda: "linux-aarch64")
     assert provision.packaged_build(target) is None
@@ -223,9 +223,9 @@ def test_bundle_places_build_with_manifest_and_lookup_checks_platform_and_hashes
 
 def test_windows_cuda_bundle_has_its_own_directory_and_matches_the_gpu(tmp_path, monkeypatch):
     source = tmp_path / "source"
-    crate = source / "native/crates/inference"
-    (crate / "gpu").mkdir(parents=True)
-    (crate / "src").mkdir()
+    crate = source / "crates/straydog-gguf"
+    (source / "gpu").mkdir(parents=True)
+    (crate / "src").mkdir(parents=True)
     (crate / "Cargo.toml").write_text("[package]")
     built = tmp_path / "built"
     built.mkdir()
@@ -275,13 +275,14 @@ def test_library_load_failure_reports_a_localized_loader_message(tmp_path, monke
 def test_native_source_digest_ignores_checkout_line_endings(tmp_path):
     digests = {}
     for name, newline in (("lf", "\n"), ("crlf", "\r\n")):
-        crate = tmp_path / name / "native/crates/inference"
-        (crate / "gpu").mkdir(parents=True)
-        (crate / "Cargo.toml").write_bytes(f"[package]{newline}name = 'straydog'{newline}".encode())
-        (crate / "gpu/kernels.cpp").write_bytes(f"int a;{newline}int b;{newline}".encode())
+        crate = tmp_path / name / "crates/straydog-gguf"
+        crate.mkdir(parents=True)
+        (tmp_path / name / "gpu").mkdir()
+        (crate / "Cargo.toml").write_bytes(f"[package]{newline}name = 'straydog-gguf'{newline}".encode())
+        (tmp_path / name / "gpu/kernels.cpp").write_bytes(f"int a;{newline}int b;{newline}".encode())
         digests[name] = provision.native_source_digest(tmp_path / name)
     assert digests["lf"] == digests["crlf"]
-    (tmp_path / "crlf/native/crates/inference/gpu/kernels.cpp").write_bytes(b"int a;\r\nint c;\r\n")
+    (tmp_path / "crlf/gpu/kernels.cpp").write_bytes(b"int a;\r\nint c;\r\n")
     assert provision.native_source_digest(tmp_path / "crlf") != digests["lf"]
 
 

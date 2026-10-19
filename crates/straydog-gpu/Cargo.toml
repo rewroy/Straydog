@@ -1,0 +1,18 @@
+[package]
+name = "straydog-gpu"
+description = "The Straydog GPU library (C++/HIP/CUDA), built with CMake and linked statically, and its bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "straydog_gpu"
+
+[features]
+# One GPU backend; without either, only the bindings compile and nothing can link.
+hip = []
+cuda = []
+
+[build-dependencies]
+cmake = "0.1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+bindgen = "0.72"

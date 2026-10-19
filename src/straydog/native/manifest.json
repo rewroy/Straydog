@@ -9,17 +9,17 @@
     "libhipblas.so.3",
     "libamdhip64.so.7"
   ],
-  "source_sha256": "52fa907301be2b93d59ead1c10804aa6703d29f2686341eff74972ba54d13e32",
+  "source_sha256": "76628d9cf8a14505028fa002362db8a727033264298840660c7deb49f5a89c4d",
   "files": [
     {
       "name": "straydog-inspect",
-      "bytes": 582880,
-      "sha256": "4ed917d48279606531ff98e38a4bcd001e85461e37fc24fa3fe0c516deeaa572"
+      "bytes": 546920,
+      "sha256": "cd2d4e6861e83cadf68b914f5ea7ae01105b4413b087d7666cdb4cdfd43569dd"
     },
     {
       "name": "libstraydog_gpu.so",
       "bytes": 3020272,
-      "sha256": "6d68bf15a7bf768fa2e7e566bc342aa362b21bebd8f4baa36d3fe2979375da3c"
+      "sha256": "6d52cff095e43177da208fe149a0eb40d055274095e3692edf3e94d9ae6e5df4"
     }
   ]
 }

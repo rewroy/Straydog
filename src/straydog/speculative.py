@@ -3,7 +3,7 @@
 Up to four consecutive tokens are verified per call with the one-token arithmetic,
 so accepted tokens match token-by-token decode bitwise; DeltaNet state is restored
 and replayed for a partial acceptance. The MTP draft layer reuses the decoder layer
-machinery as layer 48. The ABI is implemented in native/crates/inference/gpu/verify_span.hpp.
+machinery as layer 48. The ABI is implemented in gpu/verify_span.hpp.
 """
 
 from __future__ import annotations

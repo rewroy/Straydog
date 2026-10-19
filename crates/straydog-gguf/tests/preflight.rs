@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use straydog::inspect;
+use straydog_gguf::inspect;
 
 fn string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -309,14 +309,14 @@ fn header_snapshot_preserves_exact_arrays_and_requires_real_header_bytes() {
     let bytes = fixture(meta, vec![dense("embedding", 0)], 16);
     let original = inspect(&mut Cursor::new(&bytes)).unwrap();
     let snapshot = &bytes[..original.data_offset as usize];
-    let header = straydog::inspect_header(snapshot, bytes.len() as u64).unwrap();
+    let header = straydog_gguf::inspect_header(snapshot, bytes.len() as u64).unwrap();
     assert_eq!(
         header.integer_arrays["qwen4exp.ple.layer_multipliers"],
         [23_703_573_157_769]
     );
     assert_eq!(header.tensors[0].offset, original.tensors[0].offset);
-    assert!(straydog::inspect_header(&snapshot[..24], bytes.len() as u64).is_err());
-    assert!(straydog::inspect_header(snapshot, snapshot.len() as u64).is_err());
+    assert!(straydog_gguf::inspect_header(&snapshot[..24], bytes.len() as u64).is_err());
+    assert!(straydog_gguf::inspect_header(snapshot, snapshot.len() as u64).is_err());
 }
 
 #[test]

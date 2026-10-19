@@ -51,8 +51,11 @@ uv run straydog fetch-mtp --root ~/.straydog/models/mtp --gpu-library src/strayd
 ## Native builds
 
 ```bash
+# The Rust crates (the executable arrives in phase R4)
+ROCM_PATH=/opt/rocm/core-10.0 cargo test --features straydog-gpu/hip
+# The reference's shared library
 uv run straydog build --backend HIP --architecture gfx1201 --prefix /opt/rocm/core-10.0
-# After changing native/crates/inference: rebuild both packaged builds
+# After changing gpu/ or crates/straydog-gguf: rebuild both packaged builds
 uv run straydog bundle --backend HIP --architecture gfx1201 --prefix /opt/rocm/core-10.0   # Linux
 uv run straydog bundle --backend CUDA --architecture "86-real;89-real;120"                 # Windows
 ```
