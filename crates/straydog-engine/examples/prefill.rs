@@ -49,20 +49,32 @@ fn main() -> Result<(), String> {
     }
     let corpus = text.encode(&corpus).map_err(|exc| exc.0)?;
     eprintln!("resident {} host_kv {} batch {}", model.resident, model.host_kv, model.prefill_batch_size);
-    for (run, length) in lengths.iter().map(|length| length.parse::<usize>().unwrap()).enumerate() {
+    // "+N" appends N tokens to the previous prompt (the conversation cache resumes it).
+    let mut previous: Vec<u32> = Vec::new();
+    for (run, length) in lengths.iter().enumerate() {
+        let (append, length) = match length.strip_prefix('+') {
+            Some(count) => (true, count.parse::<usize>().unwrap()),
+            None => (false, length.parse::<usize>().unwrap()),
+        };
         if length == 0 {
             continue;
         }
-        let mut prompt = text.encode(&format!("Prompt {run}.\n")).map_err(|exc| exc.0)?;
-        while prompt.len() < length {
-            prompt.extend(corpus.iter().take(length - prompt.len()));
+        let mut prompt = if append { previous.clone() } else { text.encode(&format!("Prompt {run}.\n")).map_err(|exc| exc.0)? };
+        let target = if append { prompt.len() + length } else { length };
+        let mut offset = run * 997;
+        while prompt.len() < target {
+            prompt.push(corpus[offset % corpus.len()]);
+            offset += 1;
         }
+        let length = prompt.len();
+        previous = prompt.clone();
         let started = Instant::now();
         model.logits_digests = Some(Vec::new());
         model.generate(&prompt, 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {})?;
         let digest = model.logits_digests.take().unwrap_or_default().first().cloned().unwrap_or_default();
         let seconds = model.last_metrics["prefill_seconds"].as_f64().unwrap_or(0.0);
-        println!("prefill {length} tokens: {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", length as f64 / seconds,
+        let reused = model.last_metrics["cached_tokens"].as_u64().unwrap_or(0);
+        println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
     }
     Ok(())

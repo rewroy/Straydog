@@ -274,17 +274,35 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
 // The tile list below, built on the device so that the host need not wait for the routing: the
 // groups' first rows, then each present group's rows in blocks of moe_block_m, in group order (a
 // part's absent groups, the peer's experts, have no weights). `count` receives the number.
-__global__ void moe_device_tiles(const MoeGroup* groups,size_t groups_count,const unsigned* counts,uint32_t* firsts,
-                                 MoeTile* tiles,unsigned* count) {
-    if (blockIdx.x || threadIdx.x) return;
-    uint32_t first=0;
-    for (size_t group=0;group<groups_count;++group) { firsts[group]=first; first+=counts[group]; }
-    unsigned tile=0;
-    for (size_t group=0;group<groups_count;++group) {
+// One block of moe_tile_threads threads, each scanning a run of groups.
+constexpr unsigned moe_tile_threads=256;
+__global__ void __launch_bounds__(moe_tile_threads) moe_device_tiles(const MoeGroup* groups,size_t groups_count,
+                                                                   const unsigned* counts,uint32_t* firsts,MoeTile* tiles,
+                                                                   unsigned* count) {
+    __shared__ unsigned rows[moe_tile_threads],blocks[moe_tile_threads];
+    const unsigned t=threadIdx.x,per=unsigned((groups_count+moe_tile_threads-1)/moe_tile_threads);
+    const size_t begin=std::min(groups_count,size_t(t)*per),end=std::min(groups_count,begin+per);
+    unsigned own_rows=0,own_blocks=0;
+    for (size_t group=begin;group<end;++group) {
+        own_rows+=counts[group];
+        if (groups[group].weights[0].data) own_blocks+=(counts[group]+moe_block_m-1)/moe_block_m;
+    }
+    rows[t]=own_rows; blocks[t]=own_blocks;
+    __syncthreads();
+    // Inclusive scans of both, then each thread's exclusive start.
+    for (unsigned offset=1;offset<moe_tile_threads;offset*=2) {
+        const unsigned r=t>=offset ? rows[t-offset] : 0,b=t>=offset ? blocks[t-offset] : 0;
+        __syncthreads();
+        rows[t]+=r; blocks[t]+=b;
+        __syncthreads();
+    }
+    unsigned first=rows[t]-own_rows,tile=blocks[t]-own_blocks;
+    for (size_t group=begin;group<end;++group) {
+        firsts[group]=first; first+=counts[group];
         if (!groups[group].weights[0].data) continue;
         for (unsigned row=0;row<counts[group];row+=moe_block_m) tiles[tile++]=MoeTile{uint32_t(group),row};
     }
-    *count=tile;
+    if (t==moe_tile_threads-1) *count=blocks[t];
 }
 #endif
 void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t experts,size_t steps,const int32_t* selected,
@@ -304,7 +322,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         // All on the device: the host queues the experts (and then the peer's half, the next
         // layer) without waiting for this layer's routing.
         auto* tile_count=reinterpret_cast<unsigned*>(tiles+max_tiles);
-        moe_device_tiles<<<1,1,0,d.stream>>>(groups,groups_count,counts,firsts,tiles,tile_count);
+        moe_device_tiles<<<1,moe_tile_threads,0,d.stream>>>(groups,groups_count,counts,firsts,tiles,tile_count);
         moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
         resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
         auto* product=reinterpret_cast<_Float16*>(scratch);
