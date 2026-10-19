@@ -270,6 +270,23 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
 // Prefill experts on RDNA4: device grouping, one host read of the expert counts,
 // then exactly sized gate/up and down tile launches. Gate/up stores FP16
 // SiLU(gate)*up per grouped row in the gate/up scratch; down scatters per route.
+#if defined(__HIPCC__)
+// The tile list below, built on the device so that the host need not wait for the routing: the
+// groups' first rows, then each present group's rows in blocks of moe_block_m, in group order (a
+// part's absent groups, the peer's experts, have no weights). `count` receives the number.
+__global__ void moe_device_tiles(const MoeGroup* groups,size_t groups_count,const unsigned* counts,uint32_t* firsts,
+                                 MoeTile* tiles,unsigned* count) {
+    if (blockIdx.x || threadIdx.x) return;
+    uint32_t first=0;
+    for (size_t group=0;group<groups_count;++group) { firsts[group]=first; first+=counts[group]; }
+    unsigned tile=0;
+    for (size_t group=0;group<groups_count;++group) {
+        if (!groups[group].weights[0].data) continue;
+        for (unsigned row=0;row<counts[group];row+=moe_block_m) tiles[tile++]=MoeTile{uint32_t(group),row};
+    }
+    *count=tile;
+}
+#endif
 void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t experts,size_t steps,const int32_t* selected,
                             int32_t* positions,unsigned* cursors,const float* input,float* scratch,float* outputs) {
     const size_t routes=steps*11, groups_count=experts+1;
@@ -277,11 +294,26 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     uint32_t* firsts=counts+groups_count;
     auto* tiles=reinterpret_cast<MoeTile*>(firsts+((groups_count+1)&~size_t(1)));
     const size_t max_tiles=(routes+moe_block_m-1)/moe_block_m+groups_count;
-    if (steps*10*4+(((experts+2)&~size_t(1))+2*groups_count+2)*4+max_tiles*sizeof(MoeTile)>65536*4)
+    if (steps*10*4+(((experts+2)&~size_t(1))+2*groups_count+2)*4+(max_tiles+1)*sizeof(MoeTile)>65536*4)
         throw std::runtime_error("resident MoE grouping scratch overflow");
     resident_clear<<<unsigned((experts+256)/256),256,0,d.stream>>>(groups,cursors,groups_count);
     resident_histogram<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,selected,steps,experts);
     moe_counts<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,counts);
+#if defined(__HIPCC__)
+    if (!plan.hybrid) {
+        // All on the device: the host queues the experts (and then the peer's half, the next
+        // layer) without waiting for this layer's routing.
+        auto* tile_count=reinterpret_cast<unsigned*>(tiles+max_tiles);
+        moe_device_tiles<<<1,1,0,d.stream>>>(groups,groups_count,counts,firsts,tiles,tile_count);
+        moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
+        resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
+        auto* product=reinterpret_cast<_Float16*>(scratch);
+        moe_gate_up_wmma<<<dim3(10,unsigned(max_tiles)),256,0,d.stream>>>(groups,tiles,positions,steps,input,product,tile_count);
+        moe_down_wmma<<<dim3(20,unsigned(max_tiles)),256,0,d.stream>>>(groups,tiles,positions,product,outputs,tile_count);
+        check(hipGetLastError());
+        return;
+    }
+#endif
     std::vector<unsigned> host_counts(groups_count);
     download(d,host_counts.data(),counts,groups_count*4);
     const size_t tail=plan.hybrid ? std::min(steps,hybrid_prompt_tail) : 0;

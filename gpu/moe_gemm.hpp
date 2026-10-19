@@ -150,11 +150,15 @@ __device__ __forceinline__ void moe_decode16(const Matrix& m, size_t row, size_t
 }
 
 // One block: 64 routed rows of one expert x 64 product columns (gate and up rows).
+// `tile_count`: the tiles listed on the device; blocks past it (the grid covers the most there
+// can be) do nothing. Null when the grid is the tile count.
 __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, const MoeTile* tiles,
                                                         const int32_t* positions, size_t steps,
-                                                        const float* input, _Float16* product) {
+                                                        const float* input, _Float16* product,
+                                                        const unsigned* tile_count = nullptr) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int L = moe_lds_k;
+    if (tile_count && blockIdx.y >= *tile_count) return;
     const MoeTile tile = tiles[blockIdx.y];
     const MoeGroup& group = groups[tile.group];
     const size_t first = group.first, count = group.count;
@@ -226,9 +230,11 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
 
 // One block: 64 grouped product rows x 128 output columns; results scatter to routes.
 __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, const MoeTile* tiles,
-                                                     const int32_t* positions, const _Float16* product, float* outputs) {
+                                                     const int32_t* positions, const _Float16* product, float* outputs,
+                                                     const unsigned* tile_count = nullptr) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int L = moe_lds_k;
+    if (tile_count && blockIdx.y >= *tile_count) return;
     const MoeTile tile = tiles[blockIdx.y];
     const MoeGroup& group = groups[tile.group];
     const size_t first = group.first, count = group.count;
