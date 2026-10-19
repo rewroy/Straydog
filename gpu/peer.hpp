@@ -1,5 +1,8 @@
 // Two GPUs on the same layers. A device writes rows into its peer's
 // inbox, then raises the peer's flag; the peer waits for the flag before reading.
+// Two channels, each with its own flag and counters: rows go owner -> helper on the
+// first, partial sums helper -> owner on the second, so a device that is owner of one
+// batch and helper of another at the same time keeps the two message streams apart.
 // Each side counts the messages it sent and received in its own memory, so graph
 // replays need no host reset: message n raises the flag to n, and its reader waits
 // for n. The flag and inbox live in the receiving device's VRAM when the devices
@@ -71,9 +74,19 @@ void peer_send(Device& d, const float* rows, size_t count, size_t width, size_t 
         d.link.peer_inbox + offset, rows, count, width, stride);
     peer_signal<<<1, 32, 0, d.stream>>>(d.link.counters, d.link.peer_flag);
 }
+// Channel offsets: counters (sent, received, gave up) and flag words of the second channel.
+constexpr size_t peer_partial_counters = 4, peer_partial_flag = 16;
 void peer_send_rows(Device& d, const float* rows, size_t count, size_t stride) { peer_send(d, rows, count, 2560, stride, 0); }
-void peer_signal_peer(Device& d) { peer_signal<<<1, 32, 0, d.stream>>>(d.link.counters, d.link.peer_flag); }
-void peer_receive(Device& d) { peer_wait<<<1, 32, 0, d.stream>>>(d.link.counters, d.link.flag, d.await_timeout); }
+// The helper's partial sums are in the owner's inbox (second channel).
+void peer_signal_peer(Device& d) {
+    peer_signal<<<1, 32, 0, d.stream>>>(d.link.counters + peer_partial_counters, d.link.peer_flag + peer_partial_flag);
+}
+// The helper waits for the owner's rows; the owner for the helper's partial sums.
+void peer_receive_rows(Device& d) { peer_wait<<<1, 32, 0, d.stream>>>(d.link.counters, d.link.flag, d.await_timeout); }
+void peer_receive(Device& d) {
+    peer_wait<<<1, 32, 0, d.stream>>>(d.link.counters + peer_partial_counters, d.link.flag + peer_partial_flag,
+                                      d.await_timeout);
+}
 
 // Runs work with `ordinal` as the current device, then restores the caller's.
 template <class Function>
@@ -91,15 +104,15 @@ void on_device(int ordinal, Function&& work) {
 void peer_settle(Device& d) {
     Device* peer = d.link.peer;
     if (!peer) return;
-    uint32_t failed[2] = {0, 0};
-    check(hipMemcpy(&failed[0], d.link.counters + 2, 4, hipMemcpyDeviceToHost));
-    on_device(peer->ordinal, [&]() { check(hipMemcpy(&failed[1], peer->link.counters + 2, 4, hipMemcpyDeviceToHost)); });
-    if (!failed[0] && !failed[1]) return;
+    uint32_t failed[2][8] = {};
+    check(hipMemcpy(failed[0], d.link.counters, 32, hipMemcpyDeviceToHost));
+    on_device(peer->ordinal, [&]() { check(hipMemcpy(failed[1], peer->link.counters, 32, hipMemcpyDeviceToHost)); });
+    if (!failed[0][2] && !failed[0][6] && !failed[1][2] && !failed[1][6]) return;
     auto reset = [](Device& side) {
         on_device(side.ordinal, [&]() {
-            check(hipMemset(side.link.counters, 0, 16));
-            if (side.link.direct) check(hipMemset(side.link.flag, 0, 4));
-            else *static_cast<volatile uint32_t*>(side.link.flag) = 0;
+            check(hipMemset(side.link.counters, 0, 32));
+            if (side.link.direct) check(hipMemset(side.link.flag, 0, (peer_partial_flag + 1) * 4));
+            else for (size_t i : {size_t(0), peer_partial_flag}) static_cast<volatile uint32_t*>(side.link.flag)[i] = 0;
         });
     };
     reset(d); reset(*peer);

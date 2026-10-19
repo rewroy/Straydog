@@ -492,7 +492,7 @@ void helper_moe_tokens(Device& h,size_t layer,size_t tokens) {
     auto found=h.helper_moe.find(layer);
     if (found==h.helper_moe.end() || !h.link.peer) throw std::runtime_error("no resident MoE part helps this layer");
     const TokenMoe moe=token_moe(h,found->second,tokens);
-    peer_receive(h);
+    peer_receive_rows(h);
     moe_tokens_experts(h,moe,tokens,peer_inputs(h.link),2560);
     moe_partial<<<unsigned((tokens*2560+255)/256),256,0,h.stream>>>(moe.outputs,moe.probabilities,moe.selected,
         moe.groups,tokens,false,peer_remote_partials(h.link));
@@ -653,7 +653,7 @@ void resident_moe_parts(Device& d,void* handle,size_t layer,size_t steps,const f
     moe_steps_experts(d,moe,steps,input);
     on_device(h.ordinal,[&]() {
         const StepMoe part=step_moe(h,helper->second,steps);
-        peer_receive(h);
+        peer_receive_rows(h);
         moe_steps_experts(h,part,steps,peer_inputs(h.link));
         moe_partial<<<unsigned((steps*2560+255)/256),256,0,h.stream>>>(part.outputs,part.probabilities,part.selected,
             part.groups,steps,true,peer_remote_partials(h.link));

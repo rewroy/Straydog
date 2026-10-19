@@ -265,7 +265,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         const Matrix low{static_cast<const uint8_t*>(peer_head), row_bytes, split, 2560, 0, 0, 0, kinds[3]};
         float* scratch = h.input;
         auto* best = reinterpret_cast<int32_t*>(scratch + 2 * verify_max * argmax_chunks);
-        peer_receive(h);
+        peer_receive_rows(h);
         gemv(h, &low, 1, peer_inputs(h.link), h.output, steps, 2560, split);
         row_argmax(h, h.output, steps, split, split, scratch, best);
         head_part<<<1, 32, 0, h.stream>>>(h.output, split, best, steps, peer_remote_partials(h.link));
