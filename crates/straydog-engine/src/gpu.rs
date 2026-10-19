@@ -110,6 +110,8 @@ pub struct Backend {
     /// One of two devices that split every layer's experts: its help for the peer's batches
     /// runs in a workspace of its own (`@moe:helper`), beside its own batch.
     pub expert_parallel: bool,
+    /// Host states page-locking beside the weight upload, created by `finish_model_state`.
+    pending_host: Vec<(String, u64, u64)>,
 }
 
 /// Move prompt rows a span left on `from` (layer `from_layer`'s workspace) to `to`'s
@@ -160,6 +162,7 @@ impl Backend {
             output_capacity,
             keeps_mtp_rows: false,
             expert_parallel: false,
+            pending_host: Vec::new(),
         })
     }
 
@@ -305,15 +308,45 @@ impl Backend {
     }
 
     /// Allocate and zero all sequence state of the given layers before advertising capacity.
+    /// Host states (K/V in page-locked memory) start on a thread of their own and are taken by
+    /// [`Backend::finish_model_state`], so page-locking them overlaps the weight upload.
     pub fn reserve_model_state(&mut self, context: u64, layers: &[usize], prefill: u64, host_attention: bool)
                                -> Result<()> {
         self.prefill_capacity = context.min(prefill);
         for (key, rows, cols, host) in self.state_plan(context, layers, prefill, host_attention)? {
-            let entry = self.state(&key, rows, cols, host)?;
-            if key == "@kv:stage" {
-                // SAFETY: the staging allocation just made on this device.
-                check(unsafe { ffi::sd_kv_stage(self.handle, entry.pointer, rows / 4) })?;
+            if host && !self.states.contains_key(&key) {
+                self.pending_host.push((key, rows, cols));
+            } else {
+                self.state(&key, rows, cols, host)?;
             }
+        }
+        let sizes: Vec<u64> = self.pending_host.iter().map(|(_, rows, cols)| rows * cols * 4).collect();
+        if !sizes.is_empty() {
+            // SAFETY: a live handle; `sizes` outlives the call (the thread copies it).
+            check(unsafe { ffi::sd_host_states_prefetch(self.handle, sizes.as_ptr(), sizes.len() as u64) })?;
+        }
+        if self.pending_host.is_empty() {
+            self.register_kv_stage()?;
+        }
+        Ok(())
+    }
+
+    /// Take the host states [`Backend::reserve_model_state`] started, then register the K/V stage.
+    pub fn finish_model_state(&mut self) -> Result<()> {
+        if self.pending_host.is_empty() {
+            return Ok(());
+        }
+        for (key, rows, cols) in std::mem::take(&mut self.pending_host) {
+            self.state(&key, rows, cols, true)?;
+        }
+        self.register_kv_stage()
+    }
+
+    /// The VRAM stage mirrors every registered host state's prefix (see sd_kv_stage).
+    fn register_kv_stage(&mut self) -> Result<()> {
+        if let Some(stage) = self.states.get("@kv:stage").copied() {
+            // SAFETY: the staging allocation made on this device.
+            check(unsafe { ffi::sd_kv_stage(self.handle, stage.pointer, stage.rows / 4) })?;
         }
         Ok(())
     }

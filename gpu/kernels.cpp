@@ -360,6 +360,11 @@ struct Device {
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
     hipEvent_t handoff = nullptr;
+    // Host states allocated beside the weight upload (sd_host_states_prefetch): page-locking
+    // ~13 GB of K/V takes ~5 s. The thread alone writes `host_ready` until joined.
+    std::thread host_prefetch;
+    std::vector<std::pair<size_t, void*>> host_ready;
+    std::string host_prefetch_error;
     // Page-locked staging for a deferred prompt's MTP embeddings, two batches deep
     // (sd_mtp_embed): a batch's copy waits only for the copy two batches before.
     float* mtp_staging[2] = {nullptr, nullptr};
@@ -405,6 +410,8 @@ struct Device {
     explicit Device(int value) : ordinal(value) {}
     ~Device() {
         cleanup(hipSetDevice(ordinal));
+        if (host_prefetch.joinable()) host_prefetch.join();
+        for (auto& ready : host_ready) cleanup(hipHostFree(ready.second));
         copier.reset();
         if (stream) cleanup(hipStreamSynchronize(stream));
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
@@ -1545,15 +1552,50 @@ int sd_release(void* handle, void* pointer) {
 // Zeroed sequence state in mapped, page-locked host memory that the kernels read and write
 // over the bus (the long-context K/V that does not fit the VRAM budget). It is owned like a
 // device allocation but not counted in the VRAM budget.
+// Page-lock and zero host states of these sizes on a thread of their own; sd_host_state then
+// takes them (in any order) once the thread is done.
+int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count) {
+    try {
+        auto& value = device(handle);
+        if (!sizes || value.host_prefetch.joinable() || !value.host_ready.empty())
+            throw std::runtime_error("invalid Straydog host state prefetch");
+        std::vector<size_t> wanted(sizes, sizes + count);
+        const int ordinal = value.ordinal;
+        value.host_prefetch_error.clear();
+        value.host_prefetch = std::thread([&value, wanted, ordinal]() {
+            try {
+                check(hipSetDevice(ordinal));
+                for (size_t bytes : wanted) {
+                    void* host = nullptr;
+                    check(hipHostMalloc(&host, bytes + allocation_tail, hipHostMallocMapped));
+                    value.host_ready.emplace_back(bytes, host);
+                    std::memset(host, 0, bytes + allocation_tail);
+                }
+            } catch (const std::exception& e) { value.host_prefetch_error = e.what(); }
+        });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 void* sd_host_state(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);
         if (!bytes) throw std::runtime_error("invalid Straydog host state");
+        if (value.host_prefetch.joinable()) value.host_prefetch.join();
+        if (!value.host_prefetch_error.empty()) {
+            const std::string error = value.host_prefetch_error;
+            value.host_prefetch_error.clear();
+            throw std::runtime_error(error);
+        }
         void* host = nullptr;
-        check(hipHostMalloc(&host, size_t(bytes) + allocation_tail, hipHostMallocMapped));
+        auto prefetched = std::find_if(value.host_ready.begin(), value.host_ready.end(),
+                                       [&](const auto& ready) { return ready.first == size_t(bytes); });
+        const bool zeroed = prefetched != value.host_ready.end();   // the prefetch zeroed it
+        if (zeroed) { host = prefetched->second; value.host_ready.erase(prefetched); }
+        else check(hipHostMalloc(&host, size_t(bytes) + allocation_tail, hipHostMallocMapped));
         void* pointer = nullptr;
         try {
-            std::memset(host, 0, size_t(bytes) + allocation_tail);
+            if (!zeroed) std::memset(host, 0, size_t(bytes) + allocation_tail);
             check(hipHostGetDevicePointer(&pointer, host, 0));
             value.host_states.emplace(pointer, host);
             try { value.allocations.emplace(pointer, size_t(bytes)); }

@@ -272,6 +272,7 @@ impl Model {
             mtp_kept: 0,
         };
         model.resident = model.prepare_resident_moe()?;
+        model.group.finish_model_state()?;
         if !model.resident {
             let pinned = checkpoint_bytes + if host { kv_bytes } else { 0 };
             model.partial = model.group.batch_capacity() == 256 && model.prepare_hybrid_moe(settings.cpu_threads, pinned)?;

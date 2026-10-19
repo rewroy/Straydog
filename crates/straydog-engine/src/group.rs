@@ -483,6 +483,11 @@ impl Group {
         Ok(())
     }
 
+    /// Take every device's host states once their page-locking (beside the weight upload) is done.
+    pub fn finish_model_state(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::finish_model_state)
+    }
+
     /// Per device, the VRAM a placement would still allocate.
     pub fn planned_state_bytes(&self, context: u64, prefill: u64, drafter: bool, host_attention: bool)
                                -> Result<Vec<u64>> {
