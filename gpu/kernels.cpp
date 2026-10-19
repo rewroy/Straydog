@@ -51,6 +51,7 @@
 #define hipMalloc cudaMalloc
 #define hipFree cudaFree
 #define hipMemcpyAsync cudaMemcpyAsync
+#define hipMemcpyPeerAsync cudaMemcpyPeerAsync
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define hipMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
@@ -938,6 +939,43 @@ int sd_prefill_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,u
     try {
         prefill_span(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,output,
                      size_t(output_rows),timings);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_handoff(void* from,void* to,uint64_t from_layer,uint64_t to_layer,uint64_t steps) {
+    try {
+        auto workspace=[](Device& d,uint64_t layer,uint64_t steps) {
+            auto found=d.decoder.find(size_t(layer));
+            if (found==d.decoder.end() || !steps || steps>found->second.capacity)
+                throw std::runtime_error("prefill handoff has no compatible resident layer");
+            return found->second.workspace;
+        };
+        Device& a=device(from);
+        const float* source=workspace(a,from_layer,steps);
+        Device& b=device(to);
+        float* target=workspace(b,to_layer,steps);
+        // The span that left the rows ended with a synchronizing download: they are complete.
+        check(hipMemcpyPeerAsync(target,b.ordinal,source,a.ordinal,size_t(steps)*10240*4,b.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+__global__ void prefill_tile(const float* embeddings,size_t steps,float* hidden) {
+    const size_t index=size_t(blockIdx.x)*256+threadIdx.x;
+    if (index>=steps*10240) return;
+    const size_t row=index/10240,column=index%10240%2560;
+    hidden[index]=embeddings[row*2560+column];
+}
+int sd_prefill_embed(void* handle,uint64_t layer,const float* embeddings,uint64_t steps) {
+    try {
+        Device& d=device(handle);
+        auto found=d.decoder.find(size_t(layer));
+        if (!embeddings || found==d.decoder.end() || !steps || steps>found->second.capacity)
+            throw std::runtime_error("prefill embeddings have no compatible resident layer");
+        // The rows land after the hidden rows (where a span's mixed rows go) and are tiled from there.
+        float* hidden=found->second.workspace; float* rows=hidden+size_t(steps)*10240;
+        upload(d,rows,embeddings,size_t(steps)*2560*4);
+        prefill_tile<<<unsigned((size_t(steps)*10240+255)/256),256,0,d.stream>>>(rows,size_t(steps),hidden);
+        check(hipGetLastError());
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }

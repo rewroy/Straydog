@@ -589,17 +589,17 @@ impl Model {
         if self.history.len() + tokens.len() > self.context || tokens.iter().any(|token| *token as usize >= VOCABULARY) {
             return Err("Straydog token or context is out of range".into());
         }
-        let hidden = tile(&self.token_embeddings(tokens)?);
+        let embeddings = self.token_embeddings(tokens)?;
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
         let hidden = if tokens.len() > 1 {
-            let Some(rows) = self.resident_prefill(hidden, tokens, cancelled)? else { return Ok(None) };
+            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled)? else { return Ok(None) };
             if self.speculative > 0 {
                 self.mtp_prompt(tokens, &rows, previous)?;
             }
             rows
         } else {
-            let mut hidden = self.group.decode_span(0, 1, &hidden, position)?;
+            let mut hidden = self.group.decode_span(0, 1, &tile(&embeddings), position)?;
             if cancelled() {
                 self.reset()?;
                 return Ok(None);
@@ -646,7 +646,7 @@ impl Model {
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
     /// for cancellation, and rows cross the host only at device boundaries.
-    fn resident_prefill(&mut self, hidden: Vec<f32>, tokens: &[u32], cancelled: &dyn Fn() -> bool)
+    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool)
                         -> Result<Option<Vec<f32>>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
         let boundaries = self.group.decoder_spans(1);
@@ -654,10 +654,16 @@ impl Model {
         for (begin, end) in &boundaries {
             spans.extend((*begin..*end).step_by(4).map(|first| (first, (first + 4).min(*end))));
         }
-        let transfers: Vec<usize> = boundaries.iter().map(|(_, end)| *end).collect();
-        // The rows the next span uploads (the prompt's, then each device boundary's), if any.
-        let (mut rows_in, mut upload) = (hidden, true);
+        // The prompt's embeddings start the first span; later spans continue on the device, and
+        // rows move GPU to GPU where the next span is on the other device.
+        self.group.prefill_embed(0, embeddings)?;
+        let mut rows_out = Vec::new();
+        let mut previous: Option<usize> = None;
         for (index, (first, last)) in spans.into_iter().enumerate() {
+            if let Some(previous) = previous {
+                self.group.prefill_handoff(previous, first, steps)?;
+            }
+            previous = Some(last - 1);
             if cancelled() {
                 self.reset()?;
                 return Ok(None);
@@ -669,16 +675,13 @@ impl Model {
                 })?;
             }
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
-            let last_rows = if self.speculative > 0 { steps } else { 1 };
-            let rows = if last == 48 { last_rows } else if transfers.contains(&last) { steps } else { 0 };
-            let input = upload.then_some(&rows_in[..]);
-            let output = self.group.prefill_layers(first, last, input, position, steps, rows)?;
+            let rows = if last == 48 { if self.speculative > 0 { steps } else { 1 } } else { 0 };
+            let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
             if rows > 0 {
-                rows_in = output;
+                rows_out = output;
             }
-            upload = rows == steps;
         }
-        Ok(Some(rows_in))
+        Ok(Some(rows_out))
     }
 
     /// Advance the MTP layer's K/V over prologue rows starting at `position`.

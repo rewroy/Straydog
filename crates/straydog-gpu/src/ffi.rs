@@ -303,6 +303,23 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_handoff(
+        from: *mut ::std::os::raw::c_void,
+        to: *mut ::std::os::raw::c_void,
+        from_layer: u64,
+        to_layer: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_embed(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        embeddings: *const f32,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_verify_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

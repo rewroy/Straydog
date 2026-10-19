@@ -104,6 +104,14 @@ pub struct Backend {
     pub output_capacity: u64,
 }
 
+/// Move prompt rows a span left on `from` (layer `from_layer`'s workspace) to `to`'s
+/// (`to_layer`'s), device to device.
+pub fn prefill_handoff(from: &Backend, to: &Backend, from_layer: usize, to_layer: usize, steps: u64) -> Result<()> {
+    // SAFETY: two live devices; the native side checks both workspaces against `steps`.
+    check(unsafe { ffi::sd_prefill_handoff(from.handle, to.handle, from_layer as u64, to_layer as u64, steps) })?;
+    Ok(())
+}
+
 /// The sequence state carried from token to token (DeltaNet, its convolution, PLE history),
 /// as opposed to K/V and the indexer, which are indexed by position.
 const RECURRENT: [&str; 3] = ["@delta:", "@conv:", "@ple:"];
@@ -436,6 +444,19 @@ impl Backend {
     /// Advance resident prefill rows through [begin, end) (at most four layers). `values`
     /// uploads new rows; `None` continues from this GPU's previous span. The last
     /// `output_rows` rows come back.
+    /// Start a prompt in `layer`'s workspace from its embeddings (2560 per row), tiled on the GPU.
+    pub fn prefill_embed(&mut self, layer: usize, embeddings: &[f32]) -> Result<()> {
+        let steps = embeddings.len() / HIDDEN;
+        if embeddings.len() != steps * HIDDEN || !(2..=self.prefill_capacity as usize).contains(&steps)
+            || !embeddings.iter().all(|value| value.is_finite())
+        {
+            return Err("invalid Straydog prefill embeddings".into());
+        }
+        // SAFETY: steps rows of 2560 floats; the native side checks the workspace.
+        check(unsafe { ffi::sd_prefill_embed(self.handle, layer as u64, embeddings.as_ptr(), steps as u64) })?;
+        Ok(())
+    }
+
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
         if begin >= end || end > 49 || end - begin > 4 || !(2..=self.prefill_capacity).contains(&steps)

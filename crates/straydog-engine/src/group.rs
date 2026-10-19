@@ -239,6 +239,22 @@ impl Group {
         self.backends[owner].prefill_layers(begin, end, values, position, steps, output_rows)
     }
 
+    pub fn prefill_embed(&mut self, layer: usize, embeddings: &[f32]) -> Result<()> {
+        let owner = self.owner(layer);
+        self.backends[owner].prefill_embed(layer, embeddings)
+    }
+
+    /// Move prompt rows from the device of layer `from` to the device of layer `to`, GPU to GPU;
+    /// false when both layers are on one device (nothing to move).
+    pub fn prefill_handoff(&mut self, from: usize, to: usize, steps: u64) -> Result<bool> {
+        let (source, target) = (self.owner(from), self.owner(to));
+        if source == target {
+            return Ok(false);
+        }
+        crate::gpu::prefill_handoff(&self.backends[source], &self.backends[target], from, to, steps)?;
+        Ok(true)
+    }
+
     pub fn prefill_ple(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
         let owner = self.index(prefix);
         self.backends[owner].prefill_ple(prefix, embeddings, operands, 1)
