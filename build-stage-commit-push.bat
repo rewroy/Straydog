@@ -1,5 +1,3 @@
-git pull
-
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -9,6 +7,13 @@ set "COMMIT_MSG=Update"
 git rev-parse --show-toplevel >nul 2>&1
 if errorlevel 1 (
   echo This directory is not a git repository.
+  exit /b 1
+)
+
+echo === pull ===
+git pull
+if errorlevel 1 (
+  echo Pull failed. Nothing was built, staged, committed, or pushed.
   exit /b 1
 )
 
