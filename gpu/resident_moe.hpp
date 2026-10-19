@@ -1,39 +1,5 @@
 // Fully resident execution is an optional budget-checked path. Expert banks stay
 // packed; routing, grouping, every top-10 expert and shared expert remain on GPU.
-__global__ void resident_dense_wmma(Matrix matrix, size_t steps, const float* input, float* output) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    using Half8=_Float16 __attribute__((ext_vector_type(8)));
-    using Float8=float __attribute__((ext_vector_type(8)));
-    const size_t thread=threadIdx.x,wave=thread/32,lane=thread%32;
-    const size_t first=size_t(blockIdx.y)*16,column=size_t(blockIdx.x)*64;
-    __shared__ _Float16 x[16*32],w[64*32];
-    Float8 result{};
-    for (size_t begin=0;begin<matrix.cols;begin+=32) {
-        for (size_t i=thread;i<16*32;i+=128)
-            x[i]=first+i/32<steps ? _Float16(input[(first+i/32)*matrix.cols+begin+i%32]) : _Float16(0);
-        for (size_t i=thread;i<64*32;i+=128)
-            w[i]=column+i/32<matrix.rows ? _Float16(grouped_weight(matrix,column+i/32,begin+i%32)) : _Float16(0);
-        __syncthreads();
-        #pragma unroll
-        for (size_t panel=0;panel<32;panel+=16) {
-            Half8 a,b;
-            #pragma unroll
-            for (size_t i=0;i<8;++i) {
-                const size_t k=panel+(lane/16)*4+(i/4)*8+i%4;
-                a[i]=x[(lane%16)*32+k]; b[i]=w[(wave*16+lane%16)*32+k];
-            }
-            result=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,result);
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (size_t i=0;i<8;++i) {
-        const size_t row=first+(lane/16)*8+i,col=column+wave*16+lane%16;
-        if (row<steps && col<matrix.rows) output[row*matrix.rows+col]=result[i];
-    }
-#endif
-}
-
 __global__ void resident_mix(Matrix matrix, const float* input, float* output) {
     const size_t token=blockIdx.x,lane=threadIdx.x;
     float sum=0;
@@ -623,9 +589,7 @@ void moe_steps_experts(Device& d,const StepMoe& moe,size_t steps,const float* so
         projections[1].output_offset=experts;
         gemv(d,projections,2,source,d.output);
     } else {
-        if (d.rdna4 && d.half_gemm && steps>=d.gemm_min_batch)
-            resident_dense_wmma<<<dim3(unsigned((experts+63)/64),unsigned((steps+15)/16)),128,0,d.stream>>>(router,steps,source,d.output);
-        else hc_project(d,router,steps,source,d.output,descriptors);
+        hc_project(d,router,steps,source,d.output,descriptors);
         resident_mix<<<unsigned(steps),256,0,d.stream>>>(mix,source,d.output+steps*experts);
     }
     resident_route<<<unsigned(steps),256,0,d.stream>>>(d.output,d.output+steps*experts,experts,moe.selected,moe.probabilities);
