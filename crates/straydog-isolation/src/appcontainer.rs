@@ -26,17 +26,26 @@ use crate::{check_exposable, resolve, Exposure, LAUNCHER_SUBCOMMAND};
 pub const PROFILE_NAME: &str = "Straydog.Worker";
 
 /// The variables the worker inherits (Windows ignores the case of names), TEMP and TMP aside:
-/// what the system, the loader and the CUDA runtime read. Nothing else reaches it: no proxy,
-/// token, key or credential the server's environment may hold.
-const WORKER_VARIABLES: [&str; 10] = [
+/// what the system, the loader and the CUDA runtime read, and the profile paths. Creating an
+/// AppContainer process points LOCALAPPDATA and the user profile at the container's own
+/// folders, and fails with ERROR_ENVVAR_NOT_FOUND (203) when they are absent. Nothing else
+/// reaches it: no proxy, token, key or credential the server's environment may hold.
+pub const WORKER_VARIABLES: [&str; 17] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
+    "ComSpec",
+    "OS",
     "PATH",
     "PATHEXT",
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
     "PROCESSOR_IDENTIFIER",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "APPDATA",
     "CUDA_PATH",
     "LANG",
 ];
@@ -676,8 +685,10 @@ mod tests {
             Some(wide(r"C:\container\Temp")),
         );
         let text = String::from_utf16(&block).unwrap();
+        // LOCALAPPDATA stays: creating the AppContainer process repoints it (and fails without it).
         let expected = [
             r"cuda_path=C:\CUDA",
+            r"LOCALAPPDATA=C:\Users\u\AppData\Local",
             r"Path=C:\bin",
             r"SystemRoot=C:\Windows",
             r"TEMP=C:\container\Temp",

@@ -21,6 +21,8 @@ pub use tree::{prepare, ProcessTree};
 
 #[cfg(any(windows, test))]
 mod appcontainer;
+#[cfg(windows)]
+pub use appcontainer::WORKER_VARIABLES;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 #[cfg(windows)]

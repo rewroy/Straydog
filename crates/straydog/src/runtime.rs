@@ -112,12 +112,11 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
 
 /// The minimal environment the worker starts with: no proxy, token, secret or key variables.
 fn worker_environment() -> Vec<(OsString, OsString)> {
-    let keep: &[&str] = if cfg!(windows) {
-        &["PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "TEMP", "TMP", "LOCALAPPDATA", "NUMBER_OF_PROCESSORS",
-          "PROCESSOR_ARCHITECTURE", "CUDA_PATH"]
-    } else {
-        &["PATH", "HOME", "USER", "LANG", "TZ", "TERM"]
-    };
+    // On Windows the launcher passes on what the worker needs (and gives it its own TEMP).
+    #[cfg(windows)]
+    let keep: &[&str] = &straydog_isolation::WORKER_VARIABLES;
+    #[cfg(not(windows))]
+    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM"];
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()
