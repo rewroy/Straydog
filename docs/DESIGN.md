@@ -1,23 +1,26 @@
 # Straydog — design
 
-Status: phase 1 done, phase 2 in progress. Updated: 2026-10-19.
+Status: Python reference implementation in place (phase R0); the Rust host is being
+designed. Updated: 2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
-OpenAI-compatible API.
+OpenAI-compatible API, shipped as one executable per GPU backend.
 
 ## 1. Goals
 
 - One long-lived server keeps the model loaded. Clients start, update and restart
   without reloading it (authenticating and loading the IQ3_S model takes about 70 s).
 - Any OpenAI-compatible client can use it.
-- Its own release cadence, native builds (Linux/HIP, Windows/CUDA), GPU tests and
-  benchmarks.
+- One executable: the server, the engine, the isolated worker and provisioning. The
+  only external pieces are the GPU vendor's runtime and driver.
+- Every per-token and per-pass host step is native code. Performance work starts from
+  a language without an interpreter in the loop.
 
 ## 2. No client logic
 
 Straydog serves the OpenAI-compatible API and nothing specific to one client. Client
 integrations, client-shaped benchmarks and a client's own secrets belong to the
-client. Straydog's own secret, its API key, is never granted to the worker.
+client. Straydog's own secret, its API key, is never exposed to the worker.
 
 The conversation cache, the reasoning replay and the tool-call split are not client
 logic: they follow from the official chat template and the OpenAI message format.
@@ -28,36 +31,67 @@ logic: they follow from the official chat template and the OpenAI message format
   FP16 GEMM is used only when configured. A speculative verification pass is
   bitwise identical to token-by-token decode in the same placement. Unsupported
   formats are an error, never a silent conversion.
-- **Isolation.** The engine runs in a separate worker without network access:
-  bubblewrap on Linux, an AppContainer of its own on Windows. Every model, drafter
-  and native file is pinned by SHA-256 and authenticated before use. The SSD is
-  read-only: no swap, weight or K/V files.
+- **Isolation.** The engine runs in a separate worker process without network
+  access: bubblewrap on Linux, an AppContainer of its own on Windows. The worker is
+  the same executable. Every model and drafter file is pinned by SHA-256 and
+  authenticated before use. The SSD is read-only: no swap, weight or K/V files.
 - **Measurement.** Performance claims come from alternating A/B runs on the same
   machine, under a GPU lock.
 
 [Strata](https://github.com/Niko1221/Strata) has been used as a benchmark comparison
 target.
 
-## 4. Layout
+## 4. Architecture
+
+### 4.1 Processes
 
 ```
-src/straydog/
-  engine: model, weights, gpu, devices, speculative, mtp, hybrid, cpu, host,
-          formats, numeric, digest, library, bundles, assets.json, worker
-  native/        packaged native builds (Linux HIP at the root, win32-amd64/)
-  runtime.py     owns the isolated worker process (one engine, serialized requests)
-  isolation.py   bubblewrap command; appcontainer.py the Windows launcher
-  chat.py        the official template's output split into reasoning, answer, tool calls
-  server.py      the OpenAI-compatible HTTP API
-  config.py      settings (~/.straydog/config.yaml)
-  provisioning.py, progress.py   model and drafter download and authentication
-  cli.py         straydog serve | init | fetch | verify | build | bundle
-  platform/      process groups, environment, Windows helpers
-native/          Rust inspector crate and the C++/HIP/CUDA GPU library
-scripts/         benchmarks
-tests/
+straydog serve ──HTTP──▶ clients
+   │  runtime: one worker, a bounded queue (4), cancellation
+   │  stdio, JSON lines (one frame per event; ~8 µs per token)
+   ▼
+straydog worker   (same executable, isolated; never opens a socket)
+   tokenizer, template, weights, placement, generation loop
+   │  C ABI (sd_*, 61 entry points)
+   ▼
+GPU library (C++ / HIP / CUDA, linked statically)
+```
+
+The server never loads the model; a worker failure never takes the server down. The
+worker reads only what isolation exposes: the executable, the GPU runtime, the pinned
+model and drafter files and the GPU device nodes.
+
+### 4.2 Source layout
+
+```
+Cargo.toml                 workspace
+crates/
+  straydog/                the executable: cli, config, server, runtime, isolation, provisioning
+  straydog-engine/         tokenizer, template, gguf, weights, placement, model, speculative, sampling, worker
+  straydog-gpu/            bindings to the C ABI; build.rs compiles gpu/ with CMake (HIP or CUDA)
+gpu/                       C++/HIP/CUDA kernels and the C ABI
+python/                    the reference implementation, until phase R6 removes it
+tests/                     kernel tests (Python, NumPy references) against a shared build of gpu/
 docs/
 ```
+
+The kernel tests stay in Python: NumPy is the reference math, and the tests drive the
+same C ABI the engine uses. They are development tooling, not part of the product.
+
+### 4.3 What moves where
+
+| Python reference | Rust | Notes |
+| --- | --- | --- |
+| tokenizers (HF) | `tokenizers` crate | the same implementation; pure-Rust regex backend |
+| jinja2 sandbox | `minijinja` (+ Python-compatible methods) | renders must equal the reference byte for byte |
+| gguf parsing, mmap, SHA-256 | gguf reader (from the inspector crate), `memmap2`, `sha2` | two files hashed at once, as now |
+| placement, residency planning | same algorithms | equal plans for the same budgets |
+| generation loop, MTP control, checkpoints | same algorithms over the C ABI | host steps are copies, integer math and argmax |
+| NumPy layer math (bounded-cache tier) | not ported | see §9, decision 5 |
+| sampling with temperature | own RNG | same distribution; a seed gives different samples than the reference |
+| HTTP server | `axum` on `tokio` | |
+| bubblewrap command, AppContainer launcher | same, in Rust (`windows` crate) | grants: the executable, the CUDA runtime, model files |
+| provisioning (download, resume, MTP conversion) | `ureq` + `rustls`, own GGUF writer | the drafter is bit-identical to the reference's |
 
 ## 5. Command line and configuration
 
@@ -68,12 +102,12 @@ setting, the name is the same.
 | --- | --- | --- |
 | `-m, --model DIR` | model bundle directory (the pinned GGUF shards and tokenizer/template files of one quantization) | from config |
 | `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS or IQ3_S, when the directory alone does not say | detected from the pinned files |
-| `-md, --model-draft DIR` | MTP drafter bundle | none |
+| `-md, --model-draft DIR` | MTP drafter directory | none |
 | `--draft-max N` | MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget) |
 | `-dev, --device LIST` | GPU ordinals, e.g. `0,1` | `0` |
-| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` when possible |
+| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` |
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
@@ -81,42 +115,47 @@ setting, the name is the same.
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |
 | `--alias NAME` | model id in `/v1/models` and answers | `Qwen3.8-Flash-Next-<quant>` |
 | `--temp T`, `--seed N` | defaults when a request gives none | 0, 0 |
-| `--inspector PATH`, `--gpu-library PATH` | native files other than the packaged build for this machine | packaged build |
+| `--reasoning-effort E` | reasoning when a request gives none: none, low, medium, high | high (the template's default) |
 | `--startup-timeout S`, `--log-file FILE`, `-v` | operations | 180 s, stderr |
-| `--config FILE` | the same settings as a file | `~/.straydog/config.yaml` when present |
+| `--config FILE` | the same settings as a file | `~/.straydog/config.toml` when present |
 
 Precedence: options, then `STRAYDOG_*` environment variables (`STRAYDOG_CTX_SIZE`),
-then the config file, then defaults. One schema defines all three, so they cannot
-drift. `straydog serve --print-config` shows the settings in effect and where each
-came from.
+then the config file, then defaults. One `clap` definition gives the options and the
+variables; the file uses the same names. `straydog serve --print-config` shows the
+settings in effect and where each came from.
 
 There is no `-ngl`. Residency is decided by measuring what fits:
 - full residency first, then host K/V, then a smaller prefill batch;
 - partial residency with CPU and GPU expert slots otherwise.
 
 There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authenticated
-before use.
+before use. The pins are compiled into the executable.
 
 Other commands:
 - `straydog init`: interactive setup. It chooses a quantization and GPUs, fetches
   and authenticates the model, builds the drafter, writes the config and the key,
   and optionally installs a systemd user service.
-- `straydog fetch`, `straydog verify`.
-- `straydog build`, `straydog bundle`: native builds, for development.
+- `straydog fetch`, `straydog verify`, `straydog fetch-mtp`.
 
 ## 6. API
 
-- `GET /health`, `GET /v1/models`.
+- `GET /health` (no key needed): 200 when ready, 503 while loading (with progress),
+  500 after a fatal engine error.
+- `GET /v1/models`.
 - `POST /v1/chat/completions`, streaming (SSE `chat.completion.chunk`) or not:
-  - messages: system, user, assistant (content, `reasoning_content`, `tool_calls`)
-    and tool messages;
+  - messages: system (and developer), user, assistant (content, `reasoning_content`,
+    `tool_calls`) and tool messages; content as a string or text parts;
   - `tools`, `tool_choice` (`auto` or `none`);
-  - `max_tokens` / `max_completion_tokens`, `temperature`, `seed`;
-  - `reasoning_effort` (`none`, `low`, `medium`, `high`);
+  - `max_tokens` / `max_completion_tokens`, `temperature`, `seed`, `stop`;
+  - `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and
+    `chat_template_kwargs` (`enable_thinking`, the template's `reasoning_effort`);
   - `stream_options.include_usage`.
 
   Answers carry `reasoning_content` deltas, structured `tool_calls` and `usage`
   with `prompt_tokens_details.cached_tokens`, plus engine `timings`.
+- Sampling controls the engine does not implement (`top_p`, penalties, `n`,
+  `logprobs`, `logit_bias`, `top_k`, `min_p`, other `response_format`s, ...) are
+  accepted only at their neutral value; anything else is a 400, never ignored.
 - Extension (optional `straydog` object in the request): `checkpoint` set to false
   marks a one-off request (a summary, a title) that saves no conversation checkpoint.
   A request that ends with a tool message continues the assistant's reply; one that
@@ -124,24 +163,60 @@ Other commands:
   client.
 - Reasoning sent back in assistant messages is part of the prompt the official
   template renders, so a client that returns it keeps the conversation cache warm.
+- Errors are OpenAI-style objects. Before the first byte of a stream the status says
+  it (400 invalid request or context overflow, 401, 503 loading or busy, 500 engine
+  failure); after it, an `error` event ends the stream.
 - Security: listens on 127.0.0.1 by default. A Bearer API key is optional and
   required once given (`--api-key`, or `--api-key-file` for a key kept out of the
   process list). One engine serializes generation. The waiting queue is bounded, and
   a request whose client disconnects is cancelled.
 
-## 7. Phases
+## 7. Build and distribution
 
-1. The engine, native sources, packaged builds, scripts and tests, with the tests
-   passing in this repository.
-2. The server (`straydog serve`) on the runtime and worker.
-3. `straydog init / fetch / verify`: provisioning.
-4. Clients move onto the server.
+- `cargo build --release --features hip` (or `cuda`). `build.rs` runs CMake on `gpu/`
+  with the vendor compiler and links the result statically; the architectures come
+  from `STRAYDOG_GPU_ARCHITECTURES` (`gfx1201`; `86-real;89-real;120`).
+- Release artifacts: `straydog-linux-x86_64-hip` (ROCm 10 runtime required) and
+  `straydog-windows-x86_64-cuda.exe` (NVIDIA driver; `cublas64_12.dll` next to it or
+  from a CUDA Toolkit). The C/C++ runtimes are linked statically.
+- A GPU without code in the executable fails at startup with its architecture named.
+- The executable's own SHA-256 is published with each release. The model pins are
+  compiled in, so a binary authenticates exactly the bundles it was tested with.
 
-## 8. Decisions (2026-10-19)
+## 8. Phases
+
+- **R0** (done): the Python reference: engine, native sources, packaged builds,
+  provisioning and tests, passing in this repository.
+- **R1**: workspace, `straydog-gpu` (all `sd_*` bindings, static HIP and CUDA
+  builds), the gguf reader. The kernel tests run against the same CMake build.
+- **R2**: tokenizer and template, with golden files from the reference: token ids
+  and renders over a corpus of conversations (tools, reasoning, tool results,
+  Japanese text). Equal byte for byte.
+- **R3**: weights, authentication, placement and the generation loop (prefill,
+  decode, verification, MTP, conversation checkpoints, partial residency). Gate:
+  for a fixed prompt set, every logit vector and every greedy token equals the
+  reference's bitwise, for one GPU, two GPUs (layer and expert split), partial
+  residency and host K/V.
+- **R4**: worker, runtime, server, CLI and config. Gate: API tests, including
+  streaming, tool calls, stop strings, cancellation on disconnect and errors.
+- **R5**: isolation (bubblewrap, AppContainer) and provisioning (`fetch`, `verify`,
+  `fetch-mtp`, `init`). Gate: the drafter built by Rust equals the reference's.
+- **R6**: alternating A/B against the reference on the single-request benchmark and
+  a multi-turn session; no metric may be slower. Then the Python engine and its
+  packaged builds are removed and the first binaries released.
+- **R7**: clients move onto the server.
+
+## 9. Decisions (2026-10-19)
 
 1. The repository starts a fresh history.
-2. HTTP stack: Starlette and uvicorn.
+2. The host is Rust; the kernels stay C++/HIP/CUDA behind their C ABI. HTTP:
+   `axum` on `tokio` (this replaces Starlette and uvicorn).
 3. Port 8080 by default (`--port` changes it). An API key is optional and required
    only once one is given.
-4. Home directory `~/.straydog` (config, models, drafter, native builds). Existing
-   model directories are used in place.
+4. Home directory `~/.straydog` (config, models, drafter). Existing model
+   directories are used in place. The config file is TOML.
+5. The bounded-cache tier, where the dense weights do not fit the GPU budget and
+   layers run in NumPy on the host, is not ported: a budget below the dense weights
+   (about 3.4 GB) is an error. Partial residency covers every supported GPU.
+6. Sampling with a temperature uses Straydog's own RNG; a seed is reproducible
+   within Straydog, not across the reference.

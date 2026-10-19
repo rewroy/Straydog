@@ -15,8 +15,9 @@ Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Status
 
-Phase 1 of the [design](docs/DESIGN.md#7-phases): the engine, the native sources,
-the packaged builds, provisioning and the benchmark. `straydog serve` comes next.
+The Python reference implementation (phase R0 of the [design](docs/DESIGN.md#8-phases)):
+the engine, the native sources, the packaged builds, provisioning and the benchmark.
+The Rust host, a single executable with the OpenAI-compatible server, is next.
 
 ## Requirements
 
