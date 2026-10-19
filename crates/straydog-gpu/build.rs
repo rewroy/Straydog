@@ -29,7 +29,6 @@ fn main() {
     let mut config = cmake::Config::new(&source);
     config
         .define("STRAYDOG_BACKEND", backend)
-        .define("STRAYDOG_GPU_STATIC", "ON")
         .define(format!("CMAKE_{backend}_ARCHITECTURES"), &architectures)
         .profile("Release")
         .build_target("straydog_gpu");

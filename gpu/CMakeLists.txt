@@ -15,20 +15,13 @@ elseif(STRAYDOG_BACKEND STREQUAL "CUDA")
 else()
   message(FATAL_ERROR "STRAYDOG_BACKEND must be HIP or CUDA")
 endif()
-# Static for the straydog executable; shared for the kernel tests, which load it from Python.
-option(STRAYDOG_GPU_STATIC "Build a static library" OFF)
-if(STRAYDOG_GPU_STATIC)
-  add_library(straydog_gpu STATIC kernels.cpp cpu_experts.cpp)
-  set_target_properties(straydog_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
-else()
-  add_library(straydog_gpu SHARED kernels.cpp cpu_experts.cpp)
-endif()
+# Static, linked into the straydog executable.
+add_library(straydog_gpu STATIC kernels.cpp cpu_experts.cpp)
+set_target_properties(straydog_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
 target_link_libraries(straydog_gpu PRIVATE Threads::Threads)
 if(STRAYDOG_BACKEND STREQUAL "HIP")
   target_link_libraries(straydog_gpu PRIVATE hip::host roc::hipblas)
-  # The ROCm this was built with, then the standard /opt/rocm link for other installs.
-  set_target_properties(straydog_gpu PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:hip::amdhip64>;/opt/rocm/lib")
 else()
   target_link_libraries(straydog_gpu PRIVATE CUDA::cublas)
   # Device code calls constexpr std::min/std::max, as HIP allows.
@@ -37,9 +30,6 @@ endif()
 # Drafter quantization must produce the pinned bytes on every compiler.
 set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
 set_target_properties(straydog_gpu PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 CUDA_STANDARD 17)
-if(WIN32 AND NOT STRAYDOG_GPU_STATIC)
-  set_target_properties(straydog_gpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
-endif()
 
 option(STRAYDOG_CPU_TESTS "Build standalone CPU scheduling regressions" OFF)
 if(STRAYDOG_CPU_TESTS)
