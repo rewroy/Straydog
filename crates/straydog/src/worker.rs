@@ -96,6 +96,19 @@ struct Engine {
     template: ChatTemplate,
 }
 
+/// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
+/// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty.
+fn warm_up(model: &mut Model) -> Result<(), String> {
+    let longest = model.prefill_batch_size.min(model.context.saturating_sub(4));
+    for length in [longest, longest.min(300)] {
+        if length >= 2 {
+            let prompt: Vec<u32> = (0..length as u32).map(|index| 1000 + index % 50_000).collect();
+            model.generate(&prompt, 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {})?;
+        }
+    }
+    model.reset()
+}
+
 pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
@@ -117,7 +130,9 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         speculative: args.speculative,
         cpu_threads: 0,
     };
-    let model = Model::new(weights, group, &settings)?;
+    let mut model = Model::new(weights, group, &settings)?;
+    loading.report("warm", 0, 0);
+    warm_up(&mut model)?;
     output.send(&json!({
         "event": "ready", "protocol": 1, "engine": "Straydog", "model": straydog_engine::bundle::MODEL,
         "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,

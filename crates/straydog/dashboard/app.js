@@ -45,7 +45,7 @@ const STRINGS = {
     budgetOf: "{0} / {1} GiB budget", noSensors: "No sensors for this GPU.", waiting: "Waiting for the engine…",
     time: "Time", prompt: "Prompt", completion: "Completion", ttft: "First token", finish: "Finish",
     acceptance: "MTP accepted", stageAuthenticate: "authenticating the model", stageDrafter: "authenticating the drafter",
-    stagePrepare: "placing the model on the GPUs", error: "Error",
+    stagePrepare: "placing the model on the GPUs", stageWarm: "warming up the GPU code", error: "Error",
   },
   ja: {
     connecting: "接続中…", ready: "待機中", generating: "生成中", loading: "読み込み中", failed: "停止",
@@ -84,7 +84,7 @@ const STRINGS = {
     budgetOf: "予算 {1} GiB 中 {0}", noSensors: "この GPU のセンサーは読めません。", waiting: "エンジンを待っています…",
     time: "時刻", prompt: "プロンプト", completion: "生成", ttft: "最初のトークン", finish: "終了理由",
     acceptance: "MTP 採択", stageAuthenticate: "モデルを検証中", stageDrafter: "drafter を検証中",
-    stagePrepare: "モデルを GPU に配置中", error: "エラー",
+    stagePrepare: "モデルを GPU に配置中", stageWarm: "GPU のコードを準備中", error: "エラー",
   },
 };
 const LANG = (navigator.language || "en").toLowerCase().startsWith("ja") ? "ja" : "en";
@@ -389,7 +389,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function stageText(progress) {
-  return { authenticate: t("stageAuthenticate"), drafter: t("stageDrafter"), prepare: t("stagePrepare") }[progress.stage]
+  return { authenticate: t("stageAuthenticate"), drafter: t("stageDrafter"), prepare: t("stagePrepare"), warm: t("stageWarm") }[progress.stage]
     || progress.stage || "";
 }
 
