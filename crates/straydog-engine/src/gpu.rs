@@ -104,6 +104,10 @@ pub struct Backend {
     pub output_capacity: u64,
 }
 
+/// The sequence state carried from token to token (DeltaNet, its convolution, PLE history),
+/// as opposed to K/V and the indexer, which are indexed by position.
+const RECURRENT: [&str; 3] = ["@delta:", "@conv:", "@ple:"];
+
 // The native library orders each device's work on its own stream; the backend moves
 // between threads but is never used by two at once.
 unsafe impl Send for Backend {}
@@ -672,10 +676,12 @@ impl Backend {
         check(unsafe { ffi::sd_copy_allocation(self.handle, target.pointer, source.pointer) }).map(drop)
     }
 
-    /// Zero every owned sequence state (scratch and MoE workspace carry none).
+    /// Start a new sequence: zero the recurrent state. K/V and the indexer are read only at
+    /// positions already written in the sequence (as a checkpoint restore relies on), so their
+    /// gigabytes stay as they are.
     pub fn reset_state(&mut self) -> Result<()> {
         for (key, entry) in &self.states {
-            if !key.starts_with("@moe:") && !key.starts_with("@scratch:") {
+            if RECURRENT.iter().any(|prefix| key.starts_with(prefix)) {
                 // SAFETY: an allocation of this device.
                 check(unsafe { ffi::sd_zero(self.handle, entry.pointer) })?;
             }
@@ -687,7 +693,7 @@ impl Backend {
     /// history); their bytes. K/V and the indexer are indexed by position and need none.
     pub fn reserve_checkpoints(&mut self, count: usize) -> Result<u64> {
         let keys: Vec<&String> =
-            self.states.keys().filter(|key| ["@delta:", "@conv:", "@ple:"].iter().any(|p| key.starts_with(p))).collect();
+            self.states.keys().filter(|key| RECURRENT.iter().any(|prefix| key.starts_with(prefix))).collect();
         self.checkpoint_states = keys.iter().map(|key| self.states[*key].pointer).collect();
         let size: u64 = keys.iter().map(|key| self.states[*key].rows * self.states[*key].cols * 4).sum();
         self.checkpoints.clear();
