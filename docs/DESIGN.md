@@ -70,7 +70,7 @@ crates/
   straydog/                the executable: cli, config, server, runtime, isolation, provisioning
   straydog-engine/         tokenizer, template, gguf, weights, placement, model, speculative, sampling, worker
   straydog-gpu/            bindings to the C ABI; build.rs compiles gpu/ with CMake (HIP or CUDA)
-  straydog-gguf/           GGUF structure checks (and the reference's inspector command)
+  straydog-gguf/           GGUF structure checks
   straydog-api/            the OpenAI-compatible API over an Engine (the runtime)
   straydog-isolation/      bubblewrap and AppContainer containment of the worker
   straydog-provision/      fetch, verify, and the MTP drafter build

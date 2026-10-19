@@ -9,7 +9,7 @@ const MAX_METADATA: u64 = 65_536;
 const MAX_ARRAY_ITEMS: u64 = 1_048_576;
 const MAX_TENSORS: u64 = 16_384;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
     pub name: String,
     pub dimensions: Vec<u64>,
@@ -19,7 +19,7 @@ pub struct TensorInfo {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelHeader {
     pub architecture: String,
     /// GGUF declaration only. This is NOT an observed running context capacity.
