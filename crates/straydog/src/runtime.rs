@@ -161,11 +161,25 @@ pub fn request_summary(event: &Value) -> String {
     )
 }
 
-/// The worker's pipes.
+/// The worker's pipes, and the process tree it heads (the sandbox and the worker in it).
 struct Process {
     child: Child,
+    tree: straydog_isolation::ProcessTree,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+impl Process {
+    /// End the whole tree: ask, then after `grace` force, and reap the child.
+    async fn end(&mut self, grace: Duration) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.tree.terminate();
+            if tokio::time::timeout(grace, self.child.wait()).await.is_err() {
+                let _ = self.tree.kill();
+                let _ = self.child.wait().await;
+            }
+        }
+    }
 }
 
 impl Process {
@@ -262,8 +276,7 @@ impl Driver {
                                           ("command", pyjson::Value::Str("shutdown".into()))]);
                 let _ = process.send(&shutdown).await;
                 if tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await.is_err() {
-                    // kill() also waits for the exit.
-                    let _ = process.child.kill().await;
+                    process.end(Duration::from_secs(5)).await;
                 }
             }
             Err(message) => self.fail(message),
@@ -302,7 +315,7 @@ impl Driver {
                 let _ = job.events.send(json!({"event": "error", "message": message, "fatal": true})).await;
                 self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
                 self.fail(message);
-                let _ = process.child.kill().await;
+                process.end(Duration::from_secs(5)).await;
                 return;
             }
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
@@ -310,16 +323,25 @@ impl Driver {
     }
 
     async fn launch(&self, (program, args): Command) -> Result<Process, String> {
-        let mut command = tokio::process::Command::new(&program);
+        let mut command = std::process::Command::new(&program);
         command
             .args(&args)
             .env_clear()
             .envs(worker_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        // Its own session (Linux) or console group (Windows), ended with the server. Spawned
+        // here, on a runtime thread that lives as long as the worker.
+        straydog_isolation::prepare(&mut command);
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|exc| format!("Straydog failed to start ({}: {exc})", program.display()))?;
+        #[cfg(unix)]
+        let tree = straydog_isolation::ProcessTree::from_pid(child.id().unwrap_or(0));
+        #[cfg(windows)]
+        let tree = straydog_isolation::ProcessTree::from_handle(child.raw_handle().unwrap_or(std::ptr::null_mut()));
+        let tree = tree.map_err(|exc| format!("Straydog failed to start ({exc})"))?;
         let stderr = child.stderr.take().unwrap();
         let (shared, verbose) = (self.shared.clone(), self.verbose);
         tokio::spawn(async move {
@@ -342,6 +364,7 @@ impl Driver {
             stdin: child.stdin.take().unwrap(),
             stdout: BufReader::new(child.stdout.take().unwrap()),
             child,
+            tree,
         };
         self.set(Phase::Loading(json!({})));
         let deadline = Instant::now() + self.timeout;
@@ -376,7 +399,7 @@ impl Driver {
                 Ok(process)
             }
             Err(message) => {
-                let _ = process.child.kill().await;
+                process.end(Duration::from_secs(2)).await;
                 // Let the last stderr lines arrive: the worker's last line names the cause.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let tail = String::from_utf8_lossy(&self.shared.stderr_tail.lock().unwrap()).to_string();
