@@ -22,6 +22,7 @@ use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use straydog_engine::pyjson;
+use straydog_engine::sampling::Sampling;
 use subtle::ConstantTimeEq;
 
 pub use request::ReasoningEffort;
@@ -70,7 +71,8 @@ pub enum SubmitError {
 /// The worker request body, built from an OpenAI request with Python-compatible JSON
 /// (`messages` and `tools` keep the client's numbers, key order and strings exactly):
 /// `{"messages": [...], "tools": [...] | null, "max_tokens": n | null, "temperature": t,
-/// "seed": n, "thinking": bool, "reasoning_effort": "low" | "medium" | "xhigh",
+/// "top_k": k, "top_p": p, "min_p": p, "presence_penalty": x, "seed": n, "thinking": bool,
+/// "reasoning_effort": "low" | "medium" | "xhigh",
 /// "checkpoint": bool}`.
 ///
 /// Each message keeps, in the client's order, the fields the template reads or a client
@@ -90,14 +92,38 @@ pub struct ApiConfig {
     pub quantization: String,
     /// The Bearer key every route but `/health` then requires (`--api-key`).
     pub api_key: Option<String>,
-    /// The temperature when a request gives none (`--temp`).
-    pub temperature: f64,
-    /// The sampling seed when a request gives none (`--seed`).
-    pub seed: u64,
+    /// Sampling when a request gives none (`--temp`, `--top-k`, ...).
+    pub sampling: SamplingDefaults,
+    /// The sampling seed when a request gives none (`--seed`); unset, a fresh one each time.
+    pub seed: Option<u64>,
     /// The reasoning when a request gives none (`--reasoning-effort`).
     pub reasoning_effort: ReasoningEffort,
     /// The model's `created` time in Unix seconds: when the server started.
     pub created: u64,
+}
+
+/// The server's sampling settings: each one set applies to every request that gives none, and
+/// each one unset follows the model card for the request's mode (thinking or not).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SamplingDefaults {
+    pub temperature: Option<f64>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f64>,
+    pub min_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
+}
+
+impl SamplingDefaults {
+    pub fn resolve(&self, thinking: bool) -> Sampling {
+        let card = Sampling::recommended(thinking);
+        Sampling {
+            temperature: self.temperature.unwrap_or(card.temperature),
+            top_k: self.top_k.unwrap_or(card.top_k),
+            top_p: self.top_p.unwrap_or(card.top_p),
+            min_p: self.min_p.unwrap_or(card.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(card.presence_penalty),
+        }
+    }
 }
 
 /// The largest request body.
@@ -147,9 +173,13 @@ impl Api {
     /// time, with the server's defaults and no output limit but the context.
     fn slot(&self) -> Result<serde_json::Value, ApiError> {
         let (context, speculative, processing) = self.ready()?;
+        // The defaults of the default reasoning; -1 is llama-server's random seed.
+        let sampling = self.config.sampling.resolve(self.config.reasoning_effort != ReasoningEffort::None);
         Ok(json!({
             "id": 0, "n_ctx": context, "speculative": speculative > 0, "is_processing": processing,
-            "params": {"n_predict": -1, "seed": self.config.seed, "temperature": self.config.temperature,
+            "params": {"n_predict": -1, "seed": self.config.seed.map_or(-1, |seed| seed as i128),
+                       "temperature": sampling.temperature, "top_k": sampling.top_k, "top_p": sampling.top_p,
+                       "min_p": sampling.min_p, "presence_penalty": sampling.presence_penalty,
                        "speculative.n_max": speculative},
         }))
     }

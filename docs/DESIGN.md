@@ -119,7 +119,8 @@ option, named as llama-server names it where it has the same setting.
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |
 | `--alias NAME` | model id in `/v1/models` and answers | `Qwen3.8-Flash-Next-<quant>` |
-| `--temp T`, `--seed N` | defaults when a request gives none | 0, 0 |
+| `--temp T`, `--top-k K`, `--top-p P`, `--min-p P`, `--presence-penalty X` | sampling when a request gives none | the model card's for the request's mode |
+| `--seed N` | seed when a request gives none | a fresh one per request |
 | `--reasoning-effort E` | reasoning when a request gives none: none, low, medium, high | high (the template's default) |
 | `--startup-timeout S`, `--log-file FILE`, `-v` | operations | 180 s, stderr |
 | `--config FILE` | the same settings as a TOML file | none |
@@ -149,15 +150,24 @@ There is no setup command: a model is fetched once, then given by path.
   - messages: system (and developer), user, assistant (content, `reasoning_content`,
     `tool_calls`) and tool messages; content as a string or text parts;
   - `tools`, `tool_choice` (`auto` or `none`);
-  - `max_tokens` / `max_completion_tokens`, `temperature`, `seed`, `stop`;
+  - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
+    `presence_penalty`, `seed`, `stop`;
   - `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and
     `chat_template_kwargs` (`enable_thinking`, the template's `reasoning_effort`);
   - `stream_options.include_usage`.
 
   Answers carry `reasoning_content` deltas, structured `tool_calls` and `usage`
   with `prompt_tokens_details.cached_tokens`, plus engine `timings`.
-- Sampling controls the engine does not implement (`top_p`, penalties, `n`,
-  `logprobs`, `logit_bias`, `top_k`, `min_p`, other `response_format`s, ...) are
+- Sampling: greedy at temperature 0, else `softmax(logits / temperature)` cut to
+  `top_k`, then `top_p`, then `min_p` (vLLM's order), after `presence_penalty` is
+  subtracted from every token the answer already holds. A control a request leaves
+  out takes the server's setting, else the model card's for the request's mode:
+  thinking `temperature=1.0, top_p=0.95, top_k=20`, non-thinking `temperature=0.7,
+  top_p=0.80, top_k=20, presence_penalty=1.5` (`min_p=0` in both). Greedy decoding
+  repeats itself endlessly with this model; it is never the default. MTP verification
+  stays exact: a draft is accepted with its probability under the same cut and penalty.
+- Sampling controls the engine does not implement (`n`, `typical_p`, frequency and
+  repetition penalties, `logprobs`, `logit_bias`, other `response_format`s, ...) are
   accepted only at their neutral value; anything else is a 400, never ignored.
 - Extension (optional `straydog` object in the request): `checkpoint` set to false
   marks a one-off request (a summary, a title) that saves no conversation checkpoint.
@@ -258,4 +268,5 @@ There is no setup command: a model is fetched once, then given by path.
    layers run in NumPy on the host, is not ported: a budget below the dense weights
    (about 3.4 GB) is an error. Partial residency covers every supported GPU.
 6. Sampling with a temperature uses Straydog's own RNG; a seed is reproducible
-   within Straydog, not across the reference.
+   within Straydog, not across the reference. The defaults are the model card's
+   sampling settings for the request's mode, not greedy decoding, which loops.

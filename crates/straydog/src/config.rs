@@ -91,10 +91,22 @@ pub struct Options {
     /// Model id in /v1/models and answers [default: Qwen3.8-Flash-Next-<quant>]
     #[arg(long, env = "STRAYDOG_ALIAS", value_name = "NAME")]
     pub alias: Option<String>,
-    /// Temperature when a request gives none [default: 0]
+    /// Temperature when a request gives none; 0 is greedy [default: the model card's, 1.0 thinking and 0.7 not]
     #[arg(long, env = "STRAYDOG_TEMP", value_name = "T")]
     pub temp: Option<f64>,
-    /// Sampling seed when a request gives none [default: 0]
+    /// Keep the K most likely tokens; 0 keeps all [default: the model card's, 20]
+    #[arg(long, env = "STRAYDOG_TOP_K", value_name = "K")]
+    pub top_k: Option<usize>,
+    /// Keep the most likely tokens holding P of the probability [default: the model card's, 0.95 thinking and 0.8 not]
+    #[arg(long, env = "STRAYDOG_TOP_P", value_name = "P")]
+    pub top_p: Option<f64>,
+    /// Keep tokens at least P times as likely as the most likely [default: the model card's, 0]
+    #[arg(long, env = "STRAYDOG_MIN_P", value_name = "P")]
+    pub min_p: Option<f64>,
+    /// Lower the logit of every token the answer already holds by X [default: the model card's, 0 thinking and 1.5 not]
+    #[arg(long, env = "STRAYDOG_PRESENCE_PENALTY", value_name = "X", allow_negative_numbers = true)]
+    pub presence_penalty: Option<f64>,
+    /// Sampling seed when a request gives none [default: a fresh one per request]
     #[arg(long, env = "STRAYDOG_SEED", value_name = "N")]
     pub seed: Option<u64>,
     /// Reasoning when a request gives none; high is the template's own default [default: high]
@@ -132,8 +144,14 @@ pub struct Settings {
     pub api_key: Option<String>,
     pub api_key_file: Option<PathBuf>,
     pub alias: String,
-    pub temp: f64,
-    pub seed: u64,
+    /// Unset sampling controls follow the model card for each request's mode.
+    pub temp: Option<f64>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f64>,
+    pub min_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    /// Unset: a fresh seed per request.
+    pub seed: Option<u64>,
     pub reasoning_effort: Effort,
     pub startup_timeout: f64,
     pub log_file: Option<PathBuf>,
@@ -197,8 +215,8 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
         }};
     }
     let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, device, split_mode, vram,
-                         state_ram, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, seed,
-                         reasoning_effort, startup_timeout, log_file, verbose);
+                         state_ram, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
+                         top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose);
     Ok((options, sources))
 }
 
@@ -299,9 +317,20 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if !(0.01..=256.0).contains(&state_ram) {
         return Err("--state-ram must be between 0.01 and 256 GiB".into());
     }
-    let temp = options.temp.unwrap_or(0.0);
-    if !(0.0..=2.0).contains(&temp) {
+    if options.temp.is_some_and(|temp| !(0.0..=2.0).contains(&temp)) {
         return Err("--temp must be between 0 and 2".into());
+    }
+    if options.top_k.is_some_and(|top_k| top_k > 1_000_000) {
+        return Err("--top-k must be at most 1000000".into());
+    }
+    if options.top_p.is_some_and(|top_p| !(top_p > 0.0 && top_p <= 1.0)) {
+        return Err("--top-p must be in (0, 1]".into());
+    }
+    if options.min_p.is_some_and(|min_p| !(0.0..1.0).contains(&min_p)) {
+        return Err("--min-p must be in [0, 1)".into());
+    }
+    if options.presence_penalty.is_some_and(|penalty| !(-2.0..=2.0).contains(&penalty)) {
+        return Err("--presence-penalty must be between -2 and 2".into());
     }
     let startup_timeout = options.startup_timeout.unwrap_or(180.0);
     if !(startup_timeout > 0.0 && startup_timeout <= 1800.0) {
@@ -343,8 +372,12 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         api_key,
         api_key_file,
         alias,
-        temp,
-        seed: options.seed.unwrap_or(0),
+        temp: options.temp,
+        top_k: options.top_k,
+        top_p: options.top_p,
+        min_p: options.min_p,
+        presence_penalty: options.presence_penalty,
+        seed: options.seed,
         reasoning_effort: options.reasoning_effort.unwrap_or(Effort::High),
         startup_timeout,
         log_file: options.log_file,
@@ -355,6 +388,9 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
 /// One line per setting: its value and where it came from (`derived` when filled in).
 pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
     let path = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string()).unwrap_or_default();
+    fn card<T: ToString>(value: Option<T>) -> String {
+        value.map_or_else(|| "(model card)".into(), |value| value.to_string())
+    }
     let values: Vec<(&str, String)> = vec![
         ("model", settings.model.display().to_string()),
         ("quant", settings.quant.clone()),
@@ -373,8 +409,12 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("api_key", if settings.api_key.is_some() { "(set)".into() } else { String::new() }),
         ("api_key_file", path(&settings.api_key_file)),
         ("alias", settings.alias.clone()),
-        ("temp", settings.temp.to_string()),
-        ("seed", settings.seed.to_string()),
+        ("temp", card(settings.temp)),
+        ("top_k", card(settings.top_k)),
+        ("top_p", card(settings.top_p)),
+        ("min_p", card(settings.min_p)),
+        ("presence_penalty", card(settings.presence_penalty)),
+        ("seed", settings.seed.map_or_else(|| "(fresh per request)".into(), |seed| seed.to_string())),
         ("reasoning_effort", format!("{:?}", settings.reasoning_effort).to_lowercase()),
         ("startup_timeout", settings.startup_timeout.to_string()),
         ("log_file", path(&settings.log_file)),

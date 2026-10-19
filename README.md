@@ -70,9 +70,12 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $(cat ~
 ```
 
 Answers carry `reasoning_content`, structured `tool_calls`, `usage` with
-`prompt_tokens_details.cached_tokens` and the engine's `timings`. Sampling controls the
-engine does not implement are refused (400), never ignored. A client that returns the
-reasoning in its assistant messages keeps the conversation cache warm.
+`prompt_tokens_details.cached_tokens` and the engine's `timings`. Sampling follows the
+model card unless a request or the server says otherwise: thinking `temperature=1.0,
+top_p=0.95, top_k=20`, non-thinking `temperature=0.7, top_p=0.8, top_k=20,
+presence_penalty=1.5`; `temperature: 0` is greedy. Sampling controls the engine does
+not implement are refused (400), never ignored. A client that returns the reasoning in
+its assistant messages keeps the conversation cache warm.
 
 Like llama-server, `GET /props` (`default_generation_settings.n_ctx`) and `GET /slots`
 report the context, and `GET /health` the loading progress.

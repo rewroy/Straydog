@@ -196,6 +196,10 @@ fn describe(settings: &Settings) -> Value {
         "address": format!("{}:{}", settings.host, settings.port),
         "api_key": settings.api_key.is_some(),
         "temperature": settings.temp,
+        "top_k": settings.top_k,
+        "top_p": settings.top_p,
+        "min_p": settings.min_p,
+        "presence_penalty": settings.presence_penalty,
         "seed": settings.seed,
         "reasoning_effort": match settings.reasoning_effort {
             Effort::None => "none",

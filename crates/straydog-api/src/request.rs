@@ -2,8 +2,9 @@
 //!
 //! `messages` and `tools` pass through as Python's `json.loads` read them, so the template
 //! renders the client's numbers, key order and strings. Everything else is checked here, and
-//! what the engine cannot honor is a 400: a sampling control is accepted only at the value
-//! that turns it off, never ignored.
+//! what the engine cannot honor is a 400: a sampling control it does not implement is
+//! accepted only at the value that turns it off, never ignored. Sampling a request leaves
+//! out follows the server's settings, then the model card for the request's mode.
 
 use std::str::FromStr;
 
@@ -55,13 +56,9 @@ impl FromStr for ReasoningEffort {
 
 /// Controls the engine does not implement, each with the one value a request may give: the
 /// one that turns it off.
-const NEUTRAL: [(&str, &str); 15] = [
+const NEUTRAL: [(&str, &str); 11] = [
     ("n", "1"),
-    ("top_p", "1"),
-    ("top_k", "0"),
-    ("min_p", "0"),
     ("typical_p", "1"),
-    ("presence_penalty", "0"),
     ("frequency_penalty", "0"),
     ("repeat_penalty", "1"),
     ("repetition_penalty", "1"),
@@ -127,16 +124,20 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
         Some((_, Value::Int(count))) if *count >= 1 => Value::Int(*count),
         Some((key, _)) => return Err(ApiError::invalid(format!("{key} must be a positive integer"))),
     };
-    let temperature = match given(payload, "temperature") {
-        None => Some(config.temperature),
-        Some(Value::Int(number)) => Some(*number as f64),
-        Some(Value::Float(number)) => Some(*number),
-        Some(_) => None,
-    }
-    .filter(|temperature| (0.0..=2.0).contains(temperature))
-    .ok_or_else(|| ApiError::invalid("temperature must be between 0 and 2"))?;
+    let temperature = number(payload, "temperature", |value| (0.0..=2.0).contains(&value), "between 0 and 2")?;
+    let top_p = number(payload, "top_p", |value| value > 0.0 && value <= 1.0, "in (0, 1]")?;
+    let min_p = number(payload, "min_p", |value| (0.0..1.0).contains(&value), "in [0, 1)")?;
+    let presence_penalty = number(payload, "presence_penalty", |value| (-2.0..=2.0).contains(&value), "between -2 and 2")?;
+    // 0 and -1 (vLLM's spelling) keep every token.
+    let top_k = match given(payload, "top_k") {
+        None => None,
+        Some(Value::Int(-1)) => Some(0),
+        Some(Value::Int(count)) => Some(usize::try_from(*count).ok().filter(|count| *count <= 1_000_000)
+            .ok_or_else(|| ApiError::invalid("top_k must be -1, 0 or a positive integer"))?),
+        Some(_) => return Err(ApiError::invalid("top_k must be -1, 0 or a positive integer")),
+    };
     let seed = match given(payload, "seed") {
-        None => Some(config.seed),
+        None => Some(config.seed.unwrap_or_else(|| getrandom::u64().expect("the OS random source"))),
         Some(Value::Int(seed)) => u64::try_from(*seed).ok(),
         Some(_) => None,
     }
@@ -212,18 +213,33 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
         Some(_) => return Err(ApiError::invalid("stream_options must be an object")),
     };
 
+    let defaults = config.sampling.resolve(thinking);
     let messages = messages.iter().map(message).collect::<Result<Vec<_>, _>>()?;
     let request = Value::Object(vec![
         ("messages".into(), Value::Array(messages)),
         ("tools".into(), tools.clone().unwrap_or(Value::Null)),
         ("max_tokens".into(), max_tokens),
-        ("temperature".into(), Value::Float(temperature)),
+        ("temperature".into(), Value::Float(temperature.unwrap_or(defaults.temperature))),
+        ("top_k".into(), Value::Int(top_k.unwrap_or(defaults.top_k) as i128)),
+        ("top_p".into(), Value::Float(top_p.unwrap_or(defaults.top_p))),
+        ("min_p".into(), Value::Float(min_p.unwrap_or(defaults.min_p))),
+        ("presence_penalty".into(), Value::Float(presence_penalty.unwrap_or(defaults.presence_penalty))),
         ("seed".into(), Value::Int(seed.into())),
         ("thinking".into(), Value::Bool(thinking)),
         ("reasoning_effort".into(), Value::Str(level.into())),
         ("checkpoint".into(), Value::Bool(checkpoint)),
     ]);
     Ok((request, Shape { thinking, tools, stops, stream, include_usage }))
+}
+
+/// A number the request gives, checked by `valid`.
+fn number(payload: &Value, key: &str, valid: impl Fn(f64) -> bool, range: &str) -> Result<Option<f64>, ApiError> {
+    match given(payload, key) {
+        None => Ok(None),
+        Some(Value::Int(number)) if valid(*number as f64) => Ok(Some(*number as f64)),
+        Some(Value::Float(number)) if valid(*number) => Ok(Some(*number)),
+        Some(_) => Err(ApiError::invalid(format!("{key} must be {range}"))),
+    }
 }
 
 /// A field of `object`, null counting as absent.

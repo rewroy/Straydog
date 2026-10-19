@@ -16,6 +16,7 @@ use straydog_engine::chat::ChatTemplate;
 use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings};
 use straydog_engine::pyjson;
+use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 use straydog_engine::weights::Weights;
 
@@ -264,6 +265,25 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         Some(Py::Bool(value)) => f64::from(u8::from(*value)),
         Some(_) => return Err(refused("invalid Straydog temperature")),
     };
+    // Absent, each control is off: the server's API fills in the model card's settings.
+    let number = |key: &str, neutral: f64| match body.get(key) {
+        None | Some(Py::Null) => Ok(neutral),
+        Some(Py::Int(value)) => Ok(*value as f64),
+        Some(Py::Float(value)) => Ok(*value),
+        Some(_) => Err(refused(format!("invalid Straydog {key}"))),
+    };
+    let top_k = match body.get("top_k") {
+        None | Some(Py::Null) => 0,
+        Some(Py::Int(value)) if (0..=1_000_000).contains(value) => *value as usize,
+        Some(_) => return Err(refused("invalid Straydog top_k")),
+    };
+    let sampling = Sampling {
+        temperature,
+        top_k,
+        top_p: number("top_p", 1.0)?,
+        min_p: number("min_p", 0.0)?,
+        presence_penalty: number("presence_penalty", 0.0)?,
+    };
     let seed = match body.get("seed") {
         None => 0,
         Some(Py::Int(value)) if *value >= 0 => *value as u64,
@@ -272,9 +292,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     if ids.is_empty() || max_new < 1 || max_new > context as i128 || ids.len() as i128 + max_new > context as i128 {
         return Err(refused("Straydog prompt plus output exceeds the allocated context"));
     }
-    if !temperature.is_finite() || temperature < 0.0 {
-        return Err(refused("invalid Straydog temperature"));
-    }
+    sampling.check().map_err(refused)?;
     // A prompt ending in a tool result continues the same reply; one ending in a user message starts one.
     let turn = match messages {
         Py::Array(items) => items.last().and_then(|last| last.get("role")).and_then(Py::as_str) != Some("tool"),
@@ -287,7 +305,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let mut decode_error: Option<String> = None;
     let cancelled = || cancel.load(Ordering::SeqCst);
     let result = engine.model.generate(
-        &ids, max_new, temperature, seed, &cancelled,
+        &ids, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
         turn, checkpoint,
         &mut |token| {

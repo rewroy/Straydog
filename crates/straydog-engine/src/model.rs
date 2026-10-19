@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::gpu::{expert_bytes, CpuExperts, Operand, Result, HIDDEN, WIDTH};
 use crate::group::{row_count, Group};
+use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Weights, CONTEXT_LIMIT};
 
 pub const MAX_DRAFTS: usize = 3;
@@ -789,25 +790,18 @@ impl Model {
         Ok(())
     }
 
-    /// Accepted draft count and the next token: a greedy match, or exact speculative sampling.
-    fn accept(drafts: &[u32], targets: &[i32], scores: Option<&[f32]>, temperature: f64, rng: &mut Rng) -> (usize, u32) {
-        let Some(scores) = scores.filter(|_| temperature > 0.0) else {
+    /// Accepted draft count and the next token: a match with the GPU's argmax when greedy,
+    /// else decided on the rows' logits (see [`sampling::accept`]).
+    fn accept(drafts: &[u32], targets: &[i32], scores: Option<&[f32]>, sampling: &Sampling, generated: &mut Generated,
+              rng: &mut Rng) -> (usize, u32) {
+        let Some(scores) = scores.filter(|_| sampling.needs_logits()) else {
             let accepted = drafts.iter().zip(targets).take_while(|(draft, target)| **draft == **target as u32).count();
+            for draft in &drafts[..accepted] {
+                generated.insert(*draft);
+            }
             return (accepted, targets[accepted] as u32);
         };
-        for (index, draft) in drafts.iter().enumerate() {
-            let probabilities = softmax(&scores[index * VOCABULARY..(index + 1) * VOCABULARY], temperature);
-            if rng.random() < probabilities[*draft as usize] {
-                continue;
-            }
-            // A deterministic draft is a point proposal: resample from the target without it.
-            let mut residual = probabilities;
-            residual[*draft as usize] = 0.0;
-            return (index, rng.choice(&residual) as u32);
-        }
-        let index = drafts.len();
-        let probabilities = softmax(&scores[index * VOCABULARY..(index + 1) * VOCABULARY], temperature);
-        (index, rng.choice(&probabilities) as u32)
+        sampling::accept(drafts, scores, VOCABULARY, sampling, generated, rng)
     }
 
     fn metric_add(&mut self, key: &str, amount: f64) {
@@ -827,10 +821,12 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_speculative(&mut self, logits: &[f32], max_new: usize, temperature: f64, rng: &mut Rng,
+    fn generate_speculative(&mut self, logits: &[f32], max_new: usize, sampling: &Sampling, rng: &mut Rng,
                             cancelled: &dyn Fn() -> bool, started: Instant, emit: &mut dyn FnMut(u32))
                             -> Result<()> {
-        let mut token = if temperature == 0.0 { argmax(logits) } else { rng.choice(&softmax(logits, temperature)) as u32 };
+        let mut generated = Generated::new(VOCABULARY);
+        let mut token = sampling::choose(logits, sampling, &generated, rng);
+        generated.insert(token);
         if END_TOKENS.contains(&token) {
             return Ok(());
         }
@@ -861,8 +857,9 @@ impl Model {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }
             let position = self.history.len() as u64;
-            let (first, embeddings, hidden, targets, scores) = self.verify(&rows, temperature > 0.0)?;
-            let (accepted, following) = Self::accept(&drafts, &targets, scores.as_deref(), temperature, rng);
+            let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits())?;
+            let (accepted, following) = Self::accept(&drafts, &targets, scores.as_deref(), sampling, &mut generated, rng);
+            generated.insert(following);
             if !drafts.is_empty() {
                 let attempted = accepted + usize::from(accepted < drafts.len());
                 acceptance = 0.9 * acceptance + 0.1 * accepted as f64 / attempted as f64;
@@ -901,7 +898,7 @@ impl Model {
     /// held. `turn`: the prompt ends with a user message rather than a tool result;
     /// `checkpoint` false marks a one-off request whose reply no later request continues.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate(&mut self, tokens: &[u32], max_new: usize, temperature: f64, seed: u64,
+    pub fn generate(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
                     cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool, checkpoint: bool,
                     emit: &mut dyn FnMut(u32)) -> Result<()> {
         let started = Instant::now();
@@ -909,9 +906,7 @@ impl Model {
         if tokens.is_empty() || max_new == 0 || max_new > self.context || tokens.len() + max_new > self.context {
             return Err("Straydog prompt plus output exceeds the allocated context".into());
         }
-        if !temperature.is_finite() || temperature < 0.0 {
-            return Err("invalid Straydog temperature".into());
-        }
+        sampling.check()?;
         self.weights.check_unchanged()?;
         let (reused, resumed) = self.resume(tokens)?;
         self.last_metrics = json!({
@@ -963,14 +958,15 @@ impl Model {
         let mut rng = Rng::new(seed);
         let Some(mut logits) = output else { return Ok(()) };
         if self.speculative > 0 {
-            return self.generate_speculative(&logits, max_new, temperature, &mut rng, cancelled, started, emit);
+            return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit);
         }
+        let mut generated = Generated::new(VOCABULARY);
         for index in 0..max_new {
             if cancelled() {
                 return Ok(());
             }
-            let token =
-                if temperature == 0.0 { argmax(&logits) } else { rng.choice(&softmax(&logits, temperature)) as u32 };
+            let token = sampling::choose(&logits, sampling, &generated, &mut rng);
+            generated.insert(token);
             if END_TOKENS.contains(&token) {
                 return Ok(());
             }

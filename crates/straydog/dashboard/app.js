@@ -39,7 +39,8 @@ const STRINGS = {
     draftMax: "MTP drafts", devices: "GPUs", vramBudget: "VRAM per GPU", splitMode: "Split",
     stateRam: "Host memory for state", gemm: "GEMM precision", gemmMin: "GEMM from batch", address: "Address",
     required: "required", notRequired: "not required", defaultTemp: "Default temperature", defaultSeed: "Default seed",
-    defaultEffort: "Default reasoning", startupTimeout: "Startup timeout", pci: "PCI", fan: "Fan", clock: "Clock",
+    defaultEffort: "Default reasoning", startupTimeout: "Startup timeout", topK: "Top-k", topP: "Top-p",
+    minP: "Min-p", presencePenalty: "Presence penalty", modelCard: "model card", freshSeed: "fresh per request", pci: "PCI", fan: "Fan", clock: "Clock",
     powerCap: "Power limit", deviceMemory: "Device memory", allocated: "Straydog allocation",
     budgetOf: "{0} / {1} GiB budget", noSensors: "No sensors for this GPU.", waiting: "Waiting for the engine…",
     time: "Time", prompt: "Prompt", completion: "Completion", ttft: "First token", finish: "Finish",
@@ -77,7 +78,8 @@ const STRINGS = {
     draftMax: "MTP ドラフト", devices: "GPU", vramBudget: "GPU ごとの VRAM", splitMode: "分割",
     stateRam: "系列状態のホストメモリ", gemm: "GEMM 精度", gemmMin: "GEMM 開始バッチ", address: "アドレス",
     required: "必要", notRequired: "不要", defaultTemp: "既定の温度", defaultSeed: "既定のシード",
-    defaultEffort: "既定の思考", startupTimeout: "起動タイムアウト", pci: "PCI", fan: "ファン", clock: "クロック",
+    defaultEffort: "既定の思考", startupTimeout: "起動タイムアウト", topK: "Top-k", topP: "Top-p",
+    minP: "Min-p", presencePenalty: "Presence penalty", modelCard: "モデルカード準拠", freshSeed: "リクエストごとに新規", pci: "PCI", fan: "ファン", clock: "クロック",
     powerCap: "電力上限", deviceMemory: "デバイスメモリ", allocated: "Straydog の確保",
     budgetOf: "予算 {1} GiB 中 {0}", noSensors: "この GPU のセンサーは読めません。", waiting: "エンジンを待っています…",
     time: "時刻", prompt: "プロンプト", completion: "生成", ttft: "最初のトークン", finish: "終了理由",
@@ -421,7 +423,7 @@ function render({ now, server, engine, host, samples: fresh = [] }) {
   renderEngine(engine, ready, activity);
   renderEnvironment(engine, host, server);
   if (!effortChosen) $("effort").value = server.reasoning_effort;
-  $("temperature").placeholder = number(server.temperature, 1);
+  $("temperature").placeholder = server.temperature == null ? t("auto") : number(server.temperature, 1);
   $("chat-open").classList.toggle("busy", Boolean(controller));
 }
 
@@ -870,8 +872,12 @@ function renderEnvironment(engine, host, server) {
     [t("gemmMin"), number(server.gemm_min_batch)],
     [t("address"), server.address],
     [t("apiKey"), server.api_key ? t("required") : t("notRequired")],
-    [t("defaultTemp"), number(server.temperature, 2)],
-    [t("defaultSeed"), String(server.seed)],
+    [t("defaultTemp"), server.temperature == null ? t("modelCard") : number(server.temperature, 2)],
+    [t("topK"), server.top_k == null ? t("modelCard") : number(server.top_k)],
+    [t("topP"), server.top_p == null ? t("modelCard") : number(server.top_p, 2)],
+    [t("minP"), server.min_p == null ? t("modelCard") : number(server.min_p, 2)],
+    [t("presencePenalty"), server.presence_penalty == null ? t("modelCard") : number(server.presence_penalty, 2)],
+    [t("defaultSeed"), server.seed == null ? t("freshSeed") : String(server.seed)],
     [t("defaultEffort"), server.reasoning_effort],
     [t("startupTimeout"), `${number(server.startup_timeout)} s`],
   ]);

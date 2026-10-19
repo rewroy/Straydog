@@ -11,5 +11,6 @@ pub mod host;
 pub mod model;
 pub mod pyjson;
 pub mod reply;
+pub mod sampling;
 pub mod text;
 pub mod weights;

@@ -70,7 +70,7 @@ fn generations_equal_the_reference() {
             let comparable = !model.partial || fresh || resumed == "root";
             model.logits_digests = Some(Vec::new());
             let mut tokens = Vec::new();
-            model.generate(&prompt, request["max_new"].as_u64().unwrap() as usize, 0.0, 0, &|| false, &mut |_, _| {},
+            model.generate(&prompt, request["max_new"].as_u64().unwrap() as usize, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| false, &mut |_, _| {},
                            request["turn"].as_bool().unwrap(), request["checkpoint"].as_bool().unwrap(),
                            &mut |token| tokens.push(token)).unwrap();
             if !comparable {

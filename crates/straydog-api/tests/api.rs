@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use straydog_api::{router, ApiConfig, Engine, EngineState, Generation, ReasoningEffort, SubmitError};
+use straydog_api::{router, ApiConfig, Engine, EngineState, Generation, ReasoningEffort, SamplingDefaults, SubmitError};
 use straydog_engine::pyjson;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -111,8 +111,8 @@ fn config() -> ApiConfig {
         context: 262144,
         quantization: "IQ3_S".into(),
         api_key: None,
-        temperature: 0.0,
-        seed: 0,
+        sampling: SamplingDefaults::default(),
+        seed: Some(0),
         reasoning_effort: ReasoningEffort::High,
         created: 1_760_000_000,
     }
@@ -445,7 +445,7 @@ async fn messages_and_tools_reach_the_engine_as_python_reads_them() {
     let (status, _, _) = send(app(&mock), chat(body)).await;
     assert_eq!(status, StatusCode::OK);
     let expected = format!(
-        r#"{{"messages": {messages}, "tools": {tools}, "max_tokens": null, "temperature": 0.5, "seed": 0, "thinking": true, "reasoning_effort": "xhigh", "checkpoint": true}}"#
+        r#"{{"messages": {messages}, "tools": {tools}, "max_tokens": null, "temperature": 0.5, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "presence_penalty": 0.0, "seed": 0, "thinking": true, "reasoning_effort": "xhigh", "checkpoint": true}}"#
     );
     assert_eq!(pyjson::dumps(&mock.requests()[0]), expected);
 }
@@ -478,24 +478,63 @@ async fn settings_reach_the_worker_request() {
         assert_eq!(field(request, "reasoning_effort").as_str(), Some(level), "{fields}");
     }
 
+    let card = r#""top_k": 20, "top_p": 0.95, "min_p": 0.0, "presence_penalty": 0.0"#;
     let cases = [
-        (json!({}), r#"null, "temperature": 0.7, "seed": 42, "#, true),
-        (json!({"max_tokens": 5, "temperature": 1, "seed": 7}), r#"5, "temperature": 1.0, "seed": 7, "#, true),
+        (json!({}), format!(r#"null, "temperature": 0.7, {card}, "seed": 42, "#), true),
+        (json!({"max_tokens": 5, "temperature": 1, "seed": 7}), format!(r#"5, "temperature": 1.0, {card}, "seed": 7, "#), true),
         (json!({"max_tokens": 5, "max_completion_tokens": 9, "straydog": {"checkpoint": false}}),
-         r#"9, "temperature": 0.7, "seed": 42, "#, false),
+         format!(r#"9, "temperature": 0.7, {card}, "seed": 42, "#), false),
         (json!({"max_completion_tokens": null, "max_tokens": 3, "straydog": {}}),
-         r#"3, "temperature": 0.7, "seed": 42, "#, true),
+         format!(r#"3, "temperature": 0.7, {card}, "seed": 42, "#), true),
     ];
     for (fields, numbers, checkpoint) in cases {
         let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
         let mut settings = config();
-        (settings.temperature, settings.seed) = (0.7, 42);
+        (settings.sampling.temperature, settings.seed) = (Some(0.7), Some(42));
         let (status, _, _) = send(router(mock.clone(), settings), chat(ask(fields.clone()).to_string())).await;
         assert_eq!(status, StatusCode::OK, "{fields}");
         let request = pyjson::dumps(&mock.requests()[0]);
         assert!(request.contains(&format!(r#""max_tokens": {numbers}"#)), "{request}");
         assert!(request.ends_with(&format!(r#""checkpoint": {checkpoint}}}"#)), "{request}");
     }
+}
+
+#[tokio::test]
+async fn sampling_follows_the_request_then_the_server_then_the_model_card_for_the_mode() {
+    let sampling = |request: &pyjson::Value| -> Vec<String> {
+        ["temperature", "top_k", "top_p", "min_p", "presence_penalty"].iter()
+            .map(|key| pyjson::dumps(field(request, key))).collect()
+    };
+    let cases = [
+        // The model card: thinking, and not.
+        (json!({}), SamplingDefaults::default(), ["1.0", "20", "0.95", "0.0", "0.0"]),
+        (json!({"reasoning_effort": "none"}), SamplingDefaults::default(), ["0.7", "20", "0.8", "0.0", "1.5"]),
+        (json!({"chat_template_kwargs": {"enable_thinking": false}}), SamplingDefaults::default(),
+         ["0.7", "20", "0.8", "0.0", "1.5"]),
+        // The server's settings, then the request's.
+        (json!({"reasoning_effort": "none"}), SamplingDefaults { top_k: Some(40), presence_penalty: Some(0.0), ..Default::default() },
+         ["0.7", "40", "0.8", "0.0", "0.0"]),
+        (json!({"temperature": 0, "top_k": -1, "top_p": 1, "min_p": 0.05, "presence_penalty": -0.5}),
+         SamplingDefaults { top_k: Some(40), ..Default::default() }, ["0.0", "0", "1.0", "0.05", "-0.5"]),
+    ];
+    for (fields, defaults, expected) in cases {
+        let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
+        let mut settings = config();
+        settings.sampling = defaults;
+        let (status, _, _) = send(router(mock.clone(), settings), chat(ask(fields.clone()).to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{fields}");
+        assert_eq!(sampling(&mock.requests()[0]), expected, "{fields}");
+    }
+    // Without a seed anywhere, each request gets a fresh one.
+    let mock = Mock::new(vec![Script::Events(vec![done("stop")]), Script::Events(vec![done("stop")])]);
+    let mut settings = config();
+    settings.seed = None;
+    for _ in 0..2 {
+        let (status, _, _) = send(router(mock.clone(), settings.clone()), chat(ask(json!({})).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let seeds: Vec<String> = mock.requests().iter().map(|request| pyjson::dumps(field(request, "seed"))).collect();
+    assert_ne!(seeds[0], seeds[1]);
 }
 
 #[tokio::test]
@@ -530,12 +569,13 @@ async fn invalid_requests_are_refused() {
         (json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}), "only text content is supported"),
         (json!({"messages": [{"role": "user", "content": 5}]}), content),
         (ask(json!({"n": 2})), "n is not supported (only 1)"),
-        (ask(json!({"top_p": 0.9})), "top_p is not supported (only 1)"),
-        (ask(json!({"top_p": true})), "top_p is not supported (only 1)"),
-        (ask(json!({"top_k": 20})), "top_k is not supported (only 0)"),
-        (ask(json!({"min_p": 0.05})), "min_p is not supported (only 0)"),
+        (ask(json!({"top_p": 0})), "top_p must be in (0, 1]"),
+        (ask(json!({"top_p": true})), "top_p must be in (0, 1]"),
+        (ask(json!({"top_k": 1.5})), "top_k must be -1, 0 or a positive integer"),
+        (ask(json!({"top_k": -2})), "top_k must be -1, 0 or a positive integer"),
+        (ask(json!({"min_p": 1})), "min_p must be in [0, 1)"),
         (ask(json!({"typical_p": 0.9})), "typical_p is not supported (only 1)"),
-        (ask(json!({"presence_penalty": 0.5})), "presence_penalty is not supported (only 0)"),
+        (ask(json!({"presence_penalty": 2.5})), "presence_penalty must be between -2 and 2"),
         (ask(json!({"frequency_penalty": 1})), "frequency_penalty is not supported (only 0)"),
         (ask(json!({"repeat_penalty": 1.1})), "repeat_penalty is not supported (only 1)"),
         (ask(json!({"repetition_penalty": 1.05})), "repetition_penalty is not supported (only 1)"),
@@ -680,7 +720,8 @@ async fn health_and_models_follow_the_engine() {
                                                  "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
-                      "params": {"n_predict": -1, "seed": 0, "temperature": 0.0, "speculative.n_max": 3}});
+                      "params": {"n_predict": -1, "seed": 0, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
+                                 "min_p": 0.0, "presence_penalty": 0.0, "speculative.n_max": 3}});
     let (status, props) = fetch(app(&mock), get("/props")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,

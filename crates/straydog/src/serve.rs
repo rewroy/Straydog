@@ -66,7 +66,13 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             context: u64::from(settings.ctx_size),
             quantization: settings.quant.clone(),
             api_key: settings.api_key.clone(),
-            temperature: settings.temp,
+            sampling: straydog_api::SamplingDefaults {
+                temperature: settings.temp,
+                top_k: settings.top_k,
+                top_p: settings.top_p,
+                min_p: settings.min_p,
+                presence_penalty: settings.presence_penalty,
+            },
             seed: settings.seed,
             reasoning_effort: match settings.reasoning_effort {
                 Effort::None => ReasoningEffort::None,
