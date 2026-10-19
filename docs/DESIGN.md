@@ -47,7 +47,7 @@ target.
 ### 4.1 Processes
 
 ```
-straydog serve ──HTTP──▶ clients
+straydog ──HTTP──▶ clients
    │  runtime: one worker, a bounded queue (4), cancellation
    │  stdio, JSON lines (one frame per event; ~8 µs per token)
    ▼
@@ -100,8 +100,8 @@ same C ABI the engine uses. They are development tooling, not part of the produc
 
 ## 5. Command line and configuration
 
-`straydog serve` takes llama.cpp-style options. Where llama-server has the same
-setting, the name is the same.
+With no subcommand, `straydog` is the server, as llama-server is: every setting is an
+option, named as llama-server names it where it has the same setting.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
@@ -122,12 +122,12 @@ setting, the name is the same.
 | `--temp T`, `--seed N` | defaults when a request gives none | 0, 0 |
 | `--reasoning-effort E` | reasoning when a request gives none: none, low, medium, high | high (the template's default) |
 | `--startup-timeout S`, `--log-file FILE`, `-v` | operations | 180 s, stderr |
-| `--config FILE` | the same settings as a file | `~/.straydog/config.toml` when present |
+| `--config FILE` | the same settings as a TOML file | none |
 
 Precedence: options, then `STRAYDOG_*` environment variables (`STRAYDOG_CTX_SIZE`),
 then the config file, then defaults. One `clap` definition gives the options and the
-variables; the file uses the same names. `straydog serve --print-config` shows the
-settings in effect and where each came from.
+variables; the file uses the same names. `--print-config` shows the settings in effect
+and where each came from. Nothing is read from a home directory unless given.
 
 There is no `-ngl`. Residency is decided by measuring what fits:
 - full residency first, then host K/V, then a smaller prefill batch;
@@ -136,11 +136,8 @@ There is no `-ngl`. Residency is decided by measuring what fits:
 There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authenticated
 before use. The pins are compiled into the executable.
 
-Other commands:
-- `straydog init`: interactive setup. It chooses a quantization and GPUs, fetches
-  and authenticates the model, builds the drafter, writes the config and the key,
-  and optionally installs a systemd user service.
-- `straydog fetch`, `straydog verify`, `straydog fetch-mtp`.
+Subcommands: `straydog fetch`, `straydog verify`, `straydog fetch-mtp` (provisioning).
+There is no setup command: a model is fetched once, then given by path.
 
 ## 6. API
 
@@ -222,7 +219,7 @@ Other commands:
   transparent huge pages, as NumPy's do (a 160 MB prompt buffer otherwise costs some
   40,000 page faults).
 - **R5** (done on Linux): isolation (bubblewrap, AppContainer) and provisioning (`fetch`,
-  `verify`, `fetch-mtp`, `init`). Gate met: the drafter built by Rust equals the pin byte
+  `verify`, `fetch-mtp`). Gate met: the drafter built by Rust equals the pin byte
   for byte. The worker runs under bubblewrap with a cleared environment; the AppContainer
   launcher builds and passes its tests on Linux but has not run on Windows.
 - **R6**: alternating A/B against the reference on the single-request benchmark and
@@ -242,8 +239,9 @@ Other commands:
    `axum` on `tokio` (this replaces Starlette and uvicorn).
 3. Port 8080 by default (`--port` changes it). An API key is optional and required
    only once one is given.
-4. Home directory `~/.straydog` (config, models, drafter). Existing model
-   directories are used in place. The config file is TOML.
+4. No home directory: models, the drafter and an optional TOML config file are given
+   by path; existing model directories are used in place. (`init`, `serve` and an
+   implicit `~/.straydog/config.toml` were dropped: the options are the interface.)
 5. The bounded-cache tier, where the dense weights do not fit the GPU budget and
    layers run in NumPy on the host, is not ported: a budget below the dense weights
    (about 3.4 GB) is an error. Partial residency covers every supported GPU.

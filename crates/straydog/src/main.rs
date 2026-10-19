@@ -1,4 +1,4 @@
-//! The `straydog` command: the server, its isolated worker, and provisioning.
+//! The `straydog` command: the server (with no subcommand), its isolated worker, and provisioning.
 
 mod serve;
 
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use straydog::{config, init, progress, worker};
+use straydog::{config, progress, worker};
 
 #[cfg(not(any(feature = "hip", feature = "cuda")))]
 compile_error!("the straydog executable links one GPU backend: build it with --features hip or --features cuda");
@@ -16,28 +16,25 @@ compile_error!("the straydog executable links one GPU backend: build it with --f
 #[global_allocator]
 static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::HugePages;
 
+/// With no subcommand, `straydog` serves the API with the given settings, as llama-server does.
 #[derive(Parser)]
-#[command(name = "straydog", version, about = "A local inference engine with an OpenAI-compatible server")]
+#[command(name = "straydog", version, about = "A local inference engine with an OpenAI-compatible server",
+          args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(flatten)]
+    options: config::Options,
+    /// Read settings from a TOML file (the option names, with underscores)
+    #[arg(long, env = "STRAYDOG_CONFIG", value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Show the settings in effect and where each came from, then exit
+    #[arg(long)]
+    print_config: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the OpenAI-compatible API
-    Serve {
-        #[command(flatten)]
-        options: config::Options,
-        /// The same settings as a file [default: ~/.straydog/config.toml when present]
-        #[arg(long, env = "STRAYDOG_CONFIG", value_name = "FILE")]
-        config: Option<PathBuf>,
-        /// Show the settings in effect and where each came from, then exit
-        #[arg(long)]
-        print_config: bool,
-    },
-    /// Set up: choose a bundle and GPUs, fetch the model and drafter, write the config
-    Init(init::InitArgs),
     /// Download and authenticate a model bundle
     Fetch {
         /// The bundle directory
@@ -77,29 +74,23 @@ enum Command {
     },
 }
 
-
 fn main() -> ExitCode {
-    let cli = Cli::parse_from(config::expand_short_options(std::env::args_os()));
+    let args = config::expand_short_options(std::env::args_os());
+    let matches = <Cli as clap::CommandFactory>::command().get_matches_from(args);
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let result = match cli.command {
-        Command::Serve { .. } => {
-            let matches = <Cli as clap::CommandFactory>::command()
-                .get_matches_from(config::expand_short_options(std::env::args_os()));
-            let (_, matches) = matches.subcommand().expect("serve");
-            let Command::Serve { config, print_config, .. } = cli.command else { unreachable!() };
-            serve::main(matches, config.as_deref(), print_config)
-        }
-        Command::Init(args) => init::main(args),
-        Command::Fetch { model, quant, offline } => straydog_provision::fetch(&model, &quant, offline, &progress::report),
-        Command::Verify { model, quant } => straydog_provision::verify(&model, &quant, &progress::report),
-        Command::FetchMtp { directory, keep_source } => {
+        None => serve::main(&matches, cli.config.as_deref(), cli.print_config),
+        Some(Command::Fetch { model, quant, offline }) => straydog_provision::fetch(&model, &quant, offline, &progress::report),
+        Some(Command::Verify { model, quant }) => straydog_provision::verify(&model, &quant, &progress::report),
+        Some(Command::FetchMtp { directory, keep_source }) => {
             straydog_provision::fetch_drafter(&directory, keep_source, &progress::report)
                 .map(|path| println!("verified {}", path.display()))
         }
-        Command::Worker(args) => worker::main(args),
+        Some(Command::Worker(args)) => worker::main(args),
         #[cfg(windows)]
-        Command::Contain { args } => return ExitCode::from(straydog_isolation::launcher_main(&args) as u8),
+        Some(Command::Contain { args }) => return ExitCode::from(straydog_isolation::launcher_main(&args) as u8),
         #[cfg(not(windows))]
-        Command::Contain { .. } => Err("contain is the Windows AppContainer launcher".into()),
+        Some(Command::Contain { .. }) => Err("contain is the Windows AppContainer launcher".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

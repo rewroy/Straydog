@@ -1,5 +1,5 @@
-//! `straydog serve` settings: one definition for the options, the `STRAYDOG_*` variables and
-//! the config file. Precedence: options, then variables, then the file, then defaults;
+//! The server's settings: one definition for the options, the `STRAYDOG_*` variables and
+//! an optional config file. Precedence: options, then variables, then the file, then defaults;
 //! settings left unset are derived from the others and from the machine.
 
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub enum Effort {
     High,
 }
 
-/// Every setting of `straydog serve`. Field names are the long options with underscores;
+/// Every setting of the server. Field names are the long options with underscores;
 /// the config file uses the same names.
 #[derive(Debug, Clone, Default, Args, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +44,7 @@ pub struct Options {
     /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS or IQ3_S [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
-    /// MTP drafter directory
+    /// MTP drafter directory (also -md)
     #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "DIR")]
     pub model_draft: Option<PathBuf>,
     /// MTP drafts per pass, 0 turns speculation off [default: 3 with a drafter]
@@ -58,10 +58,10 @@ pub struct Options {
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=4096))]
     pub batch_size: Option<u16>,
-    /// GPU ordinals, comma separated [default: 0]
+    /// GPU ordinals, comma separated (also -dev) [default: 0]
     #[arg(long = "device", env = "STRAYDOG_DEVICE", value_name = "LIST", value_delimiter = ',')]
     pub device: Option<Vec<usize>>,
-    /// With two GPUs holding the whole model: experts splits every layer's experts, layer splits the layers [default: experts]
+    /// With two GPUs holding the whole model: experts splits every layer's experts, layer splits the layers (also -sm) [default: experts]
     #[arg(long = "split-mode", env = "STRAYDOG_SPLIT_MODE", value_name = "MODE")]
     pub split_mode: Option<SplitMode>,
     /// VRAM budget per GPU in GiB [default: 6]
@@ -140,10 +140,6 @@ pub struct Settings {
     pub verbose: bool,
 }
 
-pub fn straydog_home() -> Option<PathBuf> {
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| PathBuf::from(home).join(".straydog"))
-}
-
 /// llama.cpp's multi-letter short options, as their long forms (clap's short options are one letter).
 pub fn expand_short_options(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     args.into_iter()
@@ -165,10 +161,10 @@ pub fn expand_short_options(args: impl IntoIterator<Item = std::ffi::OsString>) 
 /// Where each setting came from, for `--print-config`.
 pub type Sources = Vec<(&'static str, String)>;
 
-/// Merge the command line (with its variables) over the config file.
+/// Merge the command line (with its variables) over the config file, when one is given.
 pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sources), String> {
     let given = Options::from_arg_matches(matches).map_err(|exc| exc.to_string())?;
-    let path = config.map(Path::to_path_buf).or_else(|| straydog_home().map(|home| home.join("config.toml")).filter(|path| path.is_file()));
+    let path = config.map(Path::to_path_buf);
     let file: Options = match &path {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|exc| format!("{}: {exc}", path.display()))?;

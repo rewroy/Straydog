@@ -1,4 +1,4 @@
-//! `straydog serve`: settings, logging, the runtime and the HTTP listener.
+//! The server: settings, logging, the runtime and the HTTP listener.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -36,17 +36,18 @@ The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm
 (next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
 bubblewrap.
 
-## Set up and serve
+## Run
 
 ```bash
-straydog init      # choose a bundle and GPUs, fetch the model and drafter, write ~/.straydog/config.toml
-straydog serve     # http://127.0.0.1:8080
+straydog fetch -m ~/models/IQ3_S --quant IQ3_S      # download and authenticate a bundle (once)
+straydog fetch-mtp --model-draft ~/models/mtp       # build the MTP drafter (once, optional)
+straydog -m ~/models/IQ3_S -md ~/models/mtp -dev 0,1 --vram 30 --api-key-file ~/.straydog-key
 ```
 
-`init` asks for what it needs; `straydog init --yes` takes the defaults. Settings work
-like llama.cpp's server: `straydog serve -m DIR -md DIR -dev 0,1 --vram 30 -c 262144`.
-Options beat `STRAYDOG_*` variables, which beat `~/.straydog/config.toml`;
-`straydog serve --print-config` shows what is in effect and where each value came from.
+Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
+Every setting is an option; each also reads a `STRAYDOG_*` variable (`STRAYDOG_CTX_SIZE`),
+and `--config FILE` reads them from a TOML file. Options beat variables, which beat the
+file. `--print-config` shows the settings in effect and where each came from.
 
 | Bundle | Size | |
 | --- | ---: | --- |
@@ -60,7 +61,7 @@ Options beat `STRAYDOG_*` variables, which beat `~/.straydog/config.toml`;
 Any OpenAI-compatible client:
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $(cat ~/.straydog/api-key)" \
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $(cat ~/.straydog-key)" \
   -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
