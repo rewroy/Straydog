@@ -1,4 +1,4 @@
-// Transfers of caller memory. Python arrays, std::vector storage and the stack are
+// Transfers of caller memory. Rust vectors, std::vector storage and the stack are
 // pageable: an asynchronous copy from or to them makes the runtime pin those pages
 // for the call, and ROCm can reuse such a pin after the pages were unmapped and
 // reallocated, so the copy engine reads unmapped memory (an SDMA page fault,
