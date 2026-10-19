@@ -389,8 +389,9 @@ impl Drop for AttributeList {
 /// Run `command` in the AppContainer with this process's standard handles and no other
 /// inheritable handle, in a job that ends it with this process; return its exit status.
 ///
-/// No capability is given: no network, loopback included. TEMP and TMP name the AppContainer's
-/// own folder, the one place it may write.
+/// No capability is given: no network, loopback included. The environment holds only named
+/// variables (`appcontainer::environment_block`); TEMP and TMP name the AppContainer's own
+/// folder, the one place it may write.
 pub fn launch(command: &[OsString], sid: &Sid, working_directory: Option<&Path>) -> io::Result<u32> {
     // SAFETY: plain values.
     let standard = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| unsafe { GetStdHandle(which) });
@@ -410,15 +411,11 @@ pub fn launch(command: &[OsString], sid: &Sid, working_directory: Option<&Path>)
         }
     }
     let units = |text: &OsStr| text.encode_wide().collect::<Vec<u16>>();
+    // Only the variables the system, the loader and the CUDA runtime read pass from this
+    // environment, which holds whatever the server's had.
     let variables = std::env::vars_os().map(|(name, value)| (units(&name), units(&value))).collect();
-    let overrides = match profile_folder(sid) {
-        Some(folder) => {
-            let temp = units(folder.join("Temp").as_os_str());
-            vec![(units(OsStr::new("TEMP")), temp.clone()), (units(OsStr::new("TMP")), temp)]
-        }
-        None => Vec::new(),
-    };
-    let environment = environment_block(variables, overrides);
+    let temp = profile_folder(sid).map(|folder| units(folder.join("Temp").as_os_str()));
+    let environment = environment_block(variables, temp);
     let job = Job::new()?; // kill on close: the worker never outlives the launcher
 
     let mut attributes = AttributeList::new(3)?;

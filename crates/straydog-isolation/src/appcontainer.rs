@@ -4,10 +4,12 @@
 //!
 //! The server starts the launcher (`straydog contain`) as an ordinary child with its private
 //! pipes. The launcher grants the dedicated `Straydog.Worker` AppContainer profile read access
-//! to exactly what the worker reads: the executable's directory (cuBLAS may sit next to the
-//! executable), the CUDA Toolkit's DLL directories, each pinned file and the directories the
-//! worker opens them in. It then starts the worker in that AppContainer with the launcher's own
-//! standard handles (and no other inheritable handle) and exits with the worker's status.
+//! to exactly what the worker reads: the executable and the cuBLAS DLLs next to it (never the
+//! directory they are in, which may be Downloads or a home directory), the CUDA Toolkit's DLL
+//! directories, each pinned file and the directories the worker opens them in. It then starts
+//! the worker in that AppContainer with the launcher's own standard handles (and no other
+//! inheritable handle) and an environment of named variables only, and exits with the worker's
+//! status.
 //!
 //! No capability is given, so the network (loopback included) is closed; nothing outside the
 //! profile's own folder is writable. A Job Object ends the worker with the launcher. There is
@@ -22,6 +24,31 @@ use crate::{check_exposable, resolve, Exposure, LAUNCHER_SUBCOMMAND};
 
 /// The AppContainer profile the worker runs as. It persists, and so do its grants.
 pub const PROFILE_NAME: &str = "Straydog.Worker";
+
+/// The variables the worker inherits (Windows ignores the case of names), TEMP and TMP aside:
+/// what the system, the loader and the CUDA runtime read. Nothing else reaches it: no proxy,
+/// token, key or credential the server's environment may hold.
+const WORKER_VARIABLES: [&str; 10] = [
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "PATH",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "CUDA_PATH",
+    "LANG",
+];
+
+/// Whether a file is a CUDA runtime DLL a CUDA build of the executable loads: cuBLAS
+/// (`cublas64_12.dll`) and the cuBLASLt it imports. The CUDA runtime itself is linked
+/// statically and the driver is a system DLL.
+fn runtime_library(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else { return false };
+    let name = name.to_ascii_lowercase();
+    (name.starts_with("cublas64_") || name.starts_with("cublaslt64_")) && name.ends_with(".dll")
+}
 
 /// The access a grant gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,7 +89,7 @@ pub trait Grants {
 /// What the launcher was asked to do.
 #[derive(Debug, Default, PartialEq)]
 pub struct Launch {
-    /// Directories whose whole subtree the worker reads and executes.
+    /// Directories whose whole subtree the worker reads and executes (the CUDA Toolkit's).
     pub trees: Vec<PathBuf>,
     pub files: Vec<PathBuf>,
     /// Directories the worker opens files in (their own entries, not their subtree).
@@ -108,25 +135,37 @@ impl Launch {
 
 /// The launcher's arguments that run `exposure.executable worker_args...` contained: the
 /// subcommand, what to grant, the working directory, then the worker command after `--`.
-/// `cuda` are the CUDA Toolkit's DLL directories.
+/// `cuda` are the CUDA Toolkit's DLL directories, granted whole: a toolkit directory holds the
+/// toolkit only. The executable's own directory is not: the executable and the cuBLAS DLLs next
+/// to it are granted as files.
 pub fn launcher_arguments(
     worker_args: &[OsString],
     exposure: &Exposure,
     cuda: &[PathBuf],
 ) -> Result<Vec<OsString>, String> {
     let directory = exposure.executable.parent().ok_or("Straydog worker executable has no directory")?;
-    let mut trees = vec![directory.to_path_buf()];
+    let mut libraries: Vec<PathBuf> = std::fs::read_dir(directory)
+        .map_err(|error| format!("Straydog cannot list {}: {error}", directory.display()))?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| runtime_library(path))
+        .collect();
+    libraries.sort();
+    let files: Vec<PathBuf> =
+        [exposure.executable.clone()].into_iter().chain(libraries).chain(exposure.files.iter().cloned()).collect();
+    let mut trees: Vec<PathBuf> = Vec::new();
     for path in cuda {
         if !trees.contains(path) {
             trees.push(path.clone());
         }
     }
-    let exposed = trees.iter().chain(&exposure.files).chain(&exposure.directories).chain([&exposure.working_directory]);
+    let exposed = trees.iter().chain(&files).chain(&exposure.directories).chain([&exposure.working_directory]);
     check_exposable(&exposed.map(PathBuf::as_path).collect::<Vec<_>>(), &exposure.secrets)?;
     let mut args: Vec<OsString> = vec![LAUNCHER_SUBCOMMAND.into()];
     for (flag, paths) in [
         ("--tree", &trees),
-        ("--file", &exposure.files),
+        ("--file", &files),
         ("--directory", &exposure.directories),
         ("--secret", &exposure.secrets),
     ] {
@@ -190,21 +229,22 @@ pub fn grant_worker_access<G: Grants>(grants: &G, launch: &Launch) -> Result<G::
             }
             return Err(refused(tree, error));
         }
-        let missing = ungranted_entries(grants, tree, &sid);
+        let missing = ungranted_libraries(grants, tree, &sid);
         if missing.is_empty() {
             continue;
         }
         eprintln!(
-            "Straydog: granting the worker read access to {} new entries in {} (one-time)",
+            "Straydog: granting the worker read access to {} new libraries in {} (one-time)",
             missing.len(),
             tree.display()
         );
         // Writing the tree's DACL again propagates its inheritable grant to every entry it can
-        // reach; an entry that still lacks it (inheritance blocked on it) gets an entry of its own.
+        // reach; a library that still lacks it (inheritance blocked on it) gets an entry of its
+        // own. No other file does: what the toolkit's owner closed stays closed.
         grants.grant(tree, &sid, Access::ReadExecute, true).map_err(|error| refused(tree, error))?;
-        for (path, access) in missing {
-            if !grants.has_grant(&path, &sid, access, false) {
-                grants.grant(&path, &sid, access, false).map_err(|error| refused(&path, error))?;
+        for path in missing {
+            if !grants.has_grant(&path, &sid, Access::ReadExecute, false) {
+                grants.grant(&path, &sid, Access::ReadExecute, false).map_err(|error| refused(&path, error))?;
             }
         }
     }
@@ -226,25 +266,20 @@ fn ensure<G: Grants>(grants: &G, path: &Path, sid: &G::Sid, access: Access, inhe
     }
 }
 
-/// The files directly in `tree` the profile cannot use, with the access each needs.
+/// The CUDA runtime DLLs directly in `tree` the profile cannot load.
 ///
 /// A file copied, moved or hard-linked into a directory keeps the ACL it had rather than
 /// inheriting the directory's grant, and the worker then fails to load it ("Access is
-/// denied"): a cuBLAS DLL moved next to the executable, a toolkit file installed that way. The
-/// directory itself inherits the grant, so it says nothing about the files in it; each is
-/// checked (one DACL read each). Only the files directly in a tree: the loader looks for DLLs
-/// in these directories, never below them.
-fn ungranted_entries<G: Grants>(grants: &G, tree: &Path, sid: &G::Sid) -> Vec<(PathBuf, Access)> {
+/// denied"). The directory itself inherits the grant, so it says nothing about the files in
+/// it; each runtime DLL is checked (one DACL read each), directly in the tree, where the loader
+/// looks.
+fn ungranted_libraries<G: Grants>(grants: &G, tree: &Path, sid: &G::Sid) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(tree) else { return Vec::new() };
-    let mut missing: Vec<(PathBuf, Access)> = entries
+    let mut missing: Vec<PathBuf> = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
-        .map(|path| {
-            let access = Access::for_file(&path);
-            (path, access)
-        })
-        .filter(|(path, access)| !grants.has_grant(path, sid, *access, false))
+        .filter(|path| runtime_library(path) && !grants.has_grant(path, sid, Access::ReadExecute, false))
         .collect();
     missing.sort();
     missing
@@ -313,17 +348,20 @@ pub fn command_line(args: &[Vec<u16>]) -> Vec<u16> {
     line
 }
 
-/// A Unicode environment block from `variables`, with `overrides` replacing any variable of the
-/// same name (Windows ignores the case of names): `NAME=value` strings sorted by name without
-/// regard to case, as Windows keeps them, each NUL-terminated, then a final NUL.
-pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, overrides: Vec<(Vec<u16>, Vec<u16>)>) -> Vec<u16> {
+/// The worker's Unicode environment block: of `variables` only those `WORKER_VARIABLES`
+/// names, then TEMP and TMP set to `temp` when given, as `NAME=value` strings sorted by name
+/// without regard to case (as Windows keeps them), each NUL-terminated, then a final NUL.
+pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<u16>>) -> Vec<u16> {
     let upper = |name: &[u16]| -> Vec<u16> {
         name.iter()
             .map(|&unit| if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) { unit - 32 } else { unit })
             .collect()
     };
+    let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let allowed: Vec<Vec<u16>> = WORKER_VARIABLES.iter().map(|name| upper(&wide(name))).collect();
+    let temp = temp.into_iter().flat_map(|temp| [(wide("TEMP"), temp.clone()), (wide("TMP"), temp)]);
     let mut sorted = BTreeMap::new();
-    for (name, value) in variables.into_iter().chain(overrides) {
+    for (name, value) in variables.into_iter().filter(|(name, _)| allowed.contains(&upper(name))).chain(temp) {
         sorted.insert(upper(&name), (name, value));
     }
     let mut block = Vec::new();
@@ -363,35 +401,53 @@ mod tests {
         std::fs::create_dir_all(cuda.join("x64")).unwrap();
         assert_eq!(cuda_directories(Some(scratch.0.join("cuda").as_os_str())), vec![cuda.clone(), cuda.join("x64")]);
         assert!(cuda_directories(None).is_empty() && cuda_directories(Some(OsStr::new(""))).is_empty());
+        // The executable sits among other things (Downloads, say), with cuBLAS next to it.
+        let executable = scratch.file("downloads/straydog.exe", "MZ");
+        let cublas = scratch.file("downloads/cublas64_12.dll", "MZ");
+        let cublas_lt = scratch.file("downloads/cublasLt64_12.dll", "MZ");
+        for other in ["downloads/tax-return.pdf", "downloads/other.dll", "downloads/sub/cublas64_11.dll"] {
+            scratch.file(other, "");
+        }
         let model = scratch.0.join("model");
         let exposure = Exposure {
-            executable: scratch.file("bin/straydog.exe", "MZ"),
+            executable: executable.clone(),
             files: vec![scratch.file("model/a.gguf", "a"), scratch.file("model/tokenizer.json", "{}")],
             directories: vec![model.clone()],
             working_directory: model.clone(),
-            secrets: vec![scratch.0.join("key")],
+            // Next to the executable, but its directory is not exposed.
+            secrets: vec![scratch.file("downloads/api-key", "k")],
         };
-        let worker = os(&["worker", "--model-root", "C:\\models\\IQ3_S", "--file"]);
+        let worker = os(&["worker", "--model-root", r"C:\models\IQ3_S", "--file"]);
         let args = launcher_arguments(&worker, &exposure, std::slice::from_ref(&cuda)).unwrap();
         assert_eq!(args[0], "contain");
         let separator = args.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(args[separator + 1], exposure.executable.as_os_str());
         assert_eq!(&args[separator + 2..], &worker);
         let launch = Launch::parse(&args[1..]).unwrap();
+        let files = [vec![executable.clone(), cublas, cublas_lt], exposure.files.clone()].concat();
         assert_eq!(
             launch,
             Launch {
-                trees: vec![scratch.0.join("bin"), cuda],
-                files: exposure.files.clone(),
+                trees: vec![cuda],
+                files,
                 directories: vec![model.clone()],
                 secrets: exposure.secrets.clone(),
                 working_directory: Some(model),
                 command: args[separator + 1..].to_vec(),
             }
         );
-        // The executable's directory must not hold a secret either.
-        let exposure = Exposure { secrets: vec![scratch.file("bin/api-key", "k")], ..exposure };
+        // The executable itself must not be a secret.
+        let exposure = Exposure { secrets: vec![executable], ..exposure };
         assert!(launcher_arguments(&worker, &exposure, &[]).unwrap_err().contains("secret"));
+        for (name, runtime) in [
+            ("CUBLAS64_12.DLL", true),
+            ("cublasLt64_13.dll", true),
+            ("cudart64_12.dll", false),
+            ("cublas64_12.dll.bak", false),
+            ("nvcc.exe", false),
+        ] {
+            assert_eq!(runtime_library(Path::new(name)), runtime, "{name}");
+        }
     }
 
     /// ACL calls against paths that lack the grant; a grant on a tree clears what is below it
@@ -448,13 +504,12 @@ mod tests {
         }
     }
 
-    /// The executable's directory: the executable, cuBLAS (moved in from elsewhere) and a note.
-    fn executable_directory(scratch: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
-        scratch.file("bin/straydog.exe", "MZ");
-        let dll = scratch.file("bin/cublas64_12.dll", "MZ");
-        let note = scratch.file("bin/NOTICE.txt", "");
-        std::fs::create_dir_all(scratch.0.join("bin/sub")).unwrap();
-        (scratch.0.join("bin"), dll, note)
+    /// A CUDA Toolkit directory: cuBLAS (moved in from elsewhere), a compiler and a note.
+    fn toolkit(scratch: &Scratch) -> (PathBuf, PathBuf, [PathBuf; 2]) {
+        let dll = scratch.file("cuda/bin/cublas64_12.dll", "MZ");
+        let others = [scratch.file("cuda/bin/nvcc.exe", "MZ"), scratch.file("cuda/bin/NOTICE.txt", "")];
+        std::fs::create_dir_all(scratch.0.join("cuda/bin/sub")).unwrap();
+        (scratch.0.join("cuda/bin"), dll, others)
     }
 
     fn launch(trees: Vec<PathBuf>) -> Launch {
@@ -476,34 +531,34 @@ mod tests {
     }
 
     #[test]
-    fn files_moved_in_without_the_grant_get_it_again() {
+    fn a_library_moved_in_without_the_grant_gets_it_again() {
         let scratch = Scratch::new("straydog-launcher-moved");
-        let (tree, dll, note) = executable_directory(&scratch);
-        let fake = Fake::lacking(&[&dll, &note]);
-        assert_eq!(ungranted_entries(&fake, &tree, &7), vec![(note, Access::Read), (dll, Access::ReadExecute)]);
-        let launch = launch(vec![tree.clone(), scratch.0.join("cuda/bin")]);
+        let (tree, dll, [compiler, note]) = toolkit(&scratch);
+        let fake = Fake::lacking(&[&dll, &compiler, &note]);
+        assert_eq!(ungranted_libraries(&fake, &tree, &7), vec![dll]);
+        let launch = launch(vec![tree.clone(), scratch.0.join("cuda/bin/x64")]);
         assert_eq!(grant_worker_access(&fake, &launch), Ok(7));
-        // Granted again once, on the tree, which propagates; the missing toolkit directory needed nothing.
+        // Granted again once, on the tree, which propagates; the missing x64 directory needed nothing.
         assert_eq!(fake.calls(), vec![(tree, Access::ReadExecute, true)]);
         grant_worker_access(&fake, &launch).unwrap();
         assert_eq!(fake.calls(), vec![]);
     }
 
     #[test]
-    fn a_dll_inheritance_cannot_reach_gets_its_own_grant() {
+    fn only_a_runtime_library_inheritance_cannot_reach_gets_its_own_grant() {
         // A DLL whose own DACL blocks inheritance keeps lacking the tree's grant, and the worker
-        // fails to load it: "Access is denied".
+        // fails to load it: "Access is denied". Other files closed that way stay closed.
         let scratch = Scratch::new("straydog-launcher-blocked");
-        let (tree, dll, _) = executable_directory(&scratch);
-        let fake = Fake { inheritance_blocked: true, ..Fake::lacking(&[&dll]) };
+        let (tree, dll, [compiler, note]) = toolkit(&scratch);
+        let fake = Fake { inheritance_blocked: true, ..Fake::lacking(&[&dll, &compiler, &note]) };
         grant_worker_access(&fake, &launch(vec![tree.clone()])).unwrap();
         assert_eq!(fake.calls(), vec![(tree, Access::ReadExecute, true), (dll, Access::ReadExecute, false)]);
     }
 
     #[test]
-    fn an_entry_that_refuses_the_grant_names_itself() {
+    fn a_library_that_refuses_the_grant_names_itself() {
         let scratch = Scratch::new("straydog-launcher-refused");
-        let (tree, dll, _) = executable_directory(&scratch);
+        let (tree, dll, _) = toolkit(&scratch);
         let fake = Fake { inheritance_blocked: true, refused: [dll.clone()].into(), ..Fake::lacking(&[&dll]) };
         let error = grant_worker_access(&fake, &launch(vec![tree])).unwrap_err();
         assert!(error.contains("cublas64_12.dll"), "{error}");
@@ -512,12 +567,12 @@ mod tests {
     #[test]
     fn an_administrator_owned_tree_is_used_when_app_containers_may_already_read_it() {
         let scratch = Scratch::new("straydog-launcher-administered");
-        let (tree, dll, _) = executable_directory(&scratch);
-        let toolkit = scratch.0.join("cuda/bin");
-        std::fs::create_dir_all(&toolkit).unwrap();
-        let fake = Fake { administered: [toolkit.clone()].into(), ..Fake::default() };
-        grant_worker_access(&fake, &launch(vec![tree.clone(), toolkit.clone()])).unwrap();
-        assert_eq!(fake.calls(), vec![(toolkit.clone(), Access::ReadExecute, true)]);
+        let (tree, dll, _) = toolkit(&scratch);
+        let installed = scratch.0.join("Program Files/CUDA/bin");
+        std::fs::create_dir_all(&installed).unwrap();
+        let fake = Fake { administered: [installed.clone()].into(), ..Fake::default() };
+        grant_worker_access(&fake, &launch(vec![tree.clone(), installed.clone()])).unwrap();
+        assert_eq!(fake.calls(), vec![(installed, Access::ReadExecute, true)]);
         // Without that, the grant's failure is the launcher's.
         let fake = Fake { refused: [tree.clone()].into(), ..Fake::lacking(&[&tree, &dll]) };
         let error = grant_worker_access(&fake, &launch(vec![tree.clone()])).unwrap_err();
@@ -527,13 +582,13 @@ mod tests {
     #[test]
     fn files_and_directories_get_grants_of_their_own() {
         let scratch = Scratch::new("straydog-launcher-files");
+        let executable = scratch.file("downloads/straydog.exe", "MZ");
         let shard = scratch.file("model/a.gguf", "a");
-        let library = scratch.file("model/helper.dll", "MZ");
         let model = scratch.0.join("model");
         let drafter = scratch.file("mtp/mtp.gguf", "m").parent().unwrap().to_path_buf();
-        let fake = Fake::lacking(&[&shard, &library, &model, &drafter]);
+        let fake = Fake::lacking(&[&executable, &shard, &model, &drafter]);
         let launch = Launch {
-            files: vec![shard.clone(), library.clone()],
+            files: vec![executable.clone(), shard.clone()],
             directories: vec![drafter.clone()],
             working_directory: Some(model.clone()),
             ..launch(vec![])
@@ -542,8 +597,8 @@ mod tests {
         assert_eq!(
             fake.calls(),
             vec![
+                (executable, Access::ReadExecute, false),
                 (shard, Access::Read, false),
-                (library, Access::ReadExecute, false),
                 (drafter, Access::ReadExecute, false),
                 (model.clone(), Access::ReadExecute, false),
             ]
@@ -604,14 +659,44 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_block_is_sorted_without_case_and_overrides_replace_any_case() {
+    fn the_worker_environment_holds_named_variables_only_sorted_without_case() {
         let pair = |name: &str, value: &str| (wide(name), wide(value));
         let block = environment_block(
-            vec![pair("Path", "C:\\bin"), pair("temp", "C:\\Users\\u\\Temp"), pair("ALPHA", "1"), pair("=C:", "C:\\")],
-            vec![pair("TEMP", "C:\\container\\Temp"), pair("TMP", "C:\\container\\Temp")],
+            vec![
+                pair("Path", r"C:\bin"),
+                pair("temp", r"C:\Users\u\Temp"),
+                pair("SystemRoot", r"C:\Windows"),
+                pair("cuda_path", r"C:\CUDA"),
+                pair("STRAYDOG_API_KEY", "k"),
+                pair("HTTPS_PROXY", "http://user:password@proxy"),
+                pair("GITHUB_TOKEN", "t"),
+                pair("LOCALAPPDATA", r"C:\Users\u\AppData\Local"),
+                pair("=C:", r"C:\"),
+            ],
+            Some(wide(r"C:\container\Temp")),
         );
         let text = String::from_utf16(&block).unwrap();
-        assert_eq!(text, "=C:=C:\\\0ALPHA=1\0Path=C:\\bin\0TEMP=C:\\container\\Temp\0TMP=C:\\container\\Temp\0\0");
-        assert_eq!(environment_block(vec![], vec![]), vec![0, 0]);
+        let expected = [
+            r"cuda_path=C:\CUDA",
+            r"Path=C:\bin",
+            r"SystemRoot=C:\Windows",
+            r"TEMP=C:\container\Temp",
+            r"TMP=C:\container\Temp",
+            "",
+            "",
+        ];
+        assert_eq!(text, expected.join("\0"));
+        // Without the AppContainer's folder there is no TEMP: the user's own is not writable from it anyway.
+        assert_eq!(environment_block(vec![pair("TEMP", r"C:\t")], None), vec![0, 0]);
+    }
+
+    #[test]
+    fn no_variable_the_worker_inherits_looks_like_a_secret() {
+        for name in WORKER_VARIABLES {
+            let name = name.to_ascii_lowercase();
+            for word in ["proxy", "token", "secret", "key", "password", "credential", "auth"] {
+                assert!(!name.contains(word), "{name}");
+            }
+        }
     }
 }

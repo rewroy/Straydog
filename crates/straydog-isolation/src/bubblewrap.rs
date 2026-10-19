@@ -3,8 +3,9 @@
 //! Every namespace is unshared, the network's included (loopback too). The root is empty but
 //! for what is mounted read-only here: the system libraries, ROCm, the loader's cache and
 //! configuration, the executable and each exposed file; the GPU device nodes are bound, and
-//! `/tmp` and `/dev/shm` are private memory file systems. No general home directory mount, no
-//! writable mount, and nothing the server could probe at run time turns any of it off.
+//! `/tmp` and `/dev/shm` are private memory file systems. The environment is cleared but for
+//! named variables. No general home directory mount, no writable mount, and nothing the server
+//! could probe at run time turns any of it off.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -19,6 +20,19 @@ const SYSTEM: [&str; 5] = ["/usr", "/sys", "/lib", "/lib64", "/opt/rocm"];
 /// The loader's cache and configuration. Packaged ROCm may reach /opt/rocm/lib through
 /// alternatives links.
 const LOADER: [&str; 4] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives"];
+
+/// The variables the worker keeps from the server's environment, when set there: the search
+/// path, the locale and time zone, and the GPU runtimes' device selection and architecture
+/// override. Nothing else reaches it: no proxy, token, key or credential the server may hold.
+const VARIABLES: [&str; 7] = [
+    "PATH",
+    "LANG",
+    "TZ",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "HSA_OVERRIDE_GFX_VERSION",
+];
 
 /// GPU device nodes: AMD's, then NVIDIA's (further NVIDIA GPUs are found by name).
 const DEVICES: [&str; 7] = [
@@ -74,6 +88,7 @@ pub fn arguments(worker_args: &[OsString], exposure: &Exposure) -> Result<Vec<Os
     check_exposable(&exposed.chain(devices.iter().map(PathBuf::as_path)).collect::<Vec<_>>(), &exposure.secrets)?;
 
     let mut args: Vec<OsString> = [
+        "--clearenv",
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
@@ -95,6 +110,11 @@ pub fn arguments(worker_args: &[OsString], exposure: &Exposure) -> Result<Vec<Os
     .into_iter()
     .map(OsString::from)
     .collect();
+    for name in VARIABLES {
+        if let Some(value) = std::env::var_os(name) {
+            args.extend(["--setenv".into(), name.into(), value]);
+        }
+    }
     // The directories the worker opens files in exist (empty but for the files bound in them).
     for directory in &directories {
         push(&mut args, "--dir", &[directory]);
@@ -203,6 +223,22 @@ mod tests {
             working,
         ];
         assert_eq!(&args[args.len() - tail.len()..], &tail);
+    }
+
+    #[test]
+    fn the_environment_is_cleared_but_for_named_variables() {
+        let scratch = Scratch::new("straydog-bwrap-environment");
+        let args = arguments_for(&exposure(&scratch)).unwrap();
+        assert_eq!(args[0], "--clearenv");
+        let set: Vec<(&OsString, &OsString)> =
+            args.windows(3).filter(|window| window[0] == "--setenv").map(|window| (&window[1], &window[2])).collect();
+        for (name, _) in &set {
+            let name = name.to_str().unwrap();
+            assert!(["HOME", "TMPDIR"].contains(&name) || VARIABLES.contains(&name), "{name}");
+        }
+        let path = std::env::var_os("PATH").unwrap();
+        assert!(set.contains(&(&"PATH".into(), &path)));
+        assert!(set.contains(&(&"HOME".into(), &"/tmp".into())));
     }
 
     #[test]

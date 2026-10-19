@@ -92,7 +92,11 @@ pub fn check_exposable(paths: &[&Path], secrets: &[PathBuf]) -> Result<(), Strin
 ///
 /// Windows: the executable's `contain` subcommand (`launcher_main`) with the grants to make
 /// and the worker command after `--`. The launcher runs the worker in the working directory
-/// itself, and passes its own environment on (the AppContainer's private folder as TEMP).
+/// itself, with only the system's, the loader's and the CUDA runtime's variables of its own
+/// environment (and the AppContainer's private folder as TEMP).
+///
+/// Either way the worker's environment is an allowlist: no proxy, token, key or credential
+/// variable of the server's reaches it.
 pub fn worker_command(worker_args: &[OsString], exposure: &Exposure) -> Result<(PathBuf, Vec<OsString>), String> {
     #[cfg(target_os = "linux")]
     {
