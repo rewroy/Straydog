@@ -133,10 +133,20 @@ fn open_authenticated(root: &Path, assets: &[Asset], stage: &str, progress: Prog
     let done = AtomicU64::new(0);
     progress(stage, 0, total);
     let count = |bytes: u64| progress(stage, done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
-    let references: Vec<&File> = files.iter().collect();
-    let digests = digest::files_sha256(&references, &count).map_err(|exc| exc.to_string())?;
-    for (asset, digest) in assets.iter().zip(digests) {
-        if digest != asset.sha256 {
+    // Files with pinned chunk digests are hashed piece by piece on every core; the rest whole.
+    let pieces = assets.iter().map(|asset| bundle::chunk_digests(&asset.sha256)).collect::<Result<Vec<_>, _>>()?;
+    let chunked: Vec<(&File, &[String])> = files.iter().zip(&pieces)
+        .filter_map(|(file, pieces)| pieces.as_deref().map(|pieces| (file, pieces)))
+        .collect();
+    let whole: Vec<&File> = files.iter().zip(&pieces).filter(|(_, pieces)| pieces.is_none()).map(|(file, _)| file).collect();
+    let mut chunked_results = digest::verify_chunks(&chunked, &count).map_err(|exc| exc.to_string())?.into_iter();
+    let mut whole_digests = digest::files_sha256(&whole, &count).map_err(|exc| exc.to_string())?.into_iter();
+    for (asset, pieces) in assets.iter().zip(&pieces) {
+        let authentic = match pieces {
+            Some(_) => chunked_results.next() == Some(true),
+            None => whole_digests.next().as_deref() == Some(asset.sha256.as_str()),
+        };
+        if !authentic {
             return Err(format!("Straydog asset digest mismatch: {}", asset.name));
         }
     }

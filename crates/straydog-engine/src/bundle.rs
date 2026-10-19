@@ -5,6 +5,9 @@ use serde_json::Value;
 /// The manifest, compiled in: a binary authenticates exactly the bundles it was tested with.
 pub const MANIFEST: &str = include_str!("../../../src/straydog/assets.json");
 pub const QUANTIZATIONS: [&str; 4] = ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"];
+/// The chunk digests of pinned files (see `digest::verify_chunks`), by whole-file SHA-256:
+/// taken from files that matched their pins, compiled in like the manifest.
+pub const CHUNKS: &str = include_str!("asset_chunks.json");
 pub const MODEL: &str = "Qwen3.8-Flash-Next";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +63,20 @@ pub fn bundle(quantization: &str) -> Result<Bundle, String> {
         resources: list(&manifest["resources"])?,
         drafter: asset(drafter)?,
     })
+}
+
+/// The pinned chunk digests of the file whose whole SHA-256 is `sha256`, if any.
+pub fn chunk_digests(sha256: &str) -> Result<Option<Vec<String>>, String> {
+    let chunks: Value = serde_json::from_str(CHUNKS).map_err(|exc| exc.to_string())?;
+    if chunks["chunk_bytes"].as_u64() != Some(crate::digest::CHUNK_BYTES) {
+        return Err("unsupported Straydog chunk digests".into());
+    }
+    let Some(list) = chunks["files"].get(sha256) else { return Ok(None) };
+    let list = list.as_array().ok_or("invalid Straydog chunk digests")?;
+    list.iter()
+        .map(|digest| digest.as_str().map(str::to_string).ok_or_else(|| "invalid Straydog chunk digests".to_string()))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// The repository the resources (tokenizer, template, config) come from, at the manifest's
