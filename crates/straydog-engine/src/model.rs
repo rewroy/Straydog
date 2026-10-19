@@ -185,6 +185,8 @@ pub struct Model {
     pub last_metrics: Map<String, Value>,
     /// When set, the SHA-256 of every logits vector the model returns (a determinism check).
     pub logits_digests: Option<Vec<String>>,
+    /// When set, every logits vector the model returns (validation tooling).
+    pub logits_capture: Option<Vec<Vec<f32>>>,
 }
 
 impl Model {
@@ -249,6 +251,7 @@ impl Model {
             checkpoints: IndexMap::new(),
             last_metrics: Map::new(),
             logits_digests: None,
+            logits_capture: None,
         };
         model.resident = model.prepare_resident_moe()?;
         if !model.resident {
@@ -641,6 +644,9 @@ impl Model {
         if let Some(digests) = self.logits_digests.as_mut() {
             let bytes: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
             digests.push(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes)));
+        }
+        if let Some(capture) = self.logits_capture.as_mut() {
+            capture.push(logits.clone());
         }
         Ok(Some(Some(logits)))
     }
