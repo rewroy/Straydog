@@ -521,6 +521,8 @@ impl Engine for Runtime {
             Phase::Loading(progress) => EngineState::Loading { progress: progress.clone() },
             Phase::Ready(ready) => EngineState::Ready {
                 context: ready["context"].as_u64().unwrap_or(0),
+                speculative: ready["speculative_drafts"].as_u64().unwrap_or(0),
+                processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
                                   "gpu": ready["gpu"]}),
             },

@@ -74,6 +74,9 @@ Answers carry `reasoning_content`, structured `tool_calls`, `usage` with
 engine does not implement are refused (400), never ignored. A client that returns the
 reasoning in its assistant messages keeps the conversation cache warm.
 
+Like llama-server, `GET /props` (`default_generation_settings.n_ctx`) and `GET /slots`
+report the context, and `GET /health` the loading progress.
+
 ## Development
 
 ```bash

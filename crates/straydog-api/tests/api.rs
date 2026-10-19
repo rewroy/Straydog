@@ -42,7 +42,8 @@ struct Mock {
 impl Mock {
     fn new(scripts: Vec<Script>) -> Arc<Mock> {
         Arc::new(Mock {
-            state: Mutex::new(EngineState::Ready { context: 131072, placement: json!({"resident": true}) }),
+            state: Mutex::new(EngineState::Ready { context: 131072, speculative: 0, processing: false,
+                                                   placement: json!({"resident": true}) }),
             scripts: Mutex::new(scripts.into()),
             requests: Mutex::new(Vec::new()),
             interrupts: Arc::new(AtomicUsize::new(0)),
@@ -637,7 +638,9 @@ async fn the_key_guards_everything_but_health() {
     };
     let unauthorized = refused(401, "authentication_error", "invalid API key");
     assert_eq!(fetch(app.clone(), get("/health")).await.0, StatusCode::OK);
-    assert_eq!(fetch(app.clone(), get("/v1/models")).await, unauthorized);
+    for path in ["/v1/models", "/props", "/slots"] {
+        assert_eq!(fetch(app.clone(), get(path)).await, unauthorized, "{path}");
+    }
     for authorization in ["Bearer sk-wrong", "Bearer sk-loca", "Basic sk-local", "sk-local", "Bearer"] {
         let request = with_key(get("/v1/models"), authorization);
         assert_eq!(fetch(app.clone(), request).await, unauthorized, "{authorization}");
@@ -665,12 +668,25 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
         "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false}}]}));
+    for path in ["/props", "/slots"] {
+        assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
+    }
 
-    mock.set_state(EngineState::Ready { context: 131072, placement: json!({"resident": true, "host_kv": false}) });
+    mock.set_state(EngineState::Ready { context: 131072, speculative: 3, processing: true,
+                                        placement: json!({"resident": true, "host_kv": false}) });
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true,
                                                  "placement": {"resident": true, "host_kv": false}}));
+    // llama-server's endpoints, where its clients read the context.
+    let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
+                      "params": {"n_predict": -1, "seed": 0, "temperature": 0.0, "speculative.n_max": 3}});
+    let (status, props) = fetch(app(&mock), get("/props")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,
+                             "model_alias": "Qwen3.8-Flash-Next-IQ3_S", "modalities": {"vision": false, "audio": false},
+                             "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false}));
+    assert_eq!(fetch(app(&mock), get("/slots")).await, (StatusCode::OK, json!([slot])));
 
     mock.set_state(EngineState::Failed("the GPU stopped responding".into()));
     let mut failed = refused(500, "server_error", "the GPU stopped responding");
@@ -694,7 +710,7 @@ async fn loading_and_busy_engines_answer_503() {
     assert_eq!(complete(&mock, ask(json!({}))).await, refused(503, "unavailable_error", "the worker exited"));
     assert!(mock.requests().is_empty());
 
-    mock.set_state(EngineState::Ready { context: 131072, placement: json!({}) });
+    mock.set_state(EngineState::Ready { context: 131072, speculative: 0, processing: false, placement: json!({}) });
     let busy = refused(503, "server_busy", "Straydog generation queue is full");
     assert_eq!(complete(&mock, ask(json!({}))).await, busy);
     let restarting = refused(503, "unavailable_error", "Straydog is restarting");

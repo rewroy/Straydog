@@ -1,8 +1,8 @@
 //! The OpenAI-compatible HTTP API (docs/DESIGN.md §6) over an [`Engine`]: the server's
 //! runtime, which owns the isolated worker.
 //!
-//! `GET /health` needs no key; `GET /v1/models` and `POST /v1/chat/completions` need the
-//! Bearer key once one is configured. A chat completion request becomes a worker request
+//! `GET /health` needs no key; `GET /v1/models`, `POST /v1/chat/completions` and
+//! llama-server's `GET /props` and `GET /slots` need the Bearer key once one is configured. A chat completion request becomes a worker request
 //! ([`WorkerRequest`]); the worker's raw template text comes back as reasoning, answer and
 //! structured tool calls.
 
@@ -51,8 +51,9 @@ pub struct Generation {
 pub enum EngineState {
     /// `progress` is shown as is by `/health`.
     Loading { progress: serde_json::Value },
-    /// `placement` is shown as is by `/v1/models`.
-    Ready { context: u64, placement: serde_json::Value },
+    /// `context` in tokens; `speculative` MTP drafts per step (0: none); `processing` while a
+    /// generation runs or waits. `placement` is shown as is by `/v1/models`.
+    Ready { context: u64, speculative: u64, processing: bool, placement: serde_json::Value },
     Failed(String),
 }
 
@@ -110,6 +111,8 @@ pub fn router(engine: Arc<dyn Engine>, config: ApiConfig) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/props", get(props))
+        .route("/slots", get(slots))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "no such route") })
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "method not allowed")
@@ -135,6 +138,26 @@ impl Api {
             Some(token) if bool::from(token.as_bytes().ct_eq(key.as_bytes())) => Ok(()),
             _ => Err(ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key")),
         }
+    }
+
+    /// The engine's state once it is ready: 503 while it loads or after it failed.
+    fn ready(&self) -> Result<(u64, u64, bool), ApiError> {
+        match self.engine.state() {
+            EngineState::Ready { context, speculative, processing, .. } => Ok((context, speculative, processing)),
+            EngineState::Loading { .. } => Err(ApiError::unavailable(LOADING)),
+            EngineState::Failed(message) => Err(ApiError::unavailable(message)),
+        }
+    }
+
+    /// The engine's one slot as llama-server describes a slot: it answers one request at a
+    /// time, with the server's defaults and no output limit but the context.
+    fn slot(&self) -> Result<serde_json::Value, ApiError> {
+        let (context, speculative, processing) = self.ready()?;
+        Ok(json!({
+            "id": 0, "n_ctx": context, "speculative": speculative > 0, "is_processing": processing,
+            "params": {"n_predict": -1, "seed": self.config.seed, "temperature": self.config.temperature,
+                       "speculative.n_max": speculative},
+        }))
     }
 }
 
@@ -207,7 +230,7 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     api.authorize(&headers)?;
     let config = &api.config;
     let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false});
-    if let EngineState::Ready { context, placement } = api.engine.state() {
+    if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
         meta["placement"] = placement;
@@ -217,15 +240,27 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     Ok(Json(json!({"object": "list", "data": [model]})))
 }
 
+/// llama-server's `/props`, where its clients read the context (`n_ctx`).
+async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    api.authorize(&headers)?;
+    Ok(Json(json!({
+        "default_generation_settings": api.slot()?, "total_slots": 1, "model_alias": api.config.model_id,
+        "modalities": {"vision": false, "audio": false},
+        "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
+    })))
+}
+
+/// llama-server's `/slots`.
+async fn slots(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    api.authorize(&headers)?;
+    Ok(Json(json!([api.slot()?])))
+}
+
 /// A client that disconnects drops this handler, or the stream it returned, and with it the
 /// generation: hyper ends a connection whose client closed it mid-request.
 async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
     api.authorize(&headers)?;
-    match api.engine.state() {
-        EngineState::Ready { .. } => {}
-        EngineState::Loading { .. } => return Err(ApiError::unavailable(LOADING)),
-        EngineState::Failed(message) => return Err(ApiError::unavailable(message)),
-    }
+    api.ready()?;
     let payload = read_payload(&headers, body).await?;
     let (request, shape) = request::translate(&payload, &api.config)?;
     let generation = api.engine.generate(request).await?;
