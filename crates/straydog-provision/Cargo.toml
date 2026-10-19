@@ -6,4 +6,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+memmap2 = "0.9"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 straydog-engine = { path = "../straydog-engine" }
+straydog-gpu = { path = "../straydog-gpu" }
+# The idle timeout wraps ureq's transport, an interface outside its semver guarantees.
+ureq = { version = "~3.4.2", default-features = false, features = ["rustls"] }
+
+[features]
+# The GPU backend to link: the drafter build runs the library's CPU quantizer.
+hip = ["straydog-gpu/hip"]
+cuda = ["straydog-gpu/cuda"]
+
+[dev-dependencies]
+straydog-gguf = { path = "../straydog-gguf" }
