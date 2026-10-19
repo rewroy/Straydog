@@ -11,3 +11,7 @@ repository = "https://github.com/rewroy/Straydog"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Hashing and decoding are unusable unoptimized: dependencies are optimized in every profile.
+[profile.dev.package."*"]
+opt-level = 3

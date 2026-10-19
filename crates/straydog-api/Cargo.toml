@@ -1,0 +1,11 @@
+[package]
+name = "straydog-api"
+description = "The OpenAI-compatible HTTP API of the Straydog server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+straydog-engine = { path = "../straydog-engine" }
+serde_json = { version = "1", features = ["preserve_order"] }
+futures = "0.3"

@@ -1,0 +1,8 @@
+[package]
+name = "straydog-isolation"
+description = "Containment of the Straydog GPU worker: bubblewrap on Linux, its own AppContainer on Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

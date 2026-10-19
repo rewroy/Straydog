@@ -1,0 +1,9 @@
+[package]
+name = "straydog-provision"
+description = "Fetching and authenticating the pinned Straydog model bundles and building the MTP drafter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+straydog-engine = { path = "../straydog-engine" }

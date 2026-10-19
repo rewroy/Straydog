@@ -1,7 +1,7 @@
 # Straydog — design
 
-Status: phases R1 and R2 done (the GPU library builds statically into Rust; renders and
-token ids equal the reference's). Updated: 2026-10-19.
+Status: phases R1-R3 done (the GPU library builds statically into Rust; renders, token
+ids, weights and generations equal the reference's). Updated: 2026-10-19.
 
 Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
 OpenAI-compatible API, shipped as one executable per GPU backend.
@@ -70,6 +70,9 @@ crates/
   straydog-engine/         tokenizer, template, gguf, weights, placement, model, speculative, sampling, worker
   straydog-gpu/            bindings to the C ABI; build.rs compiles gpu/ with CMake (HIP or CUDA)
   straydog-gguf/           GGUF structure checks (and the reference's inspector command)
+  straydog-api/            the OpenAI-compatible API over an Engine (the runtime)
+  straydog-isolation/      bubblewrap and AppContainer containment of the worker
+  straydog-provision/      fetch, verify, and the MTP drafter build
 gpu/                       C++/HIP/CUDA kernels; straydog_gpu.h is the C ABI
 src/straydog/              the Python reference implementation, until phase R6 removes it
 tests/                     kernel tests (Python, NumPy references) against a shared build of gpu/
@@ -194,11 +197,19 @@ Other commands:
   (`scripts/golden.py`): token ids and renders over a corpus of conversations (tools,
   reasoning, tool results, Japanese text, 150 seeded random ones), the template's
   errors, decoding, JSON and float formatting. Equal byte for byte.
-- **R3**: weights, authentication, placement and the generation loop (prefill,
-  decode, verification, MTP, conversation checkpoints, partial residency). Gate:
-  for a fixed prompt set, every logit vector and every greedy token equals the
-  reference's bitwise, for one GPU, two GPUs (layer and expert split), partial
-  residency and host K/V.
+- **R3** (done): weights, authentication, placement and the generation loop (prefill,
+  decode, verification, MTP, conversation checkpoints, partial residency). Gate
+  (`scripts/golden_model.py`, `tests/model_gpu.rs`): over a scripted conversation that
+  takes every resume path, every greedy token, request metric, logits vector and final
+  hidden state equals the reference's bitwise, with two GPUs (layer and expert split,
+  with and without MTP, K/V in VRAM and in host memory). Partial residency swaps expert
+  slots asynchronously during decode, so whether an expert runs on the GPU or the CPU
+  depends on timing and the reference does not reproduce its own decode bit for bit;
+  there, requests whose state comes from prefill alone are compared (prompt logits and
+  tokens), and the placement's allocations are equal to the byte.
+- R4 and R5 are built in parallel in their own crates: `straydog-api` (the HTTP API over
+  an `Engine` trait), `straydog-isolation` and `straydog-provision`; the executable
+  (`crates/straydog`) wires them to the worker and runtime.
 - **R4**: worker, runtime, server, CLI and config. Gate: API tests, including
   streaming, tool calls, stop strings, cancellation on disconnect and errors.
 - **R5**: isolation (bubblewrap, AppContainer) and provisioning (`fetch`, `verify`,
