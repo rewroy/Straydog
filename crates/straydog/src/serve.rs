@@ -7,20 +7,26 @@ use clap::ArgMatches;
 use straydog_api::ReasoningEffort;
 
 use straydog::config::{self, Effort};
+use straydog::dashboard::{self, Dashboard};
+use straydog::monitor::{LogBuffer, LogSink};
 use straydog::runtime::{self, Runtime};
+use tracing_subscriber::fmt;
+use tracing_subscriber::prelude::*;
 
-fn logging(settings: &config::Settings) -> Result<(), String> {
+/// Log to the file or stderr, and into `buffer` for the dashboard.
+fn logging(settings: &config::Settings, buffer: Arc<LogBuffer>) -> Result<(), String> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(if settings.verbose { "debug" } else { "info" }));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
-    match &settings.log_file {
+    let (file, stderr) = match &settings.log_file {
         Some(path) => {
             let file = std::fs::OpenOptions::new().create(true).append(true).open(path)
                 .map_err(|exc| format!("{}: {exc}", path.display()))?;
-            builder.with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+            (Some(fmt::layer().with_target(false).with_ansi(false).with_writer(std::sync::Mutex::new(file))), None)
         }
-        None => builder.with_writer(std::io::stderr).init(),
-    }
+        None => (None, Some(fmt::layer().with_target(false).with_writer(std::io::stderr))),
+    };
+    let dashboard = fmt::layer().with_target(false).with_ansi(false).with_writer(move || LogSink(buffer.clone()));
+    tracing_subscriber::registry().with(filter).with(file).with(stderr).with(dashboard).init();
     Ok(())
 }
 
@@ -33,7 +39,8 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         }
         return Ok(());
     }
-    logging(&settings)?;
+    let logs = Arc::new(LogBuffer::default());
+    logging(&settings, logs.clone())?;
     if let Some(reason) = straydog_isolation::unavailable_reason() {
         return Err(reason);
     }
@@ -69,7 +76,8 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             },
             created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs()),
         };
-        let router = straydog_api::router(engine.clone(), api);
+        let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
+        let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor));
         let address = format!("{}:{}", settings.host, settings.port);
         let listener = tokio::net::TcpListener::bind(&address).await.map_err(|exc| format!("{address}: {exc}"))?;
         tracing::info!("Straydog listening on http://{address}");

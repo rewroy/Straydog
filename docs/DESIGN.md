@@ -143,7 +143,8 @@ There is no setup command: a model is fetched once, then given by path.
 
 - `GET /health` (no key needed): 200 when ready, 503 while loading (with progress),
   500 after a fatal engine error.
-- `GET /v1/models`.
+- `GET /v1/models`, and llama-server's `GET /props` and `GET /slots` (the context
+  as `n_ctx`).
 - `POST /v1/chat/completions`, streaming (SSE `chat.completion.chunk`) or not:
   - messages: system (and developer), user, assistant (content, `reasoning_content`,
     `tool_calls`) and tool messages; content as a string or text parts;
@@ -172,6 +173,13 @@ There is no setup command: a model is fetched once, then given by path.
   required once given (`--api-key`, or `--api-key-file` for a key kept out of the
   process list). One engine serializes generation. The waiting queue is bounded, and
   a request whose client disconnects is cancelled.
+- Dashboard: `GET /dashboard` is a page compiled into the executable (its script,
+  style and icon beside it, a strict CSP, no other origin). It reads
+  `GET /dashboard/status` (settings without the key, engine state and placement,
+  GPU telemetry, the running generation, the latest 120 finished ones with their
+  speeds, host and process figures) and `GET /dashboard/logs?after=N` (the latest
+  2000 log lines), and chats through `/v1/chat/completions`. The page needs no key;
+  the data and the chat need it once one is set.
 - One principal: every client that holds the key shares the engine and its
   conversation cache, so whether a prompt prefix was seen before is observable
   (`cached_tokens`, first-token latency). Users who must not see each other's prompts

@@ -1,13 +1,13 @@
 //! The server's ownership of the single isolated worker: startup, a bounded queue of
 //! generations run one at a time, interruption and cancellation, and failure reports.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -24,6 +24,8 @@ use crate::worker::FRAME_BYTES;
 /// Generations accepted at once: the running one and three waiting.
 const QUEUE: usize = 4;
 const STDERR_TAIL: usize = 8192;
+/// Finished generations the dashboard keeps.
+const RECENT: usize = 120;
 
 /// The program and arguments that start the worker (isolated, in production).
 pub type Command = (PathBuf, Vec<OsString>);
@@ -55,6 +57,61 @@ struct Shared {
     jobs: AtomicUsize,
     cancelled: Mutex<HashSet<String>>,
     stderr_tail: Mutex<Vec<u8>>,
+    activity: Mutex<Activity>,
+}
+
+/// What the dashboard shows of the generations: the one running and the latest finished.
+#[derive(Default)]
+struct Activity {
+    live: Option<Live>,
+    recent: VecDeque<Value>,
+    requests: u64,
+    failed: u64,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    completion_tokens: u64,
+}
+
+/// The generation running now.
+struct Live {
+    started: Instant,
+    /// Prompt tokens computed and to compute, from the worker's progress events.
+    prefill: (u64, u64),
+    /// Tokens generated so far, and when the first came.
+    tokens: u64,
+    first_token: Option<Instant>,
+}
+
+impl Activity {
+    fn record(&mut self, event: &Value) {
+        let (usage, timings) = (&event["usage"], &event["timings"]);
+        self.requests += 1;
+        self.prompt_tokens += usage["prompt_tokens"].as_u64().unwrap_or(0);
+        self.cached_tokens += usage["cached_tokens"].as_u64().unwrap_or(0);
+        self.completion_tokens += usage["completion_tokens"].as_u64().unwrap_or(0);
+        let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |time| time.as_secs_f64());
+        let mut entry = json!({"time": time, "finish_reason": event["finish_reason"], "prompt_tokens": usage["prompt_tokens"],
+                               "cached_tokens": usage["cached_tokens"], "completion_tokens": usage["completion_tokens"]});
+        for key in ["prefill_tokens_per_second", "decode_tokens_per_second", "ttft_seconds", "request_seconds",
+                    "drafted_tokens", "accepted_tokens", "resumed_from"] {
+            entry[key] = timings[key].clone();
+        }
+        if self.recent.len() == RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(entry);
+    }
+
+    fn snapshot(&self) -> Value {
+        let live = self.live.as_ref().map(|live| {
+            let decoding = live.first_token.map_or(0.0, |first| first.elapsed().as_secs_f64());
+            json!({"seconds": live.started.elapsed().as_secs_f64(), "prefill_done": live.prefill.0,
+                   "prefill_total": live.prefill.1, "tokens": live.tokens, "decode_seconds": decoding})
+        });
+        json!({"live": live, "recent": self.recent, "requests": self.requests, "failed": self.failed,
+               "prompt_tokens": self.prompt_tokens, "cached_tokens": self.cached_tokens,
+               "completion_tokens": self.completion_tokens})
+    }
 }
 
 pub struct Runtime {
@@ -245,6 +302,7 @@ impl Runtime {
             jobs: AtomicUsize::new(0),
             cancelled: Mutex::new(HashSet::new()),
             stderr_tail: Mutex::new(Vec::new()),
+            activity: Mutex::new(Activity::default()),
         });
         let (queue, jobs) = mpsc::unbounded_channel();
         let (control, controls) = mpsc::unbounded_channel();
@@ -256,6 +314,22 @@ impl Runtime {
         };
         let driver = tokio::spawn(driver.run(command, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
+    }
+
+    /// The engine as the dashboard shows it: its state (with the ready frame, the latest GPU
+    /// telemetry and the load time), the queue and the generations.
+    pub fn snapshot(&self) -> Value {
+        let mut snapshot = match &*self.shared.phase.lock().unwrap() {
+            Phase::Idle => json!({"state": "loading", "progress": {}}),
+            Phase::Loading(progress) => json!({"state": "loading", "progress": progress}),
+            Phase::Ready(ready) => json!({"state": "ready", "ready": ready}),
+            Phase::Failed(message) => json!({"state": "failed", "error": message}),
+        };
+        let activity = self.shared.activity.lock().unwrap();
+        let running = usize::from(activity.live.is_some());
+        snapshot["queued"] = self.shared.jobs.load(Ordering::SeqCst).saturating_sub(running).into();
+        snapshot["activity"] = activity.snapshot();
+        snapshot
     }
 
     /// Finish the queued generations, stop the worker and wait until it has exited (its
@@ -330,6 +404,7 @@ impl Driver {
             };
             let skipped = self.shared.cancelled.lock().unwrap().remove(&job.id);
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
+            self.shared.activity.lock().unwrap().live = None;
             if let Err(message) = result {
                 let message = format!("{message}; restart the server");
                 let _ = job.events.send(json!({"event": "error", "message": message, "fatal": true})).await;
@@ -423,8 +498,9 @@ impl Driver {
         }
         .await;
         match result {
-            Ok(ready) => {
+            Ok(mut ready) => {
                 tracing::info!("{} (loaded in {:.0} s)", ready_summary(&ready), started.elapsed().as_secs_f64());
+                ready["loaded_seconds"] = started.elapsed().as_secs_f64().into();
                 self.set(Phase::Ready(ready));
                 Ok(process)
             }
@@ -441,6 +517,25 @@ impl Driver {
         }
     }
 
+    /// Follow a generation's events for the dashboard.
+    fn observe(&self, kind: &str, event: &Value) {
+        let mut activity = self.shared.activity.lock().unwrap();
+        match kind {
+            "done" => activity.record(event),
+            "error" => activity.failed += 1,
+            _ => {}
+        }
+        let Some(live) = activity.live.as_mut() else { return };
+        match kind {
+            "progress" => live.prefill = (event["done"].as_u64().unwrap_or(0), event["total"].as_u64().unwrap_or(0)),
+            "delta" => {
+                live.first_token.get_or_insert_with(Instant::now);
+                live.tokens = event["tokens"].as_u64().unwrap_or(live.tokens);
+            }
+            _ => {}
+        }
+    }
+
     /// Run one generation, forwarding its events; Err only when the worker is unusable.
     async fn generation(&self, process: &mut Process, job: &Job, controls: &mut mpsc::UnboundedReceiver<Control>)
                         -> Result<(), String> {
@@ -450,6 +545,8 @@ impl Driver {
                                       ("command", pyjson::Value::Str("cancel".into()))]);
         let mut forwarding = true;
         let mut cancel_deadline: Option<Instant> = None;
+        self.shared.activity.lock().unwrap().live =
+            Some(Live { started: Instant::now(), prefill: (0, 0), tokens: 0, first_token: None });
         loop {
             let wait = cancel_deadline.map_or(Duration::from_secs(86400), |deadline| {
                 deadline.saturating_duration_since(Instant::now())
@@ -469,6 +566,7 @@ impl Driver {
                     if kind == "done" {
                         tracing::info!("{}", request_summary(&event));
                     }
+                    self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
                     if forwarding && job.events.send(event).await.is_err() {
                         // The client went away: end the generation, keep reading until it ends.

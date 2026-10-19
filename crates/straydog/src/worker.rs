@@ -295,7 +295,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
             match stream.push(token) {
                 Ok(delta) if !delta.is_empty() => {
                     first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                    output.send(&json!({"id": id, "event": "delta", "content": delta}));
+                    output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
                 }
                 Ok(_) => {}
                 Err(exc) => {
@@ -310,7 +310,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     }
     let rest = stream.finish().map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
     if !rest.is_empty() {
-        output.send(&json!({"id": id, "event": "delta", "content": rest}));
+        output.send(&json!({"id": id, "event": "delta", "content": rest, "tokens": generated}));
     }
     let finish_reason = if cancelled() {
         "cancelled"

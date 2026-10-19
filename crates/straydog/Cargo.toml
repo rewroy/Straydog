@@ -33,7 +33,12 @@ straydog-engine = { path = "../straydog-engine" }
 straydog-gpu = { path = "../straydog-gpu" }
 straydog-isolation = { path = "../straydog-isolation" }
 straydog-provision = { path = "../straydog-provision" }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal", "net"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

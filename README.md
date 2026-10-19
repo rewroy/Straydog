@@ -77,6 +77,13 @@ reasoning in its assistant messages keeps the conversation cache warm.
 Like llama-server, `GET /props` (`default_generation_settings.n_ctx`) and `GET /slots`
 report the context, and `GET /health` the loading progress.
 
+## Dashboard
+
+Open http://127.0.0.1:8080/dashboard in a browser. It shows the engine's state, prefill
+and decode speed per request and live during a generation, the GPUs' memory, the
+host, the settings and the service log, and has a chat. With an API key set, the page
+asks for it and keeps it in that tab.
+
 ## Development
 
 ```bash
@@ -89,6 +96,8 @@ STRAYDOG_MODEL=DIR cargo test -p straydog --features hip --test runtime_gpu
 uv sync && uv run pytest && STRAYDOG_GPU_LIBRARY=$PWD/src/straydog/native/libstraydog_gpu.so uv run pytest -m gpu
 # A/B against the reference
 cargo run --release --features hip --example ab -- --model DIR --drafter DIR --output ab.json
+# The dashboard over a simulated engine (no GPU, no model): http://127.0.0.1:18090/dashboard
+cargo run --release --features hip --example dashboard
 ```
 
 ## License

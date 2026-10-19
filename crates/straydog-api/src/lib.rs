@@ -126,17 +126,11 @@ struct Api {
 }
 
 impl Api {
-    /// The configured key, compared in constant time; without one, every client may call.
     fn authorize(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let Some(key) = &self.config.api_key else { return Ok(()) };
-        let given = headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()?.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-            .map(|(_, token)| token.trim());
-        match given {
-            Some(token) if bool::from(token.as_bytes().ct_eq(key.as_bytes())) => Ok(()),
-            _ => Err(ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key")),
+        if authorized(self.config.api_key.as_deref(), headers) {
+            Ok(())
+        } else {
+            Err(ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key"))
         }
     }
 
@@ -159,6 +153,22 @@ impl Api {
                        "speculative.n_max": speculative},
         }))
     }
+}
+
+/// Whether `headers` carry the Bearer `key`, compared in constant time; without a key, every
+/// client may call.
+pub fn authorized(key: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(key) = key else { return true };
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok()?.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .is_some_and(|(_, token)| bool::from(token.trim().as_bytes().ct_eq(key.as_bytes())))
+}
+
+/// The answer to a request without the key.
+pub fn unauthorized() -> Response {
+    ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key").into_response()
 }
 
 /// An OpenAI-style error, `{"error": {"code", "message", "type"}}`, with its HTTP status.
