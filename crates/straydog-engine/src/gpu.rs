@@ -672,6 +672,28 @@ impl Backend {
         Ok(output)
     }
 
+    /// Feed the MTP layer one batch of prompt pairs, the hidden rows coming from `stash`'s
+    /// decoder workspace (see `sd_mtp_prompt_rows`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_prompt_rows(&mut self, stash: &Backend, operands: &[Operand], stash_layer: usize, first: usize,
+                           count: usize, previous: Option<&[f32]>, embeddings: &[f32], position: u64, layer: usize)
+                           -> Result<()> {
+        if count == 0 || count > 512 || embeddings.len() != count * HIDDEN || operands.len() != 4
+            || previous.is_some_and(|row| row.len() != WIDTH)
+        {
+            return Err("invalid Straydog MTP prompt rows".into());
+        }
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: `count` embedding rows, one previous row or none; the native side checks both
+        // workspaces and the operands.
+        check(unsafe {
+            ffi::sd_mtp_prompt_rows(self.handle, pointers.as_ptr(), kinds.as_ptr(), stash.handle, stash_layer as u64,
+                                    first as u64, count as u64, previous.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                                    embeddings.as_ptr(), position, layer as u64)
+        })?;
+        Ok(())
+    }
+
     /// PLE for up to four rows with the one-row arithmetic (speculative verification).
     pub fn ple_rows(&mut self, prefix: &str, values: &[f32], embeddings: &[f32], operands: &[Operand]) -> Result<Vec<f32>> {
         let steps = Self::rows(values, WIDTH)?;

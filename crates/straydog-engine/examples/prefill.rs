@@ -1,6 +1,6 @@
 //! Time fresh prefills of real text in-process (no sandbox), for a profiler to wrap.
 //!
-//! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR]
+//! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
 //!
 //! The text is this repository's design document and engine sources, repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads.
@@ -21,6 +21,11 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         path
     });
+    let batch = args.iter().position(|arg| arg == "--batch").map(|at| {
+        let batch: usize = args[at + 1].parse().unwrap();
+        args.drain(at..at + 2);
+        batch
+    });
     let [model, quant, devices, vram, context, lengths @ ..] = &args[..] else {
         return Err("usage: prefill MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR]".into());
     };
@@ -30,7 +35,7 @@ fn main() -> Result<(), String> {
     group.configure_gemm(2, true)?;
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
-    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: 4096,
+    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: batch.unwrap_or(4096),
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0 };
     let mut model = Model::new(weights, group, &settings)?;
     let text = Text::new(&std::fs::read(root.join("tokenizer.json")).map_err(|exc| exc.to_string())?).map_err(|exc| exc.0)?;
@@ -53,10 +58,12 @@ fn main() -> Result<(), String> {
             prompt.extend(corpus.iter().take(length - prompt.len()));
         }
         let started = Instant::now();
+        model.logits_digests = Some(Vec::new());
         model.generate(&prompt, 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {})?;
+        let digest = model.logits_digests.take().unwrap_or_default().first().cloned().unwrap_or_default();
         let seconds = model.last_metrics["prefill_seconds"].as_f64().unwrap_or(0.0);
-        println!("prefill {length} tokens: {seconds:.3} s ({:.0} tok/s), request {:.3} s", length as f64 / seconds,
-                 started.elapsed().as_secs_f64());
+        println!("prefill {length} tokens: {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", length as f64 / seconds,
+                 started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
     }
     Ok(())
 }

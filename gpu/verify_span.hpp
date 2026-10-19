@@ -307,10 +307,12 @@ __global__ void mtp_combine(const float* streams, const float* embedding, float*
 }
 // MTP input: RMSNorm(embedding)·fc_embedding added to every stream of
 // fc_hidden(RMSNorm over the four-stream hidden), operands (norm_e, fc_e, norm_h, fc_h).
-void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* embeddings,
-                  const float* hidden, float* output) {
-    if (!steps || steps > 4096 || !embeddings || !hidden || !output ||
-        steps * (2 * 10240 + 2 * 2560) > d.input_capacity || steps * (10240 + 2560) > d.output_capacity)
+// The prologue's inputs and output live in the device's input area: embeddings (steps x 2560),
+// then hidden rows (steps x 10240), which the prologue replaces with its output rows.
+float* mtp_prologue_embeddings(Device& d) { return d.input; }
+float* mtp_prologue_hidden(Device& d, size_t steps) { return d.input + steps * 2560; }
+void mtp_prologue_check(Device& d, void* const* pointers, const int* kinds, size_t steps) {
+    if (!steps || steps > 4096 || steps * (2 * 10240 + 2 * 2560) > d.input_capacity || steps * (10240 + 2560) > d.output_capacity)
         throw std::runtime_error("invalid MTP prologue");
     const size_t widths[4] = {2560, 2560, 10240, 2560};
     for (size_t i = 0; i < 4; ++i) {
@@ -319,9 +321,12 @@ void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t ste
         if (found == d.allocations.end() || found->second != bytes || (i % 2 == 0 && kinds[i] != 0))
             throw std::runtime_error("invalid MTP operand");
     }
-    float* e = d.input; float* h = e + steps * 2560; float* ne = h + steps * 10240; float* nh = ne + steps * 2560;
-    upload(d, e, embeddings, steps * 2560 * 4);
-    upload(d, h, hidden, steps * 10240 * 4);
+}
+// The prologue over the rows already in the input area (see mtp_prologue_hidden).
+void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, size_t steps) {
+    mtp_prologue_check(d, pointers, kinds, steps);
+    float* e = mtp_prologue_embeddings(d); float* h = mtp_prologue_hidden(d, steps);
+    float* ne = h + steps * 10240; float* nh = ne + steps * 2560;
     mtp_norm<<<unsigned(steps),256,0,d.stream>>>(e, 2560, static_cast<const float*>(pointers[0]), ne);
     mtp_norm<<<unsigned(steps),256,0,d.stream>>>(h, 10240, static_cast<const float*>(pointers[2]), nh);
     const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
@@ -337,5 +342,13 @@ void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t ste
     }
     mtp_combine<<<dim3(40, unsigned(steps)),256,0,d.stream>>>(projected, projected + steps * 10240, h);
     check(hipGetLastError());
-    download(d, output, h, steps * 10240 * 4);
+}
+void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* embeddings,
+                  const float* hidden, float* output) {
+    if (!embeddings || !hidden || !output) throw std::runtime_error("invalid MTP prologue");
+    mtp_prologue_check(d, pointers, kinds, steps);
+    upload(d, mtp_prologue_embeddings(d), embeddings, steps * 2560 * 4);
+    upload(d, mtp_prologue_hidden(d, steps), hidden, steps * 10240 * 4);
+    mtp_prologue_device(d, pointers, kinds, steps);
+    download(d, output, mtp_prologue_hidden(d, steps), steps * 10240 * 4);
 }

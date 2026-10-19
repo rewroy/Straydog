@@ -64,6 +64,13 @@ int sd_prefill_handoff(void* from, void* to, uint64_t from_layer, uint64_t to_la
 /* Start a prompt in layer's decoder workspace from its embeddings (steps rows of 2560), each
    row repeated into the four hyper-connection streams on the device. */
 int sd_prefill_embed(void* handle, uint64_t layer, const float* embeddings, uint64_t steps);
+/* Feed the MTP layer (`layer`, on this device) one batch of prompt pairs at `position`: the
+   hidden rows are `previous` (one row, or none) then rows first .. of the prompt rows left in
+   `stash`'s decoder workspace (of stash_layer), the embeddings (count x 2560) come from the host,
+   and nothing returns to the host. */
+int sd_mtp_prompt_rows(void* handle, void* const* pointers, const int* kinds, void* stash, uint64_t stash_layer,
+                       uint64_t first, uint64_t count, const float* previous, const float* embeddings,
+                       uint64_t position, uint64_t layer);
 int sd_verify_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output);
 int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
 int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits);

@@ -593,9 +593,15 @@ impl Model {
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
         let hidden = if tokens.len() > 1 {
-            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled)? else { return Ok(None) };
+            // With another device to keep them on, the prompt's rows never leave the GPUs.
+            let stash = self.speculative > 0 && self.group.mtp_stash();
+            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash)? else { return Ok(None) };
             if self.speculative > 0 {
-                self.mtp_prompt(tokens, &rows, previous)?;
+                if stash {
+                    self.mtp_prompt_resident(tokens, previous)?;
+                } else {
+                    self.mtp_prompt(tokens, &rows, previous)?;
+                }
             }
             rows
         } else {
@@ -646,7 +652,9 @@ impl Model {
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
     /// for cancellation, and rows cross the host only at device boundaries.
-    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool)
+    /// `stash`: the MTP layer reads every final row from the first layer's workspace, so only
+    /// the last comes back; otherwise speculation takes them all.
+    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool, stash: bool)
                         -> Result<Option<Vec<f32>>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
         let boundaries = self.group.decoder_spans(1);
@@ -675,11 +683,14 @@ impl Model {
                 })?;
             }
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
-            let rows = if last == 48 { if self.speculative > 0 { steps } else { 1 } } else { 0 };
+            let rows = if last == 48 { if self.speculative > 0 && !stash { steps } else { 1 } } else { 0 };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
             if rows > 0 {
                 rows_out = output;
             }
+        }
+        if stash && !self.group.prefill_handoff(47, 0, steps)? {
+            return Err("Straydog could not keep the prompt rows for the MTP layer".into());
         }
         Ok(Some(rows_out))
     }
@@ -712,6 +723,28 @@ impl Model {
             |group, operands| group.output_head(operands, values, false),
         )?;
         Ok(tokens)
+    }
+
+    /// [`Model::mtp_prompt`] with the prompt's rows kept on the GPUs (see [`Group::mtp_stash`]):
+    /// the same pairs, in the same batches of 512.
+    fn mtp_prompt_resident(&mut self, tokens: &[u32], previous: Option<Vec<f32>>) -> Result<()> {
+        let start = self.history.len();
+        let previous = previous.filter(|_| start > 0);
+        let (following, first) = if previous.is_some() { (tokens, start - 1) } else { (&tokens[1..], start) };
+        for offset in (0..following.len()).step_by(512) {
+            let end = (offset + 512).min(following.len());
+            let embedded = self.token_embeddings(&following[offset..end])?;
+            // Pair j's hidden row is the prompt's row j, or row j - 1 after the previous row.
+            let (row, earlier) = match previous.as_deref() {
+                Some(row) if offset == 0 => (0, Some(row)),
+                Some(_) => (offset - 1, None),
+                None => (offset, None),
+            };
+            self.with_operands(Model::mtp_operands, |group, operands| {
+                group.mtp_prompt_rows(operands, row, end - offset, earlier, &embedded, (first + offset) as u64)
+            })?;
+        }
+        Ok(())
     }
 
     /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t.

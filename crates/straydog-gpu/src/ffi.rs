@@ -320,6 +320,21 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_mtp_prompt_rows(
+        handle: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        stash: *mut ::std::os::raw::c_void,
+        stash_layer: u64,
+        first: u64,
+        count: u64,
+        previous: *const f32,
+        embeddings: *const f32,
+        position: u64,
+        layer: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_verify_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

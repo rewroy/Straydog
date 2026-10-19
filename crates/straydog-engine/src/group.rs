@@ -244,6 +244,26 @@ impl Group {
         self.backends[owner].prefill_embed(layer, embeddings)
     }
 
+    /// Whether a prompt's rows can wait on another device than the MTP layer's (the first
+    /// layer's) while the MTP layer reads them: two devices, the MTP prologue's and the MTP
+    /// layer's being the last.
+    pub fn mtp_stash(&self) -> bool {
+        let mtp = self.owner(48);
+        mtp == self.backends.len() - 1 && self.owner(0) != mtp
+    }
+
+    /// One batch of prompt pairs for the MTP layer, the rows waiting in the first layer's
+    /// workspace (see [`Group::mtp_stash`]).
+    pub fn mtp_prompt_rows(&mut self, operands: &[Operand], first: usize, count: usize, previous: Option<&[f32]>,
+                           embeddings: &[f32], position: u64) -> Result<()> {
+        let (mtp, stash) = (self.owner(48), self.owner(0));
+        if !self.mtp_stash() {
+            return Err("Straydog has no device to keep MTP prompt rows on".into());
+        }
+        let (low, high) = self.backends.split_at_mut(mtp);
+        high[0].mtp_prompt_rows(&low[stash], operands, 0, first, count, previous, embeddings, position, 48)
+    }
+
     /// Move prompt rows from the device of layer `from` to the device of layer `to`, GPU to GPU;
     /// false when both layers are on one device (nothing to move).
     pub fn prefill_handoff(&mut self, from: usize, to: usize, steps: u64) -> Result<bool> {

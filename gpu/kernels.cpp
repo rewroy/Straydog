@@ -916,6 +916,43 @@ int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t
         mtp_prologue(device(handle),pointers,kinds,size_t(steps),embeddings,hidden,output); return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_mtp_prompt_rows(void* handle,void* const* pointers,const int* kinds,void* stash,uint64_t stash_layer,
+                       uint64_t first,uint64_t count,const float* previous,const float* embeddings,
+                       uint64_t position,uint64_t layer) {
+    try {
+        if (!pointers || !kinds || !embeddings || !count || (previous && count<1))
+            throw std::runtime_error("invalid MTP prompt rows");
+        const size_t stashed=size_t(count)-(previous ? 1 : 0);
+        Device& s=device(stash);
+        auto source=s.decoder.find(size_t(stash_layer));
+        if (source==s.decoder.end() || first+stashed>source->second.capacity)
+            throw std::runtime_error("MTP prompt rows have no compatible stash");
+        const float* rows=source->second.workspace;
+        // The rows reached the stash on its own stream (sd_prefill_handoff): wait for them there.
+        check(hipStreamSynchronize(s.stream));
+        Device& d=device(handle);
+        mtp_prologue_check(d,pointers,kinds,size_t(count));
+        float* hidden=mtp_prologue_hidden(d,size_t(count));
+        if (previous) upload(d,hidden,previous,10240*4);
+        if (stashed) check(hipMemcpyPeerAsync(hidden+(size_t(count)-stashed)*10240,d.ordinal,rows+size_t(first)*10240,
+                                              s.ordinal,stashed*10240*4,d.stream));
+        upload(d,mtp_prologue_embeddings(d),embeddings,size_t(count)*2560*4);
+        mtp_prologue_device(d,pointers,kinds,size_t(count));
+        if (count==1) {
+            // One pair goes through the MTP layer as a verification row, as a host row would.
+            std::vector<float> row(10240),output(10240);
+            download(d,row.data(),hidden,10240*4);
+            verify_span(d,size_t(layer),size_t(layer)+1,size_t(position),1,row.data(),output.data());
+            return 0;
+        }
+        auto target=d.decoder.find(size_t(layer));
+        if (target==d.decoder.end() || count>target->second.capacity)
+            throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
+        check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+        prefill_span(d,size_t(layer),size_t(layer)+1,size_t(position),size_t(count),nullptr,nullptr,0);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_ple_rows(void* handle,void* const* pointers,const int* kinds,void* history,uint64_t steps,
                 const float* embeddings,const float* hidden,float* output) {
     try { ple(device(handle),pointers,kinds,history,size_t(steps),embeddings,hidden,output,nullptr,true); return 0; }
