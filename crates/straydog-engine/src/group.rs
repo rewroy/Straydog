@@ -275,6 +275,23 @@ impl Group {
         Ok(true)
     }
 
+    /// Deferred prefill on every device (see [`Backend::prefill_defer`]).
+    pub fn prefill_defer(&mut self, on: bool) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.prefill_defer(on))
+    }
+
+    /// Settle every device, the first failure winning.
+    pub fn prefill_settle(&mut self) -> Result<()> {
+        let mut result = Ok(());
+        for backend in &mut self.backends {
+            let settled = backend.prefill_settle();
+            if result.is_ok() {
+                result = settled;
+            }
+        }
+        result
+    }
+
     pub fn prefill_ple(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
         let owner = self.index(prefix);
         self.backends[owner].prefill_ple(prefix, embeddings, operands, 1)

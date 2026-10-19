@@ -192,6 +192,8 @@ pub struct Model {
     pub logits_digests: Option<Vec<String>>,
     /// When set, every logits vector the model returns (validation tooling).
     pub logits_capture: Option<Vec<Vec<f32>>>,
+    /// Inside a pipelined prefill: batches before the last return no rows.
+    deferred: bool,
 }
 
 impl Model {
@@ -257,6 +259,7 @@ impl Model {
             last_metrics: Map::new(),
             logits_digests: None,
             logits_capture: None,
+            deferred: false,
         };
         model.resident = model.prepare_resident_moe()?;
         if !model.resident {
@@ -612,7 +615,9 @@ impl Model {
         } else if tokens.len() > 1 {
             // With another device to keep them on, the prompt's rows never leave the GPUs.
             let stash = self.speculative > 0 && self.group.mtp_stash();
-            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash)? else { return Ok(None) };
+            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash, logits || !self.deferred)? else {
+                return Ok(None);
+            };
             if self.speculative > 0 {
                 if stash {
                     self.mtp_prompt_resident(tokens, previous)?;
@@ -641,7 +646,7 @@ impl Model {
             hidden
         };
         self.history.extend_from_slice(tokens);
-        self.final_hidden = Some(last_row(&hidden).to_vec());
+        self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
         if !logits {
             return Ok(Some(None));
         }
@@ -674,8 +679,9 @@ impl Model {
     /// for cancellation, and rows cross the host only at device boundaries.
     /// `stash`: the MTP layer reads every final row from the first layer's workspace, so only
     /// the last comes back; otherwise speculation takes them all.
-    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool, stash: bool)
-                        -> Result<Option<Vec<f32>>> {
+    /// `keep_rows`: whether the last span returns rows (a deferred batch before the last does not).
+    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool, stash: bool,
+                        keep_rows: bool) -> Result<Option<Vec<f32>>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
         let boundaries = self.group.decoder_spans(1);
         let mut spans = vec![(0, 1)];
@@ -703,7 +709,11 @@ impl Model {
                 })?;
             }
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
-            let rows = if last == 48 { if self.speculative > 0 && !stash { steps } else { 1 } } else { 0 };
+            let rows = match last {
+                48 if !keep_rows => 0,
+                48 => if self.speculative > 0 && !stash { steps } else { 1 },
+                _ => 0,
+            };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
             if rows > 0 {
                 rows_out = output;
@@ -812,6 +822,46 @@ impl Model {
 
     /// The next token and its drafts through every layer with the one-token arithmetic.
     #[allow(clippy::type_complexity)]
+    /// The prompt's batches from `position`, with the checkpoints of `plan`: the last batch's
+    /// logits, or None when cancelled.
+    fn prefill(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)],
+               cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
+        let mut output = None;
+        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
+        for stop in stops {
+            while position < stop {
+                if cancelled() {
+                    return Ok(None);
+                }
+                let end = (position + self.prefill_batch_size).min(stop);
+                // A one-token batch runs whole, as decode does; a longer one checks between spans.
+                let check: &dyn Fn() -> bool = if self.prefill_batch_size == 1 { &|| false } else { cancelled };
+                let Some(logits) = self.forward(&tokens[position..end], end == tokens.len(), check)? else {
+                    return Ok(None);
+                };
+                output = logits;
+                if cancelled() {
+                    return Ok(None);
+                }
+                position = end;
+                progress(end, tokens.len());
+            }
+            if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
+                for kind in kinds.clone() {
+                    self.save_checkpoint(kind)?;
+                }
+            }
+        }
+        Ok(Some(output))
+    }
+
+    /// Whether a prompt's batches overlap on two GPUs that split the layers: the first device
+    /// starts batch n+1 while the second finishes batch n, nothing waiting on the host between.
+    fn pipelined_prefill(&self, tokens: usize) -> Result<bool> {
+        Ok(self.resident && self.speculative == 0 && self.group.backends.len() == 2 && !self.group.expert_parallel()?
+           && tokens > self.prefill_batch_size)
+    }
+
     fn verify(&mut self, tokens: &[u32], sampling: bool)
               -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
         let (first, embeddings, hidden) = self.verify_rows(tokens)?;
@@ -990,35 +1040,22 @@ impl Model {
         .as_object()
         .unwrap()
         .clone();
-        let mut output = None;
         let prefill_started = Instant::now();
         let plan = self.checkpoint_plan(tokens, reused, turn, checkpoint);
-        let mut position = reused;
-        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
-        for stop in stops {
-            while position < stop {
-                if cancelled() {
-                    return Ok(());
-                }
-                let end = (position + self.prefill_batch_size).min(stop);
-                // A one-token batch runs whole, as decode does; a longer one checks between spans.
-                let check: &dyn Fn() -> bool = if self.prefill_batch_size == 1 { &|| false } else { cancelled };
-                let Some(logits) = self.forward(&tokens[position..end], end == tokens.len(), check)? else {
-                    return Ok(());
-                };
-                output = logits;
-                if cancelled() {
-                    return Ok(());
-                }
-                position = end;
-                progress(end, tokens.len());
-            }
-            if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
-                for kind in kinds.clone() {
-                    self.save_checkpoint(kind)?;
-                }
+        let pipelined = self.pipelined_prefill(tokens.len() - reused)?;
+        if pipelined {
+            self.group.prefill_defer(true)?;
+            self.deferred = true;
+        }
+        let prefilled = self.prefill(tokens, reused, &plan, cancelled, progress);
+        if pipelined {
+            self.deferred = false;
+            let settled = self.group.prefill_settle();
+            if prefilled.is_ok() {
+                settled?;
             }
         }
+        let Some(output) = prefilled? else { return Ok(()) };
         let elapsed = prefill_started.elapsed().as_secs_f64();
         self.last_metrics.insert("prefill_seconds".into(), json!(elapsed));
         self.last_metrics.insert("prefill_tokens_per_second".into(), json!((tokens.len() - reused) as f64 / elapsed));

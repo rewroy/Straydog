@@ -312,6 +312,15 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_defer(
+        handle: *mut ::std::os::raw::c_void,
+        on: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_settle(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_embed(
         handle: *mut ::std::os::raw::c_void,
         layer: u64,

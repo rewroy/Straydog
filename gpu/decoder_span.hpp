@@ -317,10 +317,16 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         });
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
     }
+    const bool parts=span_has_parts(d,begin,end);
+    if (d.prefill_deferred && !output_rows && !timings && !parts) {
+        decoder_nonfinite<<<256,256,0,d.stream>>>(hidden,steps*10240,d.flags+1);
+        check(hipGetLastError());
+        return;
+    }
     check(hipMemsetAsync(d.flags,0,4,d.stream));
     decoder_nonfinite<<<256,256,0,d.stream>>>(hidden,steps*10240,d.flags);
     check(hipGetLastError());
-    if (span_has_parts(d,begin,end)) finish_with_helper(d);
+    if (parts) finish_with_helper(d);
     unsigned flag=0;
     download(d,&flag,d.flags,4);
     if (output_rows) download(d,output,hidden+(steps-output_rows)*10240,output_rows*10240*4);

@@ -61,6 +61,8 @@ int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t positio
 /* Move the prompt rows a span left in `from`'s decoder workspace (of layer from_layer) into
    `to`'s (of layer to_layer), device to device, for the next span to continue from. */
 int sd_prefill_handoff(void* from, void* to, uint64_t from_layer, uint64_t to_layer, uint64_t steps);
+int sd_prefill_defer(void* handle, int on);
+int sd_prefill_settle(void* handle);
 /* Start a prompt in layer's decoder workspace from its embeddings (steps rows of 2560), each
    row repeated into the four hyper-connection streams on the device. */
 int sd_prefill_embed(void* handle, uint64_t layer, const float* embeddings, uint64_t steps);

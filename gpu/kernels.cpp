@@ -348,6 +348,11 @@ struct Device {
     float* attention_scores = nullptr;
     void* blas_workspace = nullptr;
     unsigned* flags = nullptr;
+    // Deferred prefill (sd_prefill_defer): spans end without a host wait; their non-finite
+    // check accumulates in flags[1] until sd_prefill_settle. `handoff` orders a row handoff
+    // between this device's stream and its peer's.
+    bool prefill_deferred = false;
+    hipEvent_t handoff = nullptr;
     uint64_t gemm_calls = 0, gemm_vectors = 0;
     std::unordered_map<void*, size_t> allocations;
     // Allocations that live in mapped, page-locked host memory (sd_host_state): device pointer -> host pointer.
@@ -407,6 +412,7 @@ struct Device {
         if (attention_scores) cleanup(hipFree(attention_scores));
         if (blas_workspace) cleanup(hipFree(blas_workspace));
         if (flags) cleanup(hipFree(flags));
+        if (handoff) cleanup(hipEventDestroy(handoff));
         for (auto entry : allocations) {
             const auto host = host_states.find(entry.first);
             cleanup(host == host_states.end() ? hipFree(entry.first) : hipHostFree(host->second));
@@ -979,6 +985,26 @@ int sd_prefill_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,u
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// Deferred prefill: while on, spans that return no rows end without waiting for the device.
+int sd_prefill_defer(void* handle,int on) {
+    try {
+        Device& d=device(handle);
+        if (on && !d.prefill_deferred) check(hipMemsetAsync(d.flags+1,0,4,d.stream));
+        d.prefill_deferred=on!=0;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Waits for the device, ends deferral and fails if a deferred span produced non-finite rows.
+int sd_prefill_settle(void* handle) {
+    try {
+        Device& d=device(handle);
+        unsigned flag=0;
+        download(d,&flag,d.flags+1,4);
+        d.prefill_deferred=false;
+        if (flag) throw std::runtime_error("Straydog GPU produced non-finite decoder state");
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_handoff(void* from,void* to,uint64_t from_layer,uint64_t to_layer,uint64_t steps) {
     try {
         auto workspace=[](Device& d,uint64_t layer,uint64_t steps) {
@@ -991,8 +1017,15 @@ int sd_prefill_handoff(void* from,void* to,uint64_t from_layer,uint64_t to_layer
         const float* source=workspace(a,from_layer,steps);
         Device& b=device(to);
         float* target=workspace(b,to_layer,steps);
-        // The span that left the rows ended with a synchronizing download: they are complete.
-        check(hipMemcpyPeerAsync(target,b.ordinal,source,a.ordinal,size_t(steps)*10240*4,b.stream));
+        // The copy starts once the source stream has written the rows, and the source's later
+        // work (the next batch, with deferred spans) waits until the rows have left.
+        on_device(a.ordinal,[&]() { check(hipEventRecord(a.handoff,a.stream)); });
+        on_device(b.ordinal,[&]() {
+            check(hipStreamWaitEvent(b.stream,a.handoff,0));
+            check(hipMemcpyPeerAsync(target,b.ordinal,source,a.ordinal,size_t(steps)*10240*4,b.stream));
+            check(hipEventRecord(b.handoff,b.stream));
+        });
+        on_device(a.ordinal,[&]() { check(hipStreamWaitEvent(a.stream,b.handoff,0)); });
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1315,6 +1348,7 @@ void* sd_create(int ordinal, uint64_t budget) {
         check(hipStreamCreate(&value->stream));
         check(hipHostMalloc(reinterpret_cast<void**>(&value->io), io_arena_bytes, hipHostMallocDefault));
         for (auto& event : value->io_halves) check(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+        check(hipEventCreateWithFlags(&value->handoff, hipEventDisableTiming));
         check(hipMalloc(reinterpret_cast<void**>(&value->input), value->input_capacity * 4));
         check(hipMalloc(reinterpret_cast<void**>(&value->output), value->output_capacity * 4));
         check(hipMalloc(reinterpret_cast<void**>(&value->matrices), value->batch_capacity * sizeof(GemvItem)));

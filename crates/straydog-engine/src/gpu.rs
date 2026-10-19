@@ -457,6 +457,18 @@ impl Backend {
         Ok(())
     }
 
+    /// While on, prefill spans that return no rows end without waiting for the device.
+    pub fn prefill_defer(&mut self, on: bool) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_prefill_defer(self.handle, c_int::from(on)) }).map(drop)
+    }
+
+    /// Wait for deferred spans, end deferral, and fail if one produced non-finite rows.
+    pub fn prefill_settle(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_prefill_settle(self.handle) }).map(drop)
+    }
+
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
         if begin >= end || end > 49 || end - begin > 4 || !(2..=self.prefill_capacity).contains(&steps)
