@@ -1,11 +1,30 @@
 //! The OpenAI-compatible HTTP API (docs/DESIGN.md §6) over an [`Engine`]: the server's
 //! runtime, which owns the isolated worker.
 //!
-//! Interface fixed for phase R4; the router is to be written.
+//! `GET /health` needs no key; `GET /v1/models` and `POST /v1/chat/completions` need the
+//! Bearer key once one is configured. A chat completion request becomes a worker request
+//! ([`WorkerRequest`]); the worker's raw template text comes back as reasoning, answer and
+//! structured tool calls.
 
+mod answer;
+mod request;
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
+use axum::Router;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt};
+use serde_json::json;
 use straydog_engine::pyjson;
+use subtle::ConstantTimeEq;
+
+pub use request::ReasoningEffort;
 
 /// The engine as the API sees it.
 pub trait Engine: Send + Sync + 'static {
@@ -21,7 +40,8 @@ pub struct Generation {
     /// Worker events as JSON objects: `{"event": "delta", "content"}`, `{"event": "progress",
     /// "done", "total"}`, `{"event": "done", "finish_reason", "usage": {"prompt_tokens",
     /// "completion_tokens", "total_tokens", "cached_tokens"}, "timings"}` or `{"event":
-    /// "error", "message", "fatal"}`.
+    /// "error", "message", "fatal"}`. A non-fatal error is the request's fault (400), a fatal
+    /// one the engine's (500).
     pub events: BoxStream<'static, serde_json::Value>,
     /// Ask the worker to end early (a stop string matched); its `done` event still follows.
     pub interrupt: Box<dyn Fn() + Send + Sync>,
@@ -29,7 +49,9 @@ pub struct Generation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineState {
+    /// `progress` is shown as is by `/health`.
     Loading { progress: serde_json::Value },
+    /// `placement` is shown as is by `/v1/models`.
     Ready { context: u64, placement: serde_json::Value },
     Failed(String),
 }
@@ -49,4 +71,188 @@ pub enum SubmitError {
 /// `{"messages": [...], "tools": [...] | null, "max_tokens": n | null, "temperature": t,
 /// "seed": n, "thinking": bool, "reasoning_effort": "low" | "medium" | "xhigh",
 /// "checkpoint": bool}`.
+///
+/// Each message keeps, in the client's order, the fields the template reads or a client
+/// sends back (`role`, `content`, `name`, `tool_call_id`, `tool_calls`,
+/// `reasoning_content`) that are not null; a developer message is a system one, and text
+/// parts are joined into one string as the template would render them.
 pub struct WorkerRequest;
+
+/// What the API takes from the server's settings (docs/DESIGN.md §5).
+#[derive(Clone)]
+pub struct ApiConfig {
+    /// The model id in `/v1/models` and in every answer (`--alias`).
+    pub model_id: String,
+    /// The configured context in tokens, shown as `n_ctx` until the engine reports its own.
+    pub context: u64,
+    /// The bundle's quantization, e.g. `IQ3_S`.
+    pub quantization: String,
+    /// The Bearer key every route but `/health` then requires (`--api-key`).
+    pub api_key: Option<String>,
+    /// The temperature when a request gives none (`--temp`).
+    pub temperature: f64,
+    /// The sampling seed when a request gives none (`--seed`).
+    pub seed: u64,
+    /// The reasoning when a request gives none (`--reasoning-effort`).
+    pub reasoning_effort: ReasoningEffort,
+    /// The model's `created` time in Unix seconds: when the server started.
+    pub created: u64,
+}
+
+/// The largest request body.
+const BODY_LIMIT: usize = 15 * 1024 * 1024;
+/// What a request sees while the model loads (llama-server's wording).
+const LOADING: &str = "Loading model";
+
+/// The routes over one engine.
+pub fn router(engine: Arc<dyn Engine>, config: ApiConfig) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "no such route") })
+        .method_not_allowed_fallback(|| async {
+            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "method not allowed")
+        })
+        .with_state(Arc::new(Api { engine, config }))
+}
+
+struct Api {
+    engine: Arc<dyn Engine>,
+    config: ApiConfig,
+}
+
+impl Api {
+    /// The configured key, compared in constant time; without one, every client may call.
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let Some(key) = &self.config.api_key else { return Ok(()) };
+        let given = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()?.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.trim());
+        match given {
+            Some(token) if bool::from(token.as_bytes().ct_eq(key.as_bytes())) => Ok(()),
+            _ => Err(ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key")),
+        }
+    }
+}
+
+/// An OpenAI-style error, `{"error": {"code", "message", "type"}}`, with its HTTP status.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    kind: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> ApiError {
+        ApiError { status, kind, message: message.into() }
+    }
+
+    fn invalid(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    }
+
+    fn server(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", message)
+    }
+
+    fn unavailable(message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable_error", message)
+    }
+
+    fn object(&self) -> serde_json::Value {
+        json!({"code": self.status.as_u16(), "message": self.message, "type": self.kind})
+    }
+
+    fn body(&self) -> serde_json::Value {
+        json!({"error": self.object()})
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body())).into_response()
+    }
+}
+
+impl From<SubmitError> for ApiError {
+    fn from(error: SubmitError) -> ApiError {
+        match error {
+            SubmitError::Busy(message) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "server_busy", message),
+            SubmitError::Invalid(message) => ApiError::invalid(message),
+            SubmitError::Unavailable(message) => ApiError::unavailable(message),
+        }
+    }
+}
+
+async fn health(State(api): State<Arc<Api>>) -> Response {
+    match api.engine.state() {
+        EngineState::Ready { .. } => Json(json!({"status": "ok"})).into_response(),
+        EngineState::Loading { progress } => {
+            let error = ApiError::unavailable(LOADING).object();
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "loading", "progress": progress, "error": error})))
+                .into_response()
+        }
+        EngineState::Failed(message) => {
+            let error = ApiError::server(message).object();
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"status": "error", "error": error}))).into_response()
+        }
+    }
+}
+
+async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    api.authorize(&headers)?;
+    let config = &api.config;
+    let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false});
+    if let EngineState::Ready { context, placement } = api.engine.state() {
+        meta["n_ctx"] = context.into();
+        meta["ready"] = true.into();
+        meta["placement"] = placement;
+    }
+    let model = json!({"id": config.model_id, "object": "model", "created": config.created, "owned_by": "straydog",
+                       "meta": meta});
+    Ok(Json(json!({"object": "list", "data": [model]})))
+}
+
+/// A client that disconnects drops this handler, or the stream it returned, and with it the
+/// generation: hyper ends a connection whose client closed it mid-request.
+async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
+    api.authorize(&headers)?;
+    match api.engine.state() {
+        EngineState::Ready { .. } => {}
+        EngineState::Loading { .. } => return Err(ApiError::unavailable(LOADING)),
+        EngineState::Failed(message) => return Err(ApiError::unavailable(message)),
+    }
+    let payload = read_payload(&headers, body).await?;
+    let (request, shape) = request::translate(&payload, &api.config)?;
+    let generation = api.engine.generate(request).await?;
+    answer::respond(generation, shape, &api.config.model_id).await
+}
+
+/// The request body as Python's `json.loads` reads it: the prompt is rendered from it.
+async fn read_payload(headers: &HeaderMap, body: Body) -> Result<pyjson::Value, ApiError> {
+    let too_large = || ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "request body too large");
+    let declared = headers.get(CONTENT_LENGTH).and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > BODY_LIMIT as u64) {
+        return Err(too_large());
+    }
+    let mut data = Vec::new();
+    let mut chunks = body.into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| ApiError::invalid("the request body could not be read"))?;
+        if data.len() + chunk.len() > BODY_LIMIT {
+            return Err(too_large());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let text = std::str::from_utf8(&data).map_err(|_| ApiError::invalid("the request body is not UTF-8"))?;
+    let payload =
+        pyjson::parse(text).map_err(|error| ApiError::invalid(format!("the request body is not valid JSON: {error}")))?;
+    if !matches!(payload, pyjson::Value::Object(_)) {
+        return Err(ApiError::invalid("the request body must be a JSON object"));
+    }
+    Ok(payload)
+}
