@@ -38,14 +38,14 @@ pub enum Effort {
 #[derive(Debug, Clone, Default, Args, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Options {
-    /// Model bundle directory (the pinned GGUF shards and tokenizer files of one quantization)
-    #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "DIR")]
+    /// Model bundle: its directory (the pinned GGUF shards and tokenizer files of one quantization) or one of its shards
+    #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "PATH")]
     pub model: Option<PathBuf>,
     /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS or IQ3_S [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
-    /// MTP drafter directory (also -md)
-    #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "DIR")]
+    /// MTP drafter: its directory or its GGUF file (also -md)
+    #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "PATH")]
     pub model_draft: Option<PathBuf>,
     /// MTP drafts per pass, 0 turns speculation off [default: 3 with a drafter]
     #[arg(long, env = "STRAYDOG_DRAFT_MAX", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
@@ -238,20 +238,44 @@ pub fn detect_quantization(model: &Path) -> Result<String, String> {
     }
 }
 
+/// The directory and quantization of a pinned shard given as the model.
+fn bundle_of_shard(shard: &Path) -> Result<(PathBuf, Option<String>), String> {
+    let name = shard.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let quant = QUANTIZATIONS
+        .iter()
+        .find(|quant| bundle::bundle(quant).is_ok_and(|pins| pins.shards.iter().any(|pin| pin.name == name)))
+        .ok_or_else(|| format!("{} is not a shard of a pinned model bundle", shard.display()))?;
+    Ok((shard.parent().unwrap().to_path_buf(), Some(quant.to_string())))
+}
+
+/// The directory of the pinned drafter given as a file.
+fn drafter_directory(file: &Path) -> Result<PathBuf, String> {
+    let pin = bundle::bundle(QUANTIZATIONS[0])?.drafter;
+    if file.file_name().and_then(|name| name.to_str()) != Some(pin.name.as_str()) {
+        return Err(format!("{} is not the pinned drafter ({})", file.display(), pin.name));
+    }
+    Ok(file.parent().unwrap().to_path_buf())
+}
+
 /// Fill every derived setting.
 pub fn resolve(options: Options) -> Result<Settings, String> {
     let model = options.model.ok_or("no model: give -m DIR or set model in the config file")?;
-    let model = model.canonicalize().map_err(|exc| format!("model directory {}: {exc}", model.display()))?;
+    let model = model.canonicalize().map_err(|exc| format!("model {}: {exc}", model.display()))?;
+    // A shard of a bundle, as llama.cpp takes a model, names its directory (and quantization).
+    let (model, shard_quant) = if model.is_file() { bundle_of_shard(&model)? } else { (model, None) };
     if !model.is_dir() {
         return Err(format!("model directory not found: {}", model.display()));
     }
-    let quant = match options.quant {
+    let quant = match options.quant.or(shard_quant) {
         Some(quant) if QUANTIZATIONS.contains(&quant.as_str()) => quant,
         Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS or IQ3_S")),
         None => detect_quantization(&model)?,
     };
     let model_draft = match options.model_draft {
-        Some(directory) => Some(directory.canonicalize().map_err(|exc| format!("drafter {}: {exc}", directory.display()))?),
+        Some(path) => {
+            let path = path.canonicalize().map_err(|exc| format!("drafter {}: {exc}", path.display()))?;
+            Some(if path.is_file() { drafter_directory(&path)? } else { path })
+        }
         None => None,
     };
     let draft_max = options.draft_max.unwrap_or(if model_draft.is_some() { 3 } else { 0 });
@@ -434,6 +458,20 @@ mod tests {
         assert!(parse(&["--temp", "3"]).is_err());
         assert!(parse(&["-c", "300000"]).is_err());
         assert!(parse(&["--draft-max", "4"]).is_err());
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    #[test]
+    fn a_shard_names_its_bundle_directory_and_quantization() {
+        let model = bundle_directory("IQ2_XS");
+        let shard = model.join(&bundle::bundle("IQ2_XS").unwrap().shards[0].name);
+        let matches = command().try_get_matches_from(["-m", shard.to_str().unwrap()]).unwrap();
+        let settings = resolve(Options::from_arg_matches(&matches).unwrap()).unwrap();
+        assert_eq!((settings.model, settings.quant.as_str()), (model.canonicalize().unwrap(), "IQ2_XS"));
+        let stray = model.join("other.gguf");
+        std::fs::write(&stray, b"").unwrap();
+        let matches = command().try_get_matches_from(["-m", stray.to_str().unwrap()]).unwrap();
+        assert!(resolve(Options::from_arg_matches(&matches).unwrap()).is_err());
         std::fs::remove_dir_all(model).unwrap();
     }
 

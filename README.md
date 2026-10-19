@@ -45,6 +45,9 @@ straydog -m ~/models/IQ3_S -md ~/models/mtp -dev 0,1 --vram 30 --api-key-file ~/
 ```
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
+`-m` takes the bundle's directory (both GGUF shards with `tokenizer.json`,
+`chat_template.jinja` and `config.json`) or either shard; `-md` the drafter's directory
+or its GGUF.
 Every setting is an option; each also reads a `STRAYDOG_*` variable (`STRAYDOG_CTX_SIZE`),
 and `--config FILE` reads them from a TOML file. Options beat variables, which beat the
 file. `--print-config` shows the settings in effect and where each came from.
