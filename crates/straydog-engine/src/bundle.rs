@@ -61,3 +61,89 @@ pub fn bundle(quantization: &str) -> Result<Bundle, String> {
         drafter: asset(drafter)?,
     })
 }
+
+/// The repository the resources (tokenizer, template, config) come from, at the manifest's
+/// tokenizer revision: the official model's.
+pub const RESOURCE_REPOSITORY: &str = "Qwen/Qwen3.8-Flash-Next";
+
+/// Where a pinned file comes from: a Hugging Face repository, a revision and a path in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub asset: Asset,
+    pub repository: String,
+    pub revision: String,
+    pub path: String,
+}
+
+/// Where every pinned file of `quantization` comes from: its shards, then the resources.
+/// Provisioning only; the engine needs the pins alone.
+pub fn sources(quantization: &str) -> Result<Vec<Source>, String> {
+    let pins = bundle(quantization)?;
+    let manifest: Value = serde_json::from_str(MANIFEST).map_err(|exc| exc.to_string())?;
+    let listed = if manifest["quantization"] == quantization {
+        &manifest["assets"]
+    } else {
+        &manifest["bundles"][quantization]["assets"]
+    };
+    let text = |value: &Value, what: &str| -> Result<String, String> {
+        value.as_str().map(str::to_string).ok_or_else(|| format!("manifest without {what}"))
+    };
+    let repository = text(&manifest["repository"], "a repository")?;
+    let revision = text(&manifest["revision"], "a revision")?;
+    let tokenizer_revision = text(&manifest["tokenizer_revision"], "a tokenizer revision")?;
+    let mut sources = Vec::new();
+    for (asset, item) in pins.shards.into_iter().zip(listed.as_array().ok_or("manifest list missing")?) {
+        let path = text(&item["source_path"], "a source path")?;
+        sources.push(Source { asset, repository: repository.clone(), revision: revision.clone(), path });
+    }
+    for asset in pins.resources {
+        let path = asset.name.clone();
+        sources.push(Source { asset, repository: RESOURCE_REPOSITORY.into(), revision: tokenizer_revision.clone(), path });
+    }
+    Ok(sources)
+}
+
+/// One official tensor the drafter is built from, pinned by size and SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTensor {
+    pub name: String,
+    /// The safetensors shard of the official checkpoint that holds it.
+    pub shard: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// The drafter's pin and what it is built from: the official checkpoint's repository,
+/// revision and MTP tensors (in name order).
+#[derive(Debug, Clone)]
+pub struct DrafterSource {
+    pub asset: Asset,
+    pub repository: String,
+    pub revision: String,
+    pub tensors: Vec<SourceTensor>,
+}
+
+pub fn drafter_source() -> Result<DrafterSource, String> {
+    let manifest: Value = serde_json::from_str(MANIFEST).map_err(|exc| exc.to_string())?;
+    let drafter = &manifest["drafter"];
+    if manifest["schema"] != 1 || manifest["model"] != MODEL || drafter["kind"] != "mtp" {
+        return Err("Straydog drafter is not pinned in the model manifest".into());
+    }
+    let text = |value: &Value| value.as_str().map(str::to_string).ok_or("manifest drafter source incomplete");
+    let mut tensors = Vec::new();
+    for (name, pin) in drafter["source_tensors"].as_object().ok_or("manifest drafter source incomplete")? {
+        tensors.push(SourceTensor {
+            name: name.clone(),
+            shard: text(&pin["shard"])?,
+            bytes: pin["bytes"].as_u64().ok_or("manifest drafter source incomplete")?,
+            sha256: text(&pin["sha256"])?,
+        });
+    }
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(DrafterSource {
+        asset: asset(drafter)?,
+        repository: text(&drafter["repository"])?,
+        revision: text(&drafter["revision"])?,
+        tensors,
+    })
+}
