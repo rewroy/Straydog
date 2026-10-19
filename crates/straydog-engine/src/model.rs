@@ -167,6 +167,10 @@ fn tile(embeddings: &[f32]) -> Vec<f32> {
     hidden
 }
 
+/// A verification pass: the first layer's rows, the PLE embeddings, the final rows, each
+/// row's argmax and, when sampling, the rows' logits.
+type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>);
+
 fn last_row(values: &[f32]) -> &[f32] {
     &values[values.len() - WIDTH..]
 }
@@ -892,8 +896,7 @@ impl Model {
            && tokens > self.prefill_batch_size)
     }
 
-    fn verify(&mut self, tokens: &[u32], sampling: bool)
-              -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
+    fn verify(&mut self, tokens: &[u32], sampling: bool) -> Result<Verified> {
         let (first, embeddings, hidden) = self.verify_rows(tokens)?;
         let (targets, scores) =
             self.with_operands(Model::head_operands, |group, operands| group.output_head(operands, &hidden, sampling))?;
