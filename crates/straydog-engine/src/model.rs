@@ -194,6 +194,8 @@ pub struct Model {
     pub logits_capture: Option<Vec<Vec<f32>>>,
     /// Inside a pipelined prefill: batches before the last return no rows.
     deferred: bool,
+    /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
+    mtp_kept: u64,
 }
 
 impl Model {
@@ -260,6 +262,7 @@ impl Model {
             logits_digests: None,
             logits_capture: None,
             deferred: false,
+            mtp_kept: 0,
         };
         model.resident = model.prepare_resident_moe()?;
         if !model.resident {
@@ -614,12 +617,14 @@ impl Model {
             rows
         } else if tokens.len() > 1 {
             // With another device to keep them on, the prompt's rows never leave the GPUs.
-            let stash = self.speculative > 0 && self.group.mtp_stash();
+            let stash = self.speculative > 0 && !self.deferred && self.group.mtp_stash();
             let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash, logits || !self.deferred)? else {
                 return Ok(None);
             };
             if self.speculative > 0 {
-                if stash {
+                if self.deferred {
+                    self.mtp_prompt_kept(tokens, previous)?;
+                } else if stash {
                     self.mtp_prompt_resident(tokens, previous)?;
                 } else {
                     self.mtp_prompt(tokens, &rows, previous)?;
@@ -711,7 +716,7 @@ impl Model {
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
             let rows = match last {
                 48 if !keep_rows => 0,
-                48 => if self.speculative > 0 && !stash { steps } else { 1 },
+                48 => if self.speculative > 0 && !stash && !self.deferred { steps } else { 1 },
                 _ => 0,
             };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
@@ -772,6 +777,30 @@ impl Model {
             };
             self.with_operands(Model::mtp_operands, |group, operands| {
                 group.mtp_prompt_rows(operands, row, end - offset, earlier, &embedded, (first + offset) as u64)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// [`Model::mtp_prompt_resident`] inside a pipelined prefill: the batch's rows stay on the
+    /// MTP layer's device after the row before them (carried there from the last batch, else
+    /// `previous` from the host), and its pairs run on that device's stream with no host wait.
+    fn mtp_prompt_kept(&mut self, tokens: &[u32], previous: Option<Vec<f32>>) -> Result<()> {
+        let start = self.history.len();
+        let host = if self.mtp_kept == 0 { previous.filter(|_| start > 0) } else { None };
+        let before = self.mtp_kept > 0 || host.is_some();
+        self.group.mtp_keep(tokens.len() as u64, self.mtp_kept, host.as_deref())?;
+        self.mtp_kept = tokens.len() as u64;
+        let (following, first, row) = if before { (tokens, start - 1, 0) } else { (&tokens[1..], start, 1) };
+        if following.is_empty() {
+            return Ok(());
+        }
+        let embedded = self.token_embeddings(following)?;
+        self.group.mtp_embed(&embedded)?;
+        for offset in (0..following.len()).step_by(512) {
+            let count = (following.len() - offset).min(512) as u64;
+            self.with_operands(Model::mtp_operands, |group, operands| {
+                group.mtp_prompt_kept(operands, (row + offset) as u64, offset as u64, count, (first + offset) as u64)
             })?;
         }
         Ok(())
@@ -858,7 +887,8 @@ impl Model {
     /// Whether a prompt's batches overlap on two GPUs that split the layers: the first device
     /// starts batch n+1 while the second finishes batch n, nothing waiting on the host between.
     fn pipelined_prefill(&self, tokens: usize) -> Result<bool> {
-        Ok(self.resident && self.speculative == 0 && self.group.backends.len() == 2 && !self.group.expert_parallel()?
+        Ok(self.resident && (self.speculative == 0 || self.group.keeps_mtp_rows()) && self.group.backends.len() == 2
+           && !self.group.expert_parallel()?
            && tokens > self.prefill_batch_size)
     }
 
@@ -1046,10 +1076,12 @@ impl Model {
         if pipelined {
             self.group.prefill_defer(true)?;
             self.deferred = true;
+            self.mtp_kept = 0;
         }
         let prefilled = self.prefill(tokens, reused, &plan, cancelled, progress);
         if pipelined {
             self.deferred = false;
+            self.mtp_kept = 0;
             let settled = self.group.prefill_settle();
             if prefilled.is_ok() {
                 settled?;

@@ -353,6 +353,12 @@ struct Device {
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
     hipEvent_t handoff = nullptr;
+    // Page-locked staging for a deferred prompt's MTP embeddings, two batches deep
+    // (sd_mtp_embed): a batch's copy waits only for the copy two batches before.
+    float* mtp_staging[2] = {nullptr, nullptr};
+    hipEvent_t mtp_staged[2] = {nullptr, nullptr};
+    size_t mtp_staging_floats = 0;
+    unsigned mtp_turn = 0;
     uint64_t gemm_calls = 0, gemm_vectors = 0;
     std::unordered_map<void*, size_t> allocations;
     // Allocations that live in mapped, page-locked host memory (sd_host_state): device pointer -> host pointer.
@@ -413,6 +419,10 @@ struct Device {
         if (blas_workspace) cleanup(hipFree(blas_workspace));
         if (flags) cleanup(hipFree(flags));
         if (handoff) cleanup(hipEventDestroy(handoff));
+        for (int i = 0; i < 2; ++i) {
+            if (mtp_staged[i]) { cleanup(hipEventSynchronize(mtp_staged[i])); cleanup(hipEventDestroy(mtp_staged[i])); }
+            if (mtp_staging[i]) cleanup(hipHostFree(mtp_staging[i]));
+        }
         for (auto entry : allocations) {
             const auto host = host_states.find(entry.first);
             cleanup(host == host_states.end() ? hipFree(entry.first) : hipHostFree(host->second));
@@ -920,6 +930,81 @@ int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t
     try {
         if (!pointers || !kinds) throw std::runtime_error("invalid MTP prologue");
         mtp_prologue(device(handle),pointers,kinds,size_t(steps),embeddings,hidden,output); return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// A deferred prompt's MTP pairs stay on the MTP layer's device (sd_mtp_keep, sd_mtp_embed,
+// sd_mtp_prompt_kept): nothing waits on the host between the prompt's batches.
+float* mtp_allocation(Device& d,void* base,size_t floats) {
+    auto found=d.allocations.find(base);
+    if (!base || found==d.allocations.end() || found->second<floats*4) throw std::runtime_error("invalid MTP prompt buffer");
+    return static_cast<float*>(base);
+}
+// Row 0 of `rows` becomes the pair row before the batch: row `previous` of the last batch kept
+// there (0: none), or `host` when given; rows 1..steps receive the batch's rows from the
+// workspace of `layer`.
+int sd_mtp_keep(void* handle,uint64_t layer,uint64_t steps,void* rows,uint64_t previous,const float* host) {
+    try {
+        Device& d=device(handle);
+        auto found=d.decoder.find(size_t(layer));
+        if (found==d.decoder.end() || !steps || steps>found->second.capacity) throw std::runtime_error("invalid MTP rows");
+        float* kept=mtp_allocation(d,rows,(std::max(size_t(steps),size_t(previous))+1)*10240);
+        if (host) upload(d,kept,host,10240*4);
+        else if (previous)
+            check(hipMemcpyAsync(kept,kept+size_t(previous)*10240,10240*4,hipMemcpyDeviceToDevice,d.stream));
+        check(hipMemcpyAsync(kept+10240,found->second.workspace,size_t(steps)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// `count` embedding rows into `target`, staged without waiting for the device's stream.
+int sd_mtp_embed(void* handle,const float* embeddings,uint64_t count,void* target) {
+    try {
+        Device& d=device(handle);
+        if (!embeddings || !count) throw std::runtime_error("invalid MTP embeddings");
+        float* device_rows=mtp_allocation(d,target,size_t(count)*2560);
+        const size_t floats=size_t(count)*2560;
+        if (floats>d.mtp_staging_floats) {
+            for (int i=0;i<2;++i) {
+                if (!d.mtp_staged[i]) check(hipEventCreateWithFlags(&d.mtp_staged[i],hipEventDisableTiming));
+                check(hipEventSynchronize(d.mtp_staged[i]));
+                if (d.mtp_staging[i]) { check(hipHostFree(d.mtp_staging[i])); d.mtp_staging[i]=nullptr; }
+            }
+            d.mtp_staging_floats=0;
+            for (int i=0;i<2;++i) check(hipHostMalloc(reinterpret_cast<void**>(&d.mtp_staging[i]),floats*4,hipHostMallocDefault));
+            d.mtp_staging_floats=floats;
+        }
+        const unsigned slot=d.mtp_turn++%2;
+        check(hipEventSynchronize(d.mtp_staged[slot]));
+        std::memcpy(d.mtp_staging[slot],embeddings,floats*4);
+        check(hipMemcpyAsync(device_rows,d.mtp_staging[slot],floats*4,hipMemcpyHostToDevice,d.stream));
+        check(hipEventRecord(d.mtp_staged[slot],d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// `count` pairs: kept rows from `row`, embeddings from `offset` (see sd_mtp_keep, sd_mtp_embed).
+int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void* rows,uint64_t row,void* embeddings,
+                       uint64_t offset,uint64_t count,uint64_t position,uint64_t layer) {
+    try {
+        if (!pointers || !kinds || !count) throw std::runtime_error("invalid MTP prompt rows");
+        Device& d=device(handle);
+        const float* kept=mtp_allocation(d,rows,size_t(row+count)*10240)+size_t(row)*10240;
+        const float* embedded=mtp_allocation(d,embeddings,size_t(offset+count)*2560)+size_t(offset)*2560;
+        mtp_prologue_check(d,pointers,kinds,size_t(count));
+        float* hidden=mtp_prologue_hidden(d,size_t(count));
+        check(hipMemcpyAsync(hidden,kept,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+        check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded,size_t(count)*2560*4,hipMemcpyDeviceToDevice,d.stream));
+        mtp_prologue_device(d,pointers,kinds,size_t(count));
+        if (count==1) {
+            std::vector<float> one(10240),output(10240);
+            download(d,one.data(),hidden,10240*4);
+            verify_span(d,size_t(layer),size_t(layer)+1,size_t(position),1,one.data(),output.data());
+            return 0;
+        }
+        auto target=d.decoder.find(size_t(layer));
+        if (target==d.decoder.end() || count>target->second.capacity)
+            throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
+        check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+        prefill_span(d,size_t(layer),size_t(layer)+1,size_t(position),size_t(count),nullptr,nullptr,0);
+        return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_mtp_prompt_rows(void* handle,void* const* pointers,const int* kinds,void* stash,uint64_t stash_layer,

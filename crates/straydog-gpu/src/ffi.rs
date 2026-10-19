@@ -344,6 +344,38 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_mtp_keep(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        steps: u64,
+        rows: *mut ::std::os::raw::c_void,
+        previous: u64,
+        host: *const f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_mtp_embed(
+        handle: *mut ::std::os::raw::c_void,
+        embeddings: *const f32,
+        count: u64,
+        target: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_mtp_prompt_kept(
+        handle: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        rows: *mut ::std::os::raw::c_void,
+        row: u64,
+        embeddings: *mut ::std::os::raw::c_void,
+        offset: u64,
+        count: u64,
+        position: u64,
+        layer: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_verify_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

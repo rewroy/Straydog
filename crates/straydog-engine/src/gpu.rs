@@ -102,6 +102,9 @@ pub struct Backend {
     pub batch_capacity: usize,
     pub logical_capacity: usize,
     pub output_capacity: u64,
+    /// The last of two devices that split the layers: it keeps a deferred prompt's MTP pairs
+    /// (see [`Backend::mtp_keep`]) when it holds the MTP layer.
+    pub keeps_mtp_rows: bool,
 }
 
 /// Move prompt rows a span left on `from` (layer `from_layer`'s workspace) to `to`'s
@@ -150,6 +153,7 @@ impl Backend {
             batch_capacity,
             logical_capacity: if budget >= 2 << 30 { 4096 } else { 1024 },
             output_capacity,
+            keeps_mtp_rows: false,
         })
     }
 
@@ -274,6 +278,11 @@ impl Backend {
                 plan.push((format!("@qsa:blk.{layer}."), context * 4, 256, host_attention));
                 plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + 512, 1, false));
             }
+        }
+        if self.keeps_mtp_rows && self.batch_capacity == 256 && layers.contains(&48) && !layers.contains(&0) {
+            // A batch's rows after the row before it, and the embeddings of the tokens they pair with.
+            plan.push(("@mtp:rows".into(), context.min(prefill) + 1, WIDTH as u64, false));
+            plan.push(("@mtp:embeddings".into(), context.min(prefill), HIDDEN as u64, false));
         }
         if host_attention && self.batch_capacity == 256 {
             // Up to a sixteenth of the budget: one layer's rows in prefill, per-layer prefix mirrors in decode.
@@ -455,6 +464,45 @@ impl Backend {
         // SAFETY: steps rows of 2560 floats; the native side checks the workspace.
         check(unsafe { ffi::sd_prefill_embed(self.handle, layer as u64, embeddings.as_ptr(), steps as u64) })?;
         Ok(())
+    }
+
+    /// Keep a deferred batch's last-layer rows for the MTP layer after the row before them:
+    /// row `previous` of the last batch kept, or `host` (0 and None: no row before).
+    pub fn mtp_keep(&mut self, steps: u64, previous: u64, host: Option<&[f32]>) -> Result<()> {
+        let rows = self.state_entry("@mtp:rows")?;
+        if host.is_some_and(|row| row.len() != WIDTH) || steps + 1 > rows.rows || previous > rows.rows {
+            return Err("invalid Straydog MTP rows".into());
+        }
+        let host = host.map_or(std::ptr::null(), <[f32]>::as_ptr);
+        // SAFETY: the kept-rows state of this device; one host row or none.
+        check(unsafe { ffi::sd_mtp_keep(self.handle, 47, steps, rows.pointer, previous, host) }).map(drop)
+    }
+
+    /// The embeddings the kept rows pair with, staged without waiting for the device.
+    pub fn mtp_embed(&mut self, embeddings: &[f32]) -> Result<()> {
+        let target = self.state_entry("@mtp:embeddings")?;
+        let count = embeddings.len() / HIDDEN;
+        if count == 0 || embeddings.len() != count * HIDDEN || count as u64 > target.rows {
+            return Err("invalid Straydog MTP embeddings".into());
+        }
+        // SAFETY: count rows of 2560 floats; the embeddings state holds them.
+        check(unsafe { ffi::sd_mtp_embed(self.handle, embeddings.as_ptr(), count as u64, target.pointer) }).map(drop)
+    }
+
+    /// `count` MTP pairs from kept row `row` and embedding row `offset`, at `position`.
+    pub fn mtp_prompt_kept(&mut self, operands: &[Operand], row: u64, offset: u64, count: u64, position: u64)
+                           -> Result<()> {
+        let (rows, embeddings) = (self.state_entry("@mtp:rows")?, self.state_entry("@mtp:embeddings")?);
+        if count == 0 || row + count > rows.rows || offset + count > embeddings.rows {
+            return Err("invalid Straydog MTP prompt rows".into());
+        }
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: four operands; the kept states hold the rows (checked above and natively).
+        check(unsafe {
+            ffi::sd_mtp_prompt_kept(self.handle, pointers.as_ptr(), kinds.as_ptr(), rows.pointer, row, embeddings.pointer,
+                                    offset, count, position, 48)
+        })
+        .map(drop)
     }
 
     /// While on, prefill spans that return no rows end without waiting for the device.

@@ -73,6 +73,10 @@ int sd_prefill_embed(void* handle, uint64_t layer, const float* embeddings, uint
 int sd_mtp_prompt_rows(void* handle, void* const* pointers, const int* kinds, void* stash, uint64_t stash_layer,
                        uint64_t first, uint64_t count, const float* previous, const float* embeddings,
                        uint64_t position, uint64_t layer);
+int sd_mtp_keep(void* handle, uint64_t layer, uint64_t steps, void* rows, uint64_t previous, const float* host);
+int sd_mtp_embed(void* handle, const float* embeddings, uint64_t count, void* target);
+int sd_mtp_prompt_kept(void* handle, void* const* pointers, const int* kinds, void* rows, uint64_t row, void* embeddings,
+                       uint64_t offset, uint64_t count, uint64_t position, uint64_t layer);
 int sd_verify_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output);
 int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
 int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits);

@@ -30,7 +30,12 @@ impl Group {
         if devices.is_empty() || devices.len() > 4 || distinct.len() != devices.len() {
             return Err("Straydog requires one to four distinct GPU ordinals".into());
         }
-        let backends = devices.iter().map(|&device| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
+        let mut backends = devices.iter().map(|&device| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
+        if backends.len() == 2 {
+            let parallel = split_mode == SplitMode::Experts
+                && backends.iter().map(Backend::hybrid_supported).collect::<Result<Vec<_>>>()?.into_iter().all(|on| on);
+            backends[1].keeps_mtp_rows = !parallel;
+        }
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
@@ -273,6 +278,28 @@ impl Group {
         }
         crate::gpu::prefill_handoff(&self.backends[source], &self.backends[target], from, to, steps)?;
         Ok(true)
+    }
+
+    /// Whether a deferred prompt's MTP pairs stay on the MTP layer's device (see [`Backend::mtp_keep`]).
+    pub fn keeps_mtp_rows(&self) -> bool {
+        let mtp = self.owner(48);
+        self.backends[mtp].keeps_mtp_rows && self.owner(47) == mtp && self.owner(0) != mtp
+    }
+
+    pub fn mtp_keep(&mut self, steps: u64, previous: u64, host: Option<&[f32]>) -> Result<()> {
+        let mtp = self.owner(48);
+        self.backends[mtp].mtp_keep(steps, previous, host)
+    }
+
+    pub fn mtp_embed(&mut self, embeddings: &[f32]) -> Result<()> {
+        let mtp = self.owner(48);
+        self.backends[mtp].mtp_embed(embeddings)
+    }
+
+    pub fn mtp_prompt_kept(&mut self, operands: &[Operand], row: u64, offset: u64, count: u64, position: u64)
+                           -> Result<()> {
+        let mtp = self.owner(48);
+        self.backends[mtp].mtp_prompt_kept(operands, row, offset, count, position)
     }
 
     /// Deferred prefill on every device (see [`Backend::prefill_defer`]).
