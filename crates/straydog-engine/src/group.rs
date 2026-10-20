@@ -4,7 +4,7 @@
 //! GPUs holding the whole model, every layer's routed experts are split between them
 //! instead (expert parallelism): both evaluate their half of each layer's routes at once.
 
-use crate::gpu::{Backend, Operand, Result, WIDTH};
+use crate::gpu::{Backend, Head, Operand, Result, WIDTH};
 use crate::weights::layer_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,11 +394,11 @@ impl Group {
 
     /// The vocabulary head and its mixing on the last GPU. In the two-GPU mode the first GPU
     /// evaluates the lower half of the vocabulary rows from its own copy at the same time.
-    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool)
-                       -> Result<(Vec<i32>, Option<Vec<f32>>)> {
+    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, confidence: bool)
+                       -> Result<Head> {
         let last = self.backends.len() - 1;
         if !(self.expert_parallel()? && self.linked) {
-            return self.backends[last].output_head(operands, values, logits, None);
+            return self.backends[last].output_head(operands, values, logits, confidence, None);
         }
         let head = &operands[3];
         let split = head.rows / 2;
@@ -408,7 +408,7 @@ impl Group {
                                    split, head.cols);
         self.backends[0].pin(std::slice::from_ref(&lower))?;
         let peer = self.backends[0].prepare(&lower)?.pointer;
-        self.backends[last].output_head(operands, values, logits, Some((split, peer)))
+        self.backends[last].output_head(operands, values, logits, confidence, Some((split, peer)))
     }
 
     pub fn mtp_prologue(&mut self, operands: &[Operand], embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {

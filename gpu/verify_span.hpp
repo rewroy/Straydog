@@ -186,12 +186,54 @@ void row_argmax(Device& d, const float* values, size_t rows, size_t count, size_
     row_argmax_finish<<<unsigned(rows),256,0,d.stream>>>(scratch, indices, result);
 }
 
+// Per row, the chosen logit and the sum of exp(logit - chosen) over the row, as two floats
+// at result[2 * row]: a softmax's top probability, also across the halves of a split head.
+__global__ void row_exp_sum_chunks(const float* values, size_t count, size_t stride, const int32_t* chosen, float* sums) {
+    const float* row = values + size_t(blockIdx.y) * stride;
+    const float best = row[chosen[blockIdx.y]];
+    const size_t per = (count + argmax_chunks - 1) / argmax_chunks, first = blockIdx.x * per, last = std::min(count, first + per);
+    float sum = 0.0f;
+    for (size_t i = first + threadIdx.x; i < last; i += blockDim.x) sum += expf(row[i] - best);
+    __shared__ float shared[256];
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned offset = 128; offset; offset /= 2) {
+        if (threadIdx.x < offset) shared[threadIdx.x] += shared[threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) sums[blockIdx.y * argmax_chunks + blockIdx.x] = shared[0];
+}
+__global__ void row_exp_sum_finish(const float* values, size_t stride, const int32_t* chosen, const float* sums, float* result) {
+    if (threadIdx.x) return;
+    float sum = 0.0f;
+    for (unsigned i = 0; i < argmax_chunks; ++i) sum += sums[blockIdx.x * argmax_chunks + i];
+    result[2 * blockIdx.x] = values[size_t(blockIdx.x) * stride + chosen[blockIdx.x]];
+    result[2 * blockIdx.x + 1] = sum;
+}
+void row_exp_sum(Device& d, const float* values, size_t rows, size_t count, size_t stride, const int32_t* chosen,
+                 float* scratch, float* result) {
+    row_exp_sum_chunks<<<dim3(argmax_chunks, unsigned(rows)),256,0,d.stream>>>(values, count, stride, chosen, scratch);
+    row_exp_sum_finish<<<unsigned(rows),32,0,d.stream>>>(values, stride, chosen, scratch, result);
+}
+// The top token's probability from the (logit, sum) pairs of the head, or of both halves.
+__global__ void head_confidence(const float* own, const float* other, size_t steps, float* result) {
+    const size_t row = threadIdx.x;
+    if (row >= steps) return;
+    float best = own[2 * row], sum = own[2 * row + 1];
+    if (other) {
+        const float peer = other[2 * row], top = fmaxf(best, peer);
+        sum = sum * expf(best - top) + other[2 * row + 1] * expf(peer - top);
+    }
+    result[row] = 1.0f / sum;
+}
+
 // HyperConnection mix (norm, down, up) and the vocabulary head for up to four rows,
-// each with the one-row arithmetic; returns the first maximum of every row.
+// each with the one-row arithmetic; returns the first maximum of every row and, when
+// asked, its probability (drafts stop at an unlikely one).
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
-                 const float* input, int32_t* tokens, float* logits) {
+                 const float* input, int32_t* tokens, float* logits, float* confidence) {
     if (!steps || steps > verify_max || !input || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
-        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + verify_max > d.input_capacity)
+        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max > d.input_capacity)
         throw std::runtime_error("invalid Straydog output head");
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
@@ -209,8 +251,14 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
     gemv(d, &head, 1, mixed, d.output, steps, 2564, vocabulary);
     row_argmax(d, d.output, steps, vocabulary, vocabulary, partial, chosen);
+    float* top = reinterpret_cast<float*>(chosen + verify_max);
+    if (confidence) {
+        row_exp_sum(d, d.output, steps, vocabulary, vocabulary, chosen, partial, top);
+        head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
+    }
     check(hipGetLastError());
     download(d, tokens, chosen, steps * 4);
+    if (confidence) download(d, confidence, top + 2 * verify_max, steps * 4);
     if (logits) download(d, logits, d.output, steps * vocabulary * 4);
 }
 
@@ -232,12 +280,12 @@ __global__ void head_choose(const float* logits, size_t width, size_t split, con
     tokens[row] = peer[2 * row] >= own ? __float_as_int(peer[2 * row + 1]) : int32_t(split) + chosen[row];
 }
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
-                       void* peer_head, const float* input, int32_t* tokens, float* logits) {
+                       void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence) {
     Device* peer = d.link.peer;
     if (!peer || !steps || steps > verify_max || !input || !tokens || !split || split >= vocabulary ||
         steps * vocabulary > d.output_capacity || steps * split > peer->output_capacity ||
         64 + steps * split > d.link.rows * 2560 || 2560 * steps > peer->link.rows * 2560 ||
-        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 2 * verify_max > d.input_capacity ||
+        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 5 * verify_max > d.input_capacity ||
         2 * verify_max * argmax_chunks + verify_max > peer->input_capacity)
         throw std::runtime_error("invalid Straydog split output head");
     Matrix hc[4];
@@ -269,6 +317,8 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         gemv(h, &low, 1, peer_inputs(h.link), h.output, steps, 2560, split);
         row_argmax(h, h.output, steps, split, split, scratch, best);
         head_part<<<1, 32, 0, h.stream>>>(h.output, split, best, steps, peer_remote_partials(h.link));
+        // The lower half's (logit, sum) pairs follow its choices, before the logits at 64.
+        if (confidence) row_exp_sum(h, h.output, steps, split, split, best, scratch, peer_remote_partials(h.link) + 16);
         if (logits) peer_copy<<<1024, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, h.output, steps, split, split);
         peer_signal_peer(h);
         check(hipGetLastError());
@@ -278,9 +328,15 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     row_argmax(d, d.output, steps, vocabulary - split, vocabulary - split, partial, chosen);
     peer_receive(d);
     head_choose<<<1, 32, 0, d.stream>>>(d.output, vocabulary - split, split, chosen, received, steps, final_tokens);
+    float* top = reinterpret_cast<float*>(final_tokens + verify_max);
+    if (confidence) {
+        row_exp_sum(d, d.output, steps, vocabulary - split, vocabulary - split, chosen, partial, top);
+        head_confidence<<<1, 32, 0, d.stream>>>(top, received + 16, steps, top + 2 * verify_max);
+    }
     check(hipGetLastError());
     finish_with_helper(d);
     download(d, tokens, final_tokens, steps * 4);
+    if (confidence) download(d, confidence, top + 2 * verify_max, steps * 4);
     if (logits)
         for (size_t row = 0; row < steps; ++row) {
             download(d, logits + row * vocabulary, received + 64 + row * split, split * 4);

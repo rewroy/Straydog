@@ -15,6 +15,8 @@ use crate::formats;
 use crate::weights::Vector;
 
 pub type Result<T> = std::result::Result<T, String>;
+/// A head's rows: each row's first maximum, its logits and its probability when asked.
+pub type Head = (Vec<i32>, Option<Vec<f32>>, Option<Vec<f32>>);
 
 /// The native library pads every VRAM allocation (allocation_tail in kernels.cpp).
 pub const ALLOCATION_TAIL: u64 = 64;
@@ -734,9 +736,10 @@ impl Backend {
         check(unsafe { ffi::sd_verify_commit(self.handle, begin as u64, end as u64, kept) }).map(drop)
     }
 
-    /// The head's mixing and vocabulary rows: each row's first maximum, and its logits when asked.
-    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool,
-                       split: Option<(u64, *mut c_void)>) -> Result<(Vec<i32>, Option<Vec<f32>>)> {
+    /// The head's mixing and vocabulary rows: each row's first maximum, and when asked its
+    /// logits and its probability.
+    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, confidence: bool,
+                       split: Option<(u64, *mut c_void)>) -> Result<Head> {
         let steps = Self::rows(values, WIDTH)?;
         let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
         if operands.len() != 4 || operands[3].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
@@ -748,17 +751,20 @@ impl Backend {
         let mut tokens = vec![0i32; steps];
         let mut scores = logits.then(|| vec![0f32; steps * vocabulary as usize]);
         let target = scores.as_mut().map_or(std::ptr::null_mut(), |scores| scores.as_mut_ptr());
-        // SAFETY: four operands; `steps` rows in; tokens and optional logits sized above.
+        let mut top = confidence.then(|| vec![0f32; steps]);
+        let probabilities = top.as_mut().map_or(std::ptr::null_mut(), |top| top.as_mut_ptr());
+        // SAFETY: four operands; `steps` rows in; tokens and optional logits and probabilities sized above.
         check(unsafe {
             match split {
                 None => ffi::sd_output_head(self.handle, pointers.as_ptr(), kinds.as_ptr(), steps as u64, vocabulary,
-                                            values.as_ptr(), tokens.as_mut_ptr(), target),
+                                            values.as_ptr(), tokens.as_mut_ptr(), target, probabilities),
                 Some((split, peer)) => ffi::sd_output_head_split(self.handle, pointers.as_ptr(), kinds.as_ptr(),
                                                                  steps as u64, vocabulary, split, peer,
-                                                                 values.as_ptr(), tokens.as_mut_ptr(), target),
+                                                                 values.as_ptr(), tokens.as_mut_ptr(), target,
+                                                                 probabilities),
             }
         })?;
-        Ok((tokens, scores))
+        Ok((tokens, scores, top))
     }
 
     /// MTP layer inputs from token embeddings (rows of 2560) and backbone hidden rows.

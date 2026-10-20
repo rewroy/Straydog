@@ -30,8 +30,12 @@ const VERIFIED_PREFILL: usize = 16;
 const END_TOKENS: [u32; 2] = [248044, 248046];
 const IM_START: u32 = 248045;
 const IM_END: u32 = 248046;
-/// Verifying (and drafting) one more row, relative to a one-token pass.
-const ROW_COST: f64 = 0.45;
+/// Drafts stop where the product of their probabilities under the drafter falls below
+/// this. Replayed over 16 prompts, with and without reasoning, greedy and with the model
+/// card's sampling (every pass drafting three), 0.6 was best or within 1% everywhere: 3-9%
+/// more tokens per second than an acceptance-rate estimate. A draft row costs about 3.5 ms of
+/// verification and 1.35 ms of drafting against a 15 ms pass.
+const DRAFT_CUT: f32 = 0.6;
 /// Conversation checkpoints, each a page-locked host copy of the recurrent state (~118 MB):
 /// root (the end of the system prompt), turn (where the reply to the last user message
 /// began), prior (the same for the message before) and step (the reply to the last tool result).
@@ -39,19 +43,6 @@ const CHECKPOINTS: [&str; 4] = ["root", "turn", "prior", "step"];
 /// Only a system prompt this long is worth a copy.
 const ROOT_MINIMUM: usize = 2048;
 const VOCABULARY: usize = 248320;
-
-/// Drafts that maximize expected tokens per pass cost for a per-draft acceptance rate.
-pub fn draft_length(acceptance: f64, limit: usize) -> usize {
-    let (mut best, mut chosen) = (1.0, 0);
-    for drafts in 1..=limit {
-        let expected: f64 = (0..=drafts).map(|index| acceptance.powi(index as i32)).sum();
-        let value = expected / (1.0 + ROW_COST * drafts as f64);
-        if value > best {
-            (best, chosen) = (value, drafts);
-        }
-    }
-    chosen
-}
 
 /// Host bytes of one sequence's state before the GPU takes its attention and recurrence:
 /// QSA K/V and pooled indexer keys, DeltaNet state and convolution, PLE history and the
@@ -759,13 +750,15 @@ impl Model {
     }
 
     /// Draft tokens from MTP rows through its own mixer and the shared vocabulary head.
-    fn mtp_head(&mut self, values: &[f32]) -> Result<Vec<i32>> {
-        let (tokens, _) = self.with_operands(
+    /// The drafter's token for the last row and its probability under the drafter.
+    fn mtp_head(&mut self, values: &[f32]) -> Result<(u32, f32)> {
+        let (tokens, _, top) = self.with_operands(
             |model| Ok(vec![model.vector("mtp.hc_out_norm.weight", None)?, model.projection("mtp.hc_out_down.weight")?,
                             model.projection("mtp.hc_out_up.weight")?, model.projection("output.weight")?]),
-            |group, operands| group.output_head(operands, values, false),
+            |group, operands| group.output_head(operands, values, false, true),
         )?;
-        Ok(tokens)
+        let top = top.ok_or("Straydog drafter head returned no probability")?;
+        Ok((*tokens.last().ok_or("Straydog drafter head returned no token")? as u32, top[top.len() - 1]))
     }
 
     /// [`Model::mtp_prompt`] with the prompt's rows kept on the GPUs (see [`Group::mtp_stash`]):
@@ -837,7 +830,8 @@ impl Model {
         Ok(())
     }
 
-    /// Catch the MTP layer up on the accepted pairs, then chain `limit` greedy drafts.
+    /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
+    /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
         let embedded = self.token_embeddings(tokens)?;
         let rows = self.mtp_prologue(&embedded, hidden)?;
@@ -845,13 +839,22 @@ impl Model {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut drafts = vec![self.mtp_head(last_row(&output))?[0] as u32];
+        let (token, mut chain) = self.mtp_head(last_row(&output))?;
+        if chain < DRAFT_CUT {
+            return Ok(Vec::new());
+        }
+        let mut drafts = vec![token];
         let (mut multi, mut position) = (last_row(&output).to_vec(), position + tokens.len() as u64);
         while drafts.len() < limit {
             let embedded = self.token_embeddings(&drafts[drafts.len() - 1..])?;
             let rows = self.mtp_prologue(&embedded, &multi)?;
             let output = self.group.verify_span(48, 49, &rows, position)?;
-            drafts.push(self.mtp_head(&output)?[0] as u32);
+            let (token, probability) = self.mtp_head(&output)?;
+            chain *= probability;
+            if chain < DRAFT_CUT {
+                break;
+            }
+            drafts.push(token);
             (multi, position) = (output, position + 1);
         }
         Ok(drafts)
@@ -902,8 +905,8 @@ impl Model {
 
     fn verify(&mut self, tokens: &[u32], sampling: bool) -> Result<Verified> {
         let (first, embeddings, hidden) = self.verify_rows(tokens)?;
-        let (targets, scores) =
-            self.with_operands(Model::head_operands, |group, operands| group.output_head(operands, &hidden, sampling))?;
+        let (targets, scores, _) = self.with_operands(Model::head_operands,
+                                                      |group, operands| group.output_head(operands, &hidden, sampling, false))?;
         Ok((first, embeddings, hidden, targets, scores))
     }
 
@@ -995,7 +998,7 @@ impl Model {
             self.last_metrics.insert(key.into(), json!(value));
         }
         emit(token);
-        let (mut produced, mut acceptance, mut passes) = (1usize, 0.7f64, 0usize);
+        let mut produced = 1usize;
         // The MTP layer pairs each hidden state with the token after it, at the hidden's position.
         let mut mtp_hidden = self.final_hidden.clone().ok_or("Straydog has no hidden state to draft from")?;
         let mut mtp_tokens = vec![token];
@@ -1006,12 +1009,7 @@ impl Model {
             }
             let pass_started = Instant::now();
             let limit = self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
-            let mut drafting = draft_length(acceptance, limit);
-            if drafting == 0 && limit > 0 && passes % 8 == 7 {
-                drafting = 1;   // probe: the acceptance estimate must keep tracking the text
-            }
-            passes += 1;
-            let drafts = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, drafting)?;
+            let drafts = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit)?;
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
             if self.history.len() + rows.len() > self.context {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
@@ -1020,10 +1018,6 @@ impl Model {
             let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits())?;
             let (accepted, following) = Self::accept(&drafts, &targets, scores.as_deref(), sampling, &mut generated, rng);
             generated.insert(following);
-            if !drafts.is_empty() {
-                let attempted = accepted + usize::from(accepted < drafts.len());
-                acceptance = 0.9 * acceptance + 0.1 * accepted as f64 / attempted as f64;
-            }
             let mut emitted: Vec<u32> = drafts[..accepted].iter().copied().chain([following]).collect();
             let mut kept = accepted + 1;
             if let Some(index) = emitted.iter().position(|value| END_TOKENS.contains(value)) {

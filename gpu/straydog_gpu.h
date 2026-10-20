@@ -80,8 +80,8 @@ int sd_mtp_prompt_kept(void* handle, void* const* pointers, const int* kinds, vo
                        uint64_t offset, uint64_t count, uint64_t position, uint64_t layer);
 int sd_verify_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output);
 int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
-int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits);
-int sd_output_head_split(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, uint64_t split, void* peer_head, const float* input, int32_t* tokens, float* logits);
+int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits, float* confidence);
+int sd_output_head_split(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, uint64_t split, void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence);
 int sd_mtp_prologue(void* handle, void* const* pointers, const int* kinds, uint64_t steps, const float* embeddings, const float* hidden, float* output);
 int sd_execution_counts(void* handle, uint64_t* graphs, uint64_t* replays, uint64_t* resident);
 

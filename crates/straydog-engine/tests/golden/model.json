@@ -4956,9 +4956,9 @@
       "prefill_tokens": 4902,
       "generated_tokens": 19,
       "decode_forward_tokens": 18,
-      "speculative_passes": 7,
-      "drafted_tokens": 12,
-      "accepted_tokens": 12
+      "speculative_passes": 6,
+      "drafted_tokens": 17,
+      "accepted_tokens": 16
      },
      "logits": [
       "92375e01ce9bac2aecefc41964333f6fe4f0ef606188c883b5984c8979ba9f4b"
@@ -9919,8 +9919,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 4,
+      "accepted_tokens": 4
      },
      "logits": [
       "967dd0fd629fdc1a7c0cdbc37ac761b69792dfdfa31d7dbd06706eab662b3fd8"
@@ -15169,9 +15169,9 @@
       "prefill_tokens": 5202,
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
-      "speculative_passes": 9,
-      "drafted_tokens": 18,
-      "accepted_tokens": 18
+      "speculative_passes": 7,
+      "drafted_tokens": 21,
+      "accepted_tokens": 19
      },
      "logits": [
       "bde4c67e7d900e6b97c85744fc7691e824c6acab282bea22af44c5743b7090ed"
@@ -20453,8 +20453,8 @@
       "prefill_tokens": 24,
       "generated_tokens": 9,
       "decode_forward_tokens": 8,
-      "speculative_passes": 4,
-      "drafted_tokens": 6,
+      "speculative_passes": 3,
+      "drafted_tokens": 9,
       "accepted_tokens": 6
      },
      "logits": [
@@ -25416,8 +25416,8 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 1,
-      "accepted_tokens": 1
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "f89d83e7642b53107361cb65e14abb3506d87a9a978c9d5a3f1870f86f3d7699"
@@ -30389,9 +30389,9 @@
       "prefill_tokens": 22,
       "generated_tokens": 48,
       "decode_forward_tokens": 47,
-      "speculative_passes": 17,
+      "speculative_passes": 14,
       "drafted_tokens": 33,
-      "accepted_tokens": 30
+      "accepted_tokens": 33
      },
      "logits": [
       "e4542f6ac11638b2f46b113f2af7e83ea49bb6d93d0a05dc154fe3d79388b789"
@@ -30440,8 +30440,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "d07fd853646601376d6c128832da6e7bcc06843cc8c25717ef9db9b9d8ecf17b"
@@ -30484,9 +30484,9 @@
       "prefill_tokens": 13,
       "generated_tokens": 8,
       "decode_forward_tokens": 7,
-      "speculative_passes": 3,
-      "drafted_tokens": 4,
-      "accepted_tokens": 4
+      "speculative_passes": 2,
+      "drafted_tokens": 5,
+      "accepted_tokens": 5
      },
      "logits": [
       "636c030c59cf2a379d2fb16fd17163f662429b6532a727885fe6fa3c29599cd2"
@@ -35450,9 +35450,9 @@
       "prefill_tokens": 4902,
       "generated_tokens": 19,
       "decode_forward_tokens": 18,
-      "speculative_passes": 7,
-      "drafted_tokens": 12,
-      "accepted_tokens": 12
+      "speculative_passes": 6,
+      "drafted_tokens": 17,
+      "accepted_tokens": 16
      },
      "logits": [
       "e138ad7e9a2cf30499c855554fa88dcb587c9b7f13a46064eb6a3c3d6c4ce7f7"
@@ -40413,8 +40413,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 4,
+      "accepted_tokens": 4
      },
      "logits": [
       "7fc9ebc3688f564f3c17189dc15c5fe45a214954fcef76cfbe6c4b2f752ad1c1"
@@ -45663,9 +45663,9 @@
       "prefill_tokens": 5202,
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
-      "speculative_passes": 9,
-      "drafted_tokens": 18,
-      "accepted_tokens": 18
+      "speculative_passes": 7,
+      "drafted_tokens": 21,
+      "accepted_tokens": 19
      },
      "logits": [
       "18ca7bde0961dd9cb3f0e8976d76215a6b7570f08170825e24e2b20e1d3fd48c"
@@ -50947,7 +50947,7 @@
       "prefill_tokens": 24,
       "generated_tokens": 9,
       "decode_forward_tokens": 8,
-      "speculative_passes": 4,
+      "speculative_passes": 3,
       "drafted_tokens": 6,
       "accepted_tokens": 6
      },
@@ -55910,8 +55910,8 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 1,
-      "accepted_tokens": 1
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "675ed774bfc3ad4177ad84b2e026c33c07b4006d002f75592ee65d8c3a98b99f"
@@ -60883,9 +60883,9 @@
       "prefill_tokens": 22,
       "generated_tokens": 48,
       "decode_forward_tokens": 47,
-      "speculative_passes": 17,
+      "speculative_passes": 14,
       "drafted_tokens": 33,
-      "accepted_tokens": 30
+      "accepted_tokens": 33
      },
      "logits": [
       "8fd2dc23c54447b163fd3da0e3b8f988db7ee4fae0455deef36820647aa967c6"
@@ -60934,8 +60934,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "e06beb74c30918a4e8a9c0879e77d311cf73da7355e4bdd4aa9a925f257812b7"
@@ -60978,9 +60978,9 @@
       "prefill_tokens": 13,
       "generated_tokens": 8,
       "decode_forward_tokens": 7,
-      "speculative_passes": 3,
-      "drafted_tokens": 4,
-      "accepted_tokens": 4
+      "speculative_passes": 2,
+      "drafted_tokens": 5,
+      "accepted_tokens": 5
      },
      "logits": [
       "bee83dcb9e7829623e13fdf924d2abe2add164d7fa409d92943a1a2987469b51"
@@ -65949,9 +65949,9 @@
       "prefill_tokens": 4902,
       "generated_tokens": 24,
       "decode_forward_tokens": 23,
-      "speculative_passes": 11,
-      "drafted_tokens": 15,
-      "accepted_tokens": 12
+      "speculative_passes": 7,
+      "drafted_tokens": 18,
+      "accepted_tokens": 16
      },
      "logits": [
       "e4cd899be7c6ba7b790750f7cf04b87cfc09ccd21dceda3b9ee51e140a32def4"
@@ -70912,8 +70912,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 4,
+      "accepted_tokens": 4
      },
      "logits": [
       "fbeba771c5300ada42a0b927971c4f4cf285514cc0b102156b8d4c154687a31c"
@@ -76162,9 +76162,9 @@
       "prefill_tokens": 5202,
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
-      "speculative_passes": 9,
-      "drafted_tokens": 18,
-      "accepted_tokens": 18
+      "speculative_passes": 7,
+      "drafted_tokens": 19,
+      "accepted_tokens": 19
      },
      "logits": [
       "6572a73753b27eeaa4a486da1039637f02a331c89efd63d15ac113e71ae5db61"
@@ -81446,7 +81446,7 @@
       "prefill_tokens": 24,
       "generated_tokens": 9,
       "decode_forward_tokens": 8,
-      "speculative_passes": 4,
+      "speculative_passes": 3,
       "drafted_tokens": 6,
       "accepted_tokens": 6
      },
@@ -86409,8 +86409,8 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 1,
-      "accepted_tokens": 1
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "25c03efdd7feaff012bfd755fb3ef2de37681f1acd54c93e332bc784dcda89d0"
@@ -91382,9 +91382,9 @@
       "prefill_tokens": 22,
       "generated_tokens": 48,
       "decode_forward_tokens": 47,
-      "speculative_passes": 16,
+      "speculative_passes": 14,
       "drafted_tokens": 34,
-      "accepted_tokens": 31
+      "accepted_tokens": 33
      },
      "logits": [
       "eeca9bd7e79254cc77b55e9e852d74f681f3dd43c5e003a5757f2942dc849e04"
@@ -91433,8 +91433,8 @@
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
-      "drafted_tokens": 2,
-      "accepted_tokens": 2
+      "drafted_tokens": 3,
+      "accepted_tokens": 3
      },
      "logits": [
       "d07fd853646601376d6c128832da6e7bcc06843cc8c25717ef9db9b9d8ecf17b"
@@ -91477,9 +91477,9 @@
       "prefill_tokens": 13,
       "generated_tokens": 8,
       "decode_forward_tokens": 7,
-      "speculative_passes": 3,
-      "drafted_tokens": 4,
-      "accepted_tokens": 4
+      "speculative_passes": 2,
+      "drafted_tokens": 5,
+      "accepted_tokens": 5
      },
      "logits": [
       "636c030c59cf2a379d2fb16fd17163f662429b6532a727885fe6fa3c29599cd2"
@@ -137295,29 +137295,29 @@
       "165be03883710aa98560174c1e53c0d4479353cb03a1a714ef6946e595905900",
       "07d21f1710f39cfa4304395e192fe023281907c1355374564ce82e46688738aa",
       "c218c049e143d68e6a7c038654bed0b0b885df8de2ba7621e7302f8b010de544",
-      "0c28b00d1a987145d3e0d520950e5e63f8778cb1fc32bde101fb2986dfbb8b88",
-      "e5e939e9bab44287c0e6d90328c5b6ed36eae67de1be6762abdf4bc0b5038bff",
-      "acede23434dcaf6a6f6dfc79bc05f5069521e35c0e68737c82b743d1953d1b70",
-      "5fa5a1983b6e8e9643f10bf1a2816dab1395c7899e2b7edb24a09d7fee7c5009",
-      "4985716ba65b9589c26c751bb5f1d1dd59b48e0c3af61f4e6599d031b7244101",
-      "3e55f35e2e065abeee4af3ffe99e0378dcb0bb9d5210f7a06e1f01949202e597",
-      "ca1573b44b1a6ab9230bc33c23b36c33fa8ba4ece0080272a17f7f4891330f55",
-      "c0f2447ccfdf9f82ee7c9d471881ab355feb16a46ca49fa3a0188ec6979dd10e",
-      "f0237806e6acb19787a60d4d6d43c89ebafdefdecf639ad120b002bfb0ad02bf",
-      "c24f97ed241b57365f2e1f9129ed4dd419adbe2c3440a1d2990c84aadcef0e6d",
-      "30968cd80973ea0a16095d01f5141b44584aeb26452a4970d1f8ca30ef5b656c",
-      "922988511a990f4f05e5fad96a2137cc47625cd94e0e16344458bbe9f6b145dc",
-      "b29291f7221b702add48bbf25fc432aa9fe6ce1dacdf9a5e4a06846f34bd9f89",
-      "e1730183175de6c92017c244f9d6b3f89f4e08f453f05cbb20761cf8187bd9fe",
-      "8ccdbab9152221e9090c8dd117e80aa7b0baaddd1b748e0281463581b95b6a47",
-      "7dae595552119fab71433dd04b42b1f063c22555302375d463dfce3a419bdf0b",
-      "b58211b7e329d6602e434fa853a173949f8f00e788c1395b837abcda8937b172",
-      "20bc92ad5064b9f491feeeeddf0a4cfe00f92ea0dec01333d68771fb45e8b239",
-      "3506aae70541d220c3b164277f4fefe9de46592594809db35b7db9e47045dde0",
-      "5f8019e520244fd26f826a6eff64cf2e0a86e5be12ce8d482e27d17cdc8715e3",
-      "46aa2738e04f59c06bc18366bf792ddf405509c6e246d1a9fd646ca4efd26d1c"
+      "708111ef0ff21f111b360b5c57c65debcad830f943e6f16c7d62adc3718551cd",
+      "1f866d36957a02be3102af98934d37dcc8cd8a4ff4fda94feb7796e42641a491",
+      "040e402731ae6bca3b44b150732ee109aec1e1532d24d72b60e2789ce2228ac6",
+      "d078f178dc11e4e8aa7cb4cb8520f12f5731b254e0568639fe85f142994a0d13",
+      "3da9388ddfe00eb764dc766f46ab643914032d7fc0fc9cd695b8151753d4912b",
+      "65196030bb825465b169d84d79eb1fab156f0001a8bc3cf8202fcb04d4bfcc99",
+      "e399ac01e9d619f882170dc16508b669c5a9b17a8afe3fe06b95538fb7044200",
+      "0e8f17b0bebb8b56169125511804ad67b4c23b45bb9608306a961b0918ce046c",
+      "cf576f95f5c872954b1b9b055d0c1c1e01d434ae77d7b224ec8c874548070914",
+      "9fbdef0427eee90f6078eef482593fcfbed15072717011ed8fdd9b5a25f6ad20",
+      "c14bf3ae78874e8ecff12f3f1e316df92a89a5f965f2e7ae8cbde3dd089e9e71",
+      "069dd2fb07fc3bf8c42c3772995ef3ad342fdb10490ee52386241feec6bbd8cd",
+      "24c61a6e2d2eb0685a73f95a22d3fe75bba8594beb10400f440c643e466dabc4",
+      "0b50dd0d183567be394b2803a551b5a18cbb99dc5b5537717d2f106bb5b44168",
+      "b745f10ca87c1d2f2d094a6e4f00efa17d63d7755d73f27d41a6af28f6d7c869",
+      "1e42c6151b92ee4a82a290391d5e7eb29b9831cf68762e9c38845acc579c484f",
+      "6619025dbe2dd7f82e0895a4503e6f92179e8d65f267976b5f21b721d56fa4b6",
+      "9dcfae88bad8d915e73a0272f4ab81788accd7adcf74cb1f8528a5de6f51183f",
+      "99553742d7e6ecd5a290173a46656037fa1d641c01bd6fd69d7e2cf6d9f57535",
+      "8d3739c28d0931293fd59b10b9aa9fe62fbf913bb58dc59c1e1819cc0b79522f",
+      "c8b898e0e07901ca1dee43e47965d9bd9edefa454c5c4f814389eba14edcee5c"
      ],
-     "final_hidden": "766ab4fb1512e8b18a8e1b647fdb7397f92e1dc7f0b625010939ba639540cf1d"
+     "final_hidden": "4f669e78784bdbefa2c9be35ec238566bef1d834117d772661a616609f17a282"
     },
     {
      "name": "step",
@@ -142599,18 +142599,18 @@
       "accepted_tokens": null
      },
      "logits": [
-      "2b1e269d9856ab6d7bd13bbc06d83fced1aa5353ee2dcd4c731c1550fcec3dc4",
-      "746144985b2d26cb589993fe3e4545fb183f78ef0a31dbcfd2227f67bf3ee945",
-      "3a75dab45f2f347aababfa5eb4d523bf290a1088f3fcbe15058f84e3edfdde81",
-      "f64105a8d785c2aa7a6be2690e024a8ca4857051d54f6b18b3cedc28a9991333",
-      "580a23369a1becc6e8d59350ad38566b19b7cbd672c89e81518fdf6e700a9af1",
-      "3477ad9f37f6d0a621392dc6624b6902a046d09fb367c49c3a30fcf68f602d25",
-      "65faacf544c0a6adc6f5958319672e9dc944db4c6b1e5e8cc367cf8837e1b6e0",
-      "4466158cb59fb3d8e8627c70b69e803aa8818fac6929940946ff4bca2d26931b",
-      "1a8640a0f11f261bf1f25629d977b42dea2f863132b6cce71c8aa6a9326b2651",
-      "58f4d9395aad1a5a2a3cba4005750fef8e404a542c38d7f0a297027c872e63bf"
+      "f004f166e19b9117c5f1002dd9b72285984fbafd1cbb806d3dd3a979242616c7",
+      "59f625974a324a64698579ca20ace913b1b8bca614187a781dfa0ae5e58941c2",
+      "b39b9d1d454dde393d0ff8b33c77fc9c1d04eb71948171dc88d63ca4016dbc5c",
+      "4989e381b5714801ccbec5b917e60f2ed2927f2dff1b3e4a4a10e2cdbb026e22",
+      "7b0691585ebe8c51cd366b35624f90e5b1ce364ab87043b8a0ba21ce1930e5cf",
+      "8233485ed8429022d3463d0f3d0d833080e3ccaa4323bcdbfe86737894912e6b",
+      "f938fd9297717e09cc400c603f60ca53ced8d207ee4e20a963ff35c2ce8cbce0",
+      "9563631b6aa8e039e2c94e22db04bfa9f33e871a8b800a58d86b5089e49e8d8d",
+      "d766313786dbe10d0bef206217990764e110a821c46791d43e9b1d0bd93dd9b6",
+      "563f930c80368d8374fe592cde7eefc01fabaf49652481a0e42ff880f79e1ab1"
      ],
-     "final_hidden": "2124cd64c6eb82758849201cf506f44aa0038e16eedf8cd7602df7febea94d8f"
+     "final_hidden": "454ae6d80b76151fe4cb88ee3b0373dd9d4648460432ee16d2cf2acceb905581"
     },
     {
      "name": "turn",

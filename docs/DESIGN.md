@@ -111,7 +111,7 @@ option, named as llama-server names it where it has the same setting.
 | `-m, --model DIR` | model bundle directory (the pinned GGUF shards and tokenizer/template files of one quantization) | from config |
 | `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS or IQ3_S, when the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | MTP drafter directory | none |
-| `--draft-max N` | MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
+| `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget) |
 | `-dev, --device LIST` | GPU ordinals, e.g. `0,1` | `0` |
@@ -169,6 +169,8 @@ There is no setup command: a model is fetched once, then given by path.
   top_p=0.80, top_k=20, presence_penalty=1.5` (`min_p=0` in both). Greedy decoding
   repeats itself endlessly with this model; it is never the default. MTP verification
   stays exact: a draft is accepted with its probability under the same cut and penalty.
+  A pass drafts while the product of the drafts' probabilities under the drafter stays
+  at 0.6 or more, up to `--draft-max`.
 - Sampling controls the engine does not implement (`n`, `typical_p`, frequency and
   repetition penalties, `logprobs`, `logit_bias`, other `response_format`s, ...) are
   accepted only at their neutral value; anything else is a 400, never ignored.

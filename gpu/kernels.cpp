@@ -925,19 +925,20 @@ int sd_verify_commit(void* handle,uint64_t begin,uint64_t end,uint64_t kept) {
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_output_head(void* handle,void* const* pointers,const int* kinds,uint64_t steps,uint64_t vocabulary,
-                   const float* input,int32_t* tokens,float* logits) {
+                   const float* input,int32_t* tokens,float* logits,float* confidence) {
     try {
         if (!pointers || !kinds) throw std::runtime_error("invalid Straydog output head");
-        output_head(device(handle),pointers,kinds,size_t(steps),size_t(vocabulary),input,tokens,logits); return 0;
+        output_head(device(handle),pointers,kinds,size_t(steps),size_t(vocabulary),input,tokens,logits,confidence); return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // The head with rows [0, split) evaluated by the linked peer from its copy `peer_head`.
 int sd_output_head_split(void* handle,void* const* pointers,const int* kinds,uint64_t steps,uint64_t vocabulary,
-                         uint64_t split,void* peer_head,const float* input,int32_t* tokens,float* logits) {
+                         uint64_t split,void* peer_head,const float* input,int32_t* tokens,float* logits,
+                         float* confidence) {
     try {
         if (!pointers || !kinds) throw std::runtime_error("invalid Straydog output head");
         output_head_split(device(handle),pointers,kinds,size_t(steps),size_t(vocabulary),size_t(split),peer_head,input,
-                          tokens,logits);
+                          tokens,logits,confidence);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
