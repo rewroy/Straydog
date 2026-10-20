@@ -292,6 +292,8 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         if (timings) { check(hipEventRecord(events[index]->last,d.stream)); categories.push_back(category); }
     };
     if (input) upload(d,hidden,input,steps*10240*4);
+    // The span's first host-K/V attention layer stages its prefix while the layers before it run.
+    if (steps>1) kv_prefetch_from(d,begin,position);
     for (size_t layer=begin;layer<end;++layer) {
         const auto& plan=d.decoder.find(layer)->second;
         auto* pointers=plan.pointers.data(); const int* kinds=plan.kinds.data();
@@ -306,8 +308,11 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
             if (linear) {
                 const size_t chunk=d.input_capacity>=16*1024*1024 ? 512 : 128;
                 gdn_prefill(d,pointers+4,kinds+4,plan.states[0],plan.states[1],steps,chunk,mixed,branch,scratch);
-            } else qsa_prefill(d,pointers+4,kinds+4,plan.states[0],plan.states[1],plan.states[2],
-                               plan.context,position,steps,mixed,branch,scratch);
+            } else {
+                qsa_prefill(d,pointers+4,kinds+4,plan.states[0],plan.states[1],plan.states[2],
+                            plan.context,position,steps,mixed,branch,scratch);
+                if (steps>1) kv_prefetch_from(d,layer+1,position);
+            }
         });
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
         record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch); });

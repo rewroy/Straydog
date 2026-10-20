@@ -396,6 +396,11 @@ struct Device {
     float* kv_stage = nullptr;
     size_t kv_stage_rows = 0, kv_stage_valid = 0;
     void* kv_stage_owner = nullptr;
+    // A prefetch (kv_prefetch) fills the stage on kv_stream; device-stream work waits for
+    // kv_prefetched before it touches the stage while kv_prefetching.
+    hipStream_t kv_stream = nullptr;
+    hipEvent_t kv_released = nullptr, kv_prefetched = nullptr;
+    bool kv_prefetching = false;
     // Decode partitions the same stage into fixed per-host-state F32 prefixes.
     // Valid ends are prepared outside graph replay; pointers stay fixed until re-registration.
     size_t kv_mirror_rows = 0;
@@ -430,6 +435,7 @@ struct Device {
         transfers.reset();   // waits for its copies before the allocations go
         if (stream) cleanup(hipStreamSynchronize(stream));
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
+        if (kv_stream) cleanup(hipStreamSynchronize(kv_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -473,6 +479,8 @@ struct Device {
         for (auto event : io_halves) if (event) cleanup(hipEventDestroy(event));
         if (stream) cleanup(hipStreamDestroy(stream));
         if (helper_stream) cleanup(hipStreamDestroy(helper_stream));
+        if (kv_stream) cleanup(hipStreamDestroy(kv_stream));
+        for (auto event : {kv_released, kv_prefetched}) if (event) cleanup(hipEventDestroy(event));
     }
 };
 
@@ -1672,6 +1680,10 @@ int sd_release(void* handle, void* pointer) {
         auto& value = device(handle);
         auto found = value.allocations.find(pointer);
         if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        if (value.kv_prefetching && (pointer == value.kv_stage || pointer == value.kv_stage_owner)) {
+            check(hipStreamSynchronize(value.kv_stream));
+            value.kv_prefetching = false;
+        }
         for (const auto& entry : value.resident) {
             const auto& plan=*entry.second;
             if (plan.table==pointer || plan.workspace==pointer ||
@@ -1819,6 +1831,7 @@ int sd_kv_stage(void* handle, void* pointer, uint64_t rows) {
         if (!rows || rows > 262144 || found == value.allocations.end() || found->second != size_t(rows) * 1024 * 4 ||
             value.host_states.count(pointer))
             throw std::runtime_error("invalid Straydog K/V stage");
+        if (value.kv_prefetching) { check(hipStreamSynchronize(value.kv_stream)); value.kv_prefetching = false; }
         kv_clear_graphs(value);
         value.kv_mirrors.clear(); value.kv_mirror_rows = 0;
         value.kv_stage = static_cast<float*>(pointer); value.kv_stage_rows = size_t(rows);

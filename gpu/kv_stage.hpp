@@ -5,10 +5,50 @@ struct KvView {
     float* mirror = nullptr; size_t mirror_rows = 0;
 };
 void kv_copy_rows(Device& d, float* to, size_t to_capacity, const float* from, size_t from_capacity,
-                  size_t first, size_t count) {
+                  size_t first, size_t count, hipStream_t stream=nullptr) {
     for (size_t segment=0;count && segment<4;++segment)
         check(hipMemcpyAsync(to+(segment*to_capacity+first)*256,from+(segment*from_capacity+first)*256,count*256*4,
-                             hipMemcpyDefault,d.stream));
+                             hipMemcpyDefault,stream ? stream : d.stream));
+}
+// Work on the device stream that reads or writes the stage first waits for a prefetch's copy.
+void kv_stage_settle(Device& d) {
+    if (!d.kv_prefetching) return;
+    check(hipStreamWaitEvent(d.stream,d.kv_prefetched,0));
+    d.kv_prefetching=false;
+}
+// A prefill batch past a layer's decode mirror stages the layer's whole prefix. Between two of
+// a device's attention layers the stage is idle, so the next one's prefix is copied then, on a
+// stream of its own, while the layers in between compute.
+void kv_prefetch(Device& d, void* state, size_t context, size_t base) {
+    if (!d.kv_stage || base>d.kv_stage_rows || !d.host_states.count(state) ||
+        (d.kv_mirrors.count(state) && base<d.kv_mirror_rows))
+        return;
+    for (auto& entry : d.kv_mirrors) entry.second.valid=0;
+    if (d.kv_stage_owner!=state) { d.kv_stage_owner=state; d.kv_stage_valid=0; }
+    if (d.kv_stage_valid>=base) return;
+    if (!d.kv_stream) {
+        check(hipStreamCreate(&d.kv_stream));
+        check(hipEventCreateWithFlags(&d.kv_released,hipEventDisableTiming));
+        check(hipEventCreateWithFlags(&d.kv_prefetched,hipEventDisableTiming));
+    }
+    // After the stage's last reader and the host rows' last writer on the device stream.
+    check(hipEventRecord(d.kv_released,d.stream));
+    check(hipStreamWaitEvent(d.kv_stream,d.kv_released,0));
+    kv_copy_rows(d,d.kv_stage,d.kv_stage_rows,static_cast<const float*>(state),context,d.kv_stage_valid,
+                 base-d.kv_stage_valid,d.kv_stream);
+    check(hipEventRecord(d.kv_prefetched,d.kv_stream));
+    d.kv_prefetching=true;
+    d.kv_stage_valid=base;
+}
+// The first attention layer from `layer` on this device whose K/V is in host memory, prefetched for `base`.
+void kv_prefetch_from(Device& d, size_t layer, size_t base) {
+    for (;layer<=48;++layer) {
+        if (layer%4!=3 && layer!=48) continue;
+        auto plan=d.decoder.find(layer);
+        if (plan==d.decoder.end()) continue;
+        if (base<=plan->second.context) kv_prefetch(d,plan->second.states[0],plan->second.context,base);
+        return;
+    }
 }
 void kv_invalidate_write(Device& d, void* state, size_t base) {
     if (state==d.kv_stage) {
@@ -37,6 +77,7 @@ KvView kv_decode_view(Device& d, void* state, size_t context) {
 // orders fills after old writes and before attention. Rewrites truncate validity;
 // the current token(s) are supplied by write_attention_kv's duplicate stores.
 KvView kv_prepare_decode(Device& d, void* state, size_t context, size_t base, size_t count=1) {
+    kv_stage_settle(d);
     const KvView view=kv_decode_view(d,state,context);
     kv_invalidate_write(d,state,base);
     if (!view.mirror) return view;
@@ -51,6 +92,7 @@ KvView kv_prepare_decode(Device& d, void* state, size_t context, size_t base, si
 // A batch that fits its layer's decode mirror runs there: the mirror stays valid for the
 // decode and the follow-up batches after it, instead of re-copying the whole prefix per layer.
 KvView kv_for_prefill(Device& d, void* state, size_t context, size_t base, size_t count) {
+    kv_stage_settle(d);
     if (count==1) return kv_prepare_decode(d,state,context,base);
     if (d.kv_mirrors.count(state) && base+count<=d.kv_mirror_rows) {
         const KvView view=kv_prepare_decode(d,state,context,base,count);
