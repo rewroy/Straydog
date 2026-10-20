@@ -81,6 +81,10 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
                 Effort::High => ReasoningEffort::High,
             },
             created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs()),
+            markup: straydog_engine::bundle::architecture_of(&settings.quant)
+                .ok()
+                .and_then(|architecture| straydog_api::Markup::of_architecture(&architecture))
+                .ok_or("no reply markup for this model")?,
         };
         let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
         let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor.clone()));

@@ -35,7 +35,9 @@ logic: they follow from the official chat template and the OpenAI message format
 - **Isolation.** The engine runs in a separate worker process without network
   access: bubblewrap on Linux, an AppContainer of its own on Windows. The worker is
   the same executable. Every model and drafter file is pinned by SHA-256 and
-  authenticated before use. The SSD is read-only: no swap, weight or K/V files.
+  authenticated before use; the shards of a model read on demand also by their
+  fs-verity digests, every 4 KiB block checked against its Merkle tree before use.
+  The SSD is read-only: no swap, weight or K/V files.
 - **Measurement.** Performance claims come from alternating A/B runs on the same
   machine, under a GPU lock.
 
@@ -169,7 +171,7 @@ option, named as llama-server names it where it has the same setting.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `-m, --model DIR` | model bundle directory (the pinned GGUF shards and tokenizer/template files of one quantization) | from config |
-| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS or IQ3_S, when the directory alone does not say | detected from the pinned files |
+| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S or UD-IQ2_XXS (DeepSeek-V4.1-Flash), when the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | MTP drafter directory | none |
 | `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
@@ -179,6 +181,8 @@ option, named as llama-server names it where it has the same setting.
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--row-cache MIB` | host memory caching rows of the PLE table, read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
+| `--data-dir DIR` | Straydog's data directory: the verity trees of a model read on demand | none (required for such a model) |
+| `--expert-ram GIB` | host memory for routed experts outside VRAM (a model read on demand) | half the host memory, less 4 GiB |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |
@@ -202,7 +206,11 @@ There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authentic
 before use. The pins are compiled into the executable.
 
 Subcommands: `straydog fetch`, `straydog verify`, `straydog fetch-mtp` (provisioning).
-There is no setup command: a model is fetched once, then given by path.
+There is no setup command: a model is fetched once, then given by path. For a model read
+on demand, `fetch` and `verify` also build each shard's verity tree into the data
+directory (`<data-dir>/verity/<shard>.verity`, one read of the files) and keep it only when
+its digest is the pinned one; the model directory is never written, and the server refuses
+to start without the trees.
 
 ## 6. API
 
@@ -408,3 +416,13 @@ page-locked RAM, a token costs 20-25 ms on two R9700s; the goal is 30 tokens/s.
   Replaying only the last 128 (the model's own bounded replay) is an option, not the
   default.
 - **D6**: the block drafter, two-GPU strategies, tuning to the goal.
+
+It is served like the Qwen model: `straydog -m DIR --data-dir DIR ...` with the same API,
+isolation and dashboard. The bundle's pins name the architecture; the worker opens the six
+shards against their trees, splits the layers across the GPUs where no layer reads another
+part's compressed rows (balancing the dense bytes), gives each GPU's VRAM left after its dense
+weights and sequence state to expert slots, and plans the host tier from the host memory.
+Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the official
+tokenizer's ids; the template renders the reference encoder's prompts), replies split at the
+first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A
+prompt that extends the held sequence continues it; there are no checkpoints yet.

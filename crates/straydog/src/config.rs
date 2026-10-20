@@ -41,7 +41,7 @@ pub struct Options {
     /// Model bundle: its directory (the pinned GGUF shards and tokenizer files of one quantization) or one of its shards
     #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "PATH")]
     pub model: Option<PathBuf>,
-    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS or IQ3_S [default: detected from its files]
+    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next) or UD-IQ2_XXS (DeepSeek-V4.1-Flash) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
     /// MTP drafter: its directory or its GGUF file (also -md)
@@ -92,7 +92,7 @@ pub struct Options {
     /// File holding the API key, kept out of the process list
     #[arg(long, env = "STRAYDOG_API_KEY_FILE", value_name = "FILE")]
     pub api_key_file: Option<PathBuf>,
-    /// Model id in /v1/models and answers [default: Qwen3.8-Flash-Next-<quant>]
+    /// Model id in /v1/models and answers [default: <model>-<quant>, e.g. Qwen3.8-Flash-Next-IQ3_S]
     #[arg(long, env = "STRAYDOG_ALIAS", value_name = "NAME")]
     pub alias: Option<String>,
     /// Temperature when a request gives none; 0 is greedy [default: the model card's, 1.0 thinking and 0.7 not]
@@ -126,6 +126,12 @@ pub struct Options {
     #[arg(short = 'v', long, env = "STRAYDOG_VERBOSE")]
     #[serde(default)]
     pub verbose: bool,
+    /// Straydog's data directory: the verity trees `straydog verify` builds for a bundle read on demand
+    #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// Host memory for routed experts outside VRAM, in GiB, for a bundle read on demand [default: half the host memory, less 4 GiB]
+    #[arg(long, env = "STRAYDOG_EXPERT_RAM", value_name = "GIB")]
+    pub expert_ram: Option<f64>,
 }
 
 /// The settings in effect, every derived value filled in.
@@ -162,6 +168,10 @@ pub struct Settings {
     pub startup_timeout: f64,
     pub log_file: Option<PathBuf>,
     pub verbose: bool,
+    /// Required for a bundle read on demand (its verity trees).
+    pub data_dir: Option<PathBuf>,
+    /// Unset: planned from the host memory.
+    pub expert_ram: Option<f64>,
 }
 
 /// llama.cpp's multi-letter short options, as their long forms (clap's short options are one letter).
@@ -222,7 +232,8 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
     }
     let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
-                         top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose);
+                         top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose,
+                         data_dir, expert_ram);
     Ok((options, sources))
 }
 
@@ -248,12 +259,8 @@ fn is_unset(value: &impl Unset) -> bool {
 
 /// The one quantization whose pinned shards are all in `model`.
 pub fn detect_quantization(model: &Path) -> Result<String, String> {
-    let found: Vec<&str> = QUANTIZATIONS
-        .iter()
-        .copied()
-        .filter(|quant| {
-            bundle::bundle(quant).is_ok_and(|pins| pins.shards.iter().all(|shard| model.join(&shard.name).is_file()))
-        })
+    let found: Vec<&str> = bundle::quantizations()
+        .filter(|quant| bundle::shards(quant).is_ok_and(|shards| shards.iter().all(|shard| model.join(&shard.name).is_file())))
         .collect();
     match found[..] {
         [quant] => Ok(quant.to_string()),
@@ -265,9 +272,8 @@ pub fn detect_quantization(model: &Path) -> Result<String, String> {
 /// The directory and quantization of a pinned shard given as the model.
 fn bundle_of_shard(shard: &Path) -> Result<(PathBuf, Option<String>), String> {
     let name = shard.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    let quant = QUANTIZATIONS
-        .iter()
-        .find(|quant| bundle::bundle(quant).is_ok_and(|pins| pins.shards.iter().any(|pin| pin.name == name)))
+    let quant = bundle::quantizations()
+        .find(|quant| bundle::shards(quant).is_ok_and(|shards| shards.iter().any(|pin| pin.name == name)))
         .ok_or_else(|| format!("{} is not a shard of a pinned model bundle", shard.display()))?;
     Ok((shard.parent().unwrap().to_path_buf(), Some(quant.to_string())))
 }
@@ -291,10 +297,26 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         return Err(format!("model directory not found: {}", model.display()));
     }
     let quant = match options.quant.or(shard_quant) {
-        Some(quant) if QUANTIZATIONS.contains(&quant.as_str()) => quant,
-        Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS or IQ3_S")),
+        Some(quant) if bundle::quantizations().any(|known| known == quant) => quant,
+        Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S or UD-IQ2_XXS")),
         None => detect_quantization(&model)?,
     };
+    // A bundle read on demand is checked against verity trees in the data directory, and has no MTP drafter.
+    let on_demand = bundle::is_on_demand(&quant);
+    let data_dir = match options.data_dir {
+        Some(dir) => Some(dir.canonicalize().map_err(|exc| format!("data directory {}: {exc}", dir.display()))?),
+        None if on_demand => {
+            return Err(format!("the {quant} bundle needs --data-dir: the directory its verity trees are built into \
+                                (straydog verify -m {} --quant {quant} --data-dir DIR)", model.display()));
+        }
+        None => None,
+    };
+    if on_demand && options.model_draft.is_some() {
+        return Err(format!("the {quant} bundle has no MTP drafter"));
+    }
+    if options.expert_ram.is_some_and(|gib| !(0.0..=4096.0).contains(&gib)) {
+        return Err("--expert-ram must be between 0 and 4096 GiB".into());
+    }
     let model_draft = match options.model_draft {
         Some(path) => {
             let path = path.canonicalize().map_err(|exc| format!("drafter {}: {exc}", path.display()))?;
@@ -315,7 +337,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         return Err("--vram must be between 0.01 and 256 GiB".into());
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
-    let batch_size = options.batch_size.unwrap_or(if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
+    // A bundle read on demand prefills in passes of 64 tokens.
+    let batch_size = options.batch_size.unwrap_or(if on_demand { 64 } else if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
     let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
@@ -363,7 +386,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if api_key.as_ref().is_some_and(String::is_empty) {
         return Err("the API key is empty".into());
     }
-    let alias = options.alias.unwrap_or_else(|| format!("{}-{quant}", bundle::MODEL));
+    let alias = options.alias.unwrap_or_else(|| format!("{}-{quant}", bundle::model_of(&quant).unwrap_or_default()));
     Ok(Settings {
         model,
         quant,
@@ -393,6 +416,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         startup_timeout,
         log_file: options.log_file,
         verbose: options.verbose,
+        data_dir,
+        expert_ram: options.expert_ram,
     })
 }
 
@@ -431,6 +456,8 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("startup_timeout", settings.startup_timeout.to_string()),
         ("log_file", path(&settings.log_file)),
         ("verbose", settings.verbose.to_string()),
+        ("data_dir", path(&settings.data_dir)),
+        ("expert_ram", settings.expert_ram.map_or_else(|| "(planned)".into(), |gib| gib.to_string())),
     ];
     values
         .into_iter()
@@ -458,10 +485,35 @@ mod tests {
     fn bundle_directory(quant: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("straydog-config-{quant}-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        for shard in bundle::bundle(quant).unwrap().shards {
+        for shard in bundle::shards(quant).unwrap() {
             std::fs::write(directory.join(shard.name), b"").unwrap();
         }
         directory
+    }
+
+    #[test]
+    fn a_bundle_read_on_demand_needs_its_data_directory() {
+        let model = bundle_directory("UD-IQ2_XXS");
+        let data = std::env::temp_dir().join(format!("straydog-config-data-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let parse = |args: &[&str]| {
+            let mut all = vec!["-m", model.to_str().unwrap()];
+            all.extend_from_slice(args);
+            let matches = command().try_get_matches_from(all).map_err(|exc| exc.to_string())?;
+            resolve(Options::from_arg_matches(&matches).map_err(|exc| exc.to_string())?)
+        };
+        assert!(parse(&[]).unwrap_err().contains("--data-dir"));
+        let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
+        assert_eq!((settings.quant.as_str(), settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-UD-IQ2_XXS"));
+        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (64, Some(48.0), Some(data.canonicalize().unwrap())));
+        assert!(parse(&["--data-dir", data.to_str().unwrap(), "--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
+        let worker = crate::runtime::worker_args(&settings);
+        let text: Vec<String> = worker.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(text.windows(2).any(|pair| pair[0] == "--host-expert-bytes" && pair[1] == (48u64 << 30).to_string()));
+        // The trees are what the worker reads beside the shards; without them the server does not start.
+        assert!(crate::runtime::exposure(&settings).unwrap_err().contains("straydog verify"));
+        std::fs::remove_dir_all(model).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]

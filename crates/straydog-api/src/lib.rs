@@ -22,6 +22,7 @@ use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use straydog_engine::pyjson;
+pub use straydog_engine::reply::Markup;
 use straydog_engine::sampling::Sampling;
 use subtle::ConstantTimeEq;
 
@@ -100,6 +101,8 @@ pub struct ApiConfig {
     pub reasoning_effort: ReasoningEffort,
     /// The model's `created` time in Unix seconds: when the server started.
     pub created: u64,
+    /// The model family's template: its reasoning levels and reply markup.
+    pub markup: Markup,
 }
 
 /// The server's sampling settings: each one set applies to every request that gives none, and
@@ -115,7 +118,11 @@ pub struct SamplingDefaults {
 
 impl SamplingDefaults {
     pub fn resolve(&self, thinking: bool) -> Sampling {
-        let card = Sampling::recommended(thinking);
+        self.resolve_with(Sampling::recommended(thinking))
+    }
+
+    /// Each setting, else the given model card's.
+    pub fn resolve_with(&self, card: Sampling) -> Sampling {
         Sampling {
             temperature: self.temperature.unwrap_or(card.temperature),
             top_k: self.top_k.unwrap_or(card.top_k),
@@ -173,8 +180,14 @@ impl Api {
     /// time, with the server's defaults and no output limit but the context.
     fn slot(&self) -> Result<serde_json::Value, ApiError> {
         let (context, speculative, processing) = self.ready()?;
-        // The defaults of the default reasoning; -1 is llama-server's random seed.
-        let sampling = self.config.sampling.resolve(self.config.reasoning_effort != ReasoningEffort::None);
+        // The defaults of the default reasoning (the card the worker reports, if it does); -1 is
+        // llama-server's random seed.
+        let sampling = match self.engine.state() {
+            EngineState::Ready { placement, .. } if placement["sampling"].is_object() => {
+                self.config.sampling.resolve_with(card(&placement["sampling"]))
+            }
+            _ => self.config.sampling.resolve(self.config.reasoning_effort != ReasoningEffort::None),
+        };
         Ok(json!({
             "id": 0, "n_ctx": context, "speculative": speculative > 0, "is_processing": processing,
             "params": {"n_predict": -1, "seed": self.config.seed.map_or(-1, |seed| seed as i128),
@@ -182,6 +195,18 @@ impl Api {
                        "min_p": sampling.min_p, "presence_penalty": sampling.presence_penalty,
                        "speculative.n_max": speculative},
         }))
+    }
+}
+
+/// A model card the worker reports (`{"temperature", "top_k", "top_p", "min_p", "presence_penalty"}`).
+fn card(card: &serde_json::Value) -> Sampling {
+    let number = |key: &str, neutral: f64| card[key].as_f64().unwrap_or(neutral);
+    Sampling {
+        temperature: number("temperature", 1.0),
+        top_k: card["top_k"].as_u64().unwrap_or(0) as usize,
+        top_p: number("top_p", 1.0),
+        min_p: number("min_p", 0.0),
+        presence_penalty: number("presence_penalty", 0.0),
     }
 }
 

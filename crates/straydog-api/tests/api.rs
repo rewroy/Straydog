@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use straydog_api::{router, ApiConfig, Engine, EngineState, Generation, ReasoningEffort, SamplingDefaults, SubmitError};
+use straydog_api::{router, ApiConfig, Engine, EngineState, Generation, Markup, ReasoningEffort, SamplingDefaults, SubmitError};
 use straydog_engine::pyjson;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -115,6 +115,7 @@ fn config() -> ApiConfig {
         seed: Some(0),
         reasoning_effort: ReasoningEffort::High,
         created: 1_760_000_000,
+        markup: Markup::Qwen,
     }
 }
 
@@ -833,4 +834,39 @@ async fn a_client_that_disconnects_cancels_its_generation() {
     timeout(mock.submitted.notified()).await.expect("the request reaches the engine");
     drop(connection);
     timeout(mock.dropped.notified()).await.expect("the generation is cancelled");
+}
+
+/// A DeepSeek-V4.1 server: its own reasoning levels, the card left to the worker (which reports
+/// it), and DSML tool calls turned into structured ones.
+#[tokio::test]
+async fn a_dsml_model_gets_its_own_levels_card_and_tool_calls() {
+    let text = "Need the file.</think>Reading.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n\
+                <｜DSML｜ parameter name=\"path\" string=\"true\">main.rs</｜DSML｜ parameter>\n\
+                <｜DSML｜ parameter name=\"limit\" string=\"false\">50</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    let (first, rest) = text.split_at(text.find("<｜DSML｜ invoke").unwrap());
+    let mock = Mock::new(vec![Script::Events(vec![delta(first), delta(rest), done("stop")]), Script::Events(vec![delta("Hi"), done("stop")])]);
+    mock.set_state(EngineState::Ready { context: 65536, speculative: 0, processing: false,
+                                        placement: json!({"sampling": {"temperature": 1.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0,
+                                                                       "presence_penalty": 0.0}}) });
+    let app = || router(mock.clone(), ApiConfig { markup: Markup::Dsml, ..config() });
+    let (status, body) = fetch(app(), chat(ask(json!({"tools": read_file(), "reasoning_effort": "xhigh", "top_p": 0.9})).to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &body["choices"][0]["message"];
+    assert_eq!((message["reasoning_content"].as_str(), message["content"].as_str()), (Some("Need the file."), Some("Reading.")));
+    let call = &message["tool_calls"][0]["function"];
+    assert_eq!((call["name"].as_str(), call["arguments"].as_str()), (Some("read_file"), Some(r#"{"path": "main.rs", "limit": 50}"#)));
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    let request = &mock.requests()[0];
+    assert_eq!(request.get("reasoning_effort"), Some(&pyjson::Value::Str("max".into())));
+    // What the request leaves out stays null for the worker's card; what it gives is kept.
+    assert_eq!(request.get("temperature"), Some(&pyjson::Value::Null));
+    assert_eq!(request.get("top_p"), Some(&pyjson::Value::Float(0.9)));
+    let (status, _) = fetch(app(), chat(ask(json!({"chat_template_kwargs": {"reasoning_effort": "xhigh"}})).to_string())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = fetch(app(), chat(ask(json!({"chat_template_kwargs": {"reasoning_effort": "max", "enable_thinking": false}})).to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.requests()[1].get("thinking"), Some(&pyjson::Value::Bool(false)));
+    let (_, props) = fetch(app(), get("/props")).await;
+    assert_eq!((props["default_generation_settings"]["params"]["top_k"].as_u64(), props["default_generation_settings"]["params"]["top_p"].as_f64()),
+               (Some(0), Some(1.0)));
 }

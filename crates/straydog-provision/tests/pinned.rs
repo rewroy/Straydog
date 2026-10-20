@@ -52,12 +52,12 @@ fn a_bundle_authenticates() {
         return;
     };
     let stages = Stages::new();
-    straydog_provision::verify(&root, "IQ3_S", &|stage, done, total| stages.report(stage, done, total)).unwrap();
+    straydog_provision::verify(&root, "IQ3_S", None, &|stage, done, total| stages.report(stage, done, total)).unwrap();
     let pins = bundle::bundle("IQ3_S").unwrap();
     let total: u64 = pins.shards.iter().chain(&pins.resources).map(|asset| asset.bytes).sum();
     assert_eq!(*stages.0.lock().unwrap(), [("authenticating 5 present file(s)".to_string(), total, total)]);
     // The Q2_0 bundle's first shard is not there.
-    let message = straydog_provision::verify(&root, "Q2_0", &|_, _, _| {}).unwrap_err();
+    let message = straydog_provision::verify(&root, "Q2_0", None, &|_, _, _| {}).unwrap_err();
     assert!(message.contains("Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"), "{message}");
 }
 

@@ -28,8 +28,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(1);
 pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -> Result<Response, ApiError> {
     let reply = Reply {
         stop: StopMatcher::new(&shape.stops),
-        reasoning: ReasoningSplitter::new(shape.thinking),
-        tools: ToolCallSplitter::new(shape.tools.as_ref()),
+        reasoning: ReasoningSplitter::with_markup(shape.thinking, shape.markup),
+        tools: ToolCallSplitter::with_markup(shape.tools.as_ref(), shape.markup),
         calls: Vec::new(),
     };
     let mut completion = Completion { generation, reply };
@@ -321,6 +321,9 @@ fn tool_call(call: &ToolCall, streamed: bool) -> Value {
     fields.insert("id".into(), call.id.clone().into());
     fields.insert("type".into(), "function".into());
     fields.insert("function".into(), json!({"name": call.name, "arguments": call.arguments}));
+    if let Some(namespace) = &call.namespace {
+        fields.insert("namespace".into(), namespace.clone().into());
+    }
     Value::Object(fields)
 }
 

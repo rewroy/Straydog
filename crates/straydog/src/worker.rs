@@ -56,14 +56,20 @@ pub struct WorkerArgs {
     /// Host memory available to the worker (its cgroup limits are invisible inside isolation).
     #[arg(long, default_value_t = 0)]
     pub host_memory_bytes: u64,
+    /// Straydog's data directory: the verity trees of a bundle read on demand.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+    /// The routed experts' host tier of a bundle read on demand [default: planned from host memory].
+    #[arg(long)]
+    pub host_expert_bytes: Option<u64>,
 }
 
 /// Frames go to stdout whole, one line each, from whichever thread sends them.
 #[derive(Clone)]
-struct Output(Arc<Mutex<std::io::Stdout>>);
+pub(crate) struct Output(Arc<Mutex<std::io::Stdout>>);
 
 impl Output {
-    fn send(&self, frame: &Value) {
+    pub(crate) fn send(&self, frame: &Value) {
         let mut line = serde_json::to_vec(frame).expect("frames serialize");
         if line.len() > FRAME_BYTES {
             line = serde_json::to_vec(&json!({"id": frame["id"], "event": "error", "fatal": false,
@@ -99,6 +105,25 @@ struct Engine {
     template: ChatTemplate,
 }
 
+/// A loaded model as the request loop drives it: one request at a time, and a reset after a
+/// failed one.
+pub(crate) trait Served: Send {
+    fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
+           started: Instant) -> Result<Value, Failure>;
+    fn reset(&mut self) -> Result<(), String>;
+}
+
+impl Served for Engine {
+    fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
+           started: Instant) -> Result<Value, Failure> {
+        run(self, text, output, id, body, cancel, started)
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        self.model.reset()
+    }
+}
+
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
 /// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty.
 fn warm_up(model: &mut Model) -> Result<(), String> {
@@ -115,6 +140,9 @@ fn warm_up(model: &mut Model) -> Result<(), String> {
 pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
+    if straydog_engine::bundle::is_on_demand(&args.quant) {
+        return crate::worker_deepseek41::main(&args, output, &|stage, done, total| loading.report(stage, done, total));
+    }
     let split = if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts };
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
@@ -170,7 +198,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
 }
 
 /// Read bounded frames until stdin closes or `shutdown`; reject concurrent generation.
-fn serve(engine: Arc<Mutex<Engine>>, text: Arc<Text>, output: Output) -> Result<(), String> {
+pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>, output: Output) -> Result<(), String> {
     let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cancel = Arc::new(AtomicBool::new(false));
     let mut thread: Option<std::thread::JoinHandle<()>> = None;
@@ -243,26 +271,26 @@ fn serve(engine: Arc<Mutex<Engine>>, text: Arc<Text>, output: Output) -> Result<
 }
 
 /// One request's failure: a request the engine refuses, or an engine failure (fatal).
-struct Failure {
-    message: String,
-    fatal: bool,
+pub(crate) struct Failure {
+    pub message: String,
+    pub fatal: bool,
 }
 
-fn refused(message: impl Into<String>) -> Failure {
+pub(crate) fn refused(message: impl Into<String>) -> Failure {
     Failure { message: message.into(), fatal: false }
 }
 
 /// Run one chat request; returns its terminal frame (`done` or `error`).
-fn generate(engine: &Mutex<Engine>, text: &Text, output: &Output, id: &str, body: &pyjson::Value,
-            cancel: &AtomicBool) -> Value {
+fn generate<S: Served>(engine: &Mutex<S>, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value,
+                       cancel: &Arc<AtomicBool>) -> Value {
     let started = Instant::now();
     let mut engine = engine.lock().unwrap();
-    match run(&mut engine, text, output, id, body, cancel, started) {
+    match engine.run(text, output, id, body, cancel, started) {
         Ok(done) => done,
         Err(failure) => {
             let mut fatal = failure.fatal;
             // A failed device (an illegal memory access) cannot be reset; the request still ends.
-            if let Err(exc) = engine.model.reset() {
+            if let Err(exc) = engine.reset() {
                 tracing::error!("Straydog could not reset after a failed generation: {exc}");
                 fatal = true;
             }

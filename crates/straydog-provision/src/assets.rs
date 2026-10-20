@@ -21,7 +21,8 @@ const BLOCK: usize = 1 << 20;
 /// Every pinned file of `quantization` with the URL it is fetched from: the shards, then
 /// the resources.
 pub fn entries(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
-    Ok(bundle::sources(quantization)?
+    let sources = if bundle::is_on_demand(quantization) { bundle::on_demand_sources(quantization)? } else { bundle::sources(quantization)? };
+    Ok(sources
         .into_iter()
         .map(|source| {
             let url = format!("https://huggingface.co/{}/resolve/{}/{}", source.repository, source.revision, source.path);

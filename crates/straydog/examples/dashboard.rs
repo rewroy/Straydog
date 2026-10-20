@@ -62,6 +62,8 @@ fn main() {
         startup_timeout: 60.0,
         log_file: None,
         verbose: false,
+        data_dir: None,
+        expert_ram: None,
     };
     let command = (std::env::current_exe().unwrap(), vec!["simulate-worker".into()]);
     tokio::runtime::Runtime::new().unwrap().block_on(async move {
@@ -75,6 +77,7 @@ fn main() {
             seed: None,
             reasoning_effort: straydog_api::ReasoningEffort::High,
             created: 0,
+            markup: straydog_api::Markup::Qwen,
         };
         let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
         let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor));

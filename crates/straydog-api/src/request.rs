@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use straydog_engine::pyjson::{self, Value};
 
-use crate::{ApiConfig, ApiError};
+use crate::{ApiConfig, ApiError, Markup};
 
 /// The OpenAI `reasoning_effort` levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,14 +26,28 @@ pub enum ReasoningEffort {
 const EFFORTS: &str = "reasoning_effort must be none, minimal, low, medium, high or xhigh";
 
 impl ReasoningEffort {
-    /// Whether the template thinks, and at which of its own levels: it has no "none" and
-    /// calls its highest level, its default, xhigh.
-    fn template(self) -> (bool, &'static str) {
-        match self {
-            ReasoningEffort::None => (false, "medium"),
-            ReasoningEffort::Minimal | ReasoningEffort::Low => (true, "low"),
-            ReasoningEffort::Medium => (true, "medium"),
-            ReasoningEffort::High | ReasoningEffort::Xhigh => (true, "xhigh"),
+    /// Whether the template thinks, and at which of its own levels. Qwen's has no "none" and calls
+    /// its highest level, its default, xhigh; DeepSeek-V4.1's are budgets named low (50), medium
+    /// (62), high (75, its default) and max (100).
+    fn template(self, markup: Markup) -> (bool, &'static str) {
+        match (markup, self) {
+            (Markup::Qwen, ReasoningEffort::None) => (false, "medium"),
+            (Markup::Qwen, ReasoningEffort::Minimal | ReasoningEffort::Low) => (true, "low"),
+            (Markup::Qwen, ReasoningEffort::Medium) => (true, "medium"),
+            (Markup::Qwen, ReasoningEffort::High | ReasoningEffort::Xhigh) => (true, "xhigh"),
+            (Markup::Dsml, ReasoningEffort::None) => (false, "high"),
+            (Markup::Dsml, ReasoningEffort::Minimal | ReasoningEffort::Low) => (true, "low"),
+            (Markup::Dsml, ReasoningEffort::Medium) => (true, "medium"),
+            (Markup::Dsml, ReasoningEffort::High) => (true, "high"),
+            (Markup::Dsml, ReasoningEffort::Xhigh) => (true, "max"),
+        }
+    }
+
+    /// The template's own levels a request may name in `chat_template_kwargs`.
+    fn levels(markup: Markup) -> &'static [&'static str] {
+        match markup {
+            Markup::Qwen => &["low", "medium", "xhigh"],
+            Markup::Dsml => &["low", "medium", "high", "max"],
         }
     }
 }
@@ -80,6 +94,8 @@ const MESSAGE_KEYS: [&str; 6] = ["role", "content", "name", "tool_call_id", "too
 pub(crate) struct Shape {
     /// The answer starts as reasoning.
     pub thinking: bool,
+    /// How the template marks reasoning and tool calls.
+    pub markup: Markup,
     /// The tools whose calls are parsed; none when tool calls stay text.
     pub tools: Option<Value>,
     pub stops: Vec<String>,
@@ -149,7 +165,8 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
         Some(Value::Str(name)) if name.is_empty() => config.reasoning_effort,
         Some(value) => value.as_str().unwrap_or_default().parse().map_err(ApiError::invalid)?,
     };
-    let (mut thinking, mut level) = effort.template();
+    let markup = config.markup;
+    let (mut thinking, mut level) = effort.template(markup);
     let kwargs_error = || ApiError::invalid("chat_template_kwargs supports enable_thinking and reasoning_effort");
     match given(payload, "chat_template_kwargs") {
         None => {}
@@ -163,9 +180,10 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
                         thinking = *flag;
                     }
                     "reasoning_effort" => {
-                        let levels = ["low", "medium", "xhigh"];
-                        level = levels.into_iter().find(|name| value.as_str() == Some(name)).ok_or_else(|| {
-                            ApiError::invalid("chat_template_kwargs.reasoning_effort must be low, medium or xhigh")
+                        let levels = ReasoningEffort::levels(markup);
+                        level = levels.iter().copied().find(|name| value.as_str() == Some(name)).ok_or_else(|| {
+                            let (last, rest) = levels.split_last().unwrap();
+                            ApiError::invalid(format!("chat_template_kwargs.reasoning_effort must be {} or {last}", rest.join(", ")))
                         })?;
                     }
                     _ => return Err(kwargs_error()),
@@ -213,23 +231,38 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
         Some(_) => return Err(ApiError::invalid("stream_options must be an object")),
     };
 
-    let defaults = config.sampling.resolve(thinking);
     let messages = messages.iter().map(message).collect::<Result<Vec<_>, _>>()?;
+    // Qwen's card is the API's; another family's worker reports its own card and fills in what is
+    // left null here.
+    let (temperature, top_k, top_p, min_p, presence_penalty) = match markup {
+        Markup::Qwen => {
+            let defaults = config.sampling.resolve(thinking);
+            (Value::Float(temperature.unwrap_or(defaults.temperature)), Value::Int(top_k.unwrap_or(defaults.top_k) as i128),
+             Value::Float(top_p.unwrap_or(defaults.top_p)), Value::Float(min_p.unwrap_or(defaults.min_p)),
+             Value::Float(presence_penalty.unwrap_or(defaults.presence_penalty)))
+        }
+        Markup::Dsml => {
+            let set = &config.sampling;
+            let float = |value: Option<f64>| value.map_or(Value::Null, Value::Float);
+            (float(temperature.or(set.temperature)), top_k.or(set.top_k).map_or(Value::Null, |k| Value::Int(k as i128)),
+             float(top_p.or(set.top_p)), float(min_p.or(set.min_p)), float(presence_penalty.or(set.presence_penalty)))
+        }
+    };
     let request = Value::Object(vec![
         ("messages".into(), Value::Array(messages)),
         ("tools".into(), tools.clone().unwrap_or(Value::Null)),
         ("max_tokens".into(), max_tokens),
-        ("temperature".into(), Value::Float(temperature.unwrap_or(defaults.temperature))),
-        ("top_k".into(), Value::Int(top_k.unwrap_or(defaults.top_k) as i128)),
-        ("top_p".into(), Value::Float(top_p.unwrap_or(defaults.top_p))),
-        ("min_p".into(), Value::Float(min_p.unwrap_or(defaults.min_p))),
-        ("presence_penalty".into(), Value::Float(presence_penalty.unwrap_or(defaults.presence_penalty))),
+        ("temperature".into(), temperature),
+        ("top_k".into(), top_k),
+        ("top_p".into(), top_p),
+        ("min_p".into(), min_p),
+        ("presence_penalty".into(), presence_penalty),
         ("seed".into(), Value::Int(seed.into())),
         ("thinking".into(), Value::Bool(thinking)),
         ("reasoning_effort".into(), Value::Str(level.into())),
         ("checkpoint".into(), Value::Bool(checkpoint)),
     ]);
-    Ok((request, Shape { thinking, tools, stops, stream, include_usage }))
+    Ok((request, Shape { thinking, markup, tools, stops, stream, include_usage }))
 }
 
 /// A number the request gives, checked by `valid`.

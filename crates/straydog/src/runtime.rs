@@ -152,11 +152,38 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
     // expert banks) must see the memory this process tree may actually use.
     push("host-memory-bytes", straydog_engine::host::host_memory_bytes().to_string());
+    if let Some(dir) = &settings.data_dir {
+        push("data-dir", dir.display().to_string());
+    }
+    if let Some(gib) = settings.expert_ram {
+        push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
+    }
     args
 }
 
-/// What the worker reads: the pinned files and their directories, never the API key file.
+/// What the worker reads: the pinned files and their directories, never the API key file. A bundle
+/// read on demand: its shards and their verity trees in the data directory.
 pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, String> {
+    use straydog_engine::bundle;
+    if bundle::is_on_demand(&settings.quant) {
+        let shards = bundle::on_demand(&settings.quant)?.shards;
+        let data_dir = settings.data_dir.as_ref().ok_or("a bundle read on demand needs --data-dir")?;
+        let mut files: Vec<PathBuf> = shards.iter().map(|asset| settings.model.join(&asset.name)).collect();
+        files.extend(shards.iter().map(|asset| bundle::tree_path(data_dir, asset)));
+        for tree in &files[shards.len()..] {
+            if !tree.is_file() {
+                return Err(format!("no verity tree {}: build the trees with `straydog verify -m {} --quant {} --data-dir {}`",
+                                   tree.display(), settings.model.display(), settings.quant, data_dir.display()));
+            }
+        }
+        return Ok(straydog_isolation::Exposure {
+            executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
+            files,
+            directories: vec![settings.model.clone(), data_dir.join("verity")],
+            working_directory: settings.model.clone(),
+            secrets: settings.api_key_file.iter().cloned().collect(),
+        });
+    }
     let pins = straydog_engine::bundle::bundle(&settings.quant)?;
     let mut files: Vec<PathBuf> =
         pins.shards.iter().chain(&pins.resources).map(|asset| settings.model.join(&asset.name)).collect();
@@ -189,6 +216,19 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
 /// How the model was placed: what decides its speed.
 pub fn ready_summary(ready: &Value) -> String {
     let placement = &ready["placement"];
+    if let Some(slots) = placement["expert_slots"].as_array() {
+        // Layers split across the GPUs, routed experts in VRAM slots and a host tier.
+        let gib = |value: &Value| value.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
+        let layers: Vec<String> = placement["layers"].as_array().into_iter().flatten()
+            .map(|range| format!("{}-{}", range[0], range[1].as_u64().unwrap_or(1).saturating_sub(1))).collect();
+        let slots: Vec<String> = slots.iter().map(|slots| slots.to_string()).collect();
+        return format!(
+            "Straydog ready: {} {}, context {}, layers {} with {} expert slots, {:.1} GiB host tier, prefill batch {}; {} using {:.1} of {:.1} GiB",
+            ready["model"].as_str().unwrap_or("-"), ready["quantization"].as_str().unwrap_or("-"), ready["context"],
+            layers.join(" | "), slots.join(" | "), gib(&placement["host_expert_bytes"]), placement["prefill_batch_size"],
+            ready["gpu"]["name"].as_str().unwrap_or("GPU"), gib(&ready["gpu"]["allocated_bytes"]), gib(&ready["gpu"]["budget_bytes"]),
+        );
+    }
     let residency = if placement["resident"] == true {
         "fully resident"
     } else if placement["partial"] == true {
@@ -703,7 +743,7 @@ impl Engine for Runtime {
                 speculative: ready["speculative_drafts"].as_u64().unwrap_or(0),
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
-                                  "gpu": ready["gpu"]}),
+                                  "gpu": ready["gpu"], "sampling": ready["sampling"]}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }

@@ -3,6 +3,7 @@
 //! n-gram Engram tables. The plan below follows the reference implementation's definitions.
 
 pub mod engine;
+pub mod serve;
 
 use super::Keys;
 use straydog_gguf::ModelHeader;

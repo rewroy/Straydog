@@ -28,14 +28,59 @@ use straydog_engine::bundle;
 pub type Progress<'a> = &'a (dyn Fn(&str, u64, u64) + Sync);
 
 /// Download (resuming) and authenticate every pinned file of `quantization` into `root`;
-/// with `offline`, only authenticate what is there.
-pub fn fetch(root: &Path, quantization: &str, offline: bool, progress: Progress) -> Result<(), String> {
+/// with `offline`, only authenticate what is there. A bundle read on demand then has its verity
+/// trees built into `data_dir`.
+pub fn fetch(root: &Path, quantization: &str, offline: bool, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
+    if bundle::is_on_demand(quantization) {
+        let data_dir = data_dir.ok_or("a bundle read on demand needs --data-dir for its verity trees")?;
+        let entries = assets::entries(quantization)?;
+        let agent = http::agent(assets::TIMEOUT);
+        // The trees authenticate the files present: they are not hashed twice.
+        assets::fetch_with(&agent, root, &entries, offline, false, progress).map_err(|error| error.to_string())?;
+        return build_trees(root, quantization, data_dir, progress).map_err(|error| error.to_string());
+    }
     fetch_assets(root, quantization, offline, true, progress)
 }
 
-/// Authenticate every pinned file of `quantization` in `root`.
-pub fn verify(root: &Path, quantization: &str, progress: Progress) -> Result<(), String> {
+/// Authenticate every pinned file of `quantization` in `root` (a bundle read on demand: by
+/// building its verity trees into `data_dir`).
+pub fn verify(root: &Path, quantization: &str, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
+    if bundle::is_on_demand(quantization) {
+        let data_dir = data_dir.ok_or("a bundle read on demand needs --data-dir for its verity trees")?;
+        return build_trees(root, quantization, data_dir, progress).map_err(|error| error.to_string());
+    }
     fetch_assets(root, quantization, true, true, progress)
+}
+
+/// The verity trees of an on-demand bundle's shards (straydog_engine::verity), built from the files
+/// into `data_dir/verity` and kept only when their digests are the pinned ones. That authenticates
+/// the files: every block hashes into the pinned root. The model directory is never written.
+fn build_trees(root: &Path, quantization: &str, data_dir: &Path, progress: Progress) -> io::Result<()> {
+    let pins = bundle::on_demand(quantization).map_err(invalid)?;
+    let directory = data_dir.join("verity");
+    fs::create_dir_all(&directory).map_err(at(&directory))?;
+    for (asset, digest) in pins.shards.iter().zip(&pins.verity) {
+        let path = root.join(&asset.name);
+        if fs::metadata(&path).map_err(at(&path))?.len() != asset.bytes {
+            return Err(invalid(format!("size mismatch: {}", asset.name)));
+        }
+        let file = fs::File::open(&path).map_err(at(&path))?;
+        let tree = bundle::tree_path(data_dir, asset);
+        let partial = partial_path(&tree);
+        let label = format!("building the verity tree of {}", asset.name);
+        let done = AtomicU64::new(0);
+        progress(&label, 0, asset.bytes);
+        let count = |bytes: u64| progress(&label, done.fetch_add(bytes, Ordering::Relaxed) + bytes, asset.bytes);
+        let built = straydog_engine::verity::build(&file, &partial, &count).map_err(at(&path))?;
+        let built: String = built.iter().map(|byte| format!("{byte:02x}")).collect();
+        if built != *digest {
+            fs::remove_file(&partial).map_err(at(&partial))?;
+            return Err(invalid(format!("verity digest mismatch: {}", asset.name)));
+        }
+        fs::rename(&partial, &tree).map_err(at(&tree))?;
+        println!("verified {}", asset.name);
+    }
+    Ok(())
 }
 
 /// [`fetch`], where files already present are authenticated only when `authenticate_existing`:
