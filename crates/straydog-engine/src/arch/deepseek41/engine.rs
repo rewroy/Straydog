@@ -158,7 +158,7 @@ type Users = (Vec<i32>, Vec<f32>);
 type Routed = (usize, Users);
 
 /// Experts acquired at a time by a pass of many rows (each wave's reads overlap the one before's
-/// compute).
+/// compute), fewer when a size of experts has few slots (DeviceExperts::wave_limit).
 const WAVE: usize = 32;
 /// Experts of the next layer prefetched from its router applied to this layer's input (decode):
 /// the 8 best hold 79% of the 6 it takes.
@@ -864,7 +864,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let scratch = shard.scratch;
         // In waves: the next wave's experts load while this one's compute.
         let by_expert: Vec<Routed> = by_expert.into_iter().collect();
-        let waves: Vec<&[Routed]> = by_expert.chunks(WAVE).collect();
+        let waves: Vec<&[Routed]> = by_expert.chunks(WAVE.min(shard.experts.wave_limit())).collect();
         for (index, wave) in waves.iter().enumerate() {
             let experts: Vec<usize> = wave.iter().map(|(expert, _)| *expert).collect();
             let slots = shard.experts.acquire(&mut shard.gpu, layer, &experts)?;
@@ -955,7 +955,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().map(|expert| expert as usize).collect();
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
             .into_iter().collect();
-        let waves: Vec<&[usize]> = experts.chunks(WAVE).collect();
+        let wave = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
+        let waves: Vec<&[usize]> = experts.chunks(wave).collect();
         if let Some(first) = waves.first() {
             for shard in &mut self.shards {
                 shard.experts.request(&mut shard.gpu, layer, first)?;

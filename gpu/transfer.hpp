@@ -1,5 +1,5 @@
 // Asynchronous copies beside compute (docs/DESIGN.md §10): between page-locked host memory and
-// device allocations, on two streams of the device's own (uploads, and downloads on the other
+// device allocations, on streams of the device's own (uploads, later uploads, and downloads on the other
 // copy direction), ordered against its compute stream by numbered events. A caller fills weights
 // it will need soon (experts of a later layer) while the current layer computes, and makes the
 // compute stream wait only where it uses them. Included in the GPU TU.
@@ -27,8 +27,8 @@ void check_registered(const void* host, size_t bytes, bool write) {
 // every earlier one of its stream). Ids grow from 1 across both streams; an id no longer
 // pending has completed.
 struct Transfers {
-    hipStream_t streams[2] = {nullptr, nullptr};   // uploads, downloads
-    std::deque<std::pair<int64_t, hipEvent_t>> pending[3];   // per stream: compute, upload, download
+    hipStream_t streams[3] = {nullptr, nullptr, nullptr};   // uploads, downloads, later uploads
+    std::deque<std::pair<int64_t, hipEvent_t>> pending[4];   // per stream: compute, upload, download, later upload
     std::vector<hipEvent_t> spare;
     int64_t next = 1;
     uint64_t copies[2] = {0, 0}, bytes[2] = {0, 0};
@@ -72,6 +72,6 @@ Transfers& transfers(Device& d) {
 
 // Stream 0 computes, 1 uploads, 2 downloads.
 hipStream_t transfer_stream_of(Device& d, int which) {
-    if (which < 0 || which > 2) throw std::runtime_error("Straydog transfer: no such stream");
+    if (which < 0 || which > 3) throw std::runtime_error("Straydog transfer: no such stream");
     return which == 0 ? d.stream : transfers(d).streams[which - 1];
 }

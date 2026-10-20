@@ -48,11 +48,12 @@ void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
 /* Asynchronous copies: page-locked host memory (sd_host_register, or sd_host_pin where devices
  * also write it) to and from allocations, beside the device's compute stream (stream 0): uploads
- * on stream 1, downloads on stream 2. sd_event_record marks the work queued so far on a stream and
- * returns the mark's id (ids grow from 1); sd_event_wait makes a stream wait for a mark on the GPU;
- * sd_event_done answers 1 once it completed (block: wait for it), after which the copies before it
- * are done with their memory. A copy into memory another stream still reads must wait for a mark
- * after that use. Counts: uploads, their bytes, downloads, their bytes. */
+ * on stream 1 (and stream 3, a second upload queue for copies that may wait), downloads on
+ * stream 2. sd_event_record marks the work queued so far on a stream and returns the mark's id
+ * (ids grow from 1); sd_event_wait makes a stream wait for a mark on the GPU; sd_event_done
+ * answers 1 once it completed (block: wait for it), after which the copies before it are done
+ * with their memory. A copy into memory another stream still reads must wait for a mark after
+ * that use. Counts: uploads (both queues), their bytes, downloads, their bytes. */
 int sd_host_pin(void* pointer, uint64_t bytes);
 int sd_transfer(void* handle, int stream, void* pointer, uint64_t offset, void* host, uint64_t bytes);
 int64_t sd_event_record(void* handle, int stream);

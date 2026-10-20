@@ -9,12 +9,14 @@ use straydog_gpu::ffi;
 use crate::gpu::{Backend, Result};
 use crate::ops::Buffer;
 
-/// A device stream: compute (where ops run), uploads or downloads.
+/// A device stream: compute (where ops run), uploads, downloads, or later uploads (a second
+/// upload queue, so copies that can wait do not hold up those a pass waits for).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Compute = 0,
     Upload = 1,
     Download = 2,
+    LaterUpload = 3,
 }
 
 /// A point in a stream's queue (ids grow from 1 across a device's streams).
@@ -42,8 +44,8 @@ pub unsafe fn unpin_host(pointer: *mut u8) -> Result<()> {
 }
 
 impl Backend {
-    /// Queue a copy of `bytes` page-locked bytes at `host` into `target` at `offset` (uploads),
-    /// or out of it into `host` (downloads).
+    /// Queue a copy of `bytes` page-locked bytes at `host` into `target` at `offset` (either
+    /// upload stream), or out of it into `host` (downloads).
     ///
     /// # Safety
     /// `host` stays allocated, and unchanged by anything else, until a mark of that stream

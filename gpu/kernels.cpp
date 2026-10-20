@@ -1381,15 +1381,16 @@ int sd_host_unregister(void* pointer) {
 int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host,uint64_t bytes) {
     try {
         auto& d=device(handle);
-        if (!host || !bytes || offset>UINT64_MAX-bytes || (stream!=1 && stream!=2))
+        if (!host || !bytes || offset>UINT64_MAX-bytes || stream<1 || stream>3)
             throw std::runtime_error("invalid Straydog transfer");
         auto* at=static_cast<uint8_t*>(pointer)+offset;
         op_span(d,at,size_t(bytes),"a transferred range");
         check_registered(host,size_t(bytes),stream==2);
         auto& t=transfers(d);
-        if (stream==1) check(hipMemcpyAsync(at,host,size_t(bytes),hipMemcpyHostToDevice,t.streams[0]));
-        else check(hipMemcpyAsync(host,at,size_t(bytes),hipMemcpyDeviceToHost,t.streams[1]));
-        ++t.copies[stream-1]; t.bytes[stream-1]+=bytes;
+        if (stream==2) check(hipMemcpyAsync(host,at,size_t(bytes),hipMemcpyDeviceToHost,t.streams[1]));
+        else check(hipMemcpyAsync(at,host,size_t(bytes),hipMemcpyHostToDevice,t.streams[stream==1?0:2]));
+        const int kind=stream==2?1:0;   // counts: uploads (both upload streams), downloads
+        ++t.copies[kind]; t.bytes[kind]+=bytes;
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }

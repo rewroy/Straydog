@@ -14,7 +14,7 @@
 //! Drive reads are whole aligned 4 KiB blocks: the unit a Merkle tree over the file (fs-verity's
 //! format) hashes, so a verifier checks each block between its read and its first use.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -79,15 +79,6 @@ impl Layout {
     /// An expert's bytes in a VRAM slot: its roles one after another.
     pub fn slot_bytes(&self) -> u64 {
         self.layers.iter().flatten().map(|roles| roles.iter().map(|role| role.bytes).sum()).max().unwrap_or(0)
-    }
-
-    /// An expert's bytes in a host slot: room for either of its layouts there (read: each role's
-    /// whole blocks; written back: the VRAM slot's).
-    fn host_bytes(&self) -> u64 {
-        self.layers.iter().flatten().map(|roles| {
-            let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
-            read.max(roles.iter().map(|role| role.bytes).sum())
-        }).max().unwrap_or(0).next_multiple_of(ALIGN as u64)
     }
 
     /// Where each role's bytes lie in a host slot filled by drive reads.
@@ -166,10 +157,15 @@ impl Reader {
                         state = queue.1.wait(state).unwrap();
                     }
                 };
+                // A read that panics (a verifier's bug) fails that read; the thread lives on and the
+                // pass waiting for it gets an error instead of waiting forever.
                 let landed = if job.cancelled.load(Ordering::Relaxed) {
                     Landed::Skipped
                 } else {
-                    run_read(&job).map_or_else(Landed::Failed, |()| Landed::Read)
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read(&job))) {
+                        Ok(result) => result.map_or_else(Landed::Failed, |()| Landed::Read),
+                        Err(_) => Landed::Failed(format!("the read at {} panicked", job.offset)),
+                    }
                 };
                 let _ = job.done.send((job.slot, landed));
             })
@@ -294,12 +290,18 @@ struct HostSlot {
     cancel: Arc<AtomicBool>,
     /// A chunk was skipped: the slot holds no expert once its reads land.
     skipped: bool,
+    /// The VRAM slot that uploads this slot's expert once its reads land.
+    waiter: Option<usize>,
+    class: usize,
+    /// Its arena in the class, and its offset there.
+    arena: usize,
+    at: usize,
 }
 
 struct VramSlot {
     key: Option<Key>,
-    /// The upload mark after this slot's fill, until known complete.
-    ready: Option<Mark>,
+    /// The upload (and its stream) after this slot's fill, until known complete.
+    ready: Option<(Stream, Mark)>,
     /// Marks the slot's bytes must outlive: its last compute use, and a download from it.
     guards: [Option<Mark>; 2],
     /// A fill waiting for the drive: the host slot whose reads it uploads once they land.
@@ -307,6 +309,36 @@ struct VramSlot {
     used: u64,
     /// Filled by a prefetch and not yet acquired.
     speculative: bool,
+    /// Acquired or requested since the last release: not evicted before it.
+    held: bool,
+    class: usize,
+}
+
+/// The experts of one size (the layers whose experts take the same bytes): its VRAM slots and
+/// host slots, each with a free list and an LRU order. A layer's share of the budgets is the same
+/// for every layer (each takes the same number of routes per token), so a class's share is its
+/// layers' count; a slot is just its experts' size, not the largest layer's (on DeepSeek-V4.1,
+/// whose experts take 7.6 to 12.1 MB, that holds ~15% fewer drive reads per token).
+struct Class {
+    vram_bytes: u64,
+    host_bytes: u64,
+    vram: Buffer,
+    first: usize,
+    count: usize,
+    free: Vec<usize>,
+    /// Slots holding an expert, by last use.
+    lru: BTreeSet<(u64, usize)>,
+    /// Free slots kept ahead of need, their experts written back meanwhile.
+    reserve: usize,
+    host_capacity: usize,
+    per_arena: usize,
+    arenas: Vec<storage::Buffer>,
+    pinner: Option<Pinner>,
+    hosts: usize,
+    /// Emptied host slots, oldest first (their uploads finish in that order).
+    host_free: VecDeque<usize>,
+    /// Host slots holding an expert (read or written back), by last use.
+    host_lru: BTreeSet<(u64, usize)>,
 }
 
 /// Counters since creation.
@@ -353,15 +385,11 @@ impl std::ops::Add for Counts {
 pub struct DeviceExperts {
     layout: Arc<Layout>,
     reader: Arc<Reader>,
-    vram: Buffer,
-    vram_slot_bytes: u64,
+    classes: Vec<Class>,
+    /// Per layer: its class.
+    class_of: Vec<Option<usize>>,
     slots: Vec<VramSlot>,
     map: HashMap<Key, usize>,
-    host_slot_bytes: u64,
-    host_capacity: usize,
-    per_arena: usize,
-    arenas: Vec<storage::Buffer>,
-    pinner: Option<Pinner>,
     host: Vec<HostSlot>,
     host_map: HashMap<Key, usize>,
     done_tx: Sender<(usize, Landed)>,
@@ -371,33 +399,61 @@ pub struct DeviceExperts {
     in_use: Vec<usize>,
     /// Experts [`request`](Self::request)ed for the next acquire: already counted.
     requested: Vec<Key>,
-    /// Free VRAM slots kept ahead of need, their experts written back meanwhile.
-    reserve: usize,
+    /// Per layer: slots a prefetch filled and no acquire of that layer has taken yet.
+    speculative: HashMap<u32, Vec<usize>>,
+    /// Host slots with reads in flight.
+    reading: usize,
     counts: Counts,
     settled: bool,
 }
 
 impl DeviceExperts {
-    /// `slots` VRAM slots on this device and `host_budget` bytes of host tier.
+    /// VRAM worth `slots` of the largest experts on this device, and `host_budget` bytes of host
+    /// tier, both shared among the layers.
     pub fn new(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, slots: usize, host_budget: u64)
                -> Result<DeviceExperts> {
-        let vram_slot_bytes = layout.slot_bytes().next_multiple_of(256);
-        if slots < 16 || vram_slot_bytes == 0 {
+        // Each layer's experts' bytes in a VRAM slot (roles back to back) and in a host slot
+        // (room for either layout there: each role's whole blocks as read, or the VRAM slot's).
+        let sizes: Vec<Option<(u64, u64)>> = layout.layers.iter().map(|roles| roles.as_ref().map(|roles| {
+            let vram: u64 = roles.iter().map(|role| role.bytes).sum();
+            let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
+            (vram.next_multiple_of(256), read.max(vram).next_multiple_of(ALIGN as u64))
+        })).collect();
+        let largest = sizes.iter().flatten().map(|size| size.0).max().unwrap_or(0);
+        if slots < 16 || largest == 0 {
             return Err("an expert store needs at least 16 VRAM slots and a layer of experts".into());
         }
-        let vram = gpu.buffer(vram_slot_bytes * slots as u64)?;
-        let host_slot_bytes = layout.host_bytes();
-        let host_capacity = (host_budget / host_slot_bytes) as usize;
-        let reserve = (slots / 64).clamp(4, 32);
-        // Small tiers (and staging alone) take one arena of just their size.
-        let per_arena = ((ARENA as u64 / host_slot_bytes) as usize).clamp(1, host_capacity.max(reserve));
+        let mut distinct: Vec<(u64, u64)> = sizes.iter().flatten().copied().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let class_of: Vec<Option<usize>> = sizes.iter()
+            .map(|size| size.map(|size| distinct.iter().position(|&other| other == size).unwrap())).collect();
+        let layers = class_of.iter().flatten().count() as u64;
+        let vram_budget = largest * slots as u64;
+        let mut classes = Vec::new();
+        let mut all_slots = Vec::new();
+        for (index, &(vram_bytes, host_bytes)) in distinct.iter().enumerate() {
+            let share = class_of.iter().filter(|class| **class == Some(index)).count() as u64;
+            let count = ((vram_budget * share / layers) / vram_bytes).max(16) as usize;
+            let host_capacity = ((host_budget * share / layers) / host_bytes) as usize;
+            let reserve = (count / 64).clamp(4, 32);
+            // Small tiers (and staging alone) take one arena of just their size.
+            let per_arena = ((ARENA as u64 / host_bytes) as usize).clamp(1, host_capacity.max(reserve));
+            let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_bytes as usize);
+            let first = all_slots.len();
+            all_slots.extend((0..count).map(|_| VramSlot {
+                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
+            }));
+            classes.push(Class {
+                vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).rev().collect(),
+                lru: BTreeSet::new(), reserve, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), hosts: 0,
+                host_free: VecDeque::new(), host_lru: BTreeSet::new(),
+            });
+        }
         let (done_tx, done_rx) = channel();
-        let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_slot_bytes as usize);
         Ok(DeviceExperts {
-            layout, reader, vram, vram_slot_bytes,
-            slots: (0..slots).map(|_| VramSlot { key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false }).collect(),
-            map: HashMap::new(), host_slot_bytes, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), host: Vec::new(),
-            host_map: HashMap::new(), done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), reserve,
+            layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
+            done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false,
         })
     }
@@ -406,9 +462,15 @@ impl DeviceExperts {
         self.counts
     }
 
+    /// The most experts of one layer a pass should acquire at a time: half of the smallest
+    /// class's slots beyond its reserve, so the next wave's prefetch fits beside it.
+    pub fn wave_limit(&self) -> usize {
+        self.classes.iter().map(|class| class.count.saturating_sub(class.reserve) / 2).min().unwrap_or(0).max(1)
+    }
+
     /// VRAM and host slots.
     pub fn capacity(&self) -> (usize, usize) {
-        (self.slots.len(), self.host_capacity)
+        (self.slots.len(), self.classes.iter().map(|class| class.host_capacity).sum())
     }
 
     /// Make these experts of `layer` resident here; the compute stream waits for their copies.
@@ -419,7 +481,9 @@ impl DeviceExperts {
         let held = self.in_use.len();
         let result = self.acquire_slots(gpu, layer, experts);
         if result.is_err() {
-            self.in_use.truncate(held);
+            for slot in self.in_use.split_off(held) {
+                self.slots[slot].held = false;
+            }
         }
         self.counts.store_seconds += started.elapsed().as_secs_f64();
         result
@@ -438,7 +502,7 @@ impl DeviceExperts {
                 let key = (layer as u32, expert as u32);
                 if let Some(&slot) = self.map.get(&key) {
                     self.counts.hits += 1;
-                    self.in_use.push(slot);
+                    self.hold(slot);
                     self.requested.push(key);
                 }
             }
@@ -446,7 +510,7 @@ impl DeviceExperts {
                 let key = (layer as u32, expert as u32);
                 if !self.map.contains_key(&key) {
                     let slot = self.fill(gpu, key, true)?;
-                    self.in_use.push(slot);
+                    self.hold(slot);
                     self.requested.push(key);
                 }
             }
@@ -488,11 +552,12 @@ impl DeviceExperts {
         // drive's time goes to what passes need. Those that landed keep their recency: demoting
         // them to the eviction end sent ~25% more experts back through the host tier, since a
         // later token's route often takes them.
-        for slot in &mut self.slots {
-            if slot.speculative && slot.key.is_some_and(|key| key.0 == layer as u32) {
-                slot.speculative = false;
+        for slot in self.speculative.remove(&(layer as u32)).unwrap_or_default() {
+            let entry = &mut self.slots[slot];
+            if entry.speculative && entry.key.is_some_and(|key| key.0 == layer as u32) {
+                entry.speculative = false;
                 self.counts.prefetch_unused += 1;
-                if let Some(host) = slot.waiting {
+                if let Some(host) = entry.waiting {
                     self.host[host].cancel.store(true, Ordering::Relaxed);
                 }
             }
@@ -506,30 +571,39 @@ impl DeviceExperts {
                 return Err(format!("expert {expert} of layer {layer} was not filled"));
             }
         }
-        // The upload stream runs in order: its newest mark among these slots covers them all.
-        let newest = slots.iter().filter_map(|&slot| self.slots[slot].ready).max();
-        if let Some(mark) = newest {
+        // Each upload stream runs in order: its newest mark among these slots covers its others.
+        for stream in [Stream::Upload, Stream::LaterUpload] {
+            let newest = slots.iter().filter_map(|&slot| self.slots[slot].ready.filter(|ready| ready.0 == stream)).map(|ready| ready.1).max();
+            let Some(mark) = newest else { continue };
             if gpu.mark_done(mark, false)? {
                 for &slot in &slots {
-                    self.slots[slot].ready = self.slots[slot].ready.filter(|&ready| ready > mark);
+                    let ready = &mut self.slots[slot].ready;
+                    *ready = ready.filter(|&(other, at)| other != stream || at > mark);
                 }
             } else {
                 gpu.wait_mark(Stream::Compute, mark)?;
             }
         }
-        Ok(slots.iter().map(|&slot| self.vram.slice(slot as u64 * self.vram_slot_bytes, self.vram_slot_bytes)).collect())
+        Ok(slots.iter().map(|&slot| self.slot_buffer(slot)).collect())
     }
 
     /// Start bringing these experts of `layer` in without waiting: from the host tier at once,
     /// and with `drive`, from the drive as reads land. A wrong guess costs a slot and bus time
-    /// (and drive time: the scarcest), never a result.
+    /// (and drive time: the scarcest), never a result. Its uploads queue apart from those a pass
+    /// waits for.
     pub fn prefetch(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool) -> Result<()> {
         self.settled = false;
+        let class = self.class_of.get(layer).copied().flatten().ok_or_else(|| format!("layer {layer} has no routed experts"))?;
         for &expert in experts {
             let key = (layer as u32, expert as u32);
             if !self.map.contains_key(&key) && (drive || self.host_map.contains_key(&key)) {
+                // A guess never takes a slot a pass holds or waits for: with none left, stop.
+                if self.classes[class].free.is_empty() && self.victim(class).is_err() {
+                    break;
+                }
                 let slot = self.fill(gpu, key, false)?;
                 self.slots[slot].speculative = true;
+                self.speculative.entry(layer as u32).or_default().push(slot);
                 self.counts.prefetched += 1;
             }
         }
@@ -545,83 +619,122 @@ impl DeviceExperts {
         let mark = gpu.mark(Stream::Compute)?;
         for slot in std::mem::take(&mut self.in_use) {
             self.slots[slot].guards[0] = Some(mark);
+            self.slots[slot].held = false;
         }
         self.keep_free(gpu)
     }
 
-    /// Keep `slot` until the next release, as just used.
-    fn hold(&mut self, slot: usize) {
+    fn slot_buffer(&self, slot: usize) -> Buffer {
+        let class = &self.classes[self.slots[slot].class];
+        class.vram.slice((slot - class.first) as u64 * class.vram_bytes, class.vram_bytes)
+    }
+
+    /// Mark `slot` just used (its place in the LRU order).
+    fn touch(&mut self, slot: usize) {
         self.clock += 1;
         let entry = &mut self.slots[slot];
+        let lru = &mut self.classes[entry.class].lru;
+        if entry.key.is_some() {
+            lru.remove(&(entry.used, slot));
+            lru.insert((self.clock, slot));
+        }
         entry.used = self.clock;
+    }
+
+    /// Keep `slot` until the next release, as just used.
+    fn hold(&mut self, slot: usize) {
+        self.touch(slot);
+        let entry = &mut self.slots[slot];
         entry.speculative = false;
+        entry.held = true;
         self.in_use.push(slot);
+    }
+
+    /// Give VRAM slot `slot` (holding `key`) up: out of the map and the LRU order, onto the free list.
+    fn empty_slot(&mut self, slot: usize) -> Option<Key> {
+        let entry = &mut self.slots[slot];
+        let key = entry.key.take()?;
+        entry.speculative = false;
+        let class = &mut self.classes[entry.class];
+        class.lru.remove(&(entry.used, slot));
+        class.free.push(slot);
+        self.map.remove(&key);
+        Some(key)
     }
 
     /// A VRAM slot for `key`, its fill queued (uploaded now, or once its drive reads land).
     fn fill(&mut self, gpu: &mut Backend, key: Key, urgent: bool) -> Result<usize> {
-        let slot = self.free_slot(gpu)?;
+        let class = self.class_of.get(key.0 as usize).copied().flatten().ok_or_else(|| format!("layer {} has no routed experts", key.0))?;
+        let slot = self.free_slot(gpu, class)?;
         self.map.insert(key, slot);
         self.slots[slot].key = Some(key);
-        self.clock += 1;
-        self.slots[slot].used = self.clock;
+        self.classes[class].lru.insert((self.slots[slot].used, slot));
+        self.touch(slot);
+        let stream = if urgent { Stream::Upload } else { Stream::LaterUpload };
         let filled = match self.host_map.get(&key).copied() {
             Some(host) if !matches!(self.host[host].content, Content::Reading(_)) => {
                 self.counts.host_hits += 1;
-                self.upload(gpu, slot, host).inspect_err(|_| self.discard(host, Some(slot)))
+                self.upload(gpu, slot, host, stream).inspect_err(|_| self.discard(host, Some(slot)))
             }
             Some(host) => {
                 self.slots[slot].waiting = Some(host);
+                self.host[host].waiter = Some(slot);
                 Ok(())
             }
             None => {
                 self.counts.drive_reads += 1;
-                self.read(gpu, key, urgent).map(|host| self.slots[slot].waiting = Some(host))
+                self.read(gpu, key, urgent).map(|host| {
+                    self.slots[slot].waiting = Some(host);
+                    self.host[host].waiter = Some(slot);
+                })
             }
         };
         if filled.is_err() && self.slots[slot].key == Some(key) {
-            self.slots[slot].key = None;
-            self.map.remove(&key);
+            self.empty_slot(slot);
         }
         filled.map(|()| slot)
     }
 
-    /// Upload host slot `host` into VRAM slot `slot`; the host tier gives the expert up.
-    fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize) -> Result<()> {
+    /// Upload host slot `host` into VRAM slot `slot` on `stream`; the host tier gives the expert up.
+    fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<()> {
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
         if let Some(error) = &self.host[host].failed {
             return Err(error.clone());
         }
         // The slot's previous expert: its last compute use and any download from it come first.
         for guard in std::mem::take(&mut self.slots[slot].guards).into_iter().flatten() {
-            gpu.wait_mark(Stream::Upload, guard)?;
+            gpu.wait_mark(stream, guard)?;
         }
         let base = self.host_pointer(host);
-        let target = self.vram.slice(slot as u64 * self.vram_slot_bytes, self.vram_slot_bytes);
+        let target = self.slot_buffer(slot);
         match self.host[host].content {
             Content::Read => {
                 let mut at = 0;
                 for span in self.layout.read_plan(layer as usize, expert as usize)? {
                     // SAFETY: the host slot holds this expert until the mark below completes (busy).
-                    unsafe { gpu.transfer(Stream::Upload, &target, at, base.add(span.data as usize), span.bytes)? };
+                    unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), span.bytes)? };
                     at += span.bytes;
                 }
             }
             Content::Packed(written) => {
-                gpu.wait_mark(Stream::Upload, written)?;
+                gpu.wait_mark(stream, written)?;
                 let bytes: u64 = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).sum();
                 // SAFETY: as above.
-                unsafe { gpu.transfer(Stream::Upload, &target, 0, base, bytes)? };
+                unsafe { gpu.transfer(stream, &target, 0, base, bytes)? };
             }
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
-        let mark = gpu.mark(Stream::Upload)?;
-        self.slots[slot].ready = Some(mark);
+        let mark = gpu.mark(stream)?;
+        self.slots[slot].ready = Some((stream, mark));
         self.slots[slot].waiting = None;
         let entry = &mut self.host[host];
         entry.busy = Some(mark);
+        entry.waiter = None;
         if let Some(key) = entry.key.take() {
             self.host_map.remove(&key);
+            let class = &mut self.classes[entry.class];
+            class.host_lru.remove(&(entry.used, host));
+            class.host_free.push_back(host);
         }
         Ok(())
     }
@@ -629,7 +742,8 @@ impl DeviceExperts {
     /// Start reading `key` from the drive into a host slot (a staging slot when the host tier
     /// holds nothing).
     fn read(&mut self, gpu: &mut Backend, key: Key, urgent: bool) -> Result<usize> {
-        let host = self.free_host(gpu)?;
+        let class = self.class_of[key.0 as usize].ok_or("a read for a layer without routed experts")?;
+        let host = self.free_host(gpu, class)?;
         let plan = self.layout.read_plan(key.0 as usize, key.1 as usize)?;
         let base = self.host_pointer(host);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -641,7 +755,7 @@ impl DeviceExperts {
                 let piece = CHUNK.min(span.len - done);
                 jobs.push(ReadJob {
                     file: handle.clone(), offset: span.offset + done, len: piece,
-                    // SAFETY: inside the host slot (host_bytes covers every role's whole blocks).
+                    // SAFETY: inside the host slot (its class's host_bytes covers every role's whole blocks).
                     target: HostPointer(unsafe { base.add((span.at + done) as usize) }),
                     verifier: self.layout.verifier.clone().map(|verify| (verify, span.file)),
                     done: self.done_tx.clone(), slot: host, cancelled: cancel.clone(),
@@ -654,6 +768,7 @@ impl DeviceExperts {
         entry.content = Content::Reading(jobs.len() as u32);
         entry.cancel = cancel;
         entry.skipped = false;
+        self.reading += 1;
         self.host_map.insert(key, host);
         self.reader.submit(jobs, urgent);
         Ok(host)
@@ -668,7 +783,7 @@ impl DeviceExperts {
     fn pump(&mut self, gpu: &mut Backend, block: bool) -> Result<()> {
         let mut landed = Vec::new();
         if block {
-            if !self.host.iter().any(|slot| matches!(slot.content, Content::Reading(_))) {
+            if self.reading == 0 {
                 return Err("a wait for expert reads with none in flight".into());
             }
             let started = std::time::Instant::now();
@@ -692,7 +807,8 @@ impl DeviceExperts {
             if left > 1 {
                 continue;
             }
-            let waiting = self.slots.iter().position(|slot| slot.waiting == Some(host));
+            self.reading -= 1;
+            let waiting = entry.waiter;
             if std::mem::take(&mut self.host[host].skipped) {
                 // A cancelled prefetch: its slots are free again, nothing failed.
                 self.host[host].failed = None;
@@ -704,10 +820,20 @@ impl DeviceExperts {
                 first_error.get_or_insert(error);
                 continue;
             }
-            if let Some(slot) = waiting {
-                if let Err(error) = self.upload(gpu, slot, host) {
-                    self.discard(host, Some(slot));
-                    first_error.get_or_insert(error);
+            match waiting {
+                Some(slot) => {
+                    let stream = if self.slots[slot].speculative { Stream::LaterUpload } else { Stream::Upload };
+                    if let Err(error) = self.upload(gpu, slot, host, stream) {
+                        self.discard(host, Some(slot));
+                        first_error.get_or_insert(error);
+                    }
+                }
+                None => {
+                    // Read for nothing that still waits: the host tier keeps it.
+                    let entry = &mut self.host[host];
+                    self.clock += 1;
+                    entry.used = self.clock;
+                    self.classes[entry.class].host_lru.insert((entry.used, host));
                 }
             }
         }
@@ -716,108 +842,110 @@ impl DeviceExperts {
 
     /// Drop an expert whose fill failed from host slot `host` and VRAM slot `slot`.
     fn discard(&mut self, host: usize, slot: Option<usize>) {
-        if let Some(key) = self.host[host].key.take() {
+        let entry = &mut self.host[host];
+        entry.waiter = None;
+        if let Some(key) = entry.key.take() {
             self.host_map.remove(&key);
+            let class = &mut self.classes[entry.class];
+            class.host_lru.remove(&(entry.used, host));
+            class.host_free.push_back(host);
         }
         if let Some(slot) = slot {
             let entry = &mut self.slots[slot];
             entry.waiting = None;
             entry.ready = None;
-            entry.speculative = false;
-            if let Some(key) = entry.key.take() {
-                self.map.remove(&key);
-            }
+            self.empty_slot(slot);
         }
     }
 
-    /// A free VRAM slot: one already free, else the least recently used outside the current pass.
-    fn free_slot(&mut self, gpu: &mut Backend) -> Result<usize> {
-        if let Some(slot) = self.slots.iter().position(|slot| slot.key.is_none()) {
-            return Ok(slot);
-        }
-        let victim = self.victim()?;
-        self.evict(gpu, victim)?;
-        Ok(victim)
-    }
-
-    fn victim(&self) -> Result<usize> {
-        (0..self.slots.len())
-            .filter(|&slot| self.slots[slot].waiting.is_none() && !self.in_use.contains(&slot))
-            .min_by_key(|&slot| self.slots[slot].used)
-            .ok_or_else(|| "every expert slot is in use by this pass".into())
-    }
-
-    /// Keep `reserve` VRAM slots free, writing their experts back to the host tier, so a miss
-    /// never waits for a write-back before its upload.
-    fn keep_free(&mut self, gpu: &mut Backend) -> Result<()> {
-        let free = self.slots.iter().filter(|slot| slot.key.is_none()).count();
-        for _ in free..self.reserve {
-            let victim = self.victim()?;
+    /// A free VRAM slot of `class`: one already free, else the least recently used one no pass
+    /// holds (written back to the host tier).
+    fn free_slot(&mut self, gpu: &mut Backend, class: usize) -> Result<usize> {
+        if self.classes[class].free.is_empty() {
+            let victim = self.victim(class)?;
             self.evict(gpu, victim)?;
+        }
+        self.classes[class].free.pop().ok_or_else(|| "no free expert slot after an eviction".into())
+    }
+
+    fn victim(&self, class: usize) -> Result<usize> {
+        self.classes[class].lru.iter().map(|&(_, slot)| slot)
+            .find(|&slot| self.slots[slot].waiting.is_none() && !self.slots[slot].held)
+            .ok_or_else(|| "every expert slot of a size is in use by this pass".into())
+    }
+
+    /// Keep each class's `reserve` VRAM slots free, writing their experts back to the host tier,
+    /// so a miss never waits for a write-back before its upload.
+    fn keep_free(&mut self, gpu: &mut Backend) -> Result<()> {
+        for class in 0..self.classes.len() {
+            while self.classes[class].free.len() < self.classes[class].reserve {
+                let victim = self.victim(class)?;
+                self.evict(gpu, victim)?;
+            }
         }
         Ok(())
     }
 
-    /// Empty VRAM slot `slot`, writing its expert back to the host tier when that has room.
+    /// Empty VRAM slot `slot` (onto its class's free list), writing its expert back to the host
+    /// tier when that has room.
     fn evict(&mut self, gpu: &mut Backend, slot: usize) -> Result<()> {
-        let Some(key) = self.slots[slot].key.take() else { return Ok(()) };
-        self.map.remove(&key);
-        self.slots[slot].speculative = false;
-        if self.host_capacity == 0 || self.host_map.contains_key(&key) {
+        let Some(key) = self.empty_slot(slot) else { return Ok(()) };
+        let class = self.slots[slot].class;
+        if self.classes[class].host_capacity == 0 || self.host_map.contains_key(&key) {
             return Ok(());
         }
-        let host = self.free_host(gpu)?;
+        let host = self.free_host(gpu, class)?;
         let bytes: u64 = self.layout.roles(key.0 as usize)?.iter().map(|role| role.bytes).sum();
-        if let Some(ready) = self.slots[slot].ready.take() {
+        if let Some((_, ready)) = self.slots[slot].ready.take() {
             gpu.wait_mark(Stream::Download, ready)?;
         }
-        let source = self.vram.slice(slot as u64 * self.vram_slot_bytes, self.vram_slot_bytes);
+        let source = self.slot_buffer(slot);
         // SAFETY: the host slot is reserved for this expert; nothing reads it before the mark.
         unsafe { gpu.transfer(Stream::Download, &source, 0, self.host_pointer(host), bytes)? };
         let mark = gpu.mark(Stream::Download)?;
         self.slots[slot].guards[1] = Some(mark);
+        self.clock += 1;
         let entry = &mut self.host[host];
         entry.key = Some(key);
         entry.content = Content::Packed(mark);
-        self.clock += 1;
         entry.used = self.clock;
+        self.classes[class].host_lru.insert((self.clock, host));
         self.host_map.insert(key, host);
         self.counts.writebacks += 1;
         Ok(())
     }
 
-    /// A host slot to fill: a new one while the budget allows, else the least recently used
-    /// (after any copy still using it). With no host tier, staging slots grow as reads need.
-    fn free_host(&mut self, gpu: &mut Backend) -> Result<usize> {
-        let reading = |slot: &HostSlot| matches!(slot.content, Content::Reading(_));
-        for host in 0..self.host.len() {
-            let entry = &mut self.host[host];
-            if entry.key.is_none() && !reading(entry) {
-                match entry.busy {
-                    None => return Ok(host),
-                    Some(mark) if gpu.mark_done(mark, false)? => {
-                        entry.busy = None;
-                        return Ok(host);
-                    }
-                    Some(_) => {}
-                }
+    /// A host slot of `class` to fill: an emptied one whose upload finished, a new one while the
+    /// budget allows, else the least recently used expert's (after any copy still using it).
+    /// With no host tier, staging slots grow as reads need.
+    fn free_host(&mut self, gpu: &mut Backend, class: usize) -> Result<usize> {
+        // Emptied slots' uploads finish in order: the oldest is the one to check.
+        if let Some(&host) = self.classes[class].host_free.front() {
+            let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
+            let mut reusable = true;
+            for mark in copies.into_iter().flatten() {
+                reusable &= gpu.mark_done(mark, false)?;
+            }
+            if reusable {
+                self.classes[class].host_free.pop_front();
+                self.host[host].busy = None;
+                return Ok(host);
             }
         }
         // A new slot while pinned room lasts (or a pinned arena is ready).
-        if self.host.len() < self.arenas.len() * self.per_arena || self.take_arena(false)? {
-            return Ok(self.new_host_slot());
+        let room = self.classes[class].hosts < self.classes[class].arenas.len() * self.classes[class].per_arena;
+        if room || self.take_arena(class, false)? {
+            return Ok(self.new_host_slot(class));
         }
         // The least recently used expert's slot (its copies long done), before an emptied slot
         // whose upload is still running.
-        let waiting: Vec<usize> = self.slots.iter().filter_map(|slot| slot.waiting).collect();
-        let candidate = (0..self.host.len())
-            .filter(|&host| !reading(&self.host[host]) && !waiting.contains(&host))
-            .min_by_key(|&host| (self.host[host].key.is_none(), self.host[host].used));
+        let candidate = self.classes[class].host_lru.iter().map(|&(_, host)| host).next()
+            .or_else(|| self.classes[class].host_free.front().copied());
         let Some(host) = candidate else {
             // Every slot is being read into: wait for the next arena, or (all handed over) pin
             // one more for staging.
-            self.take_arena(true)?;
-            return Ok(self.new_host_slot());
+            self.take_arena(class, true)?;
+            return Ok(self.new_host_slot(class));
         };
         let started = std::time::Instant::now();
         if let Some(mark) = self.host[host].busy.take() {
@@ -827,17 +955,25 @@ impl DeviceExperts {
             gpu.mark_done(mark, true)?;
         }
         self.counts.slot_wait_seconds += started.elapsed().as_secs_f64();
-        if let Some(key) = self.host[host].key.take() {
-            self.host_map.remove(&key);
+        let entry = &mut self.host[host];
+        match entry.key.take() {
+            Some(key) => {
+                self.host_map.remove(&key);
+                self.classes[class].host_lru.remove(&(entry.used, host));
+            }
+            None => {
+                self.classes[class].host_free.pop_front();
+            }
         }
         Ok(host)
     }
 
-    /// Take the next pinned arena: if ready (or, with `wait`, once it is; when the pinner has
-    /// handed all over, a new one pinned here). Whether one was taken.
-    fn take_arena(&mut self, wait: bool) -> Result<bool> {
+    /// Take `class`'s next pinned arena: if ready (or, with `wait`, once it is; when its pinner
+    /// has handed all over, a new one pinned here). Whether one was taken.
+    fn take_arena(&mut self, class: usize, wait: bool) -> Result<bool> {
         let started = std::time::Instant::now();
-        let arena = match &self.pinner {
+        let entry = &mut self.classes[class];
+        let arena = match &entry.pinner {
             Some(pinner) if wait => pinner.arenas.recv().ok(),
             Some(pinner) => match pinner.arenas.try_recv() {
                 Ok(arena) => Some(arena),
@@ -849,29 +985,35 @@ impl DeviceExperts {
         let arena = match arena {
             Some(arena) => arena?,
             None if wait => {
-                let mut arena = storage::Buffer::new(self.per_arena * self.host_slot_bytes as usize);
-                // SAFETY: the arena lives in self.arenas until drop, which unpins it first.
+                let mut arena = storage::Buffer::new(entry.per_arena * entry.host_bytes as usize);
+                // SAFETY: the arena lives in its class until drop, which unpins it first.
                 unsafe { transfer::pin_host(arena.as_mut_slice().as_mut_ptr(), arena.capacity())? };
                 arena
             }
             None => return Ok(false),
         };
-        self.arenas.push(arena);
+        entry.arenas.push(arena);
         self.counts.pin_seconds += started.elapsed().as_secs_f64();
         Ok(true)
     }
 
-    fn new_host_slot(&mut self) -> usize {
-        self.host.push(HostSlot { key: None, content: Content::Read, busy: None, used: 0, failed: None,
-                                  cancel: Arc::new(AtomicBool::new(false)), skipped: false });
+    fn new_host_slot(&mut self, class: usize) -> usize {
+        let entry = &mut self.classes[class];
+        let (arena, at) = (entry.hosts / entry.per_arena, (entry.hosts % entry.per_arena) * entry.host_bytes as usize);
+        entry.hosts += 1;
+        self.host.push(HostSlot {
+            key: None, content: Content::Read, busy: None, used: 0, failed: None, cancel: Arc::new(AtomicBool::new(false)),
+            skipped: false, waiter: None, class, arena, at,
+        });
         self.host.len() - 1
     }
 
     fn host_pointer(&mut self, host: usize) -> *mut u8 {
-        let per_arena = self.per_arena;
-        let arena = &mut self.arenas[host / per_arena];
-        // SAFETY: slot (host % per_arena) lies inside its arena.
-        unsafe { arena.as_mut_slice().as_mut_ptr().add((host % per_arena) * self.host_slot_bytes as usize) }
+        let entry = &self.host[host];
+        let (arena, at) = (entry.arena, entry.at);
+        let arena = &mut self.classes[entry.class].arenas[arena];
+        // SAFETY: the slot lies inside its arena (at + host_bytes <= the arena's size).
+        unsafe { arena.as_mut_slice().as_mut_ptr().add(at) }
     }
 }
 
@@ -879,10 +1021,10 @@ impl DeviceExperts {
     /// Wait for every read and copy in flight; dropping the store frees its host memory only
     /// after this (else it leaks it, which a copy still in flight cannot then corrupt).
     pub fn settle(&mut self, gpu: &mut Backend) -> Result<()> {
-        while self.host.iter().any(|slot| matches!(slot.content, Content::Reading(_))) {
+        while self.reading > 0 {
             self.pump(gpu, true)?;
         }
-        for stream in [Stream::Upload, Stream::Download] {
+        for stream in [Stream::Upload, Stream::LaterUpload, Stream::Download] {
             let mark = gpu.mark(stream)?;
             gpu.mark_done(mark, true)?;
         }
@@ -901,27 +1043,29 @@ impl Drop for DeviceExperts {
         while reading > 0 && self.done_rx.recv().is_ok() {
             reading -= 1;
         }
-        // Stop the pinner and wait for it; the arenas it handed over but nobody took were never
-        // used by a device: unpin each before it is freed.
-        if let Some(mut pinner) = self.pinner.take() {
-            pinner.stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = pinner.thread.take() {
-                let _ = thread.join();
+        for class in &mut self.classes {
+            // Stop the pinner and wait for it; the arenas it handed over but nobody took were
+            // never used by a device: unpin each before it is freed.
+            if let Some(mut pinner) = class.pinner.take() {
+                pinner.stop.store(true, Ordering::Relaxed);
+                if let Some(thread) = pinner.thread.take() {
+                    let _ = thread.join();
+                }
+                while let Ok(Ok(mut arena)) = pinner.arenas.try_recv() {
+                    // SAFETY: pinned by the pinner, never used by a device.
+                    let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
+                }
             }
-            while let Ok(Ok(mut arena)) = pinner.arenas.try_recv() {
-                // SAFETY: pinned by the pinner, never used by a device.
+            if !self.settled {
+                for arena in std::mem::take(&mut class.arenas) {
+                    std::mem::forget(arena);
+                }
+                continue;
+            }
+            for arena in &mut class.arenas {
+                // SAFETY: pinned before use; settle saw every copy from it finish.
                 let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
             }
-        }
-        if !self.settled {
-            for arena in std::mem::take(&mut self.arenas) {
-                std::mem::forget(arena);
-            }
-            return;
-        }
-        for arena in &mut self.arenas {
-            // SAFETY: pinned before use; settle saw every copy from it finish.
-            let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
         }
     }
 }

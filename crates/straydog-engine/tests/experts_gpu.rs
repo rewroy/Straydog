@@ -26,16 +26,21 @@ const STRIDES: [u64; 3] = [70_001, 70_001, 50_003];
 
 /// Layers 0 and 2 have experts (layer 1 none), each role's tensor at an unaligned base.
 fn roles() -> Vec<Option<Vec<Role>>> {
+    sized_roles(STRIDES, STRIDES)
+}
+
+/// As [`roles`], layer 2's experts of other sizes (the store keeps a class of slots per size).
+fn sized_roles(first: [u64; 3], third: [u64; 3]) -> Vec<Option<Vec<Role>>> {
     let mut base = 1234u64;
-    let mut layer = || {
-        Some(STRIDES.iter().map(|&stride| {
+    let mut layer = |strides: [u64; 3]| {
+        Some(strides.iter().map(|&stride| {
             let role = Role { file: 0, base, stride, bytes: stride };
             base += stride * EXPERTS as u64 + 777;
             role
         }).collect::<Vec<_>>())
     };
-    let first = layer();
-    let third = layer();
+    let first = layer(first);
+    let third = layer(third);
     vec![first, None, third]
 }
 
@@ -57,9 +62,12 @@ impl Random {
 }
 
 fn run(host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
-    let layers = roles();
+    run_with(roles(), host_budget_slots, steps)
+}
+
+fn run_with(layers: Vec<Option<Vec<Role>>>, host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
     let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
-    let path = std::env::temp_dir().join(format!("straydog-experts-{}-{host_budget_slots}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-{host_budget_slots}-{end}", std::process::id()));
     {
         let mut file = File::create(&path).unwrap();
         let bytes: Vec<u8> = (0..end + 333).map(byte).collect();
@@ -166,6 +174,51 @@ fn a_failed_read_leaves_both_tiers() {
         }
         store.release(&mut gpu).unwrap();
     }
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// Experts of two sizes (a class of slots each): every acquired slot still matches the file,
+/// through drive reads, host hits, write-backs and prefetches in both classes.
+#[test]
+fn experts_of_two_sizes() {
+    let counts = run_with(sized_roles(STRIDES, [90_001, 30_011, 120_007]), 30, 400);
+    eprintln!("{counts:?}");
+    assert!(counts.drive_reads > 0 && counts.host_hits > 0 && counts.writebacks > 0 && counts.prefetched > 0);
+}
+
+/// A verifier that panics fails its read like a refused block: the pass gets an error, the
+/// store stays usable.
+#[test]
+fn a_panicking_verifier_fails_its_read() {
+    let layers = roles();
+    let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-panicking", std::process::id()));
+    std::fs::write(&path, (0..end + 333).map(byte).collect::<Vec<u8>>()).unwrap();
+    let role = layers[0].as_ref().unwrap()[0];
+    let bad = (role.base + 7 * role.stride + role.stride / 2) & !4095;
+    let left = Arc::new(AtomicU64::new(1));
+    let remaining = left.clone();
+    let verifier: Verifier = Arc::new(move |_, offset, data: &[u8]| {
+        if (offset..offset + data.len() as u64).contains(&bad) && remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+            panic!("a verifier bug");
+        }
+        Ok(())
+    });
+    let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), Some(verifier)).unwrap());
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, 1 << 26).unwrap();
+    assert!(store.acquire(&mut gpu, 0, &[7]).unwrap_err().contains("panicked"));
+    store.release(&mut gpu).unwrap();
+    let slots = store.acquire(&mut gpu, 0, &[7, 8]).unwrap();
+    for (expert, slot) in [7, 8].into_iter().zip(&slots) {
+        let want = expected(layers[0].as_ref().unwrap(), expert);
+        let mut got = vec![0u8; want.len()];
+        gpu.read_buffer(slot, 0, &mut got).unwrap();
+        assert!(got == want, "expert {expert} differs after the panicked read");
+    }
+    store.release(&mut gpu).unwrap();
     store.settle(&mut gpu).unwrap();
     drop(store);
     std::fs::remove_file(&path).unwrap();
