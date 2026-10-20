@@ -135,7 +135,7 @@ option, named as llama-server names it where it has the same setting.
 | `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget) |
-| `-dev, --device LIST` | GPU ordinals, e.g. `0,1` | `0` |
+| `-gpu, --gpu LIST` | GPU ordinals, e.g. `0,1` (`-dev`, `--device` also accepted) | `0` |
 | `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` |
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |

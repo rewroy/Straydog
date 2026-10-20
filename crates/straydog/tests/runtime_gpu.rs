@@ -58,7 +58,7 @@ fn main() {
     let options = Options {
         model: Some(PathBuf::from(model)),
         model_draft: std::env::var_os("STRAYDOG_DRAFTER").map(PathBuf::from),
-        device: Some(vec![0, 1]),
+        gpu: Some(vec![0, 1]),
         vram: Some(30.0),
         ctx_size: Some(32768),
         ..Options::default()

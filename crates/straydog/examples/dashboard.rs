@@ -40,7 +40,7 @@ fn main() {
         draft_max: 3,
         ctx_size: 262_144,
         batch_size: 4096,
-        device: vec![0, 1],
+        gpu: vec![0, 1],
         split_mode: SplitMode::Experts,
         vram: 30.0,
         state_ram: 0.0,

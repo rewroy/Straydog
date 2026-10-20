@@ -148,7 +148,7 @@ fn main() {
     let options = Options {
         model: Some(args.model.clone()),
         model_draft: args.drafter.clone(),
-        device: Some(args.devices.clone()),
+        gpu: Some(args.devices.clone()),
         vram: Some(args.vram),
         ctx_size: Some(args.ctx),
         ..Options::default()

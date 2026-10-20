@@ -58,9 +58,10 @@ pub struct Options {
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=4096))]
     pub batch_size: Option<u16>,
-    /// GPU ordinals, comma separated (also -dev) [default: 0]
-    #[arg(long = "device", env = "STRAYDOG_DEVICE", value_name = "LIST", value_delimiter = ',')]
-    pub device: Option<Vec<usize>>,
+    /// GPU ordinals, comma separated (also -gpu; -dev and --device are accepted) [default: 0]
+    #[arg(long = "gpu", alias = "device", env = "STRAYDOG_GPU", value_name = "LIST", value_delimiter = ',')]
+    #[serde(alias = "device")]
+    pub gpu: Option<Vec<usize>>,
     /// With two GPUs holding the whole model: experts splits every layer's experts, layer splits the layers (also -sm) [default: experts]
     #[arg(long = "split-mode", env = "STRAYDOG_SPLIT_MODE", value_name = "MODE")]
     pub split_mode: Option<SplitMode>,
@@ -133,7 +134,7 @@ pub struct Settings {
     pub draft_max: u8,
     pub ctx_size: u32,
     pub batch_size: u16,
-    pub device: Vec<usize>,
+    pub gpu: Vec<usize>,
     pub split_mode: SplitMode,
     pub vram: f64,
     pub state_ram: f64,
@@ -163,7 +164,7 @@ pub fn expand_short_options(args: impl IntoIterator<Item = std::ffi::OsString>) 
     args.into_iter()
         .map(|arg| {
             let text = arg.to_string_lossy();
-            for (short, long) in [("-md", "--model-draft"), ("-dev", "--device"), ("-sm", "--split-mode")] {
+            for (short, long) in [("-md", "--model-draft"), ("-gpu", "--gpu"), ("-dev", "--gpu"), ("-sm", "--split-mode")] {
                 if text == short {
                     return long.into();
                 }
@@ -214,7 +215,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
             options
         }};
     }
-    let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, device, split_mode, vram,
+    let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose);
     Ok((options, sources))
@@ -297,11 +298,11 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         None => None,
     };
     let draft_max = options.draft_max.unwrap_or(if model_draft.is_some() { 3 } else { 0 });
-    let device = options.device.unwrap_or_else(|| vec![0]);
-    let mut distinct = device.clone();
+    let gpu = options.gpu.unwrap_or_else(|| vec![0]);
+    let mut distinct = gpu.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    if device.is_empty() || device.len() > 4 || distinct.len() != device.len() {
+    if gpu.is_empty() || gpu.len() > 4 || distinct.len() != gpu.len() {
         return Err("GPU ordinals must be one to four distinct numbers".into());
     }
     let vram = options.vram.unwrap_or(6.0);
@@ -309,7 +310,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         return Err("--vram must be between 0.01 and 256 GiB".into());
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
-    let batch_size = options.batch_size.unwrap_or(if device.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
+    let batch_size = options.batch_size.unwrap_or(if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
     let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
@@ -361,7 +362,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         draft_max,
         ctx_size,
         batch_size,
-        device,
+        gpu,
         split_mode: options.split_mode.unwrap_or(SplitMode::Experts),
         vram,
         state_ram,
@@ -398,7 +399,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("draft_max", settings.draft_max.to_string()),
         ("ctx_size", settings.ctx_size.to_string()),
         ("batch_size", settings.batch_size.to_string()),
-        ("device", settings.device.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),
+        ("gpu", settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),
         ("split_mode", format!("{:?}", settings.split_mode).to_lowercase()),
         ("vram", settings.vram.to_string()),
         ("state_ram", settings.state_ram.to_string()),
@@ -463,7 +464,7 @@ mod tests {
         std::env::remove_var("STRAYDOG_PORT");
         let (options, sources) = load(&matches, Some(&file)).unwrap();
         let settings = resolve(options).unwrap();
-        assert_eq!((settings.vram, settings.port, settings.device.clone()), (30.0, 9100, vec![0, 1]));
+        assert_eq!((settings.vram, settings.port, settings.gpu.clone()), (30.0, 9100, vec![0, 1]));
         assert_eq!(settings.quant, "IQ3_S");
         assert_eq!(settings.batch_size, 4096);   // 2 x 30 GiB of GPU budget
         assert_eq!(settings.ctx_size, 32768);
@@ -474,7 +475,7 @@ mod tests {
         let line = |name: &str| lines.iter().find(|line| line.starts_with(&format!("{name} "))).unwrap().clone();
         assert!(line("vram").ends_with("[option --vram]"));
         assert!(line("port").ends_with("[env STRAYDOG_PORT]"));
-        assert!(line("device").ends_with(&format!("[config {}]", file.display())));
+        assert!(line("gpu").ends_with(&format!("[config {}]", file.display())));
         assert!(line("batch_size").ends_with("[derived]"));
         assert!(line("host").ends_with("[default]"));
         std::fs::write(&file, "unknown = 1\n").unwrap();
@@ -517,8 +518,8 @@ mod tests {
 
     #[test]
     fn llama_short_options_expand() {
-        let expanded = expand_short_options(["-md", "/d", "-dev=0,1", "-sm", "layer", "-m", "x"].map(Into::into));
-        assert_eq!(expanded, ["--model-draft", "/d", "--device=0,1", "--split-mode", "layer", "-m", "x"]
+        let expanded = expand_short_options(["-md", "/d", "-gpu=0,1", "-dev", "1", "-sm", "layer", "-m", "x"].map(Into::into));
+        assert_eq!(expanded, ["--model-draft", "/d", "--gpu=0,1", "--gpu", "1", "--split-mode", "layer", "-m", "x"]
                    .map(std::ffi::OsString::from));
     }
 }

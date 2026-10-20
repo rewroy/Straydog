@@ -187,7 +187,7 @@ fn describe(settings: &Settings) -> Value {
         "draft_max": settings.draft_max,
         "context": settings.ctx_size,
         "batch_size": settings.batch_size,
-        "devices": settings.device,
+        "devices": settings.gpu,
         "split_mode": match settings.split_mode { SplitMode::Experts => "experts", SplitMode::Layer => "layer" },
         "vram_gib": settings.vram,
         "state_ram_gib": settings.state_ram,

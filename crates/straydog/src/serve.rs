@@ -51,7 +51,7 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             "Straydog starting: {} from {}, GPU {} with {} GiB each, context {}, prefill batch {}, {}",
             settings.quant,
             settings.model.display(),
-            settings.device.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
+            settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
             settings.vram,
             settings.ctx_size,
             settings.batch_size,

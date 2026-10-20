@@ -41,7 +41,7 @@ bubblewrap.
 ```bash
 straydog fetch -m ~/models/IQ3_S --quant IQ3_S      # download and authenticate a bundle (once)
 straydog fetch-mtp --model-draft ~/models/mtp       # build the MTP drafter (once, optional)
-straydog -m ~/models/IQ3_S -md ~/models/mtp -dev 0,1 --vram 30 --api-key-file ~/.straydog-key
+straydog -m ~/models/IQ3_S -md ~/models/mtp -gpu 0,1 --vram 30 --api-key-file ~/.straydog-key
 ```
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).

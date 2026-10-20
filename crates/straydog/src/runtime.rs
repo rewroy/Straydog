@@ -137,7 +137,7 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
         push("drafter", drafter.display().to_string());
         push("speculative", settings.draft_max.to_string());
     }
-    push("devices", settings.device.iter().map(usize::to_string).collect::<Vec<_>>().join(","));
+    push("devices", settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","));
     push("split-mode", if settings.split_mode == SplitMode::Layer { "layer" } else { "experts" }.into());
     push("context", settings.ctx_size.to_string());
     push("vram-bytes", ((settings.vram * (1u64 << 30) as f64) as u64).to_string());
