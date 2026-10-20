@@ -48,8 +48,14 @@ KvView kv_prepare_decode(Device& d, void* state, size_t context, size_t base, si
     mirror.valid=std::min(base+count,view.mirror_rows);
     return view;
 }
+// A batch that fits its layer's decode mirror runs there: the mirror stays valid for the
+// decode and the follow-up batches after it, instead of re-copying the whole prefix per layer.
 KvView kv_for_prefill(Device& d, void* state, size_t context, size_t base, size_t count) {
     if (count==1) return kv_prepare_decode(d,state,context,base);
+    if (d.kv_mirrors.count(state) && base+count<=d.kv_mirror_rows) {
+        const KvView view=kv_prepare_decode(d,state,context,base,count);
+        return {view.mirror,view.mirror_rows,true};
+    }
     kv_invalidate_write(d,state,base);
     if (!d.kv_stage || base+count>d.kv_stage_rows || !d.host_states.count(state))
         return {static_cast<float*>(state),context,false};
@@ -63,7 +69,7 @@ KvView kv_for_prefill(Device& d, void* state, size_t context, size_t base, size_
 void kv_after_prefill(Device& d, const KvView& view, void* state, size_t context, size_t base, size_t count) {
     if (!view.staged) return;
     kv_copy_rows(d,static_cast<float*>(state),context,view.kv,view.capacity,base,count);
-    d.kv_stage_valid=base+count;
+    if (view.kv==d.kv_stage && d.kv_stage_owner==state) d.kv_stage_valid=base+count;
 }
 // The layer map is fully registered before decode. Preparing here, rather than
 // in qsa_decode_attend, also covers graphs reused after prefill or state restore.
