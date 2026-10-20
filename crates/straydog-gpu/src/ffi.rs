@@ -189,6 +189,230 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_buffer(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_buffer_write(
+        handle: *mut ::std::os::raw::c_void,
+        buffer: *mut ::std::os::raw::c_void,
+        offset: u64,
+        data: *const ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_buffer_read(
+        handle: *mut ::std::os::raw::c_void,
+        buffer: *const ::std::os::raw::c_void,
+        offset: u64,
+        output: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_linear(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        first_row: u64,
+        input: *const f32,
+        input_stride: u64,
+        steps: u64,
+        output: *mut f32,
+        output_stride: u64,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_rms_norm(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        weight: *const f32,
+        rows: u64,
+        width: u64,
+        eps: f32,
+        output: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_rope(
+        handle: *mut ::std::os::raw::c_void,
+        x: *mut f32,
+        rows: u64,
+        vectors: u64,
+        width: u64,
+        rope_dims: u64,
+        positions: *const i32,
+        frequencies: *const f32,
+        inverse: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_hc_coefficients(
+        handle: *mut ::std::os::raw::c_void,
+        mixes: *const f32,
+        stream: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        base: *const f32,
+        scale: *const f32,
+        iterations: u64,
+        eps: f32,
+        norm_eps: f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_hc_collapse(
+        handle: *mut ::std::os::raw::c_void,
+        stream: *const f32,
+        pre: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_hc_expand(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        residual: *const f32,
+        post: *const f32,
+        comb: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_engram_gate(
+        handle: *mut ::std::os::raw::c_void,
+        stream: *mut f32,
+        kv: *const f32,
+        weight: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        eps: f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_route(
+        handle: *mut ::std::os::raw::c_void,
+        logits: *const f32,
+        bias: *const f32,
+        rows: u64,
+        experts: u64,
+        k: u64,
+        gating: ::std::os::raw::c_int,
+        normalize: ::std::os::raw::c_int,
+        scale: f32,
+        ids: *mut i32,
+        weights: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_swiglu(
+        handle: *mut ::std::os::raw::c_void,
+        gate: *const f32,
+        up: *const f32,
+        rows: u64,
+        width: u64,
+        clamp: f32,
+        row_weights: *const f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_gather(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        x_rows: u64,
+        rows: *const i32,
+        count: u64,
+        width: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_scatter_add(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        rows: *const i32,
+        count: u64,
+        width: u64,
+        out: *mut f32,
+        out_rows: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_sparse_attention(
+        handle: *mut ::std::os::raw::c_void,
+        q: *const f32,
+        raw: *const f32,
+        raw_rows: u64,
+        positions: *const i32,
+        window: u64,
+        compressed: *const f32,
+        compressed_rows: u64,
+        selected: *const i32,
+        selections: u64,
+        sinks: *const f32,
+        rows: u64,
+        heads: u64,
+        dim: u64,
+        scale: f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_compress(
+        handle: *mut ::std::os::raw::c_void,
+        kv: *const f32,
+        gate: *const f32,
+        groups: u64,
+        ratio: u64,
+        dim: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_index_scores(
+        handle: *mut ::std::os::raw::c_void,
+        q: *const f32,
+        keys: *const f32,
+        weights: *const f32,
+        visible: *const i32,
+        rows: u64,
+        groups: u64,
+        heads: u64,
+        dim: u64,
+        scale: f32,
+        scores: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_top_k(
+        handle: *mut ::std::os::raw::c_void,
+        scores: *const f32,
+        rows: u64,
+        groups: u64,
+        k: u64,
+        out: *mut i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hyperconnection(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,

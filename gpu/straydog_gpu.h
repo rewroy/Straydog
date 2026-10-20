@@ -53,6 +53,39 @@ int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);
 int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds, const uint64_t* rows, const uint64_t* cols, uint64_t count, const float* input, uint64_t input_count, float* output, uint64_t output_count);
 
+/* Ops: generic operations over device buffers, queued on the device's stream (shapes are
+   arguments; every pointer must lie inside one of this device's allocations). A buffer starts
+   zeroed; reading one waits for the stream. Linear: out[t][r] = W[first_row + r] . in[t] (strides in values, 0: packed),
+   by GEMV for up to four inputs, else an F32 GEMM over rows expanded into scratch. Rope rotates the last
+   rope_dims values of each of a row's vectors, in adjacent pairs, by positions[row] * frequencies. */
+void* sd_buffer(void* handle, uint64_t bytes);
+int sd_buffer_write(void* handle, void* buffer, uint64_t offset, const void* data, uint64_t bytes);
+int sd_buffer_read(void* handle, const void* buffer, uint64_t offset, void* output, uint64_t bytes);
+int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row, const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
+int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, float* output);
+int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies, int inverse);
+/* Hyper-connections: coefficients (pre and post per copy, a Sinkhorn-balanced combination) from
+   mixes = W_hc . stream; a stream collapsed by pre; a sublayer output expanded back with the
+   residual: out[j] = post[j] x + sum_i comb[i][j] residual[i]. */
+int sd_op_hc_coefficients(void* handle, const float* mixes, const float* stream, uint64_t rows, uint64_t hc, uint64_t width, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps, float* pre, float* post, float* comb);
+int sd_op_hc_collapse(void* handle, const float* stream, const float* pre, uint64_t rows, uint64_t hc, uint64_t width, float* out);
+int sd_op_hc_expand(void* handle, const float* x, const float* residual, const float* post, const float* comb, uint64_t rows, uint64_t hc, uint64_t width, float* out);
+/* Engram: kv = [hc keys | value] per row from the table rows; each copy gains its gated value. */
+int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float* weight, uint64_t rows, uint64_t hc, uint64_t width, float eps);
+/* Experts: routes (gating 0 softmax, 1 sigmoid, 2 square-root softplus; bias steers the choice,
+   not the weights), clamped SwiGLU with optional row weights, row gather and scatter-add. */
+int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t rows, uint64_t experts, uint64_t k, int gating, int normalize, float scale, int32_t* ids, float* weights);
+int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp, const float* row_weights, float* out);
+int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
+int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
+/* Latent attention: each query attends to the window rows of `raw` ending at its position and
+   the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio
+   rows by a per-channel softmax of the gate. The indexer scores visible groups and keeps the top k. */
+int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions, uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected, uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim, float scale, float* out);
+int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
+int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
+int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);
+
 /* Layer operations */
 int sd_hyperconnection(void* handle, void* const* pointers, const int* kinds, uint64_t steps, int inject, const float* input, float* output);
 int sd_gdn_sequence(void* handle, void* const* pointers, const int* kinds, void* conv, void* recurrent, uint64_t steps, const float* input, float* output);

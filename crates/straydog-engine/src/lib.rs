@@ -11,6 +11,7 @@ pub mod group;
 pub mod host;
 pub mod load;
 pub mod model;
+pub mod ops;
 pub mod pyjson;
 pub mod reply;
 pub mod sampling;

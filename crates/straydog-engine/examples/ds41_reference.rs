@@ -2,12 +2,13 @@
 //! reference implementation's forward pass, written plainly, over the GGUF's own weights.
 //! Development only: the shards are read without authentication.
 //!
-//! ds41_reference SHARD_DIR TOKENS [--dump DIR] [--layers N] [--logits FILE] [--routes FILE]
+//! ds41_reference SHARD_DIR TOKENS [--dump DIR] [--layers N] [--logits FILE] [--routes FILE] [--save DIR]
 //!
 //! TOKENS: a probe `.tokens` file (int32 prompt length, kept, generated, then the ids). With
 //! --dump, every layer's tensors are compared against the reference run's dumps (int64 extents
 //! then F32 values, named like `ffn_out-7.f32`); --logits compares the final logits of the
-//! prompt's kept positions (F32 rows).
+//! prompt's kept positions (F32 rows); --save writes every compared tensor of this run in the
+//! dump format (the oracle for the GPU path).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -584,8 +585,19 @@ impl Model<'_> {
     }
 }
 
+/// Where `--save` writes this run's tensors, in the dump format, for checking other paths.
+static SAVE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
 /// Compare a computed [tokens][width] tensor with a dump of the reference run.
 fn compare(dump: Option<&Path>, name: &str, values: &[f32]) {
+    if let Some(Some(dir)) = SAVE.get() {
+        let mut bytes = Vec::with_capacity(32 + values.len() * 4);
+        for extent in [values.len() as i64, 1, 1, 1] {
+            bytes.extend_from_slice(&extent.to_le_bytes());
+        }
+        bytes.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        std::fs::write(dir.join(format!("{name}.f32")), bytes).unwrap();
+    }
     let Some(dir) = dump else { return };
     let Ok(bytes) = std::fs::read(dir.join(format!("{name}.f32"))) else {
         println!("  {name:<18} (no dump)");
@@ -616,6 +628,11 @@ fn main() -> Result<(), String> {
     let logits_file = option("--logits").map(PathBuf::from);
     let last_layer: Option<usize> = option("--layers").map(|n| n.parse().unwrap());
     let option_routes = option("--routes").map(PathBuf::from);
+    let save = option("--save").map(PathBuf::from);
+    if let Some(dir) = &save {
+        std::fs::create_dir_all(dir).map_err(|exc| exc.to_string())?;
+    }
+    SAVE.set(save).unwrap();
     let [dir, tokens_file] = &args[..] else {
         return Err("usage: ds41_reference SHARD_DIR TOKENS [--dump DIR] [--layers N] [--logits FILE]".into());
     };

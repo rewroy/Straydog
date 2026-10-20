@@ -898,6 +898,7 @@ Device& device(void* handle) {
 #include "prefill_batch.hpp"
 #include "decoder_span.hpp"
 #include "verify_span.hpp"
+#include "ops.hpp"
 } // namespace
 
 extern "C" {
@@ -1903,5 +1904,245 @@ int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds,
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols,
               const float* input, float* output) {
     return sd_matvec_batch(handle, &pointer, &kind, &rows, &cols, 1, input, cols, output, rows);
+}
+
+// ---- Ops over device buffers (ops.hpp) ----
+
+void* sd_buffer(void* handle, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
+            throw std::runtime_error("Straydog VRAM budget exceeded");
+        void* pointer = nullptr;
+        check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
+        try { value.allocations.emplace(pointer, size_t(bytes)); }
+        catch (...) { cleanup(hipFree(pointer)); throw; }
+        value.used += size_t(bytes) + allocation_tail;
+        check(hipMemsetAsync(pointer, 0, size_t(bytes) + allocation_tail, value.stream));
+        return pointer;
+    } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
+}
+
+int sd_buffer_write(void* handle, void* buffer, uint64_t offset, const void* data, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (!data || offset > UINT64_MAX - bytes) throw std::runtime_error("invalid Straydog buffer write");
+        op_span(value, static_cast<uint8_t*>(buffer) + offset, size_t(bytes), "a written buffer");
+        upload(value, static_cast<uint8_t*>(buffer) + offset, data, size_t(bytes));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_buffer_read(void* handle, const void* buffer, uint64_t offset, void* output, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (!output || offset > UINT64_MAX - bytes) throw std::runtime_error("invalid Straydog buffer read");
+        op_span(value, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes), "a read buffer");
+        download(value, output, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                 const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
+                 float* scratch, uint64_t scratch_bytes) {
+    try {
+        auto& value = device(handle);
+        input_stride = input_stride ? input_stride : cols;
+        output_stride = output_stride ? output_stride : rows;
+        if (!rows || !cols || !steps || input_stride < cols || output_stride < rows)
+            throw std::runtime_error("invalid Straydog linear shape");
+        const size_t row_bytes = matrix_row_bytes(kind, cols);
+        op_span(value, weights, size_t(first_row + rows) * row_bytes, "a weight matrix");
+        op_span(value, input, size_t((steps - 1) * input_stride + cols) * 4, "a linear input");
+        op_span(value, output, size_t((steps - 1) * output_stride + rows) * 4, "a linear output");
+        if (steps > uint64_t(gemv_max_vectors)) op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
+        op_linear(value, static_cast<const uint8_t*>(weights), kind, size_t(rows), size_t(cols), size_t(first_row), input,
+                  size_t(input_stride), size_t(steps), output, size_t(output_stride), scratch, size_t(scratch_bytes));
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps,
+                   float* output) {
+    try {
+        auto& value = device(handle);
+        if (!rows || !width) throw std::runtime_error("invalid Straydog norm shape");
+        op_span(value, input, size_t(rows * width) * 4, "a norm input");
+        op_span(value, weight, size_t(width) * 4, "a norm weight");
+        op_span(value, output, size_t(rows * width) * 4, "a norm output");
+        op_rms_norm_kernel<<<unsigned(rows), 256, 0, value.stream>>>(input, weight, size_t(width), eps, output);
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims,
+               const int32_t* positions, const float* frequencies, int inverse) {
+    try {
+        auto& value = device(handle);
+        if (!rows || !vectors || !rope_dims || rope_dims % 2 || rope_dims > width) throw std::runtime_error("invalid Straydog rope shape");
+        op_span(value, x, size_t(rows * vectors * width) * 4, "a rotated buffer");
+        op_span(value, positions, size_t(rows) * 4, "rope positions");
+        op_span(value, frequencies, size_t(rope_dims / 2) * 4, "rope frequencies");
+        const size_t count = size_t(rows * vectors * (rope_dims / 2));
+        op_rope_kernel<<<unsigned((count + 255) / 256), 256, 0, value.stream>>>(x, count, size_t(vectors), size_t(width),
+                                                                               size_t(rope_dims / 2), positions, frequencies, inverse);
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+#define SD_OP_BEGIN try { auto& value = device(handle);
+#define SD_OP_END check(hipGetLastError()); return 0; } catch (const std::exception& e) { last_error = e.what(); return -1; }
+static unsigned op_blocks(size_t count) { return unsigned((count + 255) / 256); }
+
+int sd_op_hc_coefficients(void* handle, const float* mixes, const float* stream, uint64_t rows, uint64_t hc, uint64_t width,
+                          const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps,
+                          float* pre, float* post, float* comb) {
+    SD_OP_BEGIN
+    if (!rows || !hc || hc > 8 || !width) throw std::runtime_error("invalid Straydog hyper-connection shape");
+    const size_t mix = size_t((2 + hc) * hc);
+    op_span(value, mixes, size_t(rows) * mix * 4, "hyper-connection mixes");
+    op_span(value, stream, size_t(rows * hc * width) * 4, "a stream");
+    op_span(value, base, mix * 4, "hyper-connection base");
+    op_span(value, scale, 12, "hyper-connection scale");
+    op_span(value, pre, size_t(rows * hc) * 4, "pre coefficients");
+    op_span(value, post, size_t(rows * hc) * 4, "post coefficients");
+    op_span(value, comb, size_t(rows * hc * hc) * 4, "combination coefficients");
+    op_hc_coefficients_kernel<<<unsigned(rows), 256, 0, value.stream>>>(mixes, stream, size_t(hc), size_t(width), base, scale,
+                                                                     size_t(iterations), eps, norm_eps, pre, post, comb);
+    SD_OP_END
+}
+
+int sd_op_hc_collapse(void* handle, const float* stream, const float* pre, uint64_t rows, uint64_t hc, uint64_t width, float* out) {
+    SD_OP_BEGIN
+    op_span(value, stream, size_t(rows * hc * width) * 4, "a stream");
+    op_span(value, pre, size_t(rows * hc) * 4, "pre coefficients");
+    op_span(value, out, size_t(rows * width) * 4, "a collapsed output");
+    op_hc_collapse_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(stream, pre, size_t(rows), size_t(hc), size_t(width), out);
+    SD_OP_END
+}
+
+int sd_op_hc_expand(void* handle, const float* x, const float* residual, const float* post, const float* comb, uint64_t rows,
+                    uint64_t hc, uint64_t width, float* out) {
+    SD_OP_BEGIN
+    op_span(value, x, size_t(rows * width) * 4, "a sublayer output");
+    op_span(value, residual, size_t(rows * hc * width) * 4, "a residual stream");
+    op_span(value, post, size_t(rows * hc) * 4, "post coefficients");
+    op_span(value, comb, size_t(rows * hc * hc) * 4, "combination coefficients");
+    op_span(value, out, size_t(rows * hc * width) * 4, "an expanded stream");
+    if (out == residual) throw std::runtime_error("Straydog hyper-connection expansion cannot run in place");
+    op_hc_expand_kernel<<<op_blocks(size_t(rows * hc * width)), 256, 0, value.stream>>>(x, residual, post, comb, size_t(rows),
+                                                                                    size_t(hc), size_t(width), out);
+    SD_OP_END
+}
+
+int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float* weight, uint64_t rows, uint64_t hc,
+                      uint64_t width, float eps) {
+    SD_OP_BEGIN
+    op_span(value, stream, size_t(rows * hc * width) * 4, "a stream");
+    op_span(value, kv, size_t(rows * (hc + 1) * width) * 4, "Engram keys and values");
+    op_span(value, weight, size_t(hc * width) * 4, "an Engram gate weight");
+    op_engram_gate_kernel<<<unsigned(rows * hc), 256, 0, value.stream>>>(stream, kv, weight, size_t(hc), size_t(width), eps);
+    SD_OP_END
+}
+
+int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t rows, uint64_t experts, uint64_t k, int gating,
+                int normalize, float scale, int32_t* ids, float* weights) {
+    SD_OP_BEGIN
+    if (!rows || !experts || !k || k > 64 || k > experts || gating < 0 || gating > 2 || experts * 4 > 48 * 1024)
+        throw std::runtime_error("invalid Straydog route shape");
+    op_span(value, logits, size_t(rows * experts) * 4, "router logits");
+    if (bias) op_span(value, bias, size_t(experts) * 4, "a router bias");
+    op_span(value, ids, size_t(rows * k) * 4, "routed experts");
+    op_span(value, weights, size_t(rows * k) * 4, "routing weights");
+    op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 4, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
+                                                                              normalize, scale, ids, weights);
+    SD_OP_END
+}
+
+int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp,
+                 const float* row_weights, float* out) {
+    SD_OP_BEGIN
+    op_span(value, gate, size_t(rows * width) * 4, "a gate projection");
+    op_span(value, up, size_t(rows * width) * 4, "an up projection");
+    if (row_weights) op_span(value, row_weights, size_t(rows) * 4, "row weights");
+    op_span(value, out, size_t(rows * width) * 4, "a SwiGLU output");
+    op_swiglu_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(gate, up, size_t(rows), size_t(width), clamp,
+                                                                             row_weights, out);
+    SD_OP_END
+}
+
+int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out) {
+    SD_OP_BEGIN
+    op_span(value, x, size_t(x_rows * width) * 4, "gathered rows");
+    op_span(value, rows, size_t(count) * 4, "row indices");
+    op_span(value, out, size_t(count * width) * 4, "a gather output");
+    op_gather_kernel<<<op_blocks(size_t(count * width)), 256, 0, value.stream>>>(x, rows, size_t(count), size_t(width), out);
+    SD_OP_END
+}
+
+int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out,
+                      uint64_t out_rows) {
+    SD_OP_BEGIN
+    op_span(value, x, size_t(count * width) * 4, "added rows");
+    op_span(value, rows, size_t(count) * 4, "row indices");
+    op_span(value, out, size_t(out_rows * width) * 4, "a scatter output");
+    op_scatter_add_kernel<<<op_blocks(size_t(count * width)), 256, 0, value.stream>>>(x, rows, size_t(count), size_t(width), out);
+    SD_OP_END
+}
+
+int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions,
+                           uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected,
+                           uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim,
+                           float scale, float* out) {
+    SD_OP_BEGIN
+    const size_t shared = size_t(dim + window + selections) * 4;
+    if (!rows || !heads || !dim || !window || shared > 60 * 1024) throw std::runtime_error("invalid Straydog attention shape");
+    op_span(value, q, size_t(rows * heads * dim) * 4, "attention queries");
+    op_span(value, raw, size_t(raw_rows * dim) * 4, "window rows");
+    op_span(value, positions, size_t(rows) * 4, "query positions");
+    if (selections) {
+        op_span(value, compressed, size_t(compressed_rows * dim) * 4, "compressed rows");
+        op_span(value, selected, size_t(rows * selections) * 4, "selected rows");
+    }
+    op_span(value, sinks, size_t(heads) * 4, "attention sinks");
+    op_span(value, out, size_t(rows * heads * dim) * 4, "an attention output");
+    op_sparse_attention_kernel<<<unsigned(rows * heads), 256, shared, value.stream>>>(q, raw, positions, size_t(window), compressed,
+        selected, size_t(selections), sinks, size_t(heads), size_t(dim), scale, out);
+    SD_OP_END
+}
+
+int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out) {
+    SD_OP_BEGIN
+    op_span(value, kv, size_t(groups * ratio * dim) * 4, "rows to compress");
+    if (gate) op_span(value, gate, size_t(groups * ratio * dim) * 4, "a compression gate");
+    op_span(value, out, size_t(groups * dim) * 4, "compressed rows");
+    op_compress_kernel<<<op_blocks(size_t(groups * dim)), 256, 0, value.stream>>>(kv, gate, size_t(groups), size_t(ratio), size_t(dim), out);
+    SD_OP_END
+}
+
+int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible,
+                       uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores) {
+    SD_OP_BEGIN
+    op_span(value, q, size_t(rows * heads * dim) * 4, "index queries");
+    op_span(value, keys, size_t(groups * dim) * 4, "index keys");
+    op_span(value, weights, size_t(rows * heads) * 4, "index weights");
+    op_span(value, visible, size_t(rows) * 4, "visible counts");
+    op_span(value, scores, size_t(rows * groups) * 4, "index scores");
+    op_index_scores_kernel<<<dim3(op_blocks(size_t(groups)), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
+        size_t(groups), size_t(heads), size_t(dim), scale, scores);
+    SD_OP_END
+}
+
+int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out) {
+    SD_OP_BEGIN
+    if (!rows || !groups || !k || groups > 8192) throw std::runtime_error("invalid Straydog top-k shape");
+    op_span(value, scores, size_t(rows * groups) * 4, "scores");
+    op_span(value, out, size_t(rows * k) * 4, "top-k indices");
+    op_top_k_kernel<<<unsigned(rows), 256, size_t(groups) * 4, value.stream>>>(scores, size_t(groups), size_t(k), out);
+    SD_OP_END
 }
 } // extern C
