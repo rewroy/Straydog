@@ -26,8 +26,9 @@ int sd_memory(void* handle, uint64_t* used, uint64_t* budget);
 /* Allocations and transfers */
 void* sd_upload(void* handle, const void* data, uint64_t bytes);
 /* An allocation whose bytes arrive later: sd_write stages caller memory into all of it;
- * sd_fill copies page-locked host memory (sd_host_register) into a range of it from any
- * thread that owns a filler of the device, while nothing else uses the device. */
+ * sd_fill copies page-locked host memory (sd_host_register) into a range of it, on the
+ * device's stream, from any thread that owns a filler of the device, while nothing else uses
+ * the device. */
 void* sd_allocate(void* handle, uint64_t bytes);
 int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes);
 void* sd_filler_create(void* handle);

@@ -101,8 +101,6 @@
 #define hipHostMallocPortable cudaHostAllocPortable
 #define hipEventDisableTiming cudaEventDisableTiming
 #define hipEventBlockingSync cudaEventBlockingSync
-#define hipStreamCreateWithFlags cudaStreamCreateWithFlags
-#define hipStreamNonBlocking cudaStreamNonBlocking
 // MSVC host compilation has no GNU attributes; CUDA's __align__ maps to the host's form.
 #define SD_ALIGN(n) __align__(n)
 #include <mma.h>
@@ -1526,7 +1524,6 @@ void* sd_filler_create(void* handle) {
         auto filler = std::make_unique<Filler>();
         filler->device = &device(handle);
         check(hipSetDevice(filler->device->ordinal));
-        check(hipStreamCreateWithFlags(&filler->stream, hipStreamNonBlocking));
         check(hipEventCreateWithFlags(&filler->done, hipEventDisableTiming | hipEventBlockingSync));
         return filler.release();
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
@@ -1546,8 +1543,8 @@ int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint
             throw std::runtime_error("invalid Straydog fill");
         check(hipSetDevice(value.ordinal));
         check(hipMemcpyAsync(static_cast<uint8_t*>(pointer) + offset, host, size_t(bytes), hipMemcpyHostToDevice,
-                             copier.stream));
-        check(hipEventRecord(copier.done, copier.stream));
+                             value.stream));
+        check(hipEventRecord(copier.done, value.stream));
         check(hipEventSynchronize(copier.done));
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

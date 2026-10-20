@@ -108,15 +108,15 @@ void* allocate(Device& value, uint64_t bytes) {
     check(hipMemsetAsync(static_cast<uint8_t*>(pointer) + bytes, 0, allocation_tail, value.stream));
     return pointer;
 }
-// One host thread's copies into one device's allocations (sd_fill): a stream of its own, and
-// an event the thread sleeps on instead of spinning beside the threads that read and hash.
+// One host thread's copies into one device's allocations (sd_fill), on the device's stream:
+// streams of their own would leave hardware queues behind (ROCm keeps them) that slow the
+// device's later work by ~1%. The thread sleeps on an event of its own instead of spinning
+// beside the threads that read and hash.
 struct Filler {
     Device* device = nullptr;
-    hipStream_t stream = nullptr;
     hipEvent_t done = nullptr;
     ~Filler() {
         if (device) cleanup(hipSetDevice(device->ordinal));
         if (done) cleanup(hipEventDestroy(done));
-        if (stream) cleanup(hipStreamDestroy(stream));
     }
 };

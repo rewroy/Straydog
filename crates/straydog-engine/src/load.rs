@@ -101,8 +101,8 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
                 Ok(Devices { fillers, lock: None })
             })
             .collect();
-        // Host K/V page-locks beside the reading, once the readers' copy streams exist: its
-        // thread holds up the devices' other calls meanwhile, creating them by seconds.
+        // Host K/V page-locks beside the reading, once the readers' fillers exist: its thread
+        // holds up the devices' other calls meanwhile.
         group.prefetch_host_states()?;
         workers
     })?;

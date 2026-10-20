@@ -87,7 +87,7 @@ impl Drop for PageLock {
     }
 }
 
-/// One thread's copy stream into one device's allocations (see `sd_fill`).
+/// One thread's copies into one device's allocations (see `sd_fill`).
 pub struct Filler<'a> {
     handle: *mut c_void,
     device: std::marker::PhantomData<&'a Backend>,
@@ -307,7 +307,7 @@ impl Backend {
         self.deferred.take().unwrap_or_default()
     }
 
-    /// A copy stream for one thread's fills of pending uploads.
+    /// A filler for one thread's copies into pending uploads.
     pub fn filler(&self) -> Result<Filler<'_>> {
         // SAFETY: a live handle.
         let handle = pointer(unsafe { ffi::sd_filler_create(self.handle) })?;
