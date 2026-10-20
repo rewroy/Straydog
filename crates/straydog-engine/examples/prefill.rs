@@ -111,8 +111,11 @@ fn main() -> Result<(), String> {
         let seconds = model.last_metrics["prefill_seconds"].as_f64().unwrap_or(0.0);
         let reused = model.last_metrics["cached_tokens"].as_u64().unwrap_or(0);
         if generate > 1 {
-            println!("decode {} tokens: {:.1} tok/s", tokens.len(),
-                     model.last_metrics["decode_tokens_per_second"].as_f64().unwrap_or(0.0));
+            let passes = model.last_metrics.get("speculative_passes").and_then(|value| value.as_u64()).unwrap_or(0);
+            let seconds = model.last_metrics["decode_seconds"].as_f64().unwrap_or(0.0);
+            println!("decode {} tokens: {:.1} tok/s, {passes} passes of {:.2} ms", tokens.len(),
+                     model.last_metrics["decode_tokens_per_second"].as_f64().unwrap_or(0.0),
+                     1e3 * seconds / passes.max(1) as f64);
         }
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
