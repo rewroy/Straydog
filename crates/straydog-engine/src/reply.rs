@@ -1,6 +1,6 @@
-//! The official template's generated text split as an OpenAI answer: reasoning up to
-//! `</think>`, then the answer, then optional `<tool_call>` markup turned into structured
-//! calls. Stop strings end the text first.
+//! A family's generated text split as an OpenAI answer: reasoning up to `</think>`, then the
+//! answer, then optional tool-call markup turned into structured calls ([`Markup`]: Qwen's
+//! `<tool_call>` blocks or DeepSeek-V4.1's DSML). Stop strings end the text first.
 
 use std::sync::LazyLock;
 
@@ -11,6 +11,36 @@ use crate::pyjson::{self, Value};
 
 const THINK_CLOSE: &str = "</think>";
 const TOOL_CALL_OPEN: &str = "<tool_call>";
+/// DSML: the tool calls follow the answer after a blank line (DeepSeek-V4.1's tag names start
+/// with a space).
+const DSML_CALLS_OPEN: &str = "\n\n<｜DSML｜ calls";
+const DSML_CALLS_CLOSE: &str = "</｜DSML｜ calls>";
+const DSML_INVOKE_OPEN: &str = "<｜DSML｜ invoke";
+const DSML_INVOKE_CLOSE: &str = "</｜DSML｜ invoke";
+const DSML_PARAMETER_OPEN: &str = "<｜DSML｜ parameter";
+const DSML_PARAMETER_CLOSE: &str = "/｜DSML｜ parameter";
+
+/// How a family's template marks the end of reasoning and writes tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Markup {
+    /// Qwen: `</think>` and `<tool_call>` count only at a line start, and the answer's leading
+    /// blank lines are the template's.
+    Qwen,
+    /// DeepSeek-V4.1: the first `</think>` ends the reasoning, the answer is verbatim, and a
+    /// `<｜DSML｜ calls>` block after a blank line holds the tool calls.
+    Dsml,
+}
+
+impl Markup {
+    /// The markup of a GGUF architecture's chat template.
+    pub fn of_architecture(architecture: &str) -> Option<Markup> {
+        match architecture {
+            "qwen4exp" => Some(Markup::Qwen),
+            "deepseek41" => Some(Markup::Dsml),
+            _ => None,
+        }
+    }
+}
 // Python's \s: Unicode whitespace and the separators U+001C-U+001F.
 static TOOL_CALL_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<tool_call>[\s\x1c-\x1f]*<function=([^>\s\x1c-\x1f]+)>(.*?)</function>[\s\x1c-\x1f]*</tool_call>")
@@ -18,6 +48,9 @@ static TOOL_CALL_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
 });
 static TOOL_PARAMETER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<parameter=([^>\s\x1c-\x1f]+)>(.*?)</parameter>").unwrap());
+static DSML_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^[\s\x1c-\x1f]*name="(.*?)">\n$"#).unwrap());
+static DSML_PARAMETER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s)^ name="(.*?)" string="(true|false)">(.*?)<$"#).unwrap());
 
 /// Length of the tail of `text` that could be the start of a split `tag`.
 fn split_tail(text: &str, tag: &str) -> usize {
@@ -50,12 +83,17 @@ pub struct ReasoningSplitter {
     carry: String,
     answer_lead: bool,
     line_start: bool,
+    markup: Markup,
 }
 
 impl ReasoningSplitter {
     pub fn new(thinking: bool) -> ReasoningSplitter {
-        // The prompt ends with "<think>\n".
-        ReasoningSplitter { reasoning: thinking, carry: String::new(), answer_lead: true, line_start: true }
+        ReasoningSplitter::with_markup(thinking, Markup::Qwen)
+    }
+
+    pub fn with_markup(thinking: bool, markup: Markup) -> ReasoningSplitter {
+        // The prompt ends with "<think>\n" (Qwen) or "<think>" (DSML).
+        ReasoningSplitter { reasoning: thinking, carry: String::new(), answer_lead: markup == Markup::Qwen, line_start: true, markup }
     }
 
     /// (answer, reasoning) for one delta.
@@ -64,7 +102,11 @@ impl ReasoningSplitter {
             return (self.answer(text), String::new());
         }
         let mut buffer = std::mem::take(&mut self.carry) + text;
-        if let Some(end) = line_tag(&buffer, THINK_CLOSE, self.line_start) {
+        let close = match self.markup {
+            Markup::Qwen => line_tag(&buffer, THINK_CLOSE, self.line_start),
+            Markup::Dsml => buffer.find(THINK_CLOSE),
+        };
+        if let Some(end) = close {
             self.reasoning = false;
             let answer = self.answer(&buffer[end + THINK_CLOSE.len()..]);
             buffer.truncate(end);
@@ -104,6 +146,8 @@ pub struct ToolCall {
     pub name: String,
     /// JSON, as the reference writes it.
     pub arguments: String,
+    /// DSML's tool namespace (`namespace::name`), when the call names one.
+    pub namespace: Option<String>,
 }
 
 /// The template's tool-call markup held back from the answer and parsed at the end. Only
@@ -114,6 +158,7 @@ pub struct ToolCallSplitter {
     carry: String,
     markup: Option<String>,
     line_start: bool,
+    format: Markup,
 }
 
 fn is_string_schema(schema: Option<&Value>) -> bool {
@@ -128,6 +173,10 @@ fn is_string_schema(schema: Option<&Value>) -> bool {
 
 impl ToolCallSplitter {
     pub fn new(tools: Option<&Value>) -> ToolCallSplitter {
+        ToolCallSplitter::with_markup(tools, Markup::Qwen)
+    }
+
+    pub fn with_markup(tools: Option<&Value>, format: Markup) -> ToolCallSplitter {
         let mut string_parameters = Vec::new();
         let list = match tools {
             Some(Value::Array(list)) => list.as_slice(),
@@ -152,6 +201,7 @@ impl ToolCallSplitter {
             carry: String::new(),
             markup: None,
             line_start: true,
+            format,
         }
     }
 
@@ -165,11 +215,15 @@ impl ToolCallSplitter {
             return String::new();
         }
         let mut buffer = std::mem::take(&mut self.carry) + text;
-        if let Some(start) = line_tag(&buffer, TOOL_CALL_OPEN, self.line_start) {
+        let (open, start) = match self.format {
+            Markup::Qwen => (TOOL_CALL_OPEN, line_tag(&buffer, TOOL_CALL_OPEN, self.line_start)),
+            Markup::Dsml => (DSML_CALLS_OPEN, buffer.find(DSML_CALLS_OPEN)),
+        };
+        if let Some(start) = start {
             self.markup = Some(buffer.split_off(start));
             return buffer;
         }
-        let hold = split_tail(&buffer, TOOL_CALL_OPEN);
+        let hold = split_tail(&buffer, open);
         if hold > 0 {
             self.carry = buffer.split_off(buffer.len() - hold);
         }
@@ -183,7 +237,11 @@ impl ToolCallSplitter {
     pub fn finish(&mut self) -> (String, Vec<ToolCall>) {
         let carry = std::mem::take(&mut self.carry);
         let Some(markup) = self.markup.take() else { return (carry, Vec::new()) };
-        match self.parse(&markup) {
+        let parsed = match self.format {
+            Markup::Qwen => self.parse(&markup),
+            Markup::Dsml => parse_dsml(&markup),
+        };
+        match parsed {
             Some(calls) => (carry, calls),
             None => (carry + &markup, Vec::new()),
         }
@@ -221,10 +279,86 @@ impl ToolCallSplitter {
                 id: format!("call_{}", random_hex(24)),
                 name: name.to_string(),
                 arguments: pyjson::dumps(&Value::Object(arguments)),
+                namespace: None,
             });
         }
         Some(calls)
     }
+}
+
+/// The text from `at` to the first of `stops`: (index after the stop, text before it, the stop).
+fn read_until<'a>(text: &'a str, at: usize, stops: &[&'static str]) -> (usize, &'a str, Option<&'static str>) {
+    let found = stops.iter().filter_map(|stop| text[at..].find(stop).map(|position| (at + position, *stop))).min_by_key(|(position, _)| *position);
+    match found {
+        Some((position, stop)) => (position + stop.len(), &text[at..position], Some(stop)),
+        None => (text.len(), &text[at..], None),
+    }
+}
+
+/// DSML tool calls from `\n\n<｜DSML｜ calls` to the end of the text, as the reference's parser reads
+/// them: a string parameter's value is the text itself, any other's is JSON (here it must parse).
+/// None when the markup is not that.
+fn parse_dsml(markup: &str) -> Option<Vec<ToolCall>> {
+    let mut at = markup.strip_prefix(DSML_CALLS_OPEN).map(|_| DSML_CALLS_OPEN.len())?;
+    let mut calls = Vec::new();
+    loop {
+        let (next, between, stop) = read_until(markup, at, &[DSML_INVOKE_OPEN, DSML_CALLS_CLOSE]);
+        if between != ">\n" {
+            return None;
+        }
+        at = next;
+        match stop {
+            Some(DSML_CALLS_CLOSE) => break,
+            None => return None,
+            _ => {}
+        }
+        let (next, header, mut stop) = read_until(markup, at, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
+        at = next;
+        let qualified = DSML_NAME.captures(header)?.get(1)?.as_str();
+        let mut arguments: Vec<String> = Vec::new();
+        let mut names: Vec<&str> = Vec::new();
+        while stop == Some(DSML_PARAMETER_OPEN) {
+            let (next, parameter, _) = read_until(markup, at, &[DSML_PARAMETER_CLOSE]);
+            at = next;
+            let fields = DSML_PARAMETER.captures(parameter)?;
+            let (name, string, value) = (fields.get(1)?.as_str(), &fields[2], fields.get(3)?.as_str());
+            if names.contains(&name) {
+                return None;
+            }
+            names.push(name);
+            let value = if string == "true" {
+                pyjson::dumps(&Value::Str(value.to_string()))
+            } else {
+                pyjson::parse(value).ok()?;
+                value.to_string()
+            };
+            arguments.push(format!("{}: {value}", pyjson::dumps(&Value::Str(name.to_string()))));
+            let (next, between, after) = read_until(markup, at, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
+            if between != ">\n" {
+                return None;
+            }
+            (at, stop) = (next, after);
+        }
+        if stop != Some(DSML_INVOKE_CLOSE) {
+            return None;
+        }
+        let (namespace, name) = match qualified.split_once("::") {
+            Some((namespace, name)) => (Some(namespace.to_string()), name),
+            None => (None, qualified),
+        };
+        if name.contains("::") {
+            return None;
+        }
+        calls.push(ToolCall {
+            index: calls.len(),
+            id: format!("call_{}", random_hex(24)),
+            name: name.to_string(),
+            arguments: format!("{{{}}}", arguments.join(", ")),
+            namespace,
+        });
+    }
+    // Only whitespace may follow (the end-of-sentence token is not text).
+    python_strip(&markup[at..]).is_empty().then_some(calls)
 }
 
 /// Undo the newline the template writes on each side of a value.
@@ -334,6 +468,56 @@ mod tests {
         let markup = "<tool_call>\n<function=read_file>\n</function>\n</tool_call>";
         let (_, answer, calls) = split(&[markup], false, None);
         assert_eq!((answer.as_str(), calls.len()), (markup, 0));
+    }
+
+    fn split_dsml(deltas: &[&str], thinking: bool, tools: Option<&Value>) -> (String, String, Vec<ToolCall>) {
+        let (mut reasoning, mut calls) =
+            (ReasoningSplitter::with_markup(thinking, Markup::Dsml), ToolCallSplitter::with_markup(tools, Markup::Dsml));
+        let (mut thoughts, mut answer) = (String::new(), String::new());
+        for delta in deltas {
+            let (content, thought) = reasoning.feed(delta);
+            thoughts += &thought;
+            answer += &calls.feed(&content);
+        }
+        thoughts += &reasoning.finish();
+        let (late, calls) = calls.finish();
+        (thoughts, answer + &late, calls)
+    }
+
+    /// The reference parser's (DeepSeek-V4.1's encoding.py) results for the same completions.
+    #[test]
+    fn dsml_replies_split_as_the_reference_parses_them() {
+        let (thoughts, answer, calls) = split_dsml(&["Simple arith", "metic.</th", "ink>2 + 2", " = 4."], true, None);
+        assert_eq!((thoughts.as_str(), answer.as_str(), calls.len()), ("Simple arithmetic.", "2 + 2 = 4.", 0));
+        let tools = read_file();
+        let text = "Let me check.</think>I'll look it up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n\
+                    <｜DSML｜ parameter name=\"path\" string=\"true\">a \"b\"\nc</｜DSML｜ parameter>\n\
+                    <｜DSML｜ parameter name=\"limit\" string=\"false\">50</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
+                    <｜DSML｜ invoke name=\"ns::lookup\">\n<｜DSML｜ parameter name=\"q\" string=\"false\">{\"x\": [1, 2]}\
+                    </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        // Every split point: the deltas a stream could bring.
+        for cut in (0..text.len()).filter(|cut| text.is_char_boundary(*cut)).step_by(7) {
+            let (thoughts, answer, calls) = split_dsml(&[&text[..cut], &text[cut..]], true, Some(&tools));
+            assert_eq!((thoughts.as_str(), answer.as_str()), ("Let me check.", "I'll look it up."), "cut at {cut}");
+            assert_eq!(calls.len(), 2);
+            assert_eq!((calls[0].name.as_str(), calls[0].namespace.as_deref()), ("read_file", None));
+            assert_eq!(calls[0].arguments, r#"{"path": "a \"b\"\nc", "limit": 50}"#);
+            assert_eq!((calls[1].name.as_str(), calls[1].namespace.as_deref()), ("lookup", Some("ns")));
+            assert_eq!(calls[1].arguments, r#"{"q": {"x": [1, 2]}}"#);
+        }
+        let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"now\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (_, answer, calls) = split_dsml(&[text], false, Some(&tools));
+        assert_eq!((answer.as_str(), calls.len(), calls[0].arguments.as_str()), ("", 1, "{}"));
+        // Without tools, or not parsing (a value that is not JSON), the markup stays text.
+        let (_, answer, calls) = split_dsml(&[text], false, None);
+        assert_eq!((answer.as_str(), calls.len()), (text, 0));
+        let bad = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">oops\
+                   </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (_, answer, calls) = split_dsml(&["Answer.", bad], false, Some(&tools));
+        assert_eq!((answer, calls.len()), (format!("Answer.{bad}"), 0));
+        // Only the first </think> ends reasoning; a later one is the answer's text.
+        let (thoughts, answer, _) = split_dsml(&["a</think>b</think>c"], true, None);
+        assert_eq!((thoughts.as_str(), answer.as_str()), ("a", "b</think>c"));
     }
 
     #[test]
