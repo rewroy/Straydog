@@ -41,6 +41,11 @@ impl Buffer {
     }
 }
 
+/// A device's rows of each expert for [`Backend::experts`]: gate and up rows [ffn_first,
+/// ffn_first + ffn_rows), down rows [hidden_first, hidden_first + hidden_rows); stages 1 (gate/up),
+/// 2 (down) or 3 (both).
+pub type ExpertSplit = ffi::sd_expert_split;
+
 /// One item of [`Backend::linears`]: `output[t][r] = weights[first_row + r] . input[t]`.
 #[derive(Debug, Clone, Copy)]
 pub struct Linear {
@@ -51,6 +56,20 @@ pub struct Linear {
     pub first_row: u64,
     pub input: P,
     pub output: M,
+}
+
+/// Tensor parallel: on every device, `outs[i]` = the sum of every device's `parts[j]` (`count`
+/// values each), added in device order, each device's stream waiting for the others' parts. A part
+/// stays unchanged until every sum has run.
+pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) -> Result<()> {
+    if outs.len() != devices.len() || parts.len() != devices.len() {
+        return Err("a device sum takes one out and one part per device".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let outs: Vec<*mut f32> = outs.iter().map(|out| out.cast()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
 impl Backend {
@@ -253,12 +272,14 @@ impl Backend {
     }
 
     /// Experts in slots: route `r` of `rows * top_k` (token-major) runs the expert of the slot at
-    /// `bases[r]` (gate, up and down at `offsets` bytes in, of `kinds`): `product[r]` = its clamped
-    /// SwiGLU times `weights[r]`, and `out[t]` (+)= the sum of down . product over the token's routes.
+    /// `bases[r]` (gate, up and down at `offsets` bytes in, of `kinds`; a zero base: a route another
+    /// device runs): `product[r]` = its clamped SwiGLU times `weights[r]`, and `out[t]` (+)= the sum
+    /// of down . product over the token's routes. With `split`, a device's rows of each expert and
+    /// the stages it asks for (see the C header).
     #[allow(clippy::too_many_arguments)]
     pub fn experts(&mut self, bases: &[u64], slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3], hidden: u64, ffn: u64,
                    rows: u64, top_k: u64, input: P, input_stride: u64, weights: Option<P>, clamp: f32, accumulate: bool,
-                   product: M, out: M, out_stride: u64) -> Result<()> {
+                   product: M, out: M, out_stride: u64, split: Option<ExpertSplit>) -> Result<()> {
         if bases.len() as u64 != rows * top_k {
             return Err("expert routes do not match the rows".into());
         }
@@ -267,7 +288,8 @@ impl Backend {
         check(unsafe {
             ffi::sd_op_experts(self.handle(), bases.as_ptr(), slot_bytes, offsets.as_ptr(), kinds.as_ptr(), hidden, ffn, rows, top_k,
                                input.cast(), input_stride, weights.map_or(std::ptr::null(), |w| w.cast()), clamp,
-                               i32::from(accumulate), product.cast(), out.cast(), out_stride)
+                               i32::from(accumulate), product.cast(), out.cast(), out_stride,
+                               split.as_ref().map_or(std::ptr::null(), |split| split as *const ffi::sd_expert_split))
         })
     }
 

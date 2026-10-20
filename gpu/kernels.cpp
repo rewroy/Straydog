@@ -384,6 +384,7 @@ struct Device {
     // sd_op_experts' route addresses (an allocation of slot_route_capacity entries), and the
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
+    hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
     uint8_t* readback = nullptr;
     hipEvent_t readback_done = nullptr;
     size_t readback_bytes = 0;
@@ -447,6 +448,7 @@ struct Device {
         if (exchange) cleanup(hipHostFree(exchange));
         if (readback) cleanup(hipHostFree(readback));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
+        if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
         if (copy_stream) cleanup(hipStreamDestroy(copy_stream));
         if (swapped) cleanup(hipEventDestroy(swapped));
@@ -2510,38 +2512,116 @@ int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t group
     SD_OP_END
 }
 
+// out = the sum of every device's part, in device order (so every device adds the same values the
+// same way), the other devices' parts read over the peer link at system scope (never a stale line).
+constexpr size_t sum_devices_max = 8;
+struct DeviceParts { const float* parts[sum_devices_max]; };
+__global__ void sum_devices_kernel(DeviceParts list, unsigned devices, size_t count, float* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    float sum = __hip_atomic_load(list.parts[0] + index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    for (unsigned d = 1; d < devices; ++d) sum += __hip_atomic_load(list.parts[d] + index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    out[index] = sum;
+}
+
+int sd_op_sum_devices(void* const* handles, float* const* outs, const float* const* parts, uint64_t devices, uint64_t count) {
+    try {
+        if (!handles || !outs || !parts || devices < 1 || devices > sum_devices_max || !count)
+            throw std::runtime_error("invalid Straydog device sum");
+        std::vector<Device*> list;
+        DeviceParts all{};
+        for (size_t i = 0; i < devices; ++i) {
+            Device& d = device(handles[i]);
+            for (Device* other : list) if (other == &d) throw std::runtime_error("a device twice in a Straydog device sum");
+            op_span(d, parts[i], size_t(count) * 4, "a device's part");
+            op_span(d, outs[i], size_t(count) * 4, "a device's sum");
+            for (size_t j = 0; j < devices; ++j)
+                if (static_cast<const void*>(outs[i]) == static_cast<const void*>(parts[j]))
+                    throw std::runtime_error("a device sum cannot overwrite a part");
+            list.push_back(&d);
+            all.parts[i] = parts[i];
+        }
+        // Peer access, once per pair (a device without it cannot take part).
+        static std::mutex mutex;
+        static std::vector<std::pair<int, int>> linked;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (Device* a : list)
+                for (Device* b : list) {
+                    if (a == b || std::find(linked.begin(), linked.end(), std::make_pair(a->ordinal, b->ordinal)) != linked.end()) continue;
+                    int can = 0;
+                    check(hipDeviceCanAccessPeer(&can, a->ordinal, b->ordinal));
+                    if (!can) throw std::runtime_error("Straydog devices without peer access cannot sum their parts");
+                    on_device(a->ordinal, [&]() {
+                        const hipError_t state = hipDeviceEnablePeerAccess(b->ordinal, 0);
+                        if (state == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
+                        else check(state);
+                    });
+                    linked.emplace_back(a->ordinal, b->ordinal);
+                }
+        }
+        // Every part's end is marked before any device waits, so no device waits for another's sum.
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
+                check(hipEventRecord(d->parts_ready, d->stream));
+            });
+        for (size_t i = 0; i < devices; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                for (size_t j = 0; j < devices; ++j)
+                    if (j != i) check(hipStreamWaitEvent(list[i]->stream, list[j]->parts_ready, 0));
+                sum_devices_kernel<<<unsigned((count + 255) / 256), 256, 0, list[i]->stream>>>(all, unsigned(devices), size_t(count),
+                                                                                             outs[i]);
+                check(hipGetLastError());
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 constexpr size_t slot_route_capacity = 65536;
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds,
                   uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride,
-                  const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride) {
+                  const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride,
+                  const sd_expert_split* split) {
     SD_OP_BEGIN
     input_stride = input_stride ? input_stride : hidden;
     out_stride = out_stride ? out_stride : hidden;
+    const sd_expert_split whole{0, ffn, 0, hidden, 3};
+    const sd_expert_split& part = split ? *split : whole;
     if (!bases || !offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 ||
-        rows * top_k > slot_route_capacity || input_stride < hidden || out_stride < hidden || !(clamp >= 0.0f))
+        rows * top_k > slot_route_capacity || input_stride < hidden || out_stride < hidden || !(clamp >= 0.0f) ||
+        part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
+        part.hidden_first > hidden - part.hidden_rows)
         throw std::runtime_error("invalid Straydog experts shape");
     SlotExperts plan{};
     for (int role = 0; role < 3; ++role) {
-        const size_t matrix_rows = size_t(role == 2 ? hidden : ffn), cols = size_t(role == 2 ? ffn : hidden);
+        const size_t matrix_rows = size_t(role == 2 ? part.hidden_rows : part.ffn_rows), cols = size_t(role == 2 ? ffn : hidden);
         const size_t row_bytes = matrix_row_bytes(kinds[role], cols);
         if (offsets[role] > slot_bytes || matrix_rows * row_bytes > slot_bytes - offsets[role])
             throw std::runtime_error("an expert's matrices lie outside its slot");
         plan.role[role] = {reinterpret_cast<const uint8_t*>(offsets[role]), row_bytes, matrix_rows, cols, 0, 0, 0, kinds[role]};
     }
     for (size_t route = 0; route < size_t(rows * top_k); ++route) {
+        if (!bases[route]) continue;   // a route another device runs
         if (bases[route] % 256) throw std::runtime_error("an expert slot is not 256-byte aligned");
         op_span(value, reinterpret_cast<const void*>(bases[route]), size_t(slot_bytes), "an expert slot");
     }
-    op_span(value, input, size_t((rows - 1) * input_stride + hidden) * 4, "an expert input");
-    if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
+    if (part.stages & 1) {
+        op_span(value, input, size_t((rows - 1) * input_stride + hidden) * 4, "an expert input");
+        if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
+    }
     op_span(value, product, size_t(rows * top_k * ffn) * 4, "an expert product");
-    op_span(value, out, size_t((rows - 1) * out_stride + hidden) * 4, "an expert output");
+    if (part.stages & 2) op_span(value, out, size_t((rows - 1) * out_stride + hidden) * 4, "an expert output");
     plan.top_k = uint32_t(top_k);
+    plan.product_stride = uint32_t(ffn);
+    plan.product_first = uint32_t(part.ffn_first);
+    plan.out_first = uint32_t(part.hidden_first);
     plan.clamp = clamp;
     plan.accumulate = accumulate ? 1 : 0;
     if (!value.slot_routes) value.slot_routes = static_cast<uint64_t*>(allocate(value, slot_route_capacity * 8));
     upload(value, value.slot_routes, bases, size_t(rows * top_k) * 8);
-    slot_experts(value, plan, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out, size_t(out_stride));
+    slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
+                 size_t(out_stride));
     SD_OP_END
 }
 

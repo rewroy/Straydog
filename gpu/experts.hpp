@@ -295,10 +295,13 @@ void expert_rows(Device& d, void* const* pointers, const int* kinds, size_t expe
 
 // ---- Experts in slots: decode over a cache of whole experts ----
 // A route's expert is a slot at bases[route] holding its gate, up and down matrices at byte offsets
-// role[r].data within it (a slot cache's layout, or a dense expert's). One launch per stage takes
-// every route of `tokens` rows: gate and up rows share a lane group, so SwiGLU (clamped, times the
-// route's weight) is formed before the store; down sums a row over the token's routes into `out`.
-struct SlotExperts { Matrix role[3]; uint32_t top_k, lanes[2], waves[2], accumulate; float clamp; };
+// role[r].data within it (a slot cache's layout, or a dense expert's); a zero base is a route this
+// device does not run (another holds its expert). One launch per stage takes every route of
+// `tokens` rows: gate and up rows share a lane group, so SwiGLU (clamped, times the route's
+// weight) is formed before the store; down sums a row over the token's routes into `out`.
+// With experts split across devices (tensor parallel), a device holds rows of each: product rows are
+// product_stride apart with this device's at product_first, and its down rows land at out_first.
+struct SlotExperts { Matrix role[3]; uint32_t top_k, lanes[2], waves[2], accumulate, product_stride, product_first, out_first; float clamp; };
 
 __host__ __device__ constexpr bool slot_heavy(int kind) {
     return kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23;
@@ -360,6 +363,7 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
     if (route >= plan.top_k) return;
     const size_t index = size_t(blockIdx.y) * plan.top_k + route;
     const uint8_t* base = reinterpret_cast<const uint8_t*>(bases[index]);
+    if (!base) return;
     const Matrix& gate = plan.role[0];
     const unsigned lanes = plan.lanes[0], lane = threadIdx.x % 32, sub = lane % lanes;
     const Matrix& up = plan.role[1];
@@ -371,7 +375,7 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
     u = slot_reduce(u, lanes);
     if (sub || row >= gate.rows) return;
     if (plan.clamp > 0.0f) { g = fminf(g, plan.clamp); u = fminf(fmaxf(u, -plan.clamp), plan.clamp); }
-    product[index * gate.rows + row] = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
+    product[index * plan.product_stride + plan.product_first + row] = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
 }
 // blockIdx.y selects a token; the waves cover the output rows, each summed over the token's routes
 // in route order, then added to `out` (or stored, without `accumulate`).
@@ -386,19 +390,20 @@ __global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* 
     float sum = 0.0f, unused = 0.0f;
     for (size_t route = 0; route < plan.top_k; ++route) {
         const size_t index = size_t(blockIdx.y) * plan.top_k + route;
+        if (!bases[index]) continue;
         slot_dots<kind>(reinterpret_cast<const uint8_t*>(bases[index]) + at, nullptr, down.kind, down.kind, down.cols, lanes, sub,
-                        product + index * down.cols, sum, unused);
+                        product + index * plan.product_stride, sum, unused);
     }
     sum = slot_reduce(sum, lanes);
     if (sub || row >= down.rows) return;
-    float* target = out + size_t(blockIdx.y) * out_stride + row;
+    float* target = out + size_t(blockIdx.y) * out_stride + plan.out_first + row;
     *target = plan.accumulate ? *target + sum : sum;
 }
-// Both stages for `tokens` rows: product = SwiGLU of every route (tokens x top_k x ffn), then out.
-// Lanes per row as the GEMV chooses them; a format without units, or gate and up of different
-// formats, takes the reference decoder a row per wave.
-void slot_experts(Device& d, SlotExperts plan, const uint64_t* bases, size_t tokens, const float* input, size_t input_stride,
-                  const float* weights, float* product, float* out, size_t out_stride) {
+// The stages (1 gate/up, 2 down) for `tokens` rows: product = SwiGLU of every route (tokens x top_k
+// rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
+// of different formats, takes the reference decoder a row per wave.
+void slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases, size_t tokens, const float* input,
+                  size_t input_stride, const float* weights, float* product, float* out, size_t out_stride) {
     const Matrix &gate = plan.role[0], &up = plan.role[1], &down = plan.role[2];
     auto fast = [](int kind) {
         switch (kind) {
@@ -422,12 +427,15 @@ void slot_experts(Device& d, SlotExperts plan, const uint64_t* bases, size_t tok
     const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));
     #define SD_SLOT_GATE(format) case format: \
         slot_gate_up<format><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product); break;
-    switch (gate_kind) {
-        SD_FAST_FORMATS(SD_SLOT_GATE)
-        default: slot_gate_up<-1><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);
+    if (stages & 1) {
+        switch (gate_kind) {
+            SD_FAST_FORMATS(SD_SLOT_GATE)
+            default: slot_gate_up<-1><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);
+        }
+        check(hipGetLastError());
     }
     #undef SD_SLOT_GATE
-    check(hipGetLastError());
+    if (!(stages & 2)) return;
     #define SD_SLOT_DOWN(format) case format: \
         slot_down<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride); break;
     switch (down_kind) {

@@ -29,7 +29,7 @@ fn roles() -> Vec<Option<Vec<Role>>> {
     let mut base = 1234u64;
     let mut layer = || {
         Some(STRIDES.iter().map(|&stride| {
-            let role = Role { file: 0, base, stride };
+            let role = Role { file: 0, base, stride, bytes: stride };
             base += stride * EXPERTS as u64 + 777;
             role
         }).collect::<Vec<_>>())

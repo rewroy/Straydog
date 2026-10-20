@@ -120,9 +120,22 @@ int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t co
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 /* Experts in slots: route r (rows * top_k of them, token-major) runs the expert at bases[r], a slot
    of slot_bytes holding its gate and up (ffn x hidden) and down (hidden x ffn) matrices at byte
-   offsets[0..2]; product[r] = SwiGLU of the route (clamped, times weights[r] when given) and
-   out[t] (+)= the sum over the token's routes of down . product, added when accumulate is set. */
-int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride);
+   offsets[0..2] (a zero base: a route another device runs); product[r] = SwiGLU of the route
+   (clamped, times weights[r] when given) and out[t] (+)= the sum over the token's routes of
+   down . product, added when accumulate is set.
+   With split (else whole experts, both stages): a device's rows of each expert (tensor parallel),
+   gate and up rows [ffn_first, ffn_first + ffn_rows) writing product[r][ffn_first ..] (rows of ffn
+   values), down rows [hidden_first, hidden_first + hidden_rows) writing out[t][hidden_first ..];
+   stages 1 runs gate/up, 2 down (from the whole product), 3 both. */
+typedef struct sd_expert_split {
+    uint64_t ffn_first, ffn_rows, hidden_first, hidden_rows;
+    int stages;
+} sd_expert_split;
+int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride, const sd_expert_split* split);
+/* Tensor parallel: every device's outs[i] = parts[0] + parts[1] + ... (count values, in device
+   order), each device's stream waiting for the others' parts and reading them over peer access.
+   A part must stay unchanged until every device's sum has run; an out is never a part. */
+int sd_op_sum_devices(void* const* handles, float* const* outs, const float* const* parts, uint64_t devices, uint64_t count);
 /* Latent attention: each query attends to the window rows of `raw` ending at its position
    (position p in row p % raw_rows, so `raw` may be a ring) and
    the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio

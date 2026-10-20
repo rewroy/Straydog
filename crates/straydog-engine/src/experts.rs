@@ -32,13 +32,14 @@ const CHUNK: u64 = 256 << 10;
 /// from the start (page-locking costs ~0.4 s per GiB: never in a pass's way).
 const ARENA: usize = 1 << 30;
 
-/// A tensor of a layer's experts: expert `e`'s bytes are `stride` bytes at `base + e * stride` of
-/// file `file`.
+/// A tensor of a layer's experts: expert `e`'s bytes are `bytes` bytes at `base + e * stride` of
+/// file `file` (its whole matrix, `bytes == stride`, or a device's rows of it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Role {
     pub file: usize,
     pub base: u64,
     pub stride: u64,
+    pub bytes: u64,
 }
 
 /// Checks a drive read of `file` at `offset` (whole aligned blocks) before its first use.
@@ -64,6 +65,9 @@ impl Layout {
             if role.file >= files.len() {
                 return Err("an expert role names a file that is not given".into());
             }
+            if role.bytes == 0 || role.bytes > role.stride {
+                return Err("an expert role's bytes exceed its stride".into());
+            }
         }
         Ok(Layout { files, layers, verifier })
     }
@@ -74,15 +78,15 @@ impl Layout {
 
     /// An expert's bytes in a VRAM slot: its roles one after another.
     pub fn slot_bytes(&self) -> u64 {
-        self.layers.iter().flatten().map(|roles| roles.iter().map(|role| role.stride).sum()).max().unwrap_or(0)
+        self.layers.iter().flatten().map(|roles| roles.iter().map(|role| role.bytes).sum()).max().unwrap_or(0)
     }
 
     /// An expert's bytes in a host slot: room for either of its layouts there (read: each role's
     /// whole blocks; written back: the VRAM slot's).
     fn host_bytes(&self) -> u64 {
         self.layers.iter().flatten().map(|roles| {
-            let read: u64 = roles.iter().map(|role| role.stride.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
-            read.max(roles.iter().map(|role| role.stride).sum())
+            let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
+            read.max(roles.iter().map(|role| role.bytes).sum())
         }).max().unwrap_or(0).next_multiple_of(ALIGN as u64)
     }
 
@@ -92,8 +96,8 @@ impl Layout {
         self.roles(layer)?.iter().map(|role| {
             let start = role.base + expert as u64 * role.stride;
             let offset = start & !(ALIGN as u64 - 1);
-            let len = (start + role.stride - offset).next_multiple_of(ALIGN as u64);
-            let span = Span { file: role.file, offset, len, at, data: at + (start - offset), bytes: role.stride };
+            let len = (start + role.bytes - offset).next_multiple_of(ALIGN as u64);
+            let span = Span { file: role.file, offset, len, at, data: at + (start - offset), bytes: role.bytes };
             at += len;
             Ok(span)
         }).collect()
@@ -325,6 +329,26 @@ pub struct Counts {
     pub store_seconds: f64,
 }
 
+impl std::ops::Add for Counts {
+    type Output = Counts;
+
+    /// Two stores' counters together (the devices of one engine).
+    fn add(self, other: Counts) -> Counts {
+        Counts {
+            hits: self.hits + other.hits,
+            host_hits: self.host_hits + other.host_hits,
+            drive_reads: self.drive_reads + other.drive_reads,
+            writebacks: self.writebacks + other.writebacks,
+            prefetched: self.prefetched + other.prefetched,
+            prefetch_unused: self.prefetch_unused + other.prefetch_unused,
+            wait_seconds: self.wait_seconds + other.wait_seconds,
+            slot_wait_seconds: self.slot_wait_seconds + other.slot_wait_seconds,
+            pin_seconds: self.pin_seconds + other.pin_seconds,
+            store_seconds: self.store_seconds + other.store_seconds,
+        }
+    }
+}
+
 /// One device's expert slots, and its share of the host tier.
 pub struct DeviceExperts {
     layout: Arc<Layout>,
@@ -345,6 +369,8 @@ pub struct DeviceExperts {
     clock: u64,
     /// Slots acquired since the last release, kept from eviction until then.
     in_use: Vec<usize>,
+    /// Experts [`request`](Self::request)ed for the next acquire: already counted.
+    requested: Vec<Key>,
     /// Free VRAM slots kept ahead of need, their experts written back meanwhile.
     reserve: usize,
     counts: Counts,
@@ -371,7 +397,7 @@ impl DeviceExperts {
             layout, reader, vram, vram_slot_bytes,
             slots: (0..slots).map(|_| VramSlot { key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false }).collect(),
             map: HashMap::new(), host_slot_bytes, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), host: Vec::new(),
-            host_map: HashMap::new(), done_tx, done_rx, clock: 0, in_use: Vec::new(), reserve,
+            host_map: HashMap::new(), done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), reserve,
             counts: Counts::default(), settled: false,
         })
     }
@@ -399,14 +425,49 @@ impl DeviceExperts {
         result
     }
 
+    /// Start the fills of these experts of `layer` that are missing (as urgent as an acquire's),
+    /// without waiting: when several devices each acquire, every device's reads start before any
+    /// waits. The next [`acquire`](Self::acquire) takes them (counted here) and waits.
+    pub fn request(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<()> {
+        self.settled = false;
+        let started = std::time::Instant::now();
+        let result = (|| {
+            self.pump(gpu, false)?;
+            // Hits first, as in acquire; all kept from eviction until the acquire's release.
+            for &expert in experts {
+                let key = (layer as u32, expert as u32);
+                if let Some(&slot) = self.map.get(&key) {
+                    self.counts.hits += 1;
+                    self.in_use.push(slot);
+                    self.requested.push(key);
+                }
+            }
+            for &expert in experts {
+                let key = (layer as u32, expert as u32);
+                if !self.map.contains_key(&key) {
+                    let slot = self.fill(gpu, key, true)?;
+                    self.in_use.push(slot);
+                    self.requested.push(key);
+                }
+            }
+            Ok(())
+        })();
+        self.counts.store_seconds += started.elapsed().as_secs_f64();
+        result
+    }
+
     fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
         self.pump(gpu, false)?;
         // Every hit is held before any miss is filled: a miss never evicts a slot this same
-        // request uses later.
+        // request uses later. Experts a request() started were counted there.
+        let requested = std::mem::take(&mut self.requested);
         let mut slots = vec![usize::MAX; experts.len()];
         for (index, &expert) in experts.iter().enumerate() {
-            if let Some(&slot) = self.map.get(&(layer as u32, expert as u32)) {
-                self.counts.hits += 1;
+            let key = (layer as u32, expert as u32);
+            if let Some(&slot) = self.map.get(&key) {
+                if !requested.contains(&key) {
+                    self.counts.hits += 1;
+                }
                 self.hold(slot);
                 slots[index] = slot;
             }
@@ -548,7 +609,7 @@ impl DeviceExperts {
             }
             Content::Packed(written) => {
                 gpu.wait_mark(Stream::Upload, written)?;
-                let bytes: u64 = self.layout.roles(layer as usize)?.iter().map(|role| role.stride).sum();
+                let bytes: u64 = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).sum();
                 // SAFETY: as above.
                 unsafe { gpu.transfer(Stream::Upload, &target, 0, base, bytes)? };
             }
@@ -706,7 +767,7 @@ impl DeviceExperts {
             return Ok(());
         }
         let host = self.free_host(gpu)?;
-        let bytes: u64 = self.layout.roles(key.0 as usize)?.iter().map(|role| role.stride).sum();
+        let bytes: u64 = self.layout.roles(key.0 as usize)?.iter().map(|role| role.bytes).sum();
         if let Some(ready) = self.slots[slot].ready.take() {
             gpu.wait_mark(Stream::Download, ready)?;
         }

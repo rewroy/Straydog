@@ -496,6 +496,15 @@ unsafe extern "C" {
         out_rows: u64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_expert_split {
+    pub ffn_first: u64,
+    pub ffn_rows: u64,
+    pub hidden_first: u64,
+    pub hidden_rows: u64,
+    pub stages: ::std::os::raw::c_int,
+}
 unsafe extern "C" {
     pub fn sd_op_experts(
         handle: *mut ::std::os::raw::c_void,
@@ -515,6 +524,16 @@ unsafe extern "C" {
         product: *mut f32,
         out: *mut f32,
         out_stride: u64,
+        split: *const sd_expert_split,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_sum_devices(
+        handles: *const *mut ::std::os::raw::c_void,
+        outs: *const *mut f32,
+        parts: *const *const f32,
+        devices: u64,
+        count: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

@@ -1,12 +1,14 @@
 //! DeepSeek-V4.1 through the engine (arch::deepseek41::engine): a prompt prefilled in chunks,
 //! its last logits checked against the CPU reference, then greedy decoding with its speed and
 //! where its experts came from. Development only (unauthenticated weights). With --split L, layers
-//! 0..L run on GPU 0 and the rest on GPU 1, each with --slots expert slots and --host-gb GB of host
-//! tier.
+//! 0..L run on GPU 0 and the rest on GPU 1; with --tp N, every layer is split across GPUs 0..N
+//! (each with its share of the routed experts). Each GPU has --slots expert slots and its share of
+//! --host-gb GB of host tier.
 //!
 //! Several TOKENS files (comma separated) run one after another, as a server's requests.
 //!
-//! ds41_chat SHARD_DIR TOKENS[,TOKENS...] ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N]
+//! ds41_chat SHARD_DIR TOKENS[,TOKENS...] ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] [--split L] [--tp N]
+//!     [--host-gb N]
 
 #[path = "common/files.rs"]
 mod files;
@@ -25,23 +27,27 @@ fn main() -> Result<(), String> {
         value
     });
     let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 32), option("--slots", 1500), option("--split", 0));
-    let host_gb = option("--host-gb", 0);
+    let (host_gb, tp) = (option("--host-gb", 0), option("--tp", 1));
     let [dir, tokens_files, oracle, tokenizer] = &args[..] else {
         return Err("usage: ds41_chat SHARD_DIR TOKENS[,TOKENS...] ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] \
-                    [--split L] [--host-gb N]".into());
+                    [--split L] [--tp N] [--host-gb N]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
     let vocabulary = hp.vocabulary;
     let started = std::time::Instant::now();
     let layers = hp.layers.len();
+    if split != 0 && tp > 1 {
+        return Err("--split and --tp do not combine".into());
+    }
     let parts: Vec<_> = if split == 0 { std::iter::once(0..layers).collect() } else { vec![0..split, split..layers] };
-    let parts_count = parts.len() as u64;
+    let devices = (parts.len() * tp) as u64;
     let mut engines = Vec::new();
-    for (device, part) in parts.into_iter().enumerate() {
-        let settings = Settings { context: 8192, batch: 64, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / parts_count,
+    for (index, part) in parts.into_iter().enumerate() {
+        let settings = Settings { context: 8192, batch: 64, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / devices,
                                   scratch_bytes: 512 << 20, layers: part };
-        engines.push(Engine::new(hp.clone(), &files, device, 31 << 30, settings)?);
+        let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
+        engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
     // VRAM hits, host-tier hits, drive reads, seconds: waiting for the drive, for host slots,
     // page-locking, in the store
