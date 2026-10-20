@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "runtime_gpu"
 harness = false
 
+[[test]]
+name = "runtime_controls"
+harness = false
+
 [features]
 # The GPU backend linked into the executable.
 hip = ["straydog-engine/hip"]

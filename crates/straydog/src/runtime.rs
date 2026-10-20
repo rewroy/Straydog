@@ -26,6 +26,9 @@ const QUEUE: usize = 4;
 const STDERR_TAIL: usize = 8192;
 /// Finished generations the dashboard keeps.
 const RECENT: usize = 120;
+/// A client that takes none of its generation's events for this long has gone: the generation
+/// is cancelled (its events channel holds 64, so a reader that keeps up never waits this long).
+const SEND_PATIENCE: Duration = Duration::from_secs(30);
 
 /// The program and arguments that start the worker (isolated, in production).
 pub type Command = (PathBuf, Vec<OsString>);
@@ -604,11 +607,34 @@ impl Driver {
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
-                    if forwarding && job.events.send(event).await.is_err() {
-                        // The client went away: end the generation, keep reading until it ends.
-                        forwarding = false;
-                        process.send(&cancel_frame).await?;
-                        cancel_deadline = Some(Instant::now() + Duration::from_secs(10));
+                    if forwarding {
+                        // Wait for room in the client's channel while still taking control
+                        // messages: a client that reads slowly must not hold up an interrupt, a
+                        // cancel or the queue.
+                        let patience = tokio::time::sleep(SEND_PATIENCE);
+                        tokio::pin!(patience);
+                        let mut pending = Some(event);
+                        while let Some(event) = pending.take() {
+                            tokio::select! {
+                                biased;
+                                permit = job.events.reserve() => match permit {
+                                    Ok(permit) => permit.send(event),
+                                    // The client went away: end the generation, keep reading until it ends.
+                                    Err(_) => stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?,
+                                },
+                                Some(control) = controls.recv() => {
+                                    self.control(process, job, control, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?;
+                                    if forwarding {
+                                        pending = Some(event);
+                                    }
+                                }
+                                () = &mut patience => {
+                                    tracing::warn!("Straydog client took no events for {} s: cancelling its generation",
+                                                   SEND_PATIENCE.as_secs());
+                                    stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?;
+                                }
+                            }
+                        }
                     }
                     if kind == "done" || kind == "error" {
                         if fatal {
@@ -617,20 +643,38 @@ impl Driver {
                         return Ok(());
                     }
                 }
-                Some(control) = controls.recv() => match control {
-                    Control::Interrupt(id) if id == job.id => process.send(&cancel_frame).await?,
-                    Control::Cancel(id) if id == job.id => {
-                        forwarding = false;
-                        process.send(&cancel_frame).await?;
-                        cancel_deadline.get_or_insert(Instant::now() + Duration::from_secs(10));
-                    }
-                    // A queued generation's client left: skip it when its turn comes.
-                    Control::Cancel(id) => { self.shared.cancelled.lock().unwrap().insert(id); }
-                    Control::Interrupt(_) => {}
-                },
+                Some(control) = controls.recv() => {
+                    self.control(process, job, control, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?;
+                }
             }
         }
     }
+
+    /// A control message during `job`'s generation.
+    async fn control(&self, process: &mut Process, job: &Job, control: Control, cancel_frame: &pyjson::Value,
+                     forwarding: &mut bool, cancel_deadline: &mut Option<Instant>) -> Result<(), String> {
+        match control {
+            Control::Interrupt(id) if id == job.id => process.send(cancel_frame).await?,
+            Control::Cancel(id) if id == job.id => stop_forwarding(process, cancel_frame, forwarding, cancel_deadline).await?,
+            // A queued generation's client left: skip it when its turn comes.
+            Control::Cancel(id) => {
+                self.shared.cancelled.lock().unwrap().insert(id);
+            }
+            Control::Interrupt(_) => {}
+        }
+        Ok(())
+    }
+}
+
+/// Stop sending a generation's events and end it; the worker has 10 s to acknowledge.
+async fn stop_forwarding(process: &mut Process, cancel_frame: &pyjson::Value, forwarding: &mut bool,
+                         cancel_deadline: &mut Option<Instant>) -> Result<(), String> {
+    if *forwarding {
+        *forwarding = false;
+        process.send(cancel_frame).await?;
+    }
+    cancel_deadline.get_or_insert(Instant::now() + Duration::from_secs(10));
+    Ok(())
 }
 
 /// Cancels a generation whose events stream is dropped before it ended.
