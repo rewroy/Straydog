@@ -164,6 +164,19 @@ int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out);
 int sd_cpu_rows(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
 int sd_quantize_q2_0(const uint16_t* input, uint64_t count, uint8_t* output);
 
+/* Formats: the routed expert kernels at any layer shape, for tests and measurements. `banks` are the
+   gate and up (`experts` matrices of ffn x hidden each) and down (hidden x ffn) allocations of
+   kinds[0..2]; each of `steps` input rows (hidden values) goes to its top_k experts in `selected`.
+   path 0 runs the decode GEMV (F32); path 1 the RDNA4 grouped WMMA GEMM (FP16 operands, F32 sums).
+   Outputs per route, token-major, each optional: gate_up (the gate then the up row, before the
+   activation), product (SiLU(gate) * up; rounded to FP16 on path 1) and output (down of the product,
+   or of down_input when given, which then needs no input). timings (optional) receives the
+   milliseconds of the gate/up and the down kernels (zero for a stage not run; path 1 times its fused
+   gate/up kernel, which runs for product and output). */
+int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t experts, uint64_t hidden, uint64_t ffn,
+                   uint64_t steps, uint64_t top_k, const int32_t* selected, int path, const float* input,
+                   const float* down_input, float* gate_up, float* product, float* output, double* timings);
+
 #ifdef __cplusplus
 }
 #endif

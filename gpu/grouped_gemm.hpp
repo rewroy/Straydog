@@ -2,6 +2,9 @@
 // shared K tile once, then reused by sixteen routed input rows in FP32 accumulators.
 struct MoeGroup { Matrix weights[3]; size_t first,count; int half; };
 struct MoeTile { uint32_t group,first; };
+// An expert layer's shape: hidden (gate/up K, down N), the expert width ffn (gate/up N, down K)
+// and the routed rows per token (shared rows follow all routed ones).
+struct MoeShape { uint32_t hidden, ffn, top_k; };
 
 __device__ float grouped_weight(const Matrix& matrix, size_t row, size_t column) {
     const uint8_t* data=matrix.data+row*matrix.row_bytes;

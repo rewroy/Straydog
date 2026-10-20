@@ -910,3 +910,23 @@ unsafe extern "C" {
         output: *mut u8,
     ) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn sd_expert_rows(
+        handle: *mut ::std::os::raw::c_void,
+        banks: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        experts: u64,
+        hidden: u64,
+        ffn: u64,
+        steps: u64,
+        top_k: u64,
+        selected: *const i32,
+        path: ::std::os::raw::c_int,
+        input: *const f32,
+        down_input: *const f32,
+        gate_up: *mut f32,
+        product: *mut f32,
+        output: *mut f32,
+        timings: *mut f64,
+    ) -> ::std::os::raw::c_int;
+}

@@ -917,6 +917,7 @@ Device& device(void* handle) {
 #include "sparse_attention.hpp"
 #include "hybrid_slots.hpp"
 #include "resident_moe.hpp"
+#include "experts.hpp"
 #include "hybrid_moe.hpp"
 #include "qsa_decode.hpp"
 #include "prefill_batch.hpp"
@@ -2178,5 +2179,15 @@ int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t group
     op_span(value, out, size_t(rows * k) * 4, "top-k indices");
     op_top_k_kernel<<<unsigned(rows), 256, size_t(groups) * 4, value.stream>>>(scores, size_t(groups), size_t(k), out);
     SD_OP_END
+}
+
+int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t experts, uint64_t hidden, uint64_t ffn,
+                   uint64_t steps, uint64_t top_k, const int32_t* selected, int path, const float* input,
+                   const float* down_input, float* gate_up, float* product, float* output, double* timings) {
+    try {
+        expert_rows(device(handle), banks, kinds, size_t(experts), size_t(hidden), size_t(ffn), size_t(steps), size_t(top_k),
+                    selected, path, input, down_input, gate_up, product, output, timings);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 } // extern C

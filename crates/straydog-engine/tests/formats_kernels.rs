@@ -1,16 +1,20 @@
 //! The formats' kernels against the host decoders (formats.rs, themselves checked against ggml's
 //! definitions in tests/formats.rs): the CPU expert engine's block decoders, row kernels and
-//! experts, and the GPU's linear products (sd_op_linear: GEMV for up to four inputs, an F32 GEMM
-//! over expanded rows beyond), on DeepSeek-V4.1's real tensors and on generated blocks.
+//! experts; the GPU's linear products (sd_op_linear: GEMV for up to four inputs, an F32 GEMM over
+//! expanded rows beyond); and the GPU's routed expert kernels (sd_expert_rows: the decode GEMV and
+//! the RDNA4 grouped WMMA GEMM) at DeepSeek-V4.1's expert shapes. On its real tensors, and on
+//! generated blocks (MXFP4, which no file on hand has).
 //!
-//! Every weight is checked exactly: one-hot inputs make each kernel return single decoded values.
+//! Every weight is checked exactly: one-hot inputs make each kernel return single decoded values
+//! (F32, or rounded to FP16 for the WMMA GEMM, whose products of FP16 operands are exact in F32).
 //! Random inputs then check the sums against an F64 reference within the bound of F32 summation
 //! alone: n u sum|terms| for n terms (u = 2^-24), the terms being the decoded weights times the
-//! inputs. The GEMV and CPU kernels sum codes and subtract biases or minimums per group, terms of
-//! up to about three times a weight's size, so their bound takes 4 n u.
+//! inputs (rounded to FP16 for the WMMA GEMM). The GEMV and CPU kernels sum codes and subtract
+//! biases or minimums per group, terms of up to about three times a weight's size, so their bound
+//! takes 4 n u.
 //!
 //! cargo test --release -p straydog-engine --features hip --test formats_kernels, under the GPU
-//! lock. The model cases read about 100 MB of DeepSeek-V4.1-Flash UD-IQ2_XXS: set
+//! lock. The model cases read about 300 MB of DeepSeek-V4.1-Flash UD-IQ2_XXS: set
 //! STRAYDOG_DEEPSEEK to its directory.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
@@ -41,6 +45,17 @@ impl Random {
         let value = (0..4).map(|_| self.uniform()).sum::<f64>() - 2.0;
         (if self.next().is_multiple_of(64) { value * 20.0 } else { value }) as f32
     }
+}
+
+/// The FP16 value nearest x (ties to even), as F32.
+fn round_f16(x: f32) -> f32 {
+    let magnitude = x.abs();
+    if magnitude >= 65520.0 {
+        return f32::INFINITY.copysign(x);
+    }
+    let exponent = if magnitude < 2f32.powi(-14) { -24 } else { ((magnitude.to_bits() >> 23) as i32 - 127) - 10 };
+    let quantum = 2f64.powi(exponent);
+    ((f64::from(magnitude) / quantum).round_ties_even() * quantum).copysign(f64::from(x)) as f32
 }
 
 fn decode(kind: u32, data: &[u8]) -> Vec<f32> {
@@ -355,11 +370,188 @@ impl Banks {
         Banks { label: format!("layer {layer}"), kinds, experts: which.len(), data: roles.map(|role| role.1) }
     }
 
+    fn shared(shards: &Shards, layer: usize) -> Banks {
+        let roles = ["gate", "up", "down"].map(|role| shards.experts(&format!("blk.{layer}.ffn_{role}_shexp.weight"), &[0]));
+        let kinds = [roles[0].0, roles[1].0, roles[2].0];
+        Banks { label: format!("layer {layer} shared"), kinds, experts: 1, data: roles.map(|role| role.1) }
+    }
+
+    /// MXFP4 banks of generated blocks (no file on hand has MXFP4 experts).
+    fn mxfp4(experts: usize) -> Banks {
+        let mut random = Random(39);
+        let data = [FFN * HIDDEN, FFN * HIDDEN, HIDDEN * FFN]
+            .map(|values| (0..experts * values / 32).flat_map(|_| generated_block(39, &mut random)).collect());
+        Banks { label: "MXFP4".into(), kinds: [39; 3], experts, data }
+    }
+
     /// One expert's matrix of a role, decoded (rows x cols, row-major).
     fn decoded(&self, role: usize, expert: usize) -> Vec<f32> {
         let per = self.data[role].len() / self.experts;
         decode(self.kinds[role], &self.data[role][expert * per..(expert + 1) * per])
     }
+}
+
+
+/// sd_expert_rows' outputs.
+#[derive(Default)]
+struct Rows {
+    gate_up: Vec<f32>,
+    product: Vec<f32>,
+    output: Vec<f32>,
+}
+
+/// One sd_expert_rows call: Err when the path is unavailable on this GPU.
+#[allow(clippy::too_many_arguments)]
+fn expert_rows(device: &Device, pointers: &[*mut c_void; 3], banks: &Banks, steps: usize, top_k: usize, selected: &[i32],
+               path: i32, input: Option<&[f32]>, down_input: Option<&[f32]>, want: [bool; 3]) -> Result<Rows, String> {
+    let routes = steps * top_k;
+    let mut rows = Rows {
+        gate_up: vec![0.0; if want[0] { routes * 2 * FFN } else { 0 }],
+        product: vec![0.0; if want[1] { routes * FFN } else { 0 }],
+        output: vec![0.0; if want[2] { routes * HIDDEN } else { 0 }],
+    };
+    let pointer = |want: bool, values: &mut Vec<f32>| if want { values.as_mut_ptr() } else { std::ptr::null_mut() };
+    let kinds = banks.kinds.map(|kind| kind as i32);
+    let gate_up = pointer(want[0], &mut rows.gate_up);
+    let product = pointer(want[1], &mut rows.product);
+    let output = pointer(want[2], &mut rows.output);
+    // SAFETY: the banks are this device's allocations of the declared shapes; every buffer is sized
+    // for `routes` rows.
+    let status = unsafe {
+        ffi::sd_expert_rows(device.handle(), pointers.as_ptr(), kinds.as_ptr(), banks.experts as u64, HIDDEN as u64,
+                            FFN as u64, steps as u64, top_k as u64, selected.as_ptr(), path,
+                            input.map_or(std::ptr::null(), |input| input.as_ptr()),
+                            down_input.map_or(std::ptr::null(), |input| input.as_ptr()), gate_up, product, output,
+                            std::ptr::null_mut())
+    };
+    if status == 0 { Ok(rows) } else { Err(straydog_gpu::last_error().0) }
+}
+
+fn identity(size: usize) -> Vec<f32> {
+    let mut rows = vec![0f32; size * size];
+    for i in 0..size {
+        rows[i * size + i] = 1.0;
+    }
+    rows
+}
+
+fn silu_product(gate: f32, up: f32) -> f64 {
+    let gate = f64::from(gate);
+    gate / (1.0 + (-gate).exp()) * f64::from(up)
+}
+
+
+/// Every check of one set of banks, on both paths.
+fn check_banks(device: &Device, banks: &Banks) {
+    let allocations: Vec<_> = banks.data.iter().map(|data| device.upload(data).unwrap()).collect();
+    let pointers = [allocations[0].pointer(), allocations[1].pointer(), allocations[2].pointer()];
+    let decoded: Vec<[Vec<f32>; 3]> = (0..banks.experts).map(|e| [0, 1, 2].map(|role| banks.decoded(role, e))).collect();
+    let experts = banks.experts;
+    let all: Vec<i32> = (0..experts as i32).collect();
+    for path in [0, 1] {
+        let name = format!("{} {:?} {}", banks.label, banks.kinds, ["GEMV", "WMMA"][path as usize]);
+        let exact = |value: f32| if path == 0 { value } else { round_f16(value) };
+        // Every column of every expert: one-hot rows routed to all the experts.
+        let selected: Vec<i32> = (0..HIDDEN).flat_map(|_| all.iter().copied()).collect();
+        let rows = match expert_rows(device, &pointers, banks, HIDDEN, experts, &selected, path, Some(&identity(HIDDEN)), None,
+                                     [true, false, false]) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("{name}: skipped ({error})");
+                continue;
+            }
+        };
+        for token in 0..HIDDEN {
+            for (k, expert) in all.iter().enumerate() {
+                let route = &rows.gate_up[(token * experts + k) * 2 * FFN..][..2 * FFN];
+                for role in 0..2 {
+                    for row in 0..FFN {
+                        let wanted = exact(decoded[*expert as usize][role][row * HIDDEN + token]);
+                        assert_eq!(route[role * FFN + row], wanted, "{name}: expert {expert} role {role} row {row} col {token}");
+                    }
+                }
+            }
+        }
+        let selected: Vec<i32> = (0..FFN).flat_map(|_| all.iter().copied()).collect();
+        let down_input: Vec<f32> = identity(FFN).chunks(FFN).flat_map(|row| std::iter::repeat_n(row, experts).flatten().copied()).collect();
+        let rows = expert_rows(device, &pointers, banks, FFN, experts, &selected, path, None, Some(&down_input), [false, false, true])
+            .unwrap();
+        for token in 0..FFN {
+            for (k, expert) in all.iter().enumerate() {
+                let route = &rows.output[(token * experts + k) * HIDDEN..][..HIDDEN];
+                for row in 0..HIDDEN {
+                    let wanted = exact(decoded[*expert as usize][2][row * FFN + token]);
+                    assert_eq!(route[row], wanted, "{name}: expert {expert} down row {row} col {token}");
+                }
+            }
+        }
+        // Real-sized activations: sums within F32 summation bounds, the product and the down of it.
+        let mut random = Random(17 + path as u64);
+        let steps = 40;
+        let top_k = experts.min(3);
+        let selected: Vec<i32> = (0..steps).flat_map(|_| {
+            let mut order = all.clone();
+            for i in (1..order.len()).rev() {
+                order.swap(i, random.next() as usize % (i + 1));
+            }
+            order.truncate(top_k);
+            order
+        }).collect();
+        let input: Vec<f32> = (0..steps * HIDDEN).map(|_| random.activation()).collect();
+        let rows = expert_rows(device, &pointers, banks, steps, top_k, &selected, path, Some(&input), None, [true, true, true])
+            .unwrap();
+        let operand = |value: f32| if path == 0 { value } else { round_f16(value) };
+        let factor = if path == 0 { 4.0 } else { 1.0 };
+        for token in 0..steps {
+            let x: Vec<f32> = input[token * HIDDEN..(token + 1) * HIDDEN].iter().map(|v| operand(*v)).collect();
+            for k in 0..top_k {
+                let route = token * top_k + k;
+                let expert = selected[route] as usize;
+                for (role, matrix) in decoded[expert][..2].iter().enumerate() {
+                    let weights: Vec<f32> = matrix.iter().map(|w| operand(*w)).collect();
+                    check_sums(&format!("{name} route {route} role {role}"), &rows.gate_up[(2 * route + role) * FFN..][..FFN],
+                               &weights, HIDDEN, &x, factor);
+                }
+                // SiLU(gate) * up: F32 to a few ulps (GEMV), or that rounded to FP16 (WMMA).
+                for j in 0..FFN {
+                    let wanted = silu_product(rows.gate_up[2 * route * FFN + j], rows.gate_up[(2 * route + 1) * FFN + j]);
+                    let relative = if path == 0 { 1e-6 } else { 2f64.powi(-11) + 2e-6 };
+                    let got = f64::from(rows.product[route * FFN + j]);
+                    assert!((got - wanted).abs() <= relative * wanted.abs() + 2f64.powi(-25),
+                            "{name} route {route} product {j}: {got} vs {wanted}");
+                }
+                let down: Vec<f32> = decoded[expert][2].iter().map(|w| operand(*w)).collect();
+                check_sums(&format!("{name} route {route} down"), &rows.output[route * HIDDEN..][..HIDDEN], &down, FFN,
+                           &rows.product[route * FFN..][..FFN], factor);
+            }
+        }
+        eprintln!("{name}: every weight exact, sums within bounds");
+    }
+}
+
+#[test]
+fn gpu_expert_kernels_decode_every_weight_and_sum_within_f32_bounds() {
+    let Some(shards) = Shards::open() else { return };
+    load_tables();
+    let device = Device::new(0, 6 << 30).unwrap();
+    // Every expert format of the file: gate/up IQ1_S, IQ2_XXS, IQ2_S; down Q2_K, IQ2_XS, IQ2_XXS,
+    // IQ2_S, IQ3_XXS; the shared experts' Q8_0 and Q5_K; and generated MXFP4.
+    for (layer, which) in [(0, [3, 381]), (1, [7, 200]), (2, [64, 300]), (10, [1, 255]), (20, [9, 383]), (25, [100, 2])] {
+        check_banks(&device, &Banks::layer(&shards, layer, &which));
+    }
+    check_banks(&device, &Banks::shared(&shards, 0));
+    check_banks(&device, &Banks::shared(&shards, 27));
+}
+
+#[test]
+fn gpu_expert_kernels_decode_generated_mxfp4_exactly() {
+    if straydog_gpu::device_count().unwrap_or(0) == 0 {
+        eprintln!("skipped: no GPU");
+        return;
+    }
+    load_tables();
+    let device = Device::new(0, 6 << 30).unwrap();
+    check_banks(&device, &Banks::mxfp4(2));
 }
 
 

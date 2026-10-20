@@ -237,6 +237,9 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
 // then exactly sized gate/up and down tile launches. Gate/up stores FP16
 // SiLU(gate)*up per grouped row in the gate/up scratch; down scatters per route.
 #if defined(__HIPCC__)
+// The resident plans' layer: hidden 2560, experts 640 wide, ten routes per token (fixed at compile time
+// in their expert launches).
+constexpr MoeShape resident_shape{2560,640,10};
 // Formats of a group's gate, up and down banks (routed experts share theirs).
 inline MoeKinds moe_kinds(const ResidentMoe& plan,size_t group) {
     return {plan.weights[group*3].kind,plan.weights[group*3+1].kind,plan.weights[group*3+2].kind};
@@ -300,7 +303,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         auto* product=reinterpret_cast<_Float16*>(scratch);
         auto* half_input=product+routes*640;
         moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
-        moe_expert_launch(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,half_input,
+        moe_expert_launch<2560,640,10>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,resident_shape,half_input,
                           product,outputs,tile_count,unsigned(max_tiles),shared);
         check(hipGetLastError());
         return;
@@ -354,7 +357,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         // The resident list ends with the shared expert's tiles.
         const unsigned shared=begin==0 && end==resident_tiles && !absent[experts] ?
             unsigned((host_counts[experts]+moe_block_m-1)/moe_block_m) : 0;
-        moe_expert_launch(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles+begin,positions,steps,half_input,
+        moe_expert_launch<2560,640,10>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles+begin,positions,steps,resident_shape,half_input,
                           product,outputs,nullptr,unsigned(end-begin),shared);
 #else
         // Banks have one format per role. Separate the final shared-expert

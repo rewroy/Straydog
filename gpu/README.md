@@ -10,8 +10,9 @@ runs CMake on this directory from `crates/straydog-gpu/build.rs`. Set
 `ROCM_PATH` or `CUDA_PATH`.
 
 The library implements compressed matrix-vector products and grouped GEMM for the
-floating-point formats, Q2_0, Q4_0/Q5_0/Q8_0, Q3_K-Q6_K and IQ1_M, IQ2_XXS/XS/S,
-IQ3_XXS/S, IQ4_NL/IQ4_XS. RDNA4 grouped GEMM uses its own WMMA kernels; general GEMM
+floating-point formats, Q2_0, Q4_0/Q5_0/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
+IQ3_XXS/S, IQ4_NL/IQ4_XS and MXFP4, at any layer shape whose dimensions are whole blocks
+(experts.hpp; `sd_expert_rows` runs the routed expert kernels for tests and measurements). RDNA4 grouped GEMM uses its own WMMA kernels; general GEMM
 uses hipBLAS or cuBLAS, in FP32 or, when configured, FP16 inputs with FP32
 accumulation. DeltaNet recurrence and sparse attention have their own kernels. The
 engine's pinned GPU generations (`crates/straydog-engine/tests/model_gpu.rs`) check them

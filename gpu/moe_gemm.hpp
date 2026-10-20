@@ -1,5 +1,7 @@
 // Independently authored RDNA4 grouped expert GEMM for prefill. Routed rows are
 // grouped by expert on the device and the grids cover every 64-row tile there can be.
+// Shapes are parameters (MoeShape): any hidden and expert width that are multiples of
+// the tiles and of each format's unit.
 // Each lane decodes its packed weights straight into FP16 WMMA fragments, every value
 // as the F32 decoders round it (Q2_0 values scale*(code-1) are exact in FP16);
 // activations are rounded to FP16 and products accumulate in F32, as in the explicit
@@ -14,6 +16,7 @@ typedef uint32_t moe_word4 __attribute__((ext_vector_type(4)));
 typedef uint32_t moe_word_u __attribute__((aligned(2)));
 typedef uint2 moe_word2_u __attribute__((aligned(2)));
 typedef moe_word4 moe_word4_u __attribute__((aligned(2)));
+typedef moe_word4 moe_word4_b __attribute__((aligned(1)));   // MXFP4: 17-byte blocks at any byte
 constexpr int moe_block_k = 64, moe_lds_k = moe_block_k + 8, moe_block_m = 64;
 
 __device__ __forceinline__ uint32_t moe_pack(float a, float b) {
@@ -331,6 +334,85 @@ template<> struct MoeUnit<42> {   // Q2_0: a half is one 18-byte block of 64 val
     }
 };
 
+// IQ1_S: as IQ1_M, c * (g - 1 + delta) is an integer below 136 over 8 and d times it the one rounding;
+// a half is 16 grid bytes, four 16-bit words (grid-row high bits, scale and delta) and d.
+template<> struct MoeUnit<19> {
+    static constexpr int span = 256, table_words = 4096;
+    uint32_t qs[4], qh[2], d;
+    __device__ static void stage(uint32_t* table) { MoeUnit<29>::stage(table); }
+    __device__ void load(const uint8_t* row, int, size_t unit, unsigned half) {
+        const uint8_t* b = row + unit * 50;
+        const moe_word4 q = moe_u128(b + 2 + 16 * half);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) qs[i] = q[i];
+        const uint2 h = moe_u64(b + 34 + 8 * half);
+        qh[0] = h.x; qh[1] = h.y; d = moe_u16(b) | moe_u16(b) << 16;
+    }
+    __device__ void decode(int p, const uint32_t* table, uint32_t (&out)[4]) const {
+        const int i = p / 4, l = p % 4;
+        const unsigned high = (qh[i / 2] >> (16 * (i % 2))) & 0xffff;
+        const uint2 grid = reinterpret_cast<const uint2*>(table)[((qs[i] >> (8 * l)) & 255) | (((high >> (3 * l)) & 7) << 8)];
+        const uint32_t c = moe_hpair(1 + 2 * ((high >> 12) & 7));
+        const uint32_t delta = high & 0x8000 ? 0xB000B000u : 0x30003000u;   // -1/8, 1/8
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint32_t g = moe_byte_pair(q < 2 ? grid.x : grid.y, q % 2);
+            out[q] = moe_hmul(moe_hmul(moe_hadd(moe_hadd(g, 0xE401E401u), delta), c), d);   // 1024 + g - 1025 = g - 1
+        }
+    }
+};
+// Q2_K: a half is 32 code bytes, its eight scale bytes, d and dmin. A value is
+// d * scale * code - dmin * minimum in F32, as weight<10> forms it, then rounded to FP16.
+template<> struct MoeUnit<10> {
+    static constexpr int span = 256, table_words = 0;
+    uint32_t qs[8], scales[2], dm;
+    __device__ static void stage(uint32_t*) {}
+    __device__ void load(const uint8_t* row, int, size_t unit, unsigned half) {
+        const uint8_t* b = row + unit * 84;
+        const moe_word4 q0 = moe_u128(b + 16 + 32 * half), q1 = moe_u128(b + 32 + 32 * half);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) { qs[i] = q0[i]; qs[4 + i] = q1[i]; }
+        const uint2 s = moe_u64(b + 8 * half);
+        scales[0] = s.x; scales[1] = s.y; dm = moe_u32(b + 80);
+    }
+    // Values half * 128 + 8p .. + 7: two bits at shift 2 * (p / 4) of code bytes 8 * (p % 4) ..
+    __device__ void decode(int p, const uint32_t*, uint32_t (&out)[4]) const {
+        const int quarter = p / 4, c = p % 4, k = 2 * quarter + c / 2;
+        const unsigned scale = (scales[k / 4] >> (8 * (k % 4))) & 255;
+        const float ds = gemv_half(dm) * float(scale & 15), dmin = gemv_half(dm >> 16) * float(scale >> 4);
+        float v[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = ds * float((qs[2 * c + j / 4] >> (8 * (j % 4) + 2 * quarter)) & 3) - dmin;
+        moe_store8(v, out);
+    }
+};
+// MXFP4: a half is one 17-byte block; k * 2^(e - 128) in F32, as weight<39> forms it, then rounded
+// to FP16 (exact unless the scale leaves FP16's range).
+template<> struct MoeUnit<39> {
+    static constexpr int span = 64, table_words = 0;
+    uint32_t qs[4], e;
+    __device__ static void stage(uint32_t*) {}
+    __device__ void load(const uint8_t* row, int, size_t unit, unsigned half) {
+        const uint8_t* b = row + (2 * unit + half) * 17;
+        const moe_word4 q = *reinterpret_cast<const moe_word4_b*>(b + 1);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) qs[i] = q[i];
+        e = b[0];
+    }
+    // Values 8p .. 8p + 7: low nibbles of code bytes 8 * (p % 2) .. for p < 2, high nibbles after.
+    __device__ void decode(int p, const uint32_t*, uint32_t (&out)[4]) const {
+        const float scale = __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        float v[8];
+        #pragma unroll
+        for (int w = 0; w < 2; ++w) {
+            const uint32_t biased = gemv_fp4((qs[2 * (p % 2) + w] >> (4 * (p / 2))) & 0x0F0F0F0Fu);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) v[4 * w + j] = (float((biased >> (8 * j)) & 255u) - 12.0f) * scale;
+        }
+        moe_store8(v, out);
+    }
+};
+
 // The shared expert's 256-value K-quant and IQ4_XS banks, gate and up in any mix of Q4_K, Q5_K, Q6_K
 // and IQ4_XS: a unit loads the lane's half of a super-block's scales; each panel reads its values.
 template<> struct MoeUnit<-1> {
@@ -420,15 +502,21 @@ constexpr int moe_wave_n = 2;
 
 // One block: 64 routed rows of one expert x 64 * moe_wave_n product columns; wave w decodes gate
 // (w < 4) or up rows (w % 4) * 16 * moe_wave_n .. straight into WMMA fragments for all 64 rows.
-template<int kind>
+// Unfused (tests): the F32 gate and up sums go to `raw`, per route its gate then its up row.
+// Nonzero H, F, K fix the shape's hidden, ffn and top_k at compile time (the K loop's trip count
+// and the route-to-token division constant); zero takes them from `shape`.
+template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0>
 __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, const MoeTile* tiles,
-                                                        const int32_t* positions, size_t steps,
+                                                        const int32_t* positions, size_t steps, MoeShape shape,
                                                         const _Float16* input, _Float16* product,
-                                                        const unsigned* tile_count, unsigned shared, bool tail) {
+                                                        const unsigned* tile_count, unsigned shared, bool tail,
+                                                        float* raw = nullptr) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     using Unit = MoeUnit<kind>;
     constexpr int L = moe_lds_k, N = moe_wave_n, P = moe_block_k / 16, per_unit = Unit::span / moe_block_k;
-    constexpr int total = 2560 / moe_block_k, up_stride = 68;
+    constexpr int up_stride = 68;
+    const size_t hidden = H ? H : shape.hidden, ffn = F ? F : shape.ffn, top_k = K ? K : shape.top_k;
+    const int total = int(hidden) / moe_block_k;
     MoeTile tile;
     if (!moe_tile(tiles, tile_count, shared, tail, tile)) return;
     const MoeGroup& group = groups[tile.group];
@@ -446,8 +534,8 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
     const _Float16* source = nullptr;
     if (tile.first + arow < count) {
         const size_t route = size_t(positions[first + tile.first + arow]);
-        const size_t token = route < steps * 10 ? route / 10 : route - steps * 10;
-        source = input + token * 2560;
+        const size_t token = route < steps * top_k ? route / top_k : route - steps * top_k;
+        source = input + token * hidden;
     }
     uint4 a[moe_chunks];
     auto load_a = [&](size_t step) {
@@ -496,6 +584,19 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
             __syncthreads();
         }
     }
+    if constexpr (!fused) {
+        #pragma unroll
+        for (int m = 0; m < 4; ++m)
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const size_t row = tile.first + m * 16 + half * 8 + i;
+                if (row >= count) continue;
+                float* target = raw + size_t(positions[first + row]) * 2 * ffn + (wave / 4) * ffn + j0;
+                #pragma unroll
+                for (int n = 0; n < N; ++n) target[16 * n] = sum[m][n][i];
+            }
+        return;
+    }
     // The gate and up waves of the same columns swap half their rows through LDS (gate rows 32-63,
     // up rows 0-31), a subtile column at a time: each finishes SiLU(gate)*up for its own half.
     const int own = wave < 4 ? 0 : 2;
@@ -518,7 +619,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
                     const float partner = theirs[(m * 16 + half * 8 + i) * up_stride + (wave % 4) * 16 + lane % 16];
                     const float value = wave < 4 ? sum[m][n][i] : sum[2 + m][n][i];
                     const float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
-                    product[(first + row) * 640 + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up);
+                    product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up);
                 }
             }
         if (n + 1 < N) __syncthreads();
@@ -527,14 +628,15 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
 }
 
 // One block: 64 grouped product rows x 128 * moe_wave_n output columns; results scatter to routes.
-template<int kind>
+template<int kind, int H = 0, int F = 0>
 __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, const MoeTile* tiles,
-                                                     const int32_t* positions, const _Float16* product, float* outputs,
-                                                     const unsigned* tile_count, unsigned shared, bool tail) {
+                                                     const int32_t* positions, MoeShape shape, const _Float16* product,
+                                                     float* outputs, const unsigned* tile_count, unsigned shared, bool tail) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     using Unit = MoeUnit<kind>;
     constexpr int L = moe_lds_k, N = moe_wave_n, P = moe_block_k / 16, per_unit = Unit::span / moe_block_k;
-    constexpr int total = 640 / moe_block_k;
+    const size_t hidden = H ? H : shape.hidden, ffn = F ? F : shape.ffn;
+    const int total = int(ffn) / moe_block_k;
     MoeTile tile;
     if (!moe_tile(tiles, tile_count, shared, tail, tile)) return;
     const MoeGroup& group = groups[tile.group];
@@ -548,7 +650,7 @@ __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, con
     __shared__ __attribute__((aligned(16))) uint32_t table[Unit::table_words ? Unit::table_words : 1];
     Unit::stage(table);
     const int arow = t / 4, chunk = t % 4, aoffset = arow * L + 8 * chunk;
-    const _Float16* source = tile.first + arow < count ? product + (first + tile.first + arow) * 640 : nullptr;
+    const _Float16* source = tile.first + arow < count ? product + (first + tile.first + arow) * ffn : nullptr;
     uint4 a[moe_chunks];
     auto load_a = [&](size_t step) {
         #pragma unroll
@@ -602,56 +704,69 @@ __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, con
         for (int i = 0; i < 8; ++i) {
             const size_t r = tile.first + m * 16 + half * 8 + i;
             if (r >= count) continue;
-            float* target = outputs + size_t(positions[first + r]) * 2560 + n0;
+            float* target = outputs + size_t(positions[first + r]) * hidden + n0;
             #pragma unroll
             for (int n = 0; n < N; ++n) target[16 * n] = sum[m][n][i];
         }
 #endif
 }
 
-// The input is reused by all ten routes and column tiles: round it to FP16 once (as moe_gemm_cuda.hpp).
+// The input is reused by all routes and column tiles: round it to FP16 once (as moe_gemm_cuda.hpp).
 __global__ void moe_input_half(size_t values, const float* input, _Float16* output) {
     const size_t index = (size_t(blockIdx.x) * 256 + threadIdx.x) * 4;
-    if (index >= values) return;   // values = steps * 2560, always divisible by four
+    if (index >= values) return;   // values = steps * hidden, always divisible by four
     const float4 v = reinterpret_cast<const float4*>(input)[index / 4];
     reinterpret_cast<uint2*>(output)[index / 4] = uint2{moe_pack(v.x, v.y), moe_pack(v.z, v.w)};
 }
 
-// Formats with a unit of their own; mixes of the K-quant formats take unit -1, any other format the generic one (0).
-__host__ __device__ constexpr int moe_unit_kind(int kind, bool down) {
-    return down ? (kind == 20 || kind == 8 || kind == 42 ? kind : 0)
-                : (kind == 21 || kind == 18 || kind == 22 || kind == 16 || kind == 17 || kind == 29 || kind == 23 || kind == 20 ||
-                   kind == 8 || kind == 42 ? kind : 0);
+// Formats with a unit of their own, used where the product's K is a multiple of the unit's span; mixes
+// of the K-quant formats take unit -1, any other format the generic one (0).
+__host__ __device__ constexpr int moe_unit_span(int kind) { return kind == 20 || kind == 8 || kind == 39 ? 64 : kind == 42 ? 128 : 256; }
+__host__ __device__ constexpr int moe_unit_kind(int kind, size_t k) {
+    return (kind == 21 || kind == 18 || kind == 22 || kind == 16 || kind == 17 || kind == 29 || kind == 23 || kind == 20 ||
+            kind == 8 || kind == 42 || kind == 19 || kind == 10 || kind == 39) && k % moe_unit_span(kind) == 0 ? kind : 0;
 }
 struct MoeKinds { int gate, up, down; };
 // Gate/up then down over a tile list of `listed` tiles (`count` on the device, which the grids'
 // `listed` blocks cover; null for a host list): routed experts with their banks' formats and, when
 // its formats differ, the shared expert (the last `shared` tiles) with its own.
+// Whether moe_expert_launch takes this shape: whole tiles of product and output columns, whole K steps.
+inline bool moe_shape_fits(MoeShape shape) {
+    return shape.hidden && shape.ffn && shape.top_k && shape.ffn % (64 * moe_wave_n) == 0 &&
+           shape.hidden % (128 * moe_wave_n) == 0 && shape.hidden % moe_block_k == 0 && shape.ffn % moe_block_k == 0;
+}
+// The units of a gate/up pair and of a down matrix at a shape.
+inline int moe_gate_up_unit(int gate, int up, MoeShape shape) {
+    auto k_quant = [](int kind) { return kind == 12 || kind == 13 || kind == 14 || kind == 23; };
+    return gate == up && moe_unit_kind(gate, shape.hidden) ? gate
+         : k_quant(gate) && k_quant(up) && shape.hidden % 256 == 0 ? -1 : 0;
+}
+inline int moe_down_unit(int down, MoeShape shape) {
+    const bool k_quant = down == 12 || down == 13 || down == 14 || down == 23;
+    return moe_unit_kind(down, shape.ffn) ? down : k_quant && shape.ffn % 256 == 0 ? -1 : 0;
+}
+#define SD_MOE_UNITS(X) X(21) X(18) X(22) X(16) X(17) X(29) X(19) X(10) X(23) X(20) X(8) X(39) X(42) X(-1) X(0)
+// H, F, K: as moe_gate_up_wmma's (a caller with one fixed shape passes it).
+template<int H = 0, int F = 0, int K = 0>
 inline void moe_expert_launch(hipStream_t stream, MoeKinds routed, MoeKinds common, const MoeGroup* groups, const MoeTile* tiles,
-                              const int32_t* positions, size_t steps, const _Float16* input, _Float16* product,
+                              const int32_t* positions, size_t steps, MoeShape shape, const _Float16* input, _Float16* product,
                               float* outputs, const unsigned* count, unsigned listed, unsigned shared) {
     const MoeTile* last = count ? tiles : tiles + (listed - shared);
+    const unsigned gate_columns = shape.ffn / (64 * moe_wave_n), down_columns = shape.hidden / (128 * moe_wave_n);
     auto gate_up = [&](int kind, const MoeTile* list, unsigned blocks, unsigned skip, bool tail) {
-        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format><<<dim3(10 / moe_wave_n, blocks), 256, 0, stream>>>( \
-            groups, list, positions, steps, input, product, count, skip, tail); break;
-        if (blocks) switch (kind) {
-            SD_GATE_UP(21) SD_GATE_UP(18) SD_GATE_UP(22) SD_GATE_UP(16) SD_GATE_UP(17) SD_GATE_UP(29) SD_GATE_UP(23) SD_GATE_UP(20) SD_GATE_UP(8)
-            SD_GATE_UP(42) SD_GATE_UP(-1) SD_GATE_UP(0)
-        }
+        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format, true, H, F, K><<<dim3(gate_columns, blocks), 256, 0, stream>>>( \
+            groups, list, positions, steps, shape, input, product, count, skip, tail); break;
+        if (blocks) switch (kind) { SD_MOE_UNITS(SD_GATE_UP) }
         #undef SD_GATE_UP
     };
     auto down = [&](int kind, const MoeTile* list, unsigned blocks, unsigned skip, bool tail) {
-        #define SD_DOWN(format) case format: moe_down_wmma<format><<<dim3(20 / moe_wave_n, blocks), 256, 0, stream>>>( \
-            groups, list, positions, product, outputs, count, skip, tail); break;
-        if (blocks) switch (kind) { SD_DOWN(20) SD_DOWN(8) SD_DOWN(42) SD_DOWN(0) }
+        #define SD_DOWN(format) case format: moe_down_wmma<format, H, F><<<dim3(down_columns, blocks), 256, 0, stream>>>( \
+            groups, list, positions, shape, product, outputs, count, skip, tail); break;
+        if (blocks) switch (kind) { SD_MOE_UNITS(SD_DOWN) }
         #undef SD_DOWN
     };
-    auto unit = [](int gate, int up) {
-        auto k_quant = [](int kind) { return kind == 12 || kind == 13 || kind == 14 || kind == 23; };
-        return gate == up && moe_unit_kind(gate, false) ? gate : k_quant(gate) && k_quant(up) ? -1 : 0;
-    };
-    const int routed_gate = unit(routed.gate, routed.up), shared_gate = unit(common.gate, common.up);
-    const int routed_down = moe_unit_kind(routed.down, true), shared_down = moe_unit_kind(common.down, true);
+    const int routed_gate = moe_gate_up_unit(routed.gate, routed.up, shape), shared_gate = moe_gate_up_unit(common.gate, common.up, shape);
+    const int routed_down = moe_down_unit(routed.down, shape), shared_down = moe_down_unit(common.down, shape);
     if (shared && shared_gate != routed_gate) {
         gate_up(routed_gate, tiles, listed - shared, shared, false);
         gate_up(shared_gate, last, shared, shared, true);
