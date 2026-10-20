@@ -55,17 +55,17 @@ fn main() -> Result<(), String> {
     println!("last logits vs the CPU reference: rel {:.2e}, argmax {} vs {}", (diff / norm).sqrt(), argmax(&logits), argmax(last));
     let text = Text::new(&std::fs::read(tokenizer).map_err(|exc| exc.to_string())?).map_err(|exc| exc.0)?;
     let mut output = vec![argmax(&logits)];
-    let (hits0, misses0) = engine.cache_counts();
+    let (hits0, misses0, fill0) = engine.cache_counts();
     let started = std::time::Instant::now();
     while output.len() < generate {
         logits = engine.forward(&output[output.len() - 1..])?;
         output.push(argmax(&logits));
     }
     let seconds = started.elapsed().as_secs_f64();
-    let (hits, misses) = engine.cache_counts();
-    println!("decode {} tokens: {:.2} tok/s, expert cache {:.1}% hits ({} misses)", output.len() - 1,
+    let (hits, misses, fill) = engine.cache_counts();
+    println!("decode {} tokens: {:.2} tok/s, expert cache {:.1}% hits ({} misses, {:.0}% of the time filling them)", output.len() - 1,
              (output.len() - 1) as f64 / seconds, 100.0 * (hits - hits0) as f64 / ((hits - hits0 + misses - misses0).max(1)) as f64,
-             misses - misses0);
+             misses - misses0, 100.0 * (fill - fill0) / seconds);
     let same = output.iter().zip(&reference).take_while(|(a, b)| a == b).count();
     println!("first {same} tokens equal llama.cpp's greedy ones");
     println!("text: {}", text.decode(&output).map_err(|exc| exc.0)?);

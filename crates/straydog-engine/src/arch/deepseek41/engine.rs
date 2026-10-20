@@ -95,6 +95,8 @@ struct Experts {
     clock: u64,
     hits: u64,
     misses: u64,
+    /// Seconds spent copying missed experts in.
+    fill_seconds: f64,
 }
 
 pub struct Engine<'a, T: Tensors> {
@@ -133,9 +135,6 @@ fn frequencies(dims: usize, rope: &Rope) -> Vec<f32> {
 fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
     formats::matrix_bytes(kind, 1, cols).ok_or_else(|| format!("unsupported tensor type {kind}"))
 }
-
-/// GGUF types the GPU's linear op decodes (until the expert formats land there).
-const GPU_KINDS: [u32; 19] = [0, 1, 2, 6, 8, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 23, 29, 30, 42];
 
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}.weight")
@@ -252,7 +251,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             plain: plain_buffer,
             compressed_rope: compressed_buffer,
             work,
-            experts: Experts { slots, owner: vec![None; count], used: vec![0; count], map: HashMap::new(), clock: 0, hits: 0, misses: 0 },
+            experts: Experts { slots, owner: vec![None; count], used: vec![0; count], map: HashMap::new(), clock: 0, hits: 0, misses: 0, fill_seconds: 0.0 },
         };
         engine.upload_dense()?;
         Ok(engine)
@@ -283,8 +282,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position
     }
 
-    pub fn cache_counts(&self) -> (u64, u64) {
-        (self.experts.hits, self.experts.misses)
+    /// The expert cache's hits, misses and seconds spent filling missed slots.
+    pub fn cache_counts(&self) -> (u64, u64, f64) {
+        (self.experts.hits, self.experts.misses, self.experts.fill_seconds)
     }
 
     /// Forget the sequence (the caches' contents stay, as warm experts do).
@@ -558,48 +558,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (gate_bytes, down_bytes) = (ff * row_bytes(gate.kind, w)?, w * row_bytes(down.kind, ff)?);
         let (gate_kind, up_kind, down_kind) = (gate.kind, up.kind, down.kind);
         let scratch = self.scratch;
-        // Temporary: experts in types the GPU does not decode yet run on the host.
-        let host = [gate_kind, up_kind, down_kind].iter().any(|kind| !GPU_KINDS.contains(kind));
-        let x_host = if host {
-            let mut x = vec![0f32; n * w];
-            self.gpu.read_buffer(&work.x, 0, &mut x)?;
-            x
-        } else {
-            Vec::new()
-        };
         for (expert, (rows, user_weights)) in by_expert {
             let count = rows.len();
-            if host {
-                let decode = |tensor: &crate::arch::Tensor, bytes: usize| -> Result<Vec<f32>> {
-                    let mut out = Vec::new();
-                    formats::decode_into(tensor.kind, &tensor.data[expert * bytes..(expert + 1) * bytes], &mut out)?;
-                    Ok(out)
-                };
-                let (g, u, d) = (decode(&gate, gate_bytes)?, decode(&up, gate_bytes)?, decode(&down, down_bytes)?);
-                let clamp = hp.layers[layer].clamp_routed;
-                let mut y = vec![0f32; count * w];
-                for (k, (&row, &weight)) in rows.iter().zip(&user_weights).enumerate() {
-                    let input = &x_host[row as usize * w..(row as usize + 1) * w];
-                    let dot = |m: &[f32], r: usize, width: usize, v: &[f32]| {
-                        m[r * width..(r + 1) * width].iter().zip(v).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32
-                    };
-                    let hidden: Vec<f32> = (0..ff).map(|r| {
-                        let (mut gv, mut uv) = (dot(&g, r, w, input), dot(&u, r, w, input));
-                        if clamp > 0.0 {
-                            gv = gv.min(clamp);
-                            uv = uv.clamp(-clamp, clamp);
-                        }
-                        gv / (1.0 + (-gv).exp()) * uv * weight
-                    }).collect();
-                    for col in 0..w {
-                        y[k * w + col] = dot(&d, col, ff, &hidden);
-                    }
-                }
-                self.gpu.write_buffer(&work.expert_rows, 0, &rows)?;
-                self.gpu.write_buffer(&work.y, 0, &y)?;
-                self.gpu.scatter_add(work.y.base(), work.expert_rows.base(), count as u64, w as u64, work.out.base(), n as u64)?;
-                continue;
-            }
             let slot = self.expert(layer, expert, gate_bytes, down_bytes)?;
             self.gpu.write_buffer(&work.expert_rows, 0, &rows)?;
             self.gpu.write_buffer(&work.expert_weights, 0, &user_weights)?;
@@ -634,12 +594,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.experts.map.remove(&previous);
         }
         let buffer = self.experts.slots[slot];
+        let started = std::time::Instant::now();
         for (index, (role, bytes)) in [("ffn_gate_exps", gate_bytes), ("ffn_up_exps", gate_bytes), ("ffn_down_exps", down_bytes)]
             .into_iter().enumerate()
         {
             let tensor = self.tensors.tensor(&name(layer, role))?;
             self.gpu.write_buffer(&buffer, (index.min(2) * gate_bytes) as u64, &tensor.data[expert * bytes..(expert + 1) * bytes])?;
         }
+        self.experts.fill_seconds += started.elapsed().as_secs_f64();
         self.experts.owner[slot] = Some((layer, expert));
         self.experts.map.insert((layer, expert), slot);
         self.experts.used[slot] = clock;
