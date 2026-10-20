@@ -115,6 +115,8 @@ pub struct Engine<'a, T: Tensors> {
     compressed_rope: Buffer,
     work: Work,
     experts: Experts,
+    /// With DS41_PROFILE set: seconds per phase, the GPU synchronized at each phase's end.
+    profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
 }
 
 fn frequencies(dims: usize, rope: &Rope) -> Vec<f32> {
@@ -251,6 +253,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             plain: plain_buffer,
             compressed_rope: compressed_buffer,
             work,
+            profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             experts: Experts { slots, owner: vec![None; count], used: vec![0; count], map: HashMap::new(), clock: 0, hits: 0, misses: 0, fill_seconds: 0.0 },
         };
         engine.upload_dense()?;
@@ -276,6 +279,31 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.dense.insert(name, Dense { buffer, kind: tensor.kind, dims: tensor.dims });
         }
         Ok(())
+    }
+
+    /// Attribute the time since the last mark to `phase` (profiling only: waits for the GPU).
+    fn mark(&mut self, phase: &'static str) -> Result<()> {
+        if self.profile.is_none() {
+            return Ok(());
+        }
+        let mut one = [0f32; 1];
+        let x = self.work.x;
+        self.gpu.read_buffer(&x, 0, &mut one)?;
+        let (since, phases) = self.profile.as_mut().unwrap();
+        *phases.entry(phase).or_default() += since.elapsed().as_secs_f64();
+        *since = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Seconds per phase so far (DS41_PROFILE), and restart the count.
+    pub fn take_profile(&mut self) -> BTreeMap<&'static str, f64> {
+        match self.profile.as_mut() {
+            Some((since, phases)) => {
+                *since = std::time::Instant::now();
+                std::mem::take(phases)
+            }
+            None => BTreeMap::new(),
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -343,6 +371,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         self.gpu.write_buffer(&self.work.stream, 0, &stream)?;
+        self.prefetch_engram(tokens)?;
+        self.mark("embedding")?;
         let mut pre_previous: Option<usize> = None;
         for layer in 0..self.hp.layers.len() {
             self.layer(layer, tokens, n, pre_previous)?;
@@ -358,6 +388,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut logits = vec![0f32; self.hp.vocabulary];
         let buffer = self.work.head;
         self.gpu.read_buffer(&buffer, 0, &mut logits)?;
+        self.mark("head")?;
         self.history.extend_from_slice(tokens);
         self.position += n;
         Ok(logits)
@@ -370,6 +401,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let work = self.work.clone_handles();
         if let Some(module) = plan.engram {
             self.engram(layer, module, tokens, n)?;
+            self.mark("engram")?;
         }
         self.linear(&name(layer, "hc_attn_fn"), work.stream.base(), n, work.mixes.base())?;
         let (base, scale) = (self.dense(&name(layer, "hc_attn_base"))?, self.dense(&name(layer, "hc_attn_scale"))?);
@@ -379,7 +411,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
         self.gpu.hc_collapse(work.stream.base(), pre.base(), n as u64, hc as u64, w as u64, work.x.base())?;
         self.norm(&name(layer, "attn_norm"), work.x.base(), n, w)?;
+        self.mark("hyper-connections")?;
         self.attention(layer, n)?;
+        self.mark("attention")?;
         self.gpu.hc_expand(work.out.base(), work.stream.base(), work.post_a.base(), work.comb_a.base(), n as u64, hc as u64,
                            w as u64, work.stream2.base())?;
         self.linear(&name(layer, "hc_ffn_fn"), work.stream2.base(), n, work.mixes.base())?;
@@ -390,9 +424,31 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                  work.post_f.base(), work.comb_f.base())?;
         self.gpu.hc_collapse(work.stream2.base(), work.pre_a.base(), n as u64, hc as u64, w as u64, work.x.base())?;
         self.norm(&name(layer, "ffn_norm"), work.x.base(), n, w)?;
+        self.mark("hyper-connections")?;
         self.moe(layer, n)?;
         self.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), n as u64, hc as u64,
                            w as u64, work.stream.base())
+    }
+
+    /// Start reading every Engram row these tokens will gather, while the layers before
+    /// the modules run.
+    fn prefetch_engram(&self, tokens: &[u32]) -> Result<()> {
+        let Some(engram) = self.hp.engram.as_ref() else { return Ok(()) };
+        let table = self.tensors.tensor("per_layer_token_embd.weight")?;
+        let bytes = row_bytes(table.kind, table.dims[0])?;
+        let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
+        let (mut rows, mut ranges) = (Vec::new(), Vec::new());
+        for (i, &token) in tokens.iter().enumerate() {
+            let before = history[history.len().saturating_sub(engram.ngram - 1)..].to_vec();
+            for module in 0..engram.multipliers.len() / engram.ngram {
+                rows.clear();
+                engram.rows(module, token, &before, self.position + i, &mut rows);
+                ranges.extend(rows.iter().map(|&row| &table.data[row as usize * bytes..(row as usize + 1) * bytes]));
+            }
+            history.push(token);
+        }
+        self.tensors.prefetch(&ranges);
+        Ok(())
     }
 
     fn engram(&mut self, layer: usize, module: usize, tokens: &[u32], n: usize) -> Result<()> {
@@ -537,6 +593,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
         self.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, hp.experts_used as u64, gating,
                        hp.route_normalize, hp.route_scale, work.ids.base(), work.weights.base())?;
+        self.mark("router")?;
         let mut routes = vec![0i32; n * hp.experts_used];
         self.gpu.read_buffer(&work.ids, 0, &mut routes)?;
         let mut weights = vec![0f32; n * hp.experts_used];
@@ -552,12 +609,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.linear(&name(layer, "ffn_up_shexp"), work.x.base(), n, work.up.base())?;
         self.gpu.swiglu(work.gate.base(), work.up.base(), n as u64, ff as u64, hp.layers[layer].clamp_shared, None, work.hidden.base())?;
         self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
+        self.mark("shared expert")?;
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
         let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
         let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
         let (gate_bytes, down_bytes) = (ff * row_bytes(gate.kind, w)?, w * row_bytes(down.kind, ff)?);
         let (gate_kind, up_kind, down_kind) = (gate.kind, up.kind, down.kind);
         let scratch = self.scratch;
+        // The layer's missing experts all start reading before the first is copied in.
+        let missing: Vec<&[u8]> = by_expert.keys().filter(|&&expert| !self.experts.map.contains_key(&(layer, expert)))
+            .flat_map(|&expert| [&gate.data[expert * gate_bytes..(expert + 1) * gate_bytes],
+                                 &up.data[expert * gate_bytes..(expert + 1) * gate_bytes],
+                                 &down.data[expert * down_bytes..(expert + 1) * down_bytes]])
+            .collect();
+        self.tensors.prefetch(&missing);
         for (expert, (rows, user_weights)) in by_expert {
             let count = rows.len();
             let slot = self.expert(layer, expert, gate_bytes, down_bytes)?;
@@ -576,7 +641,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                             &scratch)?;
             self.gpu.scatter_add(work.y.base(), work.expert_rows.base(), count as u64, w as u64, work.out.base(), n as u64)?;
         }
-        Ok(())
+        self.mark("routed experts")
     }
 
     /// The slot holding (layer, expert), copied in on a miss over the least recently used one.
@@ -594,6 +659,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.experts.map.remove(&previous);
         }
         let buffer = self.experts.slots[slot];
+        self.mark("routed experts")?;
         let started = std::time::Instant::now();
         for (index, (role, bytes)) in [("ffn_gate_exps", gate_bytes), ("ffn_up_exps", gate_bytes), ("ffn_down_exps", down_bytes)]
             .into_iter().enumerate()
@@ -602,6 +668,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.gpu.write_buffer(&buffer, (index.min(2) * gate_bytes) as u64, &tensor.data[expert * bytes..(expert + 1) * bytes])?;
         }
         self.experts.fill_seconds += started.elapsed().as_secs_f64();
+        self.mark("expert fills")?;
         self.experts.owner[slot] = Some((layer, expert));
         self.experts.map.insert((layer, expert), slot);
         self.experts.used[slot] = clock;

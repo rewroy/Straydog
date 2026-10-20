@@ -15,6 +15,10 @@ pub struct Tensor<'a> {
 /// Where an engine reads its weights: the authenticated files, or a development reader.
 pub trait Tensors {
     fn tensor(&self, name: &str) -> Result<Tensor<'_>, String>;
+
+    /// Start reading these byte ranges of tensors (slices of their `data`) in the background,
+    /// so a later access finds them in memory; the default reads nothing ahead.
+    fn prefetch(&self, _ranges: &[&[u8]]) {}
 }
 
 /// An architecture's metadata keys, `{architecture}.{key}`, with typed access.

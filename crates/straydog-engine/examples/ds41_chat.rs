@@ -57,6 +57,7 @@ fn main() -> Result<(), String> {
     let mut output = vec![argmax(&logits)];
     let (hits0, misses0, fill0) = engine.cache_counts();
     let started = std::time::Instant::now();
+    engine.take_profile();
     while output.len() < generate {
         logits = engine.forward(&output[output.len() - 1..])?;
         output.push(argmax(&logits));
@@ -66,6 +67,11 @@ fn main() -> Result<(), String> {
     println!("decode {} tokens: {:.2} tok/s, expert cache {:.1}% hits ({} misses, {:.0}% of the time filling them)", output.len() - 1,
              (output.len() - 1) as f64 / seconds, 100.0 * (hits - hits0) as f64 / ((hits - hits0 + misses - misses0).max(1)) as f64,
              misses - misses0, 100.0 * (fill - fill0) / seconds);
+    let profile = engine.take_profile();
+    if !profile.is_empty() {
+        let steps = (output.len() - 1) as f64;
+        println!("per token: {}", profile.iter().map(|(phase, s)| format!("{phase} {:.1} ms", 1e3 * s / steps)).collect::<Vec<_>>().join(", "));
+    }
     let same = output.iter().zip(&reference).take_while(|(a, b)| a == b).count();
     println!("first {same} tokens equal llama.cpp's greedy ones");
     println!("text: {}", text.decode(&output).map_err(|exc| exc.0)?);
