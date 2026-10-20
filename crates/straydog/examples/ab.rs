@@ -6,7 +6,7 @@
 //!
 //! Each round starts each build in turn (the order alternates), runs the single-request
 //! cases of bench/cases.json twice (the second counts) and a multi-turn agent session over
-//! this repository at a fixed commit, then stops it. Timings are the engines' own.
+//! this repository at a fixed tree, then stops it. Timings are the engines' own.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -57,7 +57,11 @@ struct Args {
     repeat: usize,
 }
 
-const SESSION_COMMIT: &str = "9ee90c6";
+/// The repository's tree at b44fbe9, not the commit: rewriting history's messages or authors
+/// keeps tree ids, so the session reads the same files after such a rewrite.
+const SESSION_TREE: &str = "3993aa7dd0fbde0a1fd14b702da6657963fa7c87";
+/// The files the session's questions are about: present in SESSION_TREE, checked before a round.
+const SESSION_FILES: [&str; 3] = ["crates/straydog-engine/src/pyjson.rs", "crates/straydog/src/runtime.rs", "gpu/straydog_gpu.h"];
 const SESSION_TURNS: [&str; 3] = [
     "Read crates/straydog-engine/src/pyjson.rs and explain how float_repr chooses between positional and exponent \
      notation.",
@@ -80,19 +84,33 @@ async fn run(engine: &Runtime, body: &pyjson::Value) -> (String, Value) {
     panic!("the generation ended without a terminal event");
 }
 
+/// A git command's output; empty when it failed (a missing path: the tool answers "not found").
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Process::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    if !output.status.success() {
+        return String::new();
+    }
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-/// Read-only answers from the repository at SESSION_COMMIT: the same calls get the same results.
+/// Stop before measuring when the session's fixture is not in `repo`: a broken fixture would
+/// otherwise look like the model asking for missing files.
+fn check_session_fixture(repo: &Path) {
+    for path in SESSION_FILES {
+        let status = Process::new("git").arg("-C").arg(repo).args(["cat-file", "-e", &format!("{SESSION_TREE}:{path}")])
+            .status().unwrap();
+        assert!(status.success(), "the A/B session's fixture is missing: tree {SESSION_TREE} has no {path} in {}", repo.display());
+    }
+}
+
+/// Read-only answers from the repository at SESSION_TREE: the same calls get the same results.
 fn tool(repo: &Path, name: &str, arguments: &Value) -> String {
     let text = |key: &str| arguments[key].as_str().unwrap_or("").to_string();
     let result = match name {
-        "read_file" => git(repo, &["show", &format!("{SESSION_COMMIT}:{}", text("path"))]),
-        "list_directory" => git(repo, &["ls-tree", "--name-only", SESSION_COMMIT, &format!("{}/", text("path").trim_end_matches('/'))]),
-        "search" => git(repo, &["grep", "-n", "-e", &text("pattern"), SESSION_COMMIT]).lines().take(60)
-            .map(|line| line.trim_start_matches(&format!("{SESSION_COMMIT}:")).chars().take(240).collect::<String>())
+        "read_file" => git(repo, &["show", &format!("{SESSION_TREE}:{}", text("path"))]),
+        "list_directory" => git(repo, &["ls-tree", "--name-only", SESSION_TREE, &format!("{}/", text("path").trim_end_matches('/'))]),
+        "search" => git(repo, &["grep", "-n", "-e", &text("pattern"), SESSION_TREE]).lines().take(60)
+            .map(|line| line.trim_start_matches(&format!("{SESSION_TREE}:")).chars().take(240).collect::<String>())
             .collect::<Vec<_>>().join("\n"),
         _ => format!("error: {name} is not available"),
     };
@@ -161,6 +179,9 @@ fn main() {
             .filter(|case| args.cases.as_ref().is_none_or(|names| names.iter().any(|name| case["name"] == name.as_str())))
             .collect();
     let repo = args.repo.canonicalize().unwrap();
+    if !args.no_session {
+        check_session_fixture(&repo);
+    }
     let mut report = json!({"settings": format!("{settings:?}"), "rounds": []});
     let tokio = tokio::runtime::Runtime::new().unwrap();
     for round in 0..args.rounds {

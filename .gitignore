@@ -8,3 +8,5 @@ target/
 dist/
 *.egg-info/
 /build-stage-commit-push.bat
+/plan/
+/AGENTS.md
