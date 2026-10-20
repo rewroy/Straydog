@@ -639,9 +639,50 @@ template<> struct GemvFormat<10> {
         for (int v = 0; v < V; ++v) r[v] = gemv_half(dm) * scaled[v] - gemv_half(dm >> 16) * minimums[v];
     }
 };
+// MXFP4: doubled E2M1 values, biased by 12 for the unsigned byte conversion (12 * sum(x) is
+// subtracted once), against low nibbles 0-15 and high nibbles 16-31.
+__device__ __forceinline__ uint32_t gemv_fp4(uint32_t nibbles) {
+    const uint32_t select = nibbles & 0x07070707u;
+    const uint32_t low = gemv_perm(0x18141210u, 0x0F0E0D0Cu, select);
+    const uint32_t high = gemv_perm(0x00040608u, 0x090A0B0Cu, select);
+    const uint32_t mask = ((nibbles >> 3) & 0x01010101u) * 0xFFu;
+    return (low & ~mask) | (high & mask);
+}
+// A 17-byte block starts at any byte: its codes are read as four realigned words.
+template<> struct GemvFormat<39> {
+    static constexpr size_t elements = 32, alignment = 1;
+    template<int V>
+    __device__ static void dots(const uint8_t* row, size_t unit, const float* x, uint32_t stride, float (&r)[V]) {
+        const uint8_t* block = row + unit * 17;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(block + 1);
+        const uint32_t* base = reinterpret_cast<const uint32_t*>(address & ~uintptr_t(3));
+        const uint32_t shift = uint32_t(address & 3), e = block[0];
+        uint32_t words[5];
+        #pragma unroll
+        for (int i = 0; i < 5; ++i) words[i] = base[i];
+        float a[V], s[V];
+        #pragma unroll
+        for (int v = 0; v < V; ++v) { a[v] = 0; s[v] = 0; }
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const uint32_t codes = gemv_realign(words[m], words[m + 1], shift);
+            const uint32_t low = gemv_fp4(codes & 0x0F0F0F0Fu), high = gemv_fp4((codes >> 4) & 0x0F0F0F0Fu);
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                const float* values = x + v * stride + unit * 32;
+                const float4 xl = gemv_load4(values + 4 * m), xh = gemv_load4(values + 16 + 4 * m);
+                a[v] = gemv_dot4(low, xl, a[v]); a[v] = gemv_dot4(high, xh, a[v]);
+                s[v] += gemv_sum4(xl) + gemv_sum4(xh);
+            }
+        }
+        const float scale = __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        #pragma unroll
+        for (int v = 0; v < V; ++v) r[v] = scale * (a[v] - 12.0f * s[v]);
+    }
+};
 // Formats with a fast unit decoder (others use the reference element decoder).
 #define SD_FAST_FORMATS(X) X(0) X(1) X(30) X(42) X(11) X(12) X(13) X(14) X(23) X(8) X(20) X(16) X(17) X(18) X(21) X(22) \
-    X(29) X(19) X(10)
+    X(29) X(19) X(10) X(39)
 
 constexpr size_t gemv_fixed_items = 24;
 // Up to four activation vectors share one pass over the weights; vector v reads
@@ -760,6 +801,7 @@ size_t gemv_unit(int kind, size_t& alignment) {
         case 0: alignment = 16; return 4;
         case 1: case 30: alignment = 16; return 8;
         case 42: alignment = 2; return 64;
+        case 39: alignment = 1; return 32;
         case 10: alignment = 4; return 128;
         case 12: case 13: alignment = 16; return 64;
         case 23: alignment = 8; return 64;

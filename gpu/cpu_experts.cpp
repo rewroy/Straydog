@@ -156,7 +156,7 @@ std::mutex iq_mutex;
 std::vector<uint8_t> iq_tables[6];   // IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S/IQ1_M
 constexpr size_t iq_table_bytes[6] = {256 * 8, 512 * 8, 1024 * 8, 256 * 4, 512 * 4, 2048 * 8};
 int iq_index(int kind) {
-    return kind == 16 ? 0 : kind == 17 ? 1 : kind == 22 ? 2 : kind == 18 ? 3 : kind == 21 ? 4 : kind == 29 ? 5 : -1;
+    return kind == 16 ? 0 : kind == 17 ? 1 : kind == 22 ? 2 : kind == 18 ? 3 : kind == 21 ? 4 : kind == 29 || kind == 19 ? 5 : -1;
 }
 const uint8_t* iq_table(int kind) {
     const int index = iq_index(kind);
@@ -171,6 +171,13 @@ const float* iq_float(int kind) {
     return iq_floats[index].data();
 }
 constexpr int iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+// MXFP4: doubled E2M1 values; the E8M0 block scale is halved to match, 2^(e - 128).
+constexpr int fp4_values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+float e8m0_half(uint8_t e) {
+    const uint32_t bits = e < 2 ? 0x00200000u << e : uint32_t(e - 1) << 23;
+    float value; std::memcpy(&value, &bits, 4);
+    return value;
+}
 unsigned iq_signs(unsigned bits) {
     unsigned parity = bits;
     parity ^= parity >> 4; parity ^= parity >> 2; parity ^= parity >> 1;
@@ -285,6 +292,38 @@ void decode_iq1_m(const uint8_t* b, float* out) {
             const uint8_t* g = grid + 8 * (b[4 * ib + l] | ((high & 7) << 8));
             for (int j = 0; j < 8; ++j) out[32 * ib + 8 * l + j] = dl * (float(g[j]) - 1.0f + delta);
         }
+}
+// IQ1_S (50 bytes): d, qs[32], then per 32 values a 16-bit word of four 3-bit grid-row high parts,
+// a 3-bit scale and the delta's sign.
+void decode_iq1_s(const uint8_t* b, float* out) {
+    const float d = half_at(b);
+    const uint8_t* grid = iq_table(19);
+    for (int ib = 0; ib < 8; ++ib) {
+        const unsigned qh = unsigned(b[34 + 2 * ib]) | unsigned(b[35 + 2 * ib]) << 8;
+        const float dl = d * float(2 * ((qh >> 12) & 7) + 1), delta = qh & 0x8000 ? -0.125f : 0.125f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t* g = grid + 8 * (b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8));
+            for (int j = 0; j < 8; ++j) out[32 * ib + 8 * l + j] = dl * (float(g[j]) - 1.0f + delta);
+        }
+    }
+}
+// Q2_K (84 bytes): scales[16] qs[64] d dmin; group g of 16 values has scale byte g (scale and minimum
+// nibbles) and two bits at shift 2 * ((g / 2) % 4) of code bytes 32 * (g / 8) + 16 * (g % 2) ..
+void decode_q2_k(const uint8_t* b, float* out) {
+    const float d = half_at(b + 80), minimum = half_at(b + 82);
+    for (int g = 0; g < 16; ++g) {
+        const float dl = d * float(b[g] & 15), ml = minimum * float(b[g] >> 4);
+        const uint8_t* codes = b + 16 + 32 * (g / 8) + 16 * (g % 2);
+        for (int l = 0; l < 16; ++l) out[16 * g + l] = dl * float((codes[l] >> (2 * ((g / 2) % 4))) & 3) - ml;
+    }
+}
+// MXFP4 (17 bytes): an E8M0 exponent, then 16 bytes of E2M1 codes (low nibbles values 0-15).
+void decode_mxfp4(const uint8_t* b, float* out) {
+    const float scale = e8m0_half(b[0]);
+    for (int j = 0; j < 16; ++j) {
+        out[j] = float(fp4_values[b[1 + j] & 15]) * scale;
+        out[j + 16] = float(fp4_values[b[1 + j] >> 4]) * scale;
+    }
 }
 void decode_iq3_s(const uint8_t* b, float* out) {
     const float d = half_at(b);
@@ -481,6 +520,10 @@ CpuFormat cpu_format(int kind) {
         case 18: return {256, 98, decode_iq3_xxs, SD_WIDE(decode_iq3_xxs), SD_ROWS(18)};
         case 21: return {256, 110, decode_iq3_s, SD_WIDE(decode_iq3_s), SD_ROWS(21)};
         case 29: return {256, 56, decode_iq1_m, SD_WIDE(decode_iq1_m), SD_ROWS(29)};
+        // No wide decoders: their fused row kernels take the AVX paths.
+        case 19: return {256, 50, decode_iq1_s, decode_iq1_s, SD_ROWS(19)};
+        case 10: return {256, 84, decode_q2_k, decode_q2_k, SD_ROWS(10)};
+        case 39: return {32, 17, decode_mxfp4, decode_mxfp4, SD_ROWS(39)};
     }
     #undef SD_WIDE
     #undef SD_ROWS
@@ -738,7 +781,8 @@ int sd_cpu_experts_stats(void* handle, uint64_t* values) {
 }
 
 // out[hidden] = sum_i weights[i] * down_i(silu(gate_i x) * up_i x) for expert slices of
-// kinds[0..2] (gate, up, down): Q2_0 or a format with a block decoder (cpu_format).
+// kinds[0..2] (gate, up, down): Q2_0 or a format with a block decoder (cpu_format), at any
+// hidden and inter that are whole blocks.
 int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up,
                        const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter,
                        const float* x, float* out) {

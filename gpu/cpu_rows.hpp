@@ -112,7 +112,26 @@ template<> struct Block<29> {   // IQ1_M: value = scale * ((grid value) + delta)
         return k;
     }
 };
-// Code formats: sixteen values are the scale times a table entry or an int8.
+template<> struct Block<19> {   // IQ1_S: value = scale * (grid value + delta), one scale and delta per 32 values
+    static constexpr size_t values = 256, bytes = 50;
+    static constexpr int grid = 19, width = 8;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = half_at(block); }
+    GridChunk chunk(unsigned c, const float* table) const {
+        const unsigned ib = c / 2, h = c % 2;
+        const unsigned qh = unsigned(b[34 + 2 * ib]) | unsigned(b[35 + 2 * ib]) << 8;
+        GridChunk k{};
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned l = 2 * h + i;
+            k.row[i] = table + 8 * (b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8));
+            k.delta[i] = qh & 0x8000 ? -0.125f : 0.125f;
+        }
+        k.scale = d * float(2 * ((qh >> 12) & 7) + 1);
+        return k;
+    }
+};
+// Code formats: sixteen values are the scale times a table entry or an int8, Q2_K's scale times
+// a code minus its minimum.
 template<> struct Block<20> {   // IQ4_NL
     static constexpr size_t values = 32, bytes = 18;
     static constexpr int grid = 0;
@@ -140,6 +159,24 @@ template<> struct Block<8> {    // Q8_0
     const uint8_t* b; float d;
     void load(const uint8_t* block) { b = block; d = half_at(block); }
 };
+template<> struct Block<10> {   // Q2_K: group c's scale byte is c; its codes as decode_q2_k
+    static constexpr size_t values = 256, bytes = 84;
+    static constexpr int grid = -2;
+    const uint8_t* b; float d, minimum;
+    void load(const uint8_t* block) { b = block; d = half_at(block + 80); minimum = half_at(block + 82); }
+    const uint8_t* codes(unsigned c) const { return b + 16 + 32 * (c / 8) + 16 * (c % 2); }
+    int shift(unsigned c) const { return 2 * int((c / 2) % 4); }
+    float scale(unsigned c) const { return d * float(b[c] & 15); }
+    float offset(unsigned c) const { return minimum * float(b[c] >> 4); }
+};
+template<> struct Block<39> {   // MXFP4: doubled E2M1 values times 2^(e - 128)
+    static constexpr size_t values = 32, bytes = 17;
+    static constexpr int grid = -3;
+    const uint8_t* b; float d;
+    void load(const uint8_t* block) { b = block; d = e8m0_half(block[0]); }
+    const uint8_t* codes(unsigned) const { return b + 1; }
+    int shift(unsigned c) const { return 4 * int(c); }
+};
 
 SD_TARGET("avx512f,avx2,f16c")
 inline __m512 grid16(const GridChunk& k, int width) {
@@ -159,7 +196,7 @@ inline __m512 values16(const Block<kind>& block, unsigned c, const float* table)
     if constexpr (B::grid > 0) {
         const GridChunk k = block.chunk(c, table);
         __m512 v = grid16(k, B::width);
-        if constexpr (kind == 29) {
+        if constexpr (kind == 29 || kind == 19) {
             const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(k.delta[0]), _mm512_set1_ps(k.delta[1]));
             return _mm512_mul_ps(_mm512_set1_ps(k.scale), _mm512_add_ps(v, delta));
         } else {
@@ -172,6 +209,15 @@ inline __m512 values16(const Block<kind>& block, unsigned c, const float* table)
         const __m512i codes = _mm512_and_si512(_mm512_srli_epi32(_mm512_cvtepu8_epi32(bytes), unsigned(block.shift(c))),
                                                _mm512_set1_epi32(15));
         return _mm512_mul_ps(_mm512_set1_ps(block.scale(c)), _mm512_permutexvar_ps(codes, table16));
+    } else if constexpr (B::grid == -2) {
+        const __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c))));
+        const __m512i codes = _mm512_and_si512(_mm512_srli_epi32(bytes, unsigned(block.shift(c))), _mm512_set1_epi32(3));
+        return _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(block.scale(c)), _mm512_cvtepi32_ps(codes)), _mm512_set1_ps(block.offset(c)));
+    } else if constexpr (B::grid == -3) {
+        const __m512 fp4 = _mm512_setr_ps(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+        const __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c))));
+        const __m512i codes = _mm512_and_si512(_mm512_srli_epi32(bytes, unsigned(block.shift(c))), _mm512_set1_epi32(15));
+        return _mm512_mul_ps(_mm512_permutexvar_ps(codes, fp4), _mm512_set1_ps(block.d));
     } else {
         const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
         return _mm512_mul_ps(_mm512_set1_ps(block.d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q)));
@@ -283,6 +329,18 @@ void prepare(const uint8_t* b, Prepared& p) {
                                                _mm512_mullo_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), _mm512_set1_epi32(3)));
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(word, _mm512_srli_epi32(lane, 2), shift, 7), 1), _mm512_set1_epi32(1));
         _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(odd)));
+    } else if constexpr (kind == 19) {   // IQ1_S: qs[2..34) | 3 bits of the ib's 16-bit word at 34; its scale and delta sign
+        const __m512i qh = _mm512_cvtepu16_epi32(_mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 34))));
+        for (int half = 0; half < 2; ++half) {
+            const __m512i g = lanes16(16 * half), ib = _mm512_srli_epi32(g, 2);
+            const __m512i high = field16(qh, ib, _mm512_mullo_epi32(_mm512_and_si512(g, _mm512_set1_epi32(3)), _mm512_set1_epi32(3)), 7);
+            const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * half), _mm512_slli_epi32(high, 8));
+            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            const __m512i delta = _mm512_or_si512(_mm512_set1_epi32(0x3E000000), _mm512_slli_epi32(field16(qh, ib, _mm512_set1_epi32(15), 1), 31));
+            _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
+        }
+        const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(qh, _mm512_srli_epi32(lane, 1), _mm512_set1_epi32(12), 7), 1), _mm512_set1_epi32(1));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_cvtepi32_ps(odd)));
     } else if constexpr (kind == 18) {   // IQ3_XXS: 64 index bytes; per ib aux at 66 (signs, scale)
         for (int quarter = 0; quarter < 4; ++quarter)
             _mm512_store_si512(p.offset + 16 * quarter, _mm512_slli_epi32(bytes16(b + 2 + 16 * quarter), 4));
@@ -328,7 +386,7 @@ inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
         v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 2])), 2);
         v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 3])), 3);
     }
-    if constexpr (kind == 29) {
+    if constexpr (kind == 29 || kind == 19) {
         const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(p.delta[2 * c]), _mm512_set1_ps(p.delta[2 * c + 1]));
         return _mm512_mul_ps(_mm512_set1_ps(p.scale[c]), _mm512_add_ps(v, delta));
     } else {
@@ -385,9 +443,9 @@ inline __m256 rows8(const float* first, const float* second, int width) {
     return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(first)), _mm_loadu_ps(second), 1);
 }
 SD_TARGET("avx2,fma,f16c")
-inline __m256 nonlinear8(__m128i bytes, int shift, float scale) {
-    const __m256 low = _mm256_setr_ps(-127, -104, -83, -65, -49, -35, -22, -10);
-    const __m256 high = _mm256_setr_ps(1, 13, 25, 38, 53, 69, 89, 113);
+inline __m256 nonlinear8(__m128i bytes, int shift, float scale, bool fp4 = false) {
+    const __m256 low = fp4 ? _mm256_setr_ps(0, 1, 2, 3, 4, 6, 8, 12) : _mm256_setr_ps(-127, -104, -83, -65, -49, -35, -22, -10);
+    const __m256 high = fp4 ? _mm256_setr_ps(0, -1, -2, -3, -4, -6, -8, -12) : _mm256_setr_ps(1, 13, 25, 38, 53, 69, 89, 113);
     const __m256i codes = _mm256_and_si256(_mm256_srli_epi32(_mm256_cvtepu8_epi32(bytes), shift), _mm256_set1_epi32(15));
     const __m256 value = _mm256_blendv_ps(_mm256_permutevar8x32_ps(low, codes), _mm256_permutevar8x32_ps(high, codes),
                                           _mm256_castsi256_ps(_mm256_slli_epi32(codes, 28)));
@@ -401,7 +459,7 @@ inline Halves values8x2(const Block<kind>& block, unsigned c, const float* table
         const GridChunk k = block.chunk(c, table);
         const bool wide = B::width == 8;
         __m256 low = rows8(k.row[0], k.row[1], B::width), high = wide ? rows8(k.row[1], nullptr, 8) : rows8(k.row[2], k.row[3], 4);
-        if constexpr (kind == 29) {
+        if constexpr (kind == 29 || kind == 19) {
             const __m256 scale = _mm256_set1_ps(k.scale);
             return {_mm256_mul_ps(scale, _mm256_add_ps(low, _mm256_set1_ps(k.delta[0]))),
                     _mm256_mul_ps(scale, _mm256_add_ps(high, _mm256_set1_ps(k.delta[1])))};
@@ -413,6 +471,17 @@ inline Halves values8x2(const Block<kind>& block, unsigned c, const float* table
         const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
         const float scale = block.scale(c);
         return {nonlinear8(bytes, block.shift(c), scale), nonlinear8(_mm_srli_si128(bytes, 8), block.shift(c), scale)};
+    } else if constexpr (B::grid == -2) {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
+        const __m256 scale = _mm256_set1_ps(block.scale(c)), offset = _mm256_set1_ps(block.offset(c));
+        const __m256i shift = _mm256_set1_epi32(block.shift(c)), three = _mm256_set1_epi32(3);
+        const __m256i low = _mm256_and_si256(_mm256_srlv_epi32(_mm256_cvtepu8_epi32(bytes), shift), three);
+        const __m256i high = _mm256_and_si256(_mm256_srlv_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(bytes, 8)), shift), three);
+        return {_mm256_sub_ps(_mm256_mul_ps(scale, _mm256_cvtepi32_ps(low)), offset),
+                _mm256_sub_ps(_mm256_mul_ps(scale, _mm256_cvtepi32_ps(high)), offset)};
+    } else if constexpr (B::grid == -3) {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
+        return {nonlinear8(bytes, block.shift(c), block.d, true), nonlinear8(_mm_srli_si128(bytes, 8), block.shift(c), block.d, true)};
     } else {
         const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
         const __m256 d = _mm256_set1_ps(block.d);

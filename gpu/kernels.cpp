@@ -151,7 +151,7 @@ struct Matrix {
 struct GemvItem { Matrix matrix; uint32_t first_wave, lanes; };
 // Every GGML type the GPU kernels decode (weight<kind>); dispatch sites expand it.
 #define SD_FORMATS(X) X(0) X(1) X(2) X(6) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) \
-    X(29) X(30) X(42)
+    X(29) X(30) X(39) X(42)
 // Allocations carry a small tail so aligned word loads of two-byte-aligned
 // quant blocks never cross the end of an owned buffer.
 constexpr size_t allocation_tail = 64;
@@ -617,6 +617,12 @@ __device__ float weight(const uint8_t* data, size_t col) {
         const unsigned code = (b[2 + (col % 64) / 4] >> ((col % 4) * 2)) & 3;
         return half_at(b) * (int(code) - 1);
     }
+    if (kind == 39) {   // MXFP4: doubled E2M1 values times 2^(e - 128) (subnormal below e = 2)
+        const uint8_t* b = data + (col / 32) * 17;
+        const unsigned i = unsigned(col % 32), e = b[0];
+        const int values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+        return float(values[(b[1 + i % 16] >> (4 * (i / 16))) & 15]) * __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+    }
     if (kind == 2 || kind == 6 || kind == 8 || kind == 20) {
         const size_t stride = kind == 6 ? 22 : kind == 8 ? 34 : 18;
         const uint8_t* b = data + (col / 32) * stride;
@@ -875,8 +881,8 @@ size_t matrix_row_bytes(int kind, uint64_t cols) {
     if (kind == 0) return size_t(cols) * 4;
     if (kind == 1 || kind == 30) return size_t(cols) * 2;
     if (kind == 42 && cols % 64 == 0) return size_t(cols / 64) * 18;
-    if ((kind == 2 || kind == 6 || kind == 8 || kind == 20) && cols % 32 == 0)
-        return size_t(cols / 32) * (kind == 6 ? 22 : kind == 8 ? 34 : 18);
+    if ((kind == 2 || kind == 6 || kind == 8 || kind == 20 || kind == 39) && cols % 32 == 0)
+        return size_t(cols / 32) * (kind == 6 ? 22 : kind == 8 ? 34 : kind == 39 ? 17 : 18);
     if ((kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23) && cols % 256 == 0)
         return size_t(cols / 256) * (kind == 10 ? 84 : kind == 11 ? 110 : kind == 12 ? 144 : kind == 13 ? 176 : kind == 14 ? 210 : 136);
     if (iq_kind(kind) && cols % 256 == 0) {

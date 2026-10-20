@@ -1,17 +1,17 @@
 //! The formats' kernels against the host decoders (formats.rs, themselves checked against ggml's
-//! definitions in tests/formats.rs), on DeepSeek-V4.1's real tensors: the GPU's linear products
-//! (sd_op_linear: GEMV for up to four inputs, an F32 GEMM over expanded rows beyond).
+//! definitions in tests/formats.rs): the CPU expert engine's block decoders, row kernels and
+//! experts, and the GPU's linear products (sd_op_linear: GEMV for up to four inputs, an F32 GEMM
+//! over expanded rows beyond), on DeepSeek-V4.1's real tensors and on generated blocks.
 //!
-//! Every weight is checked exactly: one-hot inputs make each product return single decoded values,
-//! column by column, through the GEMV and through the expansion. Random inputs then check the sums
-//! against an F64 reference within the bound of F32 summation alone: n u sum|terms| for n terms
-//! (u = 2^-24), the terms being the decoded weights times the inputs. The GEMV sums codes and
-//! subtracts biases or minimums per group, terms of up to about three times a weight's size, so
-//! its bound takes 4 n u.
+//! Every weight is checked exactly: one-hot inputs make each kernel return single decoded values.
+//! Random inputs then check the sums against an F64 reference within the bound of F32 summation
+//! alone: n u sum|terms| for n terms (u = 2^-24), the terms being the decoded weights times the
+//! inputs. The GEMV and CPU kernels sum codes and subtract biases or minimums per group, terms of
+//! up to about three times a weight's size, so their bound takes 4 n u.
 //!
 //! cargo test --release -p straydog-engine --features hip --test formats_kernels, under the GPU
-//! lock, with STRAYDOG_DEEPSEEK set to the directory of the DeepSeek-V4.1-Flash UD-IQ2_XXS shards
-//! (the cases read about 60 MB of it).
+//! lock. The model cases read about 100 MB of DeepSeek-V4.1-Flash UD-IQ2_XXS: set
+//! STRAYDOG_DEEPSEEK to its directory.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 use std::ffi::c_void;
@@ -19,6 +19,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+use serde_json::Value as Json;
 use straydog_engine::formats;
 use straydog_gguf::{ModelHeader, TensorInfo};
 use straydog_gpu::{ffi, Device};
@@ -48,8 +49,76 @@ fn decode(kind: u32, data: &[u8]) -> Vec<f32> {
     out
 }
 
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap()).collect()
+}
+
+/// A generated block of `kind` with finite scales (MXFP4 exponents keep values in FP16's range).
+fn generated_block(kind: u32, random: &mut Random) -> Vec<u8> {
+    let (_, size) = formats::block(kind).unwrap();
+    let mut block: Vec<u8> = (0..size).map(|_| random.next() as u8).collect();
+    let mut half = |block: &mut Vec<u8>, at: usize| {
+        let bits = (0x1c00 + (random.next() % 0x1800) as u16) | if random.next().is_multiple_of(2) { 0 } else { 0x8000 };
+        block[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+    };
+    match kind {
+        10 => { half(&mut block, 80); half(&mut block, 82); }
+        39 => block[0] = 118 + (random.next() % 8) as u8,
+        29 => {
+            let bits = 0x1c00 + (random.next() % 0x1800) as u16;
+            for k in 0..4 {
+                block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (((bits >> (4 * k)) & 15) << 4) as u8;
+            }
+        }
+        _ => half(&mut block, 0),
+    }
+    block
+}
+
+/// The CPU expert engine's formats.
+const CPU_KINDS: [u32; 12] = [8, 10, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39];
+
 fn load_tables() {
     straydog_engine::gpu::load_iq_tables().unwrap();
+}
+
+
+#[test]
+fn cpu_block_decoders_equal_the_host_decoders() {
+    load_tables();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/format_blocks.json");
+    let golden: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut blocks: Vec<(u32, Vec<u8>)> = golden["blocks"].as_array().unwrap().iter()
+        .map(|case| (case["kind"].as_u64().unwrap() as u32, hex(case["data"].as_str().unwrap())))
+        .filter(|(kind, _)| CPU_KINDS.contains(kind))
+        .collect();
+    let mut random = Random(11);
+    for kind in CPU_KINDS {
+        blocks.extend((0..500).map(|_| (kind, generated_block(kind, &mut random))));
+    }
+    let wide = std::is_x86_feature_detected!("avx512f");
+    for (kind, block) in &blocks {
+        let expected = decode(*kind, block);
+        for level in [0, i32::from(wide)] {
+            let mut out = vec![0f32; expected.len()];
+            // SAFETY: a whole block and room for its values.
+            let status = unsafe { ffi::sd_cpu_decode(*kind as i32, level, block.as_ptr(), out.as_mut_ptr()) };
+            assert_eq!(status, 0, "kind {kind}");
+            let bits: Vec<u32> = out.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(bits, expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "kind {kind} wide {level}");
+        }
+    }
+}
+
+/// Rows of one bank through sd_cpu_rows at an instruction-set level (0: the decoded scalar path).
+fn cpu_rows(kind: u32, level: i32, rows: &[u8], count: usize, x: &[f32]) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; count];
+    // SAFETY: `count` rows of len/count bytes each against x of their width.
+    let status = unsafe {
+        ffi::sd_cpu_rows(kind as i32, level, rows.as_ptr(), (rows.len() / count) as u64, count as u32, x.as_ptr(),
+                         x.len() as u64, out.as_mut_ptr())
+    };
+    (status == 0).then_some(out)
 }
 
 /// Each output against F64 sums of the decoded rows: within `factor` n u sum|w x|.
@@ -62,6 +131,43 @@ fn check_sums(label: &str, actual: &[f32], weights: &[f32], cols: usize, x: &[f3
         assert!((f64::from(*value) - exact).abs() <= bound, "{label} row {row}: {value} vs {exact} (bound {bound:e})");
     }
 }
+
+
+#[test]
+fn cpu_row_kernels_decode_every_weight_and_sum_within_f32_bounds() {
+    load_tables();
+    let mut random = Random(5);
+    let levels: Vec<i32> = [(1, "avx2"), (2, "avx512f")].into_iter()
+        .filter(|(_, feature)| match *feature { "avx2" => std::is_x86_feature_detected!("avx2"), _ => std::is_x86_feature_detected!("avx512f") })
+        .map(|(level, _)| level).collect();
+    for kind in CPU_KINDS {
+        let (values, _) = formats::block(kind).unwrap();
+        let (rows, cols) = (7, values * (2304 / values).min(9));
+        let data: Vec<u8> = (0..rows * cols / values).flat_map(|_| generated_block(kind, &mut random)).collect();
+        let weights = decode(kind, &data);
+        // One-hot inputs: every row returns its decoded weight at that column.
+        for col in (0..cols).step_by(if values == 256 { 7 } else { 3 }) {
+            let mut x = vec![0f32; cols];
+            x[col] = 1.0;
+            for &level in std::iter::once(&0).chain(&levels) {
+                let out = cpu_rows(kind, level, &data, rows, &x).unwrap();
+                for (row, value) in out.iter().enumerate() {
+                    assert_eq!(*value, weights[row * cols + col], "kind {kind} level {level} row {row} col {col}");
+                }
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
+        let scalar = cpu_rows(kind, 0, &data, rows, &x).unwrap();
+        check_sums(&format!("CPU kind {kind}"), &scalar, &weights, cols, &x, 4.0);
+        // The fused kernels keep the decoded path's arithmetic: equal bit for bit.
+        for &level in &levels {
+            let fused = cpu_rows(kind, level, &data, rows, &x).unwrap();
+            assert_eq!(fused.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "kind {kind} level {level}");
+        }
+    }
+}
+
 
 /// The DeepSeek-V4.1 shards: tensors by name.
 struct Shards {
@@ -215,3 +321,108 @@ fn gpu_linear_products_decode_every_type_of_the_file_exactly() {
         check_linear(&device, &format!("{name} [{kind}]"), kind, rows, cols, &data);
     }
 }
+
+#[test]
+fn gpu_linear_products_decode_mxfp4_exactly() {
+    if straydog_gpu::device_count().unwrap_or(0) == 0 {
+        eprintln!("skipped: no GPU");
+        return;
+    }
+    load_tables();
+    let device = Device::new(0, 2 << 30).unwrap();
+    // No file on hand has MXFP4 tensors: generated blocks, exponents in a trained model's range.
+    let mut random = Random(39);
+    let (rows, cols) = (2304, 5120);
+    let data: Vec<u8> = (0..rows * cols / 32).flat_map(|_| generated_block(39, &mut random)).collect();
+    check_linear(&device, "generated [39]", 39, rows, cols, &data);
+}
+
+const HIDDEN: usize = 5120;
+const FFN: usize = 2304;
+
+/// Gate, up and down banks of a few experts.
+struct Banks {
+    label: String,
+    kinds: [u32; 3],
+    experts: usize,
+    data: [Vec<u8>; 3],
+}
+
+impl Banks {
+    fn layer(shards: &Shards, layer: usize, which: &[usize]) -> Banks {
+        let roles = ["gate", "up", "down"].map(|role| shards.experts(&format!("blk.{layer}.ffn_{role}_exps.weight"), which));
+        let kinds = [roles[0].0, roles[1].0, roles[2].0];
+        Banks { label: format!("layer {layer}"), kinds, experts: which.len(), data: roles.map(|role| role.1) }
+    }
+
+    /// One expert's matrix of a role, decoded (rows x cols, row-major).
+    fn decoded(&self, role: usize, expert: usize) -> Vec<f32> {
+        let per = self.data[role].len() / self.experts;
+        decode(self.kinds[role], &self.data[role][expert * per..(expert + 1) * per])
+    }
+}
+
+
+#[test]
+fn cpu_experts_on_the_model_equal_the_reference() {
+    let Some(shards) = Shards::open() else { return };
+    load_tables();
+    // SAFETY: plain value; null on failure.
+    let engine = unsafe { ffi::sd_cpu_experts_create(0) };
+    assert!(!engine.is_null());
+    let mut random = Random(23);
+    for (layer, which) in [(0, [3, 381]), (1, [7, 200]), (2, [64, 300]), (10, [1, 255]), (20, [9, 383]), (25, [100, 2])] {
+        let banks = Banks::layer(&shards, layer, &which);
+        let kinds = banks.kinds.map(|kind| kind as i32);
+        let per = [0, 1, 2].map(|role| banks.data[role].len() / 2);
+        let slices = |role: usize| -> Vec<*const u8> { (0..2).map(|e| banks.data[role][e * per[role]..].as_ptr()).collect() };
+        let (gate, up, down) = (slices(0), slices(1), slices(2));
+        let weights = [0.625f32, 0.375];
+        let x: Vec<f32> = (0..HIDDEN).map(|_| random.activation()).collect();
+        let mut out = vec![0f32; HIDDEN];
+        // SAFETY: two experts' slices of the declared shapes; x and out hold `hidden` values.
+        let status = unsafe {
+            ffi::sd_cpu_experts_run(engine, kinds.as_ptr(), gate.as_ptr(), up.as_ptr(), down.as_ptr(), weights.as_ptr(), 2,
+                                    HIDDEN as u64, FFN as u64, x.as_ptr(), out.as_mut_ptr())
+        };
+        assert_eq!(status, 0);
+        // The same in F64 from the decoded weights, with the engine's F32 activation in between
+        // checked through its bound: each expert's products within 4 n u, then the down sums.
+        let mut expected = vec![0f64; HIDDEN];
+        let mut bound = vec![0f64; HIDDEN];
+        for (e, weight) in weights.iter().enumerate() {
+            let [g, u, d] = [0, 1, 2].map(|role| banks.decoded(role, e));
+            let sums = |w: &[f32]| -> Vec<(f64, f64)> {
+                w.chunks(HIDDEN).map(|row| row.iter().zip(&x).fold((0.0, 0.0), |(s, m), (w, x)| {
+                    let t = f64::from(*w) * f64::from(*x);
+                    (s + t, m + t.abs())
+                })).collect()
+            };
+            let (gs, us) = (sums(&g), sums(&u));
+            let product: Vec<f64> = gs.iter().zip(&us).map(|(g, u)| g.0 / (1.0 + (-g.0).exp()) * u.0).collect();
+            // A product's error: its gate's and up's sum errors, carried through SiLU (slope below 1.1).
+            let slack: Vec<f64> = gs.iter().zip(&us).map(|(g, u)| {
+                let (eg, eu) = (4.0 * HIDDEN as f64 * 2f64.powi(-24) * g.1, 4.0 * HIDDEN as f64 * 2f64.powi(-24) * u.1);
+                1.1 * eg * (u.0.abs() + eu) + (g.0.abs() + eg) * eu + 1e-6 * (g.0 * u.0).abs()
+            }).collect();
+            for (row, w) in d.chunks(FFN).enumerate() {
+                let (mut s, mut m, mut carried) = (0.0, 0.0, 0.0);
+                for ((w, p), e) in w.iter().zip(&product).zip(&slack) {
+                    s += f64::from(*w) * p;
+                    m += (f64::from(*w) * p).abs();
+                    carried += f64::from(*w).abs() * e;
+                }
+                expected[row] += f64::from(*weight) * s;
+                bound[row] += f64::from(*weight) * (4.0 * FFN as f64 * 2f64.powi(-24) * m + carried) + 1e-30;
+            }
+        }
+        for row in 0..HIDDEN {
+            assert!((f64::from(out[row]) - expected[row]).abs() <= bound[row] + 4.0 * 2f64.powi(-24) * expected[row].abs(),
+                    "layer {layer} row {row}: {} vs {} (bound {:e})", out[row], expected[row], bound[row]);
+        }
+        eprintln!("CPU experts, {} {:?}: within bounds", banks.label, banks.kinds);
+    }
+    // SAFETY: created above, destroyed once.
+    unsafe { ffi::sd_cpu_experts_destroy(engine) };
+}
+
