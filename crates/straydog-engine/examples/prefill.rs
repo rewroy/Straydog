@@ -70,7 +70,7 @@ fn main() -> Result<(), String> {
         None => {
             let mut corpus = std::fs::read_to_string(source.join("docs/DESIGN.md")).map_err(|exc| exc.to_string())?;
             let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("crates/straydog-engine/src"))
-                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path()).collect();
+                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect();
             files.sort();
             for file in files {
                 corpus += &std::fs::read_to_string(file).map_err(|exc| exc.to_string())?;
