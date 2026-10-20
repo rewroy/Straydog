@@ -278,3 +278,72 @@ There is no setup command: a model is fetched once, then given by path.
 6. Sampling with a temperature uses Straydog's own RNG; a seed is reproducible
    within Straydog, not across the reference. The defaults are the model card's
    sampling settings for the request's mode, not greedy decoding, which loops.
+
+## 10. Model architectures
+
+Straydog runs one model family today (Qwen3.8 Flash Next) and is to run others: next
+DeepSeek-V4.1 Flash (748B total, 16B active, as a 300 GB GGUF), then GLM and more. One
+engine serves them all; the GGUF's `general.architecture` selects the architecture.
+Nothing an architecture needs is a constant in the engine: dimensions, layer kinds,
+router, attention and table parameters come from the file's metadata.
+
+### 10.1 Layers of the engine
+
+1. **Runtime** (no architecture in it): devices, streams, peer links between GPUs,
+   page-locked arenas and staging, captured graphs, the storage reader, digests.
+2. **Formats.** Every GGUF block type is a decoder plus GEMV and GEMM kernels on the
+   GPU and the CPU, each tested against the format's definition. Architectures never
+   branch on formats; a type without kernels is an error at load time.
+3. **Ops**: building blocks taking their parameters from metadata: norms, rotary
+   embeddings (with YaRN), linear layers, SwiGLU (with clamping), MoE routers
+   (softmax, sigmoid, square-root softplus; bias, normalization, scale), expert
+   execution over a tiered expert store, attention kinds (grouped-query, latent,
+   sliding-window, sparse with an indexer, compressed), recurrent kinds (Gated
+   DeltaNet with its convolution), hyper-connections (n streams, Sinkhorn), embedding
+   tables (token, per-layer n-gram tables gathered by row) and output heads.
+4. **Architectures.** An architecture reads its hyperparameters and tensor names,
+   gives every tensor a role (dense per layer, routed experts, a gathered table, the
+   head, a drafter) and describes each layer as a program of ops. The GPU library runs
+   a layer's program as one captured graph; a new op kind is written once and serves
+   every architecture that needs it.
+5. **Planner.** Roles are placed into tiers from their sizes and access patterns:
+   VRAM per device, page-locked RAM, the SSD. Every-token weights go to VRAM; routed
+   experts to a VRAM cache backed by RAM and refreshed by use; gathered tables are
+   read by row where they lie. Layer split, expert parallelism and tensor parallelism
+   are the planner's choices, not the architecture's.
+6. **Serving**: the tokenizer from `tokenizer.json` or the GGUF's tokenizer metadata,
+   the chat template from the bundle or the GGUF, the reasoning and tool-call parsers
+   of the family, and its drafter (an MTP layer, a block drafter) when it has one.
+
+Integrity stays as in §3: every file is pinned by SHA-256 and authenticated before
+use. Bytes read from storage after start (table rows, experts outside RAM) are
+checked against per-block digests of the pinned file before they are used.
+
+The Qwen path keeps its specialized code until layer programs match its speed on the
+A/B harness; then it is expressed in the same terms.
+
+### 10.2 DeepSeek-V4.1 Flash (UD-IQ2_XXS)
+
+Measured from the file and a reference implementation (12 prompts, 1,536 generated
+tokens): every token reads 7.5 GB of dense weights (attention, shared expert, router,
+hyper-connections, head) and 2.45 GB of routed experts (6 of 384 in each of 40 layers,
+157 GB in all), plus 48 rows of 135 GB of n-gram tables. A per-layer cache holding a
+third of the experts, refreshed by use, catches 83-90% of the routes (a fixed
+placement of the same size: 69%). With dense weights in VRAM and misses served from
+page-locked RAM, a token costs 20-25 ms on two R9700s; the goal is 30 tokens/s.
+
+- **D1**: architecture `deepseek41`: metadata, roles, split GGUF files, the GGUF
+  tokenizer and template, bundle pins with chunk and block digests.
+- **D2**: formats IQ1_S and Q2_K, and every expert type of the file on the GPU (gate,
+  up and down) and the CPU.
+- **D3**: ops and the layer program, validated layer by layer against the reference's
+  tensors and its logits (KL divergence, top-1).
+- **D4**: the tiered expert store (VRAM cache, page-locked RAM, CPU execution of
+  misses), table rows from the SSD, prefetch.
+- **D5**: prefill streaming the experts each batch picks, layer by layer. The model is a
+  causal encoder (layers 0-19) and a decoder (20-39) whose global K/V is projected from
+  the encoder's output: a prompt runs the encoder over every token and the decoder only
+  over the last 20 x 128 tokens (its sliding windows' reach), which is exact.
+  Replaying only the last 128 (the model's own bounded replay) is an option, not the
+  default.
+- **D6**: the block drafter, two-GPU strategies, tuning to the goal.
