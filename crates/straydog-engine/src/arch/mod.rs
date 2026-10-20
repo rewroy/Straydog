@@ -34,6 +34,38 @@ pub trait Tensors {
     /// The check of every block read directly from [`files`](Self::files), before its use. No
     /// default: a source says explicitly that it reads unchecked (a development reader).
     fn verifier(&self) -> Option<crate::experts::Verifier>;
+
+    /// Rows of a table (a 2-D tensor), `rows[i]`'s bytes at `i` times the row size; the
+    /// default copies them from the tensor's data (a reader may serve them from a row cache,
+    /// see `crate::rows`).
+    fn rows(&self, name: &str, rows: &[u32]) -> Result<Vec<u8>, String> {
+        let tensor = self.tensor(name)?;
+        let width = row_size(&tensor, name)?;
+        let mut out = Vec::with_capacity(rows.len() * width);
+        for &row in rows {
+            let start = row as usize * width;
+            out.extend_from_slice(tensor.data.get(start..start + width).ok_or_else(|| format!("{name} has no row {row}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Start reading rows of a table that [`Tensors::rows`] will be asked for; the default
+    /// prefetches their bytes.
+    fn prefetch_rows(&self, name: &str, rows: &[u32]) -> Result<(), String> {
+        let tensor = self.tensor(name)?;
+        let width = row_size(&tensor, name)?;
+        let ranges: Vec<&[u8]> = rows.iter().filter_map(|&row| tensor.data.get(row as usize * width..(row as usize + 1) * width)).collect();
+        self.prefetch(&ranges);
+        Ok(())
+    }
+}
+
+/// Bytes per row of a table tensor.
+fn row_size(tensor: &Tensor, name: &str) -> Result<usize, String> {
+    match tensor.dims[..] {
+        [_, rows] if rows > 0 => Ok(tensor.data.len() / rows),
+        _ => Err(format!("{name} is not a table of rows")),
+    }
 }
 
 /// An architecture's metadata keys, `{architecture}.{key}`, with typed access.

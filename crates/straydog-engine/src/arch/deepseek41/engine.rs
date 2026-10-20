@@ -763,38 +763,34 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// the modules run.
     fn prefetch_engram(&self, tokens: &[u32]) -> Result<()> {
         let Some(engram) = self.hp.engram.as_ref() else { return Ok(()) };
-        let table = self.tensors.tensor("per_layer_token_embd.weight")?;
-        let bytes = row_bytes(table.kind, table.dims[0])?;
         let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-        let (mut rows, mut ranges) = (Vec::new(), Vec::new());
+        let mut rows = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             let before = history[history.len().saturating_sub(engram.ngram - 1)..].to_vec();
             for module in 0..engram.multipliers.len() / engram.ngram {
-                rows.clear();
                 engram.rows(module, token, &before, self.position + i, &mut rows);
-                ranges.extend(rows.iter().map(|&row| &table.data[row as usize * bytes..(row as usize + 1) * bytes]));
             }
             history.push(token);
         }
-        self.tensors.prefetch(&ranges);
-        Ok(())
+        self.tensors.prefetch_rows("per_layer_token_embd.weight", &rows)
     }
 
     fn engram(&mut self, layer: usize, module: usize, tokens: &[u32], n: usize) -> Result<()> {
         let hp = self.hp.clone();
         let engram = hp.engram.as_ref().ok_or("no Engram metadata")?;
         let table = self.tensors.tensor("per_layer_token_embd.weight")?;
-        let bytes = row_bytes(table.kind, table.dims[0])?;
+        let (kind, width) = (table.kind, row_bytes(table.kind, table.dims[0])?);
         let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-        let (mut rows, mut gathered) = (Vec::new(), Vec::with_capacity(n * hp.engram_columns() * engram.head_dim));
+        let mut rows = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
-            rows.clear();
             let before = &history[history.len().saturating_sub(engram.ngram - 1)..];
             engram.rows(module, token, before, self.position + i, &mut rows);
-            for &row in &rows {
-                formats::decode_into(table.kind, &table.data[row as usize * bytes..(row as usize + 1) * bytes], &mut gathered)?;
-            }
             history.push(token);
+        }
+        let bytes = self.tensors.rows("per_layer_token_embd.weight", &rows)?;
+        let mut gathered = Vec::with_capacity(n * hp.engram_columns() * engram.head_dim);
+        for row in bytes.chunks_exact(width) {
+            formats::decode_into(kind, row, &mut gathered)?;
         }
         for shard in &mut self.shards {
             let work = shard.work.clone_handles();

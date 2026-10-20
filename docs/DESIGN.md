@@ -138,6 +138,29 @@ in VRAM for its batch; the copy for a device's next attention layer runs on a st
 while the layers before it compute. Prefill (IQ3_S, two R9700s, 262144 context): 131072 tokens
 51.2 -> 34.3-34.8 s, 65536 21.1 -> 15.9-16.1 s, 20480 6.1 -> 5.0 s, 4096 1.48 -> 1.23 s.
 
+### 4.6 Row tables
+
+Embedding tables read a few rows per token, at random, are not kept in memory: the PLE table
+(28.8 GB of 90-byte rows, 16 per token) and DeepSeek-V4.1's Engram table (135 GB of 176-byte
+rows, 48 per token). Their rows are read from the authenticated file into a row cache of the
+engine's own (`crate::rows`, `--row-cache`, 256 MiB). Rows rather than pages: a 4 KiB page
+holds dozens of rows, one of them wanted, while 70-98% of row uses in agent sessions and chats
+repeat an earlier row, so 64-256 MB of rows hit more often than 2 GB of page cache would. A
+pass's missing rows are read together, deduplicated, as whole aligned 4 KiB blocks past the
+page cache (O_DIRECT; buffered where unavailable) on 32 threads, and blocks the page cache
+holds anyway (the table read at load) through it, as soon as their tokens are known: the next
+prompt batch's while the current one runs, a sampled token's while the drafter runs, the
+drafts' while the first layer does. Decoding waits only for rows still on their way.
+A table can take a verifier of each block read, between read and use (`crate::verity`'s, as
+the expert store does; a block that fails fails its read, and a later use reads it again).
+None is attached yet: rows are as authentic as the mapping's (the file verified at load and
+checked unchanged before each generation).
+With the IQ3_S bundle on two R9700s, a fresh 4096-token prompt prefills in 1.3 s with the table
+in the page cache, as through the mapping, and in 1.5 s with it evicted (through the mapping
+3.0-3.3 s); decode is unchanged (75 and 125 tokens/s after 1000 and 4096), peak memory
+is 18.3 GB either way (through the mapping 18.7-19.6 GB, the table's pages counted). Engram
+gathers for DeepSeek-V4.1 take 0.7-0.9 ms per decoded token (0.8-1.0 ms through the mapping).
+
 ## 5. Command line and configuration
 
 With no subcommand, `straydog` is the server, as llama-server is: every setting is an
@@ -155,6 +178,7 @@ option, named as llama-server names it where it has the same setting.
 | `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` |
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
+| `--row-cache MIB` | host memory caching rows of the PLE table, read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |

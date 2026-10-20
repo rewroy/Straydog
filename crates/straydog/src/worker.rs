@@ -46,6 +46,9 @@ pub struct WorkerArgs {
     pub state_ram_bytes: u64,
     #[arg(long)]
     pub prefill_batch_size: usize,
+    /// Bytes of the PLE row cache (0: rows through the page cache).
+    #[arg(long, default_value_t = straydog_engine::rows::DEFAULT_CACHE_BYTES)]
+    pub row_cache_bytes: u64,
     #[arg(long, default_value = "fp16")]
     pub gemm: String,
     #[arg(long, default_value_t = 2)]
@@ -136,6 +139,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         prefill_batch_size: args.prefill_batch_size,
         speculative: args.speculative,
         cpu_threads: 0,
+        row_cache_bytes: args.row_cache_bytes,
     };
     // The tokenizer builds while the model loads.
     let (text, model) = std::thread::scope(|scope| {

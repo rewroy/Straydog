@@ -55,6 +55,7 @@ fn generations_equal_the_reference() {
             prefill_batch_size: 4096,
             speculative,
             cpu_threads: 0,
+            row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES,
         };
         let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
         if update {

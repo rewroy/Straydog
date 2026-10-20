@@ -22,6 +22,8 @@ use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
 
 pub const MAX_DRAFTS: usize = 3;
+/// The per-layer (PLE) n-gram embedding table, read by rows from the host.
+const PLE_TABLE: &str = "per_layer_token_embd.weight";
 /// Rows per verification pass: a token and its drafts.
 const VERIFY_ROWS: usize = MAX_DRAFTS + 1;
 /// Longest fully resident prompt that runs as verification passes (about 27 ms per four rows)
@@ -78,6 +80,9 @@ pub struct Settings {
     pub speculative: usize,
     /// CPU expert threads for partial residency (0: one per physical core).
     pub cpu_threads: u32,
+    /// Bytes of the row cache the PLE table is read through (`crate::rows`); 0 reads its rows
+    /// through the mapping and the page cache instead.
+    pub row_cache_bytes: u64,
 }
 
 /// A small deterministic generator for sampling (xoshiro256**, seeded by SplitMix64).
@@ -302,6 +307,9 @@ impl Model {
             let pinned = checkpoint_bytes + if host { kv_bytes } else { 0 };
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
+        }
+        if settings.row_cache_bytes > 0 {
+            model.weights.cache_rows(PLE_TABLE, settings.row_cache_bytes)?;
         }
         load_seconds.push(("plans", lap(&mut clock)));
         model.load_seconds = load_seconds;
@@ -649,11 +657,27 @@ impl Model {
 
     // ---- forward ----
 
-    fn ple_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let history: Vec<i64> = self.history[self.history.len().saturating_sub(2)..].iter().map(|t| *t as i64).collect();
+    /// The PLE table rows of `tokens`, which follow `before` (its last two tokens count).
+    fn ple_indices(&self, before: &[u32], tokens: &[u32]) -> Result<Vec<i64>> {
+        let history: Vec<i64> = before[before.len().saturating_sub(2)..].iter().map(|t| *t as i64).collect();
         let tokens: Vec<i64> = tokens.iter().map(|token| *token as i64).collect();
-        let indices = ngram_rows(&history, &tokens, &self.weights.integer_arrays)?;
-        self.weights.rows("per_layer_token_embd.weight", &indices)
+        ngram_rows(&history, &tokens, &self.weights.integer_arrays)
+    }
+
+    fn ple_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.weights.rows(PLE_TABLE, &self.ple_indices(&self.history, tokens)?)
+    }
+
+    /// Start reading the PLE rows of `tokens` (after `before`) as soon as they are known: the
+    /// pass that decodes them then waits only for rows still on their way.
+    fn prefetch_ple(&self, before: &[u32], tokens: &[u32]) -> Result<()> {
+        // A batch is at most 4096 tokens (the n-gram rows' limit); longer runs go in pieces.
+        for start in (0..tokens.len()).step_by(4096) {
+            let before = if start == 0 { before } else { &tokens[..start] };
+            let part = &tokens[start..(start + 4096).min(tokens.len())];
+            self.weights.prefetch_rows(PLE_TABLE, &self.ple_indices(before, part)?)?;
+        }
+        Ok(())
     }
 
     fn token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -674,6 +698,7 @@ impl Model {
         if self.history.len() + tokens.len() > self.context || tokens.iter().any(|token| *token as usize >= VOCABULARY) {
             return Err("Straydog token or context is out of range".into());
         }
+        self.prefetch_ple(&self.history, tokens)?;
         let embeddings = self.token_embeddings(tokens)?;
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
@@ -943,6 +968,9 @@ impl Model {
                     return Ok(None);
                 }
                 let end = (position + self.prefill_batch_size).min(stop);
+                // The next batch's PLE rows arrive while this one runs.
+                let next = (end + self.prefill_batch_size).min(tokens.len());
+                self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
                 // A one-token batch runs whole, as decode does; a longer one checks between spans.
                 let check: &dyn Fn() -> bool = if self.prefill_batch_size == 1 { &|| false } else { cancelled };
                 let Some(logits) = self.forward(&tokens[position..end], end == tokens.len(), check)? else {
@@ -993,6 +1021,7 @@ impl Model {
 
     fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let position = self.history.len() as u64;
+        self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
         let first = self.group.verify_span(0, 1, &hidden, position)?;
         let embeddings = self.ple_embeddings(tokens)?;
@@ -1078,8 +1107,11 @@ impl Model {
             }
             let pass_started = Instant::now();
             let limit = self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
+            // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
+            self.prefetch_ple(&self.history, &[token])?;
             let drafts = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit)?;
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
+            self.prefetch_ple(&self.history, &rows)?;
             if self.history.len() + rows.len() > self.context {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }

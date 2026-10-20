@@ -145,6 +145,7 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     push("context", settings.ctx_size.to_string());
     push("vram-bytes", ((settings.vram * (1u64 << 30) as f64) as u64).to_string());
     push("state-ram-bytes", ((settings.state_ram * (1u64 << 30) as f64) as u64).to_string());
+    push("row-cache-bytes", (u64::from(settings.row_cache) << 20).to_string());
     push("prefill-batch-size", settings.batch_size.to_string());
     push("gemm", if settings.gemm == Gemm::Fp16 { "fp16" } else { "fp32" }.into());
     push("gemm-min-batch", settings.gemm_min_batch.to_string());

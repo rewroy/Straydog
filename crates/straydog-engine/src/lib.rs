@@ -15,6 +15,7 @@ pub mod model;
 pub mod ops;
 pub mod pyjson;
 pub mod reply;
+pub mod rows;
 pub mod sampling;
 pub mod storage;
 pub mod text;

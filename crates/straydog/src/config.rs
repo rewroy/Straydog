@@ -71,6 +71,9 @@ pub struct Options {
     /// Host memory for sequence state in GiB [default: what the context needs]
     #[arg(long, env = "STRAYDOG_STATE_RAM", value_name = "GIB")]
     pub state_ram: Option<f64>,
+    /// Host memory caching rows of the PLE table, read from the SSD as needed, in MiB; 0 reads them through the page cache [default: 256]
+    #[arg(long, env = "STRAYDOG_ROW_CACHE", value_name = "MIB")]
+    pub row_cache: Option<u32>,
     /// Input precision of large matrix products [default: fp16]
     #[arg(long, env = "STRAYDOG_GEMM", value_name = "PRECISION")]
     pub gemm: Option<Gemm>,
@@ -138,6 +141,8 @@ pub struct Settings {
     pub split_mode: SplitMode,
     pub vram: f64,
     pub state_ram: f64,
+    /// MiB.
+    pub row_cache: u32,
     pub gemm: Gemm,
     pub gemm_min_batch: u16,
     pub host: String,
@@ -216,7 +221,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
         }};
     }
     let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
-                         state_ram, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
+                         state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose);
     Ok((options, sources))
 }
@@ -318,6 +323,10 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if !(0.01..=256.0).contains(&state_ram) {
         return Err("--state-ram must be between 0.01 and 256 GiB".into());
     }
+    let row_cache = options.row_cache.unwrap_or(256);
+    if row_cache > 65536 {
+        return Err("--row-cache must be at most 65536 MiB".into());
+    }
     if options.temp.is_some_and(|temp| !(0.0..=2.0).contains(&temp)) {
         return Err("--temp must be between 0 and 2".into());
     }
@@ -366,6 +375,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         split_mode: options.split_mode.unwrap_or(SplitMode::Experts),
         vram,
         state_ram,
+        row_cache,
         gemm: options.gemm.unwrap_or(Gemm::Fp16),
         gemm_min_batch: options.gemm_min_batch.unwrap_or(2),
         host: options.host.unwrap_or_else(|| "127.0.0.1".into()),
@@ -403,6 +413,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("split_mode", format!("{:?}", settings.split_mode).to_lowercase()),
         ("vram", settings.vram.to_string()),
         ("state_ram", settings.state_ram.to_string()),
+        ("row_cache", settings.row_cache.to_string()),
         ("gemm", format!("{:?}", settings.gemm).to_lowercase()),
         ("gemm_min_batch", settings.gemm_min_batch.to_string()),
         ("host", settings.host.clone()),

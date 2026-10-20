@@ -25,6 +25,7 @@ fn settings() -> Settings {
         split_mode: SplitMode::Experts,
         vram: 6.0,
         state_ram: 0.0,
+        row_cache: 256,
         gemm: Gemm::Fp16,
         gemm_min_batch: 2,
         host: "127.0.0.1".into(),

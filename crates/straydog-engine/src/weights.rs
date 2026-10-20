@@ -20,6 +20,7 @@ use memmap2::Mmap;
 use crate::bundle::{self, Asset};
 use crate::digest::{self, CHUNK_BYTES};
 use crate::formats;
+use crate::rows::{ReadPool, RowTable};
 
 pub const CONTEXT_LIMIT: usize = 262144;
 const TENSOR_COUNT: usize = 1224;
@@ -112,6 +113,8 @@ pub struct Weights {
     kept: HashMap<String, Vec<u8>>,
     /// Whether every chunk is verified: before that only the header may be used.
     authenticated: bool,
+    /// Tables read through a row cache instead of the mapping (see `crate::rows`).
+    row_tables: HashMap<String, RowTable>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
     embeddings: Mutex<EmbeddingCache>,
 }
@@ -225,6 +228,7 @@ impl Weights {
             order: Vec::new(),
             kept: HashMap::new(),
             authenticated: false,
+            row_tables: HashMap::new(),
             vectors: Mutex::new(HashMap::new()),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
@@ -460,6 +464,42 @@ impl Weights {
         self.decoded_rows(name, indices)
     }
 
+    /// Read a table's rows through a cache of `budget` bytes (`crate::rows`) instead of the
+    /// mapping: from the authenticated file, as aligned blocks, past the page cache.
+    pub fn cache_rows(&mut self, name: &str, budget: u64) -> Result<(), String> {
+        let tensor = self.tensor(name)?;
+        let [_, count] = tensor.dims[..] else { return Err(format!("{name} is not a table of rows")) };
+        let pool = Arc::new(ReadPool::new(crate::rows::THREADS));
+        let table = RowTable::new(&self.files[tensor.file], tensor.offset, (tensor.bytes / count) as usize, count, budget, pool, None)
+            .map_err(|exc| format!("{name}: {exc}"))?;
+        self.row_tables.insert(name.to_string(), table);
+        Ok(())
+    }
+
+    /// Start reading these rows of a table in the background, so that a later `rows` waits
+    /// only for those still on their way: through its row cache, or the mapping's read-ahead.
+    pub fn prefetch_rows(&self, name: &str, indices: &[i64]) -> Result<(), String> {
+        let tensor = self.tensor(name)?;
+        let [_, count] = tensor.dims[..] else { return Err(format!("{name} is not a table of rows")) };
+        if indices.iter().any(|index| *index < 0 || *index as u64 >= count) {
+            return Err(error("invalid Straydog embedding row batch"));
+        }
+        if let Some(rows) = self.row_tables.get(name) {
+            return rows.prefetch(&indices.iter().map(|&index| index as u32).collect::<Vec<_>>());
+        }
+        if !self.kept.contains_key(name) {
+            let (table, _) = self.raw(name, 0, None)?;
+            let bytes = (tensor.bytes / count) as usize;
+            crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * bytes..(index as usize + 1) * bytes]));
+        }
+        Ok(())
+    }
+
+    /// A row-cached table's (rows asked for, rows read, blocks read), see [`Weights::cache_rows`].
+    pub fn row_counts(&self, name: &str) -> Option<(u64, u64, u64)> {
+        self.row_tables.get(name).map(RowTable::counts)
+    }
+
     fn token_rows(&self, indices: &[i64]) -> Result<Vec<f32>, String> {
         {
             let cache = self.embeddings.lock().unwrap();
@@ -499,35 +539,45 @@ impl Weights {
         let (table, kind) = self.raw(name, 0, None)?;
         let row_bytes = (tensor.bytes / count) as usize;
         let width = width as usize;
-        if !self.kept.contains_key(name) {
-            // Every row's read starts at once, so decoding waits on the slowest rather than on
-            // each in turn (a table the page cache dropped costs one read time, not one per row).
-            crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * row_bytes..(index as usize + 1) * row_bytes]));
-        }
-        let decode = |part: &[i64], out: &mut [f32]| -> Result<(), String> {
+        // The rows' bytes: through the table's row cache when it has one (see `crate::rows`),
+        // else from the mapping, every row's read started at once so that decoding waits on the
+        // slowest rather than on each in turn.
+        let fetched = match self.row_tables.get(name) {
+            Some(rows) => Some(rows.read(&indices.iter().map(|&index| index as u32).collect::<Vec<_>>())?),
+            None => {
+                if !self.kept.contains_key(name) {
+                    crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * row_bytes..(index as usize + 1) * row_bytes]));
+                }
+                None
+            }
+        };
+        let row = |position: usize| match &fetched {
+            Some(bytes) => &bytes[position * row_bytes..(position + 1) * row_bytes],
+            None => &table[indices[position] as usize * row_bytes..(indices[position] as usize + 1) * row_bytes],
+        };
+        let decode = |first: usize, out: &mut [f32]| -> Result<(), String> {
             let mut values = Vec::with_capacity(width);
-            for (index, target) in part.iter().zip(out.chunks_exact_mut(width)) {
+            for (position, target) in (first..).zip(out.chunks_exact_mut(width)) {
                 values.clear();
-                let start = *index as usize * row_bytes;
-                formats::decode_into(kind, &table[start..start + row_bytes], &mut values)?;
+                formats::decode_into(kind, row(position), &mut values)?;
                 target.copy_from_slice(&values);
             }
             Ok(())
         };
         let mut output = vec![0f32; indices.len() * width];
         if indices.len() >= PARALLEL_ROWS {
-            // Several threads keep the device queue full while uncached rows fault in.
+            // Several threads decode (and, through the mapping, keep the device queue full).
             let per = indices.len().div_ceil(ROW_THREADS);
             std::thread::scope(|scope| {
-                let workers: Vec<_> = indices
-                    .chunks(per)
-                    .zip(output.chunks_mut(per * width))
-                    .map(|(part, out)| scope.spawn(move || decode(part, out)))
+                let workers: Vec<_> = output
+                    .chunks_mut(per * width)
+                    .enumerate()
+                    .map(|(part, out)| scope.spawn(move || decode(part * per, out)))
                     .collect();
                 workers.into_iter().try_for_each(|worker| worker.join().unwrap())
             })?;
         } else {
-            decode(indices, &mut output)?;
+            decode(0, &mut output)?;
         }
         if !output.iter().all(|value| value.is_finite()) {
             return Err(error("non-finite Straydog embedding row batch"));

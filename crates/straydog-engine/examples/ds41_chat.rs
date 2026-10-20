@@ -8,7 +8,7 @@
 //! Several TOKENS files (comma separated) run one after another, as a server's requests.
 //!
 //! ds41_chat SHARD_DIR TOKENS[,TOKENS...] ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] [--split L] [--tp N]
-//!     [--host-gb N]
+//!     [--host-gb N] [--row-cache MIB]
 
 #[path = "common/files.rs"]
 mod files;
@@ -28,11 +28,16 @@ fn main() -> Result<(), String> {
     });
     let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 32), option("--slots", 1500), option("--split", 0));
     let (host_gb, tp) = (option("--host-gb", 0), option("--tp", 1));
+    // The Engram table's row cache in MiB (0: rows through the mapping and the page cache).
+    let row_cache = option("--row-cache", 256) as u64;
     let [dir, tokens_files, oracle, tokenizer] = &args[..] else {
         return Err("usage: ds41_chat SHARD_DIR TOKENS[,TOKENS...] ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] \
-                    [--split L] [--tp N] [--host-gb N]".into());
+                    [--split L] [--tp N] [--host-gb N] [--row-cache MIB]".into());
     };
-    let files = files::Files::open(Path::new(dir))?;
+    let mut files = files::Files::open(Path::new(dir))?;
+    if row_cache > 0 && straydog_engine::arch::Tensors::tensor(&files, "per_layer_token_embd.weight").is_ok() {
+        files.cache_rows("per_layer_token_embd.weight", row_cache << 20)?;
+    }
     let hp = Hparams::from_header(&files.header)?;
     let vocabulary = hp.vocabulary;
     let started = std::time::Instant::now();

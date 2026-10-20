@@ -1,7 +1,7 @@
 //! Time fresh prefills of real text in-process (no sandbox), for a profiler to wrap.
 //!
 //! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
-//!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer]
+//!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer] [--row-cache MIB]
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, and "+N"
@@ -41,6 +41,8 @@ fn main() -> Result<(), String> {
     let gemm_min_batch: u64 = option("--gemm-min-batch").map_or(2, |count| count.parse().unwrap());
     // --gemm f32: batched projections in F32 throughout (the numerical reference for FP16 GEMMs).
     let half_gemm = option("--gemm").as_deref() != Some("f32");
+    // --row-cache MIB: the PLE row cache (0: rows through the page cache).
+    let row_cache = option("--row-cache").map_or(straydog_engine::rows::DEFAULT_CACHE_BYTES, |mib| mib.parse::<u64>().unwrap() << 20);
     let split = match option("--split").as_deref() {
         Some("layer") => SplitMode::Layer,
         _ => SplitMode::Experts,
@@ -57,7 +59,8 @@ fn main() -> Result<(), String> {
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: batch.unwrap_or(4096),
-                              speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0 };
+                              speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
+                              row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
     let steps: Vec<String> =
         model.load_seconds.iter().map(|(step, seconds)| format!("{step} {seconds:.2} s")).collect();
@@ -82,6 +85,7 @@ fn main() -> Result<(), String> {
     eprintln!("resident {} host_kv {} batch {}", model.resident, model.host_kv, model.prefill_batch_size);
     // "+N" appends N tokens to the previous prompt (the conversation cache resumes it).
     let mut previous: Vec<u32> = Vec::new();
+    let mut row_counts = (0, 0, 0);
     for (run, length) in lengths.iter().enumerate() {
         let (append, length) = match length.strip_prefix('+') {
             Some(count) => (true, count.parse::<usize>().unwrap()),
@@ -125,6 +129,12 @@ fn main() -> Result<(), String> {
         }
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
+        if let Some(now) = model.weights.row_counts("per_layer_token_embd.weight") {
+            let (asked, read, blocks) = (now.0 - row_counts.0, now.1 - row_counts.1, now.2 - row_counts.2);
+            println!("PLE rows: {asked} used, {read} read ({:.1}% from the cache), {blocks} blocks",
+                     100.0 * (1.0 - read as f64 / asked.max(1) as f64));
+            row_counts = now;
+        }
     }
     Ok(())
 }
