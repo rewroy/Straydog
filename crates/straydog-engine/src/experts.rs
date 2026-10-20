@@ -319,6 +319,15 @@ impl DeviceExperts {
     /// Their slots (each roles one after another) stay until [`release`](Self::release).
     pub fn acquire(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
         self.settled = false;
+        let held = self.in_use.len();
+        let result = self.acquire_slots(gpu, layer, experts);
+        if result.is_err() {
+            self.in_use.truncate(held);
+        }
+        result
+    }
+
+    fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
         self.pump(gpu, false)?;
         let mut slots = Vec::with_capacity(experts.len());
         for &expert in experts {
@@ -338,6 +347,11 @@ impl DeviceExperts {
         // Fills waiting for the drive upload as their reads land.
         while slots.iter().any(|&slot| self.slots[slot].waiting.is_some()) {
             self.pump(gpu, true)?;
+        }
+        for (&expert, &slot) in experts.iter().zip(&slots) {
+            if self.slots[slot].key != Some((layer as u32, expert as u32)) {
+                return Err(format!("expert {expert} of layer {layer} was not filled"));
+            }
         }
         // The upload stream runs in order: its newest mark among these slots covers them all.
         let newest = slots.iter().filter_map(|&slot| self.slots[slot].ready).max();
@@ -387,26 +401,32 @@ impl DeviceExperts {
         self.slots[slot].key = Some(key);
         self.clock += 1;
         self.slots[slot].used = self.clock;
-        match self.host_map.get(&key).copied() {
+        let filled = match self.host_map.get(&key).copied() {
             Some(host) if !matches!(self.host[host].content, Content::Reading(_)) => {
                 self.counts.host_hits += 1;
-                self.upload(gpu, slot, host)?;
+                self.upload(gpu, slot, host).inspect_err(|_| self.discard(host, Some(slot)))
             }
-            Some(host) => self.slots[slot].waiting = Some(host),
+            Some(host) => {
+                self.slots[slot].waiting = Some(host);
+                Ok(())
+            }
             None => {
                 self.counts.drive_reads += 1;
-                let host = self.read(gpu, key, urgent)?;
-                self.slots[slot].waiting = Some(host);
+                self.read(gpu, key, urgent).map(|host| self.slots[slot].waiting = Some(host))
             }
+        };
+        if filled.is_err() && self.slots[slot].key == Some(key) {
+            self.slots[slot].key = None;
+            self.map.remove(&key);
         }
-        Ok(slot)
+        filled.map(|()| slot)
     }
 
     /// Upload host slot `host` into VRAM slot `slot`; the host tier gives the expert up.
     fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize) -> Result<()> {
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
-        if let Some(error) = self.host[host].failed.take() {
-            return Err(error);
+        if let Some(error) = &self.host[host].failed {
+            return Err(error.clone());
         }
         // The slot's previous expert: its last compute use and any download from it come first.
         for guard in std::mem::take(&mut self.slots[slot].guards).into_iter().flatten() {
@@ -474,30 +494,62 @@ impl DeviceExperts {
 
     /// Take finished drive reads; upload the fills waiting for them. With `block`, wait for at
     /// least one read first.
+    ///
+    /// An expert whose read failed (an I/O error, or a block that did not verify) leaves both
+    /// tiers: its bytes are never uploaded, and a later use reads it again. Every landed read is
+    /// accounted for before the first error returns.
     fn pump(&mut self, gpu: &mut Backend, block: bool) -> Result<()> {
         let mut landed = Vec::new();
         if block {
+            if !self.host.iter().any(|slot| matches!(slot.content, Content::Reading(_))) {
+                return Err("a wait for expert reads with none in flight".into());
+            }
             let started = std::time::Instant::now();
             let message = self.done_rx.recv().map_err(|_| "the expert reader stopped")?;
             self.counts.wait_seconds += started.elapsed().as_secs_f64();
             landed.push(message);
         }
         landed.extend(self.done_rx.try_iter());
+        let mut first_error = None;
         for (host, result) in landed {
             let entry = &mut self.host[host];
             if let Err(error) = result {
                 entry.failed.get_or_insert(error);
             }
-            if let Content::Reading(left) = entry.content {
-                entry.content = if left > 1 { Content::Reading(left - 1) } else { Content::Read };
-                if left == 1 {
-                    if let Some(slot) = self.slots.iter().position(|slot| slot.waiting == Some(host)) {
-                        self.upload(gpu, slot, host)?;
-                    }
+            let Content::Reading(left) = entry.content else { continue };
+            entry.content = if left > 1 { Content::Reading(left - 1) } else { Content::Read };
+            if left > 1 {
+                continue;
+            }
+            let waiting = self.slots.iter().position(|slot| slot.waiting == Some(host));
+            if let Some(error) = self.host[host].failed.take() {
+                self.discard(host, waiting);
+                first_error.get_or_insert(error);
+                continue;
+            }
+            if let Some(slot) = waiting {
+                if let Err(error) = self.upload(gpu, slot, host) {
+                    self.discard(host, Some(slot));
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Drop an expert whose fill failed from host slot `host` and VRAM slot `slot`.
+    fn discard(&mut self, host: usize, slot: Option<usize>) {
+        if let Some(key) = self.host[host].key.take() {
+            self.host_map.remove(&key);
+        }
+        if let Some(slot) = slot {
+            let entry = &mut self.slots[slot];
+            entry.waiting = None;
+            entry.ready = None;
+            if let Some(key) = entry.key.take() {
+                self.map.remove(&key);
+            }
+        }
     }
 
     /// A free VRAM slot: one already free, else the least recently used outside the current pass.

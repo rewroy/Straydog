@@ -124,3 +124,49 @@ fn experts_with_staging_only() {
     eprintln!("{counts:?}");
     assert!(counts.drive_reads > 0 && counts.host_hits == 0 && counts.writebacks == 0);
 }
+
+/// A read that fails (here: a block that does not verify) fails its pass, puts nothing in
+/// either tier, and leaves the store usable: the expert is read again on its next use.
+#[test]
+fn a_failed_read_leaves_both_tiers() {
+    let layers = roles();
+    let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-failing", std::process::id()));
+    std::fs::write(&path, (0..end + 333).map(byte).collect::<Vec<u8>>()).unwrap();
+    let role = layers[0].as_ref().unwrap()[1];
+    // A block in the middle of expert 5's up rows (an edge block is shared with a neighbour).
+    let bad = (role.base + 5 * role.stride + role.stride / 2) & !4095;
+    let failures = Arc::new(AtomicU64::new(2));
+    let left = failures.clone();
+    let verifier: Verifier = Arc::new(move |_, offset, data: &[u8]| {
+        let covers = (offset..offset + data.len() as u64).contains(&bad);
+        if covers && left.load(Ordering::Relaxed) > 0 {
+            left.fetch_sub(1, Ordering::Relaxed);
+            return Err(format!("block {bad} does not verify"));
+        }
+        Ok(())
+    });
+    let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), Some(verifier)).unwrap());
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, 1 << 26).unwrap();
+    // A prefetch of the bad expert, then passes that use it fail twice, the neighbours still served.
+    store.prefetch(&mut gpu, 0, &[5]).unwrap();
+    for attempt in 0..3 {
+        let result = store.acquire(&mut gpu, 0, &[4, 5, 6]);
+        if attempt < 2 {
+            assert!(result.unwrap_err().contains("does not verify"), "attempt {attempt}");
+        } else {
+            let slots = result.unwrap();
+            for (expert, slot) in [4, 5, 6].into_iter().zip(&slots) {
+                let want = expected(layers[0].as_ref().unwrap(), expert);
+                let mut got = vec![0u8; want.len()];
+                gpu.read_buffer(slot, 0, &mut got).unwrap();
+                assert!(got == want, "expert {expert} differs after the failed reads");
+            }
+        }
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
