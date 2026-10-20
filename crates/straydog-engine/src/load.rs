@@ -277,7 +277,8 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                             break;
                         }
                         let source = &sources[source];
-                        let length = read_chunk(source, chunk, &mut slot, count)?;
+                        let length = read_chunk(source, chunk, &mut slot)?;
+                        count(length as u64);
                         let bytes = &slot.as_slice()[..length];
                         for &(at, part, target) in &source.pieces[chunk] {
                             match target {
@@ -307,7 +308,7 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
 
 /// Read one chunk into `slot`, a piece at a time, hashing each piece as it arrives; check it
 /// against the pinned digest. The chunk's length.
-fn read_chunk(source: &Source, chunk: usize, slot: &mut Buffer, count: &dyn Fn(u64)) -> Result<usize, String> {
+fn read_chunk(source: &Source, chunk: usize, slot: &mut Buffer) -> Result<usize, String> {
     let offset = chunk as u64 * CHUNK_BYTES;
     let length = CHUNK_BYTES.min(source.map.len() as u64 - offset) as usize;
     let cached = storage::resident(&source.map[offset as usize..offset as usize + length]) >= CACHED;
@@ -323,7 +324,6 @@ fn read_chunk(source: &Source, chunk: usize, slot: &mut Buffer, count: &dyn Fn(u
         storage::read_into(direct.unwrap_or(source.file), offset + done as u64, slot, done, part, direct.is_some())
             .map_err(|exc| format!("{}: {exc}", source.name))?;
         digest.update(&slot.as_slice()[done..done + part]);
-        count(part as u64);
         done += part;
     }
     if format!("{:x}", digest.finalize()) != source.digests[chunk] {

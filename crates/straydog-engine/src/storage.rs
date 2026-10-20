@@ -96,12 +96,12 @@ pub fn direct(file: &File) -> Option<File> {
     }
 }
 
-/// The fraction of a mapped range's pages in the page cache (1 where unknown).
+/// The fraction of a mapped range's pages in the page cache (0 where unknown).
 pub fn resident(range: &[u8]) -> f64 {
     #[cfg(target_os = "linux")]
     {
         if range.is_empty() {
-            return 1.0;
+            return 0.0;
         }
         let start = range.as_ptr() as usize & !(ALIGN - 1);
         let end = range.as_ptr() as usize + range.len();
@@ -109,14 +109,14 @@ pub fn resident(range: &[u8]) -> f64 {
         let mut flags = vec![0u8; pages];
         // SAFETY: the page-aligned span lies within one live mapping; one flag byte per page.
         if unsafe { libc::mincore(start as *mut libc::c_void, end - start, flags.as_mut_ptr()) } != 0 {
-            return 1.0;
+            return 0.0;
         }
         flags.iter().filter(|flag| *flag & 1 == 1).count() as f64 / pages as f64
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = range;
-        1.0
+        0.0
     }
 }
 

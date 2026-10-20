@@ -16,6 +16,19 @@ fn every_pinned_shard_and_drafter_has_its_chunk_digests() {
     }
 }
 
+/// Drop a file's clean pages from the page cache.
+fn evict(file: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        file.sync_all().unwrap();
+        // SAFETY: a valid descriptor; advice only.
+        assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+}
+
 #[test]
 fn chunk_digests_authenticate_a_file_and_catch_a_changed_byte() {
     let path = std::env::temp_dir().join(format!("straydog-digest-{}.bin", std::process::id()));
@@ -25,12 +38,17 @@ fn chunk_digests_authenticate_a_file_and_catch_a_changed_byte() {
     let file = File::open(&path).unwrap();
     let (whole, pieces) = digest::file_digests(&file, &|_| {}).unwrap();
     assert_eq!(whole, digest::file_sha256(&file, &|_| {}).unwrap());
+    // Cached (read through the page cache), then evicted (read past it on Linux).
+    load::verify_file("test", &file, &pieces).unwrap();
+    evict(&file);
     load::verify_file("test", &file, &pieces).unwrap();
     assert!(load::verify_file("test", &file, &[]).is_err());
     let mut changed = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     changed.seek(SeekFrom::Start(12_345)).unwrap();
     changed.write_all(&[0xff]).unwrap();
     changed.sync_all().unwrap();
+    assert!(load::verify_file("test", &file, &pieces).unwrap_err().contains("digest mismatch"));
+    evict(&file);
     assert!(load::verify_file("test", &file, &pieces).unwrap_err().contains("digest mismatch"));
     std::fs::remove_file(&path).unwrap();
 }

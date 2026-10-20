@@ -113,16 +113,21 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     let split = if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts };
-    let mut group = Group::new(&args.devices, args.vram_bytes, split)?;
-    group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16")?;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
     let opened = Instant::now();
-    let weights = Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report)?;
+    // The model files open while the GPUs initialize.
+    let (group, weights) = std::thread::scope(|scope| {
+        let weights = scope.spawn(|| Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report));
+        let group = Group::new(&args.devices, args.vram_bytes, split)
+            .and_then(|mut group| group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16").map(|()| group));
+        (group, weights.join().unwrap())
+    });
+    let (group, weights) = (group?, weights?);
     let open_seconds = opened.elapsed().as_secs_f64();
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
-    let text = Arc::new(Text::new(&resource("tokenizer.json")?).map_err(|exc| exc.to_string())?);
+    let tokenizer = resource("tokenizer.json")?;
     let template = String::from_utf8(resource("chat_template.jinja")?).map_err(|exc| exc.to_string())?;
     let template = ChatTemplate::new(&template).map_err(|exc| exc.0)?;
     let settings = Settings {
@@ -132,7 +137,13 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         speculative: args.speculative,
         cpu_threads: 0,
     };
-    let mut model = Model::new(weights, group, &settings, &report)?;
+    // The tokenizer builds while the model loads.
+    let (text, model) = std::thread::scope(|scope| {
+        let text = scope.spawn(move || Text::new(&tokenizer).map_err(|exc| exc.to_string()));
+        let model = Model::new(weights, group, &settings, &report);
+        (text.join().unwrap(), model)
+    });
+    let (text, mut model) = (Arc::new(text?), model?);
     loading.report("warm", 0, 0);
     let warming = Instant::now();
     warm_up(&mut model)?;
