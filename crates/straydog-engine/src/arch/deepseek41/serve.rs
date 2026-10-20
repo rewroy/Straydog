@@ -143,8 +143,8 @@ impl Model {
                 settings.devices.iter().zip(ranges).map(|(&device, range)| (vec![device], range)).collect()
             }
         };
-        // An expert's bytes in a slot: the largest of the engine's layers, each device holding
-        // its rows of it (whole 256-byte units, as the store lays them out).
+        // The largest of the engine's layers' experts, each device holding its rows of it (whole
+        // 256-byte units, as the store lays them out): the store takes VRAM as so many of these.
         let slot_bytes = |(devices, range): &(Vec<usize>, std::ops::Range<usize>)| {
             let largest = range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1);
             (largest / devices.len() as u64).next_multiple_of(256) * devices.len() as u64
@@ -229,8 +229,9 @@ impl Model {
             "split_mode": match settings.split_mode { SplitMode::Experts => "experts", SplitMode::Layer => "layer" },
             "layers": groups.iter().map(|(_, range)| [range.start, range.end]).collect::<Vec<_>>(),
             "devices": groups.iter().map(|(devices, _)| devices.clone()).collect::<Vec<_>>(),
-            "expert_slots": slots,
-            "expert_slot_bytes": groups.iter().map(slot_bytes).collect::<Vec<_>>(),
+            "expert_slots": engines.iter().map(|engine| engine.expert_capacity().0).collect::<Vec<_>>(),
+            "host_expert_slots": engines.iter().map(|engine| engine.expert_capacity().1).collect::<Vec<_>>(),
+            "expert_vram_bytes": groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).collect::<Vec<_>>(),
             "host_expert_bytes": host,
             "expert_bytes": total_experts,
             "prefill_batch_size": settings.batch,

@@ -519,6 +519,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.iter().map(|shard| &shard.gpu)
     }
 
+    /// How many experts the devices hold in VRAM and can keep in the host tier (each device its
+    /// rows of the same experts).
+    pub fn expert_capacity(&self) -> (usize, usize) {
+        self.shards.first().map_or((0, 0), |shard| shard.experts.capacity())
+    }
+
     /// The expert stores' counters, summed over the devices.
     pub fn cache_counts(&self) -> Counts {
         self.shards.iter().map(|shard| shard.experts.counts()).fold(Counts::default(), |sum, counts| sum + counts)
