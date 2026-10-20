@@ -138,10 +138,7 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         if (completed)
             qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
         qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
-        if ((position + count) / 4 > 512)
-            qsa_block_scores<<<dim3(unsigned((pool + 255) / 256), unsigned(count)), 256, 0, d.stream>>>(chunk_iq, blocks, pool, position, count,
-                static_cast<float*>(scores));
-        qsa_select<<<unsigned(count), 256, 0, d.stream>>>(static_cast<float*>(scores), pool, position, count, selected, d.input);
+        qsa_index_chunk(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
         const KvView kv = kv_for_prefill(d, kv_state, context, position, count);
         write_attention_kv<<<unsigned((count * 512 + 255) / 256), 256, 0, d.stream>>>(kv.kv, kv.capacity, position, count, d.input, nullptr, nullptr, kv.mirror, kv.mirror_rows);
         qsa_attention(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * 6144, nullptr, kv.mirror, kv.mirror_rows);

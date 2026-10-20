@@ -179,6 +179,169 @@ __global__ void qsa_select(const float* scores, size_t pool, size_t base, size_t
     if (lane==0) packed[index_start+steps*selected+token]=float(head+position+1-complete*4);
 }
 
+// Prefill block scores as a tiled product: 256 threads cover 32 tokens and 128 blocks, each
+// thread four tokens, four blocks and the four heads, with keys and queries staged in LDS
+// sixteen columns at a time. Every dot product adds its columns in order with the fused
+// multiply-adds of qsa_block_scores, so the scores are the same bits.
+__global__ void __launch_bounds__(256) qsa_block_scores_tiled(const float* queries, const float* blocks, size_t pool,
+                                                              size_t base, size_t steps, float* scores) {
+    const size_t first_token = size_t(blockIdx.y) * 32, first_block = size_t(blockIdx.x) * 128;
+    const size_t complete = (base + std::min(steps, first_token + 32)) / 4;
+    if (complete <= 512 || first_block >= complete) return;
+    __shared__ SD_ALIGN(16) float keys[16][128];
+    __shared__ SD_ALIGN(16) float query[16][132];   // [column][token * 4 + head], padded against bank conflicts
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
+    float sums[4][4][4] = {};   // token, head, block
+    for (size_t k = 0; k < 128; k += 16) {
+        for (unsigned i = t; i < 16 * 128; i += 256) {
+            const size_t block = first_block + i % 128;
+            keys[i / 128][i % 128] = block < pool ? blocks[(k + i / 128) * pool + block] : 0.0f;
+        }
+        for (unsigned i = t; i < 16 * 128; i += 256) {
+            const size_t token = first_token + i / 64;
+            query[i % 16][i / 16] = token < steps ? queries[token * 512 + (i / 16 % 4) * 128 + k + i % 16] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned c = 0; c < 16; ++c) {
+            const float4 four = *reinterpret_cast<const float4*>(&keys[c][lane * 4]);
+            const float key[4] = {four.x, four.y, four.z, four.w};
+            #pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                const float4 heads = *reinterpret_cast<const float4*>(&query[c][(wave * 4 + i) * 4]);
+                const float q[4] = {heads.x, heads.y, heads.z, heads.w};
+                #pragma unroll
+                for (unsigned h = 0; h < 4; ++h) {
+                    #pragma unroll
+                    for (unsigned b = 0; b < 4; ++b) sums[i][h][b] = fmaf(key[b], q[h], sums[i][h][b]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned i = 0; i < 4; ++i) {
+        const size_t token = first_token + wave * 4 + i;
+        if (token >= steps || (base + token + 1) / 4 <= 512) continue;
+        for (unsigned b = 0; b < 4; ++b) {
+            const size_t block = first_block + lane * 4 + b;
+            if (block < pool)
+                scores[token * pool + block] = fmaxf(sums[i][0][b], 0.0f) + fmaxf(sums[i][1][b], 0.0f) +
+                                               fmaxf(sums[i][2][b], 0.0f) + fmaxf(sums[i][3][b], 0.0f);
+        }
+    }
+}
+
+__device__ inline unsigned qsa_ballot(bool predicate) {
+#if defined(__HIPCC__)
+    return unsigned(__ballot(predicate));
+#else
+    return __ballot_sync(0xffffffffu, predicate);
+#endif
+}
+// qsa_select's selection for a prefill chunk, with each token's row read once: the block keeps
+// it in registers, block i * threads + thread as the thread's value i (at most 64: 1024 threads
+// cover a 262144-token context, 256 threads 65536 tokens). The same radix passes find the 512th
+// value; ballots count the greater and equal values per wave in block order, so the earliest
+// equal blocks are taken, in block order, as qsa_select takes them.
+constexpr unsigned qsa_select_run = 64;
+template <unsigned threads>
+__global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, size_t pool, size_t base, size_t steps,
+                                                          size_t selected, float* packed) {
+    constexpr unsigned waves = threads / 32;
+    const size_t token = blockIdx.x, position = base + token, complete = (position + 1) / 4;
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
+    const size_t index_start = steps * (24 * 256 + 1024);
+    float* indices = packed + index_start + token * selected;
+    if (complete <= 512) {
+        for (size_t i = t; i <= position; i += threads) indices[i] = float(i);
+        if (t == 0) packed[index_start + steps * selected + token] = float(position + 1);
+        return;
+    }
+    const float* row = scores + token * pool;
+    const unsigned runs = unsigned((complete + threads - 1) / threads);
+    uint32_t values[qsa_select_run];
+    #pragma unroll
+    for (unsigned i = 0; i < qsa_select_run; ++i) {
+        const size_t block = size_t(i) * threads + t;
+        values[i] = i < runs && block < complete ? __float_as_uint(row[block]) : 0u;
+    }
+    __shared__ unsigned counts[waves * 256], partial[waves], threshold, remaining;
+    if (t == 0) { threshold = 0; remaining = 512; }
+    unsigned mask = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (unsigned i = t; i < waves * 256; i += threads) counts[i] = 0;
+        __syncthreads();
+        const unsigned prefix = threshold, wanted = remaining;
+        unsigned* own = counts + wave * 256;
+        #pragma unroll
+        for (unsigned i = 0; i < qsa_select_run; ++i)
+            if (i < runs && size_t(i) * threads + t < complete && (values[i] & mask) == prefix)
+                atomicAdd(own + ((values[i] >> shift) & 255), 1u);
+        __syncthreads();
+        const unsigned bucket = 255 - (t & 255);
+        unsigned total = 0, sum = 0;
+        if (t < 256)
+            for (unsigned w = 0; w < waves; ++w) total += counts[w * 256 + bucket];
+        const unsigned at_least = qsa_rows_scan<waves>(total, partial, sum) + total;   // values in buckets >= bucket
+        if (t < 256 && at_least >= wanted && at_least - total < wanted) {
+            threshold = prefix | (bucket << shift); remaining = wanted - (at_least - total);
+        }
+        mask |= 255u << shift;
+        __syncthreads();
+    }
+    const unsigned prefix = threshold, wanted = remaining;
+    // Greater and equal counts per (value, wave), in block order: thread t owns entries 2t and 2t + 1.
+    unsigned* greater = counts;
+    unsigned* equal = counts + 2 * threads;
+    for (unsigned i = t; i < 4 * threads; i += threads) counts[i] = 0;
+    __syncthreads();
+    #pragma unroll
+    for (unsigned i = 0; i < qsa_select_run; ++i) {
+        if (i >= runs) break;
+        const bool valid = size_t(i) * threads + t < complete;
+        const unsigned above = qsa_ballot(valid && values[i] > prefix), same = qsa_ballot(valid && values[i] == prefix);
+        if (lane == 0) { greater[i * waves + wave] = __popc(above); equal[i * waves + wave] = __popc(same); }
+    }
+    __syncthreads();
+    const unsigned g0 = greater[2 * t], g1 = greater[2 * t + 1], e0 = equal[2 * t], e1 = equal[2 * t + 1];
+    unsigned total = 0;
+    const unsigned greater_before = qsa_rows_scan<waves>(g0 + g1, partial, total);
+    const unsigned equal_before = qsa_rows_scan<waves>(e0 + e1, partial, total);
+    greater[2 * t] = greater_before; greater[2 * t + 1] = greater_before + g0;
+    equal[2 * t] = equal_before; equal[2 * t + 1] = equal_before + e0;
+    __syncthreads();
+    const unsigned below = (1u << lane) - 1;
+    #pragma unroll
+    for (unsigned i = 0; i < qsa_select_run; ++i) {
+        if (i >= runs) break;
+        const size_t block = size_t(i) * threads + t;
+        const bool valid = block < complete, above = valid && values[i] > prefix, same = valid && values[i] == prefix;
+        const unsigned above_mask = qsa_ballot(above), same_mask = qsa_ballot(same);
+        if (!above && !same) continue;
+        const unsigned equal_seen = equal[i * waves + wave] + __popc(same_mask & below);
+        if (same && equal_seen >= wanted) continue;
+        const size_t out = size_t(greater[i * waves + wave] + __popc(above_mask & below) + std::min(equal_seen, wanted)) * 4;
+        #pragma unroll
+        for (size_t tap = 0; tap < 4; ++tap) indices[out + tap] = float(block * 4 + tap);
+    }
+    const size_t head = 512 * 4;
+    for (size_t i = t; complete * 4 + i <= position; i += threads) indices[head + i] = float(complete * 4 + i);
+    if (t == 0) packed[index_start + steps * selected + token] = float(head + position + 1 - complete * 4);
+}
+// The block scores and selection of a prefill chunk. Rows of up to 6144 blocks select fastest
+// with qsa_select's rereads; longer ones in registers, 256 threads while a row fits them.
+void qsa_index_chunk(Device& d, const float* queries, const float* blocks, size_t pool, size_t base, size_t steps,
+                     size_t selected, float* scores, float* packed) {
+    const size_t complete = (base + steps) / 4;
+    if (complete > 512)
+        qsa_block_scores_tiled<<<dim3(unsigned((complete + 127) / 128), unsigned((steps + 31) / 32)), 256, 0, d.stream>>>(
+            queries, blocks, pool, base, steps, scores);
+    if (complete <= 6144) qsa_select<<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+    else if (complete <= 256 * qsa_select_run)
+        qsa_select_rows<256><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+    else qsa_select_rows<1024><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+}
+
 __global__ void qsa_gate(float* output, const float* query_gate, size_t count) {
     const size_t i=size_t(blockIdx.x)*256+threadIdx.x;
     if (i<count) output[i]*=hc_sigmoid(query_gate[(i/256)*512+256+i%256]);

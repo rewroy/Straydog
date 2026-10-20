@@ -247,3 +247,29 @@ void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,si
             static_cast<float*>(kv),context,base,selected,chunks,input,d.attention_scores,position);
     qsa_decode_merge<<<24,256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output);
 }
+
+// Exclusive prefix sum over a block of `waves` waves of 32 lanes; `total` receives the sum.
+template <unsigned waves>
+__device__ unsigned qsa_rows_scan(unsigned value, unsigned* partial, unsigned& total) {
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    unsigned inclusive = value;
+    for (unsigned offset = 1; offset < 32; offset *= 2) {
+        const unsigned other = __shfl_up(inclusive, offset, 32);
+        if (lane >= offset) inclusive += other;
+    }
+    if (lane == 31) partial[wave] = inclusive;
+    __syncthreads();
+    if (wave == 0) {
+        unsigned sum = lane < waves ? partial[lane] : 0;
+        for (unsigned offset = 1; offset < waves; offset *= 2) {
+            const unsigned other = __shfl_up(sum, offset, 32);
+            if (lane >= offset) sum += other;
+        }
+        if (lane < waves) partial[lane] = sum;
+    }
+    __syncthreads();
+    total = partial[waves - 1];
+    const unsigned before = wave ? partial[wave - 1] : 0;
+    __syncthreads();
+    return before + inclusive - value;
+}
