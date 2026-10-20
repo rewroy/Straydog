@@ -2084,6 +2084,16 @@ int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* r
     SD_OP_END
 }
 
+int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out,
+                  uint64_t out_rows) {
+    SD_OP_BEGIN
+    op_span(value, x, size_t(count * width) * 4, "written rows");
+    op_span(value, rows, size_t(count) * 4, "row indices");
+    op_span(value, out, size_t(out_rows * width) * 4, "a scatter output");
+    op_scatter_kernel<<<op_blocks(size_t(count * width)), 256, 0, value.stream>>>(x, rows, size_t(count), size_t(width), out);
+    SD_OP_END
+}
+
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out,
                       uint64_t out_rows) {
     SD_OP_BEGIN
@@ -2110,7 +2120,7 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
     }
     op_span(value, sinks, size_t(heads) * 4, "attention sinks");
     op_span(value, out, size_t(rows * heads * dim) * 4, "an attention output");
-    op_sparse_attention_kernel<<<unsigned(rows * heads), 256, shared, value.stream>>>(q, raw, positions, size_t(window), compressed,
+    op_sparse_attention_kernel<<<unsigned(rows * heads), 256, shared, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), compressed,
         selected, size_t(selections), sinks, size_t(heads), size_t(dim), scale, out);
     SD_OP_END
 }

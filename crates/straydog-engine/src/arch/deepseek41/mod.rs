@@ -2,6 +2,8 @@
 //! latent attention over a sliding window plus compressed, index-selected rows (CSA2), and
 //! n-gram Engram tables. The plan below follows the reference implementation's definitions.
 
+pub mod engine;
+
 use super::Keys;
 use straydog_gguf::ModelHeader;
 

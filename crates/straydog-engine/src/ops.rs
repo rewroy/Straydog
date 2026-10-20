@@ -33,6 +33,12 @@ impl Buffer {
     pub fn base(&self) -> *mut c_void {
         self.pointer
     }
+
+    /// `bytes` of this buffer from `offset` bytes in (for ops that take a buffer, such as weights).
+    pub fn slice(&self, offset: u64, bytes: u64) -> Buffer {
+        assert!(offset + bytes <= self.bytes, "a buffer slice past its end");
+        Buffer { pointer: self.pointer.wrapping_byte_add(offset as usize), bytes }
+    }
 }
 
 impl Backend {
@@ -155,6 +161,11 @@ impl Backend {
     pub fn gather(&mut self, x: P, x_rows: u64, rows: P, count: u64, width: u64, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_gather(self.handle(), x.cast(), x_rows, rows.cast(), count, width, out.cast()) })
+    }
+
+    pub fn scatter(&mut self, x: P, rows: P, count: u64, width: u64, out: M, out_rows: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_scatter(self.handle(), x.cast(), rows.cast(), count, width, out.cast(), out_rows) })
     }
 
     pub fn scatter_add(&mut self, x: P, rows: P, count: u64, width: u64, out: M, out_rows: u64) -> Result<()> {

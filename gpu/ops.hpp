@@ -235,6 +235,13 @@ __global__ void op_gather_kernel(const float* x, const int32_t* rows, size_t cou
     out[index] = x[size_t(rows[index / width]) * width + index % width];
 }
 
+// out[rows[i]] = x[i]
+__global__ void op_scatter_kernel(const float* x, const int32_t* rows, size_t count, size_t width, float* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count * width) return;
+    out[size_t(rows[index / width]) * width + index % width] = x[index];
+}
+
 // out[rows[i]] += x[i] (rows distinct within one call)
 __global__ void op_scatter_add_kernel(const float* x, const int32_t* rows, size_t count, size_t width, float* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -245,9 +252,10 @@ __global__ void op_scatter_add_kernel(const float* x, const int32_t* rows, size_
 // ---- Latent attention over a sliding window and selected compressed rows ----
 
 // One block per (row, head). The keys, which are also the values, are the window rows
-// max(0, p - window + 1) .. p of `raw` (positions[row] = p) and the compressed rows `selected`
-// lists for the row (-1: none). Softmax with the head's sink in the denominator.
-__global__ void op_sparse_attention_kernel(const float* q, const float* raw, const int32_t* positions, size_t window,
+// max(0, p - window + 1) .. p of `raw` (positions[row] = p; position q is row q % raw_rows, a
+// ring) and the compressed rows `selected` lists for the row (-1: none). Softmax with the
+// head's sink in the denominator.
+__global__ void op_sparse_attention_kernel(const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window,
                                            const float* compressed, const int32_t* selected, size_t selections,
                                            const float* sinks, size_t heads, size_t dim, float scale, float* out) {
     const size_t row = blockIdx.x / heads, head = blockIdx.x % heads;
@@ -261,7 +269,7 @@ __global__ void op_sparse_attention_kernel(const float* q, const float* raw, con
     for (size_t i = threadIdx.x; i < dim; i += blockDim.x) qs[i] = query[i];
     __syncthreads();
     const auto key = [&](size_t index) -> const float* {
-        if (index < raw_count) return raw + size_t(first + int64_t(index)) * dim;
+        if (index < raw_count) return raw + size_t(first + int64_t(index)) % raw_rows * dim;
         const int32_t at = selected[row * selections + (index - raw_count)];
         return at < 0 ? nullptr : compressed + size_t(at) * dim;
     };

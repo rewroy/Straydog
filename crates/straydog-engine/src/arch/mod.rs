@@ -5,6 +5,18 @@ pub mod deepseek41;
 
 use straydog_gguf::{Metadata, ModelHeader};
 
+/// A tensor's GGUF type, extents (innermost first) and bytes.
+pub struct Tensor<'a> {
+    pub kind: u32,
+    pub dims: Vec<usize>,
+    pub data: &'a [u8],
+}
+
+/// Where an engine reads its weights: the authenticated files, or a development reader.
+pub trait Tensors {
+    fn tensor(&self, name: &str) -> Result<Tensor<'_>, String>;
+}
+
 /// An architecture's metadata keys, `{architecture}.{key}`, with typed access.
 pub struct Keys<'a> {
     header: &'a ModelHeader,

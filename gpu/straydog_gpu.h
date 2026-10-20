@@ -77,8 +77,10 @@ int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float*
 int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t rows, uint64_t experts, uint64_t k, int gating, int normalize, float scale, int32_t* ids, float* weights);
 int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp, const float* row_weights, float* out);
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
+int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
-/* Latent attention: each query attends to the window rows of `raw` ending at its position and
+/* Latent attention: each query attends to the window rows of `raw` ending at its position
+   (position p in row p % raw_rows, so `raw` may be a ring) and
    the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio
    rows by a per-channel softmax of the gate. The indexer scores visible groups and keeps the top k. */
 int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions, uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected, uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim, float scale, float* out);
