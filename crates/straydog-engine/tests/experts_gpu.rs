@@ -92,7 +92,7 @@ fn run(host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts
         experts.dedup();
         if step % 3 == 0 {
             let next: Vec<usize> = (0..3).map(|_| random.below(EXPERTS)).collect();
-            store.prefetch(&mut gpu, 2 - layer, &next).unwrap();
+            store.prefetch(&mut gpu, 2 - layer, &next, true).unwrap();
         }
         let slots = store.acquire(&mut gpu, layer, &experts).unwrap();
         for (&expert, slot) in experts.iter().zip(&slots) {
@@ -150,7 +150,7 @@ fn a_failed_read_leaves_both_tiers() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, 1 << 26).unwrap();
     // A prefetch of the bad expert, then passes that use it fail twice, the neighbours still served.
-    store.prefetch(&mut gpu, 0, &[5]).unwrap();
+    store.prefetch(&mut gpu, 0, &[5], true).unwrap();
     for attempt in 0..3 {
         let result = store.acquire(&mut gpu, 0, &[4, 5, 6]);
         if attempt < 2 {

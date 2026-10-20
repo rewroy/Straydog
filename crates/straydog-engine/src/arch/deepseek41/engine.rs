@@ -1,12 +1,19 @@
 //! DeepSeek-V4.1 on one GPU, composed from the generic ops: dense weights resident, routed
-//! experts in a VRAM cache refilled by use, and the sequence state a forward pass continues
-//! (window rings, compressed rows and index keys, compression tails, the Engram history).
+//! experts in the expert store's tiers (VRAM slots, a host tier, the files; src/experts.rs),
+//! and the sequence state a forward pass continues (window rings, compressed rows and index
+//! keys, compression tails, the Engram history).
 //! Checked against the CPU reference by examples/ds41_gpu and examples/ds41_chat.
+//!
+//! A decode row's next-layer experts are predicted and prefetched from the host tier; for
+//! measurements, DS41_NO_PREDICT turns that off and DS41_PREDICT_DRIVE also reads predicted
+//! experts from the drive (so far no faster: wrong guesses spend the drive's time).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use super::{Gating, Hparams, Rope};
 use crate::arch::Tensors;
+use crate::experts::{DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, Result};
 use crate::ops::{Buffer, Linear};
@@ -18,6 +25,8 @@ pub struct Settings {
     pub batch: usize,
     /// Experts the VRAM cache holds.
     pub expert_slots: usize,
+    /// Bytes of host tier (page-locked memory) for experts VRAM evicts.
+    pub host_expert_bytes: u64,
     pub scratch_bytes: u64,
     /// The layers this engine runs: the first embeds the tokens, the last has the head, and an
     /// engine between takes the stream the one before hands over (see [`forward_split`]).
@@ -99,18 +108,17 @@ struct Work {
     hc_workspace: Buffer,
 }
 
-/// Routed experts in VRAM slots ([gate | up | down] bytes each), evicting the least recently used.
-struct Experts {
-    slots: Vec<Buffer>,
-    owner: Vec<Option<(usize, usize)>>,
-    used: Vec<u64>,
-    map: HashMap<(usize, usize), usize>,
-    clock: u64,
-    hits: u64,
-    misses: u64,
-    /// Seconds spent copying missed experts in.
-    fill_seconds: f64,
-}
+/// An expert and the rows routed to it, with their weights.
+type Routed = (usize, (Vec<i32>, Vec<f32>));
+
+/// Experts acquired at a time by a pass of many rows (each wave's reads overlap the one before's
+/// compute).
+const WAVE: usize = 32;
+/// Experts of the next layer prefetched from its router applied to this layer's input (decode):
+/// the 8 best hold 79% of the 6 it takes.
+const PREDICTED: usize = 8;
+/// Reader threads per engine: reads in flight, enough for an expert's pieces at once.
+const READERS: usize = 32;
 
 pub struct Engine<'a, T: Tensors> {
     /// Shared, so a pass takes the parameters without copying the Engram tables' metadata.
@@ -130,7 +138,9 @@ pub struct Engine<'a, T: Tensors> {
     plain: Buffer,
     compressed_rope: Buffer,
     work: Work,
-    experts: Experts,
+    experts: DeviceExperts,
+    /// Next-layer experts predicted by this pass, prefetched after the layer's own.
+    predicted: Vec<usize>,
     /// With DS41_PROFILE set: seconds per phase, the GPU synchronized at each phase's end.
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
 }
@@ -256,18 +266,22 @@ impl<'a, T: Tensors> Engine<'a, T> {
         gpu.write_buffer(&plain_buffer, 0, &plain)?;
         let compressed_buffer = floats(&mut gpu, compressed.len())?;
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
-        // One slot fits the largest layer's expert.
-        let mut slot_bytes = 0;
+        // Each layer's experts as three roles of the files (a slot holds them back to back).
+        let mut roles = vec![None; hp.layers.len()];
         for layer in range.clone() {
-            let mut bytes = 0;
+            let mut layer_roles = Vec::new();
             for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
-                let tensor = tensors.tensor(&name(layer, role))?;
-                bytes += row_bytes(tensor.kind, tensor.dims[0])? * tensor.dims[1];
+                let tensor_name = name(layer, role);
+                let tensor = tensors.tensor(&tensor_name)?;
+                let (file, base) = tensors.location(&tensor_name).ok_or("the expert store needs the model's files")?;
+                let stride = (row_bytes(tensor.kind, tensor.dims[0])? * tensor.dims[1]) as u64;
+                layer_roles.push(Role { file, base, stride });
             }
-            slot_bytes = slot_bytes.max(bytes);
+            roles[layer] = Some(layer_roles);
         }
-        let slots = (0..settings.expert_slots).map(|_| gpu.buffer(slot_bytes as u64)).collect::<Result<Vec<_>>>()?;
-        let count = slots.len();
+        let layout = Arc::new(Layout::new(&tensors.files()?, roles, tensors.verifier())?);
+        let experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots,
+                                         settings.host_expert_bytes)?;
         let mut engine = Engine {
             hp: std::rc::Rc::new(hp),
             tensors,
@@ -285,7 +299,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             compressed_rope: compressed_buffer,
             work,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
-            experts: Experts { slots, owner: vec![None; count], used: vec![0; count], map: HashMap::new(), clock: 0, hits: 0, misses: 0, fill_seconds: 0.0 },
+            experts,
+            predicted: Vec::new(),
         };
         engine.upload_dense()?;
         Ok(engine)
@@ -355,9 +370,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position
     }
 
-    /// The expert cache's hits, misses and seconds spent filling missed slots.
-    pub fn cache_counts(&self) -> (u64, u64, f64) {
-        (self.experts.hits, self.experts.misses, self.experts.fill_seconds)
+    /// The expert store's counters.
+    pub fn cache_counts(&self) -> crate::experts::Counts {
+        self.experts.counts()
+    }
+
+    /// Wait for the expert store's reads and copies (before dropping the engine).
+    pub fn settle(&mut self) -> Result<()> {
+        self.experts.settle(&mut self.gpu)
     }
 
     /// Forget the sequence (the caches' contents stay, as warm experts do).
@@ -687,9 +707,19 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
         self.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, k as u64, gating,
                        hp.route_normalize, hp.route_scale, work.ids.base(), work.weights.base())?;
+        // One decode row: the next layer's router applied to this layer's input names the experts
+        // to prefetch (their reads and copies overlap this layer's experts and the next attention).
+        let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && std::env::var_os("DS41_NO_PREDICT").is_none();
+        if predict {
+            let next_bias = self.dense(&format!("blk.{}.exp_probs_b.bias", layer + 1))?;
+            self.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, work.router.at(hp.experts))?;
+            self.gpu.route(work.router.at(hp.experts), Some(next_bias.buffer.base()), 1, hp.experts as u64, PREDICTED as u64,
+                           gating, hp.route_normalize, hp.route_scale, work.ids.at(k), work.expert_weights.base())?;
+        }
         self.mark("router")?;
         // The routes travel to the host while the shared expert writes `out`; the routed ones add to it.
-        self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
+        let read = n * k + if predict { PREDICTED } else { 0 };
+        self.gpu.read_start(&work.ids, 0, (read * 4) as u64)?;
         let shared = self.shared[&layer];
         if n <= SLOT_ROWS {
             self.gpu.experts(&vec![shared.buffer.base() as u64; n], shared.buffer.bytes, shared.offsets, shared.kinds, w as u64,
@@ -708,8 +738,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                             &scratch)?;
         }
         self.mark("shared expert")?;
-        let mut routes = vec![0i32; n * k];
+        let mut routes = vec![0i32; read];
         self.gpu.read_finish(&mut routes)?;
+        self.predicted = routes.split_off(n * k).into_iter().map(|expert| expert as usize).collect();
         if n <= SLOT_ROWS {
             return self.routed(layer, n, &routes);
         }
@@ -727,30 +758,36 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (gate_bytes, down_bytes) = (ff * row_bytes(gate.kind, w)?, w * row_bytes(down.kind, ff)?);
         let (gate_kind, up_kind, down_kind) = (gate.kind, up.kind, down.kind);
         let scratch = self.scratch;
-        // The layer's missing experts all start reading before the first is copied in.
-        let missing: Vec<&[u8]> = by_expert.keys().filter(|&&expert| !self.experts.map.contains_key(&(layer, expert)))
-            .flat_map(|&expert| [&gate.data[expert * gate_bytes..(expert + 1) * gate_bytes],
-                                 &up.data[expert * gate_bytes..(expert + 1) * gate_bytes],
-                                 &down.data[expert * down_bytes..(expert + 1) * down_bytes]])
-            .collect();
-        self.tensors.prefetch(&missing);
-        for (expert, (rows, user_weights)) in by_expert {
-            let count = rows.len();
-            let slot = self.expert(layer, expert, gate_bytes, down_bytes)?;
-            self.gpu.write_buffer(&work.expert_rows, 0, &rows)?;
-            self.gpu.write_buffer(&work.expert_weights, 0, &user_weights)?;
-            self.gpu.gather(work.x.base(), n as u64, work.expert_rows.base(), count as u64, w as u64, work.xe.base())?;
-            let gate_weights = slot.slice(0, gate_bytes as u64);
-            let up_weights = slot.slice(gate_bytes as u64, gate_bytes as u64);
-            let down_weights = slot.slice(2 * gate_bytes as u64, down_bytes as u64);
-            self.gpu.linear(&gate_weights, gate_kind, ff as u64, w as u64, 0, work.xe.base(), 0, count as u64, work.gate.base(), 0,
-                            &scratch)?;
-            self.gpu.linear(&up_weights, up_kind, ff as u64, w as u64, 0, work.xe.base(), 0, count as u64, work.up.base(), 0, &scratch)?;
-            self.gpu.swiglu(work.gate.base(), work.up.base(), count as u64, ff as u64, hp.layers[layer].clamp_routed,
-                            Some(work.expert_weights.base()), work.hidden.base())?;
-            self.gpu.linear(&down_weights, down_kind, w as u64, ff as u64, 0, work.hidden.base(), 0, count as u64, work.y.base(), 0,
-                            &scratch)?;
-            self.gpu.scatter_add(work.y.base(), work.expert_rows.base(), count as u64, w as u64, work.out.base(), n as u64)?;
+        // In waves: the next wave's experts load while this one's compute.
+        let by_expert: Vec<Routed> = by_expert.into_iter().collect();
+        let waves: Vec<&[Routed]> = by_expert.chunks(WAVE).collect();
+        for (index, wave) in waves.iter().enumerate() {
+            let experts: Vec<usize> = wave.iter().map(|(expert, _)| *expert).collect();
+            let slots = self.experts.acquire(&mut self.gpu, layer, &experts)?;
+            if let Some(next) = waves.get(index + 1) {
+                let experts: Vec<usize> = next.iter().map(|(expert, _)| *expert).collect();
+                self.experts.prefetch(&mut self.gpu, layer, &experts, true)?;
+            }
+            self.mark("expert fills")?;
+            for ((_, (rows, user_weights)), slot) in wave.iter().zip(slots) {
+                let count = rows.len();
+                self.gpu.write_buffer(&work.expert_rows, 0, rows)?;
+                self.gpu.write_buffer(&work.expert_weights, 0, user_weights)?;
+                self.gpu.gather(work.x.base(), n as u64, work.expert_rows.base(), count as u64, w as u64, work.xe.base())?;
+                let gate_weights = slot.slice(0, gate_bytes as u64);
+                let up_weights = slot.slice(gate_bytes as u64, gate_bytes as u64);
+                let down_weights = slot.slice(2 * gate_bytes as u64, down_bytes as u64);
+                self.gpu.linear(&gate_weights, gate_kind, ff as u64, w as u64, 0, work.xe.base(), 0, count as u64, work.gate.base(), 0,
+                                &scratch)?;
+                self.gpu.linear(&up_weights, up_kind, ff as u64, w as u64, 0, work.xe.base(), 0, count as u64, work.up.base(), 0,
+                                &scratch)?;
+                self.gpu.swiglu(work.gate.base(), work.up.base(), count as u64, ff as u64, hp.layers[layer].clamp_routed,
+                                Some(work.expert_weights.base()), work.hidden.base())?;
+                self.gpu.linear(&down_weights, down_kind, w as u64, ff as u64, 0, work.hidden.base(), 0, count as u64, work.y.base(),
+                                0, &scratch)?;
+                self.gpu.scatter_add(work.y.base(), work.expert_rows.base(), count as u64, w as u64, work.out.base(), n as u64)?;
+            }
+            self.experts.release(&mut self.gpu)?;
         }
         self.mark("routed experts")
     }
@@ -763,58 +800,27 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
         let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
         let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
-        let (gate_bytes, down_bytes) = (ff * row_bytes(gate.kind, w)?, w * row_bytes(down.kind, ff)?);
+        let gate_bytes = ff * row_bytes(gate.kind, w)?;
         let kinds = [gate.kind, up.kind, down.kind];
-        let experts: std::collections::BTreeSet<usize> = routes.iter().map(|&expert| expert as usize).collect();
-        // The layer's missing experts all start reading before the first is copied in.
-        let missing: Vec<&[u8]> = experts.iter().filter(|&&expert| !self.experts.map.contains_key(&(layer, expert)))
-            .flat_map(|&expert| [&gate.data[expert * gate_bytes..(expert + 1) * gate_bytes],
-                                 &up.data[expert * gate_bytes..(expert + 1) * gate_bytes],
-                                 &down.data[expert * down_bytes..(expert + 1) * down_bytes]])
-            .collect();
-        self.tensors.prefetch(&missing);
-        let mut slots = HashMap::new();
-        for &expert in &experts {
-            slots.insert(expert, self.expert(layer, expert, gate_bytes, down_bytes)?);
+        let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
+            .into_iter().collect();
+        let slots = self.experts.acquire(&mut self.gpu, layer, &experts)?;
+        // The next layer's predicted experts start their reads and copies behind this layer's.
+        let predicted = std::mem::take(&mut self.predicted);
+        if !predicted.is_empty() {
+            let drive = std::env::var_os("DS41_PREDICT_DRIVE").is_some();
+            self.experts.prefetch(&mut self.gpu, layer + 1, &predicted, drive)?;
         }
-        let bases: Vec<u64> = routes.iter().map(|expert| slots[&(*expert as usize)].base() as u64).collect();
-        let slot_bytes = slots.values().next().map_or(0, |slot| slot.bytes);
+        self.mark("expert fills")?;
+        let bases: Vec<u64> = routes.iter()
+            .map(|expert| slots[experts.binary_search(&(*expert as usize)).unwrap()].base() as u64).collect();
+        let slot_bytes = slots.first().map_or(0, |slot| slot.bytes);
         let offsets = [0, gate_bytes as u64, 2 * gate_bytes as u64];
         self.gpu.experts(&bases, slot_bytes, offsets, kinds, w as u64, ff as u64, n as u64, self.hp.experts_used as u64,
                          work.x.base(), 0, Some(work.weights.base()), self.hp.layers[layer].clamp_routed, true, work.hidden.base(),
                          work.out.base(), 0)?;
+        self.experts.release(&mut self.gpu)?;
         self.mark("routed experts")
-    }
-
-    /// The slot holding (layer, expert), copied in on a miss over the least recently used one.
-    fn expert(&mut self, layer: usize, expert: usize, gate_bytes: usize, down_bytes: usize) -> Result<Buffer> {
-        self.experts.clock += 1;
-        let clock = self.experts.clock;
-        if let Some(&slot) = self.experts.map.get(&(layer, expert)) {
-            self.experts.hits += 1;
-            self.experts.used[slot] = clock;
-            return Ok(self.experts.slots[slot]);
-        }
-        self.experts.misses += 1;
-        let slot = (0..self.experts.slots.len()).min_by_key(|&slot| self.experts.used[slot]).ok_or("no expert slots")?;
-        if let Some(previous) = self.experts.owner[slot].take() {
-            self.experts.map.remove(&previous);
-        }
-        let buffer = self.experts.slots[slot];
-        self.mark("routed experts")?;
-        let started = std::time::Instant::now();
-        for (index, (role, bytes)) in [("ffn_gate_exps", gate_bytes), ("ffn_up_exps", gate_bytes), ("ffn_down_exps", down_bytes)]
-            .into_iter().enumerate()
-        {
-            let tensor = self.tensors.tensor(&name(layer, role))?;
-            self.gpu.write_buffer(&buffer, (index.min(2) * gate_bytes) as u64, &tensor.data[expert * bytes..(expert + 1) * bytes])?;
-        }
-        self.experts.fill_seconds += started.elapsed().as_secs_f64();
-        self.mark("expert fills")?;
-        self.experts.owner[slot] = Some((layer, expert));
-        self.experts.map.insert((layer, expert), slot);
-        self.experts.used[slot] = clock;
-        Ok(buffer)
     }
 }
 

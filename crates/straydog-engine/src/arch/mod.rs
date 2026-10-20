@@ -19,6 +19,22 @@ pub trait Tensors {
     /// Start reading these byte ranges of tensors (slices of their `data`) in the background,
     /// so a later access finds them in memory; the default reads nothing ahead.
     fn prefetch(&self, _ranges: &[&[u8]]) {}
+
+    /// The files the tensors lie in, for reads that go around their mapping (routed experts,
+    /// read directly into the expert store's tiers); none by default.
+    fn files(&self) -> Result<Vec<std::fs::File>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Which of [`files`](Self::files) holds a tensor's bytes, and from which offset.
+    fn location(&self, _name: &str) -> Option<(usize, u64)> {
+        None
+    }
+
+    /// The check of every block read directly from [`files`](Self::files), before its use.
+    fn verifier(&self) -> Option<crate::experts::Verifier> {
+        None
+    }
 }
 
 /// An architecture's metadata keys, `{architecture}.{key}`, with typed access.

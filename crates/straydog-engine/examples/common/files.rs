@@ -10,6 +10,7 @@ use straydog_engine::arch::{Tensor, Tensors};
 use straydog_gguf::{ModelHeader, TensorInfo};
 
 pub struct Files {
+    handles: Vec<File>,
     maps: Vec<Mmap>,
     tensors: HashMap<String, (usize, TensorInfo)>,
     pub header: ModelHeader,
@@ -20,7 +21,7 @@ impl Files {
         let mut shards: Vec<PathBuf> = std::fs::read_dir(dir).map_err(|exc| exc.to_string())?
             .flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "gguf")).collect();
         shards.sort();
-        let (mut maps, mut tensors, mut first) = (Vec::new(), HashMap::new(), None);
+        let (mut handles, mut maps, mut tensors, mut first) = (Vec::new(), Vec::new(), HashMap::new(), None);
         for (index, path) in shards.iter().enumerate() {
             let file = File::open(path).map_err(|exc| format!("{}: {exc}", path.display()))?;
             // SAFETY: a read-only mapping of a file this process never writes.
@@ -33,8 +34,9 @@ impl Files {
                 first = Some(header);
             }
             maps.push(map);
+            handles.push(file);
         }
-        Ok(Files { maps, tensors, header: first.ok_or("no first shard")? })
+        Ok(Files { handles, maps, tensors, header: first.ok_or("no first shard")? })
     }
 }
 
@@ -43,6 +45,14 @@ impl Tensors for Files {
         if std::env::var_os("DS41_NO_PREFETCH").is_none() {
             straydog_engine::storage::read_ahead(ranges.iter().copied());
         }
+    }
+
+    fn files(&self) -> Result<Vec<File>, String> {
+        self.handles.iter().map(|file| file.try_clone().map_err(|exc| exc.to_string())).collect()
+    }
+
+    fn location(&self, name: &str) -> Option<(usize, u64)> {
+        self.tensors.get(name).map(|(shard, info)| (*shard, info.offset))
     }
 
     fn tensor(&self, name: &str) -> Result<Tensor<'_>, String> {
