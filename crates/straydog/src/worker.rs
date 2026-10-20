@@ -117,7 +117,9 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16")?;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
+    let opened = Instant::now();
     let weights = Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report)?;
+    let open_seconds = opened.elapsed().as_secs_f64();
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
     let text = Arc::new(Text::new(&resource("tokenizer.json")?).map_err(|exc| exc.to_string())?);
@@ -132,13 +134,21 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     };
     let mut model = Model::new(weights, group, &settings, &report)?;
     loading.report("warm", 0, 0);
+    let warming = Instant::now();
     warm_up(&mut model)?;
+    let mut seconds = serde_json::Map::new();
+    seconds.insert("open".into(), open_seconds.into());
+    for (step, value) in &model.load_seconds {
+        seconds.insert(step.to_string(), (*value).into());
+    }
+    seconds.insert("warm".into(), warming.elapsed().as_secs_f64().into());
     output.send(&json!({
         "event": "ready", "protocol": 1, "engine": "Straydog", "model": straydog_engine::bundle::MODEL,
         "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size},
+        "load_seconds": seconds,
         "gpu": model.info()?,
     }));
     serve(Arc::new(Mutex::new(Engine { model, template })), text, output)

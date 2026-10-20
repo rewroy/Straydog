@@ -510,6 +510,12 @@ impl Driver {
         match result {
             Ok(mut ready) => {
                 tracing::info!("{} (loaded in {:.0} s)", ready_summary(&ready), started.elapsed().as_secs_f64());
+                if let Some(steps) = ready["load_seconds"].as_object() {
+                    let steps: Vec<String> = steps.iter()
+                        .map(|(step, seconds)| format!("{step} {:.2} s", seconds.as_f64().unwrap_or(0.0)))
+                        .collect();
+                    tracing::info!("Straydog load steps: {}", steps.join(", "));
+                }
                 ready["loaded_seconds"] = started.elapsed().as_secs_f64().into();
                 self.set(Phase::Ready(ready));
                 Ok(process)
