@@ -749,8 +749,8 @@ impl Model {
         self.with_operands(Model::mtp_operands, |group, operands| group.mtp_prologue(operands, embeddings, hidden))
     }
 
-    /// Draft tokens from MTP rows through its own mixer and the shared vocabulary head.
-    /// The drafter's token for the last row and its probability under the drafter.
+    /// The drafter's token for the last row, through the MTP layer's own mixer and the shared
+    /// vocabulary head, and its probability under the drafter.
     fn mtp_head(&mut self, values: &[f32]) -> Result<(u32, f32)> {
         let (tokens, _, top) = self.with_operands(
             |model| Ok(vec![model.vector("mtp.hc_out_norm.weight", None)?, model.projection("mtp.hc_out_down.weight")?,
