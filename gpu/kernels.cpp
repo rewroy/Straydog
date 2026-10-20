@@ -384,7 +384,9 @@ struct Device {
     // sd_op_experts' route addresses (an allocation of slot_route_capacity entries), and the
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
+    size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
+    bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
     hipEvent_t readback_done = nullptr;
     size_t readback_bytes = 0;
@@ -2171,6 +2173,59 @@ int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uin
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// ---- Graphs of ops (kept in Device::graphs under "op" and the caller's key) ----
+
+static std::string op_graph_key(uint64_t key) {
+    std::string name("op");
+    name.append(reinterpret_cast<const char*>(&key), sizeof(key));
+    return name;
+}
+
+int sd_graph_begin(void* handle) {
+    try {
+        auto& value = device(handle);
+        if (value.op_recording) throw std::runtime_error("a Straydog graph is already being recorded");
+        check(hipStreamBeginCapture(value.stream, hipStreamCaptureModeThreadLocal));
+        value.op_recording = true;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_graph_end(void* handle, uint64_t key, int keep) {
+    try {
+        auto& value = device(handle);
+        if (!value.op_recording) throw std::runtime_error("no Straydog graph is being recorded");
+        value.op_recording = false;
+        CachedGraph made{};
+        check(hipStreamEndCapture(value.stream, &made.graph));
+        if (!keep) {
+            cleanup(hipGraphDestroy(made.graph));
+            return 0;
+        }
+        const hipError_t instantiated = hipGraphInstantiate(&made.executable, made.graph, nullptr, nullptr, 0);
+        if (instantiated != hipSuccess) {
+            cleanup(hipGraphDestroy(made.graph));
+            check(instantiated);
+        }
+        auto& slot = value.graphs[op_graph_key(key)];
+        if (slot.executable) cleanup(hipGraphExecDestroy(slot.executable));
+        if (slot.graph) cleanup(hipGraphDestroy(slot.graph));
+        slot = std::move(made);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_graph_run(void* handle, uint64_t key) {
+    try {
+        auto& value = device(handle);
+        const auto found = value.graphs.find(op_graph_key(key));
+        if (found == value.graphs.end()) return 1;
+        check(hipGraphLaunch(found->second.executable, value.stream));
+        ++value.graph_replays;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t steps, uint64_t input_stride,
                   uint64_t output_stride, float* scratch, uint64_t scratch_bytes) {
     try {
@@ -2588,7 +2643,7 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     out_stride = out_stride ? out_stride : hidden;
     const sd_expert_split whole{0, ffn, 0, hidden, 3};
     const sd_expert_split& part = split ? *split : whole;
-    if (!bases || !offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 ||
+    if (!offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 ||
         rows * top_k > slot_route_capacity || input_stride < hidden || out_stride < hidden || !(clamp >= 0.0f) ||
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
         part.hidden_first > hidden - part.hidden_rows)
@@ -2601,7 +2656,11 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
             throw std::runtime_error("an expert's matrices lie outside its slot");
         plan.role[role] = {reinterpret_cast<const uint8_t*>(offsets[role]), row_bytes, matrix_rows, cols, 0, 0, 0, kinds[role]};
     }
-    for (size_t route = 0; route < size_t(rows * top_k); ++route) {
+    const size_t routes = size_t(rows * top_k);
+    if (!bases && value.slot_routes_count != routes) throw std::runtime_error("no Straydog expert routes to reuse");
+    bool uniform = bases != nullptr && top_k == 1;
+    for (size_t route = 0; bases && route < routes; ++route) {
+        uniform &= bases[route] == bases[0];
         if (!bases[route]) continue;   // a route another device runs
         if (bases[route] % 256) throw std::runtime_error("an expert slot is not 256-byte aligned");
         op_span(value, reinterpret_cast<const void*>(bases[route]), size_t(slot_bytes), "an expert slot");
@@ -2619,7 +2678,14 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     plan.clamp = clamp;
     plan.accumulate = accumulate ? 1 : 0;
     if (!value.slot_routes) value.slot_routes = static_cast<uint64_t*>(allocate(value, slot_route_capacity * 8));
-    upload(value, value.slot_routes, bases, size_t(rows * top_k) * 8);
+    // One slot for a token's only route (a shared expert) goes by value; other routes are uploaded
+    // (or, without bases, the last ones uploaded are used again: the down stage after its gate/up).
+    if (uniform && bases[0]) {
+        plan.uniform = bases[0];
+    } else if (bases) {
+        upload(value, value.slot_routes, bases, routes * 8);
+        value.slot_routes_count = routes;
+    }
     slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
                  size_t(out_stride));
     SD_OP_END

@@ -685,36 +685,78 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.engram(layer, module, tokens, n)?;
             self.mark("engram")?;
         }
-        let iterations = hp.sinkhorn_iterations as u64;
-        let sublayer = |shard: &Shard, side: &str, norm: &str| -> Result<(Dense, Dense, Dense, Dense)> {
-            Ok((shard.dense(&name(layer, &format!("hc_{side}_fn")))?, shard.dense(&name(layer, &format!("hc_{side}_base")))?,
-                shard.dense(&name(layer, &format!("hc_{side}_scale")))?, shard.dense(&name(layer, norm))?))
-        };
-        for shard in &mut self.shards {
-            let work = shard.work.clone_handles();
-            let (fn_, base, scale, norm) = sublayer(shard, "attn", "attn_norm")?;
-            let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
-            let expansion = expand.then(|| (work.out.base() as P, work.stream2.base() as P, work.post_f.base() as P,
-                                            work.comb_f.base() as P));
-            shard.gpu.hc_step(expansion, work.stream.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
-                              work.pre_a.base(), work.post_a.base(), work.comb_a.base())), iterations, hp.hc_eps, hp.norm_eps, pre.base(),
-                              norm.buffer.base(), rows, hc, w, &work.hc_workspace, work.x.base())?;
+        // Decode repeats a layer's launches every token: a device queues each run of them that
+        // takes no host data at once, from a graph recorded the first time (not while profiling).
+        let record = n == 1 && self.profile.is_none() && std::env::var_os("DS41_NO_GRAPHS").is_none();
+        let attention = self.attention_plan(layer, n);
+        // a layer that compresses or indexes changes its launches from token to token
+        let fixed = plan.compressed.is_none_or(|c| c.kv_source != layer && c.index_source != layer);
+        let key = |segment: u64| (layer as u64) << 8 | segment << 4 | u64::from(expand) << 1 | u64::from(attention.existing > 0);
+        for index in 0..self.shards.len() {
+            let target = self.target(&self.shards[index], 0);
+            let shard = &mut self.shards[index];
+            if record && fixed {
+                recorded(shard, key(0), |shard| {
+                    hc_attention(shard, &hp, layer, n, expand, pre_previous)?;
+                    attention_ops(shard, &hp, &attention, target)
+                })?;
+            } else {
+                hc_attention(shard, &hp, layer, n, expand, pre_previous)?;
+            }
         }
-        self.mark("hyper-connections")?;
-        self.attention(layer, n)?;
+        if !(record && fixed) {
+            self.mark("hyper-connections")?;
+            for index in 0..self.shards.len() {
+                let target = self.target(&self.shards[index], 0);
+                attention_ops(&mut self.shards[index], &hp, &attention, target)?;
+            }
+        }
+        if let Some((ratio, tail, _)) = attention.appended {
+            let source = self.sources.get_mut(&layer).unwrap();
+            source.groups += (tail + n) / ratio;
+            source.tail = (tail + n) % ratio;
+        }
         self.sum_parts(0, n)?;
         self.mark("attention")?;
-        for shard in &mut self.shards {
-            let work = shard.work.clone_handles();
-            let (fn_, base, scale, norm) = sublayer(shard, "ffn", "ffn_norm")?;
-            let expansion = (work.out.base() as P, work.stream.base() as P, work.post_a.base() as P, work.comb_a.base() as P);
-            shard.gpu.hc_step(Some(expansion), work.stream2.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
-                              work.pre_f[layer % 2].base(), work.post_f.base(), work.comb_f.base())), iterations, hp.hc_eps, hp.norm_eps,
-                              work.pre_a.base(), norm.buffer.base(), rows, hc, w, &work.hc_workspace, work.x.base())?;
+        let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && std::env::var_os("DS41_NO_PREDICT").is_none();
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            // the next layer's experts are predicted on the first device alone
+            let predict = predict && index == 0;
+            if record {
+                recorded(shard, key(1) | u64::from(predict) << 2, |shard| {
+                    hc_ffn(shard, &hp, layer, n)?;
+                    router_ops(shard, &hp, layer, n, predict)
+                })?;
+            } else {
+                hc_ffn(shard, &hp, layer, n)?;
+            }
         }
-        self.mark("hyper-connections")?;
-        self.moe(layer, n)?;
+        if !record {
+            self.mark("hyper-connections")?;
+            for (index, shard) in self.shards.iter_mut().enumerate() {
+                router_ops(shard, &hp, layer, n, predict && index == 0)?;
+            }
+        }
+        self.mark("router")?;
+        self.moe(layer, n, predict)?;
         self.sum_parts(1, n)
+    }
+
+    /// What every device's attention of `layer` needs to know of the sequence.
+    fn attention_plan(&self, layer: usize, n: usize) -> AttentionPlan {
+        let compressed = self.hp.layers[layer].compressed;
+        AttentionPlan {
+            layer,
+            n,
+            parts: self.shards.len(),
+            compressed,
+            appended: compressed.filter(|c| c.kv_source == layer).map(|_| {
+                let source = &self.sources[&layer];
+                (source.ratio, source.tail, source.groups)
+            }),
+            existing: compressed.map_or(0, |c| self.sources[&c.kv_source].groups),
+            ring_rows: self.ring as u64,
+        }
     }
 
     /// Start reading every Engram row these tokens will gather, while the layers before
@@ -765,111 +807,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
-    /// The attention: q_a, kv, the compressed rows and the indexer on every device, and each
-    /// device's heads of q, the attention, wo_a and wo_b into its part (or `out`).
-    fn attention(&mut self, layer: usize, n: usize) -> Result<()> {
-        let hp = self.hp.clone();
-        let parts = self.shards.len();
-        let (heads, dim, rope) = (hp.heads / parts, hp.head_dim, hp.rope_dims as u64);
-        let groups = hp.out_groups / parts;
-        let plan = hp.layers[layer].compressed;
-        // the compressed rows this pass appends (on every device alike)
-        let appended = match plan {
-            Some(c) if c.kv_source == layer => {
-                let source = &self.sources[&layer];
-                Some((source.ratio, source.tail, source.groups))
-            }
-            _ => None,
-        };
-        let ring_rows = self.ring as u64;
-        for index in 0..parts {
-            let target = self.target(&self.shards[index], 0);
-            let shard = &mut self.shards[index];
-            let work = shard.work.clone_handles();
-            let freqs = if plan.is_some() { shard.compressed_rope } else { shard.plain };
-            let scratch = shard.scratch;
-            let whole = |weight: &Dense, input: M, output: M| Linear {
-                weights: weight.buffer, kind: weight.kind, rows: weight.dims[1] as u64, cols: weight.dims[0] as u64, first_row: 0,
-                input: input as P, output,
-            };
-            let (q_a, kv) = (shard.dense(&name(layer, "attn_q_a"))?, shard.dense(&name(layer, "attn_kv"))?);
-            shard.gpu.linears(&[whole(&q_a, work.x.base(), work.qr.base()), whole(&kv, work.x.base(), work.kv.base())], n as u64, 0, 0,
-                              &scratch)?;
-            shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
-            // q (this device's heads) stays unrotated: the attention rotates it as it reads it
-            shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
-            let ring = shard.rings[&layer];
-            let kv_norm = shard.dense(&name(layer, "attn_kv_a_norm"))?;
-            shard.gpu.norm_rope(work.kv.base(), &kv_norm.buffer, n as u64, dim as u64, hp.norm_eps,
-                                Some((rope, &work.positions, &freqs)), Some(work.ring_rows.base()), ring.base(), ring_rows)?;
-            let mut compressed = None;
-            if let Some(c) = plan {
-                let mut groups_now = self.sources[&c.kv_source].groups;
-                if let Some((ratio, tail, first_group)) = appended {
-                    groups_now += compress(shard, &hp, layer, n, freqs, ratio, tail, first_group)?.0;
-                }
-                if c.index_source == layer && groups_now > 0 {
-                    let keys = shard.sources[&c.kv_source].keys;
-                    shard.linear(&name(layer, "indexer.attn_q_b"), work.qr.base(), n, work.index_q.base())?;
-                    shard.gpu.rope(work.index_q.base(), n as u64, hp.index_heads as u64, hp.index_dim as u64, rope, &work.positions,
-                                   &freqs, false)?;
-                    shard.linear(&name(layer, "indexer.proj"), work.x.base(), n, work.index_w.base())?;
-                    let scale = 1.0 / ((hp.index_dim as f32).sqrt() * (hp.index_heads as f32).sqrt());
-                    shard.gpu.index_scores(work.index_q.base(), keys.base(), work.index_w.base(), work.visible[c.ratio].base(),
-                                           n as u64, groups_now as u64, hp.index_heads as u64, hp.index_dim as u64, scale,
-                                           work.scores.base())?;
-                    let chosen = work.chosen[&layer];
-                    shard.gpu.top_k(work.scores.base(), n as u64, groups_now as u64, hp.index_top_k as u64, chosen.base())?;
-                }
-                if groups_now > 0 {
-                    compressed = Some((shard.sources[&c.kv_source].rows, groups_now, work.chosen[&c.index_source]));
-                }
-            }
-            let sinks = shard.dense(&name(layer, "attn_sinks"))?;
-            shard.gpu.sparse_attention(work.q.base(), ring.base(), ring_rows, work.positions.base(), hp.window as u64,
-                                       compressed.map(|(rows, groups, _)| (rows.base() as P, groups as u64)),
-                                       compressed.map(|(_, _, chosen)| (chosen.base() as P, hp.index_top_k as u64)),
-                                       sinks.buffer.base(), n as u64, heads as u64, dim as u64, 1.0 / (dim as f32).sqrt(),
-                                       Some((rope, &freqs)), Some(&scratch), work.attended.base())?;
-            // wo_a is block-diagonal: group g projects its heads' slice alone.
-            let wo_a = shard.dense(&name(layer, "attn_output_a"))?;
-            let group_width = hp.heads * dim / hp.out_groups;
-            let projections: Vec<Linear> = (0..groups).map(|g| Linear {
-                weights: wo_a.buffer, kind: wo_a.kind, rows: hp.out_rank as u64, cols: wo_a.dims[0] as u64,
-                first_row: (g * hp.out_rank) as u64, input: work.attended.at(g * group_width) as P, output: work.low.at(g * hp.out_rank),
-            }).collect();
-            shard.gpu.linears(&projections, n as u64, (heads * dim) as u64, (groups * hp.out_rank) as u64, &scratch)?;
-            shard.linear(&name(layer, "attn_output_b"), work.low.base(), n, target)?;
-        }
-        if let Some((ratio, tail, _)) = appended {
-            let source = self.sources.get_mut(&layer).unwrap();
-            source.groups += (tail + n) / ratio;
-            source.tail = (tail + n) % ratio;
-        }
-        Ok(())
-    }
-
-    fn moe(&mut self, layer: usize, n: usize) -> Result<()> {
+    /// The experts of `layer`, after the router (see [`router_ops`]); with `predict`, the first
+    /// device also predicted the next layer's.
+    fn moe(&mut self, layer: usize, n: usize, predict: bool) -> Result<()> {
         let hp = self.hp.clone();
         let (w, k) = (hp.width, hp.experts_used);
-        let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
-        // One decode row: the next layer's router applied to this layer's input names the experts
-        // to prefetch (their reads and copies overlap this layer's experts and the next attention).
-        let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && std::env::var_os("DS41_NO_PREDICT").is_none();
-        for (index, shard) in self.shards.iter_mut().enumerate() {
-            let work = shard.work.clone_handles();
-            shard.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
-            let bias = shard.dense(&format!("blk.{layer}.exp_probs_b.bias"))?;
-            shard.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, k as u64, gating,
-                            hp.route_normalize, hp.route_scale, work.ids.base(), work.weights.base())?;
-            if predict && index == 0 {
-                let next_bias = shard.dense(&format!("blk.{}.exp_probs_b.bias", layer + 1))?;
-                shard.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, work.router.at(hp.experts))?;
-                shard.gpu.route(work.router.at(hp.experts), Some(next_bias.buffer.base()), 1, hp.experts as u64, PREDICTED as u64,
-                                gating, hp.route_normalize, hp.route_scale, work.ids.at(k), work.expert_weights.base())?;
-            }
-        }
-        self.mark("router")?;
         // The routes (alike on every device) travel to the host while the shared expert runs.
         let read = n * k + if predict { PREDICTED } else { 0 };
         let ids = self.shards[0].work.ids;
@@ -883,7 +825,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let work = shard.work.clone_handles();
         let shared = shard.shared[&layer];
         if n <= SLOT_ROWS {
-            shard.gpu.experts(&vec![shared.buffer.base() as u64; n], shared.buffer.bytes, shared.offsets, shared.kinds, w as u64,
+            shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; n]), shared.buffer.bytes, shared.offsets, shared.kinds, w as u64,
                               ff as u64, n as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false, work.hidden.base(),
                               work.out.base(), 0, None)?;
         } else {
@@ -975,7 +917,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             .map(|expert| slots[experts.binary_search(&(*expert as usize)).unwrap()].base() as u64).collect();
         let slot_bytes = slots.first().map_or(0, |slot| slot.bytes);
         let offsets = [0, gate_bytes, 2 * gate_bytes];
-        shard.gpu.experts(&bases, slot_bytes, offsets, kinds, w as u64, ff as u64, n as u64, self.hp.experts_used as u64, work.x.base(),
+        shard.gpu.experts(Some(&bases), slot_bytes, offsets, kinds, w as u64, ff as u64, n as u64, self.hp.experts_used as u64, work.x.base(),
                           0, Some(work.weights.base()), self.hp.layers[layer].clamp_routed, true, work.hidden.base(), work.out.base(), 0,
                           None)?;
         shard.experts.release(&mut shard.gpu)?;
@@ -1003,7 +945,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         for shard in &mut self.shards {
             let work = shard.work.clone_handles();
             let shared = shard.shared[&layer];
-            shard.gpu.experts(&vec![shared.buffer.base() as u64; n], shared.buffer.bytes, shared.offsets, shared.kinds, w, ff, n as u64, 1,
+            shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; n]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff, n as u64, 1,
                               work.x.base(), 0, None, hp.layers[layer].clamp_shared, false, work.products[0].at(routed_rows * ff as usize),
                               work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
         }
@@ -1041,7 +983,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             };
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let work = shard.work.clone_handles();
-                shard.gpu.experts(&bases(slots), slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, n as u64, k as u64,
+                shard.gpu.experts(Some(&bases(slots)), slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, n as u64, k as u64,
                                   work.x.base(), 0, Some(work.weights.base()), hp.layers[layer].clamp_routed, true,
                                   work.products[buffer].base(), work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
             }
@@ -1055,11 +997,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 let work = shard.work.clone_handles();
                 if index == 0 {
                     let shared = shard.shared[&layer];
-                    shard.gpu.experts(&vec![shared.buffer.base() as u64; n], shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
+                    shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; n]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
                                       n as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
                                       work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
                 }
-                shard.gpu.experts(&bases(slots), slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, n as u64, k as u64,
+                shard.gpu.experts(None, slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, n as u64, k as u64,
                                   work.x.base(), 0, None, hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(),
                                   0, Some(shard.rows.split(2)))?;
                 shard.experts.release(&mut shard.gpu)?;
@@ -1067,6 +1009,141 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         self.mark("routed experts")
     }
+}
+
+/// What a device's attention of a layer needs to know of the sequence: the compressed rows it
+/// appends (kv source layers: ratio, rows waiting, first group) and those there were before.
+struct AttentionPlan {
+    layer: usize,
+    n: usize,
+    /// devices the heads are split across
+    parts: usize,
+    compressed: Option<super::Compressed>,
+    appended: Option<(usize, usize, usize)>,
+    existing: usize,
+    ring_rows: u64,
+}
+
+/// Queue `ops` on a device from the graph recorded under `key`, recording it the first time.
+fn recorded(shard: &mut Shard, key: u64, ops: impl FnOnce(&mut Shard) -> Result<()>) -> Result<()> {
+    if shard.gpu.graph_run(key)? {
+        return Ok(());
+    }
+    shard.gpu.graph_begin()?;
+    let result = ops(shard);
+    shard.gpu.graph_end(key, result.is_ok())?;
+    result?;
+    if shard.gpu.graph_run(key)? { Ok(()) } else { Err("a recorded graph went missing".into()) }
+}
+
+/// The hyper-connection weights of a sublayer and its input norm.
+fn sublayer(shard: &Shard, layer: usize, side: &str, norm: &str) -> Result<(Dense, Dense, Dense, Dense)> {
+    Ok((shard.dense(&name(layer, &format!("hc_{side}_fn")))?, shard.dense(&name(layer, &format!("hc_{side}_base")))?,
+        shard.dense(&name(layer, &format!("hc_{side}_scale")))?, shard.dense(&name(layer, norm))?))
+}
+
+/// The hyper-connection step into a layer's attention; with `expand`, the previous layer's FFN
+/// output (in `out`) is expanded into `stream` on the way in.
+fn hc_attention(shard: &mut Shard, hp: &Hparams, layer: usize, n: usize, expand: bool, pre_previous: Option<usize>) -> Result<()> {
+    let work = shard.work.clone_handles();
+    let (fn_, base, scale, norm) = sublayer(shard, layer, "attn", "attn_norm")?;
+    let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
+    let expansion = expand.then(|| (work.out.base() as P, work.stream2.base() as P, work.post_f.base() as P, work.comb_f.base() as P));
+    shard.gpu.hc_step(expansion, work.stream.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(), work.pre_a.base(),
+                      work.post_a.base(), work.comb_a.base())), hp.sinkhorn_iterations as u64, hp.hc_eps, hp.norm_eps, pre.base(),
+                      norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace, work.x.base())
+}
+
+/// The hyper-connection step from a layer's attention (in `out`) into its FFN.
+fn hc_ffn(shard: &mut Shard, hp: &Hparams, layer: usize, n: usize) -> Result<()> {
+    let work = shard.work.clone_handles();
+    let (fn_, base, scale, norm) = sublayer(shard, layer, "ffn", "ffn_norm")?;
+    let expansion = (work.out.base() as P, work.stream.base() as P, work.post_a.base() as P, work.comb_a.base() as P);
+    shard.gpu.hc_step(Some(expansion), work.stream2.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
+                      work.pre_f[layer % 2].base(), work.post_f.base(), work.comb_f.base())), hp.sinkhorn_iterations as u64, hp.hc_eps,
+                      hp.norm_eps, work.pre_a.base(), norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace,
+                      work.x.base())
+}
+
+/// A device's attention: q_a, kv, the compressed rows and the indexer (as every device), and its
+/// heads of q, the attention, wo_a and wo_b into `target`.
+fn attention_ops(shard: &mut Shard, hp: &Hparams, plan: &AttentionPlan, target: M) -> Result<()> {
+    let (layer, n) = (plan.layer, plan.n);
+    let (heads, dim, rope) = (hp.heads / plan.parts, hp.head_dim, hp.rope_dims as u64);
+    let groups = hp.out_groups / plan.parts;
+    let work = shard.work.clone_handles();
+    let freqs = if plan.compressed.is_some() { shard.compressed_rope } else { shard.plain };
+    let scratch = shard.scratch;
+    let whole = |weight: &Dense, input: M, output: M| Linear {
+        weights: weight.buffer, kind: weight.kind, rows: weight.dims[1] as u64, cols: weight.dims[0] as u64, first_row: 0,
+        input: input as P, output,
+    };
+    let (q_a, kv) = (shard.dense(&name(layer, "attn_q_a"))?, shard.dense(&name(layer, "attn_kv"))?);
+    shard.gpu.linears(&[whole(&q_a, work.x.base(), work.qr.base()), whole(&kv, work.x.base(), work.kv.base())], n as u64, 0, 0,
+                      &scratch)?;
+    shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
+    // q (this device's heads) stays unrotated: the attention rotates it as it reads it
+    shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
+    let ring = shard.rings[&layer];
+    let kv_norm = shard.dense(&name(layer, "attn_kv_a_norm"))?;
+    shard.gpu.norm_rope(work.kv.base(), &kv_norm.buffer, n as u64, dim as u64, hp.norm_eps, Some((rope, &work.positions, &freqs)),
+                        Some(work.ring_rows.base()), ring.base(), plan.ring_rows)?;
+    let mut compressed = None;
+    if let Some(c) = plan.compressed {
+        let mut groups_now = plan.existing;
+        if let Some((ratio, tail, first_group)) = plan.appended {
+            groups_now += compress(shard, hp, layer, n, freqs, ratio, tail, first_group)?.0;
+        }
+        if c.index_source == layer && groups_now > 0 {
+            let keys = shard.sources[&c.kv_source].keys;
+            shard.linear(&name(layer, "indexer.attn_q_b"), work.qr.base(), n, work.index_q.base())?;
+            shard.gpu.rope(work.index_q.base(), n as u64, hp.index_heads as u64, hp.index_dim as u64, rope, &work.positions, &freqs,
+                           false)?;
+            shard.linear(&name(layer, "indexer.proj"), work.x.base(), n, work.index_w.base())?;
+            let scale = 1.0 / ((hp.index_dim as f32).sqrt() * (hp.index_heads as f32).sqrt());
+            shard.gpu.index_scores(work.index_q.base(), keys.base(), work.index_w.base(), work.visible[c.ratio].base(), n as u64,
+                                   groups_now as u64, hp.index_heads as u64, hp.index_dim as u64, scale, work.scores.base())?;
+            let chosen = work.chosen[&layer];
+            shard.gpu.top_k(work.scores.base(), n as u64, groups_now as u64, hp.index_top_k as u64, chosen.base())?;
+        }
+        if groups_now > 0 {
+            compressed = Some((shard.sources[&c.kv_source].rows, groups_now, work.chosen[&c.index_source]));
+        }
+    }
+    let sinks = shard.dense(&name(layer, "attn_sinks"))?;
+    shard.gpu.sparse_attention(work.q.base(), ring.base(), plan.ring_rows, work.positions.base(), hp.window as u64,
+                               compressed.map(|(rows, groups, _)| (rows.base() as P, groups as u64)),
+                               compressed.map(|(_, _, chosen)| (chosen.base() as P, hp.index_top_k as u64)), sinks.buffer.base(),
+                               n as u64, heads as u64, dim as u64, 1.0 / (dim as f32).sqrt(), Some((rope, &freqs)), Some(&scratch),
+                               work.attended.base())?;
+    // wo_a is block-diagonal: group g projects its heads' slice alone.
+    let wo_a = shard.dense(&name(layer, "attn_output_a"))?;
+    let group_width = hp.heads * dim / hp.out_groups;
+    let projections: Vec<Linear> = (0..groups).map(|g| Linear {
+        weights: wo_a.buffer, kind: wo_a.kind, rows: hp.out_rank as u64, cols: wo_a.dims[0] as u64, first_row: (g * hp.out_rank) as u64,
+        input: work.attended.at(g * group_width) as P, output: work.low.at(g * hp.out_rank),
+    }).collect();
+    shard.gpu.linears(&projections, n as u64, (heads * dim) as u64, (groups * hp.out_rank) as u64, &scratch)?;
+    shard.linear(&name(layer, "attn_output_b"), work.low.base(), n, target)
+}
+
+/// A layer's router on a device (every device routes alike); with `predict`, also the next
+/// layer's router on this layer's input, its best PREDICTED experts after the routes in `ids`.
+fn router_ops(shard: &mut Shard, hp: &Hparams, layer: usize, n: usize, predict: bool) -> Result<()> {
+    let k = hp.experts_used;
+    let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
+    let work = shard.work.clone_handles();
+    shard.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
+    let bias = shard.dense(&format!("blk.{layer}.exp_probs_b.bias"))?;
+    shard.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, k as u64, gating, hp.route_normalize,
+                    hp.route_scale, work.ids.base(), work.weights.base())?;
+    if predict {
+        let next_bias = shard.dense(&format!("blk.{}.exp_probs_b.bias", layer + 1))?;
+        shard.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, work.router.at(hp.experts))?;
+        shard.gpu.route(work.router.at(hp.experts), Some(next_bias.buffer.base()), 1, hp.experts as u64, PREDICTED as u64, gating,
+                        hp.route_normalize, hp.route_scale, work.ids.at(k), work.expert_weights.base())?;
+    }
+    Ok(())
 }
 
 /// Append this pass's complete groups of a kv source layer to a device's compressed rows and index

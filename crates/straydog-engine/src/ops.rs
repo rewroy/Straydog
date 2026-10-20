@@ -145,6 +145,27 @@ impl Backend {
         })
     }
 
+    /// Record the ops queued from here to [`Backend::graph_end`] into a graph instead of running
+    /// them (only ops with no host data: see the C header).
+    pub fn graph_begin(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_graph_begin(self.handle()) })
+    }
+
+    /// Stop recording: with `keep`, store the graph under `key` (replacing any), else drop it.
+    pub fn graph_end(&mut self, key: u64, keep: bool) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_graph_end(self.handle(), key, i32::from(keep)) })
+    }
+
+    /// Queue the graph stored under `key`; false when there is none.
+    pub fn graph_run(&mut self, key: u64) -> Result<bool> {
+        // SAFETY: a live handle.
+        let state = unsafe { ffi::sd_graph_run(self.handle(), key) };
+        check(state.min(0))?;
+        Ok(state == 0)
+    }
+
     /// Several linear ops, in one launch where the GEMV takes them all (see the C header).
     pub fn linears(&mut self, items: &[Linear], steps: u64, input_stride: u64, output_stride: u64, scratch: &Buffer) -> Result<()> {
         let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
@@ -275,18 +296,18 @@ impl Backend {
     /// `bases[r]` (gate, up and down at `offsets` bytes in, of `kinds`; a zero base: a route another
     /// device runs): `product[r]` = its clamped SwiGLU times `weights[r]`, and `out[t]` (+)= the sum
     /// of down . product over the token's routes. With `split`, a device's rows of each expert and
-    /// the stages it asks for (see the C header).
+    /// the stages it asks for; without `bases`, this device's last routes again (see the C header).
     #[allow(clippy::too_many_arguments)]
-    pub fn experts(&mut self, bases: &[u64], slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3], hidden: u64, ffn: u64,
+    pub fn experts(&mut self, bases: Option<&[u64]>, slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3], hidden: u64, ffn: u64,
                    rows: u64, top_k: u64, input: P, input_stride: u64, weights: Option<P>, clamp: f32, accumulate: bool,
                    product: M, out: M, out_stride: u64, split: Option<ExpertSplit>) -> Result<()> {
-        if bases.len() as u64 != rows * top_k {
+        if bases.is_some_and(|bases| bases.len() as u64 != rows * top_k) {
             return Err("expert routes do not match the rows".into());
         }
         let kinds = kinds.map(|kind| kind as i32);
         // SAFETY: a live handle; the library checks every slot and range against its allocations.
         check(unsafe {
-            ffi::sd_op_experts(self.handle(), bases.as_ptr(), slot_bytes, offsets.as_ptr(), kinds.as_ptr(), hidden, ffn, rows, top_k,
+            ffi::sd_op_experts(self.handle(), bases.map_or(std::ptr::null(), <[u64]>::as_ptr), slot_bytes, offsets.as_ptr(), kinds.as_ptr(), hidden, ffn, rows, top_k,
                                input.cast(), input_stride, weights.map_or(std::ptr::null(), |w| w.cast()), clamp,
                                i32::from(accumulate), product.cast(), out.cast(), out_stride,
                                split.as_ref().map_or(std::ptr::null(), |split| split as *const ffi::sd_expert_split))

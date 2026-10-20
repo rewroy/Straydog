@@ -301,7 +301,16 @@ void expert_rows(Device& d, void* const* pointers, const int* kinds, size_t expe
 // weight) is formed before the store; down sums a row over the token's routes into `out`.
 // With experts split across devices (tensor parallel), a device holds rows of each: product rows are
 // product_stride apart with this device's at product_first, and its down rows land at out_first.
-struct SlotExperts { Matrix role[3]; uint32_t top_k, lanes[2], waves[2], accumulate, product_stride, product_first, out_first; float clamp; };
+// A uniform base (every route the same slot, as the shared expert's) is passed by value.
+struct SlotExperts {
+    Matrix role[3];
+    uint32_t top_k, lanes[2], waves[2], accumulate, product_stride, product_first, out_first;
+    float clamp;
+    uint64_t uniform;
+};
+__device__ __forceinline__ uint64_t slot_base(const SlotExperts& plan, const uint64_t* bases, size_t index) {
+    return plan.uniform ? plan.uniform : bases[index];
+}
 
 __host__ __device__ constexpr bool slot_heavy(int kind) {
     return kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23;
@@ -362,7 +371,7 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
     const size_t route = wave / plan.waves[0];
     if (route >= plan.top_k) return;
     const size_t index = size_t(blockIdx.y) * plan.top_k + route;
-    const uint8_t* base = reinterpret_cast<const uint8_t*>(bases[index]);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(slot_base(plan, bases, index));
     if (!base) return;
     const Matrix& gate = plan.role[0];
     const unsigned lanes = plan.lanes[0], lane = threadIdx.x % 32, sub = lane % lanes;
@@ -390,8 +399,9 @@ __global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* 
     float sum = 0.0f, unused = 0.0f;
     for (size_t route = 0; route < plan.top_k; ++route) {
         const size_t index = size_t(blockIdx.y) * plan.top_k + route;
-        if (!bases[index]) continue;
-        slot_dots<kind>(reinterpret_cast<const uint8_t*>(bases[index]) + at, nullptr, down.kind, down.kind, down.cols, lanes, sub,
+        const uint64_t base = slot_base(plan, bases, index);
+        if (!base) continue;
+        slot_dots<kind>(reinterpret_cast<const uint8_t*>(base) + at, nullptr, down.kind, down.kind, down.cols, lanes, sub,
                         product + index * plan.product_stride, sum, unused);
     }
     sum = slot_reduce(sum, lanes);

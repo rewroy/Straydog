@@ -82,6 +82,13 @@ int sd_buffer_read_finish(void* handle, void* output, uint64_t bytes);
    on the source; the target's later work waits for it, and so does the source's. */
 int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, uint64_t bytes);
 int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row, const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
+/* Graphs of ops: between sd_graph_begin and sd_graph_end (keep: store it under key, replacing
+   any; else drop it) the ops queued on the device's stream are recorded rather than run; only
+   ops with no host data (no buffer writes, no expert routes) may be recorded. sd_graph_run
+   queues a recorded graph: 0, or 1 when none is stored under key. */
+int sd_graph_begin(void* handle);
+int sd_graph_end(void* handle, uint64_t key, int keep);
+int sd_graph_run(void* handle, uint64_t key);
 /* Several linear ops in one launch where the GEMV takes them (up to four inputs, and strides shared
    when there are several): out = W[first_row ..] . in per item; up to 24 items. */
 typedef struct sd_linear {
@@ -126,7 +133,8 @@ int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_
    With split (else whole experts, both stages): a device's rows of each expert (tensor parallel),
    gate and up rows [ffn_first, ffn_first + ffn_rows) writing product[r][ffn_first ..] (rows of ffn
    values), down rows [hidden_first, hidden_first + hidden_rows) writing out[t][hidden_first ..];
-   stages 1 runs gate/up, 2 down (from the whole product), 3 both. */
+   stages 1 runs gate/up, 2 down (from the whole product), 3 both. Without bases, the routes the
+   device last uploaded (a call of several routes per row; as many) are used again. */
 typedef struct sd_expert_split {
     uint64_t ffn_first, ffn_rows, hidden_first, hidden_rows;
     int stages;

@@ -292,6 +292,19 @@ unsafe extern "C" {
         scratch_bytes: u64,
     ) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn sd_graph_begin(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_graph_end(
+        handle: *mut ::std::os::raw::c_void,
+        key: u64,
+        keep: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_graph_run(handle: *mut ::std::os::raw::c_void, key: u64) -> ::std::os::raw::c_int;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct sd_linear {
