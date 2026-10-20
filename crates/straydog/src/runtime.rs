@@ -562,7 +562,8 @@ impl Driver {
                 }
                 let (context, quant) = &self.expected;
                 if frame["event"] != "ready" || frame["protocol"] != 1 || frame["engine"] != "Straydog"
-                    || frame["context"].as_u64() != Some(*context) || frame["model"] != straydog_engine::bundle::MODEL
+                    || frame["context"].as_u64() != Some(*context)
+                    || frame["model"].as_str() != straydog_engine::bundle::model_of(quant).ok().as_deref()
                     || frame["quantization"].as_str() != Some(quant)
                 {
                     return Err("Straydog startup contract mismatch".to_string());
