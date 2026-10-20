@@ -19,4 +19,5 @@ pub mod sampling;
 pub mod storage;
 pub mod text;
 pub mod transfer;
+pub mod verity;
 pub mod weights;
