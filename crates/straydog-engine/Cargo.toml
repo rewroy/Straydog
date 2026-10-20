@@ -27,6 +27,6 @@ cuda = ["straydog-gpu/cuda"]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]

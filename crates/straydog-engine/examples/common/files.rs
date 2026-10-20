@@ -40,15 +40,8 @@ impl Files {
 
 impl Tensors for Files {
     fn prefetch(&self, ranges: &[&[u8]]) {
-        if std::env::var_os("DS41_NO_PREFETCH").is_some() {
-            return;
-        }
-        const PAGE: usize = 4096;
-        for range in ranges {
-            let start = range.as_ptr() as usize / PAGE * PAGE;
-            let end = (range.as_ptr() as usize + range.len()).div_ceil(PAGE) * PAGE;
-            // SAFETY: an advice on pages of a live read-only mapping; it reads ahead, never writes.
-            unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_WILLNEED) };
+        if std::env::var_os("DS41_NO_PREFETCH").is_none() {
+            straydog_engine::storage::read_ahead(ranges.iter().copied());
         }
     }
 

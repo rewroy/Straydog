@@ -499,6 +499,11 @@ impl Weights {
         let (table, kind) = self.raw(name, 0, None)?;
         let row_bytes = (tensor.bytes / count) as usize;
         let width = width as usize;
+        if !self.kept.contains_key(name) {
+            // Every row's read starts at once, so decoding waits on the slowest rather than on
+            // each in turn (a table the page cache dropped costs one read time, not one per row).
+            crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * row_bytes..(index as usize + 1) * row_bytes]));
+        }
         let decode = |part: &[i64], out: &mut [f32]| -> Result<(), String> {
             let mut values = Vec::with_capacity(width);
             for (index, target) in part.iter().zip(out.chunks_exact_mut(width)) {

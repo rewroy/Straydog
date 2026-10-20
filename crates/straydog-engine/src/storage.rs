@@ -163,3 +163,32 @@ fn read_some(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usi
     }
     Ok(count)
 }
+
+/// Start reading the pages under these ranges of a mapped file in the background: just their
+/// pages, no read-ahead past them. A later access then finds them in memory instead of waiting
+/// on one page fault after another.
+pub fn read_ahead<'a>(ranges: impl Iterator<Item = &'a [u8]>) {
+    const PAGE: usize = 4096;
+    let pages = ranges.filter(|range| !range.is_empty()).map(|range| {
+        let start = range.as_ptr() as usize / PAGE * PAGE;
+        (start, (range.as_ptr() as usize + range.len()).div_ceil(PAGE) * PAGE - start)
+    });
+    #[cfg(unix)]
+    for (start, length) in pages {
+        // SAFETY: advice on pages of a live read-only mapping (the ranges borrow it); it starts
+        // reads and changes nothing.
+        unsafe { libc::madvise(start as *mut libc::c_void, length, libc::MADV_WILLNEED) };
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let entries: Vec<WIN32_MEMORY_RANGE_ENTRY> = pages
+            .map(|(start, length)| WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: start as *mut _, NumberOfBytes: length })
+            .collect();
+        if !entries.is_empty() {
+            // SAFETY: entries describe pages of live mappings; prefetching only reads them in.
+            unsafe { PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0) };
+        }
+    }
+}
