@@ -235,13 +235,19 @@ fn read_fully(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()
 struct Pinner {
     arenas: Receiver<std::result::Result<storage::Buffer, String>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Pinner {
     fn new(count: usize, bytes: usize) -> Pinner {
         let (tx, arenas) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
             for _ in 0..count {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
                 let mut arena = storage::Buffer::new(bytes);
                 // SAFETY: the arena is handed over pinned; whoever holds it unpins it before freeing.
                 if let Err(error) = unsafe { transfer::pin_host(arena.as_mut_slice().as_mut_ptr(), arena.capacity()) } {
@@ -257,7 +263,7 @@ impl Pinner {
                 }
             }
         });
-        Pinner { arenas, thread: Some(thread) }
+        Pinner { arenas, thread: Some(thread), stop }
     }
 }
 
@@ -813,16 +819,16 @@ impl Drop for DeviceExperts {
         while reading > 0 && self.done_rx.recv().is_ok() {
             reading -= 1;
         }
-        // Arenas still with the pinner were never used: unpin them as they come, then stop it.
+        // Stop the pinner and wait for it; the arenas it handed over but nobody took were never
+        // used by a device: unpin each before it is freed.
         if let Some(mut pinner) = self.pinner.take() {
+            pinner.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = pinner.thread.take() {
+                let _ = thread.join();
+            }
             while let Ok(Ok(mut arena)) = pinner.arenas.try_recv() {
                 // SAFETY: pinned by the pinner, never used by a device.
                 let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
-            }
-            let thread = pinner.thread.take();
-            drop(pinner);
-            if let Some(thread) = thread {
-                let _ = thread.join();
             }
         }
         if !self.settled {

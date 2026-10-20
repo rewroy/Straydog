@@ -47,6 +47,11 @@ impl Tensors for Files {
         }
     }
 
+    /// Development only: direct reads go unchecked, as the mapping does.
+    fn verifier(&self) -> Option<straydog_engine::experts::Verifier> {
+        None
+    }
+
     fn files(&self) -> Result<Vec<File>, String> {
         self.handles.iter().map(|file| file.try_clone().map_err(|exc| exc.to_string())).collect()
     }

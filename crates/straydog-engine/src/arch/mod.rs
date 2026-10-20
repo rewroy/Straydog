@@ -31,10 +31,9 @@ pub trait Tensors {
         None
     }
 
-    /// The check of every block read directly from [`files`](Self::files), before its use.
-    fn verifier(&self) -> Option<crate::experts::Verifier> {
-        None
-    }
+    /// The check of every block read directly from [`files`](Self::files), before its use. No
+    /// default: a source says explicitly that it reads unchecked (a development reader).
+    fn verifier(&self) -> Option<crate::experts::Verifier>;
 }
 
 /// An architecture's metadata keys, `{architecture}.{key}`, with typed access.
