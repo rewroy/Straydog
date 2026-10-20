@@ -130,6 +130,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -407,6 +408,7 @@ struct Device {
     size_t hybrid_position=SIZE_MAX;
     hipEvent_t swapped=nullptr;   // the pending swaps' copies have landed
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
+    std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
 #if defined(__linux__)
     std::unique_ptr<ReadAhead> read_ahead;   // started by the first expert read-ahead hint
 #endif
@@ -416,6 +418,7 @@ struct Device {
         if (host_prefetch.joinable()) host_prefetch.join();
         for (auto& ready : host_ready) cleanup(hipHostFree(ready.second));
         copier.reset();
+        transfers.reset();   // waits for its copies before the allocations go
         if (stream) cleanup(hipStreamSynchronize(stream));
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         for (auto& entry : graphs) {
@@ -924,6 +927,7 @@ Device& device(void* handle) {
 #include "decoder_span.hpp"
 #include "verify_span.hpp"
 #include "ops.hpp"
+#include "transfer.hpp"
 } // namespace
 
 extern "C" {
@@ -1327,12 +1331,88 @@ int sd_host_register(void* pointer,uint64_t bytes) {
     try {
         if (!pointer || !bytes) throw std::runtime_error("invalid host registration");
         check(hipHostRegister(pointer,size_t(bytes),hipHostRegisterPortable|hipHostRegisterReadOnly|hipHostRegisterMapped));
+        std::lock_guard<std::mutex> lock(registered_mutex);
+        registered[reinterpret_cast<uintptr_t>(pointer)]={size_t(bytes),false};
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Page-lock host memory that devices may also write (downloads into it).
+int sd_host_pin(void* pointer,uint64_t bytes) {
+    try {
+        if (!pointer || !bytes) throw std::runtime_error("invalid host registration");
+        check(hipHostRegister(pointer,size_t(bytes),hipHostRegisterPortable));
+        std::lock_guard<std::mutex> lock(registered_mutex);
+        registered[reinterpret_cast<uintptr_t>(pointer)]={size_t(bytes),true};
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_host_unregister(void* pointer) {
-    try { check(hipHostUnregister(pointer)); return 0; }
-    catch (const std::exception& e) { last_error=e.what(); return -1; }
+    try {
+        check(hipHostUnregister(pointer));
+        std::lock_guard<std::mutex> lock(registered_mutex);
+        registered.erase(reinterpret_cast<uintptr_t>(pointer));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host,uint64_t bytes) {
+    try {
+        auto& d=device(handle);
+        if (!host || !bytes || offset>UINT64_MAX-bytes || (stream!=1 && stream!=2))
+            throw std::runtime_error("invalid Straydog transfer");
+        auto* at=static_cast<uint8_t*>(pointer)+offset;
+        op_span(d,at,size_t(bytes),"a transferred range");
+        check_registered(host,size_t(bytes),stream==2);
+        auto& t=transfers(d);
+        if (stream==1) check(hipMemcpyAsync(at,host,size_t(bytes),hipMemcpyHostToDevice,t.streams[0]));
+        else check(hipMemcpyAsync(host,at,size_t(bytes),hipMemcpyDeviceToHost,t.streams[1]));
+        ++t.copies[stream-1]; t.bytes[stream-1]+=bytes;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int64_t sd_event_record(void* handle,int stream) {
+    try {
+        auto& d=device(handle);
+        auto& t=transfers(d);
+        const hipStream_t on=transfer_stream_of(d,stream);
+        t.reap();
+        hipEvent_t event=nullptr;
+        if (t.spare.empty()) check(hipEventCreateWithFlags(&event,hipEventDisableTiming));
+        else { event=t.spare.back(); t.spare.pop_back(); }
+        try { check(hipEventRecord(event,on)); }
+        catch (...) { t.spare.push_back(event); throw; }
+        t.pending[stream].emplace_back(t.next,event);
+        return t.next++;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_event_wait(void* handle,int stream,int64_t id) {
+    try {
+        auto& d=device(handle);
+        auto& t=transfers(d);
+        const hipStream_t on=transfer_stream_of(d,stream);
+        if (id<1 || id>=t.next) throw std::runtime_error("Straydog transfer: no such event");
+        if (hipEvent_t* event=t.find(id)) check(hipStreamWaitEvent(on,*event,0));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_event_done(void* handle,int64_t id,int block) {
+    try {
+        auto& d=device(handle);
+        auto& t=transfers(d);
+        if (id<1 || id>=t.next) throw std::runtime_error("Straydog transfer: no such event");
+        if (block)
+            if (hipEvent_t* event=t.find(id)) check(hipEventSynchronize(*event));
+        t.reap();
+        return t.find(id) ? 0 : 1;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_transfer_counts(void* handle,uint64_t* counts) {
+    try {
+        if (!counts) throw std::runtime_error("invalid transfer counters");
+        auto& d=device(handle);
+        auto& t=transfers(d);
+        counts[0]=t.copies[0]; counts[1]=t.bytes[0]; counts[2]=t.copies[1]; counts[3]=t.bytes[1];
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_execution_counts(void* handle,uint64_t* graphs,uint64_t* replays,uint64_t* resident) {
     try {

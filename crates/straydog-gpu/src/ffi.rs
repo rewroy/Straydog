@@ -150,6 +150,45 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_host_pin(pointer: *mut ::std::os::raw::c_void, bytes: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_transfer(
+        handle: *mut ::std::os::raw::c_void,
+        stream: ::std::os::raw::c_int,
+        pointer: *mut ::std::os::raw::c_void,
+        offset: u64,
+        host: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_event_record(
+        handle: *mut ::std::os::raw::c_void,
+        stream: ::std::os::raw::c_int,
+    ) -> i64;
+}
+unsafe extern "C" {
+    pub fn sd_event_wait(
+        handle: *mut ::std::os::raw::c_void,
+        stream: ::std::os::raw::c_int,
+        id: i64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_event_done(
+        handle: *mut ::std::os::raw::c_void,
+        id: i64,
+        block: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_transfer_counts(
+        handle: *mut ::std::os::raw::c_void,
+        counts: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_gemm_options(
         handle: *mut ::std::os::raw::c_void,
         minimum_batch: u64,
