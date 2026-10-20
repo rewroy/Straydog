@@ -960,9 +960,12 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
     } else gemv_fixed<V><<<blocks, 256, 0, d.stream>>>(list, input, output);
     #undef SD_UNIFORM
 }
-// Launch up to 24 independent row ranges in one dispatch, for up to four vectors.
+// Launch up to 24 independent row ranges in one dispatch, for up to four vectors. min_lanes (a
+// power of two) widens a row that gemv_lanes splits over only two lanes, when it has at least 32
+// units: two lanes read short runs of many rows at once.
 void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, float* output,
-          size_t vectors=1, size_t input_stride=0, size_t output_stride=0, const GemvResidual& residual={}) {
+          size_t vectors=1, size_t input_stride=0, size_t output_stride=0, const GemvResidual& residual={},
+          unsigned min_lanes=0) {
     if (!count || count > gemv_fixed_items || !vectors || vectors > gemv_max_vectors ||
         (vectors > 1 && (input_stride % 4 || !input_stride || (!output_stride && !residual.hidden) ||
                          input_stride > UINT32_MAX || output_stride > UINT32_MAX)) ||
@@ -971,7 +974,10 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
     FixedGemv list{};
     size_t waves = 0;
     for (size_t i = 0; i < count; ++i) {
-        const unsigned lanes = gemv_lanes(matrices[i], input);
+        unsigned lanes = gemv_lanes(matrices[i], input);
+        size_t alignment = 0;
+        if (lanes == 2 && min_lanes > 2 && matrices[i].cols / gemv_unit(matrices[i].kind, alignment) >= 32)
+            lanes = std::min(32u, min_lanes);
         list.items[i] = {matrices[i], uint32_t(waves), lanes};
         waves += gemv_waves(matrices[i], lanes);
     }
@@ -992,7 +998,7 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
                 size_t size = 0;
                 for (size_t j = i; j < count; ++j)
                     if (!done[j] && matrices[j].kind == matrices[i].kind) { group[size++] = matrices[j]; done[j] = true; }
-                gemv(d, group, size, input, output, vectors, input_stride, output_stride);
+                gemv(d, group, size, input, output, vectors, input_stride, output_stride, {}, min_lanes);
             }
             return;
         }

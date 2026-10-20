@@ -300,12 +300,24 @@ void expert_rows(Device& d, void* const* pointers, const int* kinds, size_t expe
 // route's weight) is formed before the store; down sums a row over the token's routes into `out`.
 struct SlotExperts { Matrix role[3]; uint32_t top_k, lanes[2], waves[2], accumulate; float clamp; };
 
+__host__ __device__ constexpr bool slot_heavy(int kind) {
+    return kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23;
+}
 // This lane's shares of two rows' dots with x: `kind`'s units over `lanes` lanes, or (kind < 0) the
 // reference element decoder of `format` over the wave.
 template<int kind>
 __device__ __forceinline__ void slot_dots(const uint8_t* first, const uint8_t* second, int format, int second_format, size_t cols,
                                           unsigned lanes, unsigned sub, const float* x, float& a, float& b) {
-    if constexpr (kind >= 0) {
+    if constexpr (kind >= 0 && slot_heavy(kind)) {
+        // the K-quant units take too many registers for two rows at once
+        const size_t units = cols / GemvFormat<kind>::elements;
+        for (int r = 0; r < (second ? 2 : 1); ++r)
+            for (size_t unit = sub; unit < units; unit += lanes) {
+                float dot[1];
+                GemvFormat<kind>::template dots<1>(r ? second : first, unit, x, 0, dot);
+                (r ? b : a) += dot[0];
+            }
+    } else if constexpr (kind >= 0) {
         const size_t units = cols / GemvFormat<kind>::elements;
         #pragma unroll 2
         for (size_t unit = sub; unit < units; unit += lanes) {

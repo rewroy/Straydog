@@ -2187,7 +2187,8 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
                 matrices[i].input_offset = size_t(items[i].input - input);
                 matrices[i].output_offset = size_t(items[i].output - output);
             }
-            gemv(value, matrices, size_t(count), input, output, size_t(steps), size_t(input_stride), size_t(output_stride));
+            gemv(value, matrices, size_t(count), input, output, size_t(steps), size_t(input_stride), size_t(output_stride), {},
+                 op_lanes);
         } else {
             if (steps > uint64_t(gemv_max_vectors)) op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
             for (size_t i = 0; i < count; ++i)
@@ -2354,13 +2355,13 @@ int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float*
 int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t rows, uint64_t experts, uint64_t k, int gating,
                 int normalize, float scale, int32_t* ids, float* weights) {
     SD_OP_BEGIN
-    if (!rows || !experts || !k || k > 64 || k > experts || gating < 0 || gating > 2 || experts * 4 > 48 * 1024)
+    if (!rows || !experts || !k || k > 64 || k > experts || gating < 0 || gating > 2 || experts * 8 > 48 * 1024)
         throw std::runtime_error("invalid Straydog route shape");
     op_span(value, logits, size_t(rows * experts) * 4, "router logits");
     if (bias) op_span(value, bias, size_t(experts) * 4, "a router bias");
     op_span(value, ids, size_t(rows * k) * 4, "routed experts");
     op_span(value, weights, size_t(rows * k) * 4, "routing weights");
-    op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 4, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
+    op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 8, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
                                                                               normalize, scale, ids, weights);
     SD_OP_END
 }
@@ -2428,17 +2429,34 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
     // Tiled: scores (rows x heads x the most keys a row has), then per head and block of keys its max and sum.
     const size_t stride = size_t(window + selections), chunks = (stride + attention_keys - 1) / attention_keys;
     const size_t score_bytes = size_t(rows * heads) * stride * 4, need = score_bytes + size_t(rows * heads) * chunks * 8;
-    if (dim % 64 == 0 && scratch && scratch_bytes >= need) {
+    // The weighted sums split into shares of at least 128 keys, when the scratch holds their sums.
+    size_t shares = std::min<size_t>(4, (stride + 127) / 128);
+    const size_t share_bytes = size_t(rows * heads) * (shares * dim + 1) * 4;
+    if (shares > 1 && scratch_bytes < need + share_bytes) shares = 1;
+    const size_t share_keys = (stride + shares * attention_keys - 1) / (shares * attention_keys) * attention_keys;
+    if (dim % 64 == 0 && scratch && scratch_bytes >= need && share_keys * sizeof(float*) <= 32 * 1024 && rows * shares <= 65535) {
         op_span(value, scratch, need, "attention scratch");
         float* scores = scratch;
         auto* partial = reinterpret_cast<float2*>(reinterpret_cast<uint8_t*>(scratch) + score_bytes);
-        op_attention_scores_kernel<<<dim3(unsigned(chunks), unsigned(rows), unsigned((heads + 63) / 64)), 256, 0, value.stream>>>(
+        op_attention_scores_kernel<<<dim3(unsigned(chunks), unsigned(rows), unsigned((heads + attention_heads - 1) / attention_heads)),
+                                     256, 0, value.stream>>>(
             q, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads),
             size_t(dim), scale, size_t(rope_dims / 2), frequencies, stride, scores, partial);
         check(hipGetLastError());
-        op_attention_output_kernel<<<dim3(unsigned(dim / 64), unsigned((heads + 15) / 16), unsigned(rows)), 256, 0, value.stream>>>(
+        float* sums = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(scratch) + need);
+        float* denominators = sums + size_t(rows * heads) * shares * dim;
+        if (shares > 1) op_span(value, sums, share_bytes, "attention scratch");
+        const dim3 grid(unsigned(dim / 64), unsigned((heads + attention_out_heads - 1) / attention_out_heads), unsigned(rows * shares));
+        op_attention_output_kernel<<<grid, 128, share_keys * sizeof(float*), value.stream>>>(
             scores, partial, chunks, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections),
-            sinks, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies, stride, out);
+            sinks, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies, stride, shares, share_keys, sums, denominators,
+            out);
+        if (shares > 1) {
+            check(hipGetLastError());
+            op_attention_combine_kernel<<<op_blocks(size_t(rows * heads * dim / 4)), 256, 0, value.stream>>>(
+                sums, denominators, positions, size_t(rows), shares, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies,
+                out);
+        }
     } else {
         if (shared > 60 * 1024 || rope_dims) throw std::runtime_error("invalid Straydog attention shape");
         op_sparse_attention_kernel<<<unsigned(rows * heads), 256, shared, value.stream>>>(q, raw, size_t(raw_rows), positions,
@@ -2464,17 +2482,18 @@ int sd_op_index_scores(void* handle, const float* q, const float* keys, const fl
     op_span(value, weights, size_t(rows * heads) * 4, "index weights");
     op_span(value, visible, size_t(rows) * 4, "visible counts");
     op_span(value, scores, size_t(rows * groups) * 4, "index scores");
-    op_index_scores_kernel<<<dim3(op_blocks(size_t(groups)), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
+    if (heads > 64) throw std::runtime_error("invalid Straydog index shape");
+    op_index_scores_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, scores);
     SD_OP_END
 }
 
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out) {
     SD_OP_BEGIN
-    if (!rows || !groups || !k || groups > 8192) throw std::runtime_error("invalid Straydog top-k shape");
+    if (!rows || !groups || !k || groups > (size_t(1) << 31) || k > (size_t(1) << 31)) throw std::runtime_error("invalid Straydog top-k shape");
     op_span(value, scores, size_t(rows * groups) * 4, "scores");
     op_span(value, out, size_t(rows * k) * 4, "top-k indices");
-    op_top_k_kernel<<<unsigned(rows), 256, size_t(groups) * 4, value.stream>>>(scores, size_t(groups), size_t(k), out);
+    op_top_k_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), size_t(k), out);
     SD_OP_END
 }
 
