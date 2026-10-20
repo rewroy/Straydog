@@ -313,6 +313,8 @@ pub struct Counts {
     pub drive_reads: u64,
     pub writebacks: u64,
     pub prefetched: u64,
+    /// Prefetched experts their layer then did not use.
+    pub prefetch_unused: u64,
     /// Seconds the host waited for drive reads.
     pub wait_seconds: f64,
     /// Seconds the host waited for a host slot's copy to finish before reusing it.
@@ -399,26 +401,36 @@ impl DeviceExperts {
 
     fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
         self.pump(gpu, false)?;
-        let mut slots = Vec::with_capacity(experts.len());
-        for &expert in experts {
-            let key = (layer as u32, expert as u32);
-            let slot = match self.map.get(&key) {
-                Some(&slot) => {
-                    self.counts.hits += 1;
-                    slot
-                }
-                None => self.fill(gpu, key, true)?,
-            };
-            self.clock += 1;
-            self.slots[slot].used = self.clock;
-            self.slots[slot].speculative = false;
-            self.in_use.push(slot);
-            slots.push(slot);
+        // Every hit is held before any miss is filled: a miss never evicts a slot this same
+        // request uses later.
+        let mut slots = vec![usize::MAX; experts.len()];
+        for (index, &expert) in experts.iter().enumerate() {
+            if let Some(&slot) = self.map.get(&(layer as u32, expert as u32)) {
+                self.counts.hits += 1;
+                self.hold(slot);
+                slots[index] = slot;
+            }
+        }
+        for (index, &expert) in experts.iter().enumerate() {
+            if slots[index] == usize::MAX {
+                // (a repeated expert finds the slot its first occurrence filled)
+                let key = (layer as u32, expert as u32);
+                let slot = match self.map.get(&key) {
+                    Some(&slot) => slot,
+                    None => self.fill(gpu, key, true)?,
+                };
+                self.hold(slot);
+                slots[index] = slot;
+            }
         }
         // This layer's prefetches it did not take: reads not yet started are skipped, so the
-        // drive's time goes to what passes need.
-        for slot in &self.slots {
+        // drive's time goes to what passes need. Those that landed keep their recency: demoting
+        // them to the eviction end sent ~25% more experts back through the host tier, since a
+        // later token's route often takes them.
+        for slot in &mut self.slots {
             if slot.speculative && slot.key.is_some_and(|key| key.0 == layer as u32) {
+                slot.speculative = false;
+                self.counts.prefetch_unused += 1;
                 if let Some(host) = slot.waiting {
                     self.host[host].cancel.store(true, Ordering::Relaxed);
                 }
@@ -474,6 +486,15 @@ impl DeviceExperts {
             self.slots[slot].guards[0] = Some(mark);
         }
         self.keep_free(gpu)
+    }
+
+    /// Keep `slot` until the next release, as just used.
+    fn hold(&mut self, slot: usize) {
+        self.clock += 1;
+        let entry = &mut self.slots[slot];
+        entry.used = self.clock;
+        entry.speculative = false;
+        self.in_use.push(slot);
     }
 
     /// A VRAM slot for `key`, its fill queued (uploaded now, or once its drive reads land).
