@@ -275,10 +275,10 @@ __device__ unsigned qsa_rows_scan(unsigned value, unsigned* partial, unsigned& t
 }
 
 // Batched prefill attention (RDNA4). Nearby tokens select overlapping blocks, so groups of
-// qsa_group tokens attend together: each group walks the union of its tokens' blocks in block
-// order, reading every key and value once for all of them, and masks the blocks a token did not
-// select. A token attends key j when it selected j's block and j is not after it, which is its
-// explicit selection: complete blocks whole, the incomplete block up to the token.
+// qsa_group tokens attend together: each group walks the union of its tokens' blocks, reading
+// every key and value once for all of them, and masks the blocks a token did not select. A token
+// attends key j when it selected j's block and j is not after it, which is its explicit
+// selection: complete blocks whole, the incomplete block up to the token.
 constexpr size_t qsa_group = 16, qsa_group_capacity = qsa_group * 513;   // a token selects at most 513 blocks
 // Bit (token % qsa_group) of marks[group * stride + block] for every block a token's selection
 // touches (the lists are in block order, so a block's first entry marks it).
@@ -293,33 +293,73 @@ __global__ void qsa_mark_blocks(const float* packed, size_t steps, size_t select
         if (i == 0 || size_t(indices[i - 1]) / 4 != block) atomicOr(group + block, 1u << (row % qsa_group));
     }
 }
-// Each group's marked blocks in order, with their token masks; clears nothing (the caller zeroes marks).
-__global__ void qsa_union_blocks(const uint32_t* marks, size_t stride, size_t base, size_t steps, uint32_t* blocks,
-                                 uint32_t* masks, uint32_t* counts) {
+// The union's order: a pair of waves skips 16 keys none of its tokens selected, so blocks are
+// sorted by the pairs that need them (block order within), which gathers a pair's blocks into
+// fewer of those steps (a pair computes 0.3 of them at 131072 tokens, against 0.6 in block order).
+__device__ inline uint32_t qsa_union_key(uint32_t mask) {
+    uint32_t key = 0;
+    #pragma unroll
+    for (unsigned pair = 0; pair < qsa_group * 12 / 16; ++pair) {
+        const uint32_t tokens = ((2u << ((pair * 16 + 15) / 12)) - 1) & ~((1u << (pair * 16 / 12)) - 1);
+        key |= uint32_t((mask & tokens) != 0) << pair;
+    }
+    return key;
+}
+// Each group's marked blocks with their token masks, in qsa_union_key order: a counting sort in
+// two passes over the group's marks, each pass's chunk of 1024 blocks placed in block order.
+__global__ void __launch_bounds__(256) qsa_union_blocks(const uint32_t* marks, size_t stride, size_t base, size_t steps,
+                                                        uint32_t* blocks, uint32_t* masks, uint32_t* counts) {
+    constexpr unsigned keys = 1u << (qsa_group * 12 / 16);
     const size_t group = blockIdx.x, last = std::min(steps, (group + 1) * qsa_group) - 1, end = (base + last) / 4 + 1;
     const uint32_t* row = marks + group * stride;
     const unsigned t = threadIdx.x;
-    __shared__ unsigned partial[8];
+    __shared__ unsigned starts[keys], partial[8], chunk_keys[1024];
+    for (unsigned i = t; i < keys; i += 256) starts[i] = 0;
+    __syncthreads();
+    for (size_t first = t * 4; first < end; first += 1024)
+        for (unsigned j = 0; j < 4; ++j)
+            if (first + j < end && row[first + j]) atomicAdd(&starts[qsa_union_key(row[first + j])], 1u);
+    __syncthreads();
+    // Exclusive starts: thread t owns keys 16t .. 16t + 15.
+    unsigned own = 0;
+    for (unsigned i = 0; i < keys / 256; ++i) own += starts[t * (keys / 256) + i];
     unsigned found = 0;
+    unsigned at = qsa_rows_scan<8>(own, partial, found);
+    for (unsigned i = 0; i < keys / 256; ++i) {
+        const unsigned count = starts[t * (keys / 256) + i];
+        starts[t * (keys / 256) + i] = at;
+        at += count;
+    }
+    __syncthreads();
     for (size_t first = 0; first < end; first += 1024) {
-        uint32_t mark[4];
-        unsigned own = 0;
+        uint32_t mark[4], key[4];
+        unsigned marked = 0;
         #pragma unroll
         for (unsigned j = 0; j < 4; ++j) {
             const size_t block = first + t * 4 + j;
             mark[j] = block < end ? row[block] : 0u;
-            own += mark[j] != 0;
+            key[j] = mark[j] ? qsa_union_key(mark[j]) : 0u;
+            marked += mark[j] != 0;
         }
         unsigned total = 0;
-        unsigned out = found + qsa_rows_scan<8>(own, partial, total);
-        #pragma unroll
+        const unsigned before = qsa_rows_scan<8>(marked, partial, total);
+        for (unsigned j = 0, slot = before; j < 4; ++j)
+            if (mark[j]) chunk_keys[slot++] = key[j];
+        __syncthreads();
+        // A block's place: its key's start, after the chunk's earlier blocks of the same key.
+        for (unsigned j = 0, slot = before; j < 4; ++j) {
+            if (!mark[j]) continue;
+            unsigned rank = 0;
+            for (unsigned i = 0; i < slot; ++i) rank += chunk_keys[i] == key[j];
+            const size_t out = group * qsa_group_capacity + starts[key[j]] + rank;
+            blocks[out] = uint32_t(first + t * 4 + j);
+            masks[out] = mark[j];
+            ++slot;
+        }
+        __syncthreads();
         for (unsigned j = 0; j < 4; ++j)
-            if (mark[j]) {
-                blocks[group * qsa_group_capacity + out] = uint32_t(first + t * 4 + j);
-                masks[group * qsa_group_capacity + out] = mark[j];
-                ++out;
-            }
-        found += total;
+            if (mark[j]) atomicAdd(&starts[key[j]], 1u);
+        __syncthreads();
     }
     if (t == 0) counts[group] = found;
 }

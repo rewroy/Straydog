@@ -132,10 +132,11 @@ selected in registers, each row read once; both give the one-token kernels' scor
 selection bit for bit. With FP16 GEMM on RDNA4, a batch's attention runs at once: groups of 16
 tokens walk the union of their selected blocks (about 2700 of 32768 at 131072 tokens, against
 16 x 513), so each key and value is read once per group, with FP16 WMMA products accumulated in
-F32 and an F32 softmax. With host K/V, a layer's prefix is staged in VRAM for its batch; the
-copy for a device's next attention layer runs on a stream of its own while the layers before
-it compute. Prefill (IQ3_S, two R9700s, 262144 context): 131072 tokens 51.2 -> 34.6 s,
-65536 21.1 -> 16.1 s, 20480 6.1 -> 5.1 s, 4096 1.5 -> 1.2 s.
+F32 and an F32 softmax; the union is ordered by the tokens that selected each block, so the
+waves of a token skip most blocks it did not select. With host K/V, a layer's prefix is staged
+in VRAM for its batch; the copy for a device's next attention layer runs on a stream of its own
+while the layers before it compute. Prefill (IQ3_S, two R9700s, 262144 context): 131072 tokens
+51.2 -> 34.3-34.8 s, 65536 21.1 -> 15.9-16.1 s, 20480 6.1 -> 5.0 s, 4096 1.48 -> 1.23 s.
 
 ## 5. Command line and configuration
 
