@@ -54,7 +54,7 @@ fn generations_equal_the_reference() {
             speculative,
             cpu_threads: 0,
         };
-        let mut model = Model::new(weights, group, &settings).unwrap();
+        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
         if update {
             expected["resident"] = model.resident.into();
             expected["partial"] = model.partial.into();

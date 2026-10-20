@@ -220,6 +220,7 @@ fn stage_name(stage: &str, total: u64) -> String {
         "authenticate" => format!("authenticating the model files{size}"),
         "drafter" => format!("authenticating the drafter{size}"),
         "prepare" => "placing the model on the GPUs".into(),
+        "load" => format!("reading and authenticating the model into place{size}"),
         "warm" => "warming up the GPU code".into(),
         other => format!("{other}{size}"),
     }

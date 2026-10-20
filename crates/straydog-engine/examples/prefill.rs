@@ -50,13 +50,19 @@ fn main() -> Result<(), String> {
     };
     let devices: Vec<usize> = devices.split(',').map(|device| device.parse().unwrap()).collect();
     let budget = (vram.parse::<f64>().unwrap() * (1u64 << 30) as f64) as u64;
+    let started = Instant::now();
     let mut group = Group::new(&devices, budget, split)?;
     group.configure_gemm(gemm_min_batch, half_gemm)?;
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    let open_seconds = started.elapsed().as_secs_f64();
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: batch.unwrap_or(4096),
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0 };
-    let mut model = Model::new(weights, group, &settings)?;
+    let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
+    let steps: Vec<String> =
+        model.load_seconds.iter().map(|(step, seconds)| format!("{step} {seconds:.2} s")).collect();
+    eprintln!("load {:.2} s: devices and open {open_seconds:.2} s, {}", started.elapsed().as_secs_f64(),
+              steps.join(", "));
     let text = Text::new(&std::fs::read(root.join("tokenizer.json")).map_err(|exc| exc.to_string())?).map_err(|exc| exc.0)?;
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let corpus = match &corpus_file {

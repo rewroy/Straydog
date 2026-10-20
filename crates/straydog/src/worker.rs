@@ -116,8 +116,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let mut group = Group::new(&args.devices, args.vram_bytes, split)?;
     group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16")?;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
-    let weights = Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes,
-                                &|stage, done, total| loading.report(stage, done, total))?;
+    let report = |stage: &str, done, total| loading.report(stage, done, total);
+    let weights = Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report)?;
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
     let text = Arc::new(Text::new(&resource("tokenizer.json")?).map_err(|exc| exc.to_string())?);
@@ -130,7 +130,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         speculative: args.speculative,
         cpu_threads: 0,
     };
-    let mut model = Model::new(weights, group, &settings)?;
+    let mut model = Model::new(weights, group, &settings, &report)?;
     loading.report("warm", 0, 0);
     warm_up(&mut model)?;
     output.send(&json!({

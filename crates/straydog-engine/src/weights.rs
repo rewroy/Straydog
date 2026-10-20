@@ -1,12 +1,15 @@
-//! Authenticated, demand-paged GGUF weights.
+//! Authenticated GGUF weights.
 //!
-//! Every file is hashed from the handle that is then mapped, and its header is checked
-//! from a snapshot of that same handle. Weights reach the GPU as the mapped bytes; the
-//! host decodes only embedding rows and small vectors.
+//! Opening reads and authenticates each file's first chunk and parses the header from it;
+//! placement then runs on the header alone, and `crate::load` reads every chunk once,
+//! verifying it before its bytes reach the GPUs or the host copies kept here (token
+//! embeddings, vectors, the operands passes upload at first use). Only what the engine
+//! reads through the mapping at run time, the PLE table and partial residency's expert
+//! banks, is used from the page cache after its chunk was verified.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +18,7 @@ use std::time::SystemTime;
 use memmap2::Mmap;
 
 use crate::bundle::{self, Asset};
-use crate::digest;
+use crate::digest::{self, CHUNK_BYTES};
 use crate::formats;
 
 pub const CONTEXT_LIMIT: usize = 262144;
@@ -97,16 +100,26 @@ pub struct Weights {
     /// Whether the pinned MTP drafter is authenticated and in use.
     pub drafter: bool,
     drafter_names: HashSet<String>,
+    /// Per file: its asset name, handle, mapping, pinned chunk digests and signature.
+    assets: Vec<String>,
     files: Vec<File>,
     maps: Vec<Mmap>,
-    signatures: Vec<(u64, Option<SystemTime>)>,
+    chunk_digests: Vec<Vec<String>>,
+    signatures: Vec<Signature>,
     tensors: HashMap<String, Tensor>,
     order: Vec<String>,
+    /// Host copies of tensors made from their verified chunks (see `crate::load`).
+    kept: HashMap<String, Vec<u8>>,
+    /// Whether every chunk is verified: before that only the header may be used.
+    authenticated: bool,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
     embeddings: Mutex<EmbeddingCache>,
 }
 
-fn signature(file: &File) -> std::io::Result<(u64, Option<SystemTime>)> {
+/// A file's size and modification time, compared before each generation.
+type Signature = (u64, Option<SystemTime>);
+
+fn signature(file: &File) -> std::io::Result<Signature> {
     let metadata = file.metadata()?;
     Ok((metadata.len(), metadata.modified().ok()))
 }
@@ -115,10 +128,14 @@ fn error(message: impl Into<String>) -> String {
     message.into()
 }
 
-/// Open the pinned files and authenticate them by size and SHA-256 from these handles.
-fn open_authenticated(root: &Path, assets: &[Asset], stage: &str, progress: Progress) -> Result<Vec<File>, String> {
+/// An opened file, its signature then, and the chunk digests reading will verify.
+type Opened = ((File, Signature), Vec<String>);
+
+/// Open the pinned files, checking their sizes. A file without pinned chunk digests is hashed
+/// whole now, which also yields them.
+fn open_pinned(root: &Path, assets: &[Asset], stage: &str, progress: Progress) -> Result<Vec<Opened>, String> {
     let mut seen = HashSet::new();
-    let mut files = Vec::new();
+    let mut opened = Vec::new();
     for asset in assets {
         if !seen.insert(&asset.name) {
             return Err(error("invalid Straydog asset name"));
@@ -127,41 +144,59 @@ fn open_authenticated(root: &Path, assets: &[Asset], stage: &str, progress: Prog
         if file.metadata().map_err(|exc| exc.to_string())?.len() != asset.bytes {
             return Err(format!("Straydog asset size mismatch: {}", asset.name));
         }
-        files.push(file);
-    }
-    let total: u64 = assets.iter().map(|asset| asset.bytes).sum();
-    let done = AtomicU64::new(0);
-    progress(stage, 0, total);
-    let count = |bytes: u64| progress(stage, done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
-    // Files with pinned chunk digests are hashed piece by piece on every core; the rest whole.
-    let pieces = assets.iter().map(|asset| bundle::chunk_digests(&asset.sha256)).collect::<Result<Vec<_>, _>>()?;
-    let chunked: Vec<(&File, &[String])> = files.iter().zip(&pieces)
-        .filter_map(|(file, pieces)| pieces.as_deref().map(|pieces| (file, pieces)))
-        .collect();
-    let whole: Vec<&File> = files.iter().zip(&pieces).filter(|(_, pieces)| pieces.is_none()).map(|(file, _)| file).collect();
-    let mut chunked_results = digest::verify_chunks(&chunked, &count).map_err(|exc| exc.to_string())?.into_iter();
-    let mut whole_digests = digest::files_sha256(&whole, &count).map_err(|exc| exc.to_string())?.into_iter();
-    for (asset, pieces) in assets.iter().zip(&pieces) {
-        let authentic = match pieces {
-            Some(_) => chunked_results.next() == Some(true),
-            None => whole_digests.next().as_deref() == Some(asset.sha256.as_str()),
+        let pieces = match bundle::chunk_digests(&asset.sha256)? {
+            Some(pieces) => pieces,
+            None => {
+                let total = asset.bytes;
+                let done = AtomicU64::new(0);
+                let count = |bytes: u64| progress(stage, done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
+                let (whole, pieces) = digest::file_digests(&file, &count).map_err(|exc| exc.to_string())?;
+                if whole != asset.sha256 {
+                    return Err(format!("Straydog asset digest mismatch: {}", asset.name));
+                }
+                pieces
+            }
         };
-        if !authentic {
+        if pieces.len() as u64 != asset.bytes.div_ceil(CHUNK_BYTES) {
             return Err(format!("Straydog asset digest mismatch: {}", asset.name));
         }
+        let before = signature(&file).map_err(|exc| exc.to_string())?;
+        opened.push(((file, before), pieces));
     }
-    Ok(files)
+    Ok(opened)
 }
 
-/// The header of a GGUF file, from a snapshot of the authenticated handle.
-fn header(file: &mut File) -> Result<straydog_gguf::ModelHeader, String> {
+/// A resource read whole and checked against its pin.
+fn read_resource(root: &Path, asset: &Asset) -> Result<Vec<u8>, String> {
+    if asset.bytes > RESOURCE_LIMIT {
+        return Err(error("Straydog resource exceeds size limit"));
+    }
+    let mut file = File::open(root.join(&asset.name)).map_err(|exc| format!("{}: {exc}", asset.name))?;
+    let mut data = Vec::new();
+    (&mut file).take(RESOURCE_LIMIT + 1).read_to_end(&mut data).map_err(|exc| exc.to_string())?;
+    let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&data));
+    if data.len() as u64 != asset.bytes || digest != asset.sha256 {
+        return Err(format!("Straydog asset digest mismatch: {}", asset.name));
+    }
+    Ok(data)
+}
+
+/// The header of a GGUF file, parsed from its first chunk once that matched its digest.
+fn header(file: &File, name: &str, first: &str) -> Result<straydog_gguf::ModelHeader, String> {
     let size = file.metadata().map_err(|exc| exc.to_string())?.len();
-    let mut snapshot = vec![0u8; size.min(SNAPSHOT_BYTES) as usize];
-    file.seek(SeekFrom::Start(0)).and_then(|_| file.read_exact(&mut snapshot)).map_err(|exc| exc.to_string())?;
-    straydog_gguf::inspect_header(&snapshot, size).map_err(|exc| format!("Straydog GGUF preflight: {exc}"))
+    let mut chunk = vec![0u8; size.min(CHUNK_BYTES) as usize];
+    digest::will_need(file, &[(0, chunk.len() as u64)]);
+    crate::storage::read_at(file, 0, &mut chunk).map_err(|exc| format!("{name}: {exc}"))?;
+    if format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&chunk)) != first {
+        return Err(format!("Straydog asset digest mismatch: {name}"));
+    }
+    let snapshot = &chunk[..chunk.len().min(SNAPSHOT_BYTES as usize)];
+    straydog_gguf::inspect_header(snapshot, size).map_err(|exc| format!("Straydog GGUF preflight: {exc}"))
 }
 
 impl Weights {
+    /// Open the pinned bundle: resources and headers authenticated, tensors not yet read
+    /// (placement may run; [`crate::load::load`] or [`Weights::authenticate`] reads them).
     pub fn open(root: &Path, quantization: &str, drafter: Option<&Path>, host_memory_bytes: u64,
                 progress: Progress) -> Result<Weights, String> {
         let pins = bundle::bundle(quantization)?;
@@ -173,8 +208,6 @@ impl Weights {
             return Err(error("Straydog requires authenticated tokenizer, template, and config"));
         }
         let root = root.canonicalize().map_err(|exc| format!("{}: {exc}", root.display()))?;
-        let assets: Vec<Asset> = pins.shards.iter().chain(&pins.resources).cloned().collect();
-        let opened = open_authenticated(&root, &assets, "authenticate", progress)?;
         let mut weights = Weights {
             root: root.clone(),
             quantization: quantization.to_string(),
@@ -183,30 +216,40 @@ impl Weights {
             resources: HashMap::new(),
             drafter: false,
             drafter_names: HashSet::new(),
+            assets: Vec::new(),
             files: Vec::new(),
             maps: Vec::new(),
+            chunk_digests: Vec::new(),
             signatures: Vec::new(),
             tensors: HashMap::new(),
             order: Vec::new(),
+            kept: HashMap::new(),
+            authenticated: false,
             vectors: Mutex::new(HashMap::new()),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
-        for (asset, mut file) in assets.iter().zip(opened) {
-            if pins.resources.contains(asset) {
-                if asset.bytes > RESOURCE_LIMIT {
-                    return Err(error("Straydog resource exceeds size limit"));
-                }
-                let mut data = Vec::new();
-                file.seek(SeekFrom::Start(0)).and_then(|_| file.read_to_end(&mut data)).map_err(|exc| exc.to_string())?;
-                if format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&data)) != asset.sha256 {
-                    return Err(error("Straydog resource changed during authentication"));
-                }
-                weights.resources.insert(asset.name.clone(), data);
+        for asset in &pins.resources {
+            weights.resources.insert(asset.name.clone(), read_resource(&root, asset)?);
+        }
+        let mut opened = open_pinned(&root, &pins.shards, "open", progress)?;
+        if let Some(directory) = drafter {
+            let directory = directory.canonicalize().map_err(|exc| format!("{}: {exc}", directory.display()))?;
+            opened.extend(open_pinned(&directory, std::slice::from_ref(&pins.drafter), "drafter", progress)?);
+        }
+        // Each header's chunk is read and hashed on a thread of its own.
+        let assets: Vec<&Asset> = pins.shards.iter().chain([&pins.drafter]).collect();
+        let headers: Vec<Result<straydog_gguf::ModelHeader, String>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = opened.iter().zip(&assets)
+                .map(|(((file, _), pieces), asset)| scope.spawn(move || header(file, &asset.name, &pieces[0])))
+                .collect();
+            threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+        });
+        for (index, (((file, pieces), header), asset)) in opened.into_iter().zip(headers).zip(assets).enumerate() {
+            let header = header?;
+            if index == 2 {
+                weights.add_drafter(asset, file, pieces, header)?;
                 continue;
             }
-            let before = signature(&file).map_err(|exc| exc.to_string())?;
-            let header = header(&mut file)?;
-            let index = weights.files.len();
             if header.shard_count != 2 || header.shard_index != index as u64 {
                 return Err(error("Straydog shard identity mismatch"));
             }
@@ -219,15 +262,18 @@ impl Weights {
             }
             weights.add_tensors(index, &header.tensors)?;
             weights.integer_arrays.extend(header.integer_arrays.clone());
-            weights.map(file, before)?;
-        }
-        if weights.tensors.len() != TENSOR_COUNT {
-            return Err(error("Straydog model tensor count mismatch"));
-        }
-        if let Some(directory) = drafter {
-            weights.load_drafter(directory, &pins.drafter, progress)?;
+            weights.map(&asset.name, file, pieces)?;
+            if index == 1 && weights.tensors.len() != TENSOR_COUNT {
+                return Err(error("Straydog model tensor count mismatch"));
+            }
         }
         Ok(weights)
+    }
+
+    /// Read and verify every chunk, keeping host copies of the token embeddings (for callers
+    /// that use the weights on the host only; a model loads them with its placement).
+    pub fn authenticate(&mut self, progress: Progress) -> Result<(), String> {
+        crate::load::authenticate(self, &["token_embd.weight".to_string()], progress)
     }
 
     fn add_tensors(&mut self, index: usize, tensors: &[straydog_gguf::TensorInfo]) -> Result<(), String> {
@@ -247,25 +293,24 @@ impl Weights {
         Ok(())
     }
 
-    /// Map the authenticated handle, refusing a file that changed since it was hashed.
-    fn map(&mut self, file: File, before: (u64, Option<SystemTime>)) -> Result<(), String> {
+    /// Map an opened file, refusing one that changed since it was opened.
+    fn map(&mut self, name: &str, (file, before): (File, Signature), pieces: Vec<String>) -> Result<(), String> {
         // SAFETY: the mapping is read-only and the file is checked unchanged before every
         // generation; the files are pinned assets nothing is expected to write.
         let map = unsafe { Mmap::map(&file) }.map_err(|exc| exc.to_string())?;
         if signature(&file).map_err(|exc| exc.to_string())? != before {
             return Err(error("Straydog asset changed during authentication"));
         }
+        self.assets.push(name.to_string());
         self.signatures.push(before);
         self.files.push(file);
         self.maps.push(map);
+        self.chunk_digests.push(pieces);
         Ok(())
     }
 
-    fn load_drafter(&mut self, directory: &Path, pin: &Asset, progress: Progress) -> Result<(), String> {
-        let directory = directory.canonicalize().map_err(|exc| format!("{}: {exc}", directory.display()))?;
-        let mut file = open_authenticated(&directory, std::slice::from_ref(pin), "drafter", progress)?.remove(0);
-        let before = signature(&file).map_err(|exc| exc.to_string())?;
-        let header = header(&mut file)?;
+    fn add_drafter(&mut self, pin: &Asset, file: (File, Signature), pieces: Vec<String>,
+                   header: straydog_gguf::ModelHeader) -> Result<(), String> {
         let names: HashSet<String> = header.tensors.iter().map(|tensor| tensor.name.clone()).collect();
         let expected: HashSet<String> = DRAFTER_TENSORS.iter().map(|name| name.to_string()).collect();
         if header.shard_count != 1 || header.architecture != "qwen4exp" || names != expected {
@@ -275,7 +320,7 @@ impl Weights {
             return Err(error("duplicate tensor across Straydog drafter and model"));
         }
         self.add_tensors(self.files.len(), &header.tensors)?;
-        self.map(file, before)?;
+        self.map(&pin.name, file, pieces)?;
         self.drafter_names = names;
         self.drafter = true;
         Ok(())
@@ -305,12 +350,16 @@ impl Weights {
         &self.order
     }
 
-    /// The mapped bytes of a tensor slice.
+    /// The bytes of a tensor slice: its host copy if kept, else the mapping. Before the weights
+    /// are authenticated the mapped bytes may only be placed, never read (see `crate::load`).
     pub fn raw(&self, name: &str, start: u64, size: Option<u64>) -> Result<(&[u8], u32), String> {
         let tensor = self.tensor(name)?;
         let size = size.unwrap_or(tensor.bytes);
         if start.checked_add(size).is_none_or(|end| end > tensor.bytes) {
             return Err(error("Straydog tensor slice is out of range"));
+        }
+        if let Some(kept) = self.kept.get(name) {
+            return Ok((&kept[start as usize..(start + size) as usize], tensor.kind));
         }
         let begin = (tensor.offset + start) as usize;
         let map = &self.maps[tensor.file];
@@ -318,31 +367,85 @@ impl Weights {
         Ok((&map[begin..end], tensor.kind))
     }
 
+    fn require_authenticated(&self) -> Result<(), String> {
+        if self.authenticated { Ok(()) } else { Err(error("Straydog weights are not authenticated yet")) }
+    }
+
+    // ---- reading (crate::load) ----
+
+    pub(crate) fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// The files to read, in order: the shards, and the drafter's while it is in use.
+    pub(crate) fn files_to_read(&self) -> Vec<(&str, &File, &[u8], &[String])> {
+        let count = if self.drafter || self.drafter_names.is_empty() { self.files.len() } else { self.files.len() - 1 };
+        (0..count)
+            .map(|index| (self.assets[index].as_str(), &self.files[index], &self.maps[index][..],
+                          self.chunk_digests[index].as_slice()))
+            .collect()
+    }
+
+    /// The file and offset of mapped bytes (an operand's address), if they are mapped.
+    pub(crate) fn locate(&self, address: *const u8, bytes: usize) -> Option<(usize, u64)> {
+        let address = address as usize;
+        self.maps.iter().enumerate().find_map(|(index, map)| {
+            let start = map.as_ptr() as usize;
+            (address >= start && address + bytes <= start + map.len()).then(|| (index, (address - start) as u64))
+        })
+    }
+
+    /// The tensor holding byte `offset` of a file.
+    pub(crate) fn tensor_at(&self, file: usize, offset: u64) -> Result<&str, String> {
+        self.tensors
+            .iter()
+            .find(|(_, tensor)| tensor.file == file && (tensor.offset..tensor.offset + tensor.bytes).contains(&offset))
+            .map(|(name, _)| name.as_str())
+            .ok_or_else(|| error("Straydog upload is not a tensor"))
+    }
+
+    /// Every tensor's byte range (offset, length) in a file.
+    pub(crate) fn tensor_ranges(&self, file: usize) -> Vec<(u64, u64)> {
+        self.tensors.values().filter(|tensor| tensor.file == file).map(|tensor| (tensor.offset, tensor.bytes)).collect()
+    }
+
+    /// Keep a host copy of a tensor's verified bytes.
+    pub(crate) fn keep(&mut self, name: String, bytes: Vec<u8>) {
+        self.kept.insert(name, bytes);
+    }
+
+    pub(crate) fn set_authenticated(&mut self) {
+        self.authenticated = true;
+    }
+
     /// The file a tensor lives in (for read-ahead hints).
     pub fn file_of(&self, name: &str) -> Result<&File, String> {
         Ok(&self.files[self.tensor(name)?.file])
     }
 
-    /// A small norm, bias or convolution tensor, decoded once.
-    pub fn vector(&self, name: &str) -> Result<Arc<Vector>, String> {
-        if let Some(vector) = self.vectors.lock().unwrap().get(name) {
-            return Ok(vector.clone());
-        }
+    /// A vector's shape (rows, columns): a norm, bias or convolution tensor, small enough to
+    /// be uploaded decoded to F32.
+    pub fn vector_shape(&self, name: &str) -> Result<(usize, usize), String> {
         let tensor = self.tensor(name)?;
         if tensor.elements() > 65536 {
             return Err(error("Straydog vector request is too large"));
         }
-        let (raw, kind) = self.raw(name, 0, None)?;
-        let mut values = Vec::new();
-        formats::decode_into(kind, raw, &mut values).map_err(|exc| format!("{name}: {exc}"))?;
-        if values.len() as u64 != tensor.elements() || !values.iter().all(|value| value.is_finite()) {
-            return Err(error("non-finite Straydog model parameters"));
+        match tensor.dims.as_slice() {
+            [cols] => Ok((1, *cols as usize)),
+            [inner, outer] => Ok((*outer as usize, *inner as usize)),
+            _ => Err(format!("{name} is not a vector")),
         }
-        let (rows, cols) = match tensor.dims.as_slice() {
-            [cols] => (1, *cols as usize),
-            [inner, outer] => (*outer as usize, *inner as usize),
-            _ => return Err(format!("{name} is not a vector")),
-        };
+    }
+
+    /// A small norm, bias or convolution tensor, decoded once.
+    pub fn vector(&self, name: &str) -> Result<Arc<Vector>, String> {
+        self.require_authenticated()?;
+        if let Some(vector) = self.vectors.lock().unwrap().get(name) {
+            return Ok(vector.clone());
+        }
+        let (rows, cols) = self.vector_shape(name)?;
+        let (raw, kind) = self.raw(name, 0, None)?;
+        let values = crate::gpu::decode_vector(raw, kind, rows * cols, name)?;
         let vector = Arc::new(Vector { values, rows, cols });
         self.vectors.lock().unwrap().insert(name.to_string(), vector.clone());
         Ok(vector)
@@ -350,6 +453,7 @@ impl Weights {
 
     /// Embedding rows, decoded as one batch; row `i` of the result is `indices[i]`.
     pub fn rows(&self, name: &str, indices: &[i64]) -> Result<Vec<f32>, String> {
+        self.require_authenticated()?;
         if name == "token_embd.weight" && (1..=CACHED_BATCH).contains(&indices.len()) {
             return self.token_rows(indices);
         }

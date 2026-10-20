@@ -239,6 +239,12 @@ impl Group {
         self.backends[owner].register_decoder_layer(layer, operands, context)
     }
 
+    /// Pin a decoder layer's operands on its owner ahead of [`Group::register_decoder_layer`].
+    pub fn pin_layer(&mut self, layer: usize, operands: &[Operand]) -> Result<()> {
+        let owner = self.owner(layer);
+        self.backends[owner].pin(operands)
+    }
+
     /// The remaining layers partitioned at the device boundaries.
     pub fn decoder_spans(&self, start: usize) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
@@ -397,18 +403,35 @@ impl Group {
     pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, confidence: bool)
                        -> Result<Head> {
         let last = self.backends.len() - 1;
+        let lower = self.pin_head(&operands[3])?;
+        self.backends[last].output_head(operands, values, logits, confidence, lower)
+    }
+
+    /// Pin the vocabulary head on the last GPU and, in the two-GPU mode, its lower half of the
+    /// rows on the first; that half's row count and copy.
+    pub fn pin_head(&mut self, head: &Operand) -> Result<Option<(u64, *mut std::ffi::c_void)>> {
+        let last = self.backends.len() - 1;
+        self.backends[last].pin(std::slice::from_ref(head))?;
         if !(self.expert_parallel()? && self.linked) {
-            return self.backends[last].output_head(operands, values, logits, confidence, None);
+            return Ok(None);
         }
-        let head = &operands[3];
         let split = head.rows / 2;
         let crate::gpu::Data::Bytes(bytes) = &head.data else { return Err("invalid Straydog output head".into()) };
         let per_row = bytes.len() as u64 / head.rows;
         let lower = Operand::bytes(format!("{}:rows0", head.key), &bytes[..(split * per_row) as usize], head.kind,
                                    split, head.cols);
         self.backends[0].pin(std::slice::from_ref(&lower))?;
-        let peer = self.backends[0].prepare(&lower)?.pointer;
-        self.backends[last].output_head(operands, values, logits, confidence, Some((split, peer)))
+        Ok(Some((split, self.backends[0].prepare(&lower)?.pointer)))
+    }
+
+    /// Allocate mapped weights instead of uploading them (see [`Backend::defer_uploads`]).
+    pub fn defer_uploads(&mut self) {
+        self.backends.iter_mut().for_each(Backend::defer_uploads);
+    }
+
+    /// Each device's uploads allocated since [`Group::defer_uploads`].
+    pub fn take_pending(&mut self) -> Vec<Vec<crate::gpu::Pending>> {
+        self.backends.iter_mut().map(Backend::take_pending).collect()
     }
 
     pub fn mtp_prologue(&mut self, operands: &[Operand], embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {
@@ -483,7 +506,12 @@ impl Group {
         Ok(())
     }
 
-    /// Take every device's host states once their page-locking (beside the weight upload) is done.
+    /// Start page-locking every device's planned host states (see [`Backend::prefetch_host_states`]).
+    pub fn prefetch_host_states(&self) -> Result<()> {
+        self.backends.iter().try_for_each(Backend::prefetch_host_states)
+    }
+
+    /// Take every device's host states once their page-locking (beside reading the weights) is done.
     pub fn finish_model_state(&mut self) -> Result<()> {
         self.backends.iter_mut().try_for_each(Backend::finish_model_state)
     }

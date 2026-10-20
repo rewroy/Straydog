@@ -47,6 +47,35 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {
+    pub fn sd_allocate(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_write(
+        handle: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        data: *const ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_filler_create(handle: *mut ::std::os::raw::c_void) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_filler_destroy(filler: *mut ::std::os::raw::c_void);
+}
+unsafe extern "C" {
+    pub fn sd_fill(
+        filler: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        offset: u64,
+        host: *const ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_release(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,

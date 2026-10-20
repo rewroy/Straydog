@@ -5,7 +5,7 @@ use serde_json::Value;
 /// The manifest, compiled in: a binary authenticates exactly the bundles it was tested with.
 pub const MANIFEST: &str = include_str!("assets.json");
 pub const QUANTIZATIONS: [&str; 4] = ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"];
-/// The chunk digests of pinned files (see `digest::verify_chunks`), by whole-file SHA-256:
+/// The chunk digests of pinned files (see `digest::CHUNK_BYTES`), by whole-file SHA-256:
 /// taken from files that matched their pins, compiled in like the manifest.
 pub const CHUNKS: &str = include_str!("asset_chunks.json");
 pub const MODEL: &str = "Qwen3.8-Flash-Next";

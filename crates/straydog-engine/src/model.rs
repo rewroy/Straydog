@@ -16,10 +16,10 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
-use crate::gpu::{expert_bytes, CpuExperts, Operand, Result, HIDDEN, WIDTH};
+use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, HIDDEN, WIDTH};
 use crate::group::{row_count, Group};
 use crate::sampling::{self, Generated, Sampling};
-use crate::weights::{ngram_rows, Weights, CONTEXT_LIMIT};
+use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
 
 pub const MAX_DRAFTS: usize = 3;
 /// Rows per verification pass: a token and its drafts.
@@ -162,6 +162,13 @@ fn tile(embeddings: &[f32]) -> Vec<f32> {
 /// row's argmax and, when sampling, the rows' logits.
 type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>);
 
+/// Seconds since `clock`, which restarts.
+fn lap(clock: &mut Instant) -> f64 {
+    let seconds = clock.elapsed().as_secs_f64();
+    *clock = Instant::now();
+    seconds
+}
+
 fn last_row(values: &[f32]) -> &[f32] {
     &values[values.len() - WIDTH..]
 }
@@ -191,10 +198,15 @@ pub struct Model {
     deferred: bool,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
+    /// Seconds each step of loading took, in order.
+    pub load_seconds: Vec<(&'static str, f64)>,
 }
 
 impl Model {
-    pub fn new(weights: Weights, mut group: Group, settings: &Settings) -> Result<Model> {
+    /// Place the model on the group's GPUs, then read and authenticate the weights into the
+    /// placement (see `crate::load`); `progress` follows the reading.
+    pub fn new(weights: Weights, mut group: Group, settings: &Settings, progress: Progress) -> Result<Model> {
+        let mut clock = Instant::now();
         let context = settings.context;
         if !(1..=CONTEXT_LIMIT).contains(&context) {
             return Err("Straydog context must be within the native model limit".into());
@@ -242,6 +254,7 @@ impl Model {
         }
         group.reserve_model_state(context64, batch as u64, drafting, host)?;
         let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len())?;
+        let mut load_seconds = vec![("state", lap(&mut clock))];
         let mut model = Model {
             group,
             cpu: None,
@@ -261,20 +274,37 @@ impl Model {
             logits_capture: None,
             deferred: false,
             mtp_kept: 0,
+            load_seconds: Vec::new(),
         };
+        // Placement allocates every weight before any is read; reading then fills them.
+        model.group.defer_uploads();
         model.resident = model.prepare_resident_moe()?;
-        model.group.finish_model_state()?;
         if !model.resident {
-            let pinned = checkpoint_bytes + if host { kv_bytes } else { 0 };
-            model.partial = model.group.batch_capacity() == 256 && model.prepare_hybrid_moe(settings.cpu_threads, pinned)?;
+            model.partial = model.group.batch_capacity() == 256 && model.prepare_hybrid_moe(settings.cpu_threads)?;
         }
         if !model.resident && !model.partial {
             return Err("the GPU budget cannot hold the model's dense weights; raise --vram".into());
         }
-        model.prepare_decoder(context64)?;
+        model.prepare_decoder(context64, false)?;
+        // SAFETY of the borrow: the operand points into the weights, which outlive the group.
+        let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
+        model.group.pin_head(&head)?;
+        let keep = model.first_use_tensors()?;
+        load_seconds.push(("place", lap(&mut clock)));
+        let pending = model.group.take_pending();
+        crate::load::load(&mut model.weights, &mut model.group, pending, &keep, progress)?;
+        load_seconds.push(("read", lap(&mut clock)));
+        // Host K/V page-locked on a thread of its own meanwhile (see `Backend::prefetch_host_states`).
+        model.group.finish_model_state()?;
+        load_seconds.push(("host_state", lap(&mut clock)));
+        model.prepare_decoder(context64, true)?;
         if model.partial {
+            let pinned = checkpoint_bytes + if host { kv_bytes } else { 0 };
+            model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
+        load_seconds.push(("plans", lap(&mut clock)));
+        model.load_seconds = load_seconds;
         // MTP drafting needs the fully resident decoder (exact multi-token verification).
         model.speculative = if drafting && model.resident && model.weights.drafter { settings.speculative } else { 0 };
         Ok(model)
@@ -296,9 +326,12 @@ impl Model {
         Ok(Operand::bytes(format!("{name}:None"), data, kind, rows, cols))
     }
 
+    /// A vector, uploaded decoded to F32.
     fn vector(&self, name: &str, key: Option<&str>) -> Result<Operand<'_>> {
         let key = key.map_or_else(|| format!("@vector:{name}"), str::to_string);
-        Ok(Operand::floats(key, self.weights.vector(name)?))
+        let (rows, cols) = self.weights.vector_shape(name)?;
+        let (data, kind) = self.weights.raw(name, 0, None)?;
+        Ok(Operand { key, data: Data::Decode(data, kind), kind: 0, rows: rows as u64, cols: cols as u64 })
     }
 
     /// A HyperConnection's norm (keyed by its prefix) and its down, up and inject projections.
@@ -321,6 +354,32 @@ impl Model {
     fn head_operands(&self) -> Result<Vec<Operand<'_>>> {
         Ok(vec![self.vector("output_hc_norm.weight", None)?, self.projection("output_hc_down.weight")?,
                 self.projection("output_hc_up.weight")?, self.projection("output.weight")?])
+    }
+
+    /// The drafter's mixer before the shared vocabulary head.
+    fn mtp_head_operands(&self) -> Result<Vec<Operand<'_>>> {
+        Ok(vec![self.vector("mtp.hc_out_norm.weight", None)?, self.projection("mtp.hc_out_down.weight")?,
+                self.projection("mtp.hc_out_up.weight")?, self.projection("output.weight")?])
+    }
+
+    /// The tensors behind operands the passes upload at first use (the PLE, the head's mixers,
+    /// the drafter's projections) and the token embeddings: loading keeps host copies of them.
+    fn first_use_tensors(&self) -> Result<Vec<String>> {
+        let mut operands = self.ple_operands()?;
+        operands.extend(self.head_operands()?);
+        if self.weights.drafter {
+            operands.extend(self.mtp_operands()?);
+            operands.extend(self.mtp_head_operands()?);
+        }
+        let mut names = vec!["token_embd.weight".to_string()];
+        for operand in &operands {
+            if let Data::Bytes(bytes) | Data::Decode(bytes, _) = operand.data {
+                let (file, offset) =
+                    self.weights.locate(bytes.as_ptr(), bytes.len()).ok_or("Straydog operand is not mapped")?;
+                names.push(self.weights.tensor_at(file, offset)?.to_string());
+            }
+        }
+        Ok(names)
     }
 
     fn resident_requirements(&self, drafter: bool) -> Vec<(String, u64)> {
@@ -362,8 +421,8 @@ impl Model {
     }
 
     /// Partial residency: pin every dense operand and bind the host expert banks for the CPU
-    /// engine and prefill streaming; page-lock whole layers within the lock budget.
-    fn prepare_hybrid_moe(&mut self, cpu_threads: u32, pinned_state: u64) -> Result<bool> {
+    /// engine and prefill streaming (page-locked once read, see [`Model::lock_host_banks`]).
+    fn prepare_hybrid_moe(&mut self, cpu_threads: u32) -> Result<bool> {
         if !self.group.hybrid_supported()? {
             return Ok(false);
         }
@@ -376,15 +435,9 @@ impl Model {
             return Ok(false);
         }
         let cpu = CpuExperts::new(cpu_threads)?;
-        let mut banks_total = 0u64;
-        let mut layer_banks = Vec::new();
         for (layer, kinds) in kinds.iter().enumerate() {
             let prefix = format!("blk.{layer}.");
-            let mut banks: Vec<&[u8]> = Vec::new();
-            for role in ["gate", "up", "down"] {
-                banks.push(self.weights.raw(&format!("{prefix}ffn_{role}_exps.weight"), 0, None)?.0);
-            }
-            banks_total += banks.iter().map(|bank| bank.len() as u64).sum::<u64>();
+            let banks = Self::host_banks(&self.weights, layer)?;
             let mut operands = Vec::new();
             for role in ["gate", "up", "down"] {
                 operands.push(self.projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
@@ -395,10 +448,9 @@ impl Model {
             // SAFETY of the borrows: banks and operands point into the weights, which outlive the group.
             let (operands, banks): (Vec<Operand<'static>>, [&'static [u8]; 3]) = unsafe {
                 (std::mem::transmute::<Vec<Operand<'_>>, Vec<Operand<'static>>>(operands),
-                 std::mem::transmute::<[&[u8]; 3], [&'static [u8]; 3]>([banks[0], banks[1], banks[2]]))
+                 std::mem::transmute::<[&[u8]; 3], [&'static [u8]; 3]>(banks))
             };
             self.group.register_hybrid_moe(&prefix, &operands, banks, 512, *kinds)?;
-            layer_banks.push(banks);
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
@@ -406,8 +458,23 @@ impl Model {
                                      self.projection("output_hc_up.weight")?])
         };
         self.group.pin(&head)?;
+        self.cpu = Some(cpu);
+        Ok(true)
+    }
+
+    /// A layer's mapped gate, up and down expert banks.
+    fn host_banks(weights: &Weights, layer: usize) -> Result<[&[u8]; 3]> {
+        let bank = |role: &str| weights.raw(&format!("blk.{layer}.ffn_{role}_exps.weight"), 0, None).map(|raw| raw.0);
+        Ok([bank("gate")?, bank("up")?, bank("down")?])
+    }
+
+    /// Partial residency, once the banks are authenticated: page-lock whole layers within the
+    /// lock budget and hand absent experts to the CPU engine.
+    fn lock_host_banks(&mut self, pinned_state: u64) -> Result<()> {
+        let layer_banks = (0..48).map(|layer| Self::host_banks(&self.weights, layer)).collect::<Result<Vec<_>>>()?;
+        let banks_total = layer_banks.iter().flatten().map(|bank| bank.len() as u64).sum();
         let budget = lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state);
-        // Whole layers from the last: authentication read those most recently, so they are the
+        // Whole layers from the last: reading went through those most recently, so they are the
         // likeliest to be cached; the rest of the locked range is read ahead meanwhile.
         let (mut layers, mut locked) = (Vec::new(), 0u64);
         for layer in (0..48).rev() {
@@ -429,6 +496,7 @@ impl Model {
                     (name, (tensor.offset, tensor.bytes))
                 })
                 .collect();
+            let group = &mut self.group;
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     for (name, range) in &ranges {
@@ -438,7 +506,7 @@ impl Model {
                     }
                 });
                 for layer in &layers {
-                    if !layer_banks[*layer].iter().all(|bank| self.group.register_host(bank)) {
+                    if !layer_banks[*layer].iter().all(|bank| group.register_host(bank)) {
                         break;
                     }
                     registered += 1;
@@ -450,13 +518,13 @@ impl Model {
             // rest; both read host DRAM, so one route per layer.
             self.group.enable_assist(1)?;
         }
-        self.group.attach_cpu(&cpu)?;
-        self.cpu = Some(cpu);
-        Ok(true)
+        let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
+        self.group.attach_cpu(cpu)
     }
 
-    /// Pin each complete decoder layer after the residency preflight.
-    fn prepare_decoder(&mut self, context: u64) -> Result<()> {
+    /// Pin each complete decoder layer's operands after the residency preflight; with
+    /// `register`, once the sequence state exists, also create the layers' native plans.
+    fn prepare_decoder(&mut self, context: u64, register: bool) -> Result<()> {
         for layer in self.weights.layers() {
             let prefix = format!("blk.{layer}.");
             let mut operands = self.hc_operands(&format!("{prefix}hc_attn"))?;
@@ -477,7 +545,11 @@ impl Model {
             operands.extend(self.hc_operands(&format!("{prefix}hc_ffn"))?);
             // SAFETY of the borrow: operands point into the weights, which outlive the group.
             let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(operands) };
-            self.group.register_decoder_layer(layer, &operands, context)?;
+            if register {
+                self.group.register_decoder_layer(layer, &operands, context)?;
+            } else {
+                self.group.pin_layer(layer, &operands)?;
+            }
         }
         Ok(())
     }
@@ -656,8 +728,7 @@ impl Model {
         }
         let row = last_row(&hidden).to_vec();
         let mixed = self.with_operands(
-            |model| Ok(vec![model.vector("output_hc_norm.weight", None)?, model.projection("output_hc_down.weight")?,
-                            model.projection("output_hc_up.weight")?]),
+            |model| Ok(model.head_operands()?[..3].to_vec()),
             |group, operands| group.hyperconnection("output_hc", &row, operands[0].clone(), &operands[1..]),
         )?;
         let output = self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
@@ -752,11 +823,9 @@ impl Model {
     /// The drafter's token for the last row, through the MTP layer's own mixer and the shared
     /// vocabulary head, and its probability under the drafter.
     fn mtp_head(&mut self, values: &[f32]) -> Result<(u32, f32)> {
-        let (tokens, _, top) = self.with_operands(
-            |model| Ok(vec![model.vector("mtp.hc_out_norm.weight", None)?, model.projection("mtp.hc_out_down.weight")?,
-                            model.projection("mtp.hc_out_up.weight")?, model.projection("output.weight")?]),
-            |group, operands| group.output_head(operands, values, false, true),
-        )?;
+        let (tokens, _, top) = self.with_operands(Model::mtp_head_operands, |group, operands| {
+            group.output_head(operands, values, false, true)
+        })?;
         let top = top.ok_or("Straydog drafter head returned no probability")?;
         Ok((*tokens.last().ok_or("Straydog drafter head returned no token")? as u32, top[top.len() - 1]))
     }

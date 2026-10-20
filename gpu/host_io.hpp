@@ -95,3 +95,28 @@ void download(Device& d, void* host, const void* device, size_t bytes) {
         done += part;
     }
 }
+// A tracked allocation within the budget; only its tail padding is zeroed.
+void* allocate(Device& value, uint64_t bytes) {
+    if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
+        throw std::runtime_error("Straydog VRAM budget exceeded");
+    void* pointer = nullptr;
+    check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
+    // Track ownership before copying so the destructor also cleans up copy failures.
+    try { value.allocations.emplace(pointer, size_t(bytes)); }
+    catch (...) { cleanup(hipFree(pointer)); throw; }
+    value.used += size_t(bytes) + allocation_tail;
+    check(hipMemsetAsync(static_cast<uint8_t*>(pointer) + bytes, 0, allocation_tail, value.stream));
+    return pointer;
+}
+// One host thread's copies into one device's allocations (sd_fill): a stream of its own, and
+// an event the thread sleeps on instead of spinning beside the threads that read and hash.
+struct Filler {
+    Device* device = nullptr;
+    hipStream_t stream = nullptr;
+    hipEvent_t done = nullptr;
+    ~Filler() {
+        if (device) cleanup(hipSetDevice(device->ordinal));
+        if (done) cleanup(hipEventDestroy(done));
+        if (stream) cleanup(hipStreamDestroy(stream));
+    }
+};

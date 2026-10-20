@@ -6,13 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void};
-use std::sync::Arc;
 
 use indexmap::IndexMap;
 use straydog_gpu::ffi;
 
 use crate::formats;
-use crate::weights::Vector;
 
 pub type Result<T> = std::result::Result<T, String>;
 /// A head's rows: each row's first maximum, its logits and its probability when asked.
@@ -45,13 +43,73 @@ fn pointer(result: *mut c_void) -> Result<*mut c_void> {
     if result.is_null() { Err(last_error()) } else { Ok(result) }
 }
 
-/// An operand's bytes: mapped weights, a decoded vector, or (helper parts of expert
-/// parallelism) only its description.
+/// An operand's bytes: weights, weights of a GGML kind uploaded decoded to F32 (vectors), or
+/// (helper parts of expert parallelism) only its description.
 #[derive(Clone)]
 pub enum Data<'a> {
     Bytes(&'a [u8]),
-    Floats(Arc<Vector>),
+    Decode(&'a [u8], u32),
     Described,
+}
+
+/// An upload placed before its weights were read: the allocation and the mapped bytes that
+/// fill it once their chunk is authenticated (see `crate::load`), decoded to F32 for a kind.
+#[derive(Debug, Clone, Copy)]
+pub struct Pending {
+    pub pointer: *mut c_void,
+    pub source: *const u8,
+    pub bytes: usize,
+    pub decode: Option<u32>,
+}
+
+// The source is only an address into the weights' mappings, never read through.
+unsafe impl Send for Pending {}
+
+/// A host range page-locked for DMA while this lives; the range must outlive it.
+pub struct PageLock(*mut c_void);
+
+// Page locks are process-wide: any thread may release one.
+unsafe impl Send for PageLock {}
+
+impl PageLock {
+    pub fn new(range: &[u8]) -> Result<PageLock> {
+        let start = range.as_ptr().cast_mut().cast();
+        // SAFETY: a live range, unregistered (when this drops) before its owner frees it.
+        check(unsafe { ffi::sd_host_register(start, range.len() as u64) })?;
+        Ok(PageLock(start))
+    }
+}
+
+impl Drop for PageLock {
+    fn drop(&mut self) {
+        // SAFETY: registered in `new`.
+        unsafe { ffi::sd_host_unregister(self.0) };
+    }
+}
+
+/// One thread's copy stream into one device's allocations (see `sd_fill`).
+pub struct Filler<'a> {
+    handle: *mut c_void,
+    device: std::marker::PhantomData<&'a Backend>,
+}
+
+// Each filler is used by one thread at a time; fills of distinct fillers may run at once.
+unsafe impl Send for Filler<'_> {}
+
+impl Filler<'_> {
+    /// Copy page-locked host bytes to `offset` of a pending upload; returns once they landed.
+    pub fn fill(&self, upload: &Pending, offset: u64, host: &[u8]) -> Result<()> {
+        // SAFETY: a live filler; the library checks the range against the allocation.
+        check(unsafe { ffi::sd_fill(self.handle, upload.pointer, offset, host.as_ptr().cast(), host.len() as u64) })
+            .map(drop)
+    }
+}
+
+impl Drop for Filler<'_> {
+    fn drop(&mut self) {
+        // SAFETY: created by sd_filler_create, destroyed once.
+        unsafe { ffi::sd_filler_destroy(self.handle) }
+    }
 }
 
 #[derive(Clone)]
@@ -67,12 +125,16 @@ impl<'a> Operand<'a> {
     pub fn bytes(key: impl Into<String>, data: &'a [u8], kind: u32, rows: u64, cols: u64) -> Operand<'a> {
         Operand { key: key.into(), data: Data::Bytes(data), kind, rows, cols }
     }
+}
 
-    /// A decoded vector, uploaded as F32 with its own shape.
-    pub fn floats(key: impl Into<String>, vector: Arc<Vector>) -> Operand<'a> {
-        let (rows, cols) = (vector.rows as u64, vector.cols as u64);
-        Operand { key: key.into(), data: Data::Floats(vector), kind: 0, rows, cols }
+/// A vector's bytes decoded to `count` finite F32 values.
+pub fn decode_vector(bytes: &[u8], kind: u32, count: usize, key: &str) -> Result<Vec<f32>> {
+    let mut values = Vec::with_capacity(count);
+    formats::decode_into(kind, bytes, &mut values).map_err(|exc| format!("{key}: {exc}"))?;
+    if values.len() != count || !values.iter().all(|value| value.is_finite()) {
+        return Err("non-finite Straydog model parameters".into());
     }
+    Ok(values)
 }
 
 fn float_bytes(values: &[f32]) -> &[u8] {
@@ -114,6 +176,8 @@ pub struct Backend {
     pub expert_parallel: bool,
     /// Host states page-locking beside the weight upload, created by `finish_model_state`.
     pending_host: Vec<(String, u64, u64)>,
+    /// While placing before the weights are read: uploads allocated but not yet filled.
+    deferred: Option<Vec<Pending>>,
 }
 
 /// Move prompt rows a span left on `from` (layer `from_layer`'s workspace) to `to`'s
@@ -165,6 +229,7 @@ impl Backend {
             keeps_mtp_rows: false,
             expert_parallel: false,
             pending_host: Vec::new(),
+            deferred: None,
         })
     }
 
@@ -188,7 +253,8 @@ impl Backend {
         check(unsafe { ffi::sd_gemm_options(self.handle, minimum_batch, c_int::from(half)) }).map(drop)
     }
 
-    /// Upload an operand once; later uses of its key reuse the device copy.
+    /// Upload an operand once; later uses of its key reuse the device copy. While uploads are
+    /// deferred, mapped bytes are only allocated for (see [`Backend::defer_uploads`]).
     pub fn prepare(&mut self, operand: &Operand) -> Result<Entry> {
         if let Some(entry) = self.cache.get(&operand.key) {
             if (entry.rows, entry.cols) != (operand.rows, operand.cols) {
@@ -196,25 +262,62 @@ impl Backend {
             }
             return Ok(*entry);
         }
-        let data: &[u8] = match &operand.data {
-            Data::Bytes(bytes) => bytes,
-            Data::Floats(vector) => float_bytes(&vector.values),
-            Data::Described => return Err("Straydog operand has no data".into()),
-        };
         let size = formats::matrix_bytes(operand.kind, operand.rows as usize, operand.cols as usize)
             .ok_or("unsupported Straydog GPU weight format")?;
-        if data.len() != size {
+        let decoded;
+        let (data, decode): (&[u8], Option<u32>) = match &operand.data {
+            Data::Bytes(bytes) => (bytes, None),
+            Data::Decode(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
+            Data::Decode(bytes, kind) => {
+                decoded = decode_vector(bytes, *kind, size / 4, &operand.key)?;
+                (float_bytes(&decoded), None)
+            }
+            Data::Described => return Err("Straydog operand has no data".into()),
+        };
+        if decode.is_none() && data.len() != size {
             return Err(format!("Straydog GPU weight size mismatch: {}", operand.key));
         }
         let (used, budget) = self.memory()?;
-        if used + data.len() as u64 > budget {
+        if used + size as u64 > budget {
             return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
         }
-        // SAFETY: the bytes are valid for their length; the library copies them.
-        let device = pointer(unsafe { ffi::sd_upload(self.handle, data.as_ptr().cast(), data.len() as u64) })?;
+        let device = match (&mut self.deferred, &operand.data) {
+            (Some(pending), Data::Bytes(_) | Data::Decode(..)) => {
+                // SAFETY: a plain size; the bytes arrive through `fill` or `write`.
+                let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
+                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode });
+                device
+            }
+            // SAFETY: the bytes are valid for their length; the library copies them.
+            _ => pointer(unsafe { ffi::sd_upload(self.handle, data.as_ptr().cast(), data.len() as u64) })?,
+        };
         let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
         self.cache.insert(operand.key.clone(), entry);
         Ok(entry)
+    }
+
+    /// Allocate mapped weights instead of uploading them, until [`Backend::take_pending`]:
+    /// placement then runs before the weights are read, and reading fills the allocations.
+    pub fn defer_uploads(&mut self) {
+        self.deferred.get_or_insert_with(Vec::new);
+    }
+
+    /// The uploads allocated since [`Backend::defer_uploads`]; later uploads copy at once.
+    pub fn take_pending(&mut self) -> Vec<Pending> {
+        self.deferred.take().unwrap_or_default()
+    }
+
+    /// A copy stream for one thread's fills of pending uploads.
+    pub fn filler(&self) -> Result<Filler<'_>> {
+        // SAFETY: a live handle.
+        let handle = pointer(unsafe { ffi::sd_filler_create(self.handle) })?;
+        Ok(Filler { handle, device: std::marker::PhantomData })
+    }
+
+    /// Fill a whole pending upload from caller memory, waiting for it.
+    pub fn write(&mut self, upload: &Pending, data: &[u8]) -> Result<()> {
+        // SAFETY: the library checks the allocation and its size; the bytes are valid.
+        check(unsafe { ffi::sd_write(self.handle, upload.pointer, data.as_ptr().cast(), data.len() as u64) }).map(drop)
     }
 
     /// Prepare operands and pin them for the life of the placement.
@@ -247,8 +350,17 @@ impl Backend {
             let device = pointer(unsafe { ffi::sd_host_state(self.handle, rows * cols * 4) })?;
             Entry { pointer: device, kind: 0, rows, cols }
         } else {
-            let zeros = vec![0u8; (rows * cols * 4) as usize];
-            self.prepare(&Operand::bytes(key, &zeros, 0, rows, cols))?
+            let (used, budget) = self.memory()?;
+            if used + rows * cols * 4 > budget {
+                return Err(format!("{key} cannot fit in the Straydog VRAM budget"));
+            }
+            // SAFETY: a plain size; the allocation is zeroed on the device, not uploaded.
+            let device = pointer(unsafe { ffi::sd_allocate(self.handle, rows * cols * 4) })?;
+            // SAFETY: an allocation of this device.
+            check(unsafe { ffi::sd_zero(self.handle, device) })?;
+            let entry = Entry { pointer: device, kind: 0, rows, cols };
+            self.cache.insert(key.to_string(), entry);
+            entry
         };
         self.states.insert(key.to_string(), entry);
         Ok(entry)
@@ -310,8 +422,9 @@ impl Backend {
     }
 
     /// Allocate and zero all sequence state of the given layers before advertising capacity.
-    /// Host states (K/V in page-locked memory) start on a thread of their own and are taken by
-    /// [`Backend::finish_model_state`], so page-locking them overlaps the weight upload.
+    /// Host states (K/V in page-locked memory) are only planned: [`Backend::prefetch_host_states`]
+    /// starts them on a thread of their own and [`Backend::finish_model_state`] takes them, so
+    /// page-locking them overlaps reading the weights.
     pub fn reserve_model_state(&mut self, context: u64, layers: &[usize], prefill: u64, host_attention: bool)
                                -> Result<()> {
         self.prefill_capacity = context.min(prefill);
@@ -322,13 +435,19 @@ impl Backend {
                 self.state(&key, rows, cols, host)?;
             }
         }
+        if self.pending_host.is_empty() {
+            self.register_kv_stage()?;
+        }
+        Ok(())
+    }
+
+    /// Start page-locking the planned host states. Their thread slows this device's other
+    /// calls (some 5 s for 13 GB of K/V), so it starts once placement is done.
+    pub fn prefetch_host_states(&self) -> Result<()> {
         let sizes: Vec<u64> = self.pending_host.iter().map(|(_, rows, cols)| rows * cols * 4).collect();
         if !sizes.is_empty() {
             // SAFETY: a live handle; `sizes` outlives the call (the thread copies it).
             check(unsafe { ffi::sd_host_states_prefetch(self.handle, sizes.as_ptr(), sizes.len() as u64) })?;
-        }
-        if self.pending_host.is_empty() {
-            self.register_kv_stage()?;
         }
         Ok(())
     }

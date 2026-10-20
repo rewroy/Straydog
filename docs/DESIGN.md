@@ -10,7 +10,7 @@ OpenAI-compatible API, shipped as one executable per GPU backend.
 ## 1. Goals
 
 - One long-lived server keeps the model loaded. Clients start, update and restart
-  without reloading it (authenticating and loading the IQ3_S model takes about 70 s).
+  without reloading it (authenticating and loading the IQ3_S model takes 13-22 s, §4.4).
 - Any OpenAI-compatible client can use it.
 - One executable: the server, the engine, the isolated worker and provisioning. The
   only external pieces are the GPU vendor's runtime and driver.
@@ -53,7 +53,7 @@ straydog ──HTTP──▶ clients
    ▼
 straydog worker   (same executable, isolated; never opens a socket)
    tokenizer, template, weights, placement, generation loop
-   │  C ABI (sd_*, 61 entry points)
+   │  C ABI (sd_*, 83 entry points)
    ▼
 GPU library (C++ / HIP / CUDA, linked statically)
 ```
@@ -92,7 +92,7 @@ golden files of the tokenizer, template and weights (`tests/golden/chat.json` an
 | --- | --- | --- |
 | tokenizers (HF) | `tokenizers` crate | the same implementation; pure-Rust regex backend |
 | jinja2 sandbox | `minijinja` (+ Python-compatible methods) | renders equal the reference's byte for byte |
-| gguf parsing, mmap, SHA-256 | gguf reader (from the inspector crate), `memmap2`, `sha2` | two files hashed at once |
+| gguf parsing, mmap, SHA-256 | gguf reader (from the inspector crate), `memmap2`, `sha2` | each chunk read once, hashed and placed (§4.4) |
 | placement, residency planning | same algorithms | equal plans for the same budgets |
 | generation loop, MTP control, checkpoints | same algorithms over the C ABI | host steps are copies, integer math and argmax |
 | NumPy layer math (bounded-cache tier) | not ported | see §9, decision 5 |
@@ -100,6 +100,26 @@ golden files of the tokenizer, template and weights (`tests/golden/chat.json` an
 | HTTP server | `axum` on `tokio` | |
 | bubblewrap command, AppContainer launcher | same, in Rust (`windows` crate) | grants: the executable, the CUDA runtime, model files |
 | provisioning (download, resume, MTP conversion) | `ureq` + `rustls`, own GGUF writer | the drafter is bit-identical to the reference's |
+
+### 4.4 Loading
+
+Each pinned file is authenticated in 256 MiB chunks, against digests compiled in beside its
+SHA-256. Opening reads and verifies each file's first chunk and parses the GGUF header from
+it; placement runs on the header alone, allocating every weight it pins without filling it.
+Then every core reads chunks of its own into page-locked memory and hashes them there; a
+chunk whose digest matched is copied from that memory to the GPU allocations and to the host
+copies the engine keeps (token embeddings, vectors, the operands passes upload at first use).
+The bytes hashed are the bytes used. The PLE table and partial residency's expert banks are
+read through the mapping at run time, after their chunks were verified; every generation
+checks the files unchanged. Chunks no GPU waits for are read first, while the host K/V is
+page-locked: its 5 s of `hipHostMalloc` hold up the copies.
+
+A cached chunk is read from the page cache. One that is not goes through it when the files fit
+in three quarters of the host memory, so that a restart finds them, and around it otherwise
+(direct reads). With the IQ3_S bundle and the drafter (84.5 GB) on two R9700s at 262144 tokens,
+the server is ready 22 s after a cold start, reading the SSD at 4.6 GB/s throughout (29 s
+before), and 13 s with the files cached, where SHA-256 on every core and the K/V page-locking
+bound the reading (18 s before). `ready` reports the steps' seconds.
 
 ## 5. Command line and configuration
 

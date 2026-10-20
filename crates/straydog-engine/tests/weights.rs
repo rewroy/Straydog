@@ -46,8 +46,9 @@ fn model_tensors_vectors_and_rows_equal_the_reference() {
         return;
     };
     let model = &golden["model"];
-    let weights = Weights::open(&PathBuf::from(root), model["quantization"].as_str().unwrap(), None, 0,
-                                &|_, _, _| {}).unwrap();
+    let mut weights = Weights::open(&PathBuf::from(root), model["quantization"].as_str().unwrap(), None, 0,
+                                    &|_, _, _| {}).unwrap();
+    weights.authenticate(&|_, _, _| {}).unwrap();
     let mut names: Vec<&String> = weights.names().iter().collect();
     names.sort();
     let table: Vec<Json> = names.iter().map(|name| {

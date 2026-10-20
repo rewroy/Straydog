@@ -39,7 +39,8 @@ unsafe impl GlobalAlloc for HugePages {
     }
 }
 
-fn advise(pointer: *mut u8, size: usize) {
+/// Ask Linux for transparent huge pages behind an allocation of 4 MiB or more (a hint).
+pub fn advise(pointer: *mut u8, size: usize) {
     #[cfg(target_os = "linux")]
     if !pointer.is_null() && size >= HUGE_THRESHOLD {
         // The whole 2 MiB-aligned span inside the allocation; advice is only a hint.

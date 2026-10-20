@@ -100,6 +100,9 @@
 #define hipErrorPeerAccessAlreadyEnabled cudaErrorPeerAccessAlreadyEnabled
 #define hipHostMallocPortable cudaHostAllocPortable
 #define hipEventDisableTiming cudaEventDisableTiming
+#define hipEventBlockingSync cudaEventBlockingSync
+#define hipStreamCreateWithFlags cudaStreamCreateWithFlags
+#define hipStreamNonBlocking cudaStreamNonBlocking
 // MSVC host compilation has no GNU attributes; CUDA's __align__ maps to the host's form.
 #define SD_ALIGN(n) __align__(n)
 #include <mma.h>
@@ -251,6 +254,7 @@ void cleanup(hipError_t error) noexcept {
     if (error != hipSuccess) std::fprintf(stderr, "Straydog GPU cleanup: %s\n", hipGetErrorString(error));
 }
 
+
 // One job at a time on a thread of its own with the device current. Bounded slot
 // swaps issue their copies from pageable mappings here (hybrid_rebalance), so the
 // decode thread never blocks in them. Destruction finishes a queued job first.
@@ -360,8 +364,8 @@ struct Device {
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
     hipEvent_t handoff = nullptr;
-    // Host states allocated beside the weight upload (sd_host_states_prefetch): page-locking
-    // ~13 GB of K/V takes ~5 s. The thread alone writes `host_ready` until joined.
+    // Host states allocated beside reading the weights (sd_host_states_prefetch): zeroing and
+    // page-locking ~13 GB of K/V. The thread alone writes `host_ready` until joined.
     std::thread host_prefetch;
     std::vector<std::pair<size_t, void*>> host_ready;
     std::string host_prefetch_error;
@@ -1492,19 +1496,61 @@ int sd_memory(void* handle, uint64_t* used, uint64_t* budget) {
 void* sd_upload(void* handle, const void* data, uint64_t bytes) {
     try {
         auto& value = device(handle);
-        if (!data || !bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
-            throw std::runtime_error("Straydog VRAM budget exceeded");
-        void* pointer = nullptr;
-        check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
-        // Track ownership before copying so the destructor also cleans up copy failures.
-        try { value.allocations.emplace(pointer, size_t(bytes)); }
-        catch (...) { cleanup(hipFree(pointer)); throw; }
-        value.used += size_t(bytes) + allocation_tail;
-        check(hipMemsetAsync(static_cast<uint8_t*>(pointer) + bytes, 0, allocation_tail, value.stream));
+        if (!data) throw std::runtime_error("invalid Straydog upload");
+        void* pointer = allocate(value, bytes);
         upload(value, pointer, data, size_t(bytes));
         check(hipStreamSynchronize(value.stream));
         return pointer;
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
+}
+
+void* sd_allocate(void* handle, uint64_t bytes) {
+    try { return allocate(device(handle), bytes); }
+    catch (const std::exception& e) { last_error = e.what(); return nullptr; }
+}
+
+int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        auto found = value.allocations.find(pointer);
+        if (!data || found == value.allocations.end() || found->second != bytes)
+            throw std::runtime_error("invalid Straydog write");
+        upload(value, pointer, data, size_t(bytes));
+        check(hipStreamSynchronize(value.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+void* sd_filler_create(void* handle) {
+    try {
+        auto filler = std::make_unique<Filler>();
+        filler->device = &device(handle);
+        check(hipSetDevice(filler->device->ordinal));
+        check(hipStreamCreateWithFlags(&filler->stream, hipStreamNonBlocking));
+        check(hipEventCreateWithFlags(&filler->done, hipEventDisableTiming | hipEventBlockingSync));
+        return filler.release();
+    } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
+}
+
+void sd_filler_destroy(void* filler) { delete static_cast<Filler*>(filler); }
+
+int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint64_t bytes) {
+    try {
+        if (!filler) throw std::runtime_error("invalid Straydog fill");
+        auto& copier = *static_cast<Filler*>(filler);
+        const auto& value = *copier.device;
+        // Lookups only: fills run while nothing else changes the device's allocations.
+        auto found = value.allocations.find(pointer);
+        if (!host || !bytes || found == value.allocations.end() || offset > found->second ||
+            bytes > found->second - offset)
+            throw std::runtime_error("invalid Straydog fill");
+        check(hipSetDevice(value.ordinal));
+        check(hipMemcpyAsync(static_cast<uint8_t*>(pointer) + offset, host, size_t(bytes), hipMemcpyHostToDevice,
+                             copier.stream));
+        check(hipEventRecord(copier.done, copier.stream));
+        check(hipEventSynchronize(copier.done));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
 int sd_release(void* handle, void* pointer) {
