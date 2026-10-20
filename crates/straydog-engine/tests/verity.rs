@@ -120,3 +120,37 @@ fn tampered_tree_blocks_are_refused() {
     std::fs::remove_file(&file_path).unwrap();
     std::fs::remove_file(&tree_path).unwrap();
 }
+
+/// Many threads verifying overlapping blocks through a small level-0 cache (as the expert and
+/// row readers do): every block verifies, the cache never holds a block twice, and nothing
+/// panics.
+#[test]
+fn parallel_verification_through_a_small_cache() {
+    let size = 67121157u64;
+    let data: Vec<u8> = (0..size).map(byte).collect();
+    let (file_path, tree_path) = (scratch("parallel"), scratch("parallel.tree"));
+    std::fs::write(&file_path, &data).unwrap();
+    let digest = verity::build(&std::fs::File::open(&file_path).unwrap(), &tree_path, &|_| {}).unwrap();
+    let verifier = Verifier::open(&tree_path, size, &digest, 3 * BLOCK).unwrap();
+    let count = size.div_ceil(BLOCK as u64) as usize;
+    std::thread::scope(|scope| {
+        for thread in 0..16usize {
+            let (verifier, data) = (&verifier, &data);
+            scope.spawn(move || {
+                let mut seed = 0x9e37_79b9u64 + thread as u64;
+                for _ in 0..3000 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    // Few distinct level-0 blocks, so threads miss the same one at once.
+                    let first = ((seed % 8) * 128 + (seed >> 8) % 120) as usize % count;
+                    let n = 1 + (seed >> 20) as usize % 8;
+                    let n = n.min(count - first);
+                    verifier.verify((first * BLOCK) as u64, &blocks(data, first, n)).unwrap();
+                }
+            });
+        }
+    });
+    std::fs::remove_file(&file_path).unwrap();
+    std::fs::remove_file(&tree_path).unwrap();
+}

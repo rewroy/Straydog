@@ -301,19 +301,23 @@ impl Verifier {
         }
         let hash = block[at..at + 32].try_into().unwrap();
         let mut cache = self.cache.lock().unwrap();
+        // Readers verify in parallel: another may have cached this block since the check above.
+        if let Some(entry) = cache.blocks.get_mut(&tree_block) {
+            entry.1 = true;
+            return Ok(hash);
+        }
         if cache.blocks.len() >= cache.capacity {
             // CLOCK: pass over used blocks, clearing their bit; evict the first clear one.
             loop {
                 let hand = cache.hand % cache.order.len();
                 let key = cache.order[hand];
-                let entry = cache.blocks.get_mut(&key).unwrap();
+                cache.hand = hand + 1;
+                let entry = cache.blocks.get_mut(&key).expect("the CLOCK order names only cached blocks");
                 if entry.1 {
                     entry.1 = false;
-                    cache.hand = hand + 1;
                 } else {
                     cache.blocks.remove(&key);
                     cache.order[hand] = tree_block;
-                    cache.hand = hand + 1;
                     break;
                 }
             }
