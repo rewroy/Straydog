@@ -1,8 +1,11 @@
 //! DeepSeek-V4.1's tokenizer from its GGUF against the model's official tokenizer.json (the oracle,
 //! never shipped): the same ids for text, special tokens and a corpus, and the same text back.
 //!
-//! cargo test -p straydog-engine --test deepseek41_text, with STRAYDOG_DS41_MODEL (the bundle
-//! directory) and STRAYDOG_DS41_TOKENIZER (the official tokenizer.json).
+//! cargo test -p straydog-engine --test deepseek41_text, with STRAYDOG_DEEPSEEK (the UD-IQ2_XXS
+//! directory) and STRAYDOG_DS41_TOKENIZER (the official tokenizer.json, an oracle only: without it
+//! the tokenizer test is skipped even under STRAYDOG_REQUIRE_MODEL).
+
+mod common;
 
 use std::path::PathBuf;
 
@@ -17,8 +20,9 @@ fn first_shard(directory: &std::path::Path) -> PathBuf {
 
 #[test]
 fn the_gguf_tokenizer_encodes_as_the_official_one() {
-    let (Some(model), Some(oracle)) = (std::env::var_os("STRAYDOG_DS41_MODEL"), std::env::var_os("STRAYDOG_DS41_TOKENIZER")) else {
-        eprintln!("skipped: set STRAYDOG_DS41_MODEL and STRAYDOG_DS41_TOKENIZER");
+    let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
+    let Some(oracle) = std::env::var_os("STRAYDOG_DS41_TOKENIZER") else {
+        eprintln!("skipped: set STRAYDOG_DS41_TOKENIZER to the model's official tokenizer.json");
         return;
     };
     let mut file = std::io::BufReader::new(std::fs::File::open(first_shard(&PathBuf::from(model))).unwrap());
@@ -50,10 +54,7 @@ fn the_gguf_tokenizer_encodes_as_the_official_one() {
 fn the_gguf_template_renders_as_the_reference_encoder() {
     use straydog_engine::chat::ChatTemplate;
     use straydog_engine::pyjson::{self, Value};
-    let Some(model) = std::env::var_os("STRAYDOG_DS41_MODEL") else {
-        eprintln!("skipped: set STRAYDOG_DS41_MODEL");
-        return;
-    };
+    let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
     let mut file = std::io::BufReader::new(std::fs::File::open(first_shard(&PathBuf::from(model))).unwrap());
     let header = straydog_gguf::inspect(&mut file).unwrap();
     let source = header.metadata["tokenizer.chat_template"].text().unwrap();
