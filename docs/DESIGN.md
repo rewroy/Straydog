@@ -29,9 +29,9 @@ logic: they follow from the official chat template and the OpenAI message format
 ## 3. Contracts
 
 - **Exactness.** Activations are never quantized. Weights decode exactly to F32.
-  FP16 GEMM is used only when configured. A speculative verification pass is
-  bitwise identical to token-by-token decode in the same placement. Unsupported
-  formats are an error, never a silent conversion.
+  FP16 products (GEMM, and RDNA4's prefill attention) are used only when configured.
+  A speculative verification pass is bitwise identical to token-by-token decode in the
+  same placement. Unsupported formats are an error, never a silent conversion.
 - **Isolation.** The engine runs in a separate worker process without network
   access: bubblewrap on Linux, an AppContainer of its own on Windows. The worker is
   the same executable. Every model and drafter file is pinned by SHA-256 and
@@ -121,6 +121,21 @@ the server is ready 22-23 s after a cold start, reading the SSD at 4.3-4.6 GB/s 
 s before), and 13-14 s with the files cached, where copying them from the page cache and
 SHA-256 on every core (7.5 s) and the K/V page-locking bound the reading (19 s before).
 `ready` reports the steps' seconds.
+
+### 4.5 Long-context prefill
+
+Every fourth layer attends sparsely: an indexer scores the prompt's 4-token blocks and each
+token attends the keys of its 512 best complete blocks and those of its own incomplete block. A prompt is prefilled
+in batches (2048 rows on two R9700s at 262144 tokens), split into 256-row chunks for the
+indexer. Its block scores are a tiled F32 product, and a chunk's rows past 6144 blocks are
+selected in registers, each row read once; both give the one-token kernels' scores and
+selection bit for bit. With FP16 GEMM on RDNA4, a batch's attention runs at once: groups of 16
+tokens walk the union of their selected blocks (about 2700 of 32768 at 131072 tokens, against
+16 x 513), so each key and value is read once per group, with FP16 WMMA products accumulated in
+F32 and an F32 softmax. With host K/V, a layer's prefix is staged in VRAM for its batch; the
+copy for a device's next attention layer runs on a stream of its own while the layers before
+it compute. Prefill (IQ3_S, two R9700s, 262144 context): 131072 tokens 51.2 -> 34.6 s,
+65536 21.1 -> 16.1 s, 20480 6.1 -> 5.1 s, 4096 1.5 -> 1.2 s.
 
 ## 5. Command line and configuration
 

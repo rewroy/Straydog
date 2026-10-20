@@ -273,3 +273,193 @@ __device__ unsigned qsa_rows_scan(unsigned value, unsigned* partial, unsigned& t
     __syncthreads();
     return before + inclusive - value;
 }
+
+// Batched prefill attention (RDNA4). Nearby tokens select overlapping blocks, so groups of
+// qsa_group tokens attend together: each group walks the union of its tokens' blocks in block
+// order, reading every key and value once for all of them, and masks the blocks a token did not
+// select. A token attends key j when it selected j's block and j is not after it, which is its
+// explicit selection: complete blocks whole, the incomplete block up to the token.
+constexpr size_t qsa_group = 16, qsa_group_capacity = qsa_group * 513;   // a token selects at most 513 blocks
+// Bit (token % qsa_group) of marks[group * stride + block] for every block a token's selection
+// touches (the lists are in block order, so a block's first entry marks it).
+__global__ void qsa_mark_blocks(const float* packed, size_t steps, size_t selected, size_t first, size_t stride,
+                                uint32_t* marks) {
+    const size_t token = blockIdx.x, index_start = steps * (24 * 256 + 1024);
+    const float* indices = packed + index_start + token * selected;
+    const size_t count = size_t(packed[index_start + steps * selected + token]), row = first + token;
+    uint32_t* group = marks + row / qsa_group * stride;
+    for (size_t i = threadIdx.x; i < count; i += 256) {
+        const size_t block = size_t(indices[i]) / 4;
+        if (i == 0 || size_t(indices[i - 1]) / 4 != block) atomicOr(group + block, 1u << (row % qsa_group));
+    }
+}
+// Each group's marked blocks in order, with their token masks; clears nothing (the caller zeroes marks).
+__global__ void qsa_union_blocks(const uint32_t* marks, size_t stride, size_t base, size_t steps, uint32_t* blocks,
+                                 uint32_t* masks, uint32_t* counts) {
+    const size_t group = blockIdx.x, last = std::min(steps, (group + 1) * qsa_group) - 1, end = (base + last) / 4 + 1;
+    const uint32_t* row = marks + group * stride;
+    const unsigned t = threadIdx.x;
+    __shared__ unsigned partial[8];
+    unsigned found = 0;
+    for (size_t first = 0; first < end; first += 1024) {
+        uint32_t mark[4];
+        unsigned own = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const size_t block = first + t * 4 + j;
+            mark[j] = block < end ? row[block] : 0u;
+            own += mark[j] != 0;
+        }
+        unsigned total = 0;
+        unsigned out = found + qsa_rows_scan<8>(own, partial, total);
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j)
+            if (mark[j]) {
+                blocks[group * qsa_group_capacity + out] = uint32_t(first + t * 4 + j);
+                masks[group * qsa_group_capacity + out] = mark[j];
+                ++out;
+            }
+        found += total;
+    }
+    if (t == 0) counts[group] = found;
+}
+#if defined(__HIPCC__)
+// One block per (group, KV head): 24 waves, a pair for each 16 of the group's 192 query rows
+// (token-major, twelve heads per token), each wave of a pair half the 256 dimensions. Keys and
+// values come eight union blocks (32 keys) at a time into LDS as FP16, the next tile's loads in
+// flight while this one computes. Per 16 keys, S^T = K Q^T and O^T += V^T P^T are FP16 WMMA with
+// F32 accumulation (keys as rows, so a lane's scores and output belong to one query row and P^T
+// is already the B operand): the pair adds its two halves of S^T through LDS and both run the
+// same F32 online softmax. A pair skips keys none of its tokens selected.
+constexpr unsigned qsa_flash_blocks = 8;
+__global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const float* state, size_t capacity, size_t base,
+                                                                 size_t steps, const __half* half_queries,
+                                                                 const uint32_t* union_blocks, const uint32_t* union_masks,
+                                                                 const uint32_t* union_counts, float* output) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr unsigned threads = qsa_group * 48, keys_per_tile = qsa_flash_blocks * 4;
+    constexpr unsigned loads = keys_per_tile * 64, staged_per_thread = (loads + threads - 1) / threads;
+    const unsigned group = blockIdx.x, kv = blockIdx.y, t = threadIdx.x, lane = t % 32, half = lane / 16;
+    const unsigned wave = __builtin_amdgcn_readfirstlane(t / 32), pair = wave / 2, side = wave % 2;
+    const unsigned row = pair * 16 + lane % 16, local = row / 12, head = row % 12;
+    const size_t token = size_t(group) * qsa_group + local, position = base + token;
+    const bool live = token < steps;
+    // The tokens of this pair's rows: keys none of them selected are skipped.
+    const uint32_t pair_tokens = ((2u << ((pair * 16 + 15) / 12)) - 1) & ~((1u << (pair * 16 / 12)) - 1);
+    moe_half8 query[8];
+    const _Float16* source = reinterpret_cast<const _Float16*>(half_queries) + (token * 24 + kv * 12 + head) * 256 + side * 128 + 8 * half;
+    #pragma unroll
+    for (unsigned k = 0; k < 8; ++k)
+        query[k] = live ? *reinterpret_cast<const moe_half8*>(source + 16 * k) : moe_half8{};
+    moe_float8 sums[8] = {};
+    float maximum = -INFINITY, total = 0;
+    // log2(e) / 16: scores are dot products / sqrt(256), exponentiated in base 2.
+    constexpr float scale = 0.0625f * 1.4426950408889634f;
+    typedef _Float16 half4 __attribute__((ext_vector_type(4)));
+    __shared__ SD_ALIGN(16) _Float16 keys[keys_per_tile][264];       // [key][dimension], padded
+    __shared__ SD_ALIGN(16) _Float16 values[256][keys_per_tile + 8];   // [dimension][key], padded
+    __shared__ SD_ALIGN(16) moe_float8 halves[qsa_group * 48];         // each wave's half of S^T
+    __shared__ uint32_t tile_blocks[qsa_flash_blocks], tile_marks[qsa_flash_blocks];
+    const size_t count = union_counts[group];
+    const uint32_t* blocks = union_blocks + size_t(group) * qsa_group_capacity;
+    const uint32_t* marks = union_masks + size_t(group) * qsa_group_capacity;
+    const float* rows[2] = {state + kv * capacity * 256, state + capacity * 512 + kv * capacity * 256};
+    // Keys then values of a tile: blocks x 4 keys x 64 float4 each.
+    float4 staged[2][staged_per_thread];
+    auto load = [&](size_t first) {
+        #pragma unroll
+        for (unsigned which = 0; which < 2; ++which)
+            #pragma unroll
+            for (unsigned j = 0; j < staged_per_thread; ++j) {
+                const unsigned i = t + j * threads, slot = i / 256;
+                staged[which][j] = float4{0, 0, 0, 0};
+                if (i < loads && first + slot < count)
+                    staged[which][j] = *reinterpret_cast<const float4*>(
+                        rows[which] + (size_t(blocks[first + slot]) * 4 + i / 64 % 4) * 256 + i % 64 * 4);
+            }
+    };
+    auto store = [&](size_t first) {
+        if (t < qsa_flash_blocks) {
+            const bool valid = first + t < count;
+            tile_blocks[t] = valid ? blocks[first + t] : 0u;
+            tile_marks[t] = valid ? marks[first + t] : 0u;
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < staged_per_thread; ++j) {
+            const unsigned i = t + j * threads, key = i / 64, column = i % 64 * 4;
+            if (i >= loads) break;
+            const float4 k = staged[0][j], v = staged[1][j];
+            *reinterpret_cast<half4*>(&keys[key][column]) = half4{_Float16(k.x), _Float16(k.y), _Float16(k.z), _Float16(k.w)};
+            values[column][key] = _Float16(v.x); values[column + 1][key] = _Float16(v.y);
+            values[column + 2][key] = _Float16(v.z); values[column + 3][key] = _Float16(v.w);
+        }
+    };
+    load(0);
+    for (size_t first = 0; first < count; first += qsa_flash_blocks) {
+        store(first);
+        __syncthreads();
+        if (first + qsa_flash_blocks < count) load(first + qsa_flash_blocks);
+        #pragma unroll
+        for (unsigned part = 0; part < keys_per_tile / 16; ++part) {
+            const uint32_t* tile = tile_marks + part * 4;
+            const bool needed = (tile[0] | tile[1] | tile[2] | tile[3]) & pair_tokens;
+            moe_float8 score = {};
+            if (needed) {
+                #pragma unroll
+                for (unsigned k = 0; k < 8; ++k)
+                    score = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        *reinterpret_cast<const moe_half8*>(&keys[part * 16 + lane % 16][side * 128 + 16 * k + 8 * half]), query[k], score);
+                halves[wave * 32 + lane] = score;
+            }
+            __syncthreads();
+            // The same sum in both waves: the first half's scores plus the second's.
+            const moe_float8 other = needed ? halves[(wave ^ 1) * 32 + lane] : moe_float8{};
+            if (part + 1 < keys_per_tile / 16) __syncthreads();   // read before the next part writes
+            if (!needed) continue;
+            score = side ? other + score : score + other;
+            // Lane: query row `row`, keys 8 * half .. + 7 of these 16 (two blocks).
+            float p[8], highest = -INFINITY;
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned slot = part * 4 + half * 2 + i / 4;
+                const size_t key = size_t(tile_blocks[slot]) * 4 + i % 4;
+                const bool selected = live && (tile_marks[slot] >> local & 1u) && key <= position;
+                p[i] = selected ? score[i] * scale : -INFINITY;
+                highest = fmaxf(highest, p[i]);
+            }
+            highest = fmaxf(highest, __shfl_xor(highest, 16, 32));
+            const float updated = fmaxf(maximum, highest), offset = updated == -INFINITY ? 0.0f : updated;
+            float sum = 0;
+            moe_half8 probabilities;
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                p[i] = exp2f(p[i] - offset);
+                sum += p[i];
+                probabilities[i] = _Float16(p[i]);
+            }
+            sum += __shfl_xor(sum, 16, 32);
+            const float rescale = exp2f(maximum - offset);
+            total = total * rescale + sum; maximum = updated;
+            if (rescale != 1.0f) {
+                #pragma unroll
+                for (unsigned n = 0; n < 8; ++n) sums[n] *= rescale;
+            }
+            #pragma unroll
+            for (unsigned n = 0; n < 8; ++n)
+                sums[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                    *reinterpret_cast<const moe_half8*>(&values[side * 128 + 16 * n + lane % 16][part * 16 + 8 * half]),
+                    probabilities, sums[n]);
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    float* target = output + (token * 24 + kv * 12 + head) * 256 + side * 128 + 8 * half;
+    #pragma unroll
+    for (unsigned n = 0; n < 8; ++n) {
+        const moe_float8 value = sums[n] / total;
+        *reinterpret_cast<float4*>(target + 16 * n) = float4{value[0], value[1], value[2], value[3]};
+        *reinterpret_cast<float4*>(target + 16 * n + 4) = float4{value[4], value[5], value[6], value[7]};
+    }
+#endif
+}
+#endif

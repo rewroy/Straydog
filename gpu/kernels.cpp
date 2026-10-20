@@ -239,6 +239,7 @@ struct DecoderLayer {
     size_t verified=0;            // tokens of the last uncommitted verification
 };
 constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1024 * 1024;
+constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
 void check(hipError_t error) {
@@ -1593,9 +1594,8 @@ void* sd_create(int ordinal, uint64_t budget) {
             check(hipMalloc(reinterpret_cast<void**>(&value->expanded), gemm_elements * 4));
             check(hipMalloc(reinterpret_cast<void**>(&value->half_input), value->input_capacity * 2));
             check(hipMalloc(&value->blas_workspace, blas_workspace_bytes));
-            constexpr size_t score_bytes = max_batch * 24 * 2052 * 4;
-            check(hipMalloc(reinterpret_cast<void**>(&value->attention_scores), score_bytes));
-            value->used += gemm_elements * 4 + blas_workspace_bytes + value->input_capacity * 2 + score_bytes;
+            check(hipMalloc(reinterpret_cast<void**>(&value->attention_scores), attention_score_bytes));
+            value->used += gemm_elements * 4 + blas_workspace_bytes + value->input_capacity * 2 + attention_score_bytes;
             blas_check(hipblasCreate(&value->blas));
             blas_check(hipblasSetStream(value->blas, value->stream));
             blas_check(hipblasSetWorkspace(value->blas, value->blas_workspace, blas_workspace_bytes));
