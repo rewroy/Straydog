@@ -155,8 +155,10 @@ prompt batch's while the current one runs, a sampled token's while the drafter r
 drafts' while the first layer does. Decoding waits only for rows still on their way.
 A table can take a verifier of each block read, between read and use (`crate::verity`'s, as
 the expert store does; a block that fails fails its read, and a later use reads it again).
-None is attached yet: rows are as authentic as the mapping's (the file verified at load and
-checked unchanged before each generation).
+DeepSeek-V4.1's Engram table, whose file is not read whole at load, takes its shard's fs-verity
+tree as that verifier (and through the mapping, with `--row-cache 0`, each row's blocks are
+checked the same way); the PLE table takes none yet: its rows are as authentic as the mapping's
+(the file verified at load and checked unchanged before each generation).
 With the IQ3_S bundle on two R9700s, a fresh 4096-token prompt prefills in 1.3 s with the table
 in the page cache, as through the mapping, and in 1.5 s with it evicted (through the mapping
 3.0-3.3 s); decode is unchanged (75 and 125 tokens/s after 1000 and 4096), peak memory
@@ -180,7 +182,7 @@ option, named as llama-server names it where it has the same setting.
 | `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs; for a model read on demand, `experts` splits every layer across the GPUs) | `experts` |
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
-| `--row-cache MIB` | host memory caching rows of the PLE table, read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
+| `--row-cache MIB` | host memory caching rows of the PLE table (or a model's Engram table), read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
 | `--data-dir DIR` | Straydog's data directory: the verity trees of a model read on demand | none (required for such a model) |
 | `--expert-ram GIB` | host memory for routed experts outside VRAM (a model read on demand) | half the host memory, less 4 GiB |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |

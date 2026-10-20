@@ -42,6 +42,9 @@ pub struct Settings {
     /// The experts' host tier; None plans it from `host_memory_bytes`.
     pub host_expert_bytes: Option<u64>,
     pub host_memory_bytes: u64,
+    /// Host memory caching the gathered tables' rows (the Engram table), read from the drive as
+    /// needed and verified as read; 0 reads them through the mapping.
+    pub row_cache_bytes: u64,
 }
 
 pub struct Model {
@@ -116,7 +119,8 @@ impl Model {
                progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Model, String> {
         let started = Instant::now();
         let pins = bundle::on_demand(quantization)?;
-        let files = Pinned::open(root, data_dir, &pins)?;
+        let mut files = Pinned::open(root, data_dir, &pins)?;
+        files.cache_tables(settings.row_cache_bytes)?;
         let open_seconds = started.elapsed().as_secs_f64();
         let hp = Hparams::from_header(&files.header)?;
         let layers = hp.layers.len();

@@ -62,6 +62,7 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
         batch: args.prefill_batch_size,
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
+        row_cache_bytes: args.row_cache_bytes,
     };
     let (jobs, queue) = mpsc::channel::<Job>();
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
