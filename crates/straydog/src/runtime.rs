@@ -14,7 +14,7 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 use straydog_api::{Engine, EngineState, Generation, SubmitError};
 use straydog_engine::pyjson;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
@@ -248,7 +248,37 @@ struct Process {
     child: Child,
     tree: straydog_isolation::ProcessTree,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: Frames<BufReader<ChildStdout>>,
+}
+
+/// Newline-terminated JSON frames from the worker. A read may be dropped midway (a control
+/// message or a timeout wins the select it waits in): the bytes of the frame read so far stay
+/// here, and the next read continues the same frame.
+struct Frames<R> {
+    reader: R,
+    partial: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin> Frames<R> {
+    fn new(reader: R) -> Frames<R> {
+        Frames { reader, partial: Vec::new() }
+    }
+
+    async fn read(&mut self) -> Result<Value, String> {
+        // read_until appends what it consumes to `partial` before it can be dropped.
+        let room = (FRAME_BYTES + 1).saturating_sub(self.partial.len()) as u64;
+        let read = (&mut self.reader).take(room).read_until(b'\n', &mut self.partial).await;
+        let line = std::mem::take(&mut self.partial);
+        match read {
+            Ok(0) if line.is_empty() => Err("Straydog worker ended".into()),
+            Ok(_) if line.len() > FRAME_BYTES || !line.ends_with(b"\n") => Err("Straydog worker sent an invalid frame".into()),
+            Ok(_) => serde_json::from_slice::<Value>(&line)
+                .ok()
+                .filter(Value::is_object)
+                .ok_or_else(|| "invalid Straydog response".into()),
+            Err(exc) => Err(exc.to_string()),
+        }
+    }
 }
 
 impl Process {
@@ -276,17 +306,7 @@ impl Process {
     }
 
     async fn read(&mut self) -> Result<Value, String> {
-        let mut line = Vec::new();
-        let read = (&mut self.stdout).take(FRAME_BYTES as u64 + 1).read_until(b'\n', &mut line).await;
-        match read {
-            Ok(0) => Err("Straydog worker ended".into()),
-            Ok(_) if line.len() > FRAME_BYTES || !line.ends_with(b"\n") => Err("Straydog worker sent an invalid frame".into()),
-            Ok(_) => serde_json::from_slice::<Value>(&line)
-                .ok()
-                .filter(Value::is_object)
-                .ok_or_else(|| "invalid Straydog response".into()),
-            Err(exc) => Err(exc.to_string()),
-        }
+        self.stdout.read().await
     }
 }
 
@@ -467,7 +487,7 @@ impl Driver {
         });
         let mut process = Process {
             stdin: child.stdin.take().unwrap(),
-            stdout: BufReader::new(child.stdout.take().unwrap()),
+            stdout: Frames::new(BufReader::new(child.stdout.take().unwrap())),
             child,
             tree,
         };
@@ -677,5 +697,40 @@ impl Engine for Runtime {
             Ok(Generation { events, interrupt: Box::new(interrupt) })
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame split across writes survives a read dropped between its halves (as when a
+    /// control message wins the select), and frames after it stay in step.
+    #[tokio::test]
+    async fn a_dropped_read_keeps_the_partial_frame() {
+        let (mut worker, server) = tokio::io::duplex(64);
+        let mut frames = Frames::new(BufReader::new(server));
+        worker.write_all(br#"{"id":"a","event":"tok"#).await.unwrap();
+        tokio::select! {
+            biased;
+            _ = frames.read() => panic!("half a frame read as a whole"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        worker.write_all(b"en\",\"text\":\"x\"}\n{\"id\":\"a\",\"event\":\"done\"}\n").await.unwrap();
+        let first = frames.read().await.unwrap();
+        assert_eq!(first, json!({"id": "a", "event": "token", "text": "x"}));
+        assert_eq!(frames.read().await.unwrap()["event"], "done");
+        drop(worker);
+        assert_eq!(frames.read().await.unwrap_err(), "Straydog worker ended");
+    }
+
+    /// A frame cut off by the worker's end is refused, not taken as the end alone.
+    #[tokio::test]
+    async fn a_truncated_frame_is_invalid() {
+        let (mut worker, server) = tokio::io::duplex(64);
+        let mut frames = Frames::new(BufReader::new(server));
+        worker.write_all(br#"{"id":"a""#).await.unwrap();
+        drop(worker);
+        assert_eq!(frames.read().await.unwrap_err(), "Straydog worker sent an invalid frame");
     }
 }
