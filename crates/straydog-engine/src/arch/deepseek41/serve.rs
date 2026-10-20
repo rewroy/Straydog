@@ -1,17 +1,20 @@
-//! DeepSeek-V4.1 served (docs/DESIGN.md §10): the authenticated shards ([`Pinned`]), the layers
-//! split across the GPUs where no layer reads another part's compressed rows, each GPU's VRAM
-//! left after its dense weights and state given to expert slots and the host memory planned for
-//! the experts' host tier, then prompts continued from the sequence the engines hold, sampling
-//! and the request's metrics. The engines are driven only through their public passes.
+//! DeepSeek-V4.1 served (docs/DESIGN.md §10): the authenticated shards ([`Pinned`]), placed on the
+//! GPUs either with every layer split across them (one engine, experts divided by rows) or with
+//! the layers split where no layer reads another part's compressed rows (one engine per GPU);
+//! each GPU's VRAM left after its dense weights and state given to expert slots and the host
+//! memory planned for the experts' host tier, then prompts continued from the sequence the engines
+//! hold, sampling and the request's metrics. The engines are driven only through their public
+//! passes.
 
 use std::path::Path;
 use std::time::Instant;
 
 use serde_json::{json, Map, Value};
 
-use super::engine::{forward_split, Engine, Settings as EngineSettings};
+use super::engine::{divided, forward_split, Engine, Settings as EngineSettings};
 use super::Hparams;
 use crate::bundle;
+use crate::group::SplitMode;
 use crate::model::Rng;
 use crate::pinned::Pinned;
 use crate::sampling::{self, Generated, Sampling};
@@ -28,6 +31,9 @@ const HOST_KEEP: u64 = 4 << 30;
 
 pub struct Settings {
     pub devices: Vec<usize>,
+    /// With several GPUs: Experts splits every layer across them (experts by rows), Layer gives
+    /// each a range of layers.
+    pub split_mode: SplitMode,
     /// VRAM budget per GPU.
     pub vram_bytes: u64,
     pub context: usize,
@@ -114,18 +120,37 @@ impl Model {
         let open_seconds = started.elapsed().as_secs_f64();
         let hp = Hparams::from_header(&files.header)?;
         let layers = hp.layers.len();
-        let (mut dense, mut expert_bytes, mut head) = (vec![0u64; layers], vec![0u64; layers], 0u64);
+        // Per layer: the routed experts' bytes, and the resident bytes kept whole on every device
+        // and divided among an engine's devices; the same for the head.
+        let (mut expert_bytes, mut whole, mut parted) = (vec![0u64; layers], vec![0u64; layers], vec![0u64; layers]);
+        let (mut head_whole, mut head_parted) = (0u64, 0u64);
         for (name, bytes) in files.tensor_bytes() {
             match layer_of(name) {
                 Some(layer) if layer < layers && name.ends_with("_exps.weight") => expert_bytes[layer] += bytes,
-                Some(layer) if layer < layers => dense[layer] += bytes,
-                _ if name.starts_with("output") => head += bytes,
+                Some(layer) if layer < layers && divided(name) => parted[layer] += bytes,
+                Some(layer) if layer < layers => whole[layer] += bytes,
+                _ if name.starts_with("output") && divided(name) => head_parted += bytes,
+                _ if name.starts_with("output") => head_whole += bytes,
                 _ => {}
             }
         }
-        let parts = split(&hp, &dense, head, settings.devices.len())?;
-        let slot_bytes = |range: &std::ops::Range<usize>| range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1);
-        // The sequence state of a part: window rings, and each kv source's compressed rows and keys.
+        // The engines: their devices and layers.
+        let groups: Vec<(Vec<usize>, std::ops::Range<usize>)> = match settings.split_mode {
+            SplitMode::Experts => vec![(settings.devices.clone(), 0..layers)],
+            SplitMode::Layer => {
+                let dense: Vec<u64> = whole.iter().zip(&parted).map(|(a, b)| a + b).collect();
+                let ranges = split(&hp, &dense, head_whole + head_parted, settings.devices.len())?;
+                settings.devices.iter().zip(ranges).map(|(&device, range)| (vec![device], range)).collect()
+            }
+        };
+        // An expert's bytes in a slot: the largest of the engine's layers, each device holding
+        // its rows of it (whole 256-byte units, as the store lays them out).
+        let slot_bytes = |(devices, range): &(Vec<usize>, std::ops::Range<usize>)| {
+            let largest = range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1);
+            (largest / devices.len() as u64).next_multiple_of(256) * devices.len() as u64
+        };
+        // The sequence state of an engine's layers, on each of its devices: window rings, and each
+        // kv source's compressed rows and keys.
         let state = |range: &std::ops::Range<usize>| -> u64 {
             let ring = (hp.window + settings.batch) * hp.head_dim * 4 * range.len();
             let sources: usize = hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer))
@@ -134,44 +159,54 @@ impl Model {
             (ring + sources) as u64
         };
         let total_experts: u64 = expert_bytes.iter().sum();
+        // Per engine: the experts its devices hold in VRAM together (each device its rows of every
+        // one), from what each device has left after its resident share, state and work buffers.
         let mut slots = Vec::new();
-        for range in &parts {
-            let fixed = dense[range.clone()].iter().sum::<u64>() + if range.end == layers { head } else { 0 } + state(range) + SCRATCH + RESERVE;
+        for group in &groups {
+            let (devices, range) = group;
+            let parts = devices.len() as u64;
+            let head = if range.end == layers { head_whole + head_parted.div_ceil(parts) } else { 0 };
+            let resident: u64 = range.clone().map(|layer| whole[layer] + parted[layer].div_ceil(parts)).sum::<u64>() + head;
+            let fixed = resident + state(range) + SCRATCH + RESERVE;
             let free = settings.vram_bytes.checked_sub(fixed)
-                .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM", settings.vram_bytes as f64 / (1u64 << 30) as f64))?;
-            slots.push(((free / slot_bytes(range)) as usize).min(range.len() * hp.experts));
+                .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64))?;
+            // Each device's share of an expert is 1/parts of a slot: free / share experts.
+            let held = (free / (slot_bytes(group) / parts)) as usize;
+            slots.push(held.min(range.len() * hp.experts) / devices.len() * devices.len());
         }
-        let in_vram: u64 = parts.iter().zip(&slots).map(|(range, &slots)| slots as u64 * slot_bytes(range)).sum();
+        let in_vram: u64 = groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).sum();
         let host = settings.host_expert_bytes.unwrap_or_else(|| {
             ((settings.host_memory_bytes as f64 * HOST_SHARE) as u64).saturating_sub(HOST_KEEP).min(total_experts.saturating_sub(in_vram))
         });
-        let whole = files.whole_bytes(|_| true);
+        let whole_bytes = files.whole_bytes(|_| true);
         let files: &'static Pinned = Box::leak(Box::new(files));
         let placed = Instant::now();
-        let state_bytes = parts.iter().map(state).sum();
-        // The page-locked host tier is shared out by the parts' expert bytes.
-        let part_experts: Vec<u64> = parts.iter().map(|range| expert_bytes[range.clone()].iter().sum()).collect();
+        let state_bytes = groups.iter().map(|(devices, range)| state(range) * devices.len() as u64).sum();
+        // The page-locked host tier is shared out by the engines' expert bytes, then among an
+        // engine's devices (each keeps its rows).
+        let group_experts: Vec<u64> = groups.iter().map(|(_, range)| expert_bytes[range.clone()].iter().sum()).collect();
         let loading = std::sync::atomic::AtomicBool::new(true);
         let engines = std::thread::scope(|scope| {
             // The dense weights verify as the engines take them: their bytes are the progress.
             scope.spawn(|| {
                 while loading.load(std::sync::atomic::Ordering::Relaxed) {
-                    progress("load", files.verified_bytes(), whole);
+                    progress("load", files.verified_bytes(), whole_bytes);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             });
             let mut engines = Vec::new();
             let result = (|| {
-                for ((device, range), (&slots, &experts)) in settings.devices.iter().zip(&parts).zip(slots.iter().zip(&part_experts)) {
+                for ((devices, range), (&slots, &experts)) in groups.iter().zip(slots.iter().zip(&group_experts)) {
+                    let share = host as f64 * experts as f64 / total_experts.max(1) as f64;
                     let engine_settings = EngineSettings {
                         context: settings.context,
                         batch: settings.batch,
-                        expert_slots: slots,
-                        host_expert_bytes: (host as f64 * experts as f64 / total_experts.max(1) as f64) as u64,
+                        expert_slots: slots / devices.len(),
+                        host_expert_bytes: (share / devices.len() as f64) as u64,
                         scratch_bytes: SCRATCH,
                         layers: range.clone(),
                     };
-                    engines.push(Engine::new(hp.clone(), files, &[*device], settings.vram_bytes, engine_settings)?);
+                    engines.push(Engine::new(hp.clone(), files, devices, settings.vram_bytes, engine_settings)?);
                 }
                 Ok::<_, String>(())
             })();
@@ -191,9 +226,11 @@ impl Model {
         let end = files.header.metadata.get("tokenizer.ggml.eos_token_id").and_then(|value| value.integer())
             .and_then(|id| u32::try_from(id).ok()).ok_or("GGUF tokenizer.ggml.eos_token_id is missing")?;
         let placement = json!({
-            "layers": parts.iter().map(|range| [range.start, range.end]).collect::<Vec<_>>(),
+            "split_mode": match settings.split_mode { SplitMode::Experts => "experts", SplitMode::Layer => "layer" },
+            "layers": groups.iter().map(|(_, range)| [range.start, range.end]).collect::<Vec<_>>(),
+            "devices": groups.iter().map(|(devices, _)| devices.clone()).collect::<Vec<_>>(),
             "expert_slots": slots,
-            "expert_slot_bytes": parts.iter().map(slot_bytes).collect::<Vec<_>>(),
+            "expert_slot_bytes": groups.iter().map(slot_bytes).collect::<Vec<_>>(),
             "host_expert_bytes": host,
             "expert_bytes": total_experts,
             "prefill_batch_size": settings.batch,

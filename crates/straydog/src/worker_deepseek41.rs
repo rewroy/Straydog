@@ -9,6 +9,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use straydog_engine::arch::deepseek41::serve::{Model, Settings};
 use straydog_engine::chat::ChatTemplate;
+use straydog_engine::group::SplitMode;
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
@@ -55,6 +56,7 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
     let host_memory_bytes = if args.host_memory_bytes > 0 { args.host_memory_bytes } else { straydog_engine::host::host_memory_bytes() };
     let settings = Settings {
         devices: args.devices.clone(),
+        split_mode: if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts },
         vram_bytes: args.vram_bytes,
         context: args.context,
         batch: args.prefill_batch_size,

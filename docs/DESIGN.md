@@ -177,7 +177,7 @@ option, named as llama-server names it where it has the same setting.
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget) |
 | `-gpu, --gpu LIST` | GPU ordinals, e.g. `0,1` (`-dev`, `--device` also accepted) | `0` |
-| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs) | `experts` |
+| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs; for a model read on demand, `experts` splits every layer across the GPUs) | `experts` |
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--row-cache MIB` | host memory caching rows of the PLE table, read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
@@ -419,9 +419,11 @@ page-locked RAM, a token costs 20-25 ms on two R9700s; the goal is 30 tokens/s.
 
 It is served like the Qwen model: `straydog -m DIR --data-dir DIR ...` with the same API,
 isolation and dashboard. The bundle's pins name the architecture; the worker opens the six
-shards against their trees, splits the layers across the GPUs where no layer reads another
-part's compressed rows (balancing the dense bytes), gives each GPU's VRAM left after its dense
-weights and sequence state to expert slots, and plans the host tier from the host memory.
+shards against their trees and places them by `--split-mode`: `experts` (the default) splits
+every layer across the GPUs, each holding its part of the attention and the head and its rows of
+every expert; `layer` gives each GPU a range of layers, cut where no layer reads another part's
+compressed rows (balancing the dense bytes). Each GPU's VRAM left after its resident weights and
+sequence state goes to expert slots, and the host tier is planned from the host memory.
 Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the official
 tokenizer's ids; the template renders the reference encoder's prompts), replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A

@@ -217,10 +217,15 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
 pub fn ready_summary(ready: &Value) -> String {
     let placement = &ready["placement"];
     if let Some(slots) = placement["expert_slots"].as_array() {
-        // Layers split across the GPUs, routed experts in VRAM slots and a host tier.
+        // Engines over the GPUs (each over one or several, splitting its layers), routed experts
+        // in VRAM slots and a host tier.
         let gib = |value: &Value| value.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
-        let layers: Vec<String> = placement["layers"].as_array().into_iter().flatten()
-            .map(|range| format!("{}-{}", range[0], range[1].as_u64().unwrap_or(1).saturating_sub(1))).collect();
+        let devices = placement["devices"].as_array().cloned().unwrap_or_default();
+        let layers: Vec<String> = placement["layers"].as_array().into_iter().flatten().enumerate().map(|(index, range)| {
+            let on: Vec<String> = devices.get(index).and_then(Value::as_array).into_iter().flatten().map(Value::to_string).collect();
+            let gpus = if on.len() > 1 { format!(" on GPUs {}", on.join("+")) } else if on.len() == 1 { format!(" on GPU {}", on[0]) } else { String::new() };
+            format!("{}-{}{gpus}", range[0], range[1].as_u64().unwrap_or(1).saturating_sub(1))
+        }).collect();
         let slots: Vec<String> = slots.iter().map(|slots| slots.to_string()).collect();
         return format!(
             "Straydog ready: {} {}, context {}, layers {} with {} expert slots, {:.1} GiB host tier, prefill batch {}; {} using {:.1} of {:.1} GiB",

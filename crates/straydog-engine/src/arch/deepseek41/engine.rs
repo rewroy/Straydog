@@ -438,11 +438,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             names.push(format!("blk.{layer}.exp_probs_b.bias"));
         }
-        let split = |tensor: &str| ["attn_q_b", "attn_sinks", "attn_output_a", "attn_output_b"].iter()
-            .any(|role| tensor.ends_with(&format!(".{role}.weight"))) || tensor == "output.weight";
         for name in names {
             let Ok(tensor) = self.tensors.tensor(&name) else { continue };
-            if parts == 1 || !split(&name) {
+            if parts == 1 || !divided(&name) {
                 for shard in &mut self.shards {
                     shard.upload(name.clone(), tensor.kind, tensor.dims.clone(), tensor.data)?;
                 }
@@ -1195,6 +1193,14 @@ fn compress(shard: &mut Shard, hp: &Hparams, layer: usize, n: usize, freqs: Buff
         shard.gpu.gather(work.pool_gate.at(last * dim), 1, work.all_rows.base(), 1, dim as u64, tail_gate.base())?;
     }
     Ok((groups, left))
+}
+
+/// Whether an engine over several devices divides this resident tensor among them (each holds its
+/// part: of the head and the attention's q_b, sinks and output its heads' or groups', of a shared
+/// expert its rows); every other resident tensor is whole on each device.
+pub fn divided(name: &str) -> bool {
+    ["attn_q_b", "attn_sinks", "attn_output_a", "attn_output_b", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].iter()
+        .any(|role| name.ends_with(&format!(".{role}.weight"))) || name == "output.weight"
 }
 
 /// One pass over engines that run consecutive layers (on their own devices): each hands the stream

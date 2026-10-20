@@ -29,7 +29,7 @@ const STRINGS = {
     load: "load", memory: "Memory", used: "used", straydog: "Straydog", swap: "Swap", available: "available",
     cpu: "CPU", gpu: "GPU", state: "State", placement: "Placement", fullyResident: "fully resident",
     partiallyResident: "GPU + CPU experts", kv: "K/V cache", vramKv: "VRAM", hostMemory: "host memory",
-    layers: "Layers per GPU", expertSlots: "Experts in VRAM", expertSlotsValue: "{0} slots", expertHost: "Experts in host memory",
+    layers: "Layers", layersValue: "{0}–{1} on GPU {2}", expertSlots: "Experts in VRAM", expertSlotsValue: "{0} slots", expertHost: "Experts in host memory",
     context: "Context", tokens: "{0} tokens", prefillBatch: "Prefill batch", drafts: "{0} drafts",
     sequenceState: "Sequence state", loadedIn: "Loaded in", queue: "Queue", requestsDone: "Requests",
     failedCount: "{0} failed", promptTokens: "Prompt tokens", reused: "Reused", generated: "Generated",
@@ -69,7 +69,7 @@ const STRINGS = {
     load: "負荷", memory: "メモリ", used: "使用", straydog: "Straydog", swap: "スワップ", available: "空き",
     cpu: "CPU", gpu: "GPU", state: "状態", placement: "配置", fullyResident: "全常駐",
     partiallyResident: "GPU + CPU エキスパート", kv: "K/V キャッシュ", vramKv: "VRAM", hostMemory: "ホストメモリ",
-    layers: "GPU ごとの層", expertSlots: "VRAM のエキスパート", expertSlotsValue: "{0} スロット", expertHost: "ホストメモリのエキスパート",
+    layers: "層", layersValue: "{0}–{1}（GPU {2}）", expertSlots: "VRAM のエキスパート", expertSlotsValue: "{0} スロット", expertHost: "ホストメモリのエキスパート",
     context: "コンテキスト", tokens: "{0} トークン", prefillBatch: "プレフィルバッチ", drafts: "{0} ドラフト",
     sequenceState: "系列状態", loadedIn: "読み込み", queue: "待ち行列", requestsDone: "リクエスト",
     failedCount: "失敗 {0}", promptTokens: "プロンプト", reused: "再利用", generated: "生成",
@@ -788,13 +788,15 @@ function renderEngine(engine, ready, activity) {
   const stateLabel = { ready: activity.live ? t("generating") : t("ready"), loading: t("loading"), failed: t("failed") }[engine.state];
   const reuse = percent(activity.cached_tokens, activity.prompt_tokens);
   const isReady = engine.state === "ready";
-  // A model read on demand: layers split across the GPUs, routed experts in VRAM slots and a host tier.
+  // A model read on demand: engines over the GPUs (each over one or several, splitting its layers),
+  // routed experts in VRAM slots and a host tier.
   const tiered = Array.isArray(placement.expert_slots);
   const items = [
     [t("state"), engine.state === "failed" ? `${stateLabel} · ${engine.error}` : stateLabel, "state"],
     isReady && !tiered && [t("placement"), placement.resident ? t("fullyResident") : t("partiallyResident")],
     isReady && !tiered && [t("kv"), placement.host_kv ? t("hostMemory") : t("vramKv")],
-    isReady && tiered && [t("layers"), (placement.layers || []).map(([first, end]) => `${first}–${end - 1}`).join(" · ")],
+    isReady && tiered && [t("layers"), (placement.layers || [])
+      .map(([first, end], index) => t("layersValue", first, end - 1, ((placement.devices || [])[index] || []).join("+") || "-")).join(" · ")],
     isReady && tiered && [t("expertSlots"), t("expertSlotsValue", placement.expert_slots.map((slots) => number(slots)).join(" + "))],
     isReady && tiered && [t("expertHost"), `${gib(placement.host_expert_bytes)} GiB`],
     isReady && [t("context"), number(ready.context)],
