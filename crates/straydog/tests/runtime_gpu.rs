@@ -5,6 +5,8 @@
 //! cargo test -p straydog --features hip --test runtime_gpu. This test binary also serves as
 //! the worker (run with `worker ...`), started unisolated: isolation is tested on its own.
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -51,10 +53,7 @@ fn main() {
         }
         return;
     }
-    let Some(model) = std::env::var_os("STRAYDOG_MODEL") else {
-        eprintln!("skipped: set STRAYDOG_MODEL");
-        return;
-    };
+    let Some(model) = common::model_env("STRAYDOG_MODEL", "a model bundle directory") else { return };
     let options = Options {
         model: Some(PathBuf::from(model)),
         model_draft: std::env::var_os("STRAYDOG_DRAFTER").map(PathBuf::from),

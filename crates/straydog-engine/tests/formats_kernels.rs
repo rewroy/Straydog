@@ -18,6 +18,8 @@
 //! STRAYDOG_DEEPSEEK to its directory.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
+mod common;
+
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -192,10 +194,7 @@ struct Shards {
 
 impl Shards {
     fn open() -> Option<Shards> {
-        let Some(root) = std::env::var_os("STRAYDOG_DEEPSEEK") else {
-            eprintln!("skipped: set STRAYDOG_DEEPSEEK to the DeepSeek-V4.1-Flash UD-IQ2_XXS directory");
-            return None;
-        };
+        let root = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory")?;
         let mut paths: Vec<PathBuf> = std::fs::read_dir(root).unwrap().map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "gguf")).collect();
         paths.sort();

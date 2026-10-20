@@ -7,6 +7,8 @@
 //! --gemm f32), re-pins the generations with STRAYDOG_GOLDEN_UPDATE=1.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
+mod common;
+
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
@@ -22,9 +24,9 @@ fn digest(values: &[f32]) -> String {
 
 #[test]
 fn generations_equal_the_reference() {
-    let (Some(model_root), Some(drafter)) = (std::env::var_os("STRAYDOG_MODEL"), std::env::var_os("STRAYDOG_DRAFTER"))
+    let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
+                                             common::model_env("STRAYDOG_DRAFTER", "the drafter directory"))
     else {
-        eprintln!("skipped: set STRAYDOG_MODEL and STRAYDOG_DRAFTER");
         return;
     };
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");

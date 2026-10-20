@@ -4,6 +4,8 @@
 //! The golden file is pinned data: the reference that made it was retired in phase R6. The model
 //! cases need the bundle the golden file was made from: set STRAYDOG_MODEL.
 
+mod common;
+
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
@@ -41,10 +43,7 @@ fn iq_grids_and_block_decoding_equal_the_reference() {
 #[test]
 fn model_tensors_vectors_and_rows_equal_the_reference() {
     let golden = golden();
-    let Some(root) = std::env::var_os("STRAYDOG_MODEL") else {
-        eprintln!("skipped: set STRAYDOG_MODEL to the bundle of tests/golden/weights.json");
-        return;
-    };
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the bundle of tests/golden/weights.json") else { return };
     let model = &golden["model"];
     let mut weights = Weights::open(&PathBuf::from(root), model["quantization"].as_str().unwrap(), None, 0,
                                     &|_, _, _| {}).unwrap();

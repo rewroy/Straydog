@@ -4,6 +4,8 @@
 //! The golden file is pinned data: the reference that made it was retired in phase R6. Chat
 //! cases need the pinned tokenizer and template: set STRAYDOG_MODEL to a model bundle directory.
 
+mod common;
+
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
@@ -19,10 +21,7 @@ fn golden() -> Json {
 
 /// The pinned resources the golden file was made from, or None (the test is skipped).
 fn resources(golden: &Json) -> Option<(ChatTemplate, Text)> {
-    let Some(model) = std::env::var_os("STRAYDOG_MODEL") else {
-        eprintln!("skipped: set STRAYDOG_MODEL to a model bundle directory");
-        return None;
-    };
+    let model = common::model_env("STRAYDOG_MODEL", "a model bundle directory")?;
     let read = |name: &str| {
         let data = std::fs::read(PathBuf::from(&model).join(name)).unwrap();
         let pin = golden["resources"][name].as_str().unwrap();
