@@ -150,7 +150,8 @@ struct Matrix {
 // One GEMV row range: lanes cooperating per row (0 selects the reference decoder).
 struct GemvItem { Matrix matrix; uint32_t first_wave, lanes; };
 // Every GGML type the GPU kernels decode (weight<kind>); dispatch sites expand it.
-#define SD_FORMATS(X) X(0) X(1) X(2) X(6) X(8) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(30) X(42)
+#define SD_FORMATS(X) X(0) X(1) X(2) X(6) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) \
+    X(29) X(30) X(42)
 // Allocations carry a small tail so aligned word loads of two-byte-aligned
 // quant blocks never cross the end of an owned buffer.
 constexpr size_t allocation_tail = 64;
@@ -478,11 +479,11 @@ __constant__ SD_ALIGN(16) uint8_t iq_grid3xxs[256 * 4], iq_grid3s[512 * 4], iq_g
 extern "C" const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 std::atomic<bool> iq_uploaded{false};
 __host__ __device__ inline bool iq_kind(int kind) {
-    return kind == 16 || kind == 17 || kind == 18 || kind == 21 || kind == 22 || kind == 29;
+    return kind == 16 || kind == 17 || kind == 18 || kind == 19 || kind == 21 || kind == 22 || kind == 29;
 }
 // Bytes of one 256-value IQ super-block.
 __host__ __device__ constexpr size_t iq_block_bytes(int kind) {
-    return kind == 16 ? 66 : kind == 17 ? 74 : kind == 22 ? 82 : kind == 18 ? 98 : kind == 29 ? 56 : 110;
+    return kind == 16 ? 66 : kind == 17 ? 74 : kind == 22 ? 82 : kind == 18 ? 98 : kind == 29 ? 56 : kind == 19 ? 50 : 110;
 }
 // Seven stored sign bits plus the eighth, which keeps the number of negatives even.
 __device__ __forceinline__ unsigned iq_signs(unsigned bits) { return bits | ((__popc(bits) & 1u) << 7); }
@@ -501,14 +502,24 @@ __device__ __forceinline__ void iq1m_group(const uint8_t* b, unsigned ib, unsign
     delta = high & 8 ? -0.125f : 0.125f;
     index = b[4 * ib + l] | ((high & 7) << 8);
 }
+// IQ1_S (50 bytes): d, qs[32], then per 32 values a 16-bit word of four 3-bit grid-row high
+// parts, a 3-bit scale and the delta's sign. Group l of block ib: its scale, delta and grid row.
+__device__ __forceinline__ void iq1s_group(const uint8_t* b, unsigned ib, unsigned l, float& dl, float& delta,
+                                           unsigned& index) {
+    const unsigned high = unsigned(b[34 + 2 * ib]) | unsigned(b[35 + 2 * ib]) << 8;
+    dl = half_at(b) * float(2 * ((high >> 12) & 7) + 1);
+    delta = high & 0x8000 ? -0.125f : 0.125f;
+    index = b[2 + 4 * ib + l] | (((high >> (3 * l)) & 7) << 8);
+}
 // The eight values of group l (0-3) of 32-value block ib in an IQ super-block b,
 // exactly as iq_weight decodes each of them.
 template<int kind>
 __device__ void iq_decode8(const uint8_t* b, unsigned ib, unsigned l, float (&v)[8]) {
-    if (kind == 29) {
+    if (kind == 29 || kind == 19) {
         float dl, delta;
         unsigned index;
-        iq1m_group(b, ib, l, dl, delta, index);
+        if (kind == 29) iq1m_group(b, ib, l, dl, delta, index);
+        else iq1s_group(b, ib, l, dl, delta, index);
         #pragma unroll
         for (int j = 0; j < 8; ++j) v[j] = dl * (float(iq_grid1s[index * 8 + j]) - 1.0f + delta);
         return;
@@ -547,16 +558,17 @@ __device__ void iq_decode8(const uint8_t* b, unsigned ib, unsigned l, float (&v)
     #pragma unroll
     for (int j = 0; j < 8; ++j) v[j] = db * float(g[j]) * ((signs >> j) & 1 ? -1.0f : 1.0f);
 }
-// One value of an IQ2_XXS (16), IQ2_XS (17), IQ2_S (22), IQ3_XXS (18), IQ3_S (21) or
-// IQ1_M (29) super-block of 256: scale * grid value * sign (IQ1_M: scale * (grid value
+// One value of an IQ2_XXS (16), IQ2_XS (17), IQ2_S (22), IQ3_XXS (18), IQ3_S (21), IQ1_S (19)
+// or IQ1_M (29) super-block of 256: scale * grid value * sign (IQ1: scale * (grid value
 // + delta)), every product exact in F32.
 template<int kind>
 __device__ float iq_weight(const uint8_t* b, unsigned i) {
     const unsigned ib = i / 32, l = (i % 32) / 8, j = i % 8;
-    if (kind == 29) {
+    if (kind == 29 || kind == 19) {
         float dl, delta;
         unsigned index;
-        iq1m_group(b, ib, l, dl, delta, index);
+        if (kind == 29) iq1m_group(b, ib, l, dl, delta, index);
+        else iq1s_group(b, ib, l, dl, delta, index);
         return dl * (float(iq_grid1s[index * 8 + j]) - 1.0f + delta);
     }
     const float d = half_at(b);
@@ -616,9 +628,15 @@ __device__ float weight(const uint8_t* data, size_t col) {
         return half_at(b) * (int(code) - (kind == 6 ? 16 : 8));
     }
     if (iq_kind(kind)) return iq_weight<kind>(data + (col / 256) * iq_block_bytes(kind), unsigned(col % 256));
-    const size_t stride = kind == 11 ? 110 : kind == 12 ? 144 : kind == 13 ? 176 : kind == 14 ? 210 : 136;
+    const size_t stride = kind == 10 ? 84 : kind == 11 ? 110 : kind == 12 ? 144 : kind == 13 ? 176 : kind == 14 ? 210 : 136;
     const uint8_t* b = data + (col / 256) * stride;
     const unsigned i = unsigned(col % 256), group = i / 32;
+    if (kind == 10) {   // Q2_K: scales[16] qs[64] d dmin; in each half, two bits of qs at shift 2 * quarter
+        const unsigned half = i / 128, quarter = (i % 128) / 32, lane = i % 32;
+        const unsigned scale = b[8 * half + 2 * quarter + lane / 16];
+        const unsigned code = (b[16 + 32 * half + lane] >> (2 * quarter)) & 3;
+        return half_at(b + 80) * float(scale & 15) * float(code) - half_at(b + 82) * float(scale >> 4);
+    }
     if (kind == 11) {
         const unsigned scale_group = i / 16;
         const uint8_t* scales = b + 96;
@@ -859,8 +877,8 @@ size_t matrix_row_bytes(int kind, uint64_t cols) {
     if (kind == 42 && cols % 64 == 0) return size_t(cols / 64) * 18;
     if ((kind == 2 || kind == 6 || kind == 8 || kind == 20) && cols % 32 == 0)
         return size_t(cols / 32) * (kind == 6 ? 22 : kind == 8 ? 34 : 18);
-    if ((kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23) && cols % 256 == 0)
-        return size_t(cols / 256) * (kind == 11 ? 110 : kind == 12 ? 144 : kind == 13 ? 176 : kind == 14 ? 210 : 136);
+    if ((kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23) && cols % 256 == 0)
+        return size_t(cols / 256) * (kind == 10 ? 84 : kind == 11 ? 110 : kind == 12 ? 144 : kind == 13 ? 176 : kind == 14 ? 210 : 136);
     if (iq_kind(kind) && cols % 256 == 0) {
         if (!iq_uploaded) throw std::runtime_error("IQ grid tables were not provided before the device was created");
         return size_t(cols / 256) * iq_block_bytes(kind);

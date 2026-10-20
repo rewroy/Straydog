@@ -570,9 +570,78 @@ template<> struct GemvFormat<29> {   // IQ1_M: grid rows store value + 1, so a g
         for (int v = 0; v < V; ++v) r[v] = d0 * first[v] + d1 * second[v];
     }
 };
+template<> struct GemvFormat<19> {   // IQ1_S: grid rows store value + 1, so a group adds (delta - 1) * sum(x)
+    static constexpr size_t elements = 32, alignment = 2;
+    template<int V>
+    __device__ static void dots(const uint8_t* row, size_t unit, const float* x, uint32_t stride, float (&r)[V]) {
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(row + (unit / 8) * 50);
+        const unsigned ib = unsigned(unit % 8);
+        const uint32_t q = iq_pair(h, 1 + 2 * ib);
+        const unsigned high = h[17 + ib];
+        float sum[V], total[V];
+        #pragma unroll
+        for (int v = 0; v < V; ++v) { sum[v] = 0; total[v] = 0; }
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = reinterpret_cast<const uint2*>(iq_grid1s)[((q >> (8 * l)) & 255) | (((high >> (3 * l)) & 7) << 8)];
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                const float* values = x + v * stride + unit * 32 + 8 * l;
+                const float4 lo = gemv_load4(values), hi = gemv_load4(values + 4);
+                sum[v] = gemv_dot4(g.y, hi, gemv_dot4(g.x, lo, sum[v]));
+                total[v] += gemv_sum4(lo) + gemv_sum4(hi);
+            }
+        }
+        const float dl = gemv_half(h[0]) * float(2 * ((high >> 12) & 7) + 1), shift = high & 0x8000 ? -1.125f : -0.875f;
+        #pragma unroll
+        for (int v = 0; v < V; ++v) r[v] = dl * fmaf(shift, total[v], sum[v]);
+    }
+};
+// Q2_K: one lane owns half of an 84-byte super-block (128 values): eight groups of 16, each
+// with a four-bit scale and minimum; d * sum(scale * code * x) - dmin * sum(minimum * x).
+template<> struct GemvFormat<10> {
+    static constexpr size_t elements = 128, alignment = 4;
+    template<int V>
+    __device__ static void dots(const uint8_t* row, size_t unit, const float* x, uint32_t stride, float (&r)[V]) {
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(row + (unit / 2) * 84);
+        const int half = int(unit % 2);
+        uint32_t codes[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) codes[i] = words[4 + 8 * half + i];
+        const uint32_t scales[2] = {words[2 * half], words[2 * half + 1]}, dm = words[20];
+        float scaled[V], minimums[V];
+        #pragma unroll
+        for (int v = 0; v < V; ++v) { scaled[v] = 0; minimums[v] = 0; }
+        #pragma unroll
+        for (int group = 0; group < 8; ++group) {
+            const int quarter = group / 2, side = group % 2;
+            const unsigned scale = (scales[group / 4] >> (8 * (group % 4))) & 255;
+            float sum[V], total[V];
+            #pragma unroll
+            for (int v = 0; v < V; ++v) { sum[v] = 0; total[v] = 0; }
+            #pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t c = (codes[4 * side + m] >> (2 * quarter)) & 0x03030303u;
+                #pragma unroll
+                for (int v = 0; v < V; ++v) {
+                    const float4 a = gemv_load4(x + v * stride + unit * 128 + 32 * quarter + 16 * side + 4 * m);
+                    sum[v] = gemv_dot4(c, a, sum[v]);
+                    total[v] += gemv_sum4(a);
+                }
+            }
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                scaled[v] = fmaf(float(scale & 15), sum[v], scaled[v]);
+                minimums[v] = fmaf(float(scale >> 4), total[v], minimums[v]);
+            }
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) r[v] = gemv_half(dm) * scaled[v] - gemv_half(dm >> 16) * minimums[v];
+    }
+};
 // Formats with a fast unit decoder (others use the reference element decoder).
 #define SD_FAST_FORMATS(X) X(0) X(1) X(30) X(42) X(11) X(12) X(13) X(14) X(23) X(8) X(20) X(16) X(17) X(18) X(21) X(22) \
-    X(29)
+    X(29) X(19) X(10)
 
 constexpr size_t gemv_fixed_items = 24;
 // Up to four activation vectors share one pass over the weights; vector v reads
@@ -691,10 +760,11 @@ size_t gemv_unit(int kind, size_t& alignment) {
         case 0: alignment = 16; return 4;
         case 1: case 30: alignment = 16; return 8;
         case 42: alignment = 2; return 64;
+        case 10: alignment = 4; return 128;
         case 12: case 13: alignment = 16; return 64;
         case 23: alignment = 8; return 64;
         case 11: case 14: alignment = 2; return 128;
-        case 8: case 20: case 16: case 17: case 18: case 21: case 22: case 29: alignment = 2; return 32;
+        case 8: case 20: case 16: case 17: case 18: case 19: case 21: case 22: case 29: alignment = 2; return 32;
     }
     alignment = 0; return 0;
 }

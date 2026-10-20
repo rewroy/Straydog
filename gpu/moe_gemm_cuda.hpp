@@ -49,7 +49,7 @@ __device__ __forceinline__ void moe_values16(const Matrix& m, size_t row, size_t
         float first[8], second[8];
         #define SD_IQ(format) case format: \
             iq_decode8<format>(block, ib, l, first); iq_decode8<format>(block, ib, l + 1, second); break;
-        switch (m.kind) { SD_IQ(16) SD_IQ(17) SD_IQ(18) SD_IQ(21) SD_IQ(22) SD_IQ(29) }
+        switch (m.kind) { SD_IQ(16) SD_IQ(17) SD_IQ(18) SD_IQ(19) SD_IQ(21) SD_IQ(22) SD_IQ(29) }
         #undef SD_IQ
         for (int i = 0; i < 8; ++i) { values[i] = first[i]; values[8 + i] = second[i]; }
         return;
