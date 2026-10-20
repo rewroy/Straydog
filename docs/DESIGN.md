@@ -10,7 +10,7 @@ OpenAI-compatible API, shipped as one executable per GPU backend.
 ## 1. Goals
 
 - One long-lived server keeps the model loaded. Clients start, update and restart
-  without reloading it (authenticating and loading the IQ3_S model takes 13-22 s, §4.4).
+  without reloading it (authenticating and loading the IQ3_S model takes 13-23 s, §4.4).
 - Any OpenAI-compatible client can use it.
 - One executable: the server, the engine, the isolated worker and provisioning. The
   only external pieces are the GPU vendor's runtime and driver.
@@ -117,9 +117,10 @@ page-locked: its 5 s of `hipHostMalloc` hold up the copies.
 A cached chunk is read from the page cache. One that is not goes through it when the files fit
 in three quarters of the host memory, so that a restart finds them, and around it otherwise
 (direct reads). With the IQ3_S bundle and the drafter (84.5 GB) on two R9700s at 262144 tokens,
-the server is ready 22 s after a cold start, reading the SSD at 4.6 GB/s throughout (29 s
-before), and 13 s with the files cached, where SHA-256 on every core and the K/V page-locking
-bound the reading (18 s before). `ready` reports the steps' seconds.
+the server is ready 22-23 s after a cold start, reading the SSD at 4.3-4.6 GB/s throughout (29
+s before), and 13-14 s with the files cached, where copying them from the page cache and
+SHA-256 on every core (7.5 s) and the K/V page-locking bound the reading (19 s before).
+`ready` reports the steps' seconds.
 
 ## 5. Command line and configuration
 
