@@ -1,6 +1,7 @@
 //! The Straydog inference engine.
 
 pub mod alloc;
+pub mod arch;
 pub mod bundle;
 pub mod chat;
 pub mod digest;

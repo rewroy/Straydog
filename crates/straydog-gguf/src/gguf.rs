@@ -19,8 +19,52 @@ pub struct TensorInfo {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A metadata value as the file stores it (arrays hold one element type, never arrays).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Metadata {
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+    Bool(bool),
+    Text(String),
+    Array(Vec<Metadata>),
+}
+
+impl Metadata {
+    /// An integer of either sign that fits `i64`.
+    pub fn integer(&self) -> Option<i64> {
+        match self {
+            Metadata::Unsigned(value) => i64::try_from(*value).ok(),
+            Metadata::Signed(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn float(&self) -> Option<f64> {
+        match self {
+            Metadata::Float(value) => Some(*value),
+            _ => self.integer().map(|value| value as f64),
+        }
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Metadata::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn array(&self) -> Option<&[Metadata]> {
+        match self {
+            Metadata::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelHeader {
+    /// `general.architecture`; which ones are supported is the engine's decision.
     pub architecture: String,
     /// GGUF declaration only. This is NOT an observed running context capacity.
     pub declared_context: Option<u64>,
@@ -33,6 +77,8 @@ pub struct ModelHeader {
     pub tensors: Vec<TensorInfo>,
     /// Small architecture-specific integer arrays, preserving exact PLE hashes.
     pub integer_arrays: BTreeMap<String, Vec<i64>>,
+    /// Every metadata key, within the header bounds above.
+    pub metadata: BTreeMap<String, Metadata>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -84,65 +130,47 @@ impl<R: Read + Seek> Input<'_, R> {
         String::from_utf8(bytes).map_err(|_| invalid("GGUF string is not UTF-8"))
     }
 
-    fn skip(&mut self, bytes: u64) -> io::Result<()> {
-        self.claim(bytes)?;
-        self.reader.seek(SeekFrom::Start(self.pos))?;
-        Ok(())
-    }
-
-    fn value(&mut self, kind: u32) -> io::Result<Value> {
+    fn value(&mut self, kind: u32) -> io::Result<Metadata> {
         match kind {
-            0 => Ok(Value::Unsigned(u8::from_le_bytes(self.bytes()?) as u64)),
-            2 => Ok(Value::Unsigned(u16::from_le_bytes(self.bytes()?) as u64)),
-            4 => Ok(Value::Unsigned(self.u32()? as u64)),
-            10 => Ok(Value::Unsigned(self.u64()?)),
-            7 => {
-                if self.bytes::<1>()?[0] > 1 {
-                    return Err(invalid("invalid GGUF boolean"));
-                }
-                Ok(Value::Other)
-            }
-            8 => Ok(Value::Text(self.string(MAX_STRING_BYTES)?)),
+            0 => Ok(Metadata::Unsigned(u8::from_le_bytes(self.bytes()?) as u64)),
+            2 => Ok(Metadata::Unsigned(u16::from_le_bytes(self.bytes()?) as u64)),
+            4 => Ok(Metadata::Unsigned(self.u32()? as u64)),
+            10 => Ok(Metadata::Unsigned(self.u64()?)),
+            7 => match self.bytes::<1>()?[0] {
+                0 => Ok(Metadata::Bool(false)),
+                1 => Ok(Metadata::Bool(true)),
+                _ => Err(invalid("invalid GGUF boolean")),
+            },
+            8 => Ok(Metadata::Text(self.string(MAX_STRING_BYTES)?)),
             9 => {
                 let element_kind = self.u32()?;
                 let count = self.u64()?;
                 if count > MAX_ARRAY_ITEMS || element_kind > 12 || element_kind == 9 {
                     return Err(invalid("invalid, nested, or oversized GGUF array"));
                 }
-                // Consume one scalar at a time; never allocate a model-sized array.
+                // One element at a time: each is read (and so bounded by the header's bytes)
+                // before the next is allocated.
+                let mut items = Vec::new();
                 for _ in 0..count {
-                    self.value(element_kind)?;
+                    items.push(self.value(element_kind)?);
                 }
-                Ok(Value::Other)
+                Ok(Metadata::Array(items))
             }
-            1 => Ok(Value::Signed(i8::from_le_bytes(self.bytes()?) as i64)),
-            3 => Ok(Value::Signed(i16::from_le_bytes(self.bytes()?) as i64)),
-            5 => Ok(Value::Signed(i32::from_le_bytes(self.bytes()?) as i64)),
-            6 => {
-                self.skip(4)?;
-                Ok(Value::Other)
-            }
-            11 => Ok(Value::Signed(i64::from_le_bytes(self.bytes()?))),
-            12 => {
-                self.skip(8)?;
-                Ok(Value::Other)
-            }
+            1 => Ok(Metadata::Signed(i8::from_le_bytes(self.bytes()?) as i64)),
+            3 => Ok(Metadata::Signed(i16::from_le_bytes(self.bytes()?) as i64)),
+            5 => Ok(Metadata::Signed(i32::from_le_bytes(self.bytes()?) as i64)),
+            6 => Ok(Metadata::Float(f32::from_le_bytes(self.bytes()?) as f64)),
+            11 => Ok(Metadata::Signed(i64::from_le_bytes(self.bytes()?))),
+            12 => Ok(Metadata::Float(f64::from_le_bytes(self.bytes()?))),
             _ => Err(invalid("unknown GGUF metadata type")),
         }
     }
 }
 
-enum Value {
-    Unsigned(u64),
-    Signed(i64),
-    Text(String),
-    Other,
-}
-
-fn unsigned(metadata: &BTreeMap<String, Value>, key: &str) -> io::Result<Option<u64>> {
+fn unsigned(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::Result<Option<u64>> {
     match metadata.get(key) {
         None => Ok(None),
-        Some(Value::Unsigned(value)) => Ok(Some(*value)),
+        Some(Metadata::Unsigned(value)) => Ok(Some(*value)),
         _ => Err(invalid(format!("{key} must be an unsigned integer"))),
     }
 }
@@ -167,10 +195,12 @@ fn geometry(kind: u32) -> io::Result<(u64, u64)> {
         16 => Ok((256, 66)),
         17 => Ok((256, 74)),
         18 => Ok((256, 98)),
+        19 => Ok((256, 50)),
         21 => Ok((256, 110)),
         22 => Ok((256, 82)),
         23 => Ok((256, 136)),
         29 => Ok((256, 56)),
+        39 => Ok((32, 17)),
         42 => Ok((64, 18)),
         _ => Err(invalid(format!("unsupported tensor type {kind}"))),
     }
@@ -180,8 +210,9 @@ fn geometry(kind: u32) -> io::Result<(u64, u64)> {
 ///
 /// Rejects unbounded counts, duplicate names/keys, unsupported formats, invalid
 /// alignment, arithmetic overflow, overlapping tensors, and out-of-file ranges.
-/// Only qwen4exp architecture is accepted. Identity and cross-shard consistency
-/// still need a pinned manifest before any future execution is permitted.
+/// Any well-formed architecture name is reported; whether it runs is the engine's
+/// decision. Identity and cross-shard consistency still need a pinned manifest
+/// before any execution is permitted.
 pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
     let file_bytes = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
@@ -195,7 +226,8 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
     }
     let tensor_count = input.u64()?;
     let metadata_count = input.u64()?;
-    if tensor_count == 0 || tensor_count > MAX_TENSORS || metadata_count > MAX_METADATA {
+    // A split model's first shard may hold only the metadata.
+    if tensor_count > MAX_TENSORS || metadata_count > MAX_METADATA {
         return Err(invalid("invalid GGUF tensor or metadata count"));
     }
     let mut metadata = BTreeMap::new();
@@ -215,15 +247,15 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
             let mut numbers = Vec::new();
             for _ in 0..count {
                 numbers.push(match input.value(element_kind)? {
-                    Value::Unsigned(value) => {
+                    Metadata::Unsigned(value) => {
                         i64::try_from(value).map_err(|_| invalid("PLE integer overflow"))?
                     }
-                    Value::Signed(value) => value,
+                    Metadata::Signed(value) => value,
                     _ => return Err(invalid("invalid PLE integer")),
                 });
             }
-            integer_arrays.insert(key.clone(), numbers);
-            Value::Other
+            integer_arrays.insert(key.clone(), numbers.clone());
+            Metadata::Array(numbers.into_iter().map(Metadata::Signed).collect())
         } else {
             input.value(kind)?
         };
@@ -231,7 +263,22 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
             return Err(invalid("duplicate GGUF metadata key"));
         }
     }
-    let declared_context = unsigned(&metadata, "qwen4exp.context_length")?;
+    let architecture = match metadata.get("general.architecture") {
+        Some(Metadata::Text(value))
+            if !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') =>
+        {
+            value.clone()
+        }
+        None => String::new(),
+        _ => return Err(invalid("invalid GGUF architecture name")),
+    };
+    let declared_context = if architecture.is_empty() {
+        None
+    } else {
+        unsigned(&metadata, &format!("{architecture}.context_length"))?
+    };
     if declared_context == Some(0) {
         return Err(invalid("declared context must be positive"));
     }
@@ -247,11 +294,9 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
     if shard_count > 1 && !metadata.contains_key("split.no") {
         return Err(invalid("split GGUF is missing its shard number"));
     }
-    let architecture = match metadata.get("general.architecture") {
-        Some(Value::Text(value)) if value == "qwen4exp" => value.clone(),
-        None if shard_index > 0 => String::new(),
-        _ => return Err(invalid("expected qwen4exp architecture")),
-    };
+    if architecture.is_empty() && shard_index == 0 {
+        return Err(invalid("the first GGUF shard must declare its architecture"));
+    }
     let mut names = BTreeSet::new();
     let mut tensors = Vec::new();
     for _ in 0..tensor_count {
@@ -330,5 +375,6 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
         shard_count,
         tensors,
         integer_arrays,
+        metadata,
     })
 }

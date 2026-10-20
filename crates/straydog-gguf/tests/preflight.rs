@@ -153,7 +153,7 @@ fn rejects_arrays_with_unbounded_work_or_recursion() {
 }
 
 #[test]
-fn consumes_tokenizer_arrays_without_turning_them_into_metadata_values() {
+fn keeps_tokenizer_arrays_as_metadata() {
     let mut array = Vec::new();
     string(&mut array, "tokenizer.ggml.tokens");
     array.extend_from_slice(&9u32.to_le_bytes());
@@ -170,6 +170,9 @@ fn consumes_tokenizer_arrays_without_turning_them_into_metadata_values() {
     )))
     .unwrap();
     assert_eq!(header.tensors[0].name, "embedding");
+    let tokens: Vec<&str> = header.metadata["tokenizer.ggml.tokens"].array().unwrap().iter()
+        .map(|token| token.text().unwrap()).collect();
+    assert_eq!(tokens, ["猫", "<|im_end|>"]);
 }
 
 #[test]
@@ -187,14 +190,21 @@ fn rejects_ambiguous_metadata_and_tensor_names() {
 }
 
 #[test]
-fn rejects_wrong_architecture_and_mistyped_capacity() {
+fn reports_any_architecture_but_rejects_malformed_names_and_mistyped_capacity() {
+    let header = inspect(&mut Cursor::new(fixture(
+        vec![text("general.architecture", "deepseek41"), number("deepseek41.context_length", 1_048_576)],
+        vec![dense("x", 0)],
+        16,
+    )))
+    .unwrap();
+    assert_eq!((header.architecture.as_str(), header.declared_context), ("deepseek41", Some(1_048_576)));
     rejects(
         fixture(
-            vec![text("general.architecture", "llama")],
+            vec![text("general.architecture", "Llama 3")],
             vec![dense("x", 0)],
             16,
         ),
-        "qwen4exp",
+        "architecture name",
     );
     rejects(
         fixture(
