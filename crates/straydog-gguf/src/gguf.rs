@@ -7,6 +7,9 @@ const MAX_HEADER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_STRING_BYTES: u64 = 1024 * 1024;
 const MAX_METADATA: u64 = 65_536;
 const MAX_ARRAY_ITEMS: u64 = 1_048_576;
+/// Array elements kept across the whole header: a one-byte element becomes a value of some
+/// 32 bytes, so the input bound alone would allow gigabytes (tokenizers use under 1M).
+const MAX_KEPT_ITEMS: u64 = 4_194_304;
 const MAX_TENSORS: u64 = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +92,7 @@ struct Input<'a, R> {
     reader: &'a mut R,
     pos: u64,
     file_bytes: u64,
+    kept_items: u64,
 }
 
 impl<R: Read + Seek> Input<'_, R> {
@@ -145,7 +149,8 @@ impl<R: Read + Seek> Input<'_, R> {
             9 => {
                 let element_kind = self.u32()?;
                 let count = self.u64()?;
-                if count > MAX_ARRAY_ITEMS || element_kind > 12 || element_kind == 9 {
+                self.kept_items = self.kept_items.saturating_add(count);
+                if count > MAX_ARRAY_ITEMS || self.kept_items > MAX_KEPT_ITEMS || element_kind > 12 || element_kind == 9 {
                     return Err(invalid("invalid, nested, or oversized GGUF array"));
                 }
                 // One element at a time: each is read (and so bounded by the header's bytes)
@@ -220,6 +225,7 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
         reader,
         pos: 0,
         file_bytes,
+        kept_items: 0,
     };
     if input.bytes::<4>()? != *b"GGUF" || input.u32()? != 3 {
         return Err(invalid("expected little-endian GGUF version 3"));

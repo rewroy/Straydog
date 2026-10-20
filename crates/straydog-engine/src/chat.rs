@@ -60,8 +60,23 @@ impl ChatTemplate {
         Ok(ChatTemplate { environment, raised })
     }
 
-    /// The prompt for `messages` and `tools`, ending with the assistant's generation prompt.
+    /// The prompt for `messages` and `tools`, ending with the assistant's generation prompt
+    /// (templates that take `enable_thinking` and a `reasoning_effort` of low, medium or xhigh).
     pub fn render(&self, messages: &Value, tools: &Value, thinking: bool, effort: &str) -> Result<String, ChatError> {
+        let decoded = Self::messages(messages)?;
+        if !matches!(effort, "low" | "medium" | "xhigh") {
+            return Err(error("invalid Straydog reasoning effort"));
+        }
+        self.render_decoded(&decoded, tools, &[("enable_thinking", Value::Bool(thinking)), ("reasoning_effort", Value::Str(effort.into()))])
+    }
+
+    /// The prompt for `messages` and `tools` with the template's own variables (a family's
+    /// thinking and effort controls), ending with the assistant's generation prompt.
+    pub fn render_with(&self, messages: &Value, tools: &Value, variables: &[(&str, Value)]) -> Result<String, ChatError> {
+        self.render_decoded(&Self::messages(messages)?, tools, variables)
+    }
+
+    fn messages(messages: &Value) -> Result<Vec<Value>, ChatError> {
         let Value::Array(items) = messages else {
             return Err(error("invalid Straydog messages"));
         };
@@ -76,19 +91,19 @@ impl ChatTemplate {
                 return Err(error("Straydog initially supports text messages only"));
             }
         }
-        let decoded = items.iter().map(template_message).collect::<Result<Vec<_>, _>>()?;
-        if !matches!(effort, "low" | "medium" | "xhigh") {
-            return Err(error("invalid Straydog reasoning effort"));
-        }
+        items.iter().map(template_message).collect()
+    }
+
+    fn render_decoded(&self, decoded: &[Value], tools: &Value, variables: &[(&str, Value)]) -> Result<String, ChatError> {
         let template = self.environment.get_template("chat").map_err(|exc| error(exc.to_string()))?;
         *self.raised.lock().unwrap() = None;
-        let context = minijinja::context! {
-            messages => decoded.iter().map(to_jinja).collect::<Vec<_>>(),
-            tools => to_jinja(tools),
-            add_generation_prompt => true,
-            enable_thinking => thinking,
-            reasoning_effort => effort,
-        };
+        let mut context = vec![
+            ("messages".to_string(), JinjaValue::from(decoded.iter().map(to_jinja).collect::<Vec<_>>())),
+            ("tools".to_string(), to_jinja(tools)),
+            ("add_generation_prompt".to_string(), JinjaValue::from(true)),
+        ];
+        context.extend(variables.iter().map(|(name, value)| (name.to_string(), to_jinja(value))));
+        let context: JinjaValue = context.into_iter().collect();
         let text = template.render(context).map_err(|exc| {
             // The template's own refusal carries its message; anything else is the engine's.
             match self.raised.lock().unwrap().take() {

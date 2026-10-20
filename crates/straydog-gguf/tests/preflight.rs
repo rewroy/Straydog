@@ -153,6 +153,23 @@ fn rejects_arrays_with_unbounded_work_or_recursion() {
 }
 
 #[test]
+fn bounds_the_array_elements_kept_across_the_header() {
+    // Five arrays of a million one-byte elements each fit the byte bound but not the element
+    // budget: the fifth is refused before it is decoded.
+    let mut meta = metadata();
+    for index in 0..5 {
+        let mut array = Vec::new();
+        string(&mut array, &format!("bytes.{index}"));
+        array.extend_from_slice(&9u32.to_le_bytes());
+        array.extend_from_slice(&0u32.to_le_bytes());
+        array.extend_from_slice(&1_000_000u64.to_le_bytes());
+        array.extend(std::iter::repeat_n(0u8, 1_000_000));
+        meta.push(array);
+    }
+    rejects(fixture(meta, vec![dense("embedding", 0)], 16), "oversized GGUF array");
+}
+
+#[test]
 fn keeps_tokenizer_arrays_as_metadata() {
     let mut array = Vec::new();
     string(&mut array, "tokenizer.ggml.tokens");
