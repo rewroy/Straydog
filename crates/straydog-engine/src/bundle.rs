@@ -164,3 +164,115 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
         tensors,
     })
 }
+
+/// Bundles read on demand (docs/DESIGN.md §10): too large to hash whole at each start, each shard
+/// is pinned by size, SHA-256 and the fs-verity digest of its Merkle tree (`crate::verity`). The
+/// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
+/// worker checks every block it uses against them.
+pub const ON_DEMAND_MANIFEST: &str = include_str!("assets_deepseek41.json");
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 1] = ["UD-IQ2_XXS"];
+
+#[derive(Debug, Clone)]
+pub struct OnDemand {
+    pub model: String,
+    /// The GGUF `general.architecture` the shards declare.
+    pub architecture: String,
+    pub quantization: String,
+    pub shards: Vec<Asset>,
+    /// Each shard's fs-verity digest, hex.
+    pub verity: Vec<String>,
+}
+
+fn on_demand_manifest() -> Result<Value, String> {
+    let manifest: Value = serde_json::from_str(ON_DEMAND_MANIFEST).map_err(|exc| exc.to_string())?;
+    if manifest["schema"] != 1 || !manifest["model"].is_string() || !manifest["architecture"].is_string() {
+        return Err("unsupported Straydog on-demand manifest".into());
+    }
+    Ok(manifest)
+}
+
+/// One on-demand quantization's shards and their digests.
+pub fn on_demand(quantization: &str) -> Result<OnDemand, String> {
+    if !ON_DEMAND_QUANTIZATIONS.contains(&quantization) {
+        return Err(format!("unsupported Straydog model quantization: {quantization}"));
+    }
+    let manifest = on_demand_manifest()?;
+    let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
+    let shards = listed.iter().map(asset).collect::<Result<Vec<_>, _>>()?;
+    let verity = listed
+        .iter()
+        .map(|item| match item["verity"].as_str() {
+            Some(digest) if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) => Ok(digest.to_string()),
+            _ => Err("manifest asset without a verity digest".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OnDemand {
+        model: manifest["model"].as_str().unwrap().to_string(),
+        architecture: manifest["architecture"].as_str().unwrap().to_string(),
+        quantization: quantization.to_string(),
+        shards,
+        verity,
+    })
+}
+
+/// Where every shard of an on-demand quantization comes from (provisioning only).
+pub fn on_demand_sources(quantization: &str) -> Result<Vec<Source>, String> {
+    let pins = on_demand(quantization)?;
+    let manifest = on_demand_manifest()?;
+    let text = |value: &Value, what: &str| -> Result<String, String> {
+        value.as_str().map(str::to_string).ok_or_else(|| format!("manifest without {what}"))
+    };
+    let repository = text(&manifest["repository"], "a repository")?;
+    let revision = text(&manifest["revision"], "a revision")?;
+    let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
+    pins.shards
+        .into_iter()
+        .zip(listed)
+        .map(|(asset, item)| {
+            Ok(Source { asset, repository: repository.clone(), revision: revision.clone(), path: text(&item["source_path"], "a source path")? })
+        })
+        .collect()
+}
+
+/// Whether a quantization names an on-demand bundle.
+pub fn is_on_demand(quantization: &str) -> bool {
+    ON_DEMAND_QUANTIZATIONS.contains(&quantization)
+}
+
+/// Every pinned quantization: the resident model's, then the on-demand ones.
+pub fn quantizations() -> impl Iterator<Item = &'static str> {
+    QUANTIZATIONS.into_iter().chain(ON_DEMAND_QUANTIZATIONS)
+}
+
+/// The model a pinned quantization belongs to.
+pub fn model_of(quantization: &str) -> Result<String, String> {
+    if is_on_demand(quantization) {
+        Ok(on_demand(quantization)?.model)
+    } else if QUANTIZATIONS.contains(&quantization) {
+        Ok(MODEL.to_string())
+    } else {
+        Err(format!("unsupported Straydog model quantization: {quantization}"))
+    }
+}
+
+/// The GGUF architecture of a pinned quantization's model.
+pub fn architecture_of(quantization: &str) -> Result<String, String> {
+    if is_on_demand(quantization) {
+        Ok(on_demand(quantization)?.architecture)
+    } else if QUANTIZATIONS.contains(&quantization) {
+        Ok("qwen4exp".into())
+    } else {
+        Err(format!("unsupported Straydog model quantization: {quantization}"))
+    }
+}
+
+/// The shards a quantization pins (either kind of bundle).
+pub fn shards(quantization: &str) -> Result<Vec<Asset>, String> {
+    if is_on_demand(quantization) { Ok(on_demand(quantization)?.shards) } else { Ok(bundle(quantization)?.shards) }
+}
+
+/// The verity tree of an on-demand shard in Straydog's data directory: built there from the file
+/// (`straydog verify`), never next to the model, and checked against the pinned digest when opened.
+pub fn tree_path(data_dir: &std::path::Path, shard: &Asset) -> std::path::PathBuf {
+    data_dir.join("verity").join(format!("{}.verity", shard.name))
+}

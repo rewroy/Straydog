@@ -516,6 +516,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position
     }
 
+    /// The devices this engine runs on, one per shard (memory and identity for reports).
+    pub fn gpus(&self) -> impl Iterator<Item = &Backend> {
+        self.shards.iter().map(|shard| &shard.gpu)
+    }
+
     /// The expert stores' counters, summed over the devices.
     pub fn cache_counts(&self) -> Counts {
         self.shards.iter().map(|shard| shard.experts.counts()).fold(Counts::default(), |sum, counts| sum + counts)

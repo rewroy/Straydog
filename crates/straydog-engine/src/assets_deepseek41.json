@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "model": "DeepSeek-V4.1-Flash",
+  "architecture": "deepseek41",
+  "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+  "revision": "60ad3651641b5c97679c807e064ab1d7a3ca1455",
+  "bundles": {
+    "UD-IQ2_XXS": {
+      "assets": [
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf",
+          "bytes": 5780923,
+          "sha256": "22ad51c224e499883c1a753ad35719af44c296bbc8bcb9c931de6bdf950fa3aa",
+          "verity": "ed39c88e552fdcf5eb3bb7f6d5e04b63a21261bc899961359e97627889f42f36"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf",
+          "bytes": 49955895008,
+          "sha256": "6880d0483490504a530b72686d79c92daa46e58ca5b71763bbfa3778d8a6131a",
+          "verity": "e35273e17534e11bf050f34d37c5713b8e473438166a3116144d3f48347ebe5f"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf",
+          "bytes": 49950675200,
+          "sha256": "04b3ec7947255efaf789da77557da9180e93128948644828798d07b8a6e7a60a",
+          "verity": "a1a8fca7cffcda5c5e5e792e9ac0c6f8a934640ffed02714feeec252e93b0859"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf",
+          "bytes": 48971469632,
+          "sha256": "318762f39cd7ebf03e3d7b30feaf938fab0464a9c2d6c0e0e99fc030bbfcd820",
+          "verity": "baaa2ae0e9c903af3d3a389aa1328a16fc89a5c2725e9bac6ba6cf6d85494afa"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf",
+          "bytes": 16419622240,
+          "sha256": "34fa48fbe2237b1b71a4f18a04bbe10946f6b1c76b7bbff21c76da630da677b6",
+          "verity": "46381a773f0e82eb2f7d2ffcef60a676ddb2f9222b802d55e6fcc747021d3511"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf",
+          "source_path": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf",
+          "bytes": 135172021792,
+          "sha256": "406103485a7a7193337adee38b7178d3b636940aaa3ca033bc91e0d3687e3031",
+          "verity": "892d3e948d1918eb24dde49e29d620ec78cdfe73a63eb9c9a35eca73749f276c"
+        }
+      ]
+    }
+  }
+}
