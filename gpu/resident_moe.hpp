@@ -237,6 +237,10 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
 // then exactly sized gate/up and down tile launches. Gate/up stores FP16
 // SiLU(gate)*up per grouped row in the gate/up scratch; down scatters per route.
 #if defined(__HIPCC__)
+// Formats of a group's gate, up and down banks (routed experts share theirs).
+inline MoeKinds moe_kinds(const ResidentMoe& plan,size_t group) {
+    return {plan.weights[group*3].kind,plan.weights[group*3+1].kind,plan.weights[group*3+2].kind};
+}
 // The tile list below, built on the device so that the host need not wait for the routing: the
 // groups' first rows, then each present group's rows in blocks of moe_block_m, in group order (a
 // part's absent groups, the peer's experts, have no weights). `count` receives the number.
@@ -291,9 +295,13 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         moe_device_tiles<<<1,moe_tile_threads,0,d.stream>>>(groups,groups_count,counts,firsts,tiles,tile_count);
         moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
         resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
+        const unsigned shared=plan.weights[experts*3].data ? unsigned((steps+moe_block_m-1)/moe_block_m) : 0;
+        // FP16 products (routes*1280 bytes), then the FP16 token inputs (steps*5120), within the gate/up scratch.
         auto* product=reinterpret_cast<_Float16*>(scratch);
-        moe_gate_up_wmma<<<dim3(10,unsigned(max_tiles)),256,0,d.stream>>>(groups,tiles,positions,steps,input,product,tile_count);
-        moe_down_wmma<<<dim3(20,unsigned(max_tiles)),256,0,d.stream>>>(groups,tiles,positions,product,outputs,tile_count);
+        auto* half_input=product+routes*640;
+        moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
+        moe_expert_launch(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,half_input,
+                          product,outputs,tile_count,unsigned(max_tiles),shared);
         check(hipGetLastError());
         return;
     }
@@ -335,17 +343,19 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     auto* product=reinterpret_cast<_Float16*>(scratch);
 #else
     auto* product=reinterpret_cast<__half*>(scratch);
+#endif
     // FP16 product uses routes*1280 bytes, then the converted token inputs use
     // steps*5120. Both fit before outputs (routes*7680 bytes from scratch).
     auto* half_input=product+routes*640;
     moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
-#endif
     auto launch=[&](size_t begin,size_t end) {
         if (end<=begin) return;
 #if defined(__HIPCC__)
-        const unsigned count=unsigned(end-begin);
-        moe_gate_up_wmma<<<dim3(10,count),256,0,d.stream>>>(groups,tiles+begin,positions,steps,input,product);
-        moe_down_wmma<<<dim3(20,count),256,0,d.stream>>>(groups,tiles+begin,positions,product,outputs);
+        // The resident list ends with the shared expert's tiles.
+        const unsigned shared=begin==0 && end==resident_tiles && !absent[experts] ?
+            unsigned((host_counts[experts]+moe_block_m-1)/moe_block_m) : 0;
+        moe_expert_launch(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles+begin,positions,steps,half_input,
+                          product,outputs,nullptr,unsigned(end-begin),shared);
 #else
         // Banks have one format per role. Separate the final shared-expert
         // tiles so its format cannot inflate the routed Q2 kernel's registers.
