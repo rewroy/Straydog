@@ -252,6 +252,30 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_buffer_read_start(
+        handle: *mut ::std::os::raw::c_void,
+        buffer: *const ::std::os::raw::c_void,
+        offset: u64,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_buffer_read_finish(
+        handle: *mut ::std::os::raw::c_void,
+        output: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_buffer_copy_peer(
+        to: *mut ::std::os::raw::c_void,
+        target: *mut ::std::os::raw::c_void,
+        from: *mut ::std::os::raw::c_void,
+        source: *const ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_linear(
         handle: *mut ::std::os::raw::c_void,
         weights: *const ::std::os::raw::c_void,
@@ -268,6 +292,29 @@ unsafe extern "C" {
         scratch_bytes: u64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_linear {
+    pub weights: *const ::std::os::raw::c_void,
+    pub kind: ::std::os::raw::c_int,
+    pub rows: u64,
+    pub cols: u64,
+    pub first_row: u64,
+    pub input: *const f32,
+    pub output: *mut f32,
+}
+unsafe extern "C" {
+    pub fn sd_op_linears(
+        handle: *mut ::std::os::raw::c_void,
+        items: *const sd_linear,
+        count: u64,
+        steps: u64,
+        input_stride: u64,
+        output_stride: u64,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
     pub fn sd_op_rms_norm(
         handle: *mut ::std::os::raw::c_void,
@@ -277,6 +324,22 @@ unsafe extern "C" {
         width: u64,
         eps: f32,
         output: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_norm_rope(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        weight: *const f32,
+        rows: u64,
+        width: u64,
+        eps: f32,
+        rope_dims: u64,
+        positions: *const i32,
+        frequencies: *const f32,
+        out_rows: *const i32,
+        out: *mut f32,
+        out_count: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -331,6 +394,33 @@ unsafe extern "C" {
         rows: u64,
         hc: u64,
         width: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_hc_step(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        residual: *const f32,
+        post_in: *const f32,
+        comb_in: *const f32,
+        stream: *mut f32,
+        fn_: *const f32,
+        base: *const f32,
+        scale: *const f32,
+        iterations: u64,
+        eps: f32,
+        norm_eps: f32,
+        collapse: *const f32,
+        norm_weight: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        workspace: *mut f32,
+        workspace_bytes: u64,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
         out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
@@ -407,6 +497,27 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_experts(
+        handle: *mut ::std::os::raw::c_void,
+        bases: *const u64,
+        slot_bytes: u64,
+        offsets: *const u64,
+        kinds: *const ::std::os::raw::c_int,
+        hidden: u64,
+        ffn: u64,
+        rows: u64,
+        top_k: u64,
+        input: *const f32,
+        input_stride: u64,
+        weights: *const f32,
+        clamp: f32,
+        accumulate: ::std::os::raw::c_int,
+        product: *mut f32,
+        out: *mut f32,
+        out_stride: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_sparse_attention(
         handle: *mut ::std::os::raw::c_void,
         q: *const f32,
@@ -423,6 +534,10 @@ unsafe extern "C" {
         heads: u64,
         dim: u64,
         scale: f32,
+        rope_dims: u64,
+        frequencies: *const f32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
         out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }

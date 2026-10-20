@@ -41,6 +41,18 @@ impl Buffer {
     }
 }
 
+/// One item of [`Backend::linears`]: `output[t][r] = weights[first_row + r] . input[t]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Linear {
+    pub weights: Buffer,
+    pub kind: u32,
+    pub rows: u64,
+    pub cols: u64,
+    pub first_row: u64,
+    pub input: P,
+    pub output: M,
+}
+
 impl Backend {
     /// A zeroed device buffer.
     pub fn buffer(&mut self, bytes: u64) -> Result<Buffer> {
@@ -81,6 +93,27 @@ impl Backend {
         check(unsafe { ffi::sd_buffer_read(self.handle(), buffer.pointer, at, out.as_mut_ptr().cast(), bytes) })
     }
 
+    /// Start reading `bytes` of the buffer, `offset_bytes` in, behind the work queued so far; the
+    /// work queued after it keeps running until [`Backend::read_finish`].
+    pub fn read_start(&mut self, buffer: &Buffer, offset_bytes: u64, bytes: u64) -> Result<()> {
+        // SAFETY: a live handle; the library checks the range.
+        check(unsafe { ffi::sd_buffer_read_start(self.handle(), buffer.pointer, offset_bytes, bytes) })
+    }
+
+    /// Wait for the started read and copy its values out (`out` must take exactly its bytes).
+    pub fn read_finish<T: Copy>(&mut self, out: &mut [T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(out) as u64;
+        // SAFETY: a live handle; `out` holds `bytes`, which the library checks against the read.
+        check(unsafe { ffi::sd_buffer_read_finish(self.handle(), out.as_mut_ptr().cast(), bytes) })
+    }
+
+    /// Copy `bytes` from `source` (this device's) into `target` on `to`, after the work queued here;
+    /// `to`'s later work waits for the bytes.
+    pub fn copy_to(&mut self, source: P, to: &mut Backend, target: M, bytes: u64) -> Result<()> {
+        // SAFETY: two live handles; the library checks both ranges against their devices' allocations.
+        check(unsafe { ffi::sd_buffer_copy_peer(to.handle(), target.cast(), self.handle(), source.cast(), bytes) })
+    }
+
     /// `output[t][r] = W[first + r] . input[t]` over `steps` inputs of `cols` values; strides in
     /// values between consecutive inputs and outputs (0: packed).
     #[allow(clippy::too_many_arguments)]
@@ -93,10 +126,37 @@ impl Backend {
         })
     }
 
+    /// Several linear ops, in one launch where the GEMV takes them all (see the C header).
+    pub fn linears(&mut self, items: &[Linear], steps: u64, input_stride: u64, output_stride: u64, scratch: &Buffer) -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        // SAFETY: a live handle; the library checks every item's ranges against its allocations.
+        check(unsafe {
+            ffi::sd_op_linears(self.handle(), items.as_ptr(), items.len() as u64, steps, input_stride, output_stride,
+                               scratch.pointer.cast(), scratch.bytes)
+        })
+    }
+
     pub fn rms_norm(&mut self, input: P, weight: &Buffer, rows: u64, width: u64, eps: f32, output: M)
                     -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_rms_norm(self.handle(), input.cast(), weight.pointer.cast(), rows, width, eps, output.cast()) })
+    }
+
+    /// rms_norm, then the last `rope` = (dims, positions, frequencies) values rotated as [`Backend::rope`]
+    /// rotates them, each row stored at row `out_rows[row]` of `out` (or in order).
+    #[allow(clippy::too_many_arguments)]
+    pub fn norm_rope(&mut self, input: P, weight: &Buffer, rows: u64, width: u64, eps: f32, rope: Option<(u64, &Buffer, &Buffer)>,
+                     out_rows: Option<P>, out: M, out_count: u64) -> Result<()> {
+        let (dims, positions, frequencies) =
+            rope.map_or((0, std::ptr::null_mut(), std::ptr::null_mut()), |(dims, p, f)| (dims, p.pointer, f.pointer));
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_norm_rope(self.handle(), input.cast(), weight.pointer.cast(), rows, width, eps, dims, positions.cast(),
+                                 frequencies.cast(), out_rows.map_or(std::ptr::null(), |r| r.cast()), out.cast(), out_count)
+        })
     }
 
     /// Rotate the last `rope_dims` values of each of a row's `vectors` (rows of `vectors * width`).
@@ -130,6 +190,25 @@ impl Backend {
         // SAFETY: as above.
         check(unsafe {
             ffi::sd_op_hc_expand(self.handle(), x.cast(), residual.cast(), post.cast(), comb.cast(), rows, hc, width, out.cast())
+        })
+    }
+
+    /// A sublayer boundary in one launch: `expand` = (x, residual, post, comb) expanded into `stream`
+    /// (else `stream` is read); `coefficients` = (fn, base, scale, pre, post, comb) from it; and
+    /// `out` = rms_norm(stream collapsed by `collapse`) * `norm_weight`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_step(&mut self, expand: Option<(P, P, P, P)>, stream: M, coefficients: Option<(P, P, P, M, M, M)>, iterations: u64,
+                   eps: f32, norm_eps: f32, collapse: P, norm_weight: P, rows: u64, hc: u64, width: u64, workspace: &Buffer,
+                   out: M) -> Result<()> {
+        let null = std::ptr::null::<c_void>();
+        let (x, residual, post_in, comb_in) = expand.unwrap_or((null, null, null, null));
+        let mut_null = std::ptr::null_mut::<c_void>();
+        let (fn_, base, scale, pre, post, comb) = coefficients.unwrap_or((null, null, null, mut_null, mut_null, mut_null));
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_hc_step(self.handle(), x.cast(), residual.cast(), post_in.cast(), comb_in.cast(), stream.cast(), fn_.cast(),
+                               base.cast(), scale.cast(), iterations, eps, norm_eps, collapse.cast(), norm_weight.cast(), rows, hc,
+                               width, workspace.pointer.cast(), workspace.bytes, pre.cast(), post.cast(), comb.cast(), out.cast())
         })
     }
 
@@ -173,17 +252,41 @@ impl Backend {
         check(unsafe { ffi::sd_op_scatter_add(self.handle(), x.cast(), rows.cast(), count, width, out.cast(), out_rows) })
     }
 
+    /// Experts in slots: route `r` of `rows * top_k` (token-major) runs the expert of the slot at
+    /// `bases[r]` (gate, up and down at `offsets` bytes in, of `kinds`): `product[r]` = its clamped
+    /// SwiGLU times `weights[r]`, and `out[t]` (+)= the sum of down . product over the token's routes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn experts(&mut self, bases: &[u64], slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3], hidden: u64, ffn: u64,
+                   rows: u64, top_k: u64, input: P, input_stride: u64, weights: Option<P>, clamp: f32, accumulate: bool,
+                   product: M, out: M, out_stride: u64) -> Result<()> {
+        if bases.len() as u64 != rows * top_k {
+            return Err("expert routes do not match the rows".into());
+        }
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: a live handle; the library checks every slot and range against its allocations.
+        check(unsafe {
+            ffi::sd_op_experts(self.handle(), bases.as_ptr(), slot_bytes, offsets.as_ptr(), kinds.as_ptr(), hidden, ffn, rows, top_k,
+                               input.cast(), input_stride, weights.map_or(std::ptr::null(), |w| w.cast()), clamp,
+                               i32::from(accumulate), product.cast(), out.cast(), out_stride)
+        })
+    }
+
+    /// Tiled over `scratch` when it holds the scores (see the C header), else one block per head.
+    /// `rope` = (dims, frequencies): q's last dims are rotated on the way in, the output's back
+    /// (tiled only).
     #[allow(clippy::too_many_arguments)]
     pub fn sparse_attention(&mut self, q: P, raw: P, raw_rows: u64, positions: P, window: u64, compressed: Option<(P, u64)>,
-                            selected: Option<(P, u64)>, sinks: P, rows: u64, heads: u64, dim: u64, scale: f32, out: M)
-                            -> Result<()> {
+                            selected: Option<(P, u64)>, sinks: P, rows: u64, heads: u64, dim: u64, scale: f32,
+                            rope: Option<(u64, &Buffer)>, scratch: Option<&Buffer>, out: M) -> Result<()> {
         let (compressed, compressed_rows) = compressed.unwrap_or((std::ptr::null(), 0));
         let (selected, selections) = selected.unwrap_or((std::ptr::null(), 0));
+        let (rope_dims, frequencies) = rope.map_or((0, std::ptr::null_mut()), |(dims, buffer)| (dims, buffer.pointer));
+        let (scratch, scratch_bytes) = scratch.map_or((std::ptr::null_mut(), 0), |buffer| (buffer.pointer, buffer.bytes));
         // SAFETY: as above.
         check(unsafe {
             ffi::sd_op_sparse_attention(self.handle(), q.cast(), raw.cast(), raw_rows, positions.cast(), window,
                                         compressed.cast(), compressed_rows, selected.cast(), selections, sinks.cast(), rows,
-                                        heads, dim, scale, out.cast())
+                                        heads, dim, scale, rope_dims, frequencies.cast(), scratch.cast(), scratch_bytes, out.cast())
         })
     }
 

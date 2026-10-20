@@ -1,15 +1,16 @@
 //! DeepSeek-V4.1 through the engine (arch::deepseek41::engine): a prompt prefilled in chunks,
 //! its last logits checked against the CPU reference, then greedy decoding with its speed and
-//! the expert cache's hits. Development only (unauthenticated weights).
+//! the expert cache's hits. Development only (unauthenticated weights). With --split L, layers 0..L
+//! run on GPU 0 and the rest on GPU 1, each with --slots expert slots.
 //!
-//! ds41_chat SHARD_DIR TOKENS ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N]
+//! ds41_chat SHARD_DIR TOKENS ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] [--split L]
 
 #[path = "common/files.rs"]
 mod files;
 
 use std::path::Path;
 
-use straydog_engine::arch::deepseek41::engine::{Engine, Settings};
+use straydog_engine::arch::deepseek41::engine::{forward_split, Engine, Settings};
 use straydog_engine::arch::deepseek41::Hparams;
 use straydog_engine::text::Text;
 
@@ -20,9 +21,9 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         value
     });
-    let (chunk, generate, slots) = (option("--chunk", 16), option("--generate", 32), option("--slots", 1500));
+    let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 32), option("--slots", 1500), option("--split", 0));
     let [dir, tokens_file, oracle, tokenizer] = &args[..] else {
-        return Err("usage: ds41_chat SHARD_DIR TOKENS ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N]".into());
+        return Err("usage: ds41_chat SHARD_DIR TOKENS ORACLE_DIR TOKENIZER_JSON [--chunk N] [--generate N] [--slots N] [--split L]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
@@ -33,13 +34,20 @@ fn main() -> Result<(), String> {
     let reference: Vec<u32> = ints[3 + count..].iter().map(|&id| id as u32).collect();
     let vocabulary = hp.vocabulary;
     let started = std::time::Instant::now();
-    let settings = Settings { context: 8192, batch: 64, expert_slots: slots, scratch_bytes: 512 << 20 };
-    let mut engine = Engine::new(hp, &files, 0, 31 << 30, settings)?;
+    let layers = hp.layers.len();
+    let parts = if split == 0 { vec![0..layers] } else { vec![0..split, split..layers] };
+    let mut engines = Vec::new();
+    for (device, part) in parts.into_iter().enumerate() {
+        let settings = Settings { context: 8192, batch: 64, expert_slots: slots, scratch_bytes: 512 << 20, layers: part };
+        engines.push(Engine::new(hp.clone(), &files, device, 31 << 30, settings)?);
+    }
+    let counts = |engines: &[Engine<'_, files::Files>]| engines.iter().map(|engine| engine.cache_counts())
+        .fold((0, 0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
     println!("loaded in {:.1} s", started.elapsed().as_secs_f64());
     let started = std::time::Instant::now();
     let mut logits = Vec::new();
     for piece in prompt.chunks(chunk) {
-        logits = engine.forward(piece)?;
+        logits = forward_split(&mut engines, piece)?;
     }
     println!("prefill {} tokens in chunks of {chunk}: {:.2} s", prompt.len(), started.elapsed().as_secs_f64());
     // the oracle's last kept row is the prompt's last position
@@ -55,19 +63,24 @@ fn main() -> Result<(), String> {
     println!("last logits vs the CPU reference: rel {:.2e}, argmax {} vs {}", (diff / norm).sqrt(), argmax(&logits), argmax(last));
     let text = Text::new(&std::fs::read(tokenizer).map_err(|exc| exc.to_string())?).map_err(|exc| exc.0)?;
     let mut output = vec![argmax(&logits)];
-    let (hits0, misses0, fill0) = engine.cache_counts();
+    let (hits0, misses0, fill0) = counts(&engines);
     let started = std::time::Instant::now();
-    engine.take_profile();
+    engines.iter_mut().for_each(|engine| drop(engine.take_profile()));
     while output.len() < generate {
-        logits = engine.forward(&output[output.len() - 1..])?;
+        logits = forward_split(&mut engines, &output[output.len() - 1..])?;
         output.push(argmax(&logits));
     }
     let seconds = started.elapsed().as_secs_f64();
-    let (hits, misses, fill) = engine.cache_counts();
+    let (hits, misses, fill) = counts(&engines);
     println!("decode {} tokens: {:.2} tok/s, expert cache {:.1}% hits ({} misses, {:.0}% of the time filling them)", output.len() - 1,
              (output.len() - 1) as f64 / seconds, 100.0 * (hits - hits0) as f64 / ((hits - hits0 + misses - misses0).max(1)) as f64,
              misses - misses0, 100.0 * (fill - fill0) / seconds);
-    let profile = engine.take_profile();
+    let mut profile = std::collections::BTreeMap::new();
+    for engine in &mut engines {
+        for (phase, seconds) in engine.take_profile() {
+            *profile.entry(phase).or_insert(0.0) += seconds;
+        }
+    }
     if !profile.is_empty() {
         let steps = (output.len() - 1) as f64;
         println!("per token: {}", profile.iter().map(|(phase, s)| format!("{phase} {:.1} ms", 1e3 * s / steps)).collect::<Vec<_>>().join(", "));

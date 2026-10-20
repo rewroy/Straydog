@@ -2,12 +2,25 @@
 // shapes are arguments, so any architecture composes them. Included in the GPU TU.
 
 // The allocation holding [pointer, pointer + bytes) of this device, or an error: an op never
-// touches memory the device did not allocate.
+// touches memory the device did not allocate. The address index answers in O(log n) (a model
+// holds thousands of allocations); an entry counts only while the allocation it names is live
+// with the same size, and an index that finds none is rebuilt once.
 void op_span(Device& d, const void* pointer, size_t bytes, const char* what) {
     const auto* at = static_cast<const uint8_t*>(pointer);
-    for (const auto& entry : d.allocations) {
-        const auto* base = static_cast<const uint8_t*>(entry.first);
-        if (at >= base && bytes <= entry.second && size_t(at - base) <= entry.second - bytes) return;
+    std::lock_guard<std::mutex> lock(d.spans_mutex);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto next = d.spans.upper_bound(at);
+        if (next != d.spans.begin()) {
+            --next;
+            const uint8_t* base = next->first;
+            const auto live = d.allocations.find(const_cast<uint8_t*>(base));
+            if (live != d.allocations.end() && live->second == next->second && bytes <= next->second &&
+                size_t(at - base) <= next->second - bytes)
+                return;
+        }
+        if (attempt) break;
+        d.spans.clear();
+        for (const auto& entry : d.allocations) d.spans.emplace(static_cast<const uint8_t*>(entry.first), entry.second);
     }
     throw std::runtime_error(std::string("Straydog op: ") + what + " is outside this device's allocations");
 }
@@ -27,6 +40,35 @@ __global__ void op_rms_norm_kernel(const float* input, const float* weight, size
     }
     const float scale = rsqrtf(sums[0] / float(width) + eps);
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) out[col] = row[col] * scale * weight[col];
+}
+
+// One block per row: rms_norm (op_rms_norm_kernel's arithmetic), then the last 2 * pairs values
+// rotated as op_rope_kernel rotates them, stored at row rows[row] of out (row itself without rows).
+__global__ void op_norm_rope_kernel(const float* input, const float* weight, size_t width, float eps, size_t pairs,
+                                    const int32_t* positions, const float* frequencies, const int32_t* rows, float* output) {
+    const float* row = input + size_t(blockIdx.x) * width;
+    float* out = output + size_t(rows ? rows[blockIdx.x] : blockIdx.x) * width;
+    __shared__ float sums[256];
+    float sum = 0.0f;
+    for (size_t col = threadIdx.x; col < width; col += blockDim.x) sum += row[col] * row[col];
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(sums[0] / float(width) + eps);
+    const size_t plain = width - 2 * pairs;
+    for (size_t col = threadIdx.x; col < plain; col += blockDim.x) out[col] = row[col] * scale * weight[col];
+    for (size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+        const size_t col = plain + 2 * pair;
+        const double angle = double(positions[blockIdx.x]) * double(frequencies[pair]);
+        double s, c;
+        sincos(angle, &s, &c);
+        const double a = row[col] * scale * weight[col], b = row[col + 1] * scale * weight[col + 1];
+        out[col] = float(a * c - b * s);
+        out[col + 1] = float(a * s + b * c);
+    }
 }
 
 // Rotate the last 2 * pairs values of each vector (adjacent pairs) by position * frequency; the
@@ -74,29 +116,15 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
 
 // ---- Hyper-connections: n parallel copies of the residual stream ----
 
-// One block per row: the mixing coefficients of a sublayer from mixes = W_hc . stream (the
-// projection is a linear op), scaled by the stream's RMS: pre and post by sigmoids, the
-// combination doubly stochastic by Sinkhorn (softmax rows, then alternate normalizations).
-__global__ void op_hc_coefficients_kernel(const float* mixes, const float* stream, size_t hc, size_t width,
-                                          const float* base, const float* scale, size_t iterations, float eps,
-                                          float norm_eps, float* pre, float* post, float* comb) {
-    const size_t row = blockIdx.x, flat = hc * width, mix = (2 + hc) * hc;
-    __shared__ float sums[256];
-    float sum = 0.0f;
-    for (size_t i = threadIdx.x; i < flat; i += blockDim.x) { const float v = stream[row * flat + i]; sum += v * v; }
-    sums[threadIdx.x] = sum;
-    __syncthreads();
-    for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
-        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x) return;
-    const float rsqrt = rsqrtf(sums[0] / float(flat) + norm_eps);
-    const float* m = mixes + row * mix;
+// A sublayer's mixing coefficients from its mixes m (W_hc . stream) and the stream's inverse RMS:
+// pre and post by sigmoids, the combination doubly stochastic by Sinkhorn (softmax rows, then
+// alternate normalizations). One thread.
+__device__ void hc_coefficients_of(const float* m, float rsqrt, size_t hc, const float* base, const float* scale,
+                                   size_t iterations, float eps, float* pre, float* post, float* comb) {
     const auto sigmoid = [](float x) { return 1.0f / (1.0f + expf(-x)); };
     for (size_t j = 0; j < hc; ++j) {
-        pre[row * hc + j] = sigmoid(m[j] * rsqrt * scale[0] + base[j]) + eps;
-        post[row * hc + j] = 2.0f * sigmoid(m[hc + j] * rsqrt * scale[1] + base[hc + j]);
+        pre[j] = sigmoid(m[j] * rsqrt * scale[0] + base[j]) + eps;
+        post[j] = 2.0f * sigmoid(m[hc + j] * rsqrt * scale[1] + base[hc + j]);
     }
     float c[64];
     for (size_t j = 0; j < hc; ++j) {
@@ -122,7 +150,117 @@ __global__ void op_hc_coefficients_kernel(const float* mixes, const float* strea
             for (size_t j = 0; j < hc; ++j) c[j * hc + k] /= total + eps;
         }
     }
-    for (size_t i = 0; i < hc * hc; ++i) comb[row * hc * hc + i] = c[i];
+    for (size_t i = 0; i < hc * hc; ++i) comb[i] = c[i];
+}
+
+// One block per row: the coefficients from mixes = W_hc . stream (the projection is a linear op),
+// scaled by the stream's RMS.
+__global__ void op_hc_coefficients_kernel(const float* mixes, const float* stream, size_t hc, size_t width,
+                                          const float* base, const float* scale, size_t iterations, float eps,
+                                          float norm_eps, float* pre, float* post, float* comb) {
+    const size_t row = blockIdx.x, flat = hc * width, mix = (2 + hc) * hc;
+    __shared__ float sums[256];
+    float sum = 0.0f;
+    for (size_t i = threadIdx.x; i < flat; i += blockDim.x) { const float v = stream[row * flat + i]; sum += v * v; }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x) return;
+    hc_coefficients_of(mixes + row * mix, rsqrtf(sums[0] / float(flat) + norm_eps), hc, base, scale, iterations, eps,
+                       pre + row * hc, post + row * hc, comb + row * hc * hc);
+}
+
+// A sublayer boundary in one launch, a block per 64 columns of a row (blockIdx.y) and the row's
+// last block finishing it: the previous sublayer's output x, when given, expanded into the stream
+// (stream[j] = post[j] x + sum_i comb[i][j] residual[i]; else the stream is read); this
+// sublayer's coefficients, when fn is given (the mixes W_hc . stream summed by block, then
+// hc_coefficients_of); and its input norm(sum_j collapse[j] stream[j]) * weight, which the
+// blocks write unnormalized. `counters` (one per row, zero between launches: the last block resets
+// its row's) and `partial` (per row and block the mixes and both sums of squares) are a workspace.
+constexpr size_t hc_step_columns = 64;
+template<int HC>
+__global__ void op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
+                                  float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
+                                  float eps, float norm_eps, const float* collapse, const float* norm_weight, size_t width,
+                                  unsigned* counters, float* partial, float* pre, float* post, float* comb, float* out) {
+    constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
+    const size_t row = blockIdx.y, block = blockIdx.x, blocks = gridDim.x;
+    const size_t first = block * hc_step_columns, columns = std::min(hc_step_columns, width - first);
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    __shared__ float values[HC][hc_step_columns];
+    __shared__ float reduce[8][SUMS];
+    __shared__ float totals[SUMS];
+    __shared__ bool last;
+    float acc[SUMS] = {};
+    float* s_row = stream + row * HC * width;
+    for (size_t pair = threadIdx.x; pair < HC * hc_step_columns; pair += blockDim.x) {
+        const size_t j = pair / hc_step_columns, c = pair % hc_step_columns, col = first + c;
+        if (c >= columns) continue;
+        float v;
+        if (x) {
+            v = post_in[row * HC + j] * x[row * width + col];
+            #pragma unroll
+            for (int i = 0; i < HC; ++i) v += comb_in[(row * HC + i) * HC + j] * residual[(row * HC + i) * width + col];
+            s_row[j * width + col] = v;
+        } else v = s_row[j * width + col];
+        values[j][c] = v;
+        if (fn) {
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) acc[m] += fn[(m * HC + j) * width + col] * v;
+        }
+        acc[MIX] += v * v;
+    }
+    __syncthreads();
+    if (threadIdx.x < columns) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < HC; ++j) v += collapse[row * HC + j] * values[j][threadIdx.x];
+        out[row * width + first + threadIdx.x] = v;
+        acc[MIX + 1] = v * v;
+    }
+    #pragma unroll
+    for (int m = 0; m < SUMS; ++m) {
+        float v = acc[m];
+        for (unsigned offset = 16; offset; offset /= 2) v += __shfl_xor(v, offset, 32);
+        if (lane == 0) reduce[wave][m] = v;
+    }
+    __syncthreads();
+    float* row_partial = partial + row * blocks * SUMS;
+    if (threadIdx.x < SUMS) {
+        float v = 0.0f;
+        for (unsigned w = 0; w < blockDim.x / 32; ++w) v += reduce[w][threadIdx.x];
+        row_partial[block * SUMS + threadIdx.x] = v;
+    }
+    // The row's last block to finish sees every block's sums and columns.
+    __threadfence();
+    unsigned* counter = counters + row;
+    if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == blocks - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x < SUMS) {
+        const volatile float* sums = row_partial + threadIdx.x;
+        float v = 0.0f;
+        for (size_t b = 0; b < blocks; ++b) v += sums[b * SUMS];
+        totals[threadIdx.x] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *counter = 0;
+        if (fn)
+            hc_coefficients_of(totals, rsqrtf(totals[MIX] / float(HC * width) + norm_eps), HC, base, scale, iterations, eps,
+                               pre + row * HC, post + row * HC, comb + row * HC * HC);
+    }
+    const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
+    volatile float* o = out + row * width;
+    for (size_t col = threadIdx.x; col < width; col += blockDim.x) o[col] = o[col] * factor * norm_weight[col];
+}
+// Values of op_hc_step_kernel's workspace per row: its counter, then its blocks' sums.
+size_t hc_step_row_values(size_t hc, size_t width) {
+    return 1 + (width + hc_step_columns - 1) / hc_step_columns * ((2 + hc) * hc + 2);
 }
 
 // out[t][d] = sum_j pre[t][j] stream[t][j][d]
@@ -183,35 +321,71 @@ __global__ void op_engram_gate_kernel(float* stream, const float* kv, const floa
 
 // One block per row: scores from the router logits (0 softmax, 1 sigmoid, 2 square-root
 // softplus), the k experts with the highest score + bias (lowest index on ties), their
-// unbiased scores normalized (when asked) and scaled.
+// unbiased scores normalized (when asked) and scaled. Each pick is a block-wide argmax.
+__device__ __forceinline__ void route_take(float& value, int32_t& index, float other_value, int32_t other) {
+    if (other >= 0 && (index < 0 || other_value > value || (other_value == value && other < index))) { value = other_value; index = other; }
+}
 __global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
                                 int normalize, float scale, int32_t* ids, float* weights) {
     const size_t row = blockIdx.x;
     extern __shared__ float scores[];
+    __shared__ float reduce[256];
+    __shared__ int32_t picked[64], best[8];
+    __shared__ float best_value[8];
     const float* l = logits + row * experts;
     for (size_t e = threadIdx.x; e < experts; e += blockDim.x) {
         const float x = l[e];
         scores[e] = gating == 1 ? 1.0f / (1.0f + expf(-x)) : gating == 2 ? sqrtf(x > 20.0f ? x : log1pf(expf(x))) : x;
     }
     __syncthreads();
-    if (threadIdx.x) return;
     if (gating == 0) {
-        float top = -INFINITY, total = 0.0f;
-        for (size_t e = 0; e < experts; ++e) top = fmaxf(top, scores[e]);
-        for (size_t e = 0; e < experts; ++e) total += expf(scores[e] - top);
-        for (size_t e = 0; e < experts; ++e) scores[e] = expf(scores[e] - top) / total;
+        float top = -INFINITY;
+        for (size_t e = threadIdx.x; e < experts; e += blockDim.x) top = fmaxf(top, scores[e]);
+        reduce[threadIdx.x] = top;
+        __syncthreads();
+        for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+            __syncthreads();
+        }
+        top = reduce[0];
+        __syncthreads();
+        float total = 0.0f;
+        for (size_t e = threadIdx.x; e < experts; e += blockDim.x) total += expf(scores[e] - top);
+        reduce[threadIdx.x] = total;
+        __syncthreads();
+        for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        total = reduce[0];
+        for (size_t e = threadIdx.x; e < experts; e += blockDim.x) scores[e] = expf(scores[e] - top) / total;
+        __syncthreads();
     }
-    float chosen[64]; int32_t picked[64]; float sum = 0.0f;
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
     for (size_t slot = 0; slot < k; ++slot) {
-        int32_t best = -1; float value = -INFINITY;
-        for (size_t e = 0; e < experts; ++e) {
+        float value = -INFINITY;
+        int32_t index = -1;
+        for (size_t e = threadIdx.x; e < experts; e += blockDim.x) {
             bool used = false;
             for (size_t s = 0; s < slot; ++s) used |= picked[s] == int32_t(e);
-            const float candidate = scores[e] + (bias ? bias[e] : 0.0f);
-            if (!used && (best < 0 || candidate > value)) { best = int32_t(e); value = candidate; }
+            if (!used) route_take(value, index, scores[e] + (bias ? bias[e] : 0.0f), int32_t(e));
         }
-        picked[slot] = best; chosen[slot] = scores[best]; sum += scores[best];
+        for (unsigned offset = 16; offset; offset /= 2) {
+            const float other_value = __shfl_xor(value, offset, 32);
+            const int32_t other = __shfl_xor(index, offset, 32);
+            route_take(value, index, other_value, other);
+        }
+        if (lane == 0) { best[wave] = index; best_value[wave] = value; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (unsigned w = 1; w < blockDim.x / 32; ++w) route_take(value, index, best_value[w], best[w]);
+            picked[slot] = index;
+        }
+        __syncthreads();
     }
+    if (threadIdx.x) return;
+    float chosen[64], sum = 0.0f;
+    for (size_t slot = 0; slot < k; ++slot) { chosen[slot] = scores[picked[slot]]; sum += chosen[slot]; }
     for (size_t slot = 0; slot < k; ++slot) {
         ids[row * k + slot] = picked[slot];
         weights[row * k + slot] = (normalize && k > 1 ? chosen[slot] / (sum + 1e-20f) : chosen[slot]) * scale;
@@ -312,6 +486,151 @@ __global__ void op_sparse_attention_kernel(const float* q, const float* raw, siz
         }
         o[i] = acc / denominator;
     }
+}
+
+// The same attention for every shape the tiles cover (heads a multiple of 16, dim of 64), in two
+// launches over a scratch of scores: each key is read once per block of 32 keys for all the heads.
+// Scores: a block per 32 keys of a row (blockIdx.y) and 64 heads (blockIdx.z) stores
+// scale * q . key (-inf for an empty selection) and per head the block's max and sum of
+// exp(score - max). Output: a block per 64 dims, 16 heads and row combines those into the head's
+// max and denominator (with its sink) and sums the weighted keys.
+constexpr int attention_keys = 32;
+// Key `index` of a row: window rows first, then the selected compressed rows (null: none).
+__device__ __forceinline__ const float* attention_key(size_t index, size_t raw_count, int64_t first, const float* raw,
+                                                      size_t raw_rows, const float* compressed, const int32_t* selected,
+                                                      size_t total, size_t dim) {
+    if (index < raw_count) return raw + size_t(first + int64_t(index)) % raw_rows * dim;
+    if (index >= total) return nullptr;
+    const int32_t at = selected[index - raw_count];
+    return at < 0 ? nullptr : compressed + size_t(at) * dim;
+}
+__global__ void op_attention_scores_kernel(const float* q, const float* raw, size_t raw_rows, const int32_t* positions,
+                                           size_t window, const float* compressed, const int32_t* selected, size_t selections,
+                                           size_t heads, size_t dim, float scale, size_t pairs, const float* frequencies,
+                                           size_t stride, float* scores, float2* partial) {
+    const size_t row = blockIdx.y, head0 = size_t(blockIdx.z) * 64, chunks = gridDim.x;
+    const int64_t p = positions[row];
+    const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
+    const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    __shared__ float qs[64][33], ks[attention_keys][33];
+    __shared__ const float* keys[attention_keys];
+    __shared__ double turns[64][2];   // the row's rotation per rope pair (op_rope_kernel's angles)
+    for (size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+        double s, c;
+        sincos(double(p) * double(frequencies[pair]), &s, &c);
+        turns[pair][0] = c; turns[pair][1] = s;
+    }
+    const size_t rotated = dim - 2 * pairs;
+    const size_t index = size_t(blockIdx.x) * attention_keys + lane;
+    if (threadIdx.x < attention_keys)
+        keys[threadIdx.x] = attention_key(size_t(blockIdx.x) * attention_keys + threadIdx.x, raw_count, first, raw, raw_rows,
+                                          compressed, selected + row * selections, total, dim);
+    float acc[8] = {};
+    const float* row_q = q + row * heads * dim;
+    for (size_t d0 = 0; d0 < dim; d0 += 32) {
+        __syncthreads();
+        for (unsigned i = threadIdx.x; i < 64 * 32; i += blockDim.x) {
+            const size_t h = head0 + i / 32, col = d0 + i % 32;
+            float v = 0.0f;
+            if (h < heads && col < rotated) v = row_q[h * dim + col];
+            else if (h < heads) {
+                // q rotated as it is staged, as op_rope_kernel rotates it
+                const size_t pair = (col - rotated) / 2;
+                const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
+                const double c = turns[pair][0], s = turns[pair][1];
+                v = col % 2 == rotated % 2 ? float(a * c - b * s) : float(a * s + b * c);
+            }
+            qs[i / 32][i % 32] = v;
+        }
+        for (unsigned i = threadIdx.x; i < attention_keys * 32; i += blockDim.x) {
+            const float* key = keys[i / 32];
+            ks[i / 32][i % 32] = key ? key[d0 + i % 32] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int c = 0; c < 32; ++c) {
+            const float k = ks[lane][c];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] = fmaf(qs[wave * 8 + i][c], k, acc[i]);
+        }
+    }
+    const bool valid = keys[lane] != nullptr;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const size_t head = head0 + wave * 8 + i;
+        const float score = valid ? acc[i] * scale : -INFINITY;
+        if (head < heads && index < total) scores[(row * heads + head) * stride + index] = score;
+        float top = score;
+        for (unsigned offset = 16; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 32));
+        float sum = valid ? expf(score - top) : 0.0f;
+        for (unsigned offset = 16; offset; offset /= 2) sum += __shfl_xor(sum, offset, 32);
+        if (lane == 0 && head < heads) partial[(row * heads + head) * chunks + blockIdx.x] = make_float2(top, sum);
+    }
+}
+__global__ void op_attention_output_kernel(const float* scores, const float2* partial, size_t chunks, const float* raw,
+                                           size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
+                                           const int32_t* selected, size_t selections, const float* sinks, size_t heads,
+                                           size_t dim, size_t pairs, const float* frequencies, size_t stride, float* out) {
+    const size_t row = blockIdx.z, head0 = size_t(blockIdx.y) * 16, d0 = size_t(blockIdx.x) * 64;
+    const int64_t p = positions[row];
+    const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
+    const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
+    const unsigned local = threadIdx.x / 16, quad = threadIdx.x % 16;
+    __shared__ float tops[16], denominators[16];
+    __shared__ float4 vs[attention_keys][16];
+    __shared__ float ps[16][attention_keys + 1];
+    __shared__ const float* keys[attention_keys];
+    if (threadIdx.x < 16) {
+        const size_t head = std::min(head0 + threadIdx.x, heads - 1);
+        const float2* parts = partial + (row * heads + head) * chunks;
+        float top = sinks[head];
+        for (size_t c = 0; c < chunks; ++c) top = fmaxf(top, parts[c].x);
+        float denominator = expf(sinks[head] - top);
+        for (size_t c = 0; c < chunks; ++c) if (parts[c].y > 0.0f) denominator += parts[c].y * expf(parts[c].x - top);
+        tops[threadIdx.x] = top;
+        denominators[threadIdx.x] = denominator;
+    }
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (size_t k0 = 0; k0 < total; k0 += attention_keys) {
+        __syncthreads();
+        if (threadIdx.x < attention_keys)
+            keys[threadIdx.x] = attention_key(k0 + threadIdx.x, raw_count, first, raw, raw_rows, compressed,
+                                              selected + row * selections, total, dim);
+        for (unsigned i = threadIdx.x; i < 16 * attention_keys; i += blockDim.x) {
+            const size_t h = head0 + i / attention_keys, key = k0 + i % attention_keys;
+            const float score = h < heads && key < total ? scores[(row * heads + h) * stride + key] : -INFINITY;
+            ps[i / attention_keys][i % attention_keys] = score == -INFINITY ? 0.0f : expf(score - tops[i / attention_keys]);
+        }
+        __syncthreads();
+        for (unsigned i = threadIdx.x; i < attention_keys * 16; i += blockDim.x) {
+            const float* key = keys[i / 16];
+            vs[i / 16][i % 16] = key ? *reinterpret_cast<const float4*>(key + d0 + 4 * (i % 16)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int k = 0; k < attention_keys; ++k) {
+            const float weight = ps[local][k];
+            const float4 v = vs[k][quad];
+            acc.x = fmaf(weight, v.x, acc.x); acc.y = fmaf(weight, v.y, acc.y);
+            acc.z = fmaf(weight, v.z, acc.z); acc.w = fmaf(weight, v.w, acc.w);
+        }
+    }
+    const size_t head = head0 + local;
+    if (head >= heads) return;
+    const float denominator = denominators[local];
+    float o[4] = {acc.x / denominator, acc.y / denominator, acc.z / denominator, acc.w / denominator};
+    const size_t col = d0 + 4 * quad, rotated = dim - 2 * pairs;
+    // the inverse rotation, as op_rope_kernel's inverse
+    for (int i = 0; i < 4; i += 2)
+        if (col + i >= rotated) {
+            double s, c;
+            sincos(double(p) * double(frequencies[(col + i - rotated) / 2]) * -1.0, &s, &c);
+            const double a = o[i], b = o[i + 1];
+            o[i] = float(a * c - b * s);
+            o[i + 1] = float(a * s + b * c);
+        }
+    *reinterpret_cast<float4*>(out + (row * heads + head) * dim + col) = make_float4(o[0], o[1], o[2], o[3]);
 }
 
 // Pool `ratio` consecutive rows into one per group: softmax over the group of the gate, per

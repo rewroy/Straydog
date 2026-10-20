@@ -74,8 +74,28 @@ int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds, const
 void* sd_buffer(void* handle, uint64_t bytes);
 int sd_buffer_write(void* handle, void* buffer, uint64_t offset, const void* data, uint64_t bytes);
 int sd_buffer_read(void* handle, const void* buffer, uint64_t offset, void* output, uint64_t bytes);
+/* An asynchronous read (up to 1 MiB): start queues the copy behind the work queued so far; finish
+   waits for that copy alone and returns the bytes. One read is outstanding at a time. */
+int sd_buffer_read_start(void* handle, const void* buffer, uint64_t offset, uint64_t bytes);
+int sd_buffer_read_finish(void* handle, void* output, uint64_t bytes);
+/* A copy from an allocation of one device to one of another (or the same), after the work queued
+   on the source; the target's later work waits for it, and so does the source's. */
+int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, uint64_t bytes);
 int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row, const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
+/* Several linear ops in one launch where the GEMV takes them (up to four inputs, and strides shared
+   when there are several): out = W[first_row ..] . in per item; up to 24 items. */
+typedef struct sd_linear {
+    const void* weights;
+    int kind;
+    uint64_t rows, cols, first_row;
+    const float* input;
+    float* output;
+} sd_linear;
+int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t steps, uint64_t input_stride, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
 int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, float* output);
+/* rms_norm, then sd_op_rope's rotation of the last rope_dims values (0: none), stored at row
+   out_rows[row] of out (out_count rows), or at row `row` without out_rows. */
+int sd_op_norm_rope(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, uint64_t rope_dims, const int32_t* positions, const float* frequencies, const int32_t* out_rows, float* out, uint64_t out_count);
 int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies, int inverse);
 /* Hyper-connections: coefficients (pre and post per copy, a Sinkhorn-balanced combination) from
    mixes = W_hc . stream; a stream collapsed by pre; a sublayer output expanded back with the
@@ -83,6 +103,12 @@ int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t
 int sd_op_hc_coefficients(void* handle, const float* mixes, const float* stream, uint64_t rows, uint64_t hc, uint64_t width, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps, float* pre, float* post, float* comb);
 int sd_op_hc_collapse(void* handle, const float* stream, const float* pre, uint64_t rows, uint64_t hc, uint64_t width, float* out);
 int sd_op_hc_expand(void* handle, const float* x, const float* residual, const float* post, const float* comb, uint64_t rows, uint64_t hc, uint64_t width, float* out);
+/* A sublayer boundary in one launch: x (optional) expanded with residual, post_in and comb_in into
+   stream (else stream is read); the coefficients from fn (optional, with base and scale) into
+   pre, post and comb; out = rms_norm(stream collapsed by `collapse`) * norm_weight. The workspace
+   (zeroed once, then kept) takes 1 + ceil(width / 64) * ((2 + hc) * hc + 2) values per row, up to
+   the most rows a call takes; one workspace serves one shape. */
+int sd_op_hc_step(void* handle, const float* x, const float* residual, const float* post_in, const float* comb_in, float* stream, const float* fn, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps, const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width, float* workspace, uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out);
 /* Engram: kv = [hc keys | value] per row from the table rows; each copy gains its gated value. */
 int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float* weight, uint64_t rows, uint64_t hc, uint64_t width, float eps);
 /* Experts: routes (gating 0 softmax, 1 sigmoid, 2 square-root softplus; bias steers the choice,
@@ -92,11 +118,20 @@ int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
 int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
+/* Experts in slots: route r (rows * top_k of them, token-major) runs the expert at bases[r], a slot
+   of slot_bytes holding its gate and up (ffn x hidden) and down (hidden x ffn) matrices at byte
+   offsets[0..2]; product[r] = SwiGLU of the route (clamped, times weights[r] when given) and
+   out[t] (+)= the sum over the token's routes of down . product, added when accumulate is set. */
+int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride);
 /* Latent attention: each query attends to the window rows of `raw` ending at its position
    (position p in row p % raw_rows, so `raw` may be a ring) and
    the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio
-   rows by a per-channel softmax of the gate. The indexer scores visible groups and keeps the top k. */
-int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions, uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected, uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim, float scale, float* out);
+   rows by a per-channel softmax of the gate. The indexer scores visible groups and keeps the top k.
+   Attention runs tiled when dim is a multiple of 64 and scratch (optional) holds rows * heads *
+   (window + selections) scores and rows * heads * ceil((window + selections) / 32) pairs; then
+   rope_dims (else 0) rotates q's last values by positions * frequencies as sd_op_rope does, and
+   the output back. */
+int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions, uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected, uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const float* frequencies, float* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
 int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);

@@ -309,7 +309,7 @@ fn main() -> Result<(), String> {
         gpu.backend.sparse_attention(q.base(), kv.base(), t as u64, positions.base(), hp.window as u64,
                                      compressed.map(|(rows, groups, _, _)| (rows.base() as P, groups as u64)),
                                      compressed.map(|(_, _, chosen, k)| (chosen.base() as P, k as u64)), sinks.base(), t as u64,
-                                     heads as u64, dim as u64, scale, attended.base()).unwrap();
+                                     heads as u64, dim as u64, scale, None, Some(&gpu.scratch), attended.base()).unwrap();
         gpu.backend.rope(attended.base(), t as u64, heads as u64, dim as u64, rope as u64, &positions, &freqs, true).unwrap();
         let (wo_a, kind_a, dims_a) = gpu.weight(&name("attn_output_a"));
         let group_width = heads * dim / hp.out_groups;

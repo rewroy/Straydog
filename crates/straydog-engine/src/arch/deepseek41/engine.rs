@@ -9,7 +9,7 @@ use super::{Gating, Hparams, Rope};
 use crate::arch::Tensors;
 use crate::formats;
 use crate::gpu::{Backend, Result};
-use crate::ops::Buffer;
+use crate::ops::{Buffer, Linear};
 
 pub struct Settings {
     /// Longest sequence (positions) the state holds.
@@ -19,6 +19,9 @@ pub struct Settings {
     /// Experts the VRAM cache holds.
     pub expert_slots: usize,
     pub scratch_bytes: u64,
+    /// The layers this engine runs: the first embeds the tokens, the last has the head, and an
+    /// engine between takes the stream the one before hands over (see [`forward_split`]).
+    pub layers: std::ops::Range<usize>,
 }
 
 #[derive(Clone)]
@@ -26,6 +29,14 @@ struct Dense {
     buffer: Buffer,
     kind: u32,
     dims: Vec<usize>,
+}
+
+/// An expert laid out as a slot: gate, up and down at byte offsets of one buffer.
+#[derive(Clone, Copy)]
+struct Slot {
+    buffer: Buffer,
+    offsets: [u64; 3],
+    kinds: [u32; 3],
 }
 
 /// A kv source layer's compressed rows and index keys (one per group of `ratio` positions), and
@@ -84,6 +95,8 @@ struct Work {
     engram_rows: Buffer,
     engram_kv: Buffer,
     head: Buffer,
+    /// hc_step's partial sums and counters.
+    hc_workspace: Buffer,
 }
 
 /// Routed experts in VRAM slots ([gate | up | down] bytes each), evicting the least recently used.
@@ -100,15 +113,18 @@ struct Experts {
 }
 
 pub struct Engine<'a, T: Tensors> {
-    hp: Hparams,
+    /// Shared, so a pass takes the parameters without copying the Engram tables' metadata.
+    hp: std::rc::Rc<Hparams>,
     tensors: &'a T,
     gpu: Backend,
     dense: HashMap<String, Dense>,
+    /// Per layer this engine runs: the shared expert, as a slot.
+    shared: HashMap<usize, Slot>,
     scratch: Buffer,
     settings: Settings,
     position: usize,
     history: Vec<u32>,
-    rings: Vec<Buffer>,
+    rings: BTreeMap<usize, Buffer>,
     ring: usize,
     sources: BTreeMap<usize, Source>,
     plain: Buffer,
@@ -138,20 +154,33 @@ fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
     formats::matrix_bytes(kind, 1, cols).ok_or_else(|| format!("unsupported tensor type {kind}"))
 }
 
+/// Passes of up to this many rows run the routed experts over their slots (decode); longer ones
+/// expert by expert.
+const SLOT_ROWS: usize = 4;
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}.weight")
 }
 
 impl<'a, T: Tensors> Engine<'a, T> {
     pub fn new(hp: Hparams, tensors: &'a T, device: usize, budget: u64, settings: Settings) -> Result<Engine<'a, T>> {
+        let range = settings.layers.clone();
+        if range.is_empty() || range.end > hp.layers.len() {
+            return Err("DeepSeek-V4.1 engine layers outside the model".into());
+        }
+        for plan in &hp.layers[range.clone()] {
+            if let Some(c) = plan.compressed.filter(|c| c.kv_source < range.start || c.index_source < range.start) {
+                return Err(format!("DeepSeek-V4.1 layers {range:?} read layer {}'s compressed rows", c.kv_source.min(c.index_source)));
+            }
+        }
         let mut gpu = Backend::new(device, budget)?;
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
         let ring = hp.window + b;
         let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count.max(1) * 4) as u64);
-        let rings = (0..hp.layers.len()).map(|_| floats(&mut gpu, ring * hp.head_dim)).collect::<Result<Vec<_>>>()?;
+        let rings = range.clone().map(|layer| Ok((layer, floats(&mut gpu, ring * hp.head_dim)?))).collect::<Result<BTreeMap<_, _>>>()?;
         let mut sources = BTreeMap::new();
-        for (layer, plan) in hp.layers.iter().enumerate() {
+        for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
             if let Some(c) = plan.compressed.filter(|c| c.kv_source == layer) {
                 let groups = settings.context / c.ratio + 1;
                 sources.insert(layer, Source {
@@ -169,7 +198,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let identity: Vec<f32> = (0..b).flat_map(|_| (0..hc).map(|j| f32::from(u8::from(j == 0)))).collect();
         let all_rows: Vec<i32> = (0..b as i32).collect();
         let mut chosen = BTreeMap::new();
-        for (layer, plan) in hp.layers.iter().enumerate() {
+        for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
             if plan.compressed.is_some_and(|c| c.index_source == layer) {
                 chosen.insert(layer, floats(&mut gpu, b * hp.index_top_k)?);
             }
@@ -211,12 +240,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             xe: floats(&mut gpu, b * w)?,
             gate: floats(&mut gpu, b * hp.expert_ff)?,
             up: floats(&mut gpu, b * hp.expert_ff)?,
-            hidden: floats(&mut gpu, b * hp.expert_ff)?,
+            hidden: floats(&mut gpu, b * hp.experts_used.max(1) * hp.expert_ff)?,
             y: floats(&mut gpu, b * w)?,
             shared: floats(&mut gpu, b * w)?,
             engram_rows: floats(&mut gpu, b * hp.engram_columns() * hp.engram.as_ref().map_or(1, |e| e.head_dim))?,
             engram_kv: floats(&mut gpu, b * (hc + 1) * w)?,
-            head: floats(&mut gpu, hp.vocabulary)?,
+            head: floats(&mut gpu, if range.end == hp.layers.len() { hp.vocabulary } else { 1 })?,
+            hc_workspace: floats(&mut gpu, b * w.div_ceil(64) * ((2 + hc) * hc + 2) + b)?,
         };
         gpu.write_buffer(&work.identity, 0, &identity)?;
         gpu.write_buffer(&work.all_rows, 0, &all_rows)?;
@@ -228,7 +258,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
         // One slot fits the largest layer's expert.
         let mut slot_bytes = 0;
-        for layer in 0..hp.layers.len() {
+        for layer in range.clone() {
             let mut bytes = 0;
             for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
                 let tensor = tensors.tensor(&name(layer, role))?;
@@ -239,10 +269,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let slots = (0..settings.expert_slots).map(|_| gpu.buffer(slot_bytes as u64)).collect::<Result<Vec<_>>>()?;
         let count = slots.len();
         let mut engine = Engine {
-            hp,
+            hp: std::rc::Rc::new(hp),
             tensors,
             gpu,
             dense: HashMap::new(),
+            shared: HashMap::new(),
             scratch,
             settings,
             position: 0,
@@ -260,15 +291,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(engine)
     }
 
-    /// Every tensor but the routed experts and the Engram tables, resident.
+    /// Every tensor of this engine's layers but the routed experts and the Engram tables, resident
+    /// (with the head on the last engine); each shared expert as a slot.
     fn upload_dense(&mut self) -> Result<()> {
-        let mut names = vec!["output.weight".to_string(), "output_norm.weight".to_string()];
-        for layer in 0..self.hp.layers.len() {
+        let range = self.settings.layers.clone();
+        let mut names = Vec::new();
+        if range.end == self.hp.layers.len() {
+            names.extend(["output.weight".to_string(), "output_norm.weight".to_string()]);
+        }
+        for layer in range.clone() {
             for tensor in ["attn_norm", "attn_q_a", "attn_q_a_norm", "attn_q_b", "attn_kv", "attn_kv_a_norm", "attn_sinks",
                            "attn_output_a", "attn_output_b", "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn",
-                           "hc_ffn_base", "hc_ffn_scale", "ffn_norm", "ffn_gate_inp", "ffn_gate_shexp", "ffn_up_shexp",
-                           "ffn_down_shexp", "attn_compressor_kv", "attn_compressor_gate", "attn_compressor_norm",
-                           "indexer.attn_k", "indexer.k_norm", "indexer.attn_q_b", "indexer.proj", "engram_kv", "engram_gate"] {
+                           "hc_ffn_base", "hc_ffn_scale", "ffn_norm", "ffn_gate_inp", "attn_compressor_kv", "attn_compressor_gate",
+                           "attn_compressor_norm", "indexer.attn_k", "indexer.k_norm", "indexer.attn_q_b", "indexer.proj",
+                           "engram_kv", "engram_gate"] {
                 names.push(name(layer, tensor));
             }
             names.push(format!("blk.{layer}.exp_probs_b.bias"));
@@ -277,6 +313,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let Ok(tensor) = self.tensors.tensor(&name) else { continue };
             let buffer = self.gpu.upload_bytes(tensor.data)?;
             self.dense.insert(name, Dense { buffer, kind: tensor.kind, dims: tensor.dims });
+        }
+        for layer in range {
+            let roles = ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].map(|role| self.tensors.tensor(&name(layer, role)));
+            let [gate, up, down] = roles;
+            let (gate, up, down) = (gate?, up?, down?);
+            let offsets = [0, gate.data.len() as u64, (gate.data.len() + up.data.len()) as u64];
+            let bytes = [gate.data, up.data, down.data].concat();
+            let buffer = self.gpu.upload_bytes(&bytes)?;
+            self.shared.insert(layer, Slot { buffer, offsets, kinds: [gate.kind, up.kind, down.kind] });
         }
         Ok(())
     }
@@ -342,13 +387,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.gpu.rms_norm(x, &weight.buffer, rows as u64, width as u64, self.hp.norm_eps, x)
     }
 
-    /// Advance the sequence over `tokens` (at most the batch); the logits after the last one.
+    /// Advance the sequence over `tokens` (at most the batch); the logits after the last one. The
+    /// engine runs every layer.
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.pass(tokens)?.ok_or_else(|| "this DeepSeek-V4.1 engine runs only some of the layers".into())
+    }
+
+    /// Run this engine's layers over `tokens`: the first engine embeds them, a later one continues
+    /// the stream handed over to it ([`Engine::hand_over`]); the last returns the logits after the
+    /// last token.
+    pub fn pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
         let n = tokens.len();
         if n == 0 || n > self.settings.batch || self.position + n > self.settings.context {
             return Err("DeepSeek-V4.1 forward exceeds the batch or the context".into());
         }
         let (hc, w) = (self.hp.hc, self.hp.width);
+        let range = self.settings.layers.clone();
+        if let Some((since, _)) = self.profile.as_mut() {
+            // another engine's pass ran since this one's last mark
+            *since = std::time::Instant::now();
+        }
         let start = self.position;
         let positions: Vec<i32> = (start..start + n).map(|p| p as i32).collect();
         let ring_rows: Vec<i32> = (start..start + n).map(|p| (p % self.ring) as i32).collect();
@@ -358,76 +416,106 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let visible: Vec<i32> = (start..start + n).map(|p| ((p + 1) / ratio) as i32).collect();
             self.gpu.write_buffer(&self.work.visible[ratio], 0, &visible)?;
         }
-        // embeddings repeated into the hc copies
-        let embed = self.tensors.tensor("token_embd.weight")?;
-        let bytes = row_bytes(embed.kind, embed.dims[0])?;
-        let mut stream = Vec::with_capacity(n * hc * w);
-        let mut row = Vec::new();
-        for &token in tokens {
-            row.clear();
-            formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
-            for _ in 0..hc {
-                stream.extend_from_slice(&row);
+        if range.start == 0 {
+            // embeddings repeated into the hc copies
+            let embed = self.tensors.tensor("token_embd.weight")?;
+            let bytes = row_bytes(embed.kind, embed.dims[0])?;
+            let mut stream = Vec::with_capacity(n * hc * w);
+            let mut row = Vec::new();
+            for &token in tokens {
+                row.clear();
+                formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
+                for _ in 0..hc {
+                    stream.extend_from_slice(&row);
+                }
             }
+            self.gpu.write_buffer(&self.work.stream, 0, &stream)?;
         }
-        self.gpu.write_buffer(&self.work.stream, 0, &stream)?;
-        self.prefetch_engram(tokens)?;
+        if self.hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
+            self.prefetch_engram(tokens)?;
+        }
         self.mark("embedding")?;
-        let mut pre_previous: Option<usize> = None;
-        for layer in 0..self.hp.layers.len() {
-            self.layer(layer, tokens, n, pre_previous)?;
+        // A handed-over stream comes expanded, with the collapse coefficients of the layer before.
+        let mut pre_previous = range.start.checked_sub(1).map(|layer| layer % 2);
+        for layer in range.clone() {
+            self.layer(layer, tokens, n, pre_previous, layer > range.start)?;
             pre_previous = Some(layer % 2);
         }
-        let work = &self.work;
-        let pre = work.pre_f[(self.hp.layers.len() - 1) % 2];
-        self.gpu.hc_collapse(work.stream.at((n - 1) * hc * w), pre.at((n - 1) * hc), 1, hc as u64, w as u64, work.x.base())?;
-        let x = self.work.x.base();
-        self.norm("output_norm.weight", x, 1, w)?;
-        let head = self.work.head.base();
-        self.linear("output.weight", x, 1, head)?;
-        let mut logits = vec![0f32; self.hp.vocabulary];
-        let buffer = self.work.head;
-        self.gpu.read_buffer(&buffer, 0, &mut logits)?;
-        self.mark("head")?;
+        let work = self.work.clone_handles();
+        let last_layer = range.end - 1;
+        let logits = if range.end < self.hp.layers.len() {
+            self.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), n as u64, hc as u64,
+                               w as u64, work.stream.base())?;
+            None
+        } else {
+            // The last row's expansion of the last FFN output, collapsed and normed for the head.
+            let (last, pre) = (n - 1, work.pre_f[last_layer % 2]);
+            let norm = self.dense("output_norm.weight")?;
+            let expand = (work.out.at(last * w) as *const _, work.stream2.at(last * hc * w) as *const _,
+                          work.post_f.at(last * hc) as *const _, work.comb_f.at(last * hc * hc) as *const _);
+            self.gpu.hc_step(Some(expand), work.stream.at(last * hc * w), None, 0, 0.0, self.hp.norm_eps, pre.at(last * hc),
+                             norm.buffer.base(), 1, hc as u64, w as u64, &work.hc_workspace, work.x.base())?;
+            self.linear("output.weight", work.x.base(), 1, work.head.base())?;
+            let mut logits = vec![0f32; self.hp.vocabulary];
+            self.gpu.read_buffer(&work.head, 0, &mut logits)?;
+            self.mark("head")?;
+            Some(logits)
+        };
         self.history.extend_from_slice(tokens);
         self.position += n;
         Ok(logits)
     }
 
-    fn layer(&mut self, layer: usize, tokens: &[u32], n: usize, pre_previous: Option<usize>) -> Result<()> {
+    /// Hand the stream of the pass that just ran over `rows` tokens to the engine of the next layers.
+    pub fn hand_over(&mut self, next: &mut Engine<'a, T>, rows: usize) -> Result<()> {
+        let (hc, w) = (self.hp.hc, self.hp.width);
+        let pre = (self.settings.layers.end - 1) % 2;
+        if next.settings.layers.start != self.settings.layers.end {
+            return Err("DeepSeek-V4.1 engines hand over between adjacent layers only".into());
+        }
+        let (stream, coefficients) = (self.work.stream, self.work.pre_f[pre]);
+        self.gpu.copy_to(stream.base(), &mut next.gpu, next.work.stream.base(), (rows * hc * w * 4) as u64)?;
+        self.gpu.copy_to(coefficients.base(), &mut next.gpu, next.work.pre_f[pre].base(), (rows * hc * 4) as u64)
+    }
+
+    /// One layer; with `expand`, the previous layer's FFN output (in `out`) is expanded into `stream`
+    /// on the way in.
+    fn layer(&mut self, layer: usize, tokens: &[u32], n: usize, pre_previous: Option<usize>, expand: bool) -> Result<()> {
         let hp = self.hp.clone();
-        let (hc, w) = (hp.hc, hp.width);
-        let plan = hp.layers[layer].clone();
+        let (hc, w, rows) = (hp.hc as u64, hp.width as u64, n as u64);
+        let plan = &hp.layers[layer];
         let work = self.work.clone_handles();
+        let mut expand = expand.then(|| (work.out.base() as *const _, work.stream2.base() as *const _,
+                                         work.post_f.base() as *const _, work.comb_f.base() as *const _));
         if let Some(module) = plan.engram {
+            if expand.take().is_some() {
+                self.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), rows, hc, w,
+                                   work.stream.base())?;
+            }
             self.engram(layer, module, tokens, n)?;
             self.mark("engram")?;
         }
-        self.linear(&name(layer, "hc_attn_fn"), work.stream.base(), n, work.mixes.base())?;
-        let (base, scale) = (self.dense(&name(layer, "hc_attn_base"))?, self.dense(&name(layer, "hc_attn_scale"))?);
-        self.gpu.hc_coefficients(work.mixes.base(), work.stream.base(), n as u64, hc as u64, w as u64, base.buffer.base(),
-                                 scale.buffer.base(), hp.sinkhorn_iterations as u64, hp.hc_eps, hp.norm_eps, work.pre_a.base(),
-                                 work.post_a.base(), work.comb_a.base())?;
+        let iterations = hp.sinkhorn_iterations as u64;
+        let sublayer = |engine: &Self, side: &str, norm: &str| -> Result<(Dense, Dense, Dense, Dense)> {
+            Ok((engine.dense(&name(layer, &format!("hc_{side}_fn")))?, engine.dense(&name(layer, &format!("hc_{side}_base")))?,
+                engine.dense(&name(layer, &format!("hc_{side}_scale")))?, engine.dense(&name(layer, norm))?))
+        };
+        let (fn_, base, scale, norm) = sublayer(self, "attn", "attn_norm")?;
         let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
-        self.gpu.hc_collapse(work.stream.base(), pre.base(), n as u64, hc as u64, w as u64, work.x.base())?;
-        self.norm(&name(layer, "attn_norm"), work.x.base(), n, w)?;
+        self.gpu.hc_step(expand, work.stream.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(), work.pre_a.base(),
+                         work.post_a.base(), work.comb_a.base())), iterations, hp.hc_eps, hp.norm_eps, pre.base(), norm.buffer.base(),
+                         rows, hc, w, &work.hc_workspace, work.x.base())?;
         self.mark("hyper-connections")?;
         self.attention(layer, n)?;
         self.mark("attention")?;
-        self.gpu.hc_expand(work.out.base(), work.stream.base(), work.post_a.base(), work.comb_a.base(), n as u64, hc as u64,
-                           w as u64, work.stream2.base())?;
-        self.linear(&name(layer, "hc_ffn_fn"), work.stream2.base(), n, work.mixes.base())?;
-        let (base, scale) = (self.dense(&name(layer, "hc_ffn_base"))?, self.dense(&name(layer, "hc_ffn_scale"))?);
-        let pre_f = work.pre_f[layer % 2];
-        self.gpu.hc_coefficients(work.mixes.base(), work.stream2.base(), n as u64, hc as u64, w as u64, base.buffer.base(),
-                                 scale.buffer.base(), hp.sinkhorn_iterations as u64, hp.hc_eps, hp.norm_eps, pre_f.base(),
-                                 work.post_f.base(), work.comb_f.base())?;
-        self.gpu.hc_collapse(work.stream2.base(), work.pre_a.base(), n as u64, hc as u64, w as u64, work.x.base())?;
-        self.norm(&name(layer, "ffn_norm"), work.x.base(), n, w)?;
+        let (fn_, base, scale, norm) = sublayer(self, "ffn", "ffn_norm")?;
+        let expand = (work.out.base() as *const _, work.stream.base() as *const _, work.post_a.base() as *const _,
+                      work.comb_a.base() as *const _);
+        self.gpu.hc_step(Some(expand), work.stream2.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
+                         work.pre_f[layer % 2].base(), work.post_f.base(), work.comb_f.base())), iterations, hp.hc_eps, hp.norm_eps,
+                         work.pre_a.base(), norm.buffer.base(), rows, hc, w, &work.hc_workspace, work.x.base())?;
         self.mark("hyper-connections")?;
-        self.moe(layer, n)?;
-        self.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), n as u64, hc as u64,
-                           w as u64, work.stream.base())
+        self.moe(layer, n)
     }
 
     /// Start reading every Engram row these tokens will gather, while the layers before
@@ -480,15 +568,21 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let work = self.work.clone_handles();
         let plan = hp.layers[layer].compressed;
         let freqs = if plan.is_some() { self.compressed_rope } else { self.plain };
-        self.linear(&name(layer, "attn_q_a"), work.x.base(), n, work.qr.base())?;
+        let scratch = self.scratch;
+        let whole = |weight: &Dense, input: *mut std::ffi::c_void, output: *mut std::ffi::c_void| Linear {
+            weights: weight.buffer, kind: weight.kind, rows: weight.dims[1] as u64, cols: weight.dims[0] as u64, first_row: 0,
+            input: input as *const _, output,
+        };
+        let (q_a, kv) = (self.dense(&name(layer, "attn_q_a"))?, self.dense(&name(layer, "attn_kv"))?);
+        self.gpu.linears(&[whole(&q_a, work.x.base(), work.qr.base()), whole(&kv, work.x.base(), work.kv.base())], n as u64, 0, 0,
+                         &scratch)?;
         self.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank)?;
+        // q stays unrotated: the attention rotates it as it reads it
         self.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
-        self.gpu.rope(work.q.base(), n as u64, heads as u64, dim as u64, rope, &work.positions, &freqs, false)?;
-        self.linear(&name(layer, "attn_kv"), work.x.base(), n, work.kv.base())?;
-        self.norm(&name(layer, "attn_kv_a_norm"), work.kv.base(), n, dim)?;
-        self.gpu.rope(work.kv.base(), n as u64, 1, dim as u64, rope, &work.positions, &freqs, false)?;
-        let ring = self.rings[layer];
-        self.gpu.scatter(work.kv.base(), work.ring_rows.base(), n as u64, dim as u64, ring.base(), self.ring as u64)?;
+        let ring = self.rings[&layer];
+        let kv_norm = self.dense(&name(layer, "attn_kv_a_norm"))?;
+        self.gpu.norm_rope(work.kv.base(), &kv_norm.buffer, n as u64, dim as u64, hp.norm_eps, Some((rope, &work.positions, &freqs)),
+                           Some(work.ring_rows.base()), ring.base(), self.ring as u64)?;
         let mut compressed = None;
         if let Some(c) = plan {
             if c.kv_source == layer {
@@ -516,16 +610,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                   compressed.map(|(rows, groups, _)| (rows.base() as *const _, groups as u64)),
                                   compressed.map(|(_, _, chosen)| (chosen.base() as *const _, hp.index_top_k as u64)),
                                   sinks.buffer.base(), n as u64, heads as u64, dim as u64, 1.0 / (dim as f32).sqrt(),
-                                  work.attended.base())?;
-        self.gpu.rope(work.attended.base(), n as u64, heads as u64, dim as u64, rope, &work.positions, &freqs, true)?;
+                                  Some((rope, &freqs)), Some(&self.scratch), work.attended.base())?;
+        // wo_a is block-diagonal: group g projects its heads' slice alone.
         let wo_a = self.dense(&name(layer, "attn_output_a"))?;
         let group_width = heads * dim / hp.out_groups;
-        let scratch = self.scratch;
-        for g in 0..hp.out_groups {
-            self.gpu.linear(&wo_a.buffer, wo_a.kind, hp.out_rank as u64, wo_a.dims[0] as u64, (g * hp.out_rank) as u64,
-                            work.attended.at(g * group_width), (heads * dim) as u64, n as u64, work.low.at(g * hp.out_rank),
-                            (hp.out_groups * hp.out_rank) as u64, &scratch)?;
-        }
+        let groups: Vec<Linear> = (0..hp.out_groups).map(|g| Linear {
+            weights: wo_a.buffer, kind: wo_a.kind, rows: hp.out_rank as u64, cols: wo_a.dims[0] as u64, first_row: (g * hp.out_rank) as u64,
+            input: work.attended.at(g * group_width) as *const _, output: work.low.at(g * hp.out_rank),
+        }).collect();
+        self.gpu.linears(&groups, n as u64, (heads * dim) as u64, (hp.out_groups * hp.out_rank) as u64, &scratch)?;
         self.linear(&name(layer, "attn_output_b"), work.low.base(), n, work.out.base())
     }
 
@@ -565,10 +658,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let scratch = self.scratch;
             self.gpu.linear(&weight.buffer, weight.kind, weight.dims[1] as u64, weight.dims[0] as u64, 0, target, 0, groups as u64,
                             key_target, 0, &scratch)?;
-            self.norm(&name(layer, "indexer.k_norm"), key_target, groups, hp.index_dim)?;
             let starts: Vec<i32> = (first_group..first_group + groups).map(|g| (g * ratio) as i32).collect();
             self.gpu.write_buffer(&work.group_positions, 0, &starts)?;
-            self.gpu.rope(key_target, groups as u64, 1, hp.index_dim as u64, hp.rope_dims as u64, &work.group_positions, &freqs, false)?;
+            let key_norm = self.dense(&name(layer, "indexer.k_norm"))?;
+            self.gpu.norm_rope(key_target, &key_norm.buffer, groups as u64, hp.index_dim as u64, hp.norm_eps,
+                               Some((hp.rope_dims as u64, &work.group_positions, &freqs)), None, key_target, groups as u64)?;
             self.gpu.rope(target, groups as u64, 1, dim as u64, hp.rope_dims as u64, &work.group_positions, &freqs, false)?;
         }
         if left > 0 {
@@ -586,30 +680,47 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     fn moe(&mut self, layer: usize, n: usize) -> Result<()> {
         let hp = self.hp.clone();
-        let (w, ff) = (hp.width, hp.expert_ff);
+        let (w, ff, k) = (hp.width, hp.expert_ff, hp.experts_used);
         let work = self.work.clone_handles();
         self.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
         let bias = self.dense(&format!("blk.{layer}.exp_probs_b.bias"))?;
         let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
-        self.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, hp.experts_used as u64, gating,
+        self.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, k as u64, gating,
                        hp.route_normalize, hp.route_scale, work.ids.base(), work.weights.base())?;
         self.mark("router")?;
-        let mut routes = vec![0i32; n * hp.experts_used];
-        self.gpu.read_buffer(&work.ids, 0, &mut routes)?;
-        let mut weights = vec![0f32; n * hp.experts_used];
+        // The routes travel to the host while the shared expert writes `out`; the routed ones add to it.
+        self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
+        let shared = self.shared[&layer];
+        if n <= SLOT_ROWS {
+            self.gpu.experts(&vec![shared.buffer.base() as u64; n], shared.buffer.bytes, shared.offsets, shared.kinds, w as u64,
+                             ff as u64, n as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
+                             work.hidden.base(), work.out.base(), 0)?;
+        } else {
+            let scratch = self.scratch;
+            let role = |r: usize, bytes: u64| shared.buffer.slice(shared.offsets[r], bytes);
+            let (gate, up) = (role(0, shared.offsets[1]), role(1, shared.offsets[2] - shared.offsets[1]));
+            let down = role(2, shared.buffer.bytes - shared.offsets[2]);
+            self.gpu.linear(&gate, shared.kinds[0], ff as u64, w as u64, 0, work.x.base(), 0, n as u64, work.gate.base(), 0, &scratch)?;
+            self.gpu.linear(&up, shared.kinds[1], ff as u64, w as u64, 0, work.x.base(), 0, n as u64, work.up.base(), 0, &scratch)?;
+            self.gpu.swiglu(work.gate.base(), work.up.base(), n as u64, ff as u64, hp.layers[layer].clamp_shared, None,
+                            work.hidden.base())?;
+            self.gpu.linear(&down, shared.kinds[2], w as u64, ff as u64, 0, work.hidden.base(), 0, n as u64, work.out.base(), 0,
+                            &scratch)?;
+        }
+        self.mark("shared expert")?;
+        let mut routes = vec![0i32; n * k];
+        self.gpu.read_finish(&mut routes)?;
+        if n <= SLOT_ROWS {
+            return self.routed(layer, n, &routes);
+        }
+        let mut weights = vec![0f32; n * k];
         self.gpu.read_buffer(&work.weights, 0, &mut weights)?;
         let mut by_expert: BTreeMap<usize, (Vec<i32>, Vec<f32>)> = BTreeMap::new();
         for (slot, &expert) in routes.iter().enumerate() {
             let entry = by_expert.entry(expert as usize).or_default();
-            entry.0.push((slot / hp.experts_used) as i32);
+            entry.0.push((slot / k) as i32);
             entry.1.push(weights[slot]);
         }
-        // the shared expert writes `out`, the routed ones add to it
-        self.linear(&name(layer, "ffn_gate_shexp"), work.x.base(), n, work.gate.base())?;
-        self.linear(&name(layer, "ffn_up_shexp"), work.x.base(), n, work.up.base())?;
-        self.gpu.swiglu(work.gate.base(), work.up.base(), n as u64, ff as u64, hp.layers[layer].clamp_shared, None, work.hidden.base())?;
-        self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
-        self.mark("shared expert")?;
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
         let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
         let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
@@ -641,6 +752,37 @@ impl<'a, T: Tensors> Engine<'a, T> {
                             &scratch)?;
             self.gpu.scatter_add(work.y.base(), work.expert_rows.base(), count as u64, w as u64, work.out.base(), n as u64)?;
         }
+        self.mark("routed experts")
+    }
+
+    /// The routed experts of a few rows (decode): every route's expert made resident, then both
+    /// stages over the slots in one launch each, added to `out`.
+    fn routed(&mut self, layer: usize, n: usize, routes: &[i32]) -> Result<()> {
+        let (w, ff) = (self.hp.width, self.hp.expert_ff);
+        let work = self.work.clone_handles();
+        let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
+        let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
+        let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
+        let (gate_bytes, down_bytes) = (ff * row_bytes(gate.kind, w)?, w * row_bytes(down.kind, ff)?);
+        let kinds = [gate.kind, up.kind, down.kind];
+        let experts: std::collections::BTreeSet<usize> = routes.iter().map(|&expert| expert as usize).collect();
+        // The layer's missing experts all start reading before the first is copied in.
+        let missing: Vec<&[u8]> = experts.iter().filter(|&&expert| !self.experts.map.contains_key(&(layer, expert)))
+            .flat_map(|&expert| [&gate.data[expert * gate_bytes..(expert + 1) * gate_bytes],
+                                 &up.data[expert * gate_bytes..(expert + 1) * gate_bytes],
+                                 &down.data[expert * down_bytes..(expert + 1) * down_bytes]])
+            .collect();
+        self.tensors.prefetch(&missing);
+        let mut slots = HashMap::new();
+        for &expert in &experts {
+            slots.insert(expert, self.expert(layer, expert, gate_bytes, down_bytes)?);
+        }
+        let bases: Vec<u64> = routes.iter().map(|expert| slots[&(*expert as usize)].base() as u64).collect();
+        let slot_bytes = slots.values().next().map_or(0, |slot| slot.bytes);
+        let offsets = [0, gate_bytes as u64, 2 * gate_bytes as u64];
+        self.gpu.experts(&bases, slot_bytes, offsets, kinds, w as u64, ff as u64, n as u64, self.hp.experts_used as u64,
+                         work.x.base(), 0, Some(work.weights.base()), self.hp.layers[layer].clamp_routed, true, work.hidden.base(),
+                         work.out.base(), 0)?;
         self.mark("routed experts")
     }
 
@@ -676,6 +818,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 }
 
+/// One pass over engines that run consecutive layers (on their own devices): each hands the stream
+/// to the next; the logits after the last token.
+pub fn forward_split<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
+    for i in 0..engines.len().saturating_sub(1) {
+        engines[i].pass(tokens)?;
+        let (done, rest) = engines.split_at_mut(i + 1);
+        done[i].hand_over(&mut rest[0], tokens.len())?;
+    }
+    engines.last_mut().ok_or("no DeepSeek-V4.1 engines")?.forward(tokens)
+}
+
 impl Work {
     /// The buffers' handles (copies of device addresses) to use while `self` is borrowed.
     fn clone_handles(&self) -> Work {
@@ -688,6 +841,7 @@ impl Work {
             ids: self.ids, weights: self.weights, all_rows: self.all_rows, expert_rows: self.expert_rows,
             expert_weights: self.expert_weights, xe: self.xe, gate: self.gate, up: self.up, hidden: self.hidden, y: self.y,
             shared: self.shared, engram_rows: self.engram_rows, engram_kv: self.engram_kv, head: self.head,
+            hc_workspace: self.hc_workspace,
         }
     }
 }

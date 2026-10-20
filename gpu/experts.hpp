@@ -2,7 +2,7 @@
 // (ffn x hidden) and down (hidden x ffn) matrices, each token's row routed to top_k of
 // them. Decode runs gemv.hpp's units per route (F32); prefill on RDNA4 runs moe_gemm.hpp's
 // grouped WMMA GEMM (FP16 operands, F32 sums). sd_expert_rows drives both, for tests and
-// measurements.
+// measurements; slot_experts runs decode over a cache of whole experts.
 
 // Expert e's matrix of a role is the role's first matrix moved by e strides.
 struct ExpertBanks { Matrix role[3]; size_t stride[3]; };
@@ -291,4 +291,137 @@ void expert_rows(Device& d, void* const* pointers, const int* kinds, size_t expe
     check(hipStreamSynchronize(d.stream));
     if (timings)
         for (int stage = 0; stage < 2; ++stage) timings[stage] = timed[stage] ? events.span(2 * stage) : 0;
+}
+
+// ---- Experts in slots: decode over a cache of whole experts ----
+// A route's expert is a slot at bases[route] holding its gate, up and down matrices at byte offsets
+// role[r].data within it (a slot cache's layout, or a dense expert's). One launch per stage takes
+// every route of `tokens` rows: gate and up rows share a lane group, so SwiGLU (clamped, times the
+// route's weight) is formed before the store; down sums a row over the token's routes into `out`.
+struct SlotExperts { Matrix role[3]; uint32_t top_k, lanes[2], waves[2], accumulate; float clamp; };
+
+// This lane's shares of two rows' dots with x: `kind`'s units over `lanes` lanes, or (kind < 0) the
+// reference element decoder of `format` over the wave.
+template<int kind>
+__device__ __forceinline__ void slot_dots(const uint8_t* first, const uint8_t* second, int format, int second_format, size_t cols,
+                                          unsigned lanes, unsigned sub, const float* x, float& a, float& b) {
+    if constexpr (kind >= 0) {
+        const size_t units = cols / GemvFormat<kind>::elements;
+        #pragma unroll 2
+        for (size_t unit = sub; unit < units; unit += lanes) {
+            float da[1], db[1];
+            GemvFormat<kind>::template dots<1>(first, unit, x, 0, da);
+            if (second) GemvFormat<kind>::template dots<1>(second, unit, x, 0, db);
+            a += da[0];
+            if (second) b += db[0];
+        }
+    } else {
+        #define SD_REFERENCE(format_) case format_: \
+            for (size_t col = sub; col < cols; col += lanes) a += weight<format_>(first, col) * x[col]; \
+            break;
+        switch (format) { SD_FORMATS(SD_REFERENCE) }
+        if (second) {
+            float* sum = &b;
+            first = second;
+            switch (second_format) {
+                #define SD_SECOND(format_) case format_: \
+                    for (size_t col = sub; col < cols; col += lanes) *sum += weight<format_>(first, col) * x[col]; \
+                    break;
+                SD_FORMATS(SD_SECOND)
+                #undef SD_SECOND
+            }
+        }
+        #undef SD_REFERENCE
+    }
+}
+__device__ __forceinline__ float slot_reduce(float value, unsigned lanes) {
+    for (unsigned offset = lanes / 2; offset; offset /= 2) value += __shfl_xor(value, offset, 32);
+    return value;
+}
+// blockIdx.y selects a token; the waves cover every route's rows. product[token][route][row] =
+// silu(min(gate, c)) * clamp(up, -c, c) * weight, as op_swiglu_kernel forms it.
+template<int kind>
+__global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
+                             const float* weights, float* product) {
+    const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    const size_t route = wave / plan.waves[0];
+    if (route >= plan.top_k) return;
+    const size_t index = size_t(blockIdx.y) * plan.top_k + route;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(bases[index]);
+    const Matrix& gate = plan.role[0];
+    const unsigned lanes = plan.lanes[0], lane = threadIdx.x % 32, sub = lane % lanes;
+    const Matrix& up = plan.role[1];
+    const size_t row = (wave % plan.waves[0]) * (32 / lanes) + lane / lanes, last = std::min(row, gate.rows - 1);
+    float g = 0.0f, u = 0.0f;
+    slot_dots<kind>(base + size_t(gate.data) + last * gate.row_bytes, base + size_t(up.data) + last * up.row_bytes, gate.kind,
+                    up.kind, gate.cols, lanes, sub, input + size_t(blockIdx.y) * input_stride, g, u);
+    g = slot_reduce(g, lanes);
+    u = slot_reduce(u, lanes);
+    if (sub || row >= gate.rows) return;
+    if (plan.clamp > 0.0f) { g = fminf(g, plan.clamp); u = fminf(fmaxf(u, -plan.clamp), plan.clamp); }
+    product[index * gate.rows + row] = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
+}
+// blockIdx.y selects a token; the waves cover the output rows, each summed over the token's routes
+// in route order, then added to `out` (or stored, without `accumulate`).
+template<int kind>
+__global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) {
+    const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    const Matrix& down = plan.role[2];
+    const unsigned lanes = plan.lanes[1], lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = wave * (32 / lanes) + lane / lanes;
+    if (wave >= plan.waves[1]) return;
+    const size_t at = size_t(down.data) + std::min(row, down.rows - 1) * down.row_bytes;
+    float sum = 0.0f, unused = 0.0f;
+    for (size_t route = 0; route < plan.top_k; ++route) {
+        const size_t index = size_t(blockIdx.y) * plan.top_k + route;
+        slot_dots<kind>(reinterpret_cast<const uint8_t*>(bases[index]) + at, nullptr, down.kind, down.kind, down.cols, lanes, sub,
+                        product + index * down.cols, sum, unused);
+    }
+    sum = slot_reduce(sum, lanes);
+    if (sub || row >= down.rows) return;
+    float* target = out + size_t(blockIdx.y) * out_stride + row;
+    *target = plan.accumulate ? *target + sum : sum;
+}
+// Both stages for `tokens` rows: product = SwiGLU of every route (tokens x top_k x ffn), then out.
+// Lanes per row as the GEMV chooses them; a format without units, or gate and up of different
+// formats, takes the reference decoder a row per wave.
+void slot_experts(Device& d, SlotExperts plan, const uint64_t* bases, size_t tokens, const float* input, size_t input_stride,
+                  const float* weights, float* product, float* out, size_t out_stride) {
+    const Matrix &gate = plan.role[0], &up = plan.role[1], &down = plan.role[2];
+    auto fast = [](int kind) {
+        switch (kind) {
+            #define SD_FAST(format) case format: return true;
+            SD_FAST_FORMATS(SD_FAST)
+            #undef SD_FAST
+        }
+        return false;
+    };
+    // Offsets stand in for the slots' addresses, which are 256-byte aligned.
+    const bool paired = gate.kind == up.kind && gate.row_bytes == up.row_bytes;
+    const unsigned gate_lanes = std::min(gemv_lanes(gate, input, plan.top_k * 2), gemv_lanes(up, input, plan.top_k * 2));
+    const int gate_kind = paired && gate_lanes && fast(gate.kind) ? gate.kind : -1;
+    plan.lanes[0] = gate_kind < 0 ? 32 : gate_lanes;
+    const unsigned down_lanes = gemv_lanes(down, product, 1);
+    const int down_kind = down_lanes && fast(down.kind) ? down.kind : -1;
+    plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
+    plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
+    plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
+    const dim3 first(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
+    const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));
+    #define SD_SLOT_GATE(format) case format: \
+        slot_gate_up<format><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product); break;
+    switch (gate_kind) {
+        SD_FAST_FORMATS(SD_SLOT_GATE)
+        default: slot_gate_up<-1><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);
+    }
+    #undef SD_SLOT_GATE
+    check(hipGetLastError());
+    #define SD_SLOT_DOWN(format) case format: \
+        slot_down<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride); break;
+    switch (down_kind) {
+        SD_FAST_FORMATS(SD_SLOT_DOWN)
+        default: slot_down<-1><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride);
+    }
+    #undef SD_SLOT_DOWN
+    check(hipGetLastError());
 }
