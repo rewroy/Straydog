@@ -160,6 +160,9 @@ fn main() -> Result<(), String> {
         all.extend(steps);
     }
     println!("{} | run hash {run_hash:016x}", summary("all", &all));
+    let counts = engines.iter().map(|engine| engine.cache_counts()).fold(straydog_engine::experts::Counts::default(), |a, b| a + b);
+    println!("experts: {} VRAM hits, {} host-tier fills, {} drive reads, {} write-backs", counts.hits, counts.host_hits,
+             counts.drive_reads, counts.writebacks);
     for engine in &mut engines {
         engine.settle()?;
     }
