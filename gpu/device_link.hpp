@@ -1,7 +1,8 @@
 // Tensor-parallel partial sums of two devices inside recorded graphs (docs/DESIGN.md §10.3):
 // each device holds, in its own VRAM, an inbox of two slots (alternating by sum) and a flag the
-// other raises. A sum copies this device's part into the other's inbox slot, then (a second
-// kernel, so the copy has completed) raises the other's flag to its count of sums with a
+// other raises. A sum copies this device's part into the other's inbox slot, then, once every
+// share of the copy is stored (a kernel later, or in the one-block kernel of a few rows after each
+// thread waited for its stores and a barrier), raises the other's flag to its count of sums with a
 // system-scope release, waits for its own flag to reach the same count, and adds the two parts,
 // reading the inbox at system scope (never a stale line). Both devices add the same two values
 // (addition commutes exactly), so their sums are equal. The counts live in device memory: graph
@@ -28,26 +29,27 @@ __global__ void link_copy_kernel(const float* part, size_t count, float* peer_in
         peer_inbox[slot + i] = part[i];
 }
 
-// out = this device's part + the other's (accumulate: out += that sum).
-__global__ void link_add_kernel(const float* part, size_t count, uint32_t* state, uint32_t* peer_flag, const float* inbox,
-                                size_t capacity, uint64_t timeout, int accumulate, float* out) {
-    __shared__ uint32_t sent;
-    if (!threadIdx.x) {
-        sent = state[0] + 1;
-        state[0] = sent;
-        __threadfence_system();
-        peer_store(peer_flag, sent);
-        const uint64_t start = peer_clock();
-        while (int32_t(peer_load(state + 1) - sent) < 0) {
-            if (peer_clock() - start > timeout) { state[2] = sent; break; }
+// A larger sum (a prefill pass's rows) in three kernels, so that the add runs on every unit:
+// the copy; one thread raising the other's flag and waiting for its own; then the add over the
+// whole grid (the slot from the count the wait set).
+__global__ void link_signal_kernel(uint32_t* state, uint32_t* peer_flag, uint64_t timeout) {
+    const uint32_t sent = state[0] + 1;
+    state[0] = sent;
+    __threadfence_system();
+    peer_store(peer_flag, sent);
+    const uint64_t start = peer_clock();
+    while (int32_t(peer_load(state + 1) - sent) < 0) {
+        if (peer_clock() - start > timeout) { state[2] = sent; break; }
 #if defined(__HIPCC__)
-            __builtin_amdgcn_s_sleep(1);
+        __builtin_amdgcn_s_sleep(1);
 #endif
-        }
     }
-    __syncthreads();
-    const size_t slot = size_t(sent & 1) * capacity;
-    for (size_t i = threadIdx.x; i < count; i += blockDim.x) {
+    __threadfence_system();
+}
+__global__ void link_add_grid_kernel(const float* part, size_t count, const uint32_t* state, const float* inbox, size_t capacity,
+                                     int accumulate, float* out) {
+    const size_t slot = size_t(state[0] & 1) * capacity;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x) {
         const float theirs = link_load(inbox + slot + i);
         const float sum = part[i] + theirs;
         out[i] = accumulate ? out[i] + sum : sum;
@@ -57,7 +59,7 @@ __global__ void link_add_kernel(const float* part, size_t count, uint32_t* state
 // A sum of at most link_single_floats floats in one kernel of one block: its threads store their
 // shares of the part into the other's inbox at system scope and each waits for its own stores
 // (an agent-scope release); after the block's barrier, one thread raises the other's flag with a
-// system-scope release, so the flag follows every share; then as link_add_kernel.
+// system-scope release, so the flag follows every share; then the wait and the add.
 constexpr size_t link_single_floats = 8192;
 #if defined(__HIPCC__)
 __global__ void link_sum_kernel(const float* part, size_t count, uint32_t* state, uint32_t* peer_flag, float* peer_inbox,
@@ -138,11 +140,13 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
         return 0;
     }
 #endif
-    link_copy_kernel<<<unsigned(std::min<size_t>((size_t(count) + 255) / 256, 256)), 256, 0, value.stream>>>(
-        part, size_t(count), link.peer_inbox, link.state, link.capacity);
+    const unsigned blocks = unsigned(std::min<size_t>((size_t(count) + 255) / 256, 1024));
+    link_copy_kernel<<<blocks, 256, 0, value.stream>>>(part, size_t(count), link.peer_inbox, link.state, link.capacity);
     check(hipGetLastError());
-    link_add_kernel<<<1, 1024, 0, value.stream>>>(part, size_t(count), link.state, link.peer_flag, link.inbox, link.capacity,
-                                                  value.await_timeout, accumulate ? 1 : 0, out);
+    link_signal_kernel<<<1, 1, 0, value.stream>>>(link.state, link.peer_flag, value.await_timeout);
+    check(hipGetLastError());
+    link_add_grid_kernel<<<blocks, 256, 0, value.stream>>>(part, size_t(count), link.state, link.inbox, link.capacity,
+                                                           accumulate ? 1 : 0, out);
     SD_OP_END
 }
 

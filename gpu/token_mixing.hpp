@@ -80,6 +80,73 @@ __global__ void tm_delta_rule_kernel(const float* qkv, const float* beta, const 
     for (int i = 0; i < DIM; ++i) state[(h * DIM + i) * DIM + j] = column[i];
 }
 
+// tm_delta_rule_kernel<128> a wave per value head h and 32 of its columns (blockIdx.y), with its
+// arithmetic: each wave forms the step's normalized q and k itself, their sums of squares in the
+// block kernel's tree order (lane l takes (x[l]^2 + x[l+64]^2) + (x[l+32]^2 + x[l+96]^2), the
+// tree's value at l after its stride-32 step, rounded as there, then the wave halves the rest), so
+// no wave waits on another's barrier; a column's sums are the block kernel's. A long pass is
+// latency-bound step by step: the next step's inputs load while this one computes.
+__device__ __forceinline__ float tm_tree128(const float (&x)[4]) {
+    float value = __fadd_rn(__fadd_rn(__fmul_rn(x[0], x[0]), __fmul_rn(x[2], x[2])),
+                            __fadd_rn(__fmul_rn(x[1], x[1]), __fmul_rn(x[3], x[3])));
+    for (unsigned offset = 16; offset; offset /= 2) value = __fadd_rn(value, __shfl_down(value, offset, 32));
+    return __shfl(value, 0, 32);
+}
+__global__ void __launch_bounds__(32) tm_delta_rule_wave_kernel(const float* qkv, const float* beta, const float* alpha, const float* dt,
+                                                               const float* a, float* state, size_t k_heads, size_t v_heads, size_t steps,
+                                                               float eps, float* out) {
+    constexpr int DIM = 128;
+    const size_t h = blockIdx.x, lane = threadIdx.x, j = size_t(blockIdx.y) * 32 + lane, kh = h % k_heads;
+    const size_t channels = (2 * k_heads + v_heads) * DIM;
+    __shared__ float q[DIM], k[DIM];
+    float column[DIM];
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) column[i] = state[(h * DIM + i) * DIM + j];
+    float qv[4], kv[4], v = 0.0f, al = 0.0f, be = 0.0f;
+    auto load = [&](size_t t) {
+        const float* row = qkv + t * channels;
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            qv[m] = row[kh * DIM + lane + 32 * m];
+            kv[m] = row[k_heads * DIM + kh * DIM + lane + 32 * m];
+        }
+        v = row[2 * k_heads * DIM + h * DIM + j];
+        al = alpha[t * v_heads + h];
+        be = beta[t * v_heads + h];
+    };
+    if (steps) load(0);
+    for (size_t t = 0; t < steps; ++t) {
+        const float q_sum = tm_tree128(qv), k_sum = tm_tree128(kv);
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            q[lane + 32 * m] = qv[m] / sqrtf(q_sum + eps) / sqrtf(float(DIM));
+            k[lane + 32 * m] = kv[m] / sqrtf(k_sum + eps);
+        }
+        const float g = expf(a[h] * tm_softplus(al + dt[h]));
+        const float b = tm_sigmoid(be);
+        const float value = v;
+        if (t + 1 < steps) load(t + 1);
+        __syncthreads();
+        float predicted = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < DIM; ++i) {
+            column[i] *= g;
+            predicted += column[i] * k[i];
+        }
+        const float delta = (value - predicted) * b;
+        float result = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < DIM; ++i) {
+            column[i] += k[i] * delta;
+            result += column[i] * q[i];
+        }
+        out[(t * v_heads + h) * DIM + j] = result;
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) state[(h * DIM + i) * DIM + j] = column[i];
+}
+
 // A block (256 threads) per row of width values: x / sqrt(mean(x^2) + eps) * weight * SiLU(gate).
 __global__ void tm_gated_norm_kernel(const float* x, const float* gate, const float* weight, size_t width, float eps, float* out) {
     const float* row = x + size_t(blockIdx.x) * width;
@@ -130,6 +197,76 @@ constexpr size_t tm_attention_threads = 256;
 constexpr size_t tm_attention_tile = 64;
 constexpr size_t tm_attention_max_dim = 1024;
 constexpr size_t tm_attention_max_splits = 64;
+
+// Causal grouped-query attention of many rows (a prefill pass): a block takes 16 consecutive rows
+// of one head and walks the keys up to the last one's position in tiles of 16, each tile's keys and
+// values staged once in shared memory for all 16 rows (the per-row kernel below reads them once a
+// row). Thread (row, key) scores a pair; each row's 16 threads keep its online softmax (max and
+// sum by shuffles); thread (row, d) accumulates dimensions d, d + 16, ... of the row's output.
+// F32 throughout; keys past a row's position are left out. Output times sigmoid(gate) when given.
+constexpr int tm_rows_r = 16, tm_rows_k = 16, tm_rows_dim = 256;
+__global__ void __launch_bounds__(256) tm_attention_rows_kernel(const float* q, const float* keys, const float* values,
+                                                               const int32_t* positions, size_t rows, size_t heads, size_t kv_heads,
+                                                               float scale, const float* gate, float* out) {
+    constexpr int R = tm_rows_r, K = tm_rows_k, D = tm_rows_dim;
+    __shared__ float qs[R][D], ks[K][D + 1], vs[K][D], ps[R][K];
+    const size_t h = blockIdx.y, kh = h / (heads / kv_heads), r0 = size_t(blockIdx.x) * R;
+    const unsigned t = threadIdx.x, row = t / 16, sub = t % 16;
+    const size_t my_row = r0 + row;
+    const bool valid = my_row < rows;
+    for (unsigned i = t; i < R * D; i += 256) {
+        const size_t r = r0 + i / D;
+        qs[i / D][i % D] = r < rows ? q[(r * heads + h) * D + i % D] : 0.0f;
+    }
+    size_t length = 0;
+    for (size_t r = r0; r < std::min(rows, r0 + R); ++r) length = std::max(length, size_t(positions[r]) + 1);
+    const size_t mine = valid ? size_t(positions[my_row]) + 1 : 1;
+    float m = -INFINITY, l = 0.0f, acc[D / 16];
+    #pragma unroll
+    for (int c = 0; c < D / 16; ++c) acc[c] = 0.0f;
+    __syncthreads();
+    for (size_t start = 0; start < length; start += K) {
+        for (unsigned i = t; i < K * D; i += 256) {
+            const size_t key = start + i / D;
+            const bool in = key < length;
+            ks[i / D][i % D] = in ? keys[(key * kv_heads + kh) * D + i % D] : 0.0f;
+            vs[i / D][i % D] = in ? values[(key * kv_heads + kh) * D + i % D] : 0.0f;
+        }
+        __syncthreads();
+        float score = 0.0f;
+        #pragma unroll 8
+        for (int d = 0; d < D; ++d) score += qs[row][d] * ks[sub][d];
+        const bool seen = start + sub < mine;
+        score = seen ? score * scale : -INFINITY;
+        float top = score;
+        for (unsigned offset = 8; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 16));
+        const float next = fmaxf(m, top);
+        const float p = seen ? expf(score - next) : 0.0f;
+        float total = p;
+        for (unsigned offset = 8; offset; offset /= 2) total += __shfl_xor(total, offset, 16);
+        const float correction = expf(m - next);   // (0 at the first tile: m = -inf, next finite)
+        l = l * correction + total;
+        m = next;
+        ps[row][sub] = p;
+        __syncthreads();
+        #pragma unroll
+        for (int c = 0; c < D / 16; ++c) {
+            float value = acc[c] * correction;
+            #pragma unroll
+            for (int k = 0; k < K; ++k) value += ps[row][k] * vs[k][sub + 16 * c];
+            acc[c] = value;
+        }
+        __syncthreads();
+    }
+    if (!valid) return;
+    #pragma unroll
+    for (int c = 0; c < D / 16; ++c) {
+        const size_t at = (my_row * heads + h) * D + sub + 16 * c;
+        float value = acc[c] / l;
+        if (gate) value *= tm_sigmoid(gate[at]);
+        out[at] = value;
+    }
+}
 
 // Causal grouped-query attention, split over the keys (flash decoding): block (row * heads + h,
 // split) takes its share of keys [0, positions[row]] (an equal share of each row's length, so a
@@ -259,8 +396,8 @@ int sd_op_delta_rule(void* handle, const float* qkv, const float* beta, const fl
     op_span(value, state, size_t(v_heads * dim * dim) * 4, "a delta rule state");
     op_span(value, out, size_t(steps * v_heads * dim) * 4, "a delta rule output");
     if (dim == 128)
-        tm_delta_rule_kernel<128><<<unsigned(v_heads), 128, 0, value.stream>>>(qkv, beta, alpha, dt, a, state, size_t(k_heads),
-                                                                           size_t(v_heads), size_t(steps), eps, out);
+        tm_delta_rule_wave_kernel<<<dim3(unsigned(v_heads), 4), 32, 0, value.stream>>>(qkv, beta, alpha, dt, a, state, size_t(k_heads),
+                                                                                    size_t(v_heads), size_t(steps), eps, out);
     else
         tm_delta_rule_kernel<64><<<unsigned(v_heads), 64, 0, value.stream>>>(qkv, beta, alpha, dt, a, state, size_t(k_heads),
                                                                          size_t(v_heads), size_t(steps), eps, out);
@@ -314,6 +451,13 @@ int sd_op_attention(void* handle, const float* q, const float* keys, const float
     op_span(value, positions, size_t(rows) * 4, "attention positions");
     if (gate) op_span(value, gate, size_t(rows * heads * dim) * 4, "an attention gate");
     op_span(value, out, size_t(rows * heads * dim) * 4, "an attention output");
+    // Many rows (a prefill pass): blocks of 16 rows sharing each tile of keys.
+    if (rows >= 16 && dim == tm_rows_dim && (rows + tm_rows_r - 1) / tm_rows_r <= 65535 && heads <= 65535) {
+        tm_attention_rows_kernel<<<dim3(unsigned((rows + tm_rows_r - 1) / tm_rows_r), unsigned(heads)), 256, 0, value.stream>>>(
+            q, keys, values, positions, size_t(rows), size_t(heads), size_t(kv_heads), scale, gate, out);
+        check(hipGetLastError());
+        return 0;
+    }
     // Enough blocks to fill the device whatever the rows: few rows split their keys further.
     const size_t pairs = size_t(rows * heads);
     const size_t splits = std::min(tm_attention_max_splits, std::max<size_t>(1, 256 / pairs));
