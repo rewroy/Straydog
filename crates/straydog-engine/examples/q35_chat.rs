@@ -3,9 +3,11 @@
 //! (DUMP_DIR/result_output.f32), then a greedy continuation compared with the reference's.
 //! Development only (unauthenticated weights). With --split L, layers 0..L run on GPU 0 and the
 //! rest on GPU 1. Q35_COMPARE=DIR compares each layer's tensors with DIR's as the passes go (the
-//! prompt in one chunk).
+//! prompt in one chunk). With --checkpoint N, the prompt is run again with a checkpoint N tokens
+//! before its end, other tokens after it, the checkpoint restored and the last N run again: the
+//! logits must be the same.
 //!
-//! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N]
+//! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N]
 
 #[path = "common/files.rs"]
 mod files;
@@ -27,9 +29,10 @@ fn main() -> Result<(), String> {
         value
     });
     let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 16), option("--slots", 2000), option("--split", 0));
-    let (host_gb, context) = (option("--host-gb", 0), option("--context", 4096));
+    let (host_gb, context, checkpoint) = (option("--host-gb", 0), option("--context", 4096), option("--checkpoint", 0));
     let [dir, dump] = &args[..] else {
-        return Err("usage: q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N]".into());
+        return Err("usage: q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] \
+                    [--checkpoint N]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
@@ -43,7 +46,7 @@ fn main() -> Result<(), String> {
     let mut engines = Vec::new();
     for (device, part) in parts.into_iter().enumerate() {
         let settings = Settings { context, batch: chunk.max(1), expert_slots: slots, host_expert_bytes: (host_gb as u64) << 30,
-                                  scratch_bytes: 512 << 20, layers: part };
+                                  scratch_bytes: 512 << 20, layers: part, checkpoints: usize::from(checkpoint > 0) };
         engines.push(Engine::new(hp.clone(), &files, device, 31 << 30, settings)?);
     }
     println!("{} layers on {} GPU(s), placed in {:.1} s", layers, engines.len(), started.elapsed().as_secs_f64());
@@ -90,6 +93,28 @@ fn main() -> Result<(), String> {
     println!("reference: {continuation:?}");
     let same = output.iter().zip(&continuation).take_while(|(a, b)| a == b).count();
     println!("{same} of {} tokens match", output.len().min(continuation.len()));
+    if checkpoint > 0 {
+        let cut = prompt.len().checked_sub(checkpoint).filter(|&cut| cut > 0).ok_or("--checkpoint past the prompt's start")?;
+        for engine in &mut engines {
+            engine.reset()?;
+        }
+        for piece in prompt[..cut].chunks(chunk.max(1)) {
+            forward_split(&mut engines, piece)?;
+        }
+        for engine in &mut engines {
+            engine.checkpoint(0, true)?;
+        }
+        let first = forward_split(&mut engines, &prompt[cut..])?;
+        forward_split(&mut engines, &output)?;
+        for engine in &mut engines {
+            engine.checkpoint(0, false)?;
+        }
+        let again = forward_split(&mut engines, &prompt[cut..])?;
+        let differ = first.iter().zip(&again).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let largest = first.iter().zip(&again).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("checkpoint {checkpoint} tokens before the end, restored after {} more: {differ} logits differ (largest by {largest:e}); \
+                  top-1 {} vs {}", output.len(), argmax(&first), argmax(&again));
+    }
     for engine in &mut engines {
         engine.settle()?;
     }

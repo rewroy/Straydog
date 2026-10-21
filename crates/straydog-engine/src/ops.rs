@@ -131,6 +131,12 @@ impl Backend {
         check(unsafe { ffi::sd_buffer_read_finish(self.handle(), out.as_mut_ptr().cast(), bytes) })
     }
 
+    /// Copy `bytes` from `source` to `target` on this device, queued behind its work.
+    pub fn copy(&mut self, source: P, target: M, bytes: u64) -> Result<()> {
+        // SAFETY: a live handle; the library checks both ranges against its allocations.
+        check(unsafe { ffi::sd_buffer_copy_peer(self.handle(), target.cast(), self.handle(), source.cast(), bytes) })
+    }
+
     /// Copy `bytes` from `source` (this device's) into `target` on `to`, after the work queued here;
     /// `to`'s later work waits for the bytes.
     pub fn copy_to(&mut self, source: P, to: &mut Backend, target: M, bytes: u64) -> Result<()> {

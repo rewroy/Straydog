@@ -483,3 +483,11 @@ the GPUs balancing the dense bytes, each GPU's VRAM left after its dense weights
 and K/V going to expert slots sized per layer's experts (Qwen3.6 mixes Q8_0 and BF16 experts), and
 the host tier as for DeepSeek-V4.1. Replies split as Qwen's do (`</think>`, `<tool_call>`) and end
 at the generation config's end tokens; unset sampling follows `general.sampling.*`.
+
+A next turn continues the held sequence when its prompt extends it. Qwen3.6's template drops a
+past turn's thinking (unless `preserve_thinking`), so its next prompt never extends the sequence
+that ran; the DeltaNets' state (conv histories and recurrent states, a few MB a layer) is therefore copied on
+the GPU where each prompt's generation prompt begins (its last `<|im_start|>`), keeping the last
+two. A prompt that extends such a checkpoint, while the held sequence matches it that far (so the
+K/V rows below it are the checkpoint's), restores it and runs only the rest (`resumed_from`
+"turn" or "prior").

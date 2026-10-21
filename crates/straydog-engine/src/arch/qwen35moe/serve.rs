@@ -2,7 +2,9 @@
 //! GPUs, one engine per GPU over a range of layers balancing the dense bytes; each GPU's VRAM left
 //! after its dense weights, the sequence state (DeltaNet states, K/V) and the work buffers given to
 //! expert slots, and the host memory planned for the experts' host tier. Requests then run in a
-//! [`Session`]; a reply ends at any of the official generation config's end tokens.
+//! [`Session`]; a reply ends at any of the official generation config's end tokens. The DeltaNets'
+//! state is checkpointed where each reply's generation prompt begins ([`CHECKPOINTS`] copies), so
+//! a next turn resumes there when the template renders the reply otherwise than it ran.
 
 use std::path::Path;
 use std::time::Instant;
@@ -19,6 +21,9 @@ use crate::pinned::Pinned;
 
 /// Qwen3.5 MoE served: its placed engines in a session.
 pub type Model = Session<Engines>;
+
+/// Copies of the DeltaNets' state each engine keeps: the last turn's and the one before.
+pub const CHECKPOINTS: usize = 2;
 
 /// The engines of consecutive layer ranges, one per device.
 pub struct Engines {
@@ -79,6 +84,14 @@ impl served::Engines for Engines {
     fn settle(&mut self) -> Result<(), String> {
         self.engines.iter_mut().try_for_each(Engine::settle)
     }
+
+    fn checkpoints(&self) -> usize {
+        CHECKPOINTS
+    }
+
+    fn checkpoint(&mut self, slot: usize, save: bool) -> Result<(), String> {
+        self.engines.iter_mut().try_for_each(|engine| engine.checkpoint(slot, save))
+    }
 }
 
 fn layer_of(name: &str) -> Option<usize> {
@@ -133,11 +146,13 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1).next_multiple_of(256)
     };
     // The sequence state of a part's layers: each DeltaNet's convolution history and recurrent
-    // state, each attention layer's K/V over the context.
+    // state (with its checkpoints' copies), each attention layer's K/V over the context.
     let state = |range: &std::ops::Range<usize>| -> u64 {
         range.clone().map(|layer| {
             let bytes = match hp.mixers[layer] {
-                Mixer::DeltaNet => ((hp.conv_kernel - 1) * hp.conv_channels() + hp.v_heads * hp.state_dim * hp.state_dim) * 4,
+                Mixer::DeltaNet => {
+                    ((hp.conv_kernel - 1) * hp.conv_channels() + hp.v_heads * hp.state_dim * hp.state_dim) * 4 * (1 + CHECKPOINTS)
+                }
                 Mixer::Attention => settings.context * hp.kv_heads * hp.head_dim * 2 * 4,
             };
             bytes as u64
@@ -155,6 +170,9 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let in_vram: u64 = parts.iter().zip(&slots).map(|(range, &slots)| slots as u64 * slot_bytes(range)).sum();
     let host = served::host_tier(settings, total_experts.saturating_sub(in_vram));
     let end = end_tokens(root, &pins, &files)?;
+    let turn_start = files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
+        .and_then(|tokens| tokens.iter().position(|token| token.text() == Some("<|im_start|>")))
+        .map(|id| id as u32);
     let card = served::card(&files.header)?;
     let whole_bytes = files.whole_bytes(|name| layer_of(name).is_none_or(|layer| layer < layers));
     let files: &'static Pinned = Box::leak(Box::new(files));
@@ -181,6 +199,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     host_expert_bytes: (host as f64 * experts as f64 / total_experts.max(1) as f64) as u64,
                     scratch_bytes: SCRATCH,
                     layers: range.clone(),
+                    checkpoints: CHECKPOINTS,
                 };
                 engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes, engine_settings)?);
             }
@@ -203,7 +222,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     });
     Ok(Session::new(Placed {
         engines: Engines { engines },
-        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch, end, card,
+        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch, end, turn_start,
+        card,
         placement, state_bytes, load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
     }))
 }

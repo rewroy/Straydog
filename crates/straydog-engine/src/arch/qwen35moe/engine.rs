@@ -41,6 +41,8 @@ pub struct Settings {
     pub scratch_bytes: u64,
     /// The layers this engine runs: the first embeds the tokens, the last has the head.
     pub layers: std::ops::Range<usize>,
+    /// Copies of the DeltaNets' state a session can save and restore ([`Engine::checkpoint`]).
+    pub checkpoints: usize,
 }
 
 #[derive(Clone)]
@@ -54,6 +56,13 @@ struct Dense {
 enum State {
     DeltaNet { history: Buffer, recurrent: Buffer },
     Attention { keys: Buffer, values: Buffer },
+}
+
+/// A copy of the DeltaNets' state (each one's history, then its recurrent state, in layer order)
+/// and the position it was taken at.
+struct Saved {
+    buffers: Vec<Buffer>,
+    position: usize,
 }
 
 /// Work buffers sized for a batch.
@@ -99,6 +108,7 @@ pub struct Engine<'a, T: Tensors> {
     scratch: Buffer,
     work: Work,
     states: BTreeMap<usize, State>,
+    saved: Vec<Saved>,
     experts: DeviceExperts,
     frequencies: Buffer,
     position: usize,
@@ -174,6 +184,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
             };
             states.insert(layer, state);
         }
+        let mut saved = Vec::new();
+        for _ in 0..settings.checkpoints {
+            let mut buffers = Vec::new();
+            for state in states.values() {
+                if let State::DeltaNet { history, recurrent } = state {
+                    buffers.push(gpu.buffer(history.bytes)?);
+                    buffers.push(gpu.buffer(recurrent.bytes)?);
+                }
+            }
+            saved.push(Saved { buffers, position: 0 });
+        }
         let frequencies: Vec<f32> = hp.rope_frequencies().into_iter().map(|f| f as f32).collect();
         let frequency_buffer = floats(&mut gpu, frequencies.len())?;
         gpu.write_buffer(&frequency_buffer, 0, &frequencies)?;
@@ -203,6 +224,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             scratch,
             work,
             states,
+            saved,
             experts,
             frequencies: frequency_buffer,
             position: 0,
@@ -314,6 +336,28 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         self.position = 0;
+        Ok(())
+    }
+
+    /// Save the sequence state to checkpoint `slot` (each DeltaNet's convolution history and
+    /// recurrent state, and the position), or restore it from there. K/V is not copied: a restore
+    /// keeps the rows below the checkpoint's position, which the caller must know to be the
+    /// checkpoint's sequence's (the live sequence matching it that far).
+    pub fn checkpoint(&mut self, slot: usize, save: bool) -> Result<()> {
+        let saved = self.saved.get_mut(slot).ok_or("no such qwen35moe checkpoint")?;
+        let live = self.states.values().flat_map(|state| match state {
+            State::DeltaNet { history, recurrent } => vec![*history, *recurrent],
+            State::Attention { .. } => Vec::new(),
+        });
+        for (live, copy) in live.zip(&saved.buffers) {
+            let (from, to) = if save { (live, *copy) } else { (*copy, live) };
+            self.gpu.copy(from.base(), to.base(), from.bytes)?;
+        }
+        if save {
+            saved.position = self.position;
+        } else {
+            self.position = saved.position;
+        }
         Ok(())
     }
 

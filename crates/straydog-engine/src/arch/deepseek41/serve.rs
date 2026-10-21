@@ -222,6 +222,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len() },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
-        end: vec![end], card, placement, state_bytes, load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
+        end: vec![end], turn_start: None, card, placement, state_bytes,
+        load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
     }))
 }

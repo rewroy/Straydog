@@ -1,7 +1,8 @@
 //! What a served model of any architecture does with its placed engines (docs/DESIGN.md §10.1,
-//! layer 3): continue the sequence they hold when a prompt extends it, sample, report a request's
-//! metrics, and warm the expert stores up with an earlier run's contents. An architecture places
-//! its engines (its `serve` module) and drives them through [`Engines`].
+//! layer 3): continue the sequence they hold when a prompt extends it (or, with engines that keep
+//! checkpoints, from where an earlier prompt's reply began), sample, report a request's metrics,
+//! and warm the expert stores up with an earlier run's contents. An architecture places its
+//! engines (its `serve` module) and drives them through [`Engines`].
 
 use std::time::Instant;
 
@@ -34,6 +35,16 @@ pub trait Engines {
     fn gpus(&self) -> Vec<&Backend>;
     /// Wait for the stores' reads and copies (before the process ends).
     fn settle(&mut self) -> Result<(), String>;
+    /// Copies of the sequence state the engines keep ([`Engines::checkpoint`]); none: a session
+    /// continues only a sequence the prompt extends.
+    fn checkpoints(&self) -> usize {
+        0
+    }
+    /// Save the sequence state (its position too) to checkpoint `slot`, or restore it from there.
+    /// A restore keeps the K/V below the checkpoint's position, which must be its sequence's.
+    fn checkpoint(&mut self, _slot: usize, _save: bool) -> Result<(), String> {
+        Err("these engines keep no checkpoints".into())
+    }
 }
 
 /// Per GPU: VRAM kept for the runtime's own buffers, the passes' work buffers and their scratch
@@ -116,6 +127,15 @@ pub struct Settings {
 /// Experts still to warm up with, as (layer, expert).
 type Pending = std::collections::VecDeque<(usize, usize)>;
 
+/// The sequence state saved where a prompt's reply began, and the tokens before it.
+struct Checkpoint {
+    slot: usize,
+    tokens: Vec<u32>,
+}
+
+/// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
+const TURN_REACH: usize = 64;
+
 /// A placed model serving requests one at a time.
 pub struct Session<E: Engines> {
     pub engines: E,
@@ -130,6 +150,12 @@ pub struct Session<E: Engines> {
     history: Vec<u32>,
     /// Tokens that end a reply (unsent).
     end: Vec<u32>,
+    /// The token a reply's generation prompt begins with (`<|im_start|>`): the state before it is
+    /// checkpointed when the engines keep checkpoints.
+    turn_start: Option<u32>,
+    /// Saved states, oldest first: the last ("turn") where the last prompt's reply began, the
+    /// earlier ones ("prior") where earlier prompts' did.
+    checkpoints: Vec<Checkpoint>,
     /// The sampling the model card gives, for every mode.
     pub card: Sampling,
     /// How the model was placed (the ready frame shows it).
@@ -152,6 +178,7 @@ pub struct Placed<E: Engines> {
     pub context: usize,
     pub batch: usize,
     pub end: Vec<u32>,
+    pub turn_start: Option<u32>,
     pub card: Sampling,
     pub placement: Value,
     pub state_bytes: u64,
@@ -176,7 +203,8 @@ impl<E: Engines> Session<E> {
     pub fn new(placed: Placed<E>) -> Session<E> {
         Session {
             engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary, layers: placed.layers, experts: placed.experts,
-            context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, card: placed.card,
+            context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
+            checkpoints: Vec::new(), card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
             last_metrics: Map::new(), warming: Default::default(),
         }
@@ -252,13 +280,20 @@ impl<E: Engines> Session<E> {
         }
         sampling.check()?;
         self.files.check_unchanged()?;
-        // A prompt that extends the held sequence continues it; anything else starts over.
-        let reused = if self.history.len() < tokens.len() && tokens.starts_with(&self.history) { self.history.len() } else { 0 };
-        if reused == 0 {
-            self.reset();
-        }
+        let (reused, resumed_from) = self.resume(tokens)?;
         let total = tokens.len();
-        let Some(mut logits) = self.feed(&tokens[reused..], cancelled, &mut |done| progress(done, total))? else {
+        // The state where this reply's generation prompt begins is saved on the way: the next
+        // turn's prompt keeps what precedes it even where the template renders this reply
+        // otherwise than it was generated (a past turn's thinking dropped).
+        let mut fed = reused;
+        if let Some(start) = self.turn_mark(tokens, reused) {
+            if self.feed(&tokens[reused..start], cancelled, &mut |done| progress(done, total))?.is_none() {
+                return Ok(());
+            }
+            self.save_turn()?;
+            fed = start;
+        }
+        let Some(mut logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
             return Ok(());
         };
         let prefill_seconds = started.elapsed().as_secs_f64();
@@ -292,7 +327,7 @@ impl<E: Engines> Session<E> {
         let (hits2, host2, drive2) = self.engines.counts();
         let per = |value: u64| if steps > 0 { json!(value as f64 / steps as f64) } else { Value::Null };
         self.last_metrics = json!({
-            "cached_tokens": reused, "resumed_from": if reused > 0 { "live" } else { "none" },
+            "cached_tokens": reused, "resumed_from": resumed_from,
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": steps, "decode_seconds": decode_seconds,
@@ -302,6 +337,62 @@ impl<E: Engines> Session<E> {
         .as_object()
         .unwrap()
         .clone();
+        Ok(())
+    }
+
+    /// The prompt tokens already held, after restoring the state they need: the held sequence when
+    /// the prompt extends it ("live"), else the longest checkpoint the prompt extends that the
+    /// held sequence matches as far ("turn", the last, or "prior"; its K/V rows are then the held
+    /// ones), else none (the engines start over). At least one prompt token is left to run.
+    fn resume(&mut self, tokens: &[u32]) -> Result<(usize, &'static str), String> {
+        let limit = tokens.len() - 1;
+        let held = &self.history;
+        if !held.is_empty() && held.len() <= limit && tokens.starts_with(held) {
+            return Ok((held.len(), "live"));
+        }
+        let span = held.len().min(limit);
+        let common = (0..span).find(|&index| held[index] != tokens[index]).unwrap_or(span);
+        let best = self.checkpoints.iter().enumerate()
+            .filter(|(_, checkpoint)| checkpoint.tokens.len() <= common && tokens.starts_with(&checkpoint.tokens))
+            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len());
+        let Some((index, checkpoint)) = best else {
+            self.reset();
+            return Ok((0, "none"));
+        };
+        let kind = if index + 1 == self.checkpoints.len() { "turn" } else { "prior" };
+        let (slot, saved) = (checkpoint.slot, checkpoint.tokens.clone());
+        if let Err(error) = self.engines.checkpoint(slot, false) {
+            self.reset();
+            return Err(error);
+        }
+        self.history = saved;
+        Ok((self.history.len(), kind))
+    }
+
+    /// Where the prompt's last generation prompt begins, to be checkpointed: past what is held,
+    /// within the prompt's last [`TURN_REACH`] tokens.
+    fn turn_mark(&self, tokens: &[u32], reused: usize) -> Option<usize> {
+        let start = self.turn_start.filter(|_| self.engines.checkpoints() > 0)?;
+        let lowest = tokens.len().saturating_sub(TURN_REACH).max(reused + 1);
+        (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)
+    }
+
+    /// Save the held state as the last turn's checkpoint: one of the same tokens just becomes the
+    /// last; else a free slot takes it, the oldest checkpoint giving its up when all are taken.
+    fn save_turn(&mut self) -> Result<(), String> {
+        if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
+            let same = self.checkpoints.remove(index);
+            self.checkpoints.push(same);
+            return Ok(());
+        }
+        let slots = self.engines.checkpoints();
+        if self.checkpoints.len() >= slots {
+            self.checkpoints.remove(0);
+        }
+        let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot))
+            .ok_or("no free Straydog checkpoint")?;
+        self.engines.checkpoint(slot, true)?;
+        self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone() });
         Ok(())
     }
 
