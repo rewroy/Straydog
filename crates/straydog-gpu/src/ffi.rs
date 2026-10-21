@@ -342,6 +342,32 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_norm_linears(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        weight: *const f32,
+        width: u64,
+        eps: f32,
+        normed: *mut f32,
+        items: *const sd_linear,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_swiglu_linear(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        gate: *const f32,
+        up: *const f32,
+        scale: *const f32,
+        hidden: *mut f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_rms_norm(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,

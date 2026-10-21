@@ -13,6 +13,15 @@
 // errors the pass instead of hanging it; sd_link_reset starts both counts over.
 // Included in the GPU TU after peer.hpp (peer_load, peer_store, peer_clock).
 
+// A value of this device's inbox as the other device wrote it (never a stale cached line).
+__device__ inline float link_load(const float* value) {
+#if defined(__HIPCC__)
+    return __hip_atomic_load(value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *static_cast<const volatile float*>(value);
+#endif
+}
+
 __global__ void link_copy_kernel(const float* part, size_t count, float* peer_inbox, const uint32_t* state, size_t capacity) {
     const size_t slot = size_t((state[0] + 1) & 1) * capacity;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x)
@@ -39,11 +48,46 @@ __global__ void link_add_kernel(const float* part, size_t count, uint32_t* state
     __syncthreads();
     const size_t slot = size_t(sent & 1) * capacity;
     for (size_t i = threadIdx.x; i < count; i += blockDim.x) {
-        const float theirs = __hip_atomic_load(inbox + slot + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const float theirs = link_load(inbox + slot + i);
         const float sum = part[i] + theirs;
         out[i] = accumulate ? out[i] + sum : sum;
     }
 }
+
+// A sum of at most link_single_floats floats in one kernel of one block: its threads store their
+// shares of the part into the other's inbox at system scope and each waits for its own stores
+// (an agent-scope release); after the block's barrier, one thread raises the other's flag with a
+// system-scope release, so the flag follows every share; then as link_add_kernel.
+constexpr size_t link_single_floats = 8192;
+#if defined(__HIPCC__)
+__global__ void link_sum_kernel(const float* part, size_t count, uint32_t* state, uint32_t* peer_flag, float* peer_inbox,
+                                const float* inbox, size_t capacity, uint64_t timeout, int accumulate, float* out) {
+    __shared__ uint32_t sent;
+    const uint32_t next = state[0] + 1;
+    const size_t slot = size_t(next & 1) * capacity;
+    for (size_t i = threadIdx.x; i < count; i += blockDim.x)
+        __hip_atomic_store(peer_inbox + slot + i, part[i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (!threadIdx.x) {
+        sent = next;
+        state[0] = sent;
+        __threadfence_system();
+        peer_store(peer_flag, sent);
+        const uint64_t start = peer_clock();
+        while (int32_t(peer_load(state + 1) - sent) < 0) {
+            if (peer_clock() - start > timeout) { state[2] = sent; break; }
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    for (size_t i = threadIdx.x; i < count; i += blockDim.x) {
+        const float theirs = link_load(inbox + slot + i);
+        const float sum = part[i] + theirs;
+        out[i] = accumulate ? out[i] + sum : sum;
+    }
+}
+#endif
 
 int sd_link_sums(void* first, void* second, uint64_t capacity) {
     try {
@@ -86,6 +130,14 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
     if (!link.peer || !count || count > link.capacity) throw std::runtime_error("invalid Straydog linked sum");
     op_span(value, part, size_t(count) * 4, "a linked sum's part");
     op_span(value, out, size_t(count) * 4, "a linked sum");
+#if defined(__HIPCC__)
+    if (count <= link_single_floats) {
+        link_sum_kernel<<<1, 1024, 0, value.stream>>>(part, size_t(count), link.state, link.peer_flag, link.peer_inbox, link.inbox,
+                                                      link.capacity, value.await_timeout, accumulate ? 1 : 0, out);
+        check(hipGetLastError());
+        return 0;
+    }
+#endif
     link_copy_kernel<<<unsigned(std::min<size_t>((size_t(count) + 255) / 256, 256)), 256, 0, value.stream>>>(
         part, size_t(count), link.peer_inbox, link.state, link.capacity);
     check(hipGetLastError());

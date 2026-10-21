@@ -220,6 +220,34 @@ impl Backend {
         })
     }
 
+    /// One vector: `normed` = the RMS norm of `x` (`weight`, `eps`, `width` values), and the
+    /// linears over it (every item's input `normed`), in one launch when they share a kind the
+    /// GEMV takes; the results are those of [`rms_norm`](Self::rms_norm) then [`linears`](Self::linears).
+    pub fn norm_linears(&mut self, x: P, weight: &Buffer, width: u64, eps: f32, normed: M, items: &[Linear]) -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_norm_linears(self.handle(), x.cast(), weight.pointer.cast(), width, eps, normed.cast(), items.as_ptr(),
+                                    items.len() as u64)
+        })
+    }
+
+    /// One vector: `out` = W . SwiGLU(gate, up) (`cols` values each; `hidden` takes the SwiGLU
+    /// when it is formed apart), each row times sigmoid(`*scale`) when given: the results of
+    /// [`swiglu`](Self::swiglu), [`linear`](Self::linear) and [`scale_rows`](Self::scale_rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_linear(&mut self, weights: &Buffer, kind: u32, rows: u64, cols: u64, gate: P, up: P, scale: Option<P>, hidden: M,
+                         out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_swiglu_linear(self.handle(), weights.pointer.cast_const(), kind as i32, rows, cols, gate.cast(), up.cast(),
+                                     scale.map_or(std::ptr::null(), |scale| scale.cast()), hidden.cast(), out.cast())
+        })
+    }
+
     pub fn rms_norm(&mut self, input: P, weight: &Buffer, rows: u64, width: u64, eps: f32, output: M)
                     -> Result<()> {
         // SAFETY: as above.

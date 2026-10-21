@@ -102,6 +102,13 @@ typedef struct sd_linear {
     float* output;
 } sd_linear;
 int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t steps, uint64_t input_stride, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
+/* Decode fusions (one vector): sd_op_norm_linears stores the RMS norm of x (weight, eps) in
+   normed (width floats) and runs the linears over it (every item's input is normed, its columns
+   width), in one launch when they share a kind the GEMV takes; sd_op_swiglu_linear sets out = W .
+   SwiGLU(gate, up) (cols floats each; hidden takes the SwiGLU where it is formed apart), each row
+   times sigmoid(*scale) when scale is given. The results are those of the separate ops. */
+int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_linear* items, uint64_t count);
+int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
 int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, float* output);
 /* rms_norm, then sd_op_rope's rotation of the last rope_dims values (0: none), stored at row
    out_rows[row] of out (out_count rows), or at row `row` without out_rows. */

@@ -25,20 +25,34 @@ void op_span(Device& d, const void* pointer, size_t bytes, const char* what) {
     throw std::runtime_error(std::string("Straydog op: ") + what + " is outside this device's allocations");
 }
 
-// One block per row: x / sqrt(mean(x^2) + eps) * weight.
+// The sum of a 256-thread block's partials p[0..256) in the order of the halving tree
+// (p[i] += p[i + stride] for stride 128, 64, ..., 1), formed by the first wave alone: lane i
+// takes ((p[i] + p[i+128]) + (p[i+64] + p[i+192])) + ((p[i+32] + p[i+160]) + (p[i+96] + p[i+224]))
+// -- the tree's value at i after stride 32 -- and the wave halves the rest. Every lane of the
+// first wave calls it; lane 0 has the sum (the tree's bits, with two barriers fewer than eight).
+__device__ __forceinline__ float tree256_first_wave(const float* p, unsigned lane) {
+    float value = ((p[lane] + p[lane + 128]) + (p[lane + 64] + p[lane + 192])) +
+                  ((p[lane + 32] + p[lane + 160]) + (p[lane + 96] + p[lane + 224]));
+    for (unsigned offset = 16; offset; offset /= 2) value += __shfl_down(value, offset, 32);
+    return value;
+}
+
+// One block (256 threads) per row: x / sqrt(mean(x^2) + eps) * weight.
 __global__ void op_rms_norm_kernel(const float* input, const float* weight, size_t width, float eps, float* output) {
     const float* row = input + size_t(blockIdx.x) * width;
     float* out = output + size_t(blockIdx.x) * width;
     __shared__ float sums[256];
+    __shared__ float total;
     float sum = 0.0f;
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) sum += row[col] * row[col];
     sums[threadIdx.x] = sum;
     __syncthreads();
-    for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
-        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x < 32) {
+        const float value = tree256_first_wave(sums, threadIdx.x);
+        if (!threadIdx.x) total = value;
     }
-    const float scale = rsqrtf(sums[0] / float(width) + eps);
+    __syncthreads();
+    const float scale = rsqrtf(total / float(width) + eps);
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) out[col] = row[col] * scale * weight[col];
 }
 
@@ -380,6 +394,52 @@ __global__ void op_engram_gate_kernel(float* stream, const float* kv, const floa
 __device__ __forceinline__ void route_take(float& value, int32_t& index, float other_value, int32_t other) {
     if (other >= 0 && (index < 0 || other_value > value || (other_value == value && other < index))) { value = other_value; index = other; }
 }
+// op_route_kernel's softmax routing (gating 0, no bias, scale 1) of 256 experts in one wave, with
+// its arithmetic: lane i holds experts i + 32m; the max (exact in any order), the sum of the
+// exponentials in its tree's order (tree256_first_wave over the thread terms), the same
+// probabilities, then each pick the highest (lowest index on ties) of those left, as a wave
+// argmax; the normalized weights summed in slot order. The same bits, without barriers.
+__global__ void op_route_softmax256_kernel(const float* logits, size_t k, int normalize, int32_t* ids, float* weights) {
+    const size_t row = blockIdx.x;
+    const unsigned lane = threadIdx.x;
+    const float* l = logits + row * 256;
+    float p[8];
+    float top = -INFINITY;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) { p[m] = l[lane + 32 * m]; top = fmaxf(top, p[m]); }
+    for (unsigned offset = 16; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 32));
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) p[m] = expf(p[m] - top);
+    float total = ((p[0] + p[4]) + (p[2] + p[6])) + ((p[1] + p[5]) + (p[3] + p[7]));
+    for (unsigned offset = 16; offset; offset /= 2) total += __shfl_down(total, offset, 32);
+    total = __shfl(total, 0, 32);
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) p[m] = p[m] / total;
+    __shared__ float chosen[64];
+    __shared__ int32_t chosen_ids[64];
+    for (size_t slot = 0; slot < k; ++slot) {
+        float value = -INFINITY;
+        int32_t index = -1;
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) route_take(value, index, p[m], int32_t(lane + 32 * m));
+        for (unsigned offset = 16; offset; offset /= 2) {
+            const float other_value = __shfl_xor(value, offset, 32);
+            const int32_t other = __shfl_xor(index, offset, 32);
+            route_take(value, index, other_value, other);
+        }
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) if (index == int32_t(lane + 32 * m)) p[m] = -INFINITY;
+        if (!lane) { chosen[slot] = value; chosen_ids[slot] = index; }
+    }
+    if (lane) return;
+    float sum = 0.0f;
+    for (size_t slot = 0; slot < k; ++slot) sum += chosen[slot];
+    for (size_t slot = 0; slot < k; ++slot) {
+        ids[row * k + slot] = chosen_ids[slot];
+        weights[row * k + slot] = (normalize && k > 1 ? chosen[slot] / (sum + 1e-20f) : chosen[slot]) * 1.0f;
+    }
+}
+
 __global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
                                 int normalize, float scale, int32_t* ids, float* weights) {
     const size_t row = blockIdx.x;

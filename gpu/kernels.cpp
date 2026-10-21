@@ -2506,8 +2506,11 @@ int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t r
     if (bias) op_span(value, bias, size_t(experts) * 4, "a router bias");
     op_span(value, ids, size_t(rows * k) * 4, "routed experts");
     op_span(value, weights, size_t(rows * k) * 4, "routing weights");
-    op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 8, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
-                                                                              normalize, scale, ids, weights);
+    if (experts == 256 && gating == 0 && !bias && scale == 1.0f && k <= 64)
+        op_route_softmax256_kernel<<<unsigned(rows), 32, 0, value.stream>>>(logits, size_t(k), normalize, ids, weights);
+    else
+        op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 8, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
+                                                                                  normalize, scale, ids, weights);
     SD_OP_END
 }
 
@@ -2824,3 +2827,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 } // extern C
 #include "token_mixing.hpp"
 #include "device_link.hpp"
+#include "gemv_fused.hpp"

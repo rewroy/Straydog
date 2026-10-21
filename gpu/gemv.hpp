@@ -692,11 +692,16 @@ constexpr int gemv_max_vectors = 4;
 // Optional epilogue of a 2560-row projection: instead of storing row r's result y,
 // add mix[2560 + s] * y to hidden[s * 2560 + r] for the four streams s -- the
 // decoder residual update, with vector v at hidden + v*hidden_stride, mix + v*mix_stride.
-struct GemvResidual { float* hidden; const float* mix; uint32_t hidden_stride, mix_stride; };
+// Or (gate, without hidden) store vector v's y times sigmoid(gate[v]), as tm_scale_rows_kernel
+// scales a row.
+struct GemvResidual { float* hidden; const float* mix; uint32_t hidden_stride, mix_stride; const float* gate = nullptr; };
 struct FixedGemv { GemvItem items[gemv_fixed_items]; uint32_t count, input_stride, output_stride; GemvResidual residual; };
 __device__ __forceinline__ void gemv_store(const Matrix& m, size_t row, int v, float total, float* output, uint32_t output_stride,
                                            const GemvResidual& residual) {
-    if (!residual.hidden) { output[m.output_offset + row + v * output_stride] = total; return; }
+    if (!residual.hidden) {
+        output[m.output_offset + row + v * output_stride] = residual.gate ? total * (1.0f / (1.0f + expf(-residual.gate[v]))) : total;
+        return;
+    }
     #pragma unroll
     for (int s = 0; s < 4; ++s)
         residual.hidden[v * residual.hidden_stride + s * 2560 + row] += residual.mix[v * residual.mix_stride + 2560 + s] * total;
@@ -891,6 +896,7 @@ __global__ void gemv_decode_shared_rdna4(Matrix matrix, unsigned lanes, const fl
 }
 #endif
 
+bool gemv_shared_input_launch(Device& d, const FixedGemv& list, const float* input, float* output);   // gemv_fused.hpp
 template<int V>
 void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform, const float* input, float* output) {
 #if !defined(__HIPCC__)
@@ -938,6 +944,7 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
 #if defined(__HIPCC__)
     if constexpr (V == 1) {
         const GemvItem& item = list.items[0];
+        if (d.rdna4 && uniform && item.matrix.kind == 30 && gemv_shared_input_launch(d, list, input, output)) return;
         if (d.rdna4 && uniform && list.count == 1 && item.matrix.rows == 2560 && item.matrix.cols == 6144) {
             const unsigned shared_blocks = unsigned((gemv_waves(item.matrix, item.lanes) + 7) / 8);
             // Other packed formats lost in alternating RDNA4 measurements.

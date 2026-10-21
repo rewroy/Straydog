@@ -348,8 +348,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// Several resident matrices over the same `input` (`steps` rows) into their packed outputs: a
-    /// launch per weight format when the GEMV takes them.
-    fn linears(&mut self, items: &[(String, M)], input: P, steps: usize) -> Result<()> {
+    /// launch per weight format when the GEMV takes them. With `norm` (a norm weight's name and a
+    /// raw vector), `input` is first that RMS norm of it: one vector takes it in the first launch.
+    fn linears(&mut self, items: &[(String, M)], input: P, steps: usize, norm: Option<(&str, P)>) -> Result<()> {
         let mut groups: Vec<(u32, Vec<Linear>)> = Vec::new();
         for (name, output) in items {
             let weight = self.dense(name)?;
@@ -363,6 +364,22 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         let scratch = self.scratch;
+        let mut groups = groups.into_iter();
+        if let Some((name, raw)) = norm {
+            let weight = self.dense(name)?;
+            let (width, eps) = (self.hp.width, self.hp.norm_eps);
+            match groups.next() {
+                Some((_, group)) if steps == 1 => {
+                    self.gpu.norm_linears(raw, &weight.buffer, width as u64, eps, input.cast_mut(), &group)?;
+                }
+                first => {
+                    self.gpu.rms_norm(raw, &weight.buffer, steps as u64, width as u64, eps, input.cast_mut())?;
+                    if let Some((_, group)) = first {
+                        self.gpu.linears(&group, steps as u64, 0, 0, &scratch)?;
+                    }
+                }
+            }
+        }
         for (_, group) in groups {
             self.gpu.linears(&group, steps as u64, 0, 0, &scratch)?;
         }
@@ -715,11 +732,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let w = hp.width;
         let work = self.work;
-        self.norm(&name(layer, "attn_norm"), work.stream.base(), n, w, work.x.base())?;
-        self.check("attn_norm", layer, work.x, n, w)?;
+        // The norm runs with the mixer's first projections (apart when comparing its output).
+        let norm_name = name(layer, "attn_norm");
+        let norm = if self.compare.is_some() {
+            self.norm(&norm_name, work.stream.base(), n, w, work.x.base())?;
+            self.check("attn_norm", layer, work.x, n, w)?;
+            None
+        } else {
+            Some((norm_name.as_str(), work.stream.base().cast_const()))
+        };
         match hp.mixers[layer] {
-            Mixer::DeltaNet => self.delta_net(layer, n)?,
-            Mixer::Attention => self.attention(layer, n)?,
+            Mixer::DeltaNet => self.delta_net(layer, n, norm)?,
+            Mixer::Attention => self.attention(layer, n, norm)?,
         }
         if self.settings.part.is_whole() {
             self.gpu.add(work.mixed.base(), (n * w) as u64, work.stream.base())?;
@@ -733,7 +757,6 @@ impl<'a, T: Tensors> Engine<'a, T> {
     fn feed_forward(&mut self, layer: usize, n: usize) -> Result<()> {
         let w = self.hp.width;
         let work = self.work;
-        self.norm(&name(layer, "post_attention_norm"), work.stream.base(), n, w, work.x.base())?;
         self.moe(layer, n)?;
         if self.settings.part.is_whole() {
             self.check("ffn_out", layer, work.out, n, w)?;
@@ -745,13 +768,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// The DeltaNet of `x` into `mixed`, its state carried.
-    fn delta_net(&mut self, layer: usize, n: usize) -> Result<()> {
+    fn delta_net(&mut self, layer: usize, n: usize, norm: Option<(&str, P)>) -> Result<()> {
         let hp = self.hp.clone();
         let work = self.work;
         let (dim, v_heads) = (hp.state_dim, hp.v_heads);
         let channels = hp.conv_channels();
         self.linears(&[(name(layer, "attn_qkv"), work.qkv.base()), (name(layer, "attn_gate"), work.z.base()),
-                       (name(layer, "ssm_beta"), work.beta.base()), (name(layer, "ssm_alpha"), work.alpha.base())], work.x.base(), n)?;
+                       (name(layer, "ssm_beta"), work.beta.base()), (name(layer, "ssm_alpha"), work.alpha.base())], work.x.base(), n,
+                     norm)?;
         let (history, recurrent) = match &self.states[&layer] {
             State::DeltaNet { history, recurrent } => (*history, *recurrent),
             State::Attention { .. } => return Err("a DeltaNet layer without its state".into()),
@@ -772,12 +796,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// Gated full attention of `x` into `mixed`, the layer's K/V appended.
-    fn attention(&mut self, layer: usize, n: usize) -> Result<()> {
+    fn attention(&mut self, layer: usize, n: usize, norm: Option<(&str, P)>) -> Result<()> {
         let hp = self.hp.clone();
         let work = self.work;
         let (heads, kv_heads, dim) = (hp.heads, hp.kv_heads, hp.head_dim);
         self.linears(&[(name(layer, "attn_q"), work.q_full.base()), (name(layer, "attn_k"), work.k.base()),
-                       (name(layer, "attn_v"), work.v.base())], work.x.base(), n)?;
+                       (name(layer, "attn_v"), work.v.base())], work.x.base(), n, norm)?;
         // Each head's projection holds its query, then its gate.
         self.gpu.split(work.q_full.base(), (n * heads) as u64, dim as u64, work.q.base(), work.gate.base())?;
         self.norm(&name(layer, "attn_q_norm"), work.q.base(), n * heads, dim, work.q.base())?;
@@ -807,10 +831,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let work = self.work;
         let (w, k, ff, shared_ff) = (hp.width, hp.experts_used, hp.expert_ff, hp.shared_ff);
-        // The router, the shared expert's gate and up and its own gate, over the same input.
+        // The router, the shared expert's gate and up and its own gate, over the same input: the
+        // post-attention norm of the stream, formed with them.
+        let norm = name(layer, "post_attention_norm");
         self.linears(&[(name(layer, "ffn_gate_inp"), work.router.base()), (name(layer, "ffn_gate_shexp"), work.ffn_gate.base()),
                        (name(layer, "ffn_up_shexp"), work.ffn_up.base()), (name(layer, "ffn_gate_inp_shexp"), work.shared_gate.base())],
-                     work.x.base(), n)?;
+                     work.x.base(), n, Some((norm.as_str(), work.stream.base().cast_const())))?;
         self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
                        work.weights.base())?;
         let resident = self.resident.is_some();
@@ -825,9 +851,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         } else if !resident {
             self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
         }
-        self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
-        self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
-        self.gpu.scale_rows(work.out.base(), work.shared_gate.base(), n as u64, w as u64)?;
+        // The shared expert's SwiGLU, down and gate (one vector: in one launch).
+        if n == 1 {
+            let down = self.dense(&name(layer, "ffn_down_shexp"))?;
+            let (cols, rows) = (down.dims[0] as u64, down.dims.get(1).copied().unwrap_or(1) as u64);
+            self.gpu.swiglu_linear(&down.buffer, down.kind, rows, cols, work.ffn_gate.base(), work.ffn_up.base(),
+                                   Some(work.shared_gate.base()), work.hidden.base(), work.out.base())?;
+        } else {
+            self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
+            self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
+            self.gpu.scale_rows(work.out.base(), work.shared_gate.base(), n as u64, w as u64)?;
+        }
         self.check("ffn_shexp_gated", layer, work.out, n, w)?;
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
         let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;

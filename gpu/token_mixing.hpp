@@ -80,7 +80,7 @@ __global__ void tm_delta_rule_kernel(const float* qkv, const float* beta, const 
     for (int i = 0; i < DIM; ++i) state[(h * DIM + i) * DIM + j] = column[i];
 }
 
-// A block per row of width values: x / sqrt(mean(x^2) + eps) * weight * SiLU(gate).
+// A block (256 threads) per row of width values: x / sqrt(mean(x^2) + eps) * weight * SiLU(gate).
 __global__ void tm_gated_norm_kernel(const float* x, const float* gate, const float* weight, size_t width, float eps, float* out) {
     const float* row = x + size_t(blockIdx.x) * width;
     const float* gates = gate + size_t(blockIdx.x) * width;
@@ -88,13 +88,15 @@ __global__ void tm_gated_norm_kernel(const float* x, const float* gate, const fl
     __shared__ float sums[256];
     float sum = 0.0f;
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) sum += row[col] * row[col];
+    __shared__ float total;
     sums[threadIdx.x] = sum;
     __syncthreads();
-    for (unsigned stride = blockDim.x / 2; stride; stride /= 2) {
-        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x < 32) {
+        const float value = tree256_first_wave(sums, threadIdx.x);
+        if (!threadIdx.x) total = value;
     }
-    const float scale = rsqrtf(sums[0] / float(width) + eps);
+    __syncthreads();
+    const float scale = rsqrtf(total / float(width) + eps);
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) target[col] = row[col] * scale * weight[col] * tm_silu(gates[col]);
 }
 
@@ -193,22 +195,27 @@ __global__ void tm_attention_split_kernel(const float* q, const float* keys, con
 
 // The splits of a (row, head) combined (each scaled by exp(its max - the max)), normalized, and
 // times sigmoid(gate) when a gate is given: out [rows][heads][dim].
+// Each split's max and sum are read once into shared memory and its scale formed once there (the
+// same values and sums, in the same order, as a thread forming them all itself).
 __global__ void tm_attention_combine_kernel(const float* partial, size_t splits, size_t dim, const float* gate, float* out) {
     const size_t pair = blockIdx.x;
     const float* first = partial + pair * splits * (dim + 2);
-    float top = -INFINITY;
-    for (size_t s = 0; s < splits; ++s) top = fmaxf(top, first[s * (dim + 2) + dim]);
-    float total = 0.0f;
-    for (size_t s = 0; s < splits; ++s) {
-        const float* split = first + s * (dim + 2);
-        total += split[dim + 1] * expf(split[dim] - top);
+    __shared__ float maxes[tm_attention_max_splits], sums[tm_attention_max_splits], scales[tm_attention_max_splits];
+    for (size_t s = threadIdx.x; s < splits; s += blockDim.x) {
+        maxes[s] = first[s * (dim + 2) + dim];
+        sums[s] = first[s * (dim + 2) + dim + 1];
     }
+    __syncthreads();
+    float top = -INFINITY;
+    for (size_t s = 0; s < splits; ++s) top = fmaxf(top, maxes[s]);
+    for (size_t s = threadIdx.x; s < splits; s += blockDim.x) scales[s] = expf(maxes[s] - top);
+    __syncthreads();
+    float total = 0.0f;
+    for (size_t s = 0; s < splits; ++s) total += sums[s] * scales[s];
     for (size_t d = threadIdx.x; d < dim; d += blockDim.x) {
         float sum = 0.0f;
-        for (size_t s = 0; s < splits; ++s) {
-            const float* split = first + s * (dim + 2);
-            sum += split[d] * expf(split[dim] - top);
-        }
+        #pragma unroll 8
+        for (size_t s = 0; s < splits; ++s) sum += first[s * (dim + 2) + d] * scales[s];
         const size_t at = pair * dim + d;
         float value = sum / total;
         if (gate) value *= tm_sigmoid(gate[at]);
