@@ -436,6 +436,9 @@ struct Device {
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
+    // Or, when the last call passed its few routes by value, those (reused alike).
+    uint64_t inline_routes[8] = {};
+    size_t inline_routes_count = 0;
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
@@ -2753,7 +2756,8 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         throw std::runtime_error("invalid Straydog experts shape");
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, part);
     const size_t routes = size_t(rows * top_k);
-    if (!bases && value.slot_routes_count != routes) throw std::runtime_error("no Straydog expert routes to reuse");
+    if (!bases && (value.inline_routes_count ? value.inline_routes_count : value.slot_routes_count) != routes)
+        throw std::runtime_error("no Straydog expert routes to reuse");
     bool uniform = bases != nullptr && top_k == 1;
     for (size_t route = 0; bases && route < routes; ++route) {
         uniform &= bases[route] == bases[0];
@@ -2774,13 +2778,23 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     plan.clamp = clamp;
     plan.accumulate = accumulate ? 1 : 0;
     if (!value.slot_routes) value.slot_routes = static_cast<uint64_t*>(allocate(value, slot_route_capacity * 8));
-    // One slot for a token's only route (a shared expert) goes by value; other routes are uploaded
-    // (or, without bases, the last ones uploaded are used again: the down stage after its gate/up).
+    // One slot for a token's only route (a shared expert) goes by value, as do a few routes (a
+    // decode row's) in the launch's arguments; more routes are uploaded. Without bases, the last
+    // routes passed are used again (the down stage after its gate/up).
+    static_assert(sizeof(value.inline_routes) == slot_inline_routes * 8, "inline routes");
     if (uniform && bases[0]) {
         plan.uniform = bases[0];
+    } else if (bases && routes <= slot_inline_routes) {
+        std::copy(bases, bases + routes, value.inline_routes);
+        value.inline_routes_count = routes;
     } else if (bases) {
         upload(value, value.slot_routes, bases, routes * 8);
         value.slot_routes_count = routes;
+        value.inline_routes_count = 0;
+    }
+    if (!plan.uniform && value.inline_routes_count) {
+        std::copy(value.inline_routes, value.inline_routes + value.inline_routes_count, plan.inline_bases);
+        plan.inline_count = uint32_t(value.inline_routes_count);
     }
     slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
                  size_t(out_stride));
