@@ -20,10 +20,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use super::{Gating, Hparams, Rope};
-use crate::arch::Tensors;
+use crate::arch::{Tensor, Tensors};
 use crate::experts::{Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, Result};
@@ -204,6 +205,12 @@ pub struct Engine<'a, T: Tensors> {
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
 }
 
+/// A resident tensor (or a layer's shared expert: gate, up and down) for a device's upload thread.
+enum Resident<'a> {
+    Tensor(String, Tensor<'a>),
+    Shared(usize, [Tensor<'a>; 3]),
+}
+
 fn frequencies(dims: usize, rope: &Rope) -> Vec<f32> {
     let mut freqs: Vec<f64> = (0..dims / 2).map(|i| 1.0 / rope.base.powf((2 * i) as f64 / dims as f64)).collect();
     if let Some((factor, original, beta_fast, beta_slow)) = rope.yarn {
@@ -234,7 +241,11 @@ fn columns(kind: u32, rows: usize, cols: usize, data: &[u8], first: usize, count
     let (Some(skip), Some(take)) = (skip, take) else {
         return Err(format!("columns {first}..{} of a type {kind} matrix split a block", first + count));
     };
-    Ok((0..rows).flat_map(|row| &data[row * whole + skip..row * whole + skip + take]).copied().collect())
+    let mut out = Vec::with_capacity(rows * take);
+    for row in data.chunks_exact(whole).take(rows) {
+        out.extend_from_slice(&row[skip..skip + take]);
+    }
+    Ok(out)
 }
 
 impl Shard {
@@ -331,6 +342,40 @@ impl Shard {
         })
     }
 
+    /// This device's part of a resident tensor over `parts` devices (see [`divided`]), or all of it.
+    fn place(&mut self, part: usize, parts: usize, name: String, tensor: &Tensor<'_>) -> Result<()> {
+        if parts == 1 || !divided(&name) {
+            return self.upload(name, tensor.kind, tensor.dims.clone(), tensor.data);
+        }
+        let (cols, rows) = (tensor.dims[0], tensor.dims.get(1).copied().unwrap_or(1));
+        if name.ends_with(".attn_output_b.weight") {
+            // its groups' columns: a part of every output
+            let count = cols / parts;
+            let data = columns(tensor.kind, rows, cols, tensor.data, part * count, count)?;
+            self.upload(name, tensor.kind, vec![count, rows], &data)
+        } else if name.ends_with(".attn_sinks.weight") {
+            let count = cols / parts;
+            self.upload(name, tensor.kind, vec![count], &tensor.data[part * count * 4..(part + 1) * count * 4])
+        } else {
+            // its rows: of q_b its heads, of wo_a its groups, of the head its tokens
+            let (count, bytes) = (rows / parts, row_bytes(tensor.kind, cols)?);
+            self.upload(name, tensor.kind, vec![cols, count], &tensor.data[part * count * bytes..(part + 1) * count * bytes])
+        }
+    }
+
+    /// This device's rows of a layer's shared expert (gate, up and down) as a slot.
+    fn place_shared(&mut self, layer: usize, [gate, up, down]: &[Tensor<'_>; 3]) -> Result<()> {
+        let rows = |tensor: &Tensor<'_>, (first, count): (usize, usize)| -> Result<Vec<u8>> {
+            let bytes = row_bytes(tensor.kind, tensor.dims[0])?;
+            Ok(tensor.data[first * bytes..(first + count) * bytes].to_vec())
+        };
+        let pieces = [rows(gate, self.rows.ffn)?, rows(up, self.rows.ffn)?, rows(down, self.rows.hidden)?];
+        let offsets = [0, pieces[0].len() as u64, (pieces[0].len() + pieces[1].len()) as u64];
+        let buffer = self.gpu.upload_bytes(&pieces.concat())?;
+        self.shared.insert(layer, Slot { buffer, offsets, kinds: [gate.kind, up.kind, down.kind] });
+        Ok(())
+    }
+
     fn dense(&self, name: &str) -> Result<Dense> {
         self.dense.get(name).cloned().ok_or_else(|| format!("tensor {name} is not resident"))
     }
@@ -418,8 +463,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// Every tensor of this engine's layers but the routed experts and the Engram tables, resident
-    /// (with the head on the last engine): each device's parts of the split ones (see the module
-    /// documentation), the rest whole; each shared expert's part as a slot.
+    /// (with the head on the last engine): each device's parts of the divided ones (see the module
+    /// documentation and [`divided`]), the rest whole; each shared expert's part as a slot. This
+    /// thread takes the tensors from the source (which may check them as it hands them over), a
+    /// thread per device uploads its parts of those taken before.
     fn upload_dense(&mut self) -> Result<()> {
         let hp = self.hp.clone();
         let range = self.settings.layers.clone();
@@ -438,49 +485,51 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             names.push(format!("blk.{layer}.exp_probs_b.bias"));
         }
-        for name in names {
-            let Ok(tensor) = self.tensors.tensor(&name) else { continue };
-            if parts == 1 || !divided(&name) {
-                for shard in &mut self.shards {
-                    shard.upload(name.clone(), tensor.kind, tensor.dims.clone(), tensor.data)?;
-                }
-                continue;
-            }
-            let (cols, rows) = (tensor.dims[0], tensor.dims.get(1).copied().unwrap_or(1));
+        let tensors = self.tensors;
+        let copy = |tensor: &Tensor<'a>| Tensor { kind: tensor.kind, dims: tensor.dims.clone(), data: tensor.data };
+        std::thread::scope(|scope| {
+            let (mut senders, mut threads) = (Vec::new(), Vec::new());
             for (part, shard) in self.shards.iter_mut().enumerate() {
-                if name.ends_with(".attn_output_b.weight") {
-                    // its groups' columns: a part of every output
-                    let count = cols / parts;
-                    let data = columns(tensor.kind, rows, cols, tensor.data, part * count, count)?;
-                    shard.upload(name.clone(), tensor.kind, vec![count, rows], &data)?;
-                } else if name.ends_with(".attn_sinks.weight") {
-                    let count = cols / parts;
-                    let data = &tensor.data[part * count * 4..(part + 1) * count * 4];
-                    shard.upload(name.clone(), tensor.kind, vec![count], data)?;
-                } else {
-                    // its rows: of q_b its heads, of wo_a its groups, of the head its tokens
-                    let (count, bytes) = (rows / parts, row_bytes(tensor.kind, cols)?);
-                    let data = &tensor.data[part * count * bytes..(part + 1) * count * bytes];
-                    shard.upload(name.clone(), tensor.kind, vec![cols, count], data)?;
+                let (sender, receiver) = channel::<Resident<'a>>();
+                senders.push(sender);
+                threads.push(scope.spawn(move || -> Result<()> {
+                    for resident in receiver {
+                        match resident {
+                            Resident::Tensor(name, tensor) => shard.place(part, parts, name, &tensor)?,
+                            Resident::Shared(layer, roles) => shard.place_shared(layer, &roles)?,
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            // A device's thread that failed takes no more; its error is the one reported.
+            let send = |resident: &dyn Fn() -> Resident<'a>| senders.iter().all(|sender| sender.send(resident()).is_ok());
+            let mut taken = Ok(());
+            for name in names {
+                let Ok(tensor) = tensors.tensor(&name) else { continue };
+                if !send(&|| Resident::Tensor(name.clone(), copy(&tensor))) {
+                    break;
                 }
             }
-        }
-        for layer in range {
-            let roles = ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].map(|role| self.tensors.tensor(&name(layer, role)));
-            let [gate, up, down] = roles;
-            let (gate, up, down) = (gate?, up?, down?);
-            for shard in &mut self.shards {
-                let rows = |tensor: &crate::arch::Tensor<'_>, (first, count): (usize, usize)| -> Result<Vec<u8>> {
-                    let bytes = row_bytes(tensor.kind, tensor.dims[0])?;
-                    Ok(tensor.data[first * bytes..(first + count) * bytes].to_vec())
+            for layer in range {
+                let roles = ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].map(|role| tensors.tensor(&name(layer, role)));
+                let [gate, up, down] = match roles {
+                    [Ok(gate), Ok(up), Ok(down)] => [gate, up, down],
+                    [gate, up, down] => {
+                        taken = gate.and(up).and(down).map(drop);
+                        break;
+                    }
                 };
-                let parts = [rows(&gate, shard.rows.ffn)?, rows(&up, shard.rows.ffn)?, rows(&down, shard.rows.hidden)?];
-                let offsets = [0, parts[0].len() as u64, (parts[0].len() + parts[1].len()) as u64];
-                let buffer = shard.gpu.upload_bytes(&parts.concat())?;
-                shard.shared.insert(layer, Slot { buffer, offsets, kinds: [gate.kind, up.kind, down.kind] });
+                if !send(&|| Resident::Shared(layer, [copy(&gate), copy(&up), copy(&down)])) {
+                    break;
+                }
             }
-        }
-        Ok(())
+            drop(senders);
+            for thread in threads {
+                thread.join().unwrap_or_else(|_| Err("a device's upload thread panicked".into()))?;
+            }
+            taken
+        })
     }
 
     /// Attribute the time since the last mark to `phase` (profiling only: waits for the GPUs).

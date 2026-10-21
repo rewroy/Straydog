@@ -23,6 +23,11 @@ pub struct Buffer {
     pub bytes: u64,
 }
 
+// A Buffer is a device address and a size, a plain value: nothing reaches the memory through it
+// but the ops of the Backend that owns it, which check it against that device's allocations. So it
+// may move between threads with its Backend; it is used on the thread that holds its Backend.
+unsafe impl Send for Buffer {}
+
 impl Buffer {
     /// The address `floats` F32 values (or 4-byte items) into the buffer.
     pub fn at(&self, floats: usize) -> *mut c_void {

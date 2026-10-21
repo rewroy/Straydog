@@ -7,12 +7,14 @@
 // stream has passed it: the arena wraps only after a synchronization, and a
 // download synchronizes the stream.
 // Large staged copies on several threads: one core reads the page cache at ~11 GB/s, four
-// at ~18 (a model upload is ~57 GB). The caller copies a slice and waits for the rest.
+// at ~18 (a model upload is ~57 GB). The caller copies a slice and waits for the rest; callers
+// on several threads (uploads to several devices at once) take turns.
 class StagingCopier {
 public:
     static StagingCopier& instance() { static StagingCopier copier; return copier; }
     void copy(void* to, const void* from, size_t bytes) {
         if (bytes < (size_t(4) << 20)) { std::memcpy(to, from, bytes); return; }
+        std::lock_guard<std::mutex> turn(caller_);
         std::unique_lock<std::mutex> lock(mutex_);
         to_ = static_cast<uint8_t*>(to); from_ = static_cast<const uint8_t*>(from); bytes_ = bytes;
         pending_ = workers_; ++generation_;
@@ -47,7 +49,7 @@ private:
             if (--pending_ == 0) done_.notify_one();
         }
     }
-    std::mutex mutex_;
+    std::mutex caller_, mutex_;
     std::condition_variable wake_, done_;
     std::vector<std::thread> threads_;
     uint8_t* to_ = nullptr; const uint8_t* from_ = nullptr; size_t bytes_ = 0, pending_ = 0;
