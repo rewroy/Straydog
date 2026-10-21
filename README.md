@@ -3,8 +3,11 @@
 A local inference engine for Qwen3.8-Flash-Next with an OpenAI-compatible server, in one
 executable per GPU backend.
 
-- **Exact.** Activations are never quantized; weights decode exactly to F32. MTP
-  speculative decoding is bitwise identical to token-by-token decode.
+- **No hidden shortcuts in the numbers.** Weights run in the format their GGUF ships,
+  decoded exactly; activations and the K/V cache are never quantized; every expert a
+  token routes to is computed. The one rounding on by default, FP16 operands in prompt
+  batches' products, is named below and `--gemm f32` turns it off. Speculative decoding
+  never changes an answer. See [Numerics](#numerics).
 - **Isolated.** The engine runs in a worker without network access (bubblewrap on
   Linux, its own AppContainer on Windows). Every model and drafter file is pinned by
   SHA-256 and authenticated before use.
@@ -79,6 +82,50 @@ its assistant messages keeps the conversation cache warm.
 
 Like llama-server, `GET /props` (`default_generation_settings.n_ctx`) and `GET /slots`
 report the context, and `GET /health` the loading progress.
+
+## Numerics
+
+Faster engines often trade precision for speed without saying so: weights repacked to 8
+or 4 bits, activations rounded to int8 before every product, K/V caches in FP8, experts
+skipped. Bandwidth and compute have physical limits, so Straydog finds its speed in not
+repeating work (K/V mirrors, conversation checkpoints, row and expert caches, reads and
+copies overlapped with compute, fused kernels, both GPUs at once) and states every
+rounding it does make.
+
+What Straydog does not do:
+
+- Re-quantize weights. Each GGUF type is decoded exactly as ggml defines it (checked bit
+  for bit against reference decoders); products accumulate in F32.
+- Quantize activations. No int8 or q8 inputs to any product: decode and speculative
+  verification run on F32 activations.
+- Quantize the K/V cache. It is F32.
+- Skip or approximate work. Every routed expert a token selects is computed, attention is
+  never replaced by an approximate replay, and the output head is the model's.
+- Let speculation change answers. Drafts are only proposals: a verification pass is
+  bitwise identical to token-by-token decode in the same placement.
+- Convert silently. An unsupported tensor type is an error.
+
+Where it rounds, and how to turn it off:
+
+| Where | Default | Exact |
+| --- | --- | --- |
+| Products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm f32` |
+| Long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm f32` |
+| Decode and speculative verification | F32 | |
+| MTP drafter | its experts quantized to Q2_0 when it is built: this changes only how many drafts are accepted, never the output | run without `-md` |
+| Experts beyond VRAM (partial residency) | the CPU computes them in F32 and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
+
+How this is checked: the pinned GPU generations reproduce every greedy token, logits
+vector and final hidden state bit for bit in each placement; a deliberate numerical change
+is first compared with an F32-GEMM run, by KL divergence and top-1 agreement, then pinned
+anew. With the FP16 long-prompt attention, KL against `--gemm f32` averaged 3.4e-3 over 12
+prompts of 8K-40K (3.9e-3 before it; top-1 12/12), while reordering one sum alone moves it
+by 3.0e-3. DeepSeek-V4.1
+computes in F32 throughout and keeps its K/V in F32 (the model was trained for FP4/FP8
+caches); against llama.cpp, which rounds activations to 8 bits, its next-token
+distributions differ by KL 2-6e-3 on average with 97-100% top-1 agreement, and a CPU F32
+reference agrees with it where the two disagree (`examples/ds41_quality`,
+`examples/ds41_reference`).
 
 ## Dashboard
 

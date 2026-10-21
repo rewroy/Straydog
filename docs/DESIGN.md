@@ -29,7 +29,8 @@ logic: they follow from the official chat template and the OpenAI message format
 ## 3. Contracts
 
 - **Exactness.** Activations are never quantized. Weights decode exactly to F32.
-  FP16 products (GEMM, and RDNA4's prefill attention) are used only when configured.
+  FP16 products (GEMM over prompt batches, and RDNA4's prefill attention) are the default
+  (`--gemm fp16`); `--gemm f32` computes them in F32.
   A speculative verification pass is bitwise identical to token-by-token decode in the
   same placement. Unsupported formats are an error, never a silent conversion.
 - **Isolation.** The engine runs in a separate worker process without network
