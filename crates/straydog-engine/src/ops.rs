@@ -297,6 +297,73 @@ impl Backend {
         check(unsafe { ffi::sd_op_scatter_add(self.handle(), x.cast(), rows.cast(), count, width, out.cast(), out_rows) })
     }
 
+    /// `x` (steps x channels) becomes SiLU of each channel's causal convolution with its `taps`
+    /// (channels x kernel) over `history` (kernel - 1 rows, oldest first, left holding the last inputs).
+    pub fn conv_silu(&mut self, x: M, history: M, taps: P, channels: u64, kernel: u64, steps: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_conv_silu(self.handle(), x.cast(), history.cast(), taps.cast(), channels, kernel, steps) })
+    }
+
+    /// The gated delta rule over `qkv` rows [q | k | v] into `out` (steps x v_heads x dim), `state`
+    /// (v_heads x dim x dim, [key][value]) carried (see the C header).
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_rule(&mut self, qkv: P, beta: P, alpha: P, dt: P, a: P, state: M, k_heads: u64, v_heads: u64, dim: u64, steps: u64,
+                      eps: f32, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_delta_rule(self.handle(), qkv.cast(), beta.cast(), alpha.cast(), dt.cast(), a.cast(), state.cast(), k_heads, v_heads,
+                                  dim, steps, eps, out.cast())
+        })
+    }
+
+    /// rms_norm(x) * weight * SiLU(gate) per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm(&mut self, x: P, gate: P, weight: &Buffer, rows: u64, width: u64, eps: f32, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_gated_norm(self.handle(), x.cast(), gate.cast(), weight.pointer.cast(), rows, width, eps, out.cast()) })
+    }
+
+    /// Rows of [first | second] (2 x width values) into two buffers of rows.
+    pub fn split(&mut self, x: P, rows: u64, width: u64, first: M, second: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_split(self.handle(), x.cast(), rows, width, first.cast(), second.cast()) })
+    }
+
+    /// Rotate the leading `rope_dims` values of each of a row's `vectors`, pair i = (i, i + rope_dims / 2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_halves(&mut self, x: M, rows: u64, vectors: u64, width: u64, rope_dims: u64, positions: &Buffer,
+                       frequencies: &Buffer) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_rope_halves(self.handle(), x.cast(), rows, vectors, width, rope_dims, positions.pointer.cast(),
+                                   frequencies.pointer.cast())
+        })
+    }
+
+    /// Causal grouped-query attention of `q` (rows x heads x dim) at `positions` over the cache's
+    /// keys and values (context x kv_heads x dim), times sigmoid(gate) when given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(&mut self, q: P, keys: P, values: P, context: u64, positions: P, rows: u64, heads: u64, kv_heads: u64, dim: u64,
+                     scale: f32, gate: Option<P>, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_attention(self.handle(), q.cast(), keys.cast(), values.cast(), context, positions.cast(), rows, heads, kv_heads,
+                                 dim, scale, gate.map_or(std::ptr::null(), |g| g.cast()), out.cast())
+        })
+    }
+
+    /// out += x (count values).
+    pub fn add(&mut self, x: P, count: u64, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_add(self.handle(), x.cast(), count, out.cast()) })
+    }
+
+    /// Each row of x (rows x width) times sigmoid of its scalar.
+    pub fn scale_rows(&mut self, x: M, scalars: P, rows: u64, width: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_scale_rows(self.handle(), x.cast(), scalars.cast(), rows, width) })
+    }
+
     /// Experts in slots: route `r` of `rows * top_k` (token-major) runs the expert of the slot at
     /// `bases[r]` (gate, up and down at `offsets` bytes in, of `kinds`; a zero base: a route another
     /// device runs): `product[r]` = its clamped SwiGLU times `weights[r]`, and `out[t]` (+)= the sum

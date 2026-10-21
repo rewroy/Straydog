@@ -2702,3 +2702,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 } // extern C
+#include "token_mixing.hpp"

@@ -610,6 +610,102 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_conv_silu(
+        handle: *mut ::std::os::raw::c_void,
+        x: *mut f32,
+        history: *mut f32,
+        taps: *const f32,
+        channels: u64,
+        kernel: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_delta_rule(
+        handle: *mut ::std::os::raw::c_void,
+        qkv: *const f32,
+        beta: *const f32,
+        alpha: *const f32,
+        dt: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        k_heads: u64,
+        v_heads: u64,
+        dim: u64,
+        steps: u64,
+        eps: f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_gated_norm(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        gate: *const f32,
+        weight: *const f32,
+        rows: u64,
+        width: u64,
+        eps: f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_split(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        rows: u64,
+        width: u64,
+        first: *mut f32,
+        second: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_rope_halves(
+        handle: *mut ::std::os::raw::c_void,
+        x: *mut f32,
+        rows: u64,
+        vectors: u64,
+        width: u64,
+        rope_dims: u64,
+        positions: *const i32,
+        frequencies: *const f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_attention(
+        handle: *mut ::std::os::raw::c_void,
+        q: *const f32,
+        keys: *const f32,
+        values: *const f32,
+        context: u64,
+        positions: *const i32,
+        rows: u64,
+        heads: u64,
+        kv_heads: u64,
+        dim: u64,
+        scale: f32,
+        gate: *const f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_add(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        count: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_scale_rows(
+        handle: *mut ::std::os::raw::c_void,
+        x: *mut f32,
+        scalars: *const f32,
+        rows: u64,
+        width: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hyperconnection(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,
