@@ -497,6 +497,45 @@ impl Backend {
         check(unsafe { ffi::sd_expert_table(self.handle(), table.pointer.cast(), bases.as_ptr(), bases.len() as u64, slot_bytes) })
     }
 
+    /// The bytes of an entry of an expert table for [`experts_grouped`](Self::experts_grouped).
+    pub fn moe_group_bytes() -> u64 {
+        // SAFETY: a constant.
+        unsafe { ffi::sd_moe_group_bytes() }
+    }
+
+    /// Write `groups` (an expert table: an entry per expert of `bases`) from each expert's slot
+    /// address (0: an expert another device runs), its gate, up and down at `offsets` bytes in, of
+    /// `kinds`; `hidden` and `ffn` the experts' widths.
+    pub fn moe_groups(&mut self, groups: &Buffer, bases: &[u64], offsets: [u64; 3], kinds: [u32; 3], hidden: u64, ffn: u64) -> Result<()> {
+        if bases.len() as u64 * Self::moe_group_bytes() > groups.bytes {
+            return Err("an expert table past its buffer".into());
+        }
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: a live handle; the library checks the table and every expert's matrices.
+        check(unsafe {
+            ffi::sd_moe_groups(self.handle(), groups.pointer, bases.as_ptr(), bases.len() as u64, offsets.as_ptr(), kinds.as_ptr(), hidden,
+                               ffn)
+        })
+    }
+
+    /// out += each of `rows` rows' `top_k` routes (`ids`, `weights` on the device) through the
+    /// experts of `groups` ([`moe_groups`](Self::moe_groups), `experts` entries) as grouped FP16
+    /// GEMMs with F32 sums, routes to experts another device runs left out; `scratch` holds the
+    /// grouping and the routes' rows. False when this device does not take them (not RDNA4, or a
+    /// shape its tiles do not fit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn experts_grouped(&mut self, groups: M, experts: u64, ids: P, weights: P, rows: u64, top_k: u64, hidden: u64, ffn: u64,
+                           kinds: [u32; 3], input: P, scratch: &Buffer, out: M) -> Result<bool> {
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        let state = unsafe {
+            ffi::sd_op_experts_grouped(self.handle(), groups.cast(), experts, ids.cast(), weights.cast(), rows, top_k, hidden, ffn, kinds.as_ptr(),
+                                       input.cast(), scratch.pointer, scratch.bytes, out.cast())
+        };
+        check(state.min(0))?;
+        Ok(state == 0)
+    }
+
     /// [`experts`](Self::experts) for whole experts, route `r` taking the slot `table[ids[r]]` (`count`
     /// entries; the ids on the device): no host data, so a graph may record it.
     #[allow(clippy::too_many_arguments)]

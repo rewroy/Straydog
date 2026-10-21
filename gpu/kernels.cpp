@@ -2828,3 +2828,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "token_mixing.hpp"
 #include "device_link.hpp"
 #include "gemv_fused.hpp"
+#include "moe_prefill.hpp"

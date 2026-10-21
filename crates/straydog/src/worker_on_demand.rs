@@ -98,6 +98,7 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, output: Output, report: &(dyn Fn
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
         row_cache_bytes: args.row_cache_bytes,
+        half_gemm: args.gemm == "fp16",
     };
     let (jobs, queue) = mpsc::channel::<Job>();
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();

@@ -102,10 +102,18 @@ __global__ void op_rope_kernel(float* x, size_t count, size_t vectors, size_t wi
     v[1] = float(a * s + b * c);
 }
 
+// steps rows of cols values (stride apart) rounded to FP16, packed.
+__global__ void op_half_rows(const float* input, size_t stride, size_t cols, size_t steps, __half* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < steps * cols) out[index] = __float2half(input[(index / cols) * stride + index % cols]);
+}
+
 // out[t][r] = W[first + r] . in[t] for `rows` rows, inputs and outputs `input_stride` and
 // `output_stride` values apart: GEMV for up to gemv_max_vectors inputs, else the rows expanded
-// to F32 in `scratch` (in pieces that fit) and an F32 GEMM. The GEMV gives a row at least
-// op_lanes lanes, so that a wave reads long runs of each row (short rows otherwise get two).
+// to F32 in `scratch` (in pieces that fit) and an F32 GEMM -- or, on a device set to FP16 GEMMs
+// (sd_gemm_options), the rows expanded to FP16 and the inputs rounded to FP16 (at the scratch's
+// end), an FP16 GEMM with F32 sums. The GEMV gives a row at least op_lanes lanes, so that a wave
+// reads long runs of each row (short rows otherwise get two).
 constexpr unsigned op_lanes = 8;
 void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t cols, size_t first,
                const float* input, size_t input_stride, size_t steps, float* output, size_t output_stride,
@@ -118,6 +126,24 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
         return;
     }
     if (!d.blas) throw std::runtime_error("Straydog op: GEMM needs a BLAS handle");
+    if (d.half_gemm) {
+        const size_t input_bytes = (steps * cols * 2 + 255) & ~size_t(255);
+        if (scratch_bytes <= input_bytes) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
+        auto* half_input = reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(scratch) + scratch_bytes - input_bytes);
+        op_half_rows<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(input, input_stride, cols, steps, half_input);
+        const size_t piece = std::min(rows, (scratch_bytes - input_bytes) / (cols * 2));
+        if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
+        const float alpha = 1, beta = 0;
+        for (size_t done = 0; done < rows; done += piece) {
+            const size_t count = std::min(piece, rows - done);
+            const Matrix part{matrix.data + done * row_bytes, row_bytes, count, cols, 0, 0, 0, kind};
+            expand(part, scratch, d.stream, true);
+            blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha, scratch, HIP_R_16F,
+                                     int(cols), half_input, HIP_R_16F, int(cols), &beta, output + done, HIP_R_32F, int(output_stride),
+                                     HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+        }
+        return;
+    }
     const size_t piece = std::min(rows, scratch_bytes / (cols * 4));
     if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
     const float alpha = 1, beta = 0;

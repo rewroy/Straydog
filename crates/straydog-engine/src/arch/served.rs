@@ -126,6 +126,8 @@ pub struct Settings {
     /// Host memory caching the gathered tables' rows (the Engram table), read from the drive as
     /// needed and verified as read; 0 reads them through the mapping.
     pub row_cache_bytes: u64,
+    /// Prefill products as FP16 GEMMs with F32 sums (`--gemm fp16`), where an architecture takes them.
+    pub half_gemm: bool,
 }
 
 /// Experts still to warm up with, as (layer, expert).

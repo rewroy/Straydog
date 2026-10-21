@@ -796,6 +796,39 @@ unsafe extern "C" {
     pub fn sd_link_reset(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_moe_group_bytes() -> u64;
+}
+unsafe extern "C" {
+    pub fn sd_moe_groups(
+        handle: *mut ::std::os::raw::c_void,
+        groups: *mut ::std::os::raw::c_void,
+        bases: *const u64,
+        experts: u64,
+        offsets: *const u64,
+        kinds: *const ::std::os::raw::c_int,
+        hidden: u64,
+        ffn: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_experts_grouped(
+        handle: *mut ::std::os::raw::c_void,
+        groups: *mut ::std::os::raw::c_void,
+        experts: u64,
+        ids: *const i32,
+        weights: *const f32,
+        rows: u64,
+        top_k: u64,
+        hidden: u64,
+        ffn: u64,
+        kinds: *const ::std::os::raw::c_int,
+        input: *const f32,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_scale_rows(
         handle: *mut ::std::os::raw::c_void,
         x: *mut f32,

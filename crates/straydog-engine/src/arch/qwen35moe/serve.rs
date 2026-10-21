@@ -280,6 +280,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     checkpoints: CHECKPOINTS,
                     resident: resident[part],
                     part: if tensor { Part { index: part, count: 2 } } else { Part::WHOLE },
+                    half_gemm: settings.half_gemm,
                 };
                 engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes, engine_settings)?);
             }
@@ -321,8 +322,15 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "cpu_experts": resident.iter().any(|&resident| !resident),
         "prefill_batch_size": batch,
     });
+    let mut engines = Engines { engines, parts: tensor };
+    // The first FP16 GEMMs load the BLAS library's kernels (~0.7 s): a pass of a few rows takes
+    // that at placement rather than in the first request; then it is forgotten.
+    if settings.half_gemm && batch >= 32 {
+        served::Engines::forward(&mut engines, &[0; 32])?;
+        served::Engines::reset(&mut engines);
+    }
     Ok(Session::new(Placed {
-        engines: Engines { engines, parts: tensor },
+        engines,
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch, end, turn_start,
         card,
         placement, state_bytes,

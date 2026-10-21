@@ -33,6 +33,9 @@ const SLOT_ROWS: usize = 4;
 const WAVE: usize = 32;
 /// The graph a decode step records when the experts are resident.
 const DECODE_GRAPH: u64 = 1;
+/// Rows from which a pass runs resident experts as grouped GEMMs (each expert read once a tile of
+/// its rows) rather than route by route.
+const GROUPED_ROWS: usize = 16;
 
 pub struct Settings {
     /// Longest sequence (positions) the state holds.
@@ -55,6 +58,9 @@ pub struct Settings {
     /// This GPU's part of every layer when several split them (tensor parallel: resident only;
     /// the engines are joined by [`link`] and run by [`forward_parts`]).
     pub part: Part,
+    /// Prefill passes' dense products as FP16 GEMMs (F32 sums), the explicit FP16 GEMM mode
+    /// (`--gemm fp16`); else F32.
+    pub half_gemm: bool,
 }
 
 #[derive(Clone)]
@@ -82,6 +88,9 @@ struct Saved {
 struct Resident {
     table: Buffer,
     slot_bytes: Vec<u64>,
+    /// The same experts as the grouped GEMMs take them: a table of `group_bytes` entries per layer.
+    groups: Buffer,
+    group_bytes: u64,
     /// Routes run through the table (the store counts none of them).
     routes: u64,
     /// A decode step's graph being recorded, and recorded.
@@ -191,6 +200,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return Err("qwen35moe engine layers outside the model".into());
         }
         let mut gpu = Backend::new(device, budget)?;
+        if settings.half_gemm {
+            gpu.configure_gemm(2, true)?;
+        }
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let b = settings.batch;
         let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count.max(1) * 4) as u64);
@@ -502,14 +514,29 @@ impl<'a, T: Tensors> Engine<'a, T> {
             bases.push((layer_bases, bytes));
         }
         let table = self.gpu.buffer((range.len() * experts * 8) as u64)?;
+        let group_bytes = Backend::moe_group_bytes();
+        let groups = self.gpu.buffer(range.len() as u64 * experts as u64 * group_bytes)?;
         let mut slot_bytes = Vec::with_capacity(range.len());
         for (index, (layer_bases, bytes)) in bases.into_iter().enumerate() {
             let part = table.slice((index * experts * 8) as u64, (experts * 8) as u64);
             self.gpu.expert_table(&part, &layer_bases, bytes)?;
+            let (kinds, offsets) = self.expert_layout(range.start + index)?;
+            let part = groups.slice(index as u64 * experts as u64 * group_bytes, experts as u64 * group_bytes);
+            self.gpu.moe_groups(&part, &layer_bases, offsets, kinds, self.hp.width as u64, self.hp.expert_ff as u64)?;
             slot_bytes.push(bytes);
         }
-        self.resident = Some(Resident { table, slot_bytes, routes: 0, recording: false, graph: false });
+        self.resident = Some(Resident { table, slot_bytes, groups, group_bytes, routes: 0, recording: false, graph: false });
         Ok(())
+    }
+
+    /// A layer's routed experts' formats (gate, up, down) and their matrices' byte offsets in a slot.
+    fn expert_layout(&self, layer: usize) -> Result<([u32; 3], [u64; 3])> {
+        let (w, ff) = (self.hp.width, self.hp.expert_ff);
+        let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
+        let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
+        let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
+        let (gate_bytes, up_bytes) = ((ff * row_bytes(gate.kind, w)?) as u64, (ff * row_bytes(up.kind, w)?) as u64);
+        Ok(([gate.kind, up.kind, down.kind], [0, gate_bytes, gate_bytes + up_bytes]))
     }
 
     /// Wait for the expert store's reads and copies (before dropping the engine).
@@ -884,6 +911,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 resident.routes += (n * k) as u64;
             }
             let slot_bytes = resident.slot_bytes[index];
+            let groups = resident.groups.at(0).cast::<u8>().wrapping_add((index * hp.experts) * resident.group_bytes as usize);
+            // Many rows: each expert's GEMMs over all of its rows (FP16 operands, F32 sums), when
+            // this device takes them; else route by route.
+            let scratch = self.scratch;
+            if n >= GROUPED_ROWS
+                && self.gpu.experts_grouped(groups.cast(), hp.experts as u64, work.ids.base(), work.weights.base(), n as u64, k as u64,
+                                            w as u64, ff as u64, kinds, work.x.base(), &scratch, work.out.base())?
+            {
+                return Ok(());
+            }
             return self.gpu.experts_table(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64, ff as u64,
                                           n as u64, k as u64, work.x.base(), Some(work.weights.base()), 0.0, true, work.hidden.base(),
                                           work.out.base());

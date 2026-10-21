@@ -208,6 +208,16 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
 int sd_link_failed(void* handle);
 int sd_op_link_status(void* handle, uint32_t* out);
 int sd_link_reset(void* handle);
+/* Routed experts of many rows at once (a prefill pass; gpu/moe_prefill.hpp): sd_moe_groups writes
+   an expert table (experts entries of sd_moe_group_bytes() each) from each expert's slot address
+   (0: an expert another device runs) and its gate, up and down byte offsets and kinds in the
+   slot; sd_op_experts_grouped adds to out each row's routes (ids and weights, rows x top_k)
+   through the table's experts as RDNA4 grouped FP16 GEMMs (F32 sums), routes to absent experts
+   left out, its scratch in `scratch`: 1 when not taken here (not RDNA4, or a shape its tiles do
+   not fit). */
+uint64_t sd_moe_group_bytes(void);
+int sd_moe_groups(void* handle, void* groups, const uint64_t* bases, uint64_t experts, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn);
+int sd_op_experts_grouped(void* handle, void* groups, uint64_t experts, const int32_t* ids, const float* weights, uint64_t rows, uint64_t top_k, uint64_t hidden, uint64_t ffn, const int* kinds, const float* input, void* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width);
 
 /* Layer operations */

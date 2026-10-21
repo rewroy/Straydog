@@ -521,7 +521,10 @@ Where its experts go depends on what the GPUs hold:
   placement into slots sized per size class and kept for good. A pass looks each route's slot
   up on the GPU in a table (`sd_op_experts_table`), so no routes come back to the host. A decode
   step then has no host data past its position and embedding, and each GPU runs it as one
-  recorded graph.
+  recorded graph. A pass of 16 rows or more groups its routes by expert on the device and runs
+  them as RDNA4 grouped GEMMs (`sd_op_experts_grouped`, gpu/moe_prefill.hpp: FP16 operands, F32
+  sums), each expert's weights read once a tile of 64 of its rows; with `--gemm fp16` (the
+  default) the pass's dense products are FP16 GEMMs too, else F32.
 - **Otherwise**, the expert store's tiers serve them: VRAM slots, a page-locked host tier, the
   drive. A decode step reads its routes, their weights and its MoE input back each layer.
   Routes to experts in the host tier run on the CPU (`sd_cpu_experts_run`, Q8_0 and BF16) from

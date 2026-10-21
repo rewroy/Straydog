@@ -14,10 +14,11 @@
 //! DUMP_DIR/tokens.txt (no reference logits then); --teacher 1 feeds the continuation's tokens
 //! instead of the greedy ones; --record FILE writes the logits after every prefill chunk and decode
 //! step, and --against FILE compares this run's with them (KL, top-1, equal logits). --warm 1 first
-//! runs what the server warms up with (four tokens, a decode step) and resets.
+//! runs what the server warms up with (four tokens, a decode step) and resets. --half 1: prefill's
+//! dense products as FP16 GEMMs (the server's --gemm fp16).
 //!
 //! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N] [--resident 1]
-//!          [--cpu N] [--tp 1] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE]
+//!          [--cpu N] [--tp 1] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE] [--warm 1] [--half 1]
 
 #[path = "common/files.rs"]
 mod files;
@@ -60,13 +61,21 @@ impl Probes {
         let vocabulary = self.rows.first().map_or(1, Vec::len);
         let theirs: Vec<Vec<f32>> = bytes.chunks_exact(4 * vocabulary)
             .map(|row| row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
-        if theirs.len() != self.rows.len() {
+        // A run in other chunks has other prefill probes: then only the decode steps (the last
+        // probes of both) compare, and the last prefill chunk's.
+        let decode = self.rows.len() - prefill;
+        let (theirs_prefill, prefill) = if theirs.len() == self.rows.len() {
+            (0, prefill)
+        } else if theirs.len() > decode {
+            (theirs.len() - decode - 1, 1)
+        } else {
             return Err(format!("{path} holds {} probes, this run {}", theirs.len(), self.rows.len()));
-        }
-        for (label, range) in [("prefill chunks", 0..prefill), ("decode steps", prefill..self.rows.len())] {
+        };
+        let skip = self.rows.len() - decode - prefill;
+        for (label, range) in [("prefill chunks", 0..prefill), ("decode steps", prefill..prefill + decode)] {
             let (mut kls, mut top, mut equal) = (Vec::new(), 0, 0);
             for index in range.clone() {
-                let (a, b) = (&theirs[index], &self.rows[index]);
+                let (a, b) = (&theirs[theirs_prefill + index], &self.rows[skip + index]);
                 kls.push(kl(a, b));
                 top += usize::from(argmax(a) == argmax(b));
                 equal += usize::from(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
@@ -97,6 +106,7 @@ fn main() -> Result<(), String> {
     let cpu_threads = option("--cpu", 0);
     let teacher = option("--teacher", 0) > 0;
     let warm = option("--warm", 0);
+    let half_gemm = option("--half", 0) > 0;
     let mut text_option = |flag: &str| args.iter().position(|arg| arg == flag).map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -105,7 +115,8 @@ fn main() -> Result<(), String> {
     let (tokens_file, record, against) = (text_option("--tokens"), text_option("--record"), text_option("--against"));
     let [dir, dump] = &args[..] else {
         return Err("usage: q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] \
-                    [--checkpoint N] [--resident 1] [--cpu N] [--tp 1] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE]".into());
+                    [--checkpoint N] [--resident 1] [--cpu N] [--tp 1] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE] \
+                    [--warm 1] [--half 1]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
@@ -126,7 +137,8 @@ fn main() -> Result<(), String> {
     let mut engines = Vec::new();
     for (device, (range, part)) in parts.into_iter().enumerate() {
         let settings = Settings { context, batch: chunk.max(1), expert_slots: slots, host_expert_bytes: (host_gb as u64) << 30,
-                                  scratch_bytes: 512 << 20, layers: range, checkpoints: usize::from(checkpoint > 0), resident, part };
+                                  scratch_bytes: 512 << 20, layers: range, checkpoints: usize::from(checkpoint > 0), resident, part,
+                                  half_gemm };
         engines.push(Engine::new(hp.clone(), &files, device, 31 << 30, settings)?);
     }
     if tp {
