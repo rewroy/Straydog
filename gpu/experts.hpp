@@ -325,8 +325,8 @@ __host__ __device__ constexpr bool slot_heavy(int kind) {
     return kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23;
 }
 // This lane's shares of two rows' dots with x: `kind`'s units over `lanes` lanes, or (kind < 0) the
-// reference element decoder of `format` over the wave.
-template<int kind>
+// reference element decoder of `format` over the wave. (PAIRED: gate and up, two rows a lane)
+template<int kind, bool PAIRED = false>
 __device__ __forceinline__ void slot_dots(const uint8_t* first, const uint8_t* second, int format, int second_format, size_t cols,
                                           unsigned lanes, unsigned sub, const float* x, float& a, float& b) {
     if constexpr (kind >= 0 && slot_heavy(kind)) {
@@ -340,13 +340,21 @@ __device__ __forceinline__ void slot_dots(const uint8_t* first, const uint8_t* s
             }
     } else if constexpr (kind >= 0) {
         const size_t units = cols / GemvFormat<kind>::elements;
-        #pragma unroll 2
-        for (size_t unit = sub; unit < units; unit += lanes) {
+        const auto step = [&](size_t unit) {
             float da[1], db[1];
             GemvFormat<kind>::template dots<1>(first, unit, x, 0, da);
             if (second) GemvFormat<kind>::template dots<1>(second, unit, x, 0, db);
             a += da[0];
             if (second) b += db[0];
+        };
+        if constexpr (PAIRED && kind != 16) {
+            // Gate and up a unit at a time: unrolled, their registers kept fewer waves resident (DeepSeek-V4.1's
+            // shapes: IQ2_S 64 -> 58 us, IQ1_S 49 -> 46, Q8_0 58 -> 49; IQ2_XXS 57 -> 59, so it stays unrolled).
+            #pragma unroll 1
+            for (size_t unit = sub; unit < units; unit += lanes) step(unit);
+        } else {
+            #pragma unroll 2
+            for (size_t unit = sub; unit < units; unit += lanes) step(unit);
         }
     } else {
         #define SD_REFERENCE(format_) case format_: \
@@ -387,7 +395,7 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
     const Matrix& up = plan.role[1];
     const size_t row = (wave % plan.waves[0]) * (32 / lanes) + lane / lanes, last = std::min(row, gate.rows - 1);
     float g = 0.0f, u = 0.0f;
-    slot_dots<kind>(base + size_t(gate.data) + last * gate.row_bytes, base + size_t(up.data) + last * up.row_bytes, gate.kind,
+    slot_dots<kind, true>(base + size_t(gate.data) + last * gate.row_bytes, base + size_t(up.data) + last * up.row_bytes, gate.kind,
                     up.kind, gate.cols, lanes, sub, input + size_t(blockIdx.y) * input_stride, g, u);
     g = slot_reduce(g, lanes);
     u = slot_reduce(u, lanes);

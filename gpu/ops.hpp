@@ -258,12 +258,13 @@ __global__ void op_hc_coefficients_kernel(const float* mixes, const float* strea
 // blocks write unnormalized. `counters` (one per row, zero between launches: the last block resets
 // its row's) and `partial` (per row and block the mixes and both sums of squares) are a workspace.
 constexpr size_t hc_step_columns = 64;
+constexpr unsigned hc_step_threads = 256;   // a block's threads (its last block's loads are counted by them)
 // The last block reads what other blocks wrote from the device-wide cache, without ordering the loads.
 __device__ __forceinline__ float hc_step_load(float* at) {
     return __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 template<int HC>
-__global__ void op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
+__global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
                                   float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
                                   float eps, float norm_eps, const float* collapse, const float* norm_weight, size_t width,
                                   unsigned* counters, float* partial, float* pre, float* post, float* comb, float* out) {
@@ -326,12 +327,24 @@ __global__ void op_hc_step_kernel(const float* x, const float* residual, const f
     __syncthreads();
     if (!last) return;
     __threadfence();
-    // The blocks' sums arrive GATHER at a time, all loads at once; each total adds them in order.
+    // The blocks' sums arrive GATHER at a time, all loads at once (a thread's issued before it
+    // stores any); each total adds them in order.
     float total = 0.0f;
+    constexpr unsigned LOADS = (GATHER + hc_step_threads - 1) / hc_step_threads;
     for (size_t b0 = 0; b0 < blocks; b0 += GATHER / SUMS) {
         const size_t count = std::min<size_t>(GATHER / SUMS, blocks - b0) * SUMS;
         float* sums = row_partial + b0 * SUMS;
-        for (size_t i = threadIdx.x; i < count; i += blockDim.x) gathered[i] = hc_step_load(sums + i);
+        float loaded[LOADS];
+        #pragma unroll
+        for (unsigned j = 0; j < LOADS; ++j) {
+            const size_t i = threadIdx.x + j * hc_step_threads;
+            if (i < count) loaded[j] = hc_step_load(sums + i);
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < LOADS; ++j) {
+            const size_t i = threadIdx.x + j * hc_step_threads;
+            if (i < count) gathered[i] = loaded[j];
+        }
         __syncthreads();
         if (threadIdx.x < SUMS)
             for (size_t b = 0; b < count / SUMS; ++b) total += gathered[b * SUMS + threadIdx.x];
@@ -351,7 +364,21 @@ __global__ void op_hc_step_kernel(const float* x, const float* residual, const f
     }
     const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
     float* o = out + row * width;
-    for (size_t col = threadIdx.x; col < width; col += blockDim.x) o[col] = hc_step_load(o + col) * factor * norm_weight[col];
+    // the row's columns a few at a time, each group's loads issued before its stores
+    constexpr unsigned EACH = 8;
+    for (size_t col0 = 0; col0 < width; col0 += size_t(EACH) * blockDim.x) {
+        float loaded[EACH], weights[EACH];
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = col0 + j * blockDim.x + threadIdx.x;
+            if (col < width) { loaded[j] = hc_step_load(o + col); weights[j] = norm_weight[col]; }
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = col0 + j * blockDim.x + threadIdx.x;
+            if (col < width) o[col] = loaded[j] * factor * weights[j];
+        }
+    }
 }
 // Values of op_hc_step_kernel's workspace per row: its counter, then its blocks' sums.
 size_t hc_step_row_values(size_t hc, size_t width) {

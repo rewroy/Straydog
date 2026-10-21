@@ -2490,7 +2490,7 @@ int sd_op_hc_step(void* handle, const float* x, const float* residual, const flo
     op_span(value, workspace, size_t(workspace_bytes), "a hyper-connection workspace");
     auto* counters = reinterpret_cast<unsigned*>(workspace);
     const dim3 grid(unsigned((width + hc_step_columns - 1) / hc_step_columns), unsigned(rows));
-    #define SD_HC_STEP(n) case n: op_hc_step_kernel<n><<<grid, 256, 0, value.stream>>>(x, residual, post_in, comb_in, stream, fn, \
+    #define SD_HC_STEP(n) case n: op_hc_step_kernel<n><<<grid, hc_step_threads, 0, value.stream>>>(x, residual, post_in, comb_in, stream, fn, \
         base, scale, size_t(iterations), eps, norm_eps, collapse, norm_weight, size_t(width), counters, workspace + capacity, pre, \
         post, comb, out); break;
     switch (hc) { SD_HC_STEP(1) SD_HC_STEP(2) SD_HC_STEP(3) SD_HC_STEP(4) SD_HC_STEP(5) SD_HC_STEP(6) SD_HC_STEP(7) SD_HC_STEP(8) }
