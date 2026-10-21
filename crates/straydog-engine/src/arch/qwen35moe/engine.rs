@@ -545,8 +545,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (gate_bytes, up_bytes, down_bytes) =
             ((ff * row_bytes(gate.kind, w)?) as u64, (ff * row_bytes(up.kind, w)?) as u64, (w * row_bytes(down.kind, ff)?) as u64);
         let offsets = [0, gate_bytes, gate_bytes + up_bytes];
-        if n <= SLOT_ROWS {
-            let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<BTreeSet<_>>().into_iter().collect();
+        let distinct: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<BTreeSet<_>>().into_iter().collect();
+        // A few rows run over their experts' slots in one launch, when the store's smallest size
+        // class can hold them all at once (a store of few slots takes them in waves instead).
+        if n <= SLOT_ROWS && distinct.len() <= self.experts.wave_limit() {
+            let experts = distinct;
             let slots = self.experts.acquire(&mut self.gpu, layer, &experts)?;
             let bases: Vec<u64> = routes.iter()
                 .map(|expert| slots[experts.binary_search(&(*expert as usize)).unwrap()].base() as u64).collect();
