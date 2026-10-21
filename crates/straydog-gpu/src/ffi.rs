@@ -742,6 +742,28 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_link_sums(
+        first: *mut ::std::os::raw::c_void,
+        second: *mut ::std::os::raw::c_void,
+        capacity: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_link_sum(
+        handle: *mut ::std::os::raw::c_void,
+        part: *const f32,
+        count: u64,
+        out: *mut f32,
+        accumulate: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_link_failed(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_link_reset(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_scale_rows(
         handle: *mut ::std::os::raw::c_void,
         x: *mut f32,

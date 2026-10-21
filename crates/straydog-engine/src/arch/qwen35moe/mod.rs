@@ -6,6 +6,7 @@
 //! file's metadata.
 
 pub mod engine;
+pub mod part;
 pub mod serve;
 
 use super::Keys;

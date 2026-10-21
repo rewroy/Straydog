@@ -509,14 +509,14 @@ impl DeviceExperts {
         self.classes.iter().map(|class| class.count.saturating_sub(class.reserve) / 2).min().unwrap_or(0).max(1)
     }
 
-    /// When every expert of `layer` (`0..experts`) is in a VRAM slot with no fill pending: their
-    /// slots' addresses in expert order and the slots' bytes (else None). For a caller that then
-    /// reads them without acquiring: it must keep them from eviction (slots for every expert and
-    /// their reserve, no other expert brought in), and its compute stream must already wait for
-    /// their uploads (an acquire of each did).
-    pub fn resident_bases(&self, layer: usize, experts: usize) -> Option<(Vec<u64>, u64)> {
+    /// When each of `layer`'s `experts` is in a VRAM slot with no fill pending: their slots'
+    /// addresses in that order and the slots' bytes (else None). For a caller that then reads them
+    /// without acquiring: it must keep them from eviction (slots for every expert and their
+    /// reserve, no other expert brought in), and its compute stream must already wait for their
+    /// uploads (an acquire of each did).
+    pub fn resident_bases(&self, layer: usize, experts: &[usize]) -> Option<(Vec<u64>, u64)> {
         let class = self.class_of.get(layer).copied().flatten()?;
-        let bases = (0..experts).map(|expert| {
+        let bases = experts.iter().map(|&expert| {
             let &slot = self.map.get(&(layer as u32, expert as u32))?;
             let entry = &self.slots[slot];
             (entry.waiting.is_none() && entry.key == Some((layer as u32, expert as u32))).then(|| self.slot_buffer(slot).base() as u64)

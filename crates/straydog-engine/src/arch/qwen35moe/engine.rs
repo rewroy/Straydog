@@ -2,7 +2,9 @@
 //! the expert store's tiers (VRAM slots, a host tier, the files; src/experts.rs), and the sequence
 //! state a pass continues (each DeltaNet's convolution history and recurrent state, each attention
 //! layer's K/V). One engine runs a range of layers on one device; engines of consecutive ranges
-//! hand the residual stream over ([`forward_split`]). Checked against the CPU reference by
+//! hand the residual stream over ([`forward_split`]). Or two engines each run a part of every
+//! layer (tensor parallel, [`super::part`]), adding their partial sums on the devices
+//! ([`forward_parts`]). Checked against the CPU reference by
 //! examples/q35_chat (with Q35_COMPARE naming a directory of the reference's tensors, each layer's
 //! are compared as the pass goes).
 
@@ -12,6 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use super::part::Part;
 use super::{Hparams, Mixer};
 use crate::arch::Tensors;
 use crate::experts::{Contents, Counts, DeviceExperts, Layout, Reader, Role};
@@ -49,6 +52,9 @@ pub struct Settings {
     /// `expert_slots` and `host_expert_bytes` unused): passes take them by table, with no routes
     /// read back, and a decode step runs as one recorded graph.
     pub resident: bool,
+    /// This GPU's part of every layer when several split them (tensor parallel: resident only;
+    /// the engines are joined by [`link`] and run by [`forward_parts`]).
+    pub part: Part,
 }
 
 #[derive(Clone)]
@@ -121,7 +127,10 @@ struct Work {
 }
 
 pub struct Engine<'a, T: Tensors> {
+    /// The hyperparameters of this engine's part (the whole model's when it has the whole layers).
     hp: Rc<Hparams>,
+    /// The whole model's.
+    global: Rc<Hparams>,
     tensors: &'a T,
     settings: Settings,
     gpu: Backend,
@@ -167,6 +176,15 @@ fn name(layer: usize, tensor: &str) -> String {
 
 impl<'a, T: Tensors> Engine<'a, T> {
     pub fn new(hp: Hparams, tensors: &'a T, device: usize, budget: u64, settings: Settings) -> Result<Engine<'a, T>> {
+        let part = settings.part;
+        if !part.is_whole() {
+            Part::fits(&hp, part.count)?;
+            if !settings.resident {
+                return Err("a qwen35moe part of the layers needs every expert resident".into());
+            }
+        }
+        let global = hp.clone();
+        let hp = part.hparams(&global);
         let range = settings.layers.clone();
         if range.is_empty() || range.end > hp.layers() {
             return Err("qwen35moe engine layers outside the model".into());
@@ -246,12 +264,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
         let reader = Arc::new(Reader::new(READERS));
         let experts = if settings.resident {
-            DeviceExperts::resident(&mut gpu, layout, reader, hp.experts)?
+            DeviceExperts::resident(&mut gpu, layout, reader, part.experts(&hp).len())?
         } else {
             DeviceExperts::new(&mut gpu, layout, reader, settings.expert_slots, settings.host_expert_bytes)?
         };
         let mut engine = Engine {
             hp: Rc::new(hp),
+            global: Rc::new(global),
             tensors,
             settings,
             gpu,
@@ -266,7 +285,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             cpu_routes: 0,
             frequencies: frequency_buffer,
             position: 0,
-            compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from),
+            // (the reference's tensors are whole layers')
+            compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from).filter(|_| part.is_whole()),
         };
         engine.upload_dense()?;
         if engine.settings.resident {
@@ -298,8 +318,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         for name in names {
             let tensor = self.tensors.tensor(&name)?;
-            let buffer = self.gpu.upload_bytes(tensor.data)?;
-            self.dense.insert(name, Dense { buffer, kind: tensor.kind, dims: tensor.dims.clone() });
+            // A part's slice of the tensor, else the whole of it.
+            let layer = name.strip_prefix("blk.").and_then(|rest| rest.split('.').next()).and_then(|layer| layer.parse().ok());
+            let role = name.split('.').nth(if layer.is_some() { 2 } else { 0 }).unwrap_or("");
+            let (buffer, dims) = match self.settings.part.slice(&self.global, layer, role) {
+                Some(slice) => {
+                    let (bytes, dims) = slice.take(&tensor)?;
+                    (self.gpu.upload_bytes(&bytes)?, dims)
+                }
+                None => (self.gpu.upload_bytes(tensor.data)?, tensor.dims.clone()),
+            };
+            self.dense.insert(name, Dense { buffer, kind: tensor.kind, dims });
         }
         Ok(())
     }
@@ -385,9 +414,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         counts
     }
 
-    /// The VRAM bytes the resident experts of `layers` take ([`Settings::resident`]).
-    pub fn resident_bytes(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>) -> Result<u64> {
-        Ok(DeviceExperts::resident_bytes(&Self::roles(hp, tensors, layers)?, hp.experts))
+    /// The VRAM bytes the resident experts of `layers` take ([`Settings::resident`]) on a GPU with
+    /// `part` of them.
+    pub fn resident_bytes(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>, part: Part) -> Result<u64> {
+        Ok(DeviceExperts::resident_bytes(&Self::roles(hp, tensors, layers)?, part.experts(hp).len()))
     }
 
     /// Each of `layers`' routed experts as three roles of the file (a slot holds them back to back).
@@ -428,7 +458,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     fn load_resident(&mut self) -> Result<()> {
         let range = self.settings.layers.clone();
         let experts = self.hp.experts;
-        let all: Vec<usize> = (0..experts).collect();
+        let all: Vec<usize> = self.settings.part.experts(&self.hp).collect();
         // Every layer's reads start at once; then each layer takes its experts whole.
         for layer in range.clone() {
             self.experts.prefetch(&mut self.gpu, layer, &all, true)?;
@@ -439,7 +469,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         let mut bases = Vec::with_capacity(range.len());
         for layer in range.clone() {
-            bases.push(self.experts.resident_bases(layer, experts).ok_or("a resident expert left its slot")?);
+            let (held, bytes) = self.experts.resident_bases(layer, &all).ok_or("a resident expert left its slot")?;
+            // another part's experts: none here
+            let mut layer_bases = vec![0u64; experts];
+            for (&expert, base) in all.iter().zip(held) {
+                layer_bases[expert] = base;
+            }
+            bases.push((layer_bases, bytes));
         }
         let table = self.gpu.buffer((range.len() * experts * 8) as u64)?;
         let mut slot_bytes = Vec::with_capacity(range.len());
@@ -502,54 +538,83 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// last token.
     pub fn pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
         let n = tokens.len();
+        self.begin(tokens)?;
+        if self.graphed(n) {
+            self.decode_graph()?;
+        } else {
+            self.layers_and_head(n)?;
+        }
+        self.collect(n)
+    }
+
+    /// Start a pass over `tokens`: their positions, and on the first engine their embeddings.
+    fn begin(&mut self, tokens: &[u32]) -> Result<()> {
+        let n = tokens.len();
         if n == 0 || n > self.settings.batch || self.position + n > self.settings.context {
             return Err("qwen35moe forward exceeds the batch or the context".into());
         }
-        let hp = self.hp.clone();
-        let w = hp.width;
-        let range = self.settings.layers.clone();
+        let w = self.hp.width;
         let positions: Vec<i32> = (self.position..self.position + n).map(|p| p as i32).collect();
         let work = self.work;
         self.gpu.write_buffer(&work.positions, 0, &positions)?;
-        if range.start == 0 {
+        if self.settings.layers.start == 0 {
             let embed = self.tensors.tensor("token_embd.weight")?;
             let bytes = row_bytes(embed.kind, embed.dims[0])?;
             let mut rows = Vec::with_capacity(n * w);
             for &token in tokens {
-                if token as usize >= hp.vocabulary {
+                if token as usize >= self.global.vocabulary {
                     return Err("qwen35moe token is out of range".into());
                 }
                 formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut rows)?;
             }
             self.gpu.write_buffer(&work.stream, 0, &rows)?;
         }
-        // With the experts resident a decode step has no host data past the positions and the
-        // embedding: it runs as the graph its first time recorded.
-        if n == 1 && self.resident.is_some() && self.compare.is_none() {
-            if let Some(resident) = &mut self.resident {
-                resident.routes += (range.len() * hp.experts_used) as u64;
+        Ok(())
+    }
+
+    /// Whether a pass of `n` tokens runs as the recorded decode graph: with the experts resident a
+    /// decode step has no host data past the positions and the embedding.
+    fn graphed(&self, n: usize) -> bool {
+        n == 1 && self.resident.is_some() && self.compare.is_none()
+    }
+
+    /// Queue a decode step's graph (recorded its first time).
+    fn decode_graph(&mut self) -> Result<()> {
+        let routes = (self.settings.layers.len() * self.hp.experts_used) as u64;
+        let counted = self.settings.part.index == 0;
+        if let Some(resident) = &mut self.resident {
+            // (a split model's first part counts the routes for all)
+            if counted {
+                resident.routes += routes;
             }
-            if !self.gpu.graph_run(DECODE_GRAPH)? {
-                self.gpu.graph_begin()?;
-                self.set_recording(true);
-                let recorded = self.layers_and_head(1);
-                self.set_recording(false);
-                self.gpu.graph_end(DECODE_GRAPH, recorded.is_ok())?;
-                recorded?;
-                if !self.gpu.graph_run(DECODE_GRAPH)? {
-                    return Err("the qwen35moe decode graph went missing".into());
-                }
-            }
-        } else {
-            self.layers_and_head(n)?;
         }
-        let logits = if range.end == hp.layers() {
-            let mut logits = vec![0f32; hp.vocabulary];
-            self.gpu.read_buffer(&work.head, 0, &mut logits)?;
+        if !self.gpu.graph_run(DECODE_GRAPH)? {
+            self.gpu.graph_begin()?;
+            self.set_recording(true);
+            let recorded = self.layers_and_head(1);
+            self.set_recording(false);
+            self.gpu.graph_end(DECODE_GRAPH, recorded.is_ok())?;
+            recorded?;
+            if !self.gpu.graph_run(DECODE_GRAPH)? {
+                return Err("the qwen35moe decode graph went missing".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The queued pass of `n` tokens done: the logits after its last token (a split model's part:
+    /// its rows of the vocabulary) when this engine has the head.
+    fn collect(&mut self, n: usize) -> Result<Option<Vec<f32>>> {
+        let logits = if self.settings.layers.end == self.hp.layers() {
+            let mut logits = vec![0f32; self.hp.vocabulary];
+            self.gpu.read_buffer(&self.work.head, 0, &mut logits)?;
             Some(logits)
         } else {
             None
         };
+        if !self.settings.part.is_whole() && self.gpu.link_failed()? {
+            return Err("a qwen35moe GPU waited too long for its peer's part of a sum".into());
+        }
         self.position += n;
         Ok(logits)
     }
@@ -563,11 +628,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// This engine's layers over the `n` rows in the stream, then (on the last engine) the head's
     /// logits after the last row into `work.head`.
     fn layers_and_head(&mut self, n: usize) -> Result<()> {
-        let range = self.settings.layers.clone();
-        for layer in range.clone() {
-            self.layer(layer, n)?;
+        for layer in self.settings.layers.clone() {
+            self.mix(layer, n)?;
+            self.feed_forward(layer, n)?;
         }
-        if range.end == self.hp.layers() {
+        self.head(n)
+    }
+
+    /// On the last engine, the head's logits after the last of the `n` rows into `work.head`.
+    fn head(&mut self, n: usize) -> Result<()> {
+        if self.settings.layers.end == self.hp.layers() {
             let (w, work) = (self.hp.width, self.work);
             self.norm("output_norm.weight", work.stream.at((n - 1) * w), 1, w, work.x.base())?;
             self.linear("output.weight", work.x.base(), 1, work.head.base())?;
@@ -607,7 +677,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
-    fn layer(&mut self, layer: usize, n: usize) -> Result<()> {
+    /// The layer's token mixer (a DeltaNet or attention) over the `n` rows, added to the stream (a
+    /// split model's parts' sums added: the parts meet here).
+    fn mix(&mut self, layer: usize, n: usize) -> Result<()> {
         let hp = self.hp.clone();
         let w = hp.width;
         let work = self.work;
@@ -617,12 +689,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
             Mixer::DeltaNet => self.delta_net(layer, n)?,
             Mixer::Attention => self.attention(layer, n)?,
         }
-        self.gpu.add(work.mixed.base(), (n * w) as u64, work.stream.base())?;
-        self.check("attn_residual", layer, work.stream, n, w)?;
+        if self.settings.part.is_whole() {
+            self.gpu.add(work.mixed.base(), (n * w) as u64, work.stream.base())?;
+        } else {
+            self.gpu.link_sum(work.mixed.base(), (n * w) as u64, work.stream.base(), true)?;
+        }
+        self.check("attn_residual", layer, work.stream, n, w)
+    }
+
+    /// The layer's MoE over the `n` rows, added to the stream (as [`mix`](Self::mix)).
+    fn feed_forward(&mut self, layer: usize, n: usize) -> Result<()> {
+        let w = self.hp.width;
+        let work = self.work;
         self.norm(&name(layer, "post_attention_norm"), work.stream.base(), n, w, work.x.base())?;
         self.moe(layer, n)?;
-        self.check("ffn_out", layer, work.out, n, w)?;
-        self.gpu.add(work.out.base(), (n * w) as u64, work.stream.base())?;
+        if self.settings.part.is_whole() {
+            self.check("ffn_out", layer, work.out, n, w)?;
+            self.gpu.add(work.out.base(), (n * w) as u64, work.stream.base())?;
+        } else {
+            self.gpu.link_sum(work.out.base(), (n * w) as u64, work.stream.base(), true)?;
+        }
         self.check("l_out", layer, work.stream, n, w)
     }
 
@@ -721,8 +807,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if let Some(resident) = &mut self.resident {
             let index = layer - self.settings.layers.start;
             let table = resident.table.slice((index * hp.experts * 8) as u64, (hp.experts * 8) as u64);
-            // (a decode step's graph counts its routes as it runs)
-            if !resident.recording {
+            // (a decode step's graph counts its routes as it runs; a split model's first part counts
+            // them for all)
+            if !resident.recording && self.settings.part.index == 0 {
                 resident.routes += (n * k) as u64;
             }
             let slot_bytes = resident.slot_bytes[index];
@@ -866,6 +953,65 @@ impl<T: Tensors> Engine<'_, T> {
         self.cpu_routes += cpu.len() as u64;
         self.gpu.write_buffer(&work.cpu_out, 0, &out)?;
         self.gpu.add(work.cpu_out.base(), w as u64, work.out.base())
+    }
+}
+
+/// Join the engines of a split model's two parts (their linked sums of up to `rows` rows).
+pub fn link<T: Tensors>(engines: &mut [Engine<'_, T>], rows: usize) -> Result<()> {
+    let [first, second] = engines else { return Err("a qwen35moe model splits across two GPUs".into()) };
+    if (first.settings.part.index, second.settings.part.index) != (0, 1) || first.settings.part.count != 2 {
+        return Err("qwen35moe parts link in order".into());
+    }
+    let capacity = (rows * first.global.width) as u64;
+    Backend::link_sums(&mut first.gpu, &mut second.gpu, capacity)
+}
+
+/// Forget a split model's sequence and start its linked sums over (after a failed pass too).
+pub fn reset_parts<T: Tensors>(engines: &mut [Engine<'_, T>]) -> Result<()> {
+    if let Some(first) = engines.first_mut() {
+        first.gpu.link_reset()?;
+    }
+    engines.iter_mut().try_for_each(Engine::reset)
+}
+
+/// One pass over the engines of a split model's parts (each on its own device, every layer), the
+/// parts meeting on the devices at each sum; the logits after the last token, the parts' vocabulary
+/// rows joined in order (so ties go to the lowest id, as on one GPU). A decode step queues each
+/// part's graph; a longer pass queues the parts' work a sum at a time, in turn, so that no device
+/// waits on a sum the other has not been given (a queueing call may wait for its device). Every
+/// device is waited for, even after an error.
+pub fn forward_parts<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
+    let n = tokens.len();
+    let queued = (|| -> Result<()> {
+        for engine in engines.iter_mut() {
+            engine.begin(tokens)?;
+        }
+        if engines.iter().all(|engine| engine.graphed(n)) {
+            return engines.iter_mut().try_for_each(Engine::decode_graph);
+        }
+        let layers = engines.first().map_or(0..0, |engine| engine.settings.layers.clone());
+        for layer in layers {
+            for engine in engines.iter_mut() {
+                engine.mix(layer, n)?;
+            }
+            for engine in engines.iter_mut() {
+                engine.feed_forward(layer, n)?;
+            }
+        }
+        engines.iter_mut().try_for_each(|engine| engine.head(n))
+    })();
+    let mut logits = Vec::new();
+    let mut failed = queued.err();
+    for engine in engines.iter_mut() {
+        match engine.collect(n) {
+            Ok(Some(part)) => logits.extend(part),
+            Ok(None) => failed = failed.or(Some("a qwen35moe part without the head".into())),
+            Err(error) => failed = failed.or(Some(error)),
+        }
+    }
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(logits),
     }
 }
 

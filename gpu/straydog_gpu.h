@@ -144,8 +144,8 @@ typedef struct sd_expert_split {
 } sd_expert_split;
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride, const sd_expert_split* split);
 /* Experts by table, for experts that stay in their slots: sd_expert_table writes count slot
-   addresses (each slot_bytes, 256-byte aligned, inside this device's allocations; checked) into
-   the device array table. sd_op_experts_table runs as sd_op_experts does without split, route r
+   addresses (each slot_bytes, 256-byte aligned, inside this device's allocations, or 0: an expert
+   another device runs; checked) into the device array table. sd_op_experts_table runs as sd_op_experts does without split, route r
    taking the slot table[ids[r]] (ids on the device, as sd_op_route leaves them; an id outside the
    table runs nothing), so no host data goes with it and a graph may record it. */
 int sd_expert_table(void* handle, uint64_t* table, const uint64_t* bases, uint64_t count, uint64_t slot_bytes);
@@ -188,6 +188,17 @@ int sd_op_split(void* handle, const float* x, uint64_t rows, uint64_t width, flo
 int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies);
 int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
+/* Tensor-parallel sums of two devices (gpu/device_link.hpp): sd_link_sums joins them (peer access
+   needed) with inboxes for parts of up to `capacity` floats; sd_op_link_sum queues out = this
+   device's part + the other's part of the same sum (count floats; out may be part; accumulate:
+   out += that sum), waiting on the device, so no host data goes with it and a graph may record
+   it; the two devices' results are equal. sd_link_failed (after the stream is idle): 1 when a wait
+   gave up (the sums since are void); sd_link_reset waits for both devices' streams and starts
+   their counts over. */
+int sd_link_sums(void* first, void* second, uint64_t capacity);
+int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, int accumulate);
+int sd_link_failed(void* handle);
+int sd_link_reset(void* handle);
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width);
 
 /* Layer operations */

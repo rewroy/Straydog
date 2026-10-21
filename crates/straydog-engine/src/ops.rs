@@ -360,6 +360,34 @@ impl Backend {
         })
     }
 
+    /// Join two devices for [`link_sum`](Self::link_sum), with inboxes of `capacity` floats.
+    pub fn link_sums(first: &mut Backend, second: &mut Backend, capacity: u64) -> Result<()> {
+        // SAFETY: two live handles.
+        check(unsafe { ffi::sd_link_sums(first.handle(), second.handle(), capacity) })
+    }
+
+    /// out = this device's part + the linked device's part of the same sum (`count` floats; out may
+    /// be the part; with `accumulate`, out += that sum), waiting on the device: a graph may record
+    /// it.
+    pub fn link_sum(&mut self, part: P, count: u64, out: M, accumulate: bool) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_link_sum(self.handle(), part.cast(), count, out.cast(), i32::from(accumulate)) })
+    }
+
+    /// Wait for both linked devices' streams and start their sums' counts over (after a failed pass).
+    pub fn link_reset(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_link_reset(self.handle()) })
+    }
+
+    /// Whether a linked sum's wait gave up (waits for the stream; the sums since are void).
+    pub fn link_failed(&mut self) -> Result<bool> {
+        // SAFETY: a live handle.
+        let state = unsafe { ffi::sd_link_failed(self.handle()) };
+        check(state.min(0))?;
+        Ok(state == 1)
+    }
+
     /// out += x (count values).
     pub fn add(&mut self, x: P, count: u64, out: M) -> Result<()> {
         // SAFETY: as above.

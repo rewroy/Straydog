@@ -338,6 +338,17 @@ private:
 
 struct KvMirror { float* data; size_t valid; };
 struct Device;
+// Two devices' tensor-parallel sums (device_link.hpp): this device's inbox (two slots of
+// `capacity` floats, alternating by sum) and state ([0] sums sent, [1] the flag the peer raises,
+// [2] nonzero after a wait gave up), both in its own VRAM, and the peer's as this device writes them.
+struct SumLink {
+    Device* peer = nullptr;
+    float* inbox = nullptr;
+    float* peer_inbox = nullptr;
+    uint32_t* state = nullptr;
+    uint32_t* peer_flag = nullptr;
+    size_t capacity = 0;
+};
 // This device's side of a two-GPU link: an inbox the peer writes rows
 // into, a flag the peer raises per message, and this device's message counters.
 struct PeerLink {
@@ -377,6 +388,7 @@ struct Device {
     // Expert-parallel help for the peer's batch, beside this device's own (resident_moe_parts).
     hipStream_t helper_stream = nullptr;
     PeerLink link;
+    SumLink sums;
     std::unordered_map<size_t, void*> helper_moe;   // layer -> this device's expert part, when it helps the owner
     uint8_t* io = nullptr;   // page-locked staging for caller-memory transfers (host_io.hpp)
     size_t io_used = 0;
@@ -2766,6 +2778,7 @@ int sd_expert_table(void* handle, uint64_t* table, const uint64_t* bases, uint64
     if (!bases || !count || count > (uint64_t(1) << 24) || !slot_bytes) throw std::runtime_error("invalid Straydog expert table");
     op_span(value, table, size_t(count) * 8, "an expert table");
     for (size_t index = 0; index < count; ++index) {
+        if (!bases[index]) continue;   // no expert here: another device runs it
         if (bases[index] % 256) throw std::runtime_error("an expert slot is not 256-byte aligned");
         op_span(value, reinterpret_cast<const void*>(bases[index]), size_t(slot_bytes), "an expert slot");
     }
@@ -2810,3 +2823,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 }
 } // extern C
 #include "token_mixing.hpp"
+#include "device_link.hpp"

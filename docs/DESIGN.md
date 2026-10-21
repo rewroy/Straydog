@@ -500,6 +500,22 @@ two. A prompt that extends such a checkpoint, while the held sequence matches it
 K/V rows below it are the checkpoint's), restores it and runs only the rest (`resumed_from`
 "turn" or "prior").
 
+Two GPUs that can each hold half of every layer with all of its experts (split mode experts,
+Qwen3.6) run it tensor parallel, so both read their weights at once instead of in turn: each GPU
+runs every layer with its half of the attention heads and KV heads, of the DeltaNet key heads
+(with the value heads that read them, h mod key heads), of the shared expert's rows, of the routed
+experts (a contiguous block of each layer's; the other's are empty entries of its expert table)
+and of the vocabulary (`arch/qwen35moe/part.rs`). Both keep the whole residual stream, the norms
+and the router, so they route alike. The out-projections, the shared expert's down and the routed
+experts give partial sums, added on the devices twice a layer (`sd_op_link_sum`,
+`gpu/device_link.hpp`): each GPU copies its part into the other's inbox, raises the other's flag
+to its count of sums and waits for its own; both add the same two values (addition commutes), so
+their streams stay equal. The counts live in device memory, so a decode step stays one recorded
+graph per GPU; a wait that outlasts the await timeout records a failure and lets the pass end,
+which then errors, and a reset starts both counts over. A longer pass is queued a sum at a time
+on each GPU in turn, so neither waits on a part the other was not given. The host joins the
+logits in vocabulary order. Ornith, which needs the host tier, stays split by layers.
+
 Where its experts go depends on what the GPUs hold:
 - **All of a GPU's experts fit in its VRAM** (Qwen3.6 on two GPUs): they are read in at
   placement into slots sized per size class and kept for good. A pass looks each route's slot

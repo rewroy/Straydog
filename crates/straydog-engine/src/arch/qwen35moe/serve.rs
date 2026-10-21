@@ -1,10 +1,13 @@
 //! Qwen3.5 MoE served (docs/DESIGN.md §10): the authenticated GGUF ([`Pinned`]) placed on the
-//! GPUs, one engine per GPU over a range of layers balancing the dense bytes; each GPU's VRAM left
-//! after its dense weights, the sequence state (DeltaNet states, K/V) and the work buffers given to
-//! its layers' experts: all of them for good when they fit (resident: taken by table, a decode step
-//! one recorded graph), else expert slots, with the host memory planned for the experts' host tier
-//! behind them (a decode step's routes to experts in the host tier then run on the CPU). Requests
-//! then run in a
+//! GPUs. Two GPUs that can each hold half of every layer with all of its experts (split mode
+//! experts) run as tensor parallel: an engine per GPU over every layer, each with its part of the
+//! heads, the shared expert, the routed experts and the vocabulary ([`super::part`]), the two
+//! adding their partial sums on the devices. Otherwise one engine per GPU over a range of layers
+//! balancing the dense bytes; each GPU's VRAM left after its dense weights, the sequence state
+//! (DeltaNet states, K/V) and the work buffers given to its layers' experts: all of them for good
+//! when they fit (resident: taken by table, a decode step one recorded graph), else expert slots,
+//! with the host memory planned for the experts' host tier behind them (a decode step's routes to
+//! experts in the host tier then run on the CPU). Requests then run in a
 //! [`Session`]; a reply ends at any of the official generation config's end tokens. The DeltaNets'
 //! state is checkpointed where each reply's generation prompt begins ([`CHECKPOINTS`] copies), so
 //! a next turn resumes there when the template renders the reply otherwise than it ran.
@@ -15,11 +18,13 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{self, forward_split, Engine, Settings as EngineSettings};
+use super::engine::{self, forward_parts, forward_split, link, reset_parts, Engine, Settings as EngineSettings};
+use super::part::Part;
 use super::{Hparams, Mixer};
 use crate::arch::served::{self, Placed, Session, Settings, RESERVE, SCRATCH};
 use crate::bundle;
 use crate::experts::Contents;
+use crate::group::SplitMode;
 use crate::gpu::{Backend, CpuExperts};
 use crate::pinned::Pinned;
 
@@ -31,19 +36,25 @@ pub const CHECKPOINTS: usize = 2;
 /// The CPU expert engine's threads.
 const CPU_THREADS: u32 = 6;
 
-/// The engines of consecutive layer ranges, one per device.
+/// The engines, one per device: of consecutive layer ranges, or (tensor parallel) the parts of
+/// every layer.
 pub struct Engines {
     engines: Vec<Engine<'static, Pinned>>,
+    parts: bool,
 }
 
 impl served::Engines for Engines {
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
-        forward_split(&mut self.engines, tokens)
+        if self.parts { forward_parts(&mut self.engines, tokens) } else { forward_split(&mut self.engines, tokens) }
     }
 
     fn reset(&mut self) {
+        // A device that cannot be written to fails the next pass, which reports it.
+        if self.parts {
+            let _ = reset_parts(&mut self.engines);
+            return;
+        }
         for engine in &mut self.engines {
-            // A device that cannot be written to fails the next pass, which reports it.
             let _ = engine.reset();
         }
     }
@@ -104,6 +115,16 @@ impl served::Engines for Engines {
     }
 }
 
+/// A layer's sequence state: a DeltaNet's convolution history and recurrent state (with its
+/// checkpoints' copies), an attention layer's K/V over the context.
+fn layer_state_bytes(hp: &Hparams, context: usize, layer: usize) -> u64 {
+    let bytes = match hp.mixers[layer] {
+        Mixer::DeltaNet => ((hp.conv_kernel - 1) * hp.conv_channels() + hp.v_heads * hp.state_dim * hp.state_dim) * 4 * (1 + CHECKPOINTS),
+        Mixer::Attention => context * hp.kv_heads * hp.head_dim * 2 * 4,
+    };
+    bytes as u64
+}
+
 fn layer_of(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
@@ -149,25 +170,46 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     }
     let cuts: Vec<usize> = (1..layers).collect();
     let load = |range: std::ops::Range<usize>| dense[range.clone()].iter().sum::<u64>() + if range.end == layers { head } else { 0 };
-    let parts = served::split_layers(layers, &cuts, &load, settings.devices.len())
-        .ok_or_else(|| format!("the model cannot be split across {} GPUs", settings.devices.len()))?;
+    // Tensor parallel: half of every layer and of its experts on each of two GPUs, when it fits.
+    let mut tensor_batch = settings.batch;
+    let tensor = settings.split_mode == SplitMode::Experts && settings.devices.len() == 2 && Part::fits(&hp, 2).is_ok() && {
+        let first = Part { index: 0, count: 2 };
+        // A part's dense bytes: half of each tensor it slices (heads, rows and vocabulary split
+        // evenly), the others whole.
+        let dense_part: u64 = files.tensor_bytes().filter(|(name, _)| !name.ends_with("_exps.weight")).filter_map(|(name, bytes)| {
+            let layer = layer_of(name);
+            match layer {
+                Some(layer) if layer >= layers => None,
+                None if !name.starts_with("output") => None,
+                _ => {
+                    let role = name.split('.').nth(if layer.is_some() { 2 } else { 0 }).unwrap_or("");
+                    Some(if first.slice(&hp, layer, role).is_some() { bytes / 2 } else { bytes })
+                }
+            }
+        }).sum();
+        let local = first.hparams(&hp);
+        let state_part: u64 = (0..layers).map(|layer| layer_state_bytes(&local, settings.context, layer)).sum();
+        let experts_part = Engine::<Pinned>::resident_bytes(&hp, &files, 0..layers, first)?;
+        // A pass's rows as below, each a part's work buffers and its linked sums' two inbox slots.
+        let row_bytes = engine::batch_row_bytes(&local) + 2 * hp.width as u64 * 4;
+        let fixed = dense_part + state_part + experts_part + SCRATCH + RESERVE;
+        let room = settings.vram_bytes.saturating_sub(fixed);
+        let fits = ((settings.vram_bytes / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
+        tensor_batch = settings.batch.min(fits.max(64));
+        fixed + tensor_batch as u64 * row_bytes <= settings.vram_bytes
+    };
+    let parts = if tensor {
+        vec![0..layers; 2]
+    } else {
+        served::split_layers(layers, &cuts, &load, settings.devices.len())
+            .ok_or_else(|| format!("the model cannot be split across {} GPUs", settings.devices.len()))?
+    };
     // The largest of a part's layers' experts: the store takes VRAM as so many of these.
     let slot_bytes = |range: &std::ops::Range<usize>| {
         range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1).next_multiple_of(256)
     };
-    // The sequence state of a part's layers: each DeltaNet's convolution history and recurrent
-    // state (with its checkpoints' copies), each attention layer's K/V over the context.
-    let state = |range: &std::ops::Range<usize>| -> u64 {
-        range.clone().map(|layer| {
-            let bytes = match hp.mixers[layer] {
-                Mixer::DeltaNet => {
-                    ((hp.conv_kernel - 1) * hp.conv_channels() + hp.v_heads * hp.state_dim * hp.state_dim) * 4 * (1 + CHECKPOINTS)
-                }
-                Mixer::Attention => settings.context * hp.kv_heads * hp.head_dim * 2 * 4,
-            };
-            bytes as u64
-        }).sum()
-    };
+    // The sequence state of a part's layers.
+    let state = |range: &std::ops::Range<usize>| -> u64 { range.clone().map(|layer| layer_state_bytes(&hp, settings.context, layer)).sum() };
     // A prefill pass reads each routed expert its rows need once: the longer the pass, the fewer
     // reads (with 64 rows, a 4K-token prompt read nearly every expert 64 times). Its rows' work
     // buffers take at most an eighth of each GPU's budget and a quarter of what the GPU with the
@@ -176,19 +218,27 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let base = |range: &std::ops::Range<usize>| load(range.clone()) + state(range) + SCRATCH + RESERVE;
     let room = parts.iter().map(|range| settings.vram_bytes.saturating_sub(base(range))).min().unwrap_or(0);
     let fits = ((settings.vram_bytes / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
-    let batch = settings.batch.min(fits.max(64));
+    let batch = if tensor { tensor_batch } else { settings.batch.min(fits.max(64)) };
     let total_experts: u64 = expert_bytes.iter().sum();
     let (mut slots, mut resident) = (Vec::new(), Vec::new());
-    for range in &parts {
+    for range in parts.iter().filter(|_| !tensor) {
         let fixed = base(range) + batch as u64 * row_bytes;
         let free = settings.vram_bytes.checked_sub(fixed).ok_or_else(|| {
             format!("layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64)
         })?;
         // A GPU with room for every expert of its layers keeps them all.
-        resident.push(Engine::<Pinned>::resident_bytes(&hp, &files, range.clone())? <= free);
+        resident.push(Engine::<Pinned>::resident_bytes(&hp, &files, range.clone(), Part::WHOLE)? <= free);
         slots.push(((free / slot_bytes(range)) as usize).min(range.len() * hp.experts));
     }
-    let part_experts: Vec<u64> = parts.iter().map(|range| expert_bytes[range.clone()].iter().sum()).collect();
+    if tensor {
+        slots = vec![0; 2];
+        resident = vec![true; 2];
+    }
+    // (tensor parallel: each part holds half of every layer's experts)
+    let part_experts: Vec<u64> = parts.iter().map(|range| {
+        let bytes: u64 = expert_bytes[range.clone()].iter().sum();
+        if tensor { bytes / 2 } else { bytes }
+    }).collect();
     let in_vram: u64 = parts.iter().enumerate()
         .map(|(part, range)| if resident[part] { part_experts[part] } else { slots[part] as u64 * slot_bytes(range) }).sum();
     let host = served::host_tier(settings, total_experts.saturating_sub(in_vram));
@@ -202,7 +252,12 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let whole_bytes = files.whole_bytes(|name| layer_of(name).is_none_or(|layer| layer < layers));
     let files: &'static Pinned = Box::leak(Box::new(files));
     let placed = Instant::now();
-    let state_bytes = parts.iter().map(state).sum();
+    let state_bytes = if tensor {
+        let local = Part { index: 0, count: 2 }.hparams(&hp);
+        2 * (0..layers).map(|layer| layer_state_bytes(&local, settings.context, layer)).sum::<u64>()
+    } else {
+        parts.iter().map(state).sum()
+    };
     let loading = std::sync::atomic::AtomicBool::new(true);
     let mut engines = std::thread::scope(|scope| {
         // The dense weights verify as the engines take them: their bytes are the progress.
@@ -224,8 +279,12 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     layers: range.clone(),
                     checkpoints: CHECKPOINTS,
                     resident: resident[part],
+                    part: if tensor { Part { index: part, count: 2 } } else { Part::WHOLE },
                 };
                 engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes, engine_settings)?);
+            }
+            if tensor {
+                link(&mut engines, batch)?;
             }
             Ok::<_, String>(())
         })();
@@ -241,11 +300,18 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         }
     }
     let place_seconds = placed.elapsed().as_secs_f64();
+    // Tensor parallel reads as one range of layers over both GPUs.
+    let (layer_ranges, devices, expert_slots): (Vec<[usize; 2]>, Vec<Vec<usize>>, Vec<usize>) = if tensor {
+        (vec![[0, layers]], vec![settings.devices.clone()], vec![engines.iter().map(|engine| engine.expert_capacity().0).sum()])
+    } else {
+        (parts.iter().map(|range| [range.start, range.end]).collect(), settings.devices.iter().take(parts.len()).map(|&device| vec![device]).collect(),
+         engines.iter().map(|engine| engine.expert_capacity().0).collect())
+    };
     let placement = json!({
-        "split_mode": "layer",
-        "layers": parts.iter().map(|range| [range.start, range.end]).collect::<Vec<_>>(),
-        "devices": settings.devices.iter().take(parts.len()).map(|&device| vec![device]).collect::<Vec<_>>(),
-        "expert_slots": engines.iter().map(|engine| engine.expert_capacity().0).collect::<Vec<_>>(),
+        "split_mode": if tensor { "tensor" } else { "layer" },
+        "layers": layer_ranges,
+        "devices": devices,
+        "expert_slots": expert_slots,
         "host_expert_slots": engines.iter().map(|engine| engine.expert_capacity().1).collect::<Vec<_>>(),
         "expert_vram_bytes": parts.iter().enumerate()
             .map(|(part, range)| if resident[part] { part_experts[part] } else { slots[part] as u64 * slot_bytes(range) }).collect::<Vec<_>>(),
@@ -256,7 +322,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "prefill_batch_size": batch,
     });
     Ok(Session::new(Placed {
-        engines: Engines { engines },
+        engines: Engines { engines, parts: tensor },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch, end, turn_start,
         card,
         placement, state_bytes,
