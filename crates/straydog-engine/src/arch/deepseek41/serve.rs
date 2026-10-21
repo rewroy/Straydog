@@ -47,6 +47,9 @@ pub struct Settings {
     pub row_cache_bytes: u64,
 }
 
+/// Experts still to warm up with, as (layer, expert).
+type Pending = std::collections::VecDeque<(usize, usize)>;
+
 pub struct Model {
     files: &'static Pinned,
     engines: Vec<Engine<'static, Pinned>>,
@@ -63,6 +66,9 @@ pub struct Model {
     pub state_bytes: u64,
     pub load_seconds: Vec<(&'static str, f64)>,
     pub last_metrics: Map<String, Value>,
+    /// An earlier run's experts still to warm up with: (VRAM, host tier), least recently used
+    /// first, taken from the front.
+    warming: (Pending, Pending),
 }
 
 /// Layer ranges, one per device, splitting where no layer reads an earlier part's compressed rows
@@ -243,6 +249,7 @@ impl Model {
         Ok(Model {
             files, engines, hp, context: settings.context, batch: settings.batch, history: Vec::new(), end, card, placement,
             state_bytes, load_seconds: vec![("open", open_seconds), ("place", place_seconds)], last_metrics: Map::new(),
+            warming: Default::default(),
         })
     }
 
@@ -365,6 +372,65 @@ impl Model {
         .unwrap()
         .clone();
         Ok(())
+    }
+
+    /// What a later start warms up with: the experts the engines hold, least recently used first,
+    /// in VRAM (`vram`) and only in the host tier (`host`), as [layer, expert] pairs.
+    pub fn warm_state(&self) -> Value {
+        let (mut vram, mut host) = (Vec::new(), Vec::new());
+        for engine in &self.engines {
+            let (in_vram, in_host) = engine.expert_contents();
+            vram.extend(in_vram);
+            host.extend(in_host);
+        }
+        json!({"vram": vram, "host": host})
+    }
+
+    /// Warm up with an earlier run's [`warm_state`](Self::warm_state), step by step
+    /// ([`warm_step`](Self::warm_step)) while no request runs. Pairs outside the model are dropped.
+    pub fn warm(&mut self, state: &Value) -> Result<usize, String> {
+        let (layers, experts) = (self.hp.layers.len(), self.hp.experts);
+        let pairs = |key: &str| -> Result<Pending, String> {
+            let list = state.get(key).and_then(Value::as_array).ok_or("a Straydog warm-up state without its lists")?;
+            Ok(list.iter()
+                .filter_map(|pair| Some((pair.get(0)?.as_u64()? as usize, pair.get(1)?.as_u64()? as usize)))
+                .filter(|&(layer, expert)| layer < layers && expert < experts)
+                .collect())
+        };
+        self.warming = (pairs("vram")?, pairs("host")?);
+        Ok(self.warming.0.len() + self.warming.1.len())
+    }
+
+    /// Take the warm-up's reads that landed and, while fewer than `in_flight` are on their way
+    /// (each device's read of an expert counts), start up to `count` more (VRAM's first, the
+    /// experts a request is likeliest to use, then the host tier's; each least recently used
+    /// first, so the most recent end up the most recent), without waiting: a request that comes
+    /// meanwhile finds the drive and the bus nearly free. Whether the warm-up is over.
+    pub fn warm_step(&mut self, count: usize, in_flight: usize) -> Result<bool, String> {
+        let mut reading = 0;
+        for engine in &mut self.engines {
+            reading += engine.poll_experts()?;
+        }
+        let left = self.warming.0.len() + self.warming.1.len();
+        if left == 0 || reading >= in_flight {
+            return Ok(left == 0 && reading == 0);
+        }
+        let take = |list: &mut Pending, count: usize| -> Vec<(usize, usize)> {
+            let count = count.min(list.len());
+            list.drain(..count).collect()
+        };
+        let count = count.min((in_flight - reading).div_ceil(self.devices_per_expert()));
+        let vram = take(&mut self.warming.0, count);
+        let host = take(&mut self.warming.1, count - vram.len());
+        for engine in &mut self.engines {
+            engine.warm_experts(&vram, &host)?;
+        }
+        Ok(false)
+    }
+
+    /// The devices that each read part of an expert (an engine's: one per layer range, or all).
+    fn devices_per_expert(&self) -> usize {
+        self.placement["devices"].as_array().and_then(|engines| engines.first()).and_then(Value::as_array).map_or(1, Vec::len).max(1)
     }
 
     /// Wait for the expert store's reads and copies (before the process ends).

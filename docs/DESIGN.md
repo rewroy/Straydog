@@ -445,3 +445,10 @@ Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the off
 tokenizer's ids; the template renders the reference encoder's prompts), replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A
 prompt that extends the held sequence continues it; there are no checkpoints yet.
+
+A start does not begin cold: the runtime asks the worker for the experts its stores hold (least
+recently used first, in VRAM and in the host tier) every two minutes after requests and at
+shutdown, and keeps them in the data directory (`<data-dir>/warm/<quant>-<key>.json`, the key
+hashing the pinned shards and the placement, written by the runtime: the worker has no write
+access). After the next start with the same model and placement is ready, the worker reads those
+experts back while no request runs, a few reads at a time behind any pass's.

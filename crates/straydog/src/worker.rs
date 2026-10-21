@@ -111,6 +111,16 @@ pub(crate) trait Served: Send {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure>;
     fn reset(&mut self) -> Result<(), String>;
+
+    /// What a later start warms up with (the expert store's contents), or null.
+    fn warm_state(&mut self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+
+    /// Warm up with an earlier run's state, in the background, never ahead of a request.
+    fn warm(&mut self, _state: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl Served for Engine {
@@ -243,6 +253,23 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                                                     "fatal": false})),
                 }
             }
+            Some("warm_state") => {
+                if active.lock().unwrap().is_some() {
+                    output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
+                    continue;
+                }
+                match engine.lock().unwrap().warm_state() {
+                    Ok(state) => output.send(&json!({"id": id, "event": "warm_state", "state": state})),
+                    Err(message) => output.send(&json!({"id": id, "event": "error", "message": message, "fatal": false})),
+                }
+            }
+            Some("warm") => {
+                let state = request.get("state").and_then(|state| serde_json::from_str(&pyjson::dumps(state)).ok())
+                    .unwrap_or(Value::Null);
+                if let Err(message) = engine.lock().unwrap().warm(&state) {
+                    eprintln!("Straydog could not warm up: {message}");
+                }
+            }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
                 let mut current = active.lock().unwrap();
                 if current.is_some() {
@@ -295,7 +322,7 @@ fn generate<S: Served>(engine: &Mutex<S>, text: &Arc<Text>, output: &Output, id:
             let mut fatal = failure.fatal;
             // A failed device (an illegal memory access) cannot be reset; the request still ends.
             if let Err(exc) = engine.reset() {
-                tracing::error!("Straydog could not reset after a failed generation: {exc}");
+                eprintln!("Straydog could not reset after a failed generation: {exc}");
                 fatal = true;
             }
             json!({"id": id, "event": "error", "message": failure.message.chars().take(500).collect::<String>(),

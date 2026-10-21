@@ -269,6 +269,10 @@ impl Pinner {
 
 type Key = (u32, u32);
 
+/// A store's experts as (layer, expert), least recently used first: those in VRAM slots, and
+/// those only in the host tier (see [`DeviceExperts::contents`]).
+pub type Contents = (Vec<(usize, usize)>, Vec<(usize, usize)>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Content {
     /// Drive reads in flight: this many chunks still to come.
@@ -1030,6 +1034,51 @@ impl DeviceExperts {
         }
         self.settled = true;
         Ok(())
+    }
+
+    /// The experts held, least recently used first: those in VRAM slots, and those only in the
+    /// host tier (read, or written back). A later run warms up with them ([`warm`](Self::warm)).
+    pub fn contents(&self) -> Contents {
+        let mut vram: Vec<(u64, Key)> = self.classes.iter().flat_map(|class| class.lru.iter())
+            .filter_map(|&(used, slot)| self.slots[slot].key.map(|key| (used, key)))
+            .collect();
+        let mut host: Vec<(u64, Key)> = self.classes.iter().flat_map(|class| class.host_lru.iter())
+            .filter_map(|&(used, slot)| self.host[slot].key.filter(|key| !self.map.contains_key(key)).map(|key| (used, key)))
+            .collect();
+        vram.sort_unstable();
+        host.sort_unstable();
+        let keys = |list: Vec<(u64, Key)>| list.into_iter().map(|(_, (layer, expert))| (layer as usize, expert as usize)).collect();
+        (keys(vram), keys(host))
+    }
+
+    /// Warm up with experts an earlier run held ([`contents`](Self::contents)), least recently
+    /// used first: `host` read into the host tier (when there is one), `vram` brought into VRAM
+    /// slots as prefetches (a pass's fills go first, and a pass skips its layer's reads not yet
+    /// started). The reads queue behind every pass's. Experts of layers this store does not hold
+    /// are skipped. Returns the reads still in flight.
+    pub fn warm(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+        self.settled = false;
+        for &(layer, expert) in host {
+            let Some(class) = self.class_of.get(layer).copied().flatten() else { continue };
+            let key = (layer as u32, expert as u32);
+            if self.classes[class].host_capacity == 0 || self.map.contains_key(&key) || self.host_map.contains_key(&key) {
+                continue;
+            }
+            self.read(gpu, key, false)?;
+        }
+        for &(layer, expert) in vram {
+            if self.class_of.get(layer).copied().flatten().is_some() {
+                self.prefetch(gpu, layer, &[expert], true)?;
+            }
+        }
+        self.poll(gpu)
+    }
+
+    /// Take the reads that have landed (uploading those a fill waits for), without waiting;
+    /// the reads still in flight.
+    pub fn poll(&mut self, gpu: &mut Backend) -> Result<usize> {
+        self.pump(gpu, false)?;
+        Ok(self.reading)
     }
 }
 

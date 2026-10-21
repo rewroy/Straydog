@@ -408,6 +408,7 @@ impl Runtime {
             timeout: Duration::from_secs_f64(settings.startup_timeout),
             expected: (settings.ctx_size as u64, settings.quant.clone()),
             verbose: settings.verbose,
+            warm_directory: Some(settings.data_dir.join("warm")),
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
@@ -451,7 +452,14 @@ struct Driver {
     timeout: Duration,
     expected: (u64, String),
     verbose: bool,
+    /// Where the expert store's contents are kept between runs (`<data-dir>/warm`), if anywhere.
+    warm_directory: Option<PathBuf>,
 }
+
+/// How often a changed warm-up state is saved while the server runs.
+const WARM_SAVE: Duration = Duration::from_secs(120);
+/// The largest warm-up state read back.
+const WARM_BYTES: u64 = 8 << 20;
 
 impl Driver {
     fn set(&self, phase: Phase) {
@@ -471,7 +479,11 @@ impl Driver {
         };
         match launched {
             Ok(mut process) => {
-                self.serve(&mut process, &mut jobs, &mut controls).await;
+                self.restore_warm_state(&mut process).await;
+                let changed = self.serve(&mut process, &mut jobs, &mut controls).await;
+                if changed {
+                    self.save_warm_state(&mut process).await;
+                }
                 let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
                                           ("command", pyjson::Value::Str("shutdown".into()))]);
                 let _ = process.send(&shutdown).await;
@@ -497,17 +509,28 @@ impl Driver {
     }
 
     /// Run queued generations until the runtime closes or the worker fails.
+    /// Serve generations until the runtime closes or the worker fails; whether the warm-up state
+    /// changed since it was last saved (it is saved meanwhile every [`WARM_SAVE`] it changed).
     async fn serve(&self, process: &mut Process, jobs: &mut mpsc::UnboundedReceiver<Job>,
-                   controls: &mut mpsc::UnboundedReceiver<Control>) {
+                   controls: &mut mpsc::UnboundedReceiver<Control>) -> bool {
+        let mut changed = false;
+        let mut save = tokio::time::interval(WARM_SAVE);
+        save.tick().await;
         loop {
             let job = tokio::select! {
-                job = jobs.recv() => match job { Some(job) => job, None => return },
+                job = jobs.recv() => match job { Some(job) => job, None => return changed },
                 status = process.child.wait() => {
                     let status = status.map_or_else(|exc| exc.to_string(), |status| status.to_string());
                     self.fail(format!("Straydog's worker exited ({status}); restart the server"));
-                    return;
+                    return false;
+                }
+                _ = save.tick(), if changed => {
+                    self.save_warm_state(process).await;
+                    changed = false;
+                    continue;
                 }
             };
+            changed = true;
             let skipped = self.shared.cancelled.lock().unwrap().remove(&job.id);
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
             self.shared.activity.lock().unwrap().live = None;
@@ -517,9 +540,86 @@ impl Driver {
                 self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
                 self.fail(message);
                 process.end(Duration::from_secs(5)).await;
-                return;
+                return false;
             }
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The file an engine placed as `ready` says keeps its warm-up state: one per model and
+    /// placement (a state is a list of the experts a store held, only meaningful for the same).
+    fn warm_path(&self, ready: &Value) -> Option<PathBuf> {
+        use sha2::Digest;
+        let directory = self.warm_directory.as_ref()?;
+        let quant = &self.expected.1;
+        let mut key = sha2::Sha256::new();
+        key.update(b"straydog warm-up state 1\n");
+        for shard in straydog_engine::bundle::shards(quant).ok()? {
+            key.update(shard.sha256.as_bytes());
+        }
+        key.update(serde_json::to_vec(&ready["placement"]).ok()?);
+        let key: String = key.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
+        Some(directory.join(format!("{quant}-{key}.json")))
+    }
+
+    fn ready_frame(&self) -> Option<Value> {
+        match &*self.shared.phase.lock().unwrap() {
+            Phase::Ready(ready) => Some(ready.clone()),
+            _ => None,
+        }
+    }
+
+    /// Hand the worker the state an earlier run saved for this model and placement: it warms up
+    /// with it in the background, never ahead of a request.
+    async fn restore_warm_state(&self, process: &mut Process) {
+        let Some(path) = self.ready_frame().and_then(|ready| self.warm_path(&ready)) else { return };
+        let state = std::fs::File::open(&path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, WARM_BYTES + 1), &mut bytes).ok()?;
+            (bytes.len() as u64 <= WARM_BYTES).then(|| std::str::from_utf8(&bytes).ok().and_then(|text| pyjson::parse(text).ok()))?
+        });
+        let Some(state) = state.and_then(|saved| saved.get("state").cloned()) else { return };
+        tracing::info!("Straydog warming up with {}", path.display());
+        let warm = frame(vec![("id", pyjson::Value::Str("warm".into())), ("command", pyjson::Value::Str("warm".into())),
+                              ("state", state)]);
+        if let Err(message) = process.send(&warm).await {
+            tracing::warn!("Straydog could not hand its worker the warm-up state: {message}");
+        }
+    }
+
+    /// Ask the worker for its warm-up state and keep it in the data directory (written whole,
+    /// then renamed), for the next start with this model and placement.
+    async fn save_warm_state(&self, process: &mut Process) {
+        let Some(path) = self.ready_frame().and_then(|ready| self.warm_path(&ready)) else { return };
+        let request = frame(vec![("id", pyjson::Value::Str("warm-state".into())),
+                                 ("command", pyjson::Value::Str("warm_state".into()))]);
+        let reply = async {
+            process.send(&request).await?;
+            tokio::time::timeout(Duration::from_secs(30), process.read()).await.map_err(|_| "no reply".to_string())?
+        }
+        .await;
+        let state = match reply {
+            Ok(reply) if reply["id"] == "warm-state" && reply["event"] == "warm_state" => reply["state"].clone(),
+            Ok(reply) => {
+                tracing::warn!("Straydog's worker gave no warm-up state ({})", reply["message"].as_str().unwrap_or("unexpected reply"));
+                return;
+            }
+            Err(message) => {
+                tracing::warn!("Straydog's worker gave no warm-up state ({message})");
+                return;
+            }
+        };
+        if state.is_null() {
+            return;
+        }
+        let saved = json!({"state": state, "saved": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |time| time.as_secs())});
+        let partial = path.with_extension("json.part");
+        let written = std::fs::create_dir_all(path.parent().unwrap())
+            .and_then(|()| std::fs::write(&partial, serde_json::to_vec(&saved).unwrap_or_default()))
+            .and_then(|()| std::fs::rename(&partial, &path));
+        match written {
+            Ok(()) => tracing::debug!("Straydog saved its warm-up state to {}", path.display()),
+            Err(error) => tracing::warn!("Straydog could not save its warm-up state to {}: {error}", path.display()),
         }
     }
 

@@ -28,7 +28,14 @@ enum Job {
     Run { body: pyjson::Value, id: String, output: Output, cancel: Arc<AtomicBool>, started: Instant, text: Arc<Text>,
           reply: mpsc::Sender<Result<Value, Failure>> },
     Reset(mpsc::Sender<Result<(), String>>),
+    WarmState(mpsc::Sender<Value>),
+    Warm(Value),
 }
+
+/// Warm-up experts started per step while the model is idle, and the reads (one per device of
+/// an expert) at most on their way: few, so that a request waits for little.
+const WARM_STEP: usize = 8;
+const WARM_IN_FLIGHT: usize = 8;
 
 /// The request loop's side: each request runs on the model's thread.
 struct Handle(mpsc::Sender<Job>);
@@ -48,6 +55,16 @@ impl Served for Handle {
         let (reply, result) = mpsc::channel();
         self.0.send(Job::Reset(reply)).map_err(|_| "the Straydog model thread has stopped".to_string())?;
         result.recv().map_err(|_| "the Straydog model thread has stopped".to_string())?
+    }
+
+    fn warm_state(&mut self) -> Result<Value, String> {
+        let (reply, result) = mpsc::channel();
+        self.0.send(Job::WarmState(reply)).map_err(|_| "the Straydog model thread has stopped".to_string())?;
+        result.recv().map_err(|_| "the Straydog model thread has stopped".to_string())
+    }
+
+    fn warm(&mut self, state: &Value) -> Result<(), String> {
+        self.0.send(Job::Warm(state.clone())).map_err(|_| "the Straydog model thread has stopped".to_string())
     }
 }
 
@@ -78,7 +95,33 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
                     return;
                 }
             };
-            for job in queue {
+            // Between requests, an earlier run's experts come back a few reads at a time.
+            let mut warming: Option<Instant> = None;
+            loop {
+                let job = match warming {
+                    Some(_) => match queue.recv_timeout(std::time::Duration::from_millis(2)) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            match deepseek.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    eprintln!("Straydog warmed up in {:.1} s", warming.unwrap().elapsed().as_secs_f64());
+                                    warming = None;
+                                }
+                                Err(error) => {
+                                    eprintln!("Straydog stopped warming up: {error}");
+                                    warming = None;
+                                }
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                    None => match queue.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                };
                 match job {
                     Job::Run { body, id, output, cancel, started, text, reply } => {
                         let _ = reply.send(deepseek.run(&text, &output, &id, &body, &cancel, started));
@@ -87,10 +130,20 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
                         deepseek.model.reset();
                         let _ = reply.send(Ok(()));
                     }
+                    Job::WarmState(reply) => {
+                        let _ = reply.send(deepseek.model.warm_state());
+                    }
+                    Job::Warm(state) => match deepseek.model.warm(&state) {
+                        Ok(count) => {
+                            eprintln!("Straydog warming up with {count} experts");
+                            warming = Some(Instant::now());
+                        }
+                        Err(error) => eprintln!("Straydog cannot warm up: {error}"),
+                    },
                 }
             }
             if let Err(error) = deepseek.model.settle() {
-                tracing::error!("Straydog could not settle the expert store: {error}");
+                eprintln!("Straydog could not settle the expert store: {error}");
             }
         });
         let (frame, text) = ready.recv().map_err(|_| "the Straydog model thread failed to start".to_string())??;

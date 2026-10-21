@@ -525,6 +525,36 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.first().map_or((0, 0), |shard| shard.experts.capacity())
     }
 
+    /// The experts the devices hold, least recently used first: in VRAM, and only in the host
+    /// tier (the first device's; each holds its rows of the same experts).
+    pub fn expert_contents(&self) -> crate::experts::Contents {
+        self.shards.first().map_or_else(Default::default, |shard| shard.experts.contents())
+    }
+
+    /// Warm the expert stores up with an earlier run's contents of this engine's layers (see
+    /// `DeviceExperts::warm`), each device its rows; the reads still in flight.
+    pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+        let layers = self.settings.layers.clone();
+        let mine = |keys: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            keys.iter().copied().filter(|&(layer, expert)| layers.contains(&layer) && expert < self.hp.experts).collect()
+        };
+        let (vram, host) = (mine(vram), mine(host));
+        let mut reading = 0;
+        for shard in &mut self.shards {
+            reading += shard.experts.warm(&mut shard.gpu, &vram, &host)?;
+        }
+        Ok(reading)
+    }
+
+    /// Take the expert reads that have landed, without waiting; those still in flight.
+    pub fn poll_experts(&mut self) -> Result<usize> {
+        let mut reading = 0;
+        for shard in &mut self.shards {
+            reading += shard.experts.poll(&mut shard.gpu)?;
+        }
+        Ok(reading)
+    }
+
     /// The expert stores' counters, summed over the devices.
     pub fn cache_counts(&self) -> Counts {
         self.shards.iter().map(|shard| shard.experts.counts()).fold(Counts::default(), |sum, counts| sum + counts)
