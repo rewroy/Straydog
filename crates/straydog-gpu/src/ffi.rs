@@ -1418,6 +1418,35 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_exchange(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_exchange_supported(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_export(
+        handle: *mut ::std::os::raw::c_void,
+        sources: *const *const f32,
+        counts: *const u64,
+        parts: u64,
+        exchange: *mut ::std::os::raw::c_void,
+        offset: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_await_add(
+        handle: *mut ::std::os::raw::c_void,
+        exchange: *mut ::std::os::raw::c_void,
+        result_offset: u64,
+        a: *const f32,
+        out: *mut f32,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_expert_rows(
         handle: *mut ::std::os::raw::c_void,
         banks: *const *mut ::std::os::raw::c_void,

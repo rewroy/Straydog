@@ -468,6 +468,9 @@ pub struct DeviceExperts {
     reading: usize,
     counts: Counts,
     settled: bool,
+    /// Changes to which experts VRAM slots hold and which of them are ready (see
+    /// [`vram_generation`](Self::vram_generation)).
+    vram_changes: u64,
 }
 
 impl DeviceExperts {
@@ -559,7 +562,7 @@ impl DeviceExperts {
         Ok(DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
-            counts: Counts::default(), settled: false,
+            counts: Counts::default(), settled: false, vram_changes: 0,
         })
     }
 
@@ -840,6 +843,7 @@ impl DeviceExperts {
     fn empty_slot(&mut self, slot: usize) -> Option<Key> {
         let entry = &mut self.slots[slot];
         let key = entry.key.take()?;
+        self.vram_changes += 1;
         entry.speculative = false;
         let class = &mut self.classes[entry.class];
         class.lru.remove(&(entry.used, slot));
@@ -852,6 +856,7 @@ impl DeviceExperts {
     fn fill(&mut self, gpu: &mut Backend, key: Key, urgent: bool) -> Result<usize> {
         let class = self.class_of.get(key.0 as usize).copied().flatten().ok_or_else(|| format!("layer {} has no routed experts", key.0))?;
         let slot = self.free_slot(gpu, class)?;
+        self.vram_changes += 1;
         self.map.insert(key, slot);
         self.slots[slot].key = Some(key);
         self.classes[class].lru.insert((self.slots[slot].used, slot));
@@ -915,6 +920,7 @@ impl DeviceExperts {
         }
         let mark = gpu.mark(stream)?;
         self.slots[slot].ready = Some((stream, mark));
+        self.vram_changes += 1;
         self.slots[slot].waiting = None;
         let entry = &mut self.host[host];
         entry.busy = Some(mark);
@@ -1271,6 +1277,168 @@ impl DeviceExperts {
     pub fn poll(&mut self, gpu: &mut Backend) -> Result<usize> {
         self.pump(gpu, false)?;
         Ok(self.reading)
+    }
+}
+
+/// Where a decode step's route finds an expert the device does not run (see
+/// [`DeviceExperts::host_source`]).
+#[derive(Debug, Clone, Copy)]
+pub enum HostSource {
+    /// Each role's bytes in the host tier (gate, up, down), which stay put until the store next
+    /// fills, reads or evicts.
+    Ready([*const u8; 3]),
+    /// Its drive read into the host tier is in flight ([`DeviceExperts::wait_reads`] lands it).
+    Reading,
+    /// A VRAM slot holds it (or its fill is in flight): [`DeviceExperts::copy_out`] copies it out.
+    Vram,
+    /// Neither tier holds it: [`DeviceExperts::fetch_host`] reads it.
+    Absent,
+}
+
+/// For a decode step that takes VRAM experts by a device table of slot addresses and runs the
+/// others on the host CPU from the host tier: the table's view of the store, and moves between the
+/// tiers that keep it right.
+impl DeviceExperts {
+    /// Changes so far to which experts the VRAM slots hold and which of them are ready: a table
+    /// built from [`vram_ready`](Self::vram_ready) stays right while this stays the same, apart from
+    /// the caller's own [`demote`](Self::demote) and [`promote`](Self::promote).
+    pub fn vram_generation(&self) -> u64 {
+        self.vram_changes
+    }
+
+    /// The bytes of `layer`'s VRAM slots (its size class's).
+    pub fn slot_size(&self, layer: usize) -> Option<u64> {
+        self.class_of.get(layer).copied().flatten().map(|class| self.classes[class].vram_bytes)
+    }
+
+    /// Free VRAM slots of `layer`'s size class.
+    pub fn free_slots(&self, layer: usize) -> usize {
+        self.class_of.get(layer).copied().flatten().map_or(0, |class| self.classes[class].free.len())
+    }
+
+    /// Whether `layer` and `other` take slots of one size class.
+    pub fn same_class(&self, layer: usize, other: usize) -> bool {
+        let class = |layer: usize| self.class_of.get(layer).copied().flatten();
+        class(layer).is_some() && class(layer) == class(other)
+    }
+
+    /// The experts VRAM slots hold (or are being filled with), as (layer, expert).
+    pub fn vram_keys(&self) -> Vec<(usize, usize)> {
+        self.map.keys().map(|&(layer, expert)| (layer as usize, expert as usize)).collect()
+    }
+
+    /// The slot address of `layer`'s `expert` when a VRAM slot holds it and its upload has
+    /// completed (an op may read it without waiting), else None.
+    pub fn vram_ready(&mut self, gpu: &mut Backend, layer: usize, expert: usize) -> Result<Option<u64>> {
+        let Some(&slot) = self.map.get(&(layer as u32, expert as u32)) else { return Ok(None) };
+        if self.slots[slot].waiting.is_some() {
+            return Ok(None);
+        }
+        if let Some((_, mark)) = self.slots[slot].ready {
+            if !gpu.mark_done(mark, false)? {
+                return Ok(None);
+            }
+            self.slots[slot].ready = None;
+        }
+        Ok(Some(self.slot_buffer(slot).base() as u64))
+    }
+
+    /// Mark `layer`'s `expert` (in VRAM) just used, as an acquire would: passes that take slots
+    /// evict the least recently used.
+    pub fn touch_vram(&mut self, layer: usize, expert: usize) {
+        if let Some(&slot) = self.map.get(&(layer as u32, expert as u32)) {
+            self.touch(slot);
+        }
+    }
+
+    /// Where the host finds `layer`'s `expert` (touched as used when the host tier holds it).
+    pub fn host_source(&mut self, gpu: &mut Backend, layer: usize, expert: usize) -> Result<HostSource> {
+        let key = (layer as u32, expert as u32);
+        if self.map.contains_key(&key) {
+            return Ok(HostSource::Vram);
+        }
+        match self.host_map.get(&key) {
+            Some(&host) if matches!(self.host[host].content, Content::Reading(_)) => Ok(HostSource::Reading),
+            Some(_) => Ok(self.host_roles(gpu, layer, expert)?.map_or(HostSource::Absent, HostSource::Ready)),
+            None => Ok(HostSource::Absent),
+        }
+    }
+
+    /// Start reading `layer`'s `expert` from the drive into the host tier (no VRAM slot): as
+    /// urgent as a pass's fills, or (a guess) behind them; once [`wait_reads`](Self::wait_reads)
+    /// lands it, the host tier holds it.
+    pub fn fetch_host(&mut self, gpu: &mut Backend, layer: usize, expert: usize, urgent: bool) -> Result<()> {
+        let key = (layer as u32, expert as u32);
+        if self.map.contains_key(&key) || self.host_map.contains_key(&key) {
+            return Ok(());
+        }
+        self.settled = false;
+        self.counts.drive_reads += 1;
+        if !urgent {
+            self.counts.prefetched += 1;
+        }
+        self.read(gpu, key, urgent).map(drop)
+    }
+
+    /// Wait for a drive read to land (and take every landed one). A read no pass holds a slot for
+    /// that failed drops its expert (counted): its [`host_source`](Self::host_source) is then
+    /// Absent again.
+    pub fn wait_reads(&mut self, gpu: &mut Backend) -> Result<()> {
+        self.pump(gpu, true)
+    }
+
+    /// Evict `layer`'s `expert` from its VRAM slot to the host tier (written back when the tier has
+    /// room), the slot reused only once the compute stream passes `after` (a point after every op
+    /// that may read it). False when no VRAM slot holds it ready (none, or its fill in flight).
+    pub fn demote(&mut self, gpu: &mut Backend, layer: usize, expert: usize, after: Mark) -> Result<bool> {
+        let Some(&slot) = self.map.get(&(layer as u32, expert as u32)) else { return Ok(false) };
+        if self.slots[slot].waiting.is_some() || self.slots[slot].held {
+            return Ok(false);
+        }
+        self.settled = false;
+        self.slots[slot].guards[0] = Some(after);
+        self.evict(gpu, slot)?;
+        Ok(true)
+    }
+
+    /// Bring `layer`'s `expert` from the host tier into a free VRAM slot of its size class (none is
+    /// evicted for it), uploaded behind the copies passes wait for; the host tier gives it up. Its
+    /// slot's address and the upload's mark (an op may read the slot once the compute stream waits
+    /// for it), or None when the host tier holds no ready copy or the class no free slot.
+    pub fn promote(&mut self, gpu: &mut Backend, layer: usize, expert: usize) -> Result<Option<(u64, Mark)>> {
+        let Some(class) = self.class_of.get(layer).copied().flatten() else { return Ok(None) };
+        if !self.in_host(layer, expert) || self.classes[class].free.is_empty() {
+            return Ok(None);
+        }
+        self.settled = false;
+        let slot = self.fill(gpu, (layer as u32, expert as u32), false)?;
+        let (_, mark) = self.slots[slot].ready.ok_or("a promoted expert has no upload")?;
+        Ok(Some((self.slot_buffer(slot).base() as u64, mark)))
+    }
+
+    /// Copy `layer`'s `expert` out of its VRAM slot to `target` (its roles back to back), waiting
+    /// for its fill and the copy: for a host that needs an expert only VRAM holds. False when no
+    /// VRAM slot holds it (a fill's failed read drops it).
+    ///
+    /// # Safety
+    /// `target` is page-locked (a [`transfer::pin_host`] range) and holds the layer's slot bytes.
+    pub unsafe fn copy_out(&mut self, gpu: &mut Backend, layer: usize, expert: usize, target: *mut u8) -> Result<bool> {
+        let key = (layer as u32, expert as u32);
+        while self.map.get(&key).is_some_and(|&slot| self.slots[slot].waiting.is_some()) {
+            self.pump(gpu, true)?;
+        }
+        let Some(&slot) = self.map.get(&key) else { return Ok(false) };
+        if let Some((_, ready)) = self.slots[slot].ready {
+            gpu.wait_mark(Stream::Download, ready)?;
+        }
+        let bytes: u64 = self.layout.roles(layer)?.iter().map(|role| role.bytes).sum();
+        let source = self.slot_buffer(slot);
+        // SAFETY: the caller's page-locked target of the slot's bytes; waited for below.
+        unsafe { gpu.transfer(Stream::Download, &source, 0, target, bytes)? };
+        let mark = gpu.mark(Stream::Download)?;
+        self.slots[slot].guards[1] = Some(mark);
+        gpu.mark_done(mark, true)?;
+        Ok(true)
     }
 }
 

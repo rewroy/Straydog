@@ -530,8 +530,25 @@ Where its experts go depends on what the GPUs hold:
   sums), each expert's weights read once a tile of 64 of its rows; with `--gemm fp16` (the
   default) the pass's dense products are FP16 GEMMs too, else F32.
 - **Otherwise**, the expert store's tiers serve them: VRAM slots, a page-locked host tier, the
-  drive. A decode step reads its routes, their weights and its MoE input back each layer.
-  Routes to experts in the host tier run on the CPU (`sd_cpu_experts_run`, Q8_0 and BF16) from
-  host memory, so only activations cross the bus; their sum is added to the GPU's. Experts in
-  VRAM run there. Experts only on the drive come through the host tier into VRAM, as before.
+  drive. Routes to experts outside VRAM run on the CPU (`sd_cpu_experts_run`, Q8_0 and BF16)
+  from host memory, so only activations cross the bus. A decode step is queued whole as one
+  recorded graph per GPU (`arch/qwen35moe/engine/hybrid.rs`): VRAM experts run through a device
+  table of slot addresses (zero for an expert outside VRAM, whose routes run nothing there), and
+  each layer exports its routes, their weights and its MoE input to page-locked host memory the
+  GPU writes (`sd_op_export`, gpu/host_exchange.hpp), runs its shared and VRAM experts, then
+  waits on the GPU for the host's sum of the other routes and adds it (`sd_op_await_add`). The
+  host serves the layers in order: it spins on the layer's export count, runs the routes the table
+  does not take on the CPU from the host tier, and publishes their sum with a count the GPU's wait
+  polls. So the CPU's experts overlap the GPU's, and no host launch or read-back sits between the
+  layers; split engines queue every GPU's step before the host serves the first. An expert neither
+  tier holds is read from the drive into the host tier while the CPU runs the others (no VRAM
+  slot is filled for it); each layer also exports the next layer's router applied to its own MoE
+  input, and the experts that guess names and no tier holds start reading a layer early (a guess
+  only moves reads). The table changes only between steps: experts the CPU ran often (a count of
+  their routes decaying 5% a step) move into VRAM, up to four a step, into a free slot or one a
+  clearly weaker expert gives up (its entry cleared before the step and its slot written only once
+  the GPU passed that point); each uploads once the host has served its layer, and enters the
+  table at the next step. A pass that changes the slots otherwise (a prompt's waves) has the table
+  built from the store again. A failure cancels the GPU's waits (they then take zeros and the
+  step errors); a wait that outlasts ten seconds gives up the same way.
   Prefill still uploads the experts it needs, in waves.

@@ -6,7 +6,10 @@
 //! layer (tensor parallel, [`super::part`]), adding their partial sums on the devices
 //! ([`forward_parts`]). Checked against the CPU reference by
 //! examples/q35_chat (with Q35_COMPARE naming a directory of the reference's tensors, each layer's
-//! are compared as the pass goes).
+//! are compared as the pass goes). A partially resident engine's decode steps are pipelined with
+//! the host CPU's experts ([`hybrid`]).
+
+mod hybrid;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
@@ -158,6 +161,9 @@ pub struct Engine<'a, T: Tensors> {
     position: usize,
     /// Q35_COMPARE: the reference's tensors to compare each layer's with (development).
     compare: Option<PathBuf>,
+    /// Partially resident decode steps pipelined with the CPU (made at the first), or not possible.
+    hybrid: Option<hybrid::Hybrid>,
+    hybrid_off: bool,
 }
 
 fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
@@ -305,6 +311,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             position: 0,
             // (the reference's tensors are whole layers')
             compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from).filter(|_| part.is_whole()),
+            hybrid: None,
+            hybrid_off: false,
         };
         engine.upload_dense()?;
         if engine.settings.resident {
@@ -463,7 +471,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     pub fn cache_counts(&self) -> Counts {
         let mut counts = self.experts.counts();
-        counts.hits += self.resident.as_ref().map_or(0, |resident| resident.routes);
+        counts.hits += self.resident.as_ref().map_or(0, |resident| resident.routes) + self.hybrid_routes();
         counts
     }
 
@@ -626,14 +634,37 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// the stream handed over to it ([`Engine::hand_over`]); the last returns the logits after the
     /// last token.
     pub fn pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
+        self.queue(tokens)?;
+        self.finish(tokens.len())
+    }
+
+    /// Queue a pass over `tokens` ([`finish`](Self::finish) completes it): a partially resident
+    /// decode step's device work, whose host part then waits for the finish.
+    fn queue(&mut self, tokens: &[u32]) -> Result<()> {
         let n = tokens.len();
         self.begin(tokens)?;
         if self.graphed(n) {
-            self.decode_graph()?;
+            self.decode_graph()
+        } else if self.hybrid_step(n)? {
+            self.hybrid_queue()
         } else {
-            self.layers_and_head(n)?;
+            self.layers_and_head(n)
         }
-        self.collect(n)
+    }
+
+    /// Drop a queued pass that will not be finished: a decode step's waits for the host are
+    /// cancelled (its output void) and the device drained.
+    fn abandon(&mut self) {
+        self.hybrid_abandon();
+    }
+
+    /// The queued pass of `n` tokens done (a decode step's host part served): as
+    /// [`collect`](Self::collect).
+    fn finish(&mut self, n: usize) -> Result<Option<Vec<f32>>> {
+        self.hybrid_serve()?;
+        let logits = self.collect(n)?;
+        self.hybrid_check()?;
+        Ok(logits)
     }
 
     /// Start a pass over `tokens`: their positions, and on the first engine their embeddings.
@@ -941,10 +972,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
                            work.weights.base())?;
         }
         let resident = self.resident.is_some();
-        let hybrid = n == 1 && !resident && self.cpu.is_some();
+        let exchange = n == 1 && self.hybrid_queuing();
+        let hybrid = n == 1 && !resident && self.cpu.is_some() && !exchange;
         // The routes travel to the host while the shared expert runs (resident experts take them
-        // on the device); for the CPU, with their weights and the input.
-        if hybrid {
+        // on the device); for the CPU, with their weights and the input (a pipelined step's go to
+        // its host exchange).
+        if exchange {
+            self.hybrid_export(layer)?;
+        } else if hybrid {
             self.gpu.copy(work.ids.base(), work.exchange.base(), (k * 4) as u64)?;
             self.gpu.copy(work.weights.base(), work.exchange.at(k), (k * 4) as u64)?;
             self.gpu.copy(work.x.base(), work.exchange.at(2 * k), (w * 4) as u64)?;
@@ -1006,6 +1041,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return self.gpu.experts_table(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64, ff as u64,
                                           n as u64, k as u64, work.x.base(), Some(work.weights.base()), 0.0, true, work.hidden.base(),
                                           work.out.base());
+        }
+        if exchange {
+            return self.hybrid_experts(layer, kinds, offsets);
         }
         if hybrid {
             return self.moe_hybrid(layer, kinds, offsets);
@@ -1216,17 +1254,31 @@ pub fn forward_parts<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) 
 }
 
 /// One pass over engines that run consecutive layers (on their own devices): each hands the stream
-/// to the next; the logits after the last token.
+/// to the next; the logits after the last token. Every engine's pass is queued before any is
+/// finished: pipelined decode steps then wait for the stream handed over on the devices, while the
+/// host serves each engine's layers in turn.
 pub fn forward_split<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
     let count = engines.len();
     for index in 0..count {
         let (head, tail) = engines.split_at_mut(index + 1);
-        let engine = &mut head[index];
-        let logits = engine.pass(tokens)?;
-        match tail.first_mut() {
-            Some(next) => engine.hand_over(next, tokens.len())?,
-            None => return logits.ok_or_else(|| "the last qwen35moe engine has no head".into()),
+        let queued = head[index].queue(tokens).and_then(|()| match tail.first_mut() {
+            Some(next) => head[index].hand_over(next, tokens.len()),
+            None => Ok(()),
+        });
+        if let Err(error) = queued {
+            engines[..=index].iter_mut().for_each(Engine::abandon);
+            return Err(error);
         }
     }
-    Err("no qwen35moe engines".into())
+    let mut logits = None;
+    for index in 0..count {
+        match engines[index].finish(tokens.len()) {
+            Ok(last) => logits = last,
+            Err(error) => {
+                engines[index + 1..].iter_mut().for_each(Engine::abandon);
+                return Err(error);
+            }
+        }
+    }
+    logits.ok_or_else(|| "the last qwen35moe engine has no head".into())
 }

@@ -337,6 +337,14 @@ private:
 };
 
 struct KvMirror { float* data; size_t valid; };
+// A host exchange (host_exchange.hpp): its page-locked host memory, the device's view of it, and the
+// device's count of exports (an allocation of the device).
+struct ExchangeArea {
+    uint8_t* host = nullptr;
+    uint8_t* view = nullptr;
+    uint32_t* count = nullptr;
+    size_t bytes = 0;
+};
 struct Device;
 // Two devices' tensor-parallel sums (device_link.hpp): this device's inbox (two slots of
 // `capacity` floats, alternating by sum) and state ([0] sums sent, [1] the flag the peer raises,
@@ -455,6 +463,7 @@ struct Device {
     std::unordered_map<std::string,CachedGraph> graphs;
     std::unordered_map<void*,std::unique_ptr<ResidentMoe>> resident;
     std::unordered_map<size_t,DecoderLayer> decoder;
+    std::unordered_map<void*,ExchangeArea> exchanges;   // host exchanges by host address (sd_exchange)
     uint64_t graph_replays=0;
     ExpertSlots slots;
     hipStream_t copy_stream=nullptr;
@@ -515,6 +524,7 @@ struct Device {
             cleanup(host == host_states.end() ? hipFree(entry.first) : hipHostFree(host->second));
         }
         for (auto entry : checkpoints) cleanup(hipHostFree(entry.first));
+        for (auto& entry : exchanges) cleanup(hipHostFree(entry.second.host));
         if (input) cleanup(hipFree(input));
         if (output) cleanup(hipFree(output));
         if (matrices) cleanup(hipFree(matrices));
@@ -2830,3 +2840,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "device_link.hpp"
 #include "gemv_fused.hpp"
 #include "moe_prefill.hpp"
+#include "host_exchange.hpp"

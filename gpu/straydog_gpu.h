@@ -316,6 +316,23 @@ int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out);
 int sd_cpu_rows(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
 int sd_quantize_q2_0(const uint16_t* input, uint64_t count, uint8_t* output);
 
+/* Host exchanges: page-locked host memory a device's ops read and write within a pass, so a host
+   thread takes part in a pass queued (or recorded as a graph) ahead, with no host call between the
+   ops. sd_exchange allocates `bytes` (zeroed; at least 256, the header, and a multiple of 4) and
+   returns its host address, which the ops take; freed with the device. Header words (uint32): 0 the
+   exports so far (the device's), 1 the results the host published, 2 nonzero once an await gave up
+   (after about ten seconds), 3 nonzero while the host cancels the awaits (they then take zeros).
+   sd_op_export copies `parts` (up to four) device ranges of counts[i] values one after another to
+   `offset` bytes into the exchange, then advances word 0 (the values reach the host first).
+   sd_op_await_add waits until word 1 reaches word 0's count as of the last export (the host
+   publishes a result for each export, in order), then out[i] += a[i] (optional) + result[i] over the
+   `count` values at result_offset. sd_exchange_supported answers 1 when the device's ops can wait
+   for the host so (RDNA4, CUDA sm_70+), else 0. */
+void* sd_exchange(void* handle, uint64_t bytes);
+int sd_exchange_supported(void* handle);
+int sd_op_export(void* handle, const float* const* sources, const uint64_t* counts, uint64_t parts, void* exchange, uint64_t offset);
+int sd_op_await_add(void* handle, void* exchange, uint64_t result_offset, const float* a, float* out, uint64_t count);
+
 /* Formats: the routed expert kernels at any layer shape, for tests and measurements. `banks` are the
    gate and up (`experts` matrices of ffn x hidden each) and down (hidden x ffn) allocations of
    kinds[0..2]; each of `steps` input rows (hidden values) goes to its top_k experts in `selected`.
