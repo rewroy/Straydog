@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{divided, forward_split, Engine, Settings as EngineSettings};
+use super::engine::{divided, forward_split, pass_row_bytes, Engine, Settings as EngineSettings, ATTENTION_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Placed, Session, Settings};
 use crate::bundle;
@@ -145,7 +145,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     // The sequence state of an engine's layers, on each of its devices: window rings, and each
     // kv source's compressed rows and keys.
     let state = |range: &std::ops::Range<usize>| -> u64 {
-        let ring = (hp.window + settings.batch) * hp.head_dim * 4 * range.len();
+        let ring = (hp.window + settings.batch.min(ATTENTION_ROWS)) * hp.head_dim * 4 * range.len();
         let sources: usize = hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer))
             .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer))
             .map(|c| (settings.context / c.ratio + 1) * (hp.head_dim + hp.index_dim) * 4).sum();
@@ -160,7 +160,9 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let parts = devices.len() as u64;
         let head = if range.end == layers { head_whole + head_parted.div_ceil(parts) } else { 0 };
         let resident: u64 = range.clone().map(|layer| whole[layer] + parted[layer].div_ceil(parts)).sum::<u64>() + head;
-        let fixed = resident + state(range) + SCRATCH + RESERVE;
+        // a pass of up to the batch's rows, layer by layer: its buffers of every row
+        let rows = settings.batch as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
+        let fixed = resident + state(range) + rows + SCRATCH + RESERVE;
         let free = settings.vram_bytes.checked_sub(fixed)
             .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64))?;
         // Each device's share of an expert is 1/parts of a slot: free / share experts.
@@ -191,7 +193,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                 let share = host as f64 * experts as f64 / total_experts.max(1) as f64;
                 let engine_settings = EngineSettings {
                     context: settings.context,
-                    batch: settings.batch,
+                    rows: settings.batch,
+                    batch: settings.batch.min(ATTENTION_ROWS),
                     expert_slots: slots / devices.len(),
                     host_expert_bytes: (share / devices.len() as f64) as u64,
                     scratch_bytes: SCRATCH,

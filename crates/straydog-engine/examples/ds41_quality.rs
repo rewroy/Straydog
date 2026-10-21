@@ -6,8 +6,8 @@
 //! reference's tokens under both. A hash of every logit produced tells runs apart bit for bit
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
-//! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
-//!     [--steps N] [--show KL]
+//! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
+//!     [--steps N] [--show KL] [--context N]
 //! --show prints every position whose KL exceeds KL, with both sides' top tokens. With
 //! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
 //! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
@@ -84,14 +84,17 @@ fn main() -> Result<(), String> {
     });
     let (chunk, slots, split, tp) = (option("--chunk", 64), option("--slots", 1900), option("--split", 0), option("--tp", 1));
     let (host_gb, row_cache, max_steps) = (option("--host-gb", 0), option("--row-cache", 256) as u64, option("--steps", usize::MAX));
+    // rows the attention runs at a time within a pass of up to --chunk tokens
+    let batch = option("--batch", 256);
+    let context = option("--context", 8192);
     let show = args.iter().position(|arg| arg == "--show").map(|at| {
         let value: f64 = args[at + 1].parse().unwrap();
         args.drain(at..at + 2);
         value
     });
     let [dir, tokens_files] = &args[..] else {
-        return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--slots N] [--split L] [--tp N] [--host-gb N] \
-                    [--row-cache MIB] [--steps N]".into());
+        return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
+                    [--row-cache MIB] [--steps N] [--context N]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     if row_cache > 0 && straydog_engine::arch::Tensors::tensor(&files, "per_layer_token_embd.weight").is_ok() {
@@ -107,7 +110,7 @@ fn main() -> Result<(), String> {
     let devices = (parts.len() * tp) as u64;
     let mut engines = Vec::new();
     for (index, part) in parts.into_iter().enumerate() {
-        let settings = Settings { context: 8192, batch: 64, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / devices,
+        let settings = Settings { context, rows: chunk.max(batch), batch, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / devices,
                                   scratch_bytes: 512 << 20, layers: part };
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);

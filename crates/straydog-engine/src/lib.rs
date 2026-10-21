@@ -12,6 +12,7 @@ pub mod group;
 pub mod host;
 pub mod load;
 pub mod model;
+pub mod moe;
 pub mod ops;
 pub mod pinned;
 pub mod pyjson;
