@@ -26,7 +26,11 @@
 //!
 //! A pass of up to [`VERIFY_ROWS`] tokens can be taken back but for its first few ([`Engine::rewind`]):
 //! it keeps the counters of the sequence state from before it, and each ratio-2 kv source's
-//! compressor rows of its tokens (one of them waits in the source's tail after a rewind).
+//! compressor rows of its tokens (one of them waits in the source's tail after a rewind). A
+//! verify pass ([`Engine::verify`]) is such a pass computing every row in every layer, with every
+//! token's logits: those decode gives the tokens one at a time, bit for bit (every op of a few
+//! rows computes each row as it would alone), so drafted tokens can be checked and the rejected
+//! ones taken back.
 //!
 //! A decode row can predict the next layer's experts (its router on this layer's input) and
 //! prefetch the DS41_PREDICT best (up to 8) from the host tier, DS41_PREDICT_DRIVE also from the
@@ -220,7 +224,8 @@ const READERS: usize = 32;
 /// Passes of up to this many rows run the routed experts over their slots (decode); longer ones
 /// expert by expert.
 const SLOT_ROWS: usize = 4;
-/// Most tokens a pass that can be taken back takes (its experts run over their slots).
+/// Most tokens a pass that can be taken back takes, a verify pass among them: its experts run over
+/// their slots, and every op of it computes each row as it would alone.
 pub const VERIFY_ROWS: usize = SLOT_ROWS;
 
 /// One device's share of the engine: its weights (its parts of the split ones), its copy of the
@@ -255,6 +260,8 @@ pub struct Engine<'a, T: Tensors> {
     /// The first layer of the decoder (the last kv source), whose layers run only the rows the last
     /// row's output needs (see the module documentation); None: every layer runs every row.
     decoder: Option<usize>,
+    /// The last rows of the running pass whose outputs leave it: 1, every row of a verify pass.
+    outputs: usize,
     /// The state before the last pass, when it can be taken back.
     rewind: Option<Rewind>,
     /// How many of a decode row's predicted next-layer experts are prefetched (DS41_PREDICT, up to
@@ -381,7 +388,7 @@ impl Shard {
             all_rows: floats(&mut gpu, b)?,
             engram_rows: floats(&mut gpu, b * hp.engram_columns() * hp.engram.as_ref().map_or(1, |e| e.head_dim))?,
             engram_kv: floats(&mut gpu, b * (hc + 1) * w)?,
-            head: floats(&mut gpu, if range.end == hp.layers.len() { hp.vocabulary } else { 1 })?,
+            head: floats(&mut gpu, if range.end == hp.layers.len() { VERIFY_ROWS * hp.vocabulary / parts } else { 1 })?,
             hc_workspace: floats(&mut gpu, b * w.div_ceil(64) * ((2 + hc) * hc + 2) + b)?,
             products: [floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?, floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?],
             product: floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?,
@@ -530,6 +537,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut engine = Engine {
             ring: hp.window + settings.batch,
             decoder,
+            outputs: 1,
             rewind: None,
             hp: std::rc::Rc::new(hp),
             tensors,
@@ -775,6 +783,44 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// the stream handed over to it ([`Engine::hand_over`]); the last returns the logits after the
     /// last token.
     pub fn pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
+        self.run(tokens, 1)
+    }
+
+    /// Verify `tokens` (at most [`Engine::verify_rows`], continuing the sequence): one pass
+    /// computing every row in every layer, the logits after each token, one row after another, each
+    /// bit for bit those of a pass of that token alone. [`Engine::rewind`] takes back the tokens not
+    /// accepted. The engine runs every layer.
+    pub fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.verify_pass(tokens)?.ok_or_else(|| "this DeepSeek-V4.1 engine runs only some of the layers".into())
+    }
+
+    /// [`Engine::verify`]'s pass of this engine's layers ([`Engine::pass`] otherwise).
+    pub fn verify_pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
+        let n = tokens.len();
+        // (a pass of more than a sequence's first token has compressed rows, and the first token's
+        // attention would run over a selection of none of them, its sums split otherwise than with
+        // none: not bit for bit)
+        if n == 0 || n > self.verify_rows() || (self.position == 0 && n > 1) {
+            return Err(format!("a DeepSeek-V4.1 verify pass takes 1-{} tokens continuing a sequence", self.verify_rows()));
+        }
+        self.run(tokens, n)
+    }
+
+    /// Most tokens a verify pass takes: at most [`VERIFY_ROWS`], in a batch, and as many as the
+    /// stores hold every route's expert for at once. Several devices acquire a pass's experts in
+    /// waves (experts_split), each wave's down summed apart: a verify pass's routes must fit one
+    /// wave, or a row's down would be summed otherwise than decode sums it. One device acquires
+    /// them all together (routed).
+    pub fn verify_rows(&self) -> usize {
+        let split = self.shards.len() > 1;
+        let experts = self.shards.iter()
+            .map(|shard| if split { shard.experts.wave_limit().min(WAVE) } else { shard.experts.pass_limit() }).min().unwrap_or(0);
+        VERIFY_ROWS.min(self.settings.batch).min(experts / self.hp.experts_used).max(1)
+    }
+
+    /// A pass over `tokens` whose last `outputs` rows leave it: on the last engine, the logits
+    /// after each of those tokens, one row after another.
+    fn run(&mut self, tokens: &[u32], outputs: usize) -> Result<Option<Vec<f32>>> {
         let n = tokens.len();
         if n == 0 || n > self.settings.rows.max(self.settings.batch) || self.position + n > self.settings.context {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
@@ -782,6 +828,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let (hc, w) = (hp.hc, hp.width);
         let range = self.settings.layers.clone();
+        self.outputs = outputs;
         if let Some((since, _)) = self.profile.as_mut() {
             // another engine's pass ran since this one's last mark
             *since = std::time::Instant::now();
@@ -844,23 +891,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             None
         } else {
-            // The last row's expansion of the last FFN output, collapsed and normed for the head;
+            // The output rows' expansions of the last FFN output, collapsed and normed for the head;
             // each device has its rows of the head.
-            let (last, part_rows) = (n - 1, hp.vocabulary / self.shards.len());
-            let mut logits = vec![0f32; hp.vocabulary];
+            let (first, part_rows) = (n - outputs, hp.vocabulary / self.shards.len());
+            let mut logits = vec![0f32; outputs * hp.vocabulary];
             for shard in &mut self.shards {
                 let work = shard.work.clone();
                 let pre = work.pre_f[last_layer % 2];
                 let norm = shard.dense("output_norm.weight")?;
-                let expand = (work.out.at(last * w) as P, work.stream2.at(last * hc * w) as P, work.post_f.at(last * hc) as P,
-                              work.comb_f.at(last * hc * hc) as P);
-                shard.gpu.hc_step(Some(expand), work.stream.at(last * hc * w), None, 0, 0.0, hp.norm_eps, pre.at(last * hc),
-                                  norm.buffer.base(), 1, hc as u64, w as u64, &work.hc_workspace, work.x.base())?;
-                shard.linear("output.weight", work.x.base(), 1, work.head.base())?;
+                let expand = (work.out.at(first * w) as P, work.stream2.at(first * hc * w) as P, work.post_f.at(first * hc) as P,
+                              work.comb_f.at(first * hc * hc) as P);
+                shard.gpu.hc_step(Some(expand), work.stream.at(first * hc * w), None, 0, 0.0, hp.norm_eps, pre.at(first * hc),
+                                  norm.buffer.base(), outputs as u64, hc as u64, w as u64, &work.hc_workspace, work.x.base())?;
+                shard.linear("output.weight", work.x.base(), outputs, work.head.base())?;
             }
             for (part, shard) in self.shards.iter_mut().enumerate() {
                 let head = shard.work.head;
-                shard.gpu.read_buffer(&head, 0, &mut logits[part * part_rows..(part + 1) * part_rows])?;
+                for row in 0..outputs {
+                    let at = row * hp.vocabulary + part * part_rows;
+                    shard.gpu.read_buffer(&head, row * part_rows, &mut logits[at..at + part_rows])?;
+                }
             }
             self.mark("head")?;
             Some(logits)
@@ -926,13 +976,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// The rows of a pass of `n` that `layer` runs, as the first of those it compresses (a kv
     /// source), of those whose K/V it appends to its window ring, and of those it computes: every
-    /// row before the decoder; from the decoder on, the rows the last row's output needs and the
-    /// window before them (see the module documentation).
+    /// row before the decoder; from the decoder on, the rows the outputs (the last row's, every
+    /// row's of a verify pass) need and the window before them (see the module documentation).
     fn rows_of(&self, layer: usize, n: usize) -> (usize, usize, usize) {
         match self.decoder {
             Some(decoder) if layer >= decoder => {
                 let reach = self.hp.window - 1;
-                let full = n.saturating_sub(1 + (self.hp.layers.len() - 1 - layer) * reach);
+                let full = (n - self.outputs).saturating_sub((self.hp.layers.len() - 1 - layer) * reach);
                 let kv = full.saturating_sub(reach);
                 (if layer == decoder { 0 } else { kv }, kv, full)
             }
@@ -1674,12 +1724,22 @@ pub fn pass_row_bytes(hp: &Hparams, parts: usize, layers: std::ops::Range<usize>
 /// One pass over engines that run consecutive layers (on their own devices): each hands the stream
 /// to the next; the logits after the last token.
 pub fn forward_split<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
+    split_pass(engines, tokens, false)
+}
+
+/// [`Engine::verify`] over engines that run consecutive layers: the logits after each token.
+pub fn verify_split<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
+    split_pass(engines, tokens, true)
+}
+
+fn split_pass<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32], verify: bool) -> Result<Vec<f32>> {
     for i in 0..engines.len().saturating_sub(1) {
-        engines[i].pass(tokens)?;
+        if verify { engines[i].verify_pass(tokens)? } else { engines[i].pass(tokens)? };
         let (done, rest) = engines.split_at_mut(i + 1);
         done[i].hand_over(&mut rest[0], tokens.len())?;
     }
-    engines.last_mut().ok_or("no DeepSeek-V4.1 engines")?.forward(tokens)
+    let last = engines.last_mut().ok_or("no DeepSeek-V4.1 engines")?;
+    if verify { last.verify(tokens) } else { last.forward(tokens) }
 }
 
 impl Work {

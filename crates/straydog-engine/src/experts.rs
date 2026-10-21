@@ -576,6 +576,12 @@ impl DeviceExperts {
         self.classes.iter().map(|class| class.count.saturating_sub(class.reserve) / 2).min().unwrap_or(0).max(1)
     }
 
+    /// The most experts of one layer a pass can hold at once (acquired together, no prefetch
+    /// beside them): the smallest class's slots beyond its reserve.
+    pub fn pass_limit(&self) -> usize {
+        self.classes.iter().map(|class| class.count.saturating_sub(class.reserve)).min().unwrap_or(0)
+    }
+
     /// When each of `layer`'s `experts` is in a VRAM slot with no fill pending: their slots'
     /// addresses in that order and the slots' bytes (else None). For a caller that then reads them
     /// without acquiring: it must keep them from eviction (slots for every expert and their

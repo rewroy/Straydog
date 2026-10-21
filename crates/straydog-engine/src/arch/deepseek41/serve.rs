@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{divided, forward_split, pass_row_bytes, Engine, Settings as EngineSettings, ATTENTION_ROWS};
+use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, ATTENTION_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Placed, Session, Settings};
 use crate::bundle;
@@ -37,6 +37,8 @@ pub struct Engines {
     engines: Vec<Engine<'static, Pinned>>,
     /// The devices of the first engine (each reads its rows of an expert).
     devices_per_expert: usize,
+    /// The most tokens a verify pass takes (DS41_DRAFTS=0: 1, no drafts).
+    verify_rows: usize,
 }
 
 impl served::Engines for Engines {
@@ -89,6 +91,18 @@ impl served::Engines for Engines {
 
     fn settle(&mut self) -> Result<(), String> {
         self.engines.iter_mut().try_for_each(Engine::settle)
+    }
+
+    fn verify_rows(&self) -> usize {
+        self.verify_rows
+    }
+
+    fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        verify_split(&mut self.engines, tokens)
+    }
+
+    fn rewind(&mut self, keep: usize) -> Result<(), String> {
+        self.engines.iter_mut().try_for_each(|engine| engine.rewind(keep))
     }
 }
 
@@ -232,8 +246,10 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "expert_bytes": total_experts,
         "prefill_batch_size": settings.batch,
     });
+    let drafts = std::env::var_os("DS41_DRAFTS").is_none_or(|value| value != "0");
+    let verify_rows = if drafts { engines.iter().map(Engine::verify_rows).min().unwrap_or(1) } else { 1 };
     Ok(Session::new(Placed {
-        engines: Engines { engines, devices_per_expert: groups[0].0.len() },
+        engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
         end: vec![end], turn_start: None, card, placement, state_bytes,
         load_seconds: vec![("open", open_seconds), ("place", place_seconds)],

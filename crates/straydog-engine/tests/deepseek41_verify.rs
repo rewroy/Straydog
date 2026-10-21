@@ -1,6 +1,8 @@
-//! DeepSeek-V4.1's passes of a few tokens taken back on real GPUs ([`Engine::rewind`]): after a
-//! pass of up to four tokens taken back to its first few, the sequence state and the logits of
-//! every later pass are those of a sequence fed only the tokens kept, one at a time, bit for bit.
+//! DeepSeek-V4.1's verify passes and passes taken back on real GPUs ([`Engine::verify`],
+//! [`Engine::rewind`]): a verify pass's logits after each token are those of feeding the tokens
+//! one at a time, and after a pass of up to four tokens taken back to its first few, the sequence
+//! state and the logits of every later pass are those of a sequence fed only the tokens kept, one
+//! at a time; all bit for bit.
 //! The prompt's length is odd, so a ratio-2 group of compressed rows straddles the pass's start
 //! (a rewind leaves either the row waiting before the pass or one of the pass's waiting), and
 //! every pass runs through the Engram layers, whose n-grams read the tokens kept.
@@ -64,13 +66,15 @@ fn take_back(devices: &[usize]) {
                                   host memory and the rest on the drive; a decode step reads").unwrap();
     assert!(prompt.len() >= PROMPT);
     prompt.truncate(PROMPT);
-    // (slots enough for a pass's experts in one wave, as a served placement has)
+    // (slots enough for a verify pass of four's experts at once, as a served placement has)
     let settings = Settings {
-        context: 1024, rows: 64, batch: 64, expert_slots: 1024, host_expert_bytes: (4 << 30) / devices.len() as u64,
+        context: 1024, rows: 64, batch: 64, expert_slots: 1900, host_expert_bytes: (4 << 30) / devices.len() as u64,
         scratch_bytes: 512 << 20, layers: 0..hp.layers.len(),
     };
     let mut engine = Engine::new(hp.clone(), &files, devices, 31 << 30, settings).unwrap();
+    assert_eq!(engine.verify_rows(), VERIFY_ROWS);
     assert!(engine.rewind(0).is_err(), "a rewind before any pass");
+    assert!(engine.verify(&prompt[..2]).is_err(), "a verify pass of more than a sequence's first token");
 
     // The drafts (greedy), fed one at a time: the logits after each and the states before each.
     let after_prompt = engine.forward(&prompt).unwrap();
@@ -97,12 +101,16 @@ fn take_back(devices: &[usize]) {
         instead.push((token, engine.forward(&[token]).unwrap(), engine.state().unwrap()));
     }
 
-    // One pass over the four drafts, taken back to each number kept, then the token instead.
+    // One verify pass over the four drafts, taken back to each number kept, then the token instead.
     for keep in 0..=VERIFY_ROWS {
         engine.reset();
         engine.forward(&prompt).unwrap();
-        let last = engine.forward(&drafts).unwrap();
-        same_logits(&last, &logits[VERIFY_ROWS - 1], "a pass of the drafts");
+        assert!(engine.verify(&[drafts.as_slice(), &drafts[..1]].concat()).is_err(), "a verify pass of five tokens");
+        let rows = engine.verify(&drafts).unwrap();
+        assert_eq!(rows.len(), VERIFY_ROWS * hp.vocabulary);
+        for (at, row) in rows.chunks_exact(hp.vocabulary).enumerate() {
+            same_logits(row, &logits[at], &format!("verify row {at}"));
+        }
         engine.rewind(keep).unwrap();
         assert_eq!(engine.position(), PROMPT + keep);
         same_state(&engine.state().unwrap(), &states[keep], &format!("kept {keep}"));
@@ -112,18 +120,22 @@ fn take_back(devices: &[usize]) {
         same_state(&engine.state().unwrap(), state, &format!("kept {keep}, then another token"));
     }
 
-    // Passes from both parities of the waiting row: one taken back to its first token (then none
-    // waits), the next three from there taken back to their first (one waits again: the pass's
-    // first row), and a pass of one token taken back whole.
+    // Passes from both parities of the waiting row: a plain pass of the four (its last row's logits
+    // alone) taken back to its first token (then none waits), a verify pass of the next three from
+    // there taken back to their first (one waits again: the pass's first row), and a verify pass of
+    // one token taken back whole.
     engine.reset();
     engine.forward(&prompt).unwrap();
-    engine.forward(&drafts).unwrap();
+    same_logits(&engine.forward(&drafts).unwrap(), &logits[VERIFY_ROWS - 1], "a pass of the drafts");
     engine.rewind(1).unwrap();
     same_state(&engine.state().unwrap(), &states[1], "kept 1 of 4");
-    engine.forward(&drafts[1..]).unwrap();
+    let rows = engine.verify(&drafts[1..]).unwrap();
+    for (at, row) in rows.chunks_exact(hp.vocabulary).enumerate() {
+        same_logits(row, &logits[1 + at], &format!("verify row {at} of 3"));
+    }
     engine.rewind(1).unwrap();
     same_state(&engine.state().unwrap(), &states[2], "then 1 of 3");
-    engine.forward(&drafts[2..3]).unwrap();
+    same_logits(&engine.verify(&drafts[2..3]).unwrap(), &logits[2], "a verify pass of one");
     assert!(engine.rewind(2).is_err(), "keeping more than a pass took");
     engine.rewind(0).unwrap();
     same_state(&engine.state().unwrap(), &states[2], "then none of 1");

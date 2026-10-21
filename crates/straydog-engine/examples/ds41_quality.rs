@@ -7,7 +7,10 @@
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
-//!     [--steps N] [--show KL] [--context N]
+//!     [--steps N] [--show KL] [--context N] [--verify N]
+//! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
+//! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
+//! the decode path, so the hashes must not change.
 //! --show prints every position whose KL exceeds KL, with both sides' top tokens. With
 //! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
 //! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
@@ -18,7 +21,7 @@ mod files;
 
 use std::path::Path;
 
-use straydog_engine::arch::deepseek41::engine::{forward_split, Engine, Settings};
+use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
 use straydog_engine::arch::deepseek41::Hparams;
 
 /// Log-softmax in F64.
@@ -87,6 +90,7 @@ fn main() -> Result<(), String> {
     // rows the attention runs at a time within a pass of up to --chunk tokens
     let batch = option("--batch", 256);
     let context = option("--context", 8192);
+    let verify = option("--verify", 0);
     let show = args.iter().position(|arg| arg == "--show").map(|at| {
         let value: f64 = args[at + 1].parse().unwrap();
         args.drain(at..at + 2);
@@ -94,7 +98,7 @@ fn main() -> Result<(), String> {
     });
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
-                    [--row-cache MIB] [--steps N] [--context N]".into());
+                    [--row-cache MIB] [--steps N] [--context N] [--verify N]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     if row_cache > 0 && straydog_engine::arch::Tensors::tensor(&files, "per_layer_token_embd.weight").is_ok() {
@@ -139,14 +143,33 @@ fn main() -> Result<(), String> {
         hash(&mut prompt_hash, &logits);
         let mut saved: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
         let mut steps = vec![compare(&logits, &row(kept - 1), generated.first().map(|&token| token as usize))];
-        for step in 0..decode_rows.min(generated.len()).min(max_steps) {
-            logits = forward_split(&mut engines, &generated[step..step + 1])?;
-            hash(&mut prompt_hash, &logits);
-            saved.extend(logits.iter().flat_map(|value| value.to_le_bytes()));
-            steps.push(compare(&logits, &row(kept + step), generated.get(step + 1).map(|&token| token as usize)));
+        let (decode_steps, decoding) = (decode_rows.min(generated.len()).min(max_steps), std::time::Instant::now());
+        let (mut step, mut seed, mut passes) = (0, 0x9e37_79b9_7f4a_7c15u64 ^ index as u64, 0);
+        while step < decode_steps {
+            let width = verify.clamp(1, decode_steps - step);
+            let rows = if verify == 0 {
+                forward_split(&mut engines, &generated[step..step + 1])?
+            } else {
+                verify_split(&mut engines, &generated[step..step + width])?
+            };
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let accepted = 1 + (seed % width as u64) as usize;
+            for (at, logits) in rows.chunks_exact(vocabulary).take(accepted).enumerate() {
+                hash(&mut prompt_hash, logits);
+                saved.extend(logits.iter().flat_map(|value| value.to_le_bytes()));
+                steps.push(compare(logits, &row(kept + step + at), generated.get(step + at + 1).map(|&token| token as usize)));
+            }
+            if accepted < width {
+                engines.iter_mut().try_for_each(|engine| engine.rewind(accepted))?;
+            }
+            step += accepted;
+            passes += 1;
         }
+        let seconds = decoding.elapsed().as_secs_f64();
         hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
-        println!("{} | logits hash {prompt_hash:016x}", summary(&format!("prompt {index}"), &steps));
+        println!("{} | logits hash {prompt_hash:016x} | {decode_steps} tokens in {passes} passes, {seconds:.2} s", summary(&format!("prompt {index}"), &steps));
         if let Some(dir) = std::env::var_os("DS41_QUALITY_SAVE") {
             std::fs::write(Path::new(&dir).join(format!("prompt-{index}.logits")), &saved).map_err(|exc| exc.to_string())?;
         }
