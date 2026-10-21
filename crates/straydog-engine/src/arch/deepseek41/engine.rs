@@ -242,6 +242,8 @@ pub struct Engine<'a, T: Tensors> {
     prefetches: usize,
     /// Next-layer experts predicted by this pass, prefetched after the layer's own.
     predicted: Vec<usize>,
+    /// Decode runs the experts VRAM holds while the others land (DS41_HITS_FIRST=0: all at once).
+    hits_first: bool,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end.
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
 }
@@ -515,6 +517,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             sources,
             prefetches: std::env::var("DS41_PREDICT").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(PREDICTED),
             predicted: Vec::new(),
+            hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
         };
         engine.upload_dense()?;
@@ -1121,12 +1124,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
             .into_iter().collect();
         let wave = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
         let waves: Vec<&[usize]> = experts.chunks(wave).collect();
+        let drive = std::env::var_os("DS41_PREDICT_DRIVE").is_some();
+        if waves.len() == 1 && self.hits_first {
+            let (hits, misses): (Vec<usize>, Vec<usize>) = experts.iter().partition(|&&expert| self.shards[0].experts.in_vram(layer, expert));
+            if !hits.is_empty() && !misses.is_empty() {
+                return self.experts_hits_first(layer, first, rows, &routes, &hits, &misses, &predicted, drive);
+            }
+        }
         if let Some(first) = waves.first() {
             for shard in &mut self.shards {
                 shard.experts.request(&mut shard.gpu, layer, first)?;
             }
         }
-        let drive = std::env::var_os("DS41_PREDICT_DRIVE").is_some();
         // every device holds as many rows of an expert
         let (gate_bytes, _, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
         for (index, wave) in waves.iter().enumerate() {
@@ -1171,6 +1180,67 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                   0, Some(shard.rows.split(2)))?;
                 shard.experts.release(&mut shard.gpu)?;
             }
+        }
+        self.mark("routed experts")
+    }
+
+    /// [`Engine::experts_split`]'s one wave when VRAM holds some of its experts and not others:
+    /// the others' fills start on every device, the held ones' gate and up run while they land,
+    /// then the others'; the activations are summed across devices and every route's down runs at
+    /// once. A route's gate and up are its own rows, and down sums the routes in route order, so
+    /// the result is that of one launch for every route, whatever VRAM held.
+    #[allow(clippy::too_many_arguments)]
+    fn experts_hits_first(&mut self, layer: usize, first: usize, rows: usize, routes: &[i32], hits: &[usize], misses: &[usize],
+                          predicted: &[usize], drive: bool) -> Result<()> {
+        let hp = self.hp.clone();
+        let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
+        let routed_rows = rows * k;
+        let (gate_bytes, _, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
+        let offsets = [0, gate_bytes, 2 * gate_bytes];
+        for shard in &mut self.shards {
+            shard.experts.request(&mut shard.gpu, layer, misses)?;
+        }
+        // A route to an expert of the other list has no slot here (a zero base: skipped).
+        let bases = |list: &[usize], slots: &[Buffer]| -> Vec<u64> {
+            routes.iter().map(|&expert| list.binary_search(&(expert as usize)).map_or(0, |at| slots[at].base() as u64)).collect()
+        };
+        let mut held = Vec::with_capacity(self.shards.len());
+        for shard in &mut self.shards {
+            let slots = shard.experts.acquire(&mut shard.gpu, layer, hits)?;
+            let work = shard.work.view(first);
+            shard.gpu.experts(Some(&bases(hits, &slots)), slots[0].bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0,
+                              Some(work.weights.base()), hp.layers[layer].clamp_routed, true, work.products[0].base(),
+                              work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+            held.push(slots);
+        }
+        let mut every = Vec::with_capacity(self.shards.len());
+        for (shard, held) in self.shards.iter_mut().zip(&held) {
+            let slots = shard.experts.acquire(&mut shard.gpu, layer, misses)?;
+            if !predicted.is_empty() {
+                shard.experts.prefetch(&mut shard.gpu, layer + 1, predicted, drive)?;
+            }
+            let work = shard.work.view(first);
+            shard.gpu.experts(Some(&bases(misses, &slots)), slots[0].bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0,
+                              Some(work.weights.base()), hp.layers[layer].clamp_routed, true, work.products[0].base(),
+                              work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+            let both: Vec<u64> = bases(hits, held).into_iter().zip(bases(misses, &slots)).map(|(hit, miss)| hit | miss).collect();
+            every.push((both, slots[0].bytes));
+        }
+        self.mark("expert fills")?;
+        // Every device's share of the activations, the shared expert's too.
+        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+        let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
+        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[0].base() as P).collect();
+        ops::sum_devices(&devices, &outs, &parts, (routed_rows + rows) as u64 * ff)?;
+        for (shard, (both, slot_bytes)) in self.shards.iter_mut().zip(&every) {
+            let work = shard.work.view(first);
+            let shared = shard.shared[&layer];
+            shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; rows]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
+                              rows as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
+                              work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
+            shard.gpu.experts(Some(both), *slot_bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0, None,
+                              hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
+            shard.experts.release(&mut shard.gpu)?;
         }
         self.mark("routed experts")
     }

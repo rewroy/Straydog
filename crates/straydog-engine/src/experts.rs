@@ -689,8 +689,12 @@ impl DeviceExperts {
     fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
         self.pump(gpu, false)?;
         // Every hit is held before any miss is filled: a miss never evicts a slot this same
-        // request uses later. Experts a request() started were counted there.
-        let requested = std::mem::take(&mut self.requested);
+        // request uses later. Experts a request() started were counted there; those of a later
+        // acquire of this layer (a request may run ahead of an acquire of other experts) wait for it.
+        let (requested, later): (Vec<Key>, Vec<Key>) = std::mem::take(&mut self.requested).into_iter()
+            .filter(|key| key.0 == layer as u32)
+            .partition(|key| experts.contains(&(key.1 as usize)));
+        self.requested = later;
         let mut slots = vec![usize::MAX; experts.len()];
         for (index, &expert) in experts.iter().enumerate() {
             let key = (layer as u32, expert as u32);
@@ -802,6 +806,7 @@ impl DeviceExperts {
             self.slots[slot].guards[0] = Some(mark);
             self.slots[slot].held = false;
         }
+        self.requested.clear();
         self.keep_free(gpu)
     }
 
