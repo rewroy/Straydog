@@ -42,6 +42,16 @@ pub struct Role {
     pub bytes: u64,
 }
 
+/// Of each `row_bytes` row of a role's matrix, the `take` bytes at `skip` (whole blocks of columns):
+/// a device's columns of a matrix split by them (the down matrix of experts split by their ffn
+/// rows). The role reads its whole matrix; a VRAM slot holds these bytes, row after row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Columns {
+    pub row_bytes: u64,
+    pub skip: u64,
+    pub take: u64,
+}
+
 /// Checks a drive read of `file` at `offset` (whole aligned blocks) before its first use.
 pub type Verifier = Arc<dyn Fn(usize, u64, &[u8]) -> std::result::Result<(), String> + Send + Sync>;
 
@@ -51,6 +61,8 @@ pub struct Layout {
     files: Vec<(Arc<File>, bool)>,
     /// Per layer: its roles (gate, up, down...), None for a layer without routed experts.
     layers: Vec<Option<Vec<Role>>>,
+    /// The roles (layer, role) whose slots keep some columns ([`keep_columns`](Self::keep_columns)).
+    columns: HashMap<(usize, usize), Columns>,
     verifier: Option<Verifier>,
 }
 
@@ -69,7 +81,22 @@ impl Layout {
                 return Err("an expert role's bytes exceed its stride".into());
             }
         }
-        Ok(Layout { files, layers, verifier })
+        Ok(Layout { files, layers, columns: HashMap::new(), verifier })
+    }
+
+    /// VRAM slots keep only `columns` of `layer`'s role `role` (a resident store's: see [`Columns`]).
+    pub fn keep_columns(&mut self, layer: usize, role: usize, columns: Columns) -> Result<()> {
+        let found = self.roles(layer)?.get(role).copied().ok_or("no such expert role")?;
+        if columns.take == 0 || columns.skip + columns.take > columns.row_bytes || found.bytes % columns.row_bytes != 0 {
+            return Err("an expert role's kept columns lie outside its rows".into());
+        }
+        self.columns.insert((layer, role), columns);
+        Ok(())
+    }
+
+    /// Role `role` of `layer`'s bytes in a VRAM slot, of `bytes` read.
+    fn kept(&self, layer: usize, role: usize, bytes: u64) -> u64 {
+        self.columns.get(&(layer, role)).map_or(bytes, |columns| bytes / columns.row_bytes * columns.take)
     }
 
     fn roles(&self, layer: usize) -> Result<&[Role]> {
@@ -78,17 +105,20 @@ impl Layout {
 
     /// An expert's bytes in a VRAM slot: its roles one after another.
     pub fn slot_bytes(&self) -> u64 {
-        self.layers.iter().flatten().map(|roles| roles.iter().map(|role| role.bytes).sum()).max().unwrap_or(0)
+        self.layers.iter().enumerate()
+            .filter_map(|(layer, roles)| roles.as_ref().map(|roles| roles.iter().enumerate().map(|(index, role)| self.kept(layer, index, role.bytes)).sum()))
+            .max().unwrap_or(0)
     }
 
     /// Where each role's bytes lie in a host slot filled by drive reads.
     fn read_plan(&self, layer: usize, expert: usize) -> Result<Vec<Span>> {
         let mut at = 0u64;
-        self.roles(layer)?.iter().map(|role| {
+        self.roles(layer)?.iter().enumerate().map(|(index, role)| {
             let start = role.base + expert as u64 * role.stride;
             let offset = start & !(ALIGN as u64 - 1);
             let len = (start + role.bytes - offset).next_multiple_of(ALIGN as u64);
-            let span = Span { file: role.file, offset, len, at, data: at + (start - offset), bytes: role.bytes };
+            let span = Span { file: role.file, offset, len, at, data: at + (start - offset), bytes: role.bytes,
+                              columns: self.columns.get(&(layer, index)).copied() };
             at += len;
             Ok(span)
         }).collect()
@@ -96,7 +126,7 @@ impl Layout {
 }
 
 /// A role's aligned read: `len` bytes from `offset` of file `file` to `at` in a host slot, where
-/// the role's `bytes` start at `data`.
+/// the role's `bytes` start at `data` (of which a VRAM slot keeps `columns`, when given).
 struct Span {
     file: usize,
     offset: u64,
@@ -104,6 +134,29 @@ struct Span {
     at: u64,
     data: u64,
     bytes: u64,
+    columns: Option<Columns>,
+}
+
+impl Span {
+    /// Move the kept columns of the role's rows, read to `data` of the host slot at `base`, to the
+    /// start of their rows' place there, row after row; their bytes.
+    ///
+    /// # Safety
+    /// The host slot at `base` holds the span as read, and nothing else uses it meanwhile.
+    unsafe fn keep_columns(&self, base: *mut u8) -> u64 {
+        let Some(columns) = self.columns else { return self.bytes };
+        let rows = self.bytes / columns.row_bytes;
+        for row in 0..rows {
+            // SAFETY: both ranges lie inside the span (each row's kept bytes move to before their
+            // source, after the rows already moved); `copy` allows them to overlap.
+            unsafe {
+                let data = base.add(self.data as usize);
+                std::ptr::copy(data.add((row * columns.row_bytes + columns.skip) as usize), data.add((row * columns.take) as usize),
+                               columns.take as usize);
+            }
+        }
+        rows * columns.take
+    }
 }
 
 /// A pointer a reader thread writes through; the host tier keeps the slot untouched meanwhile.
@@ -422,7 +475,10 @@ impl DeviceExperts {
     /// tier, both shared among the layers.
     pub fn new(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, slots: usize, host_budget: u64)
                -> Result<DeviceExperts> {
-        let largest = Self::sizes(&layout.layers).iter().flatten().map(|size| size.0).max().unwrap_or(0);
+        if !layout.columns.is_empty() {
+            return Err("only a resident expert store keeps some columns of a role".into());
+        }
+        let largest = Self::sizes(&layout.layers, &|_, _, bytes| bytes).iter().flatten().map(|size| size.0).max().unwrap_or(0);
         if slots < 16 || largest == 0 {
             return Err("an expert store needs at least 16 VRAM slots and a layer of experts".into());
         }
@@ -434,7 +490,7 @@ impl DeviceExperts {
     /// class's reserve, and no host tier: once each expert is acquired, none is ever evicted
     /// (see [`resident_bases`](Self::resident_bases)).
     pub fn resident(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, experts: usize) -> Result<DeviceExperts> {
-        if experts == 0 || Self::sizes(&layout.layers).iter().flatten().next().is_none() {
+        if experts == 0 || Self::sizes(&layout.layers, &|_, _, bytes| bytes).iter().flatten().next().is_none() {
             return Err("an expert store needs a layer of experts".into());
         }
         Self::build(gpu, layout, reader, 0, &|share, _, _| share as usize * experts + MAX_RESERVE)
@@ -442,7 +498,15 @@ impl DeviceExperts {
 
     /// The VRAM bytes [`resident`](Self::resident) takes for these layers' roles, `experts` a layer.
     pub fn resident_bytes(layers: &[Option<Vec<Role>>], experts: usize) -> u64 {
-        let sizes = Self::sizes(layers);
+        Self::resident_bytes_keeping(layers, &HashMap::new(), experts)
+    }
+
+    /// [`resident_bytes`](Self::resident_bytes) when slots keep `columns` of roles (layer, role)
+    /// ([`Layout::keep_columns`]).
+    pub fn resident_bytes_keeping(layers: &[Option<Vec<Role>>], columns: &HashMap<(usize, usize), Columns>, experts: usize) -> u64 {
+        let sizes = Self::sizes(layers, &|layer, role, bytes| {
+            columns.get(&(layer, role)).map_or(bytes, |columns| bytes / columns.row_bytes * columns.take)
+        });
         let mut distinct: Vec<u64> = sizes.iter().flatten().map(|size| size.0).collect();
         distinct.sort_unstable();
         distinct.dedup();
@@ -452,9 +516,9 @@ impl DeviceExperts {
 
     /// Each layer's experts' bytes in a VRAM slot (roles back to back) and in a host slot (room for
     /// either layout there: each role's whole blocks as read, or the VRAM slot's).
-    fn sizes(layers: &[Option<Vec<Role>>]) -> Vec<Option<(u64, u64)>> {
-        layers.iter().map(|roles| roles.as_ref().map(|roles| {
-            let vram: u64 = roles.iter().map(|role| role.bytes).sum();
+    fn sizes(layers: &[Option<Vec<Role>>], kept: &dyn Fn(usize, usize, u64) -> u64) -> Vec<Option<(u64, u64)>> {
+        layers.iter().enumerate().map(|(layer, roles)| roles.as_ref().map(|roles| {
+            let vram: u64 = roles.iter().enumerate().map(|(role, found)| kept(layer, role, found.bytes)).sum();
             let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
             (vram.next_multiple_of(256), read.max(vram).next_multiple_of(ALIGN as u64))
         })).collect()
@@ -464,7 +528,7 @@ impl DeviceExperts {
     /// slots, and its layers' share of `host_budget`.
     fn build(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, host_budget: u64, count: &dyn Fn(u64, u64, u64) -> usize)
              -> Result<DeviceExperts> {
-        let sizes = Self::sizes(&layout.layers);
+        let sizes = Self::sizes(&layout.layers, &|layer, role, bytes| layout.kept(layer, role, bytes));
         let mut distinct: Vec<(u64, u64)> = sizes.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
@@ -828,9 +892,12 @@ impl DeviceExperts {
             Content::Read => {
                 let mut at = 0;
                 for span in self.layout.read_plan(layer as usize, expert as usize)? {
+                    // SAFETY: the host slot holds this expert as read, and gives it up below (only a
+                    // resident store keeps columns: no CPU reads its host slots).
+                    let bytes = unsafe { span.keep_columns(base) };
                     // SAFETY: the host slot holds this expert until the mark below completes (busy).
-                    unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), span.bytes)? };
-                    at += span.bytes;
+                    unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), bytes)? };
+                    at += bytes;
                 }
             }
             Content::Packed(written) => {

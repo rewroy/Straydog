@@ -172,7 +172,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let load = |range: std::ops::Range<usize>| dense[range.clone()].iter().sum::<u64>() + if range.end == layers { head } else { 0 };
     // Tensor parallel: half of every layer and of its experts on each of two GPUs, when it fits.
     let mut tensor_batch = settings.batch;
-    let tensor = settings.split_mode == SplitMode::Experts && settings.devices.len() == 2 && Part::fits(&hp, 2).is_ok() && {
+    let tensor = settings.split_mode == SplitMode::Experts && settings.devices.len() == 2 && Part::fits(&hp, 2).is_ok() && 'tensor: {
         let first = Part { index: 0, count: 2 };
         // A part's dense bytes: half of each tensor it slices (heads, rows and vocabulary split
         // evenly), the others whole.
@@ -189,7 +189,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         }).sum();
         let local = first.hparams(&hp);
         let state_part: u64 = (0..layers).map(|layer| layer_state_bytes(&local, settings.context, layer)).sum();
-        let experts_part = Engine::<Pinned>::resident_bytes(&hp, &files, 0..layers, first)?;
+        // (experts whose ffn rows do not split into whole blocks of their format stay split by layers)
+        let Ok(experts_part) = Engine::<Pinned>::resident_bytes(&hp, &files, 0..layers, first) else { break 'tensor false };
         // A pass's rows as below, each a part's work buffers and its linked sums' two inbox slots.
         let row_bytes = engine::batch_row_bytes(&local) + 2 * hp.width as u64 * 4;
         let fixed = dense_part + state_part + experts_part + SCRATCH + RESERVE;

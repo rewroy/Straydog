@@ -1,8 +1,8 @@
 //! One GPU's share of every layer when several split the layers' work (tensor parallel): which
-//! heads, shared-expert rows, routed experts and vocabulary rows it holds, the hyperparameters
+//! heads, shared-expert rows, routed-expert rows and vocabulary rows it holds, the hyperparameters
 //! of its share, and its slices of the dense tensors. Each GPU keeps the whole residual stream;
-//! the out-projections, the shared expert's down and its routed experts give partial sums the
-//! GPUs add together (gpu/device_link.hpp).
+//! the out-projections, the shared expert's down and the routed experts' downs give partial sums
+//! the GPUs add together (gpu/device_link.hpp).
 //!
 //! The split follows the heads' grouping so that every part is a smaller model of the same shape:
 //! - Attention: heads and KV heads in contiguous blocks (a head reads KV head h / (heads /
@@ -12,7 +12,9 @@
 //!   key heads; in the part, local value head j reads local key head j % its key heads, as the
 //!   kernel computes it).
 //! - The shared expert: its ffn rows (gate and up) and the matching columns of its down.
-//! - Routed experts: whole experts, a contiguous block of each layer's per part (expert parallel).
+//! - Routed experts: alike, a block of every expert's ffn rows, so that every part runs every route
+//!   of a step (with whole experts a part, expert parallel, the part with fewer of a step's routes
+//!   waited for the other: their MoE work differed by ~19 us a layer on Qwen3.6).
 //! - The head: a contiguous block of vocabulary rows; the host joins the logits.
 
 use std::ops::Range;
@@ -41,9 +43,9 @@ impl Part {
         self.index * size..(self.index + 1) * size
     }
 
-    /// The routed experts this part runs.
+    /// The routed experts this part runs (each one's block of ffn rows): all of them.
     pub fn experts(&self, hp: &Hparams) -> Range<usize> {
-        self.block(hp.experts)
+        0..hp.experts
     }
 
     /// The vocabulary rows of the head this part computes.
@@ -60,7 +62,7 @@ impl Part {
         even(hp.heads, "attention heads")?;
         even(hp.kv_heads, "KV heads")?;
         even(hp.k_heads, "DeltaNet key heads")?;
-        even(hp.experts, "experts")?;
+        even(hp.expert_ff, "routed expert rows")?;
         even(hp.shared_ff, "shared expert rows")?;
         if !(hp.shared_ff / count).is_multiple_of(256) {
             return Err("qwen35moe shared expert rows split into partial blocks".into());
@@ -75,14 +77,15 @@ impl Part {
         (keys, values)
     }
 
-    /// The hyperparameters of this part: a model of the same shape with its heads, shared-expert
-    /// rows and head rows (the routed experts keep their shape; the part runs some of them).
+    /// The hyperparameters of this part: a model of the same shape with its heads, expert rows
+    /// (routed and shared) and head rows.
     pub fn hparams(&self, hp: &Hparams) -> Hparams {
         let mut local = hp.clone();
         local.heads = hp.heads / self.count;
         local.kv_heads = hp.kv_heads / self.count;
         local.k_heads = hp.k_heads / self.count;
         local.v_heads = hp.v_heads / self.count;
+        local.expert_ff = hp.expert_ff / self.count;
         local.shared_ff = hp.shared_ff / self.count;
         local.vocabulary = self.vocabulary(hp).len();
         local
@@ -223,7 +226,9 @@ mod tests {
         assert_eq!(second.slice(&hp, Some(3), "attn_q_norm"), None);
         assert_eq!(second.slice(&hp, None, "output"), Some(Slice::Rows(vec![124160..248320])));
         let local = second.hparams(&hp);
-        assert_eq!((local.heads, local.kv_heads, local.k_heads, local.v_heads, local.shared_ff, local.vocabulary), (8, 1, 8, 16, 256, 124160));
+        assert_eq!((local.heads, local.kv_heads, local.k_heads, local.v_heads, local.expert_ff, local.shared_ff, local.vocabulary),
+                   (8, 1, 8, 16, 256, 256, 124160));
+        assert_eq!(second.experts(&hp), 0..256);
         assert_eq!(local.conv_channels(), 2 * 8 * d + 16 * d);
     }
 

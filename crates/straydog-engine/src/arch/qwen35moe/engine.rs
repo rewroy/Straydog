@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::part::Part;
 use super::{Hparams, Mixer};
 use crate::arch::Tensors;
-use crate::experts::{Contents, Counts, DeviceExperts, Layout, Reader, Role};
+use crate::experts::{Columns, Contents, Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, CpuExperts, Result};
 use crate::ops::{Buffer, Linear};
@@ -274,8 +274,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let frequency_buffer = floats(&mut gpu, frequencies.len())?;
         gpu.write_buffer(&frequency_buffer, 0, &frequencies)?;
         let files = tensors.files()?;
-        let roles = Self::roles(&hp, tensors, range.clone())?;
-        let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
+        let (roles, columns) = Self::roles(&hp, tensors, range.clone(), part)?;
+        let mut layout = Layout::new(&files, roles, tensors.verifier())?;
+        for (&(layer, role), &kept) in &columns {
+            layout.keep_columns(layer, role, kept)?;
+        }
+        let layout = Arc::new(layout);
         let reader = Arc::new(Reader::new(READERS));
         let experts = if settings.resident {
             DeviceExperts::resident(&mut gpu, layout, reader, part.experts(&hp).len())?
@@ -466,24 +470,45 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// The VRAM bytes the resident experts of `layers` take ([`Settings::resident`]) on a GPU with
     /// `part` of them.
     pub fn resident_bytes(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>, part: Part) -> Result<u64> {
-        Ok(DeviceExperts::resident_bytes(&Self::roles(hp, tensors, layers)?, part.experts(hp).len()))
+        let (roles, columns) = Self::roles(hp, tensors, layers, part)?;
+        Ok(DeviceExperts::resident_bytes_keeping(&roles, &columns, part.experts(hp).len()))
     }
 
-    /// Each of `layers`' routed experts as three roles of the file (a slot holds them back to back).
-    fn roles(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>) -> Result<Vec<Option<Vec<Role>>>> {
+    /// Each of `layers`' routed experts as three roles of the file (a slot holds them back to back),
+    /// of `part`'s block of their ffn rows: its rows of gate and up, and the columns of down a slot
+    /// keeps of each of its rows.
+    #[allow(clippy::type_complexity)]
+    fn roles(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>, part: Part)
+             -> Result<(Vec<Option<Vec<Role>>>, HashMap<(usize, usize), Columns>)> {
         let mut roles = vec![None; hp.layers()];
+        let mut columns = HashMap::new();
         for layer in layers {
             let mut layer_roles = Vec::new();
-            for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+            for (index, role) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].into_iter().enumerate() {
                 let tensor_name = name(layer, role);
                 let tensor = tensors.tensor(&tensor_name)?;
                 let (file, base) = tensors.location(&tensor_name).ok_or("the expert store needs the model's files")?;
-                let bytes = (row_bytes(tensor.kind, tensor.dims[0])? * tensor.dims[1]) as u64;
-                layer_roles.push(Role { file, base, stride: bytes, bytes });
+                let (cols, rows) = (tensor.dims[0], tensor.dims[1]);
+                let row = row_bytes(tensor.kind, cols)?;
+                let stride = (row * rows) as u64;
+                if index < 2 {
+                    let block = part.block(rows);
+                    layer_roles.push(Role { file, base: base + (block.start * row) as u64, stride, bytes: (block.len() * row) as u64 });
+                    continue;
+                }
+                layer_roles.push(Role { file, base, stride, bytes: stride });
+                if !part.is_whole() {
+                    let block = part.block(cols);
+                    let bytes = |count: usize| if count == 0 { Some(0) } else { formats::matrix_bytes(tensor.kind, 1, count) };
+                    let (Some(skip), Some(take)) = (bytes(block.start), bytes(block.len())) else {
+                        return Err(format!("a part's columns of {tensor_name} split a block"));
+                    };
+                    columns.insert((layer, index), Columns { row_bytes: row as u64, skip: skip as u64, take: take as u64 });
+                }
             }
             roles[layer] = Some(layer_roles);
         }
-        Ok(roles)
+        Ok((roles, columns))
     }
 
     /// Run a decode step's routes to experts in the host tier on the CPU (their weights read where
