@@ -71,10 +71,12 @@ pub fn host_tier(settings: &Settings, beyond_vram: u64) -> u64 {
     })
 }
 
-/// `parts` consecutive layer ranges covering `layers`, cut only at `cuts`, with the fewest bytes
-/// on the fullest part (`load` of a range); None when there are too few cuts.
-pub fn split_layers(layers: usize, cuts: &[usize], load: &dyn Fn(std::ops::Range<usize>) -> u64, parts: usize)
+/// `parts` consecutive layer ranges covering `layers`, cut only at `cuts`, the fullest part (its
+/// `load` over its device's budget, `budgets` in part order) as empty as it can be; None when
+/// there are too few cuts.
+pub fn split_layers(layers: usize, cuts: &[usize], load: &dyn Fn(std::ops::Range<usize>) -> u64, budgets: &[u64])
                     -> Option<Vec<std::ops::Range<usize>>> {
+    let parts = budgets.len();
     if parts <= 1 {
         return Some(std::iter::once(0..layers).collect());
     }
@@ -82,8 +84,9 @@ pub fn split_layers(layers: usize, cuts: &[usize], load: &dyn Fn(std::ops::Range
         return None;
     }
     // Over every choice of cuts (few layers: exhaustive DP). best[part][end]: the fullest part's
-    // bytes and the part ends, for `part` parts ending at `end`.
-    type Choice = Option<(u64, Vec<usize>)>;
+    // share of its budget and the part ends, for `part` parts ending at `end`.
+    type Choice = Option<(u128, Vec<usize>)>;
+    let share = |range: std::ops::Range<usize>, part: usize| ((load(range) as u128) << 64) / budgets[part].max(1) as u128;
     let mut best: Vec<Vec<Choice>> = vec![vec![None; layers + 1]; parts + 1];
     best[0][0] = Some((0, Vec::new()));
     for part in 1..=parts {
@@ -93,7 +96,7 @@ pub fn split_layers(layers: usize, cuts: &[usize], load: &dyn Fn(std::ops::Range
             let mut choice: Choice = None;
             for start in starts {
                 if let Some((worst, path)) = &best[part - 1][start] {
-                    let candidate = (*worst).max(load(start..end));
+                    let candidate = (*worst).max(share(start..end, part - 1));
                     if choice.as_ref().is_none_or(|(value, _)| candidate < *value) {
                         let mut path = path.clone();
                         path.push(end);
@@ -115,8 +118,8 @@ pub struct Settings {
     /// With several GPUs: Experts splits every layer across them (experts by rows), Layer gives
     /// each a range of layers.
     pub split_mode: SplitMode,
-    /// VRAM budget per GPU.
-    pub vram_bytes: u64,
+    /// Each GPU's VRAM budget, in `devices` order.
+    pub vram_bytes: Vec<u64>,
     pub context: usize,
     /// Most tokens one pass takes (a prompt is prefilled in chunks of this many).
     pub batch: usize,

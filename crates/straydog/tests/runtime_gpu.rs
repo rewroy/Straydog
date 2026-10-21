@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use futures::StreamExt;
-use straydog::config::{self, Options};
+use straydog::config::{self, Options, Vram};
 use straydog::runtime::{self, Runtime};
 use straydog_api::{Engine, EngineState};
 use straydog_engine::pyjson;
@@ -58,7 +58,7 @@ fn main() {
         model: Some(PathBuf::from(model)),
         model_draft: std::env::var_os("STRAYDOG_DRAFTER").map(PathBuf::from),
         gpu: Some(vec![0, 1]),
-        vram: Some(30.0),
+        vram: Some(Vram::Gib(vec![30.0])),
         ctx_size: Some(32768),
         // The shards' verity trees: in STRAYDOG_DATA_DIR, else a scratch directory (built there
         // first, as the server does; the bundle's own directory is only read here).

@@ -71,7 +71,7 @@ enum Command {
     },
     /// The isolated engine (started by the server)
     #[command(hide = true)]
-    Worker(worker::WorkerArgs),
+    Worker(Box<worker::WorkerArgs>),
     /// Windows: start the worker in its AppContainer (started by the server)
     #[command(hide = true)]
     Contain {
@@ -96,7 +96,7 @@ fn main() -> ExitCode {
             straydog_provision::fetch_drafter(&directory, keep_source, &progress::report)
                 .map(|path| println!("verified {}", path.display()))
         }
-        Some(Command::Worker(args)) => worker::main(args),
+        Some(Command::Worker(args)) => worker::main(*args),
         #[cfg(windows)]
         Some(Command::Contain { args }) => return ExitCode::from(straydog_isolation::launcher_main(&args) as u8),
         #[cfg(not(windows))]

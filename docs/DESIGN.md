@@ -184,10 +184,10 @@ option, named as llama-server names it where it has the same setting.
 | `-md, --model-draft DIR` | MTP drafter directory | none |
 | `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
-| `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget, and for the models read on demand; Qwen3.5 MoE takes fewer when an eighth of the GPU budget, or a quarter of the room its weights and state leave, cannot hold them) |
+| `-b, --batch-size N` | prefill batch, 1-4096 | 1024 (4096 with 48 GiB or more of GPU budget in all, and for the models read on demand; Qwen3.5 MoE takes fewer when an eighth of the GPU budget, or a quarter of the room its weights and state leave, cannot hold them) |
 | `-gpu, --gpu LIST` | GPU ordinals, e.g. `0,1` (`-dev`, `--device` also accepted) | `0` |
-| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs; for a model read on demand, `experts` splits every layer across the GPUs) | `experts` |
-| `--vram GIB` | VRAM budget per GPU | 6 |
+| `-sm, --split-mode MODE` | `layer` or `experts` (two fully resident GPUs; for a model read on demand, `experts` splits every layer across the GPUs; GPUs whose budgets differ by more than a tenth split by layers, each taking layers in proportion to its budget) | `experts` |
+| `--vram GIB[,GIB...]\|auto` | VRAM budget: one for every GPU, or one per GPU in `--gpu` order (`30,10` for a 32 GB and a 12 GB card). Given budgets wait up to a minute for that much free memory | `auto`: each GPU's free memory less max(512 MiB, 3%), once 90% of it is free or its free memory has stopped growing for 5 s (at most a minute) |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--row-cache MIB` | host memory caching rows of the PLE table (or a model's Engram table), read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
 | `--data-dir DIR` | Straydog's data directory: the shards' verity trees, built there at the first start (reads after loading are checked against them, §3), and the expert store's warm-up state | `.straydog` in the model directory |

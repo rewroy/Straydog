@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use straydog::config::{Effort, Gemm, Settings, SplitMode};
+use straydog::config::{Effort, Gemm, Settings, SplitMode, Vram};
 use straydog::dashboard::{self, Dashboard};
 use straydog::monitor::{LogBuffer, LogSink};
 use straydog::runtime::Runtime;
@@ -20,10 +20,10 @@ fn settings() -> Settings {
         model_draft: None,
         draft_max: 0,
         ctx_size: 8192,
-        batch_size: 1024,
+        batch_size: Some(1024),
         gpu: vec![0],
         split_mode: SplitMode::Experts,
-        vram: 6.0,
+        vram: Vram::Gib(vec![6.0]),
         state_ram: 0.0,
         row_cache: 256,
         gemm: Gemm::Fp16,

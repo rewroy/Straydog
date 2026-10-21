@@ -193,16 +193,18 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let Ok(experts_part) = Engine::<Pinned>::resident_bytes(&hp, &files, 0..layers, first) else { break 'tensor false };
         // A pass's rows as below, each a part's work buffers and its linked sums' two inbox slots.
         let row_bytes = engine::batch_row_bytes(&local) + 2 * hp.width as u64 * 4;
+        // (the parts hold equal shares: the smaller budget bounds both)
+        let vram = settings.vram_bytes.iter().copied().min().unwrap_or(0);
         let fixed = dense_part + state_part + experts_part + SCRATCH + RESERVE;
-        let room = settings.vram_bytes.saturating_sub(fixed);
-        let fits = ((settings.vram_bytes / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
+        let room = vram.saturating_sub(fixed);
+        let fits = ((vram / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
         tensor_batch = settings.batch.min(fits.max(64));
-        fixed + tensor_batch as u64 * row_bytes <= settings.vram_bytes
+        fixed + tensor_batch as u64 * row_bytes <= vram
     };
     let parts = if tensor {
         vec![0..layers; 2]
     } else {
-        served::split_layers(layers, &cuts, &load, settings.devices.len())
+        served::split_layers(layers, &cuts, &load, &settings.vram_bytes)
             .ok_or_else(|| format!("the model cannot be split across {} GPUs", settings.devices.len()))?
     };
     // The largest of a part's layers' experts: the store takes VRAM as so many of these.
@@ -213,19 +215,20 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let state = |range: &std::ops::Range<usize>| -> u64 { range.clone().map(|layer| layer_state_bytes(&hp, settings.context, layer)).sum() };
     // A prefill pass reads each routed expert its rows need once: the longer the pass, the fewer
     // reads (with 64 rows, a 4K-token prompt read nearly every expert 64 times). Its rows' work
-    // buffers take at most an eighth of each GPU's budget and a quarter of what the GPU with the
-    // least room has left after its fixed bytes; the expert slots keep the rest.
+    // buffers take at most an eighth of each GPU's budget and a quarter of what it has left after
+    // its fixed bytes; the expert slots keep the rest.
     let row_bytes = engine::batch_row_bytes(&hp);
     let base = |range: &std::ops::Range<usize>| load(range.clone()) + state(range) + SCRATCH + RESERVE;
-    let room = parts.iter().map(|range| settings.vram_bytes.saturating_sub(base(range))).min().unwrap_or(0);
-    let fits = ((settings.vram_bytes / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
+    let fits = parts.iter().zip(&settings.vram_bytes).map(|(range, &vram)| {
+        ((vram / 8).min(vram.saturating_sub(base(range)) / 4) / row_bytes) as usize / 64 * 64
+    }).min().unwrap_or(0);
     let batch = if tensor { tensor_batch } else { settings.batch.min(fits.max(64)) };
     let total_experts: u64 = expert_bytes.iter().sum();
     let (mut slots, mut resident) = (Vec::new(), Vec::new());
-    for range in parts.iter().filter(|_| !tensor) {
+    for (range, (&vram, device)) in parts.iter().zip(settings.vram_bytes.iter().zip(&settings.devices)).filter(|_| !tensor) {
         let fixed = base(range) + batch as u64 * row_bytes;
-        let free = settings.vram_bytes.checked_sub(fixed).ok_or_else(|| {
-            format!("layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64)
+        let free = vram.checked_sub(fixed).ok_or_else(|| {
+            format!("layers {range:?} need more than {:.1} GiB of VRAM on GPU {device}", vram as f64 / (1u64 << 30) as f64)
         })?;
         // A GPU with room for every expert of its layers keeps them all.
         resident.push(Engine::<Pinned>::resident_bytes(&hp, &files, range.clone(), Part::WHOLE)? <= free);
@@ -283,7 +286,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     part: if tensor { Part { index: part, count: 2 } } else { Part::WHOLE },
                     half_gemm: settings.half_gemm,
                 };
-                engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes, engine_settings)?);
+                engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes[part], engine_settings)?);
             }
             if tensor {
                 link(&mut engines, batch)?;

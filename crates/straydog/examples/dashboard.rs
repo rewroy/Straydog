@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use straydog::config::{Effort, Gemm, Settings, SplitMode};
+use straydog::config::{Effort, Gemm, Settings, SplitMode, Vram};
 use straydog::dashboard::{self, Dashboard};
 use straydog::monitor::{LogBuffer, LogSink};
 use straydog::runtime::Runtime;
@@ -39,10 +39,10 @@ fn main() {
         model_draft: Some(PathBuf::from("/simulated/Qwen3.8-Flash-Next-MTP")),
         draft_max: 3,
         ctx_size: 262_144,
-        batch_size: 4096,
+        batch_size: Some(4096),
         gpu: vec![0, 1],
         split_mode: SplitMode::Experts,
-        vram: 30.0,
+        vram: Vram::Gib(vec![30.0]),
         state_ram: 0.0,
         row_cache: 256,
         gemm: Gemm::Fp16,

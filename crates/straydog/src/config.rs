@@ -24,6 +24,63 @@ pub enum Gemm {
     Fp16,
 }
 
+/// A VRAM budget for each GPU: its free memory less a margin (`auto`), or GiB, one value for
+/// every GPU or one per GPU in `--gpu` order (`30,10` for a 32 GB and a 12 GB card).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Vram {
+    Auto,
+    Gib(Vec<f64>),
+}
+
+impl std::str::FromStr for Vram {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Vram, String> {
+        if text.trim().eq_ignore_ascii_case("auto") {
+            return Ok(Vram::Auto);
+        }
+        text.split(',')
+            .map(|part| part.trim().parse::<f64>().map_err(|_| format!("invalid VRAM budget {text:?}: auto, GiB, or GiB per GPU (30,10)")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vram::Gib)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vram {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vram, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Number(f64),
+            Text(String),
+            List(Vec<f64>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Number(gib) => Ok(Vram::Gib(vec![gib])),
+            Raw::Text(text) => text.parse().map_err(serde::de::Error::custom),
+            Raw::List(gib) => Ok(Vram::Gib(gib)),
+        }
+    }
+}
+
+impl std::fmt::Display for Vram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Vram::Auto => f.write_str("auto"),
+            Vram::Gib(gib) => f.write_str(&gib.iter().map(f64::to_string).collect::<Vec<_>>().join(",")),
+        }
+    }
+}
+
+impl Vram {
+    /// Each of `gpus` GPUs' budget in bytes, None for `auto` (the worker sizes it).
+    pub fn bytes(&self, gpus: usize) -> Option<Vec<u64>> {
+        match self {
+            Vram::Auto => None,
+            Vram::Gib(gib) => Some((0..gpus).map(|gpu| (gib[if gib.len() == 1 { 0 } else { gpu }] * (1u64 << 30) as f64) as u64).collect()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -65,9 +122,9 @@ pub struct Options {
     /// With two GPUs holding the whole model: experts splits every layer's experts, layer splits the layers (also -sm) [default: experts]
     #[arg(long = "split-mode", env = "STRAYDOG_SPLIT_MODE", value_name = "MODE")]
     pub split_mode: Option<SplitMode>,
-    /// VRAM budget per GPU in GiB [default: 6]
+    /// VRAM budget per GPU in GiB: one value for every GPU, one per GPU (30,10), or auto, each GPU's free memory less a margin [default: auto]
     #[arg(long, env = "STRAYDOG_VRAM", value_name = "GIB")]
-    pub vram: Option<f64>,
+    pub vram: Option<Vram>,
     /// Host memory for sequence state in GiB [default: what the context needs]
     #[arg(long, env = "STRAYDOG_STATE_RAM", value_name = "GIB")]
     pub state_ram: Option<f64>,
@@ -142,10 +199,11 @@ pub struct Settings {
     pub model_draft: Option<PathBuf>,
     pub draft_max: u8,
     pub ctx_size: u32,
-    pub batch_size: u16,
+    /// None: chosen by the worker from the GPUs' budgets (`--vram auto`).
+    pub batch_size: Option<u16>,
     pub gpu: Vec<usize>,
     pub split_mode: SplitMode,
-    pub vram: f64,
+    pub vram: Vram,
     pub state_ram: f64,
     /// MiB.
     pub row_cache: u32,
@@ -329,15 +387,26 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if gpu.is_empty() || gpu.len() > 4 || distinct.len() != gpu.len() {
         return Err("GPU ordinals must be one to four distinct numbers".into());
     }
-    let vram = options.vram.unwrap_or(6.0);
-    if !(0.01..=256.0).contains(&vram) {
-        return Err("--vram must be between 0.01 and 256 GiB".into());
+    let vram = options.vram.unwrap_or(Vram::Auto);
+    if let Vram::Gib(gib) = &vram {
+        if gib.is_empty() || gib.iter().any(|gib| !(0.01..=256.0).contains(gib)) {
+            return Err("--vram must be auto or between 0.01 and 256 GiB a GPU".into());
+        }
+        if gib.len() > 1 && gib.len() != gpu.len() {
+            return Err(format!("--vram gives {} budgets for {} GPUs: give one, or one per GPU", gib.len(), gpu.len()));
+        }
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
     // The bundles read on demand read each routed expert a pass needs once per pass: the longer
     // the pass, the fewer reads. Qwen3.5 MoE's placement takes fewer rows when the GPU budget
     // has not the room.
-    let batch_size = options.batch_size.unwrap_or(if on_demand || gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
+    // With the budgets left to the worker, it chooses the same way from those it finds.
+    let total = vram.bytes(gpu.len()).map(|bytes| bytes.iter().sum::<u64>());
+    let batch_size = options.batch_size.or(match total {
+        _ if on_demand => Some(4096),
+        Some(total) => Some(if total >= 48 << 30 { 4096 } else { 1024 }),
+        None => None,
+    });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
     let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
@@ -432,7 +501,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("model_draft", path(&settings.model_draft)),
         ("draft_max", settings.draft_max.to_string()),
         ("ctx_size", settings.ctx_size.to_string()),
-        ("batch_size", settings.batch_size.to_string()),
+        ("batch_size", settings.batch_size.map_or_else(|| "(from the GPUs' budgets)".into(), |batch| batch.to_string())),
         ("gpu", settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),
         ("split_mode", format!("{:?}", settings.split_mode).to_lowercase()),
         ("vram", settings.vram.to_string()),
@@ -482,7 +551,10 @@ mod tests {
 
     /// A model directory holding (empty) files named like one bundle's shards.
     fn bundle_directory(quant: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!("straydog-config-{quant}-{}", std::process::id()));
+        // (one per call: the tests run in parallel, each removing its own)
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!("straydog-config-{quant}-{}-{}", std::process::id(),
+                                                          NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::create_dir_all(&directory).unwrap();
         for shard in bundle::shards(quant).unwrap() {
             std::fs::write(directory.join(shard.name), b"").unwrap();
@@ -507,7 +579,7 @@ mod tests {
         assert_eq!(beside.data_dir, model.canonicalize().unwrap().join(".straydog"));
         let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
         assert_eq!((settings.quant.as_str(), settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-UD-IQ2_XXS"));
-        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (4096, Some(48.0), data.canonicalize().unwrap()));
+        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (Some(4096), Some(48.0), data.canonicalize().unwrap()));
         assert!(parse(&["--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
         let worker = crate::runtime::worker_args(&settings);
         let text: Vec<String> = worker.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
@@ -525,7 +597,7 @@ mod tests {
         for (quant, alias) in [("UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL"), ("Q8_0", "Ornith-1.5-122B-Q8_0")] {
             let model = bundle_directory(quant);
             let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
-            assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, 4096));
+            assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, Some(4096)));
             let shard = model.join(&bundle::shards(quant).unwrap()[0].name);
             assert_eq!(resolve(Options { model: Some(shard), ..Options::default() }).unwrap().quant, quant);
             std::fs::remove_dir_all(model).unwrap();
@@ -575,9 +647,9 @@ mod tests {
         std::env::remove_var("STRAYDOG_PORT");
         let (options, sources) = load(&matches, Some(&file)).unwrap();
         let settings = resolve(options).unwrap();
-        assert_eq!((settings.vram, settings.port, settings.gpu.clone()), (30.0, 9100, vec![0, 1]));
+        assert_eq!((settings.vram.clone(), settings.port, settings.gpu.clone()), (Vram::Gib(vec![30.0]), 9100, vec![0, 1]));
         assert_eq!(settings.quant, "IQ3_S");
-        assert_eq!(settings.batch_size, 4096);   // 2 x 30 GiB of GPU budget
+        assert_eq!(settings.batch_size, Some(4096));   // 2 x 30 GiB of GPU budget
         assert_eq!(settings.ctx_size, 32768);
         assert_eq!(settings.state_ram, 2.0);     // what 32768 tokens of state need, rounded up
         assert_eq!(settings.alias, "Qwen3.8-Flash-Next-IQ3_S");
@@ -591,6 +663,36 @@ mod tests {
         assert!(line("host").ends_with("[default]"));
         std::fs::write(&file, "unknown = 1\n").unwrap();
         assert!(load(&command().try_get_matches_from(Vec::<&str>::new()).unwrap(), Some(&file)).is_err());
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    #[test]
+    fn vram_is_auto_one_budget_or_one_per_gpu() {
+        let model = bundle_directory("IQ3_S");
+        let resolved = |args: &[&str], file: Option<&str>| {
+            let path = model.join("vram.toml");
+            if let Some(text) = file {
+                std::fs::write(&path, format!("model = {:?}\n{text}\n", model.display())).unwrap();
+            }
+            let mut argv = vec!["--model".to_string(), model.display().to_string()];
+            argv.extend(args.iter().map(|arg| arg.to_string()));
+            let matches = command().try_get_matches_from(&argv).unwrap();
+            load(&matches, file.map(|_| path.as_path())).and_then(|(options, _)| resolve(options))
+        };
+        let settings = resolved(&["--gpu", "0,1"], None).unwrap();
+        assert_eq!((settings.vram.clone(), settings.batch_size), (Vram::Auto, None));
+        let settings = resolved(&["--gpu", "0,1", "--vram", "30,10"], None).unwrap();
+        assert_eq!(settings.vram.bytes(2), Some(vec![30 << 30, 10 << 30]));
+        assert_eq!(settings.batch_size, Some(1024));   // 40 GiB in all
+        assert_eq!(resolved(&["--gpu", "0,1", "--vram", "8"], None).unwrap().vram.bytes(2), Some(vec![8 << 30, 8 << 30]));
+        assert_eq!(resolved(&["--gpu", "0,1", "--vram", "auto"], None).unwrap().vram, Vram::Auto);
+        assert!(resolved(&["--gpu", "0,1", "--vram", "30,10,5"], None).unwrap_err().contains("3 budgets for 2 GPUs"));
+        assert!(resolved(&["--vram", "0"], None).is_err());
+        assert!(command().try_get_matches_from(["--vram", "lots"]).is_err());
+        for (text, expected) in [("vram = 20", Vram::Gib(vec![20.0])), ("vram = [24, 11]", Vram::Gib(vec![24.0, 11.0])),
+                                 ("vram = \"24,11\"", Vram::Gib(vec![24.0, 11.0])), ("vram = \"auto\"", Vram::Auto)] {
+            assert_eq!(resolved(&["--gpu", "0,1"], Some(text)).unwrap().vram, expected, "{text}");
+        }
         std::fs::remove_dir_all(model).unwrap();
     }
 

@@ -15,7 +15,7 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::{Effort, Gemm, Settings, SplitMode};
+use crate::config::{Effort, Gemm, Settings, SplitMode, Vram};
 use crate::monitor::{Host, LogBuffer};
 use crate::runtime::Runtime;
 
@@ -189,7 +189,8 @@ fn describe(settings: &Settings) -> Value {
         "batch_size": settings.batch_size,
         "devices": settings.gpu,
         "split_mode": match settings.split_mode { SplitMode::Experts => "experts", SplitMode::Layer => "layer" },
-        "vram_gib": settings.vram,
+        // (null: sized from each GPU's free memory)
+        "vram_gib": match &settings.vram { Vram::Auto => None, Vram::Gib(gib) => Some(gib) },
         "state_ram_gib": settings.state_ram,
         "gemm": match settings.gemm { Gemm::Fp16 => "fp16", Gemm::Fp32 => "fp32" },
         "gemm_min_batch": settings.gemm_min_batch,

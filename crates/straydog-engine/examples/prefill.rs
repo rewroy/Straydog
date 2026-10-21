@@ -53,7 +53,7 @@ fn main() -> Result<(), String> {
     let devices: Vec<usize> = devices.split(',').map(|device| device.parse().unwrap()).collect();
     let budget = (vram.parse::<f64>().unwrap() * (1u64 << 30) as f64) as u64;
     let started = Instant::now();
-    let mut group = Group::new(&devices, budget, split)?;
+    let mut group = Group::new(&devices, &vec![budget; devices.len()], split)?;
     group.configure_gemm(gemm_min_batch, half_gemm)?;
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;

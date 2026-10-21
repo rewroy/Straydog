@@ -13,12 +13,11 @@ use straydog_engine::arch::served::{Engines, Session, Settings};
 use straydog_engine::arch::{deepseek41, qwen35moe};
 use straydog_engine::bundle;
 use straydog_engine::chat::ChatTemplate;
-use straydog_engine::group::SplitMode;
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 
-use crate::worker::{refused, serve, Failure, Output, Served, WorkerArgs};
+use crate::worker::{refused, serve, Failure, Output, Plan, Served, WorkerArgs};
 
 /// The model and its template, on the thread that made them: the engines hold device state that
 /// stays on one thread.
@@ -77,24 +76,24 @@ impl Served for Handle {
     }
 }
 
-pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
+pub(crate) fn main(args: &WorkerArgs, plan: &Plan, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
     match bundle::architecture_of(&args.quant)?.as_str() {
-        "deepseek41" => run::<deepseek41::serve::Engines>(args, output, report, deepseek41::serve::place),
-        "qwen35moe" => run::<qwen35moe::serve::Engines>(args, output, report, qwen35moe::serve::place),
+        "deepseek41" => run::<deepseek41::serve::Engines>(args, plan, output, report, deepseek41::serve::place),
+        "qwen35moe" => run::<qwen35moe::serve::Engines>(args, plan, output, report, qwen35moe::serve::place),
         other => Err(format!("no engine for the {other} architecture")),
     }
 }
 
-fn run<E: Engines + 'static>(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync), place: Place<E>)
-                             -> Result<(), String> {
+fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync),
+                             place: Place<E>) -> Result<(), String> {
     let data_dir = args.data_dir.as_deref().ok_or("a bundle read on demand needs its data directory (the verity trees)")?;
     let host_memory_bytes = if args.host_memory_bytes > 0 { args.host_memory_bytes } else { straydog_engine::host::host_memory_bytes() };
     let settings = Settings {
         devices: args.devices.clone(),
-        split_mode: if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts },
-        vram_bytes: args.vram_bytes,
+        split_mode: plan.split,
+        vram_bytes: plan.budgets.clone(),
         context: args.context,
-        batch: args.prefill_batch_size,
+        batch: plan.batch,
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
         row_cache_bytes: args.row_cache_bytes,

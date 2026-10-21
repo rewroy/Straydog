@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::Parser;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use straydog::config::{self, Options};
+use straydog::config::{self, Options, Vram};
 use straydog::runtime::{self, Runtime};
 use straydog_api::{Engine, EngineState};
 use straydog_engine::pyjson;
@@ -170,7 +170,7 @@ fn main() {
         model: Some(args.model.clone()),
         model_draft: args.drafter.clone(),
         gpu: Some(args.devices.clone()),
-        vram: Some(args.vram),
+        vram: Some(Vram::Gib(vec![args.vram])),
         ctx_size: Some(args.ctx),
         data_dir: args.data_dir.clone(),
         ..Options::default()

@@ -31,7 +31,7 @@ fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &
     let budget = (placement["vram_gib"].as_f64().unwrap() * (1u64 << 30) as f64) as u64;
     let split = if placement["split_mode"] == "layer" { SplitMode::Layer } else { SplitMode::Experts };
     let speculative = placement["speculative"].as_u64().unwrap() as usize;
-    let mut group = Group::new(&devices, budget, split).unwrap();
+    let mut group = Group::new(&devices, &vec![budget; devices.len()], split).unwrap();
     group.configure_gemm(2, true).unwrap();
     let mut weights = Weights::open(&PathBuf::from(model_root), quantization,
                                     (speculative > 0).then(|| PathBuf::from(drafter)).as_deref(),

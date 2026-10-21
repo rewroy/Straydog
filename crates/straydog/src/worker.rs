@@ -40,12 +40,14 @@ pub struct WorkerArgs {
     pub split_mode: String,
     #[arg(long)]
     pub context: usize,
+    /// Each GPU's VRAM budget in bytes (comma separated, one per device), or auto.
     #[arg(long)]
-    pub vram_bytes: u64,
+    pub vram_bytes: String,
     #[arg(long)]
     pub state_ram_bytes: u64,
+    /// Tokens a prefill pass takes, or auto (from the budgets).
     #[arg(long)]
-    pub prefill_batch_size: usize,
+    pub prefill_batch_size: String,
     /// Bytes of the PLE row cache (0: rows through the page cache).
     #[arg(long, default_value_t = straydog_engine::rows::DEFAULT_CACHE_BYTES)]
     pub row_cache_bytes: u64,
@@ -150,45 +152,109 @@ fn warm_up(model: &mut Model) -> Result<(), String> {
 /// How long a GPU's memory held by another process is waited for.
 const VRAM_PATIENCE: Duration = Duration::from_secs(60);
 
-/// Wait until every GPU has the budget free. A worker started right after the last one ended
-/// (a restart) can find its memory still held while the driver frees it; memory another
-/// process keeps fails the start after [`VRAM_PATIENCE`]. A GPU smaller than the budget is
-/// left to fail as it does.
-fn await_vram(devices: &[usize], budget: u64, report: &dyn Fn(&str, u64, u64)) -> Result<(), String> {
+/// What the worker settles before placing the model: each GPU's VRAM budget, the prefill batch
+/// and the split.
+pub(crate) struct Plan {
+    pub budgets: Vec<u64>,
+    pub batch: usize,
+    pub split: SplitMode,
+}
+
+/// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more.
+fn margin(total: u64) -> u64 {
+    (512 << 20).max(total / 100 * 3)
+}
+
+/// How long `auto` waits for a GPU's free memory to stop growing (a previous worker releasing it).
+const SETTLE: Duration = Duration::from_secs(5);
+
+/// Each GPU's budget. Given ones wait until the GPU has them free: memory a previous worker still
+/// holds is released after it exits, while memory another process keeps fails the start after
+/// [`VRAM_PATIENCE`] (a GPU smaller than its budget is left to fail as it does). `auto` waits
+/// until nine tenths of each GPU are free or its free memory has stopped growing for [`SETTLE`]
+/// (at most as long), then takes what is free less a margin, in whole 256 MiB: a display's or
+/// another program's share is left to it.
+fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> Result<Vec<u64>, String> {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let wanted: Option<Vec<u64>> = if given == "auto" {
+        None
+    } else {
+        let bytes = given.split(',').map(|part| part.parse::<u64>().map_err(|_| format!("invalid Straydog VRAM budget {given:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if bytes.len() != devices.len() {
+            return Err("one Straydog VRAM budget per GPU".into());
+        }
+        Some(bytes)
+    };
     let started = Instant::now();
-    for &device in devices {
+    let mut chosen = Vec::new();
+    for (index, &device) in devices.iter().enumerate() {
+        // (the most free memory seen and when it last grew by more than 64 MiB)
+        let mut grown = (0u64, Instant::now());
         loop {
             let (_, free, total) = straydog_gpu::device_info(device).map_err(|exc| exc.to_string())?;
-            if free >= budget || total < budget {
-                break;
-            }
-            if started.elapsed() >= VRAM_PATIENCE {
-                let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-                return Err(format!("GPU {device} has {:.1} GiB free for a {:.1} GiB budget after {} s: another process holds its memory",
-                                   gib(free), gib(budget), VRAM_PATIENCE.as_secs()));
-            }
-            report("vram", free, budget);
+            let need = match &wanted {
+                Some(bytes) if free >= bytes[index] || total < bytes[index] => {
+                    chosen.push(bytes[index]);
+                    break;
+                }
+                Some(bytes) if started.elapsed() >= VRAM_PATIENCE => {
+                    return Err(format!("GPU {device} has {:.1} GiB free for a {:.1} GiB budget after {} s: another process holds its memory",
+                                       gib(free), gib(bytes[index]), VRAM_PATIENCE.as_secs()));
+                }
+                Some(bytes) => bytes[index],
+                None => {
+                    if free > grown.0 + (64 << 20) {
+                        grown = (free, Instant::now());
+                    }
+                    // (memory another program keeps is left to it)
+                    if free >= total / 10 * 9 || grown.1.elapsed() >= SETTLE || started.elapsed() >= VRAM_PATIENCE {
+                        chosen.push(free.saturating_sub(margin(total)) / (256 << 20) * (256 << 20));
+                        break;
+                    }
+                    total / 10 * 9
+                }
+            };
+            report("vram", free, need);
             std::thread::sleep(Duration::from_millis(250));
         }
     }
-    Ok(())
+    if chosen.iter().any(|&budget| budget < 1 << 30) {
+        return Err(format!("too little free GPU memory for Straydog: {} GiB",
+                           chosen.iter().map(|&bytes| format!("{:.1}", gib(bytes))).collect::<Vec<_>>().join(", ")));
+    }
+    Ok(chosen)
+}
+
+/// The budgets, batch and split for `args`. Budgets more than a tenth apart do not split every
+/// layer across the GPUs (each would take the smaller share): the layers are split instead, in
+/// proportion to the budgets.
+pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result<Plan, String> {
+    let budgets = budgets(&args.devices, &args.vram_bytes, report)?;
+    let batch = match args.prefill_batch_size.as_str() {
+        "auto" => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
+        given => given.parse().map_err(|_| format!("invalid Straydog prefill batch {given:?}"))?,
+    };
+    let (least, most) = (*budgets.iter().min().unwrap(), *budgets.iter().max().unwrap());
+    let split = if args.split_mode == "layer" || most - least > most / 10 { SplitMode::Layer } else { SplitMode::Experts };
+    Ok(Plan { budgets, batch, split })
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
-    await_vram(&args.devices, args.vram_bytes, &|stage, done, total| loading.report(stage, done, total))?;
+    let plan = plan(&args, &|stage, done, total| loading.report(stage, done, total))?;
     if straydog_engine::bundle::is_on_demand(&args.quant) {
-        return crate::worker_on_demand::main(&args, output, &|stage, done, total| loading.report(stage, done, total));
+        return crate::worker_on_demand::main(&args, &plan, output, &|stage, done, total| loading.report(stage, done, total));
     }
-    let split = if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts };
+    let split = plan.split;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
     let opened = Instant::now();
     // The model files open while the GPUs initialize.
     let (group, weights) = std::thread::scope(|scope| {
         let weights = scope.spawn(|| Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report));
-        let group = Group::new(&args.devices, args.vram_bytes, split)
+        let group = Group::new(&args.devices, &plan.budgets, split)
             .and_then(|mut group| group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16").map(|()| group));
         (group, weights.join().unwrap())
     });
@@ -206,7 +272,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let settings = Settings {
         context: args.context,
         state_budget_bytes: args.state_ram_bytes,
-        prefill_batch_size: args.prefill_batch_size,
+        prefill_batch_size: plan.batch,
         speculative: args.speculative,
         cpu_threads: 0,
         row_cache_bytes: args.row_cache_bytes,
@@ -232,7 +298,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
-                      "prefill_batch_size": model.prefill_batch_size},
+                      "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
+                      "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" }},
         "load_seconds": seconds,
         "gpu": model.info()?,
     }));

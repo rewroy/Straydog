@@ -6,7 +6,7 @@ use std::sync::Arc;
 use clap::ArgMatches;
 use straydog_api::ReasoningEffort;
 
-use straydog::config::{self, Effort};
+use straydog::config::{self, Effort, Vram};
 use straydog::dashboard::{self, Dashboard};
 use straydog::monitor::{LogBuffer, LogSink};
 use straydog::runtime::{self, Runtime};
@@ -51,13 +51,13 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
         tracing::info!(
-            "Straydog starting: {} from {}, GPU {} with {} GiB each, context {}, prefill batch {}, {}",
+            "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}, {}",
             settings.quant,
             settings.model.display(),
             settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
-            settings.vram,
+            match &settings.vram { Vram::Auto => "auto".into(), budgets => format!("{budgets} GiB") },
             settings.ctx_size,
-            settings.batch_size,
+            settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()),
             match (&settings.model_draft, settings.draft_max) {
                 (Some(_), drafts) if drafts > 0 => format!("MTP drafter with {drafts} drafts"),
                 _ => "no drafter".into(),

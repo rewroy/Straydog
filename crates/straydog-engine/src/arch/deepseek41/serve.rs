@@ -87,15 +87,15 @@ impl served::Engines for Engines {
 }
 
 /// Layer ranges, one per device, splitting where no layer reads an earlier part's compressed rows
-/// and balancing the dense bytes (the head with the last part).
-fn split(hp: &Hparams, dense: &[u64], head: u64, parts: usize) -> Result<Vec<std::ops::Range<usize>>, String> {
+/// and balancing the dense bytes (the head with the last part) in proportion to the budgets.
+fn split(hp: &Hparams, dense: &[u64], head: u64, budgets: &[u64]) -> Result<Vec<std::ops::Range<usize>>, String> {
     let layers = hp.layers.len();
     let valid = |at: usize| {
         hp.layers[at..].iter().all(|plan| plan.compressed.is_none_or(|c| c.kv_source >= at && c.index_source >= at))
     };
     let cuts: Vec<usize> = (1..layers).filter(|&at| valid(at)).collect();
     let load = |range: std::ops::Range<usize>| dense[range.clone()].iter().sum::<u64>() + if range.end == layers { head } else { 0 };
-    served::split_layers(layers, &cuts, &load, parts).ok_or_else(|| format!("DeepSeek-V4.1 cannot be split across {parts} GPUs"))
+    served::split_layers(layers, &cuts, &load, budgets).ok_or_else(|| format!("DeepSeek-V4.1 cannot be split across {} GPUs", budgets.len()))
 }
 
 fn layer_of(name: &str) -> Option<usize> {
@@ -132,7 +132,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         SplitMode::Experts => vec![(settings.devices.clone(), 0..layers)],
         SplitMode::Layer => {
             let dense: Vec<u64> = whole.iter().zip(&parted).map(|(a, b)| a + b).collect();
-            let ranges = split(&hp, &dense, head_whole + head_parted, settings.devices.len())?;
+            let ranges = split(&hp, &dense, head_whole + head_parted, &settings.vram_bytes)?;
             settings.devices.iter().zip(ranges).map(|(&device, range)| (vec![device], range)).collect()
         }
     };
@@ -154,17 +154,21 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let total_experts: u64 = expert_bytes.iter().sum();
     // Per engine: the experts its devices hold in VRAM together (each device its rows of every
     // one), from what each device has left after its resident share, state and work buffers.
+    // An engine's budget: the least of its devices' (its devices hold equal shares).
+    let budget = |devices: &[usize]| devices.iter()
+        .map(|device| settings.vram_bytes[settings.devices.iter().position(|other| other == device).unwrap()]).min().unwrap_or(0);
     let mut slots = Vec::new();
     for group in &groups {
         let (devices, range) = group;
+        let vram = budget(devices);
         let parts = devices.len() as u64;
         let head = if range.end == layers { head_whole + head_parted.div_ceil(parts) } else { 0 };
         let resident: u64 = range.clone().map(|layer| whole[layer] + parted[layer].div_ceil(parts)).sum::<u64>() + head;
         // a pass of up to the batch's rows, layer by layer: its buffers of every row
         let rows = settings.batch as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
         let fixed = resident + state(range) + rows + SCRATCH + RESERVE;
-        let free = settings.vram_bytes.checked_sub(fixed)
-            .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64))?;
+        let free = vram.checked_sub(fixed)
+            .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM on GPU {devices:?}", vram as f64 / (1u64 << 30) as f64))?;
         // Each device's share of an expert is 1/parts of a slot: free / share experts.
         let held = (free / (slot_bytes(group) / parts)) as usize;
         slots.push(held.min(range.len() * hp.experts) / devices.len() * devices.len());
@@ -200,7 +204,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     scratch_bytes: SCRATCH,
                     layers: range.clone(),
                 };
-                engines.push(Engine::new(hp.clone(), files, devices, settings.vram_bytes, engine_settings)?);
+                engines.push(Engine::new(hp.clone(), files, devices, budget(devices), engine_settings)?);
             }
             Ok::<_, String>(())
         })();

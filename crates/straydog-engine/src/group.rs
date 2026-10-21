@@ -29,14 +29,18 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn new(devices: &[usize], budget: u64, split_mode: SplitMode) -> Result<Group> {
+    /// One backend per device, each with its own VRAM budget (`budgets`, in `devices` order).
+    pub fn new(devices: &[usize], budgets: &[u64], split_mode: SplitMode) -> Result<Group> {
         let mut distinct = devices.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
         if devices.is_empty() || devices.len() > 4 || distinct.len() != devices.len() {
             return Err("Straydog requires one to four distinct GPU ordinals".into());
         }
-        let backends = devices.iter().map(|&device| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
+        if budgets.len() != devices.len() {
+            return Err("Straydog needs one VRAM budget per GPU".into());
+        }
+        let backends = devices.iter().zip(budgets).map(|(&device, &budget)| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
@@ -94,29 +98,32 @@ impl Group {
         for bytes in layer_bytes {
             prefix.push(prefix.last().unwrap() + bytes);
         }
-        let mut best: Option<u64> = None;
+        let budgets = self.backends.iter().map(|backend| backend.memory().map(|(_, budget)| budget.max(1))).collect::<Result<Vec<_>>>()?;
+        let mut best: Option<u128> = None;
         let mut starts = self.starts.clone();
-        // Every choice of count - 1 split points in lexicographic order; the first minimum wins.
-        fn search(first: usize, chosen: &mut Vec<usize>, count: usize, prefix: &[u64], tail: u64,
-                  best: &mut Option<u64>, starts: &mut Vec<usize>) {
+        // Every choice of count - 1 split points in lexicographic order; the first minimum of the
+        // fullest device (its bytes over its budget) wins.
+        #[allow(clippy::too_many_arguments)]
+        fn search(first: usize, chosen: &mut Vec<usize>, count: usize, prefix: &[u64], tail: u64, budgets: &[u64],
+                  best: &mut Option<u128>, starts: &mut Vec<usize>) {
             if chosen.len() == count - 1 {
                 let bounds: Vec<usize> = std::iter::once(0).chain(chosen.iter().copied()).chain([48]).collect();
                 let mut loads: Vec<u64> = (0..count).map(|i| prefix[bounds[i + 1]] - prefix[bounds[i]]).collect();
                 *loads.last_mut().unwrap() += tail;
-                let largest = *loads.iter().max().unwrap();
-                if best.is_none_or(|best| largest < best) {
-                    *best = Some(largest);
+                let fullest = loads.iter().zip(budgets).map(|(&load, &budget)| ((load as u128) << 64) / budget as u128).max().unwrap();
+                if best.is_none_or(|best| fullest < best) {
+                    *best = Some(fullest);
                     *starts = std::iter::once(0).chain(chosen.iter().copied()).collect();
                 }
                 return;
             }
             for split in first..48 - (count - 2 - chosen.len()) {
                 chosen.push(split);
-                search(split + 1, chosen, count, prefix, tail, best, starts);
+                search(split + 1, chosen, count, prefix, tail, budgets, best, starts);
                 chosen.pop();
             }
         }
-        search(1, &mut Vec::new(), count, &prefix, tail, &mut best, &mut starts);
+        search(1, &mut Vec::new(), count, &prefix, tail, &budgets, &mut best, &mut starts);
         self.starts = starts;
         Ok(())
     }
