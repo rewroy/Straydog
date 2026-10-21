@@ -284,14 +284,17 @@ constexpr size_t tm_prepare_max_dim = 1024;
 __global__ void tm_attention_prepare_kernel(const float* q_full, float* k, const float* v, size_t heads, size_t kv_heads, size_t dim,
                                             const float* q_weight, const float* k_weight, float eps, size_t pairs,
                                             const int32_t* positions, const float* frequencies, float* q, float* gate, float* keys,
-                                            float* values) {
+                                            float* values, size_t context) {
     const size_t row = blockIdx.y, vector = blockIdx.x, kv_width = kv_heads * dim;
     const unsigned t = threadIdx.x;
     const int32_t at = positions[row];
     const size_t position = size_t(at);
+    // (a position outside the cache writes no row of it)
+    const bool cached = at >= 0 && position < context;
     if (vector >= heads + kv_heads) {
         const size_t head = vector - heads - kv_heads;
         const float* source = v + (row * kv_heads + head) * dim;
+        if (!cached) return;
         float* target = values + position * kv_width + head * dim;
         for (size_t col = t; col < dim; col += blockDim.x) target[col] = source[col];
         return;
@@ -326,10 +329,10 @@ __global__ void tm_attention_prepare_kernel(const float* q_full, float* k, const
     } else {
         const size_t head = vector - heads;
         float* own = k + (row * kv_heads + head) * dim;
-        float* cached = keys + position * kv_width + head * dim;
+        float* row_of_keys = keys + position * kv_width + head * dim;
         for (size_t col = t; col < dim; col += blockDim.x) {
             own[col] = normed[col];
-            cached[col] = normed[col];
+            if (cached) row_of_keys[col] = normed[col];
         }
     }
 }
@@ -347,8 +350,8 @@ constexpr size_t tm_attention_max_splits = 64;
 // F32 throughout; keys past a row's position are left out. Output times sigmoid(gate) when given.
 constexpr int tm_rows_r = 16, tm_rows_k = 16, tm_rows_dim = 256;
 __global__ void __launch_bounds__(256) tm_attention_rows_kernel(const float* q, const float* keys, const float* values,
-                                                               const int32_t* positions, size_t rows, size_t heads, size_t kv_heads,
-                                                               float scale, const float* gate, float* out) {
+                                                               const int32_t* positions, size_t context, size_t rows, size_t heads,
+                                                               size_t kv_heads, float scale, const float* gate, float* out) {
     constexpr int R = tm_rows_r, K = tm_rows_k, D = tm_rows_dim;
     __shared__ float qs[R][D], ks[K][D + 1], vs[K][D], ps[R][K];
     const size_t h = blockIdx.y, kh = h / (heads / kv_heads), r0 = size_t(blockIdx.x) * R;
@@ -360,8 +363,9 @@ __global__ void __launch_bounds__(256) tm_attention_rows_kernel(const float* q, 
         qs[i / D][i % D] = r < rows ? q[(r * heads + h) * D + i % D] : 0.0f;
     }
     size_t length = 0;
-    for (size_t r = r0; r < std::min(rows, r0 + R); ++r) length = std::max(length, size_t(positions[r]) + 1);
-    const size_t mine = valid ? size_t(positions[my_row]) + 1 : 1;
+    // (a position past the cache reads no key past it)
+    for (size_t r = r0; r < std::min(rows, r0 + R); ++r) length = std::max(length, std::min(size_t(positions[r]) + 1, context));
+    const size_t mine = valid ? std::min(size_t(positions[my_row]) + 1, context) : 1;
     float m = -INFINITY, l = 0.0f, acc[D / 16];
     #pragma unroll
     for (int c = 0; c < D / 16; ++c) acc[c] = 0.0f;
@@ -512,13 +516,35 @@ __global__ void tm_scale_rows_kernel(float* x, const float* scalars, size_t coun
     if (index < count) x[index] *= tm_sigmoid(scalars[index / width]);
 }
 
+// An op's sizes from the caller's counts, checked: the product of counts (an error when it
+// overflows, so that an op_span check never passes on a wrapped size), the bytes of that many
+// floats, blocks of 256 threads over a count, and a launch dimension (at most `limit`).
+inline size_t checked_product(std::initializer_list<uint64_t> factors) {
+    uint64_t product = 1;
+    for (const uint64_t factor : factors)
+        if (__builtin_mul_overflow(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(product);
+}
+inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
+    return checked_product({uint64_t(checked_product(factors)), 4});
+}
+inline unsigned checked_blocks(size_t count) {
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
+    return unsigned(blocks);
+}
+inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
+    if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
+    return unsigned(count);
+}
+
 int sd_op_conv_silu(void* handle, float* x, float* history, const float* taps, uint64_t channels, uint64_t kernel, uint64_t steps) {
     SD_OP_BEGIN
     if (!channels || !kernel || kernel > tm_max_kernel || !steps) throw std::runtime_error("invalid Straydog convolution shape");
-    op_span(value, x, size_t(steps * channels) * 4, "a convolution input");
-    if (kernel > 1) op_span(value, history, size_t((kernel - 1) * channels) * 4, "a convolution history");
-    op_span(value, taps, size_t(kernel * channels) * 4, "convolution taps");
-    tm_conv_silu_kernel<<<op_blocks(size_t(channels)), 256, 0, value.stream>>>(x, history, taps, size_t(channels), size_t(kernel),
+    op_span(value, x, checked_floats({steps, channels}), "a convolution input");
+    if (kernel > 1) op_span(value, history, checked_floats({kernel - 1, channels}), "a convolution history");
+    op_span(value, taps, checked_floats({kernel, channels}), "convolution taps");
+    tm_conv_silu_kernel<<<checked_blocks(size_t(channels)), 256, 0, value.stream>>>(x, history, taps, size_t(channels), size_t(kernel),
                                                                             size_t(steps));
     SD_OP_END
 }
@@ -526,16 +552,16 @@ int sd_op_conv_silu(void* handle, float* x, float* history, const float* taps, u
 int sd_op_delta_rule(void* handle, const float* qkv, const float* beta, const float* alpha, const float* dt, const float* a, float* state,
                      uint64_t k_heads, uint64_t v_heads, uint64_t dim, uint64_t steps, float eps, float* out) {
     SD_OP_BEGIN
-    if (!k_heads || !v_heads || v_heads % k_heads || !steps || (dim != 64 && dim != 128))
+    if (!k_heads || !v_heads || v_heads % k_heads || v_heads > 65535 || !steps || (dim != 64 && dim != 128))
         throw std::runtime_error("invalid Straydog delta rule shape (key and value dimensions of 64 or 128)");
-    const size_t channels = size_t((2 * k_heads + v_heads) * dim);
-    op_span(value, qkv, size_t(steps) * channels * 4, "a delta rule input");
-    op_span(value, beta, size_t(steps * v_heads) * 4, "delta rule betas");
-    op_span(value, alpha, size_t(steps * v_heads) * 4, "delta rule alphas");
-    op_span(value, dt, size_t(v_heads) * 4, "a delta rule time step bias");
-    op_span(value, a, size_t(v_heads) * 4, "delta rule decays");
-    op_span(value, state, size_t(v_heads * dim * dim) * 4, "a delta rule state");
-    op_span(value, out, size_t(steps * v_heads * dim) * 4, "a delta rule output");
+    const size_t channels = checked_product({2 * k_heads + v_heads, dim});
+    op_span(value, qkv, checked_floats({steps, channels}), "a delta rule input");
+    op_span(value, beta, checked_floats({steps, v_heads}), "delta rule betas");
+    op_span(value, alpha, checked_floats({steps, v_heads}), "delta rule alphas");
+    op_span(value, dt, checked_floats({v_heads}), "a delta rule time step bias");
+    op_span(value, a, checked_floats({v_heads}), "delta rule decays");
+    op_span(value, state, checked_floats({v_heads, dim, dim}), "a delta rule state");
+    op_span(value, out, checked_floats({steps, v_heads, dim}), "a delta rule output");
     if (dim == 128)
         tm_delta_rule_wave_kernel<<<dim3(unsigned(v_heads), 4), 32, 0, value.stream>>>(qkv, beta, alpha, dt, a, state, size_t(k_heads),
                                                                                     size_t(v_heads), size_t(steps), eps, out);
@@ -549,19 +575,19 @@ int sd_op_delta_step(void* handle, const float* qkv, float* history, const float
                      const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim,
                      float eps, const float* gate, const float* weight, float* out) {
     SD_OP_BEGIN
-    if (dim != 128 || !k_heads || v_heads != 2 * k_heads || !kernel || kernel > tm_max_kernel) return 1;   // not taken
-    const size_t channels = size_t((2 * k_heads + v_heads) * dim);
-    op_span(value, qkv, channels * 4, "a delta step input");
-    if (kernel > 1) op_span(value, history, (size_t(kernel) - 1) * channels * 4, "a convolution history");
-    op_span(value, taps, size_t(kernel) * channels * 4, "convolution taps");
-    op_span(value, beta, size_t(v_heads) * 4, "delta rule betas");
-    op_span(value, alpha, size_t(v_heads) * 4, "delta rule alphas");
-    op_span(value, dt, size_t(v_heads) * 4, "a delta rule time step bias");
-    op_span(value, a, size_t(v_heads) * 4, "delta rule decays");
-    op_span(value, state, size_t(v_heads * dim * dim) * 4, "a delta rule state");
-    op_span(value, gate, size_t(v_heads * dim) * 4, "a gated norm gate");
-    op_span(value, weight, size_t(dim) * 4, "a gated norm weight");
-    op_span(value, out, size_t(v_heads * dim) * 4, "a gated norm output");
+    if (dim != 128 || !k_heads || k_heads > 32767 || v_heads != 2 * k_heads || !kernel || kernel > tm_max_kernel) return 1;   // not taken
+    const size_t channels = checked_product({2 * k_heads + v_heads, dim});
+    op_span(value, qkv, checked_floats({channels}), "a delta step input");
+    if (kernel > 1) op_span(value, history, checked_floats({kernel - 1, channels}), "a convolution history");
+    op_span(value, taps, checked_floats({kernel, channels}), "convolution taps");
+    op_span(value, beta, checked_floats({v_heads}), "delta rule betas");
+    op_span(value, alpha, checked_floats({v_heads}), "delta rule alphas");
+    op_span(value, dt, checked_floats({v_heads}), "a delta rule time step bias");
+    op_span(value, a, checked_floats({v_heads}), "delta rule decays");
+    op_span(value, state, checked_floats({v_heads, dim, dim}), "a delta rule state");
+    op_span(value, gate, checked_floats({v_heads, dim}), "a gated norm gate");
+    op_span(value, weight, checked_floats({dim}), "a gated norm weight");
+    op_span(value, out, checked_floats({v_heads, dim}), "a gated norm output");
     tm_delta_step_kernel<2><<<unsigned(k_heads), 256, 0, value.stream>>>(qkv, history, taps, size_t(kernel), beta, alpha, dt, a, state,
                                                                        size_t(k_heads), size_t(v_heads), eps, gate, weight, out);
     SD_OP_END
@@ -571,11 +597,11 @@ int sd_op_gated_norm(void* handle, const float* x, const float* gate, const floa
                      float* out) {
     SD_OP_BEGIN
     if (!rows || !width) throw std::runtime_error("invalid Straydog gated norm shape");
-    op_span(value, x, size_t(rows * width) * 4, "a gated norm input");
-    op_span(value, gate, size_t(rows * width) * 4, "a gated norm gate");
-    op_span(value, weight, size_t(width) * 4, "a gated norm weight");
-    op_span(value, out, size_t(rows * width) * 4, "a gated norm output");
-    tm_gated_norm_kernel<<<unsigned(rows), 256, 0, value.stream>>>(x, gate, weight, size_t(width), eps, out);
+    op_span(value, x, checked_floats({rows, width}), "a gated norm input");
+    op_span(value, gate, checked_floats({rows, width}), "a gated norm gate");
+    op_span(value, weight, checked_floats({width}), "a gated norm weight");
+    op_span(value, out, checked_floats({rows, width}), "a gated norm output");
+    tm_gated_norm_kernel<<<checked_dim(rows, INT32_MAX), 256, 0, value.stream>>>(x, gate, weight, size_t(width), eps, out);
     SD_OP_END
 }
 
@@ -584,34 +610,36 @@ int sd_op_attention_prepare(void* handle, const float* q_full, float* k, const f
                             const int32_t* positions, const float* frequencies, float* q, float* gate, float* keys, float* values,
                             uint64_t context) {
     SD_OP_BEGIN
-    if (!rows || rows > 65535 || !heads || !kv_heads || !dim || dim > tm_prepare_max_dim || rope_dims % 2 || rope_dims > dim)
+    if (!rows || rows > 65535 || !heads || heads > 1024 || !kv_heads || kv_heads > 1024 || !dim || dim > tm_prepare_max_dim ||
+        rope_dims % 2 || rope_dims > dim || !context)
         throw std::runtime_error("invalid Straydog attention prepare shape");
-    const size_t kv_width = size_t(kv_heads * dim);
-    op_span(value, q_full, size_t(rows * heads * 2 * dim) * 4, "an attention query projection");
-    op_span(value, k, size_t(rows) * kv_width * 4, "attention keys");
-    op_span(value, v, size_t(rows) * kv_width * 4, "attention values");
-    op_span(value, q_weight, size_t(dim) * 4, "a query norm weight");
-    op_span(value, k_weight, size_t(dim) * 4, "a key norm weight");
-    op_span(value, positions, size_t(rows) * 4, "rope positions");
-    if (rope_dims) op_span(value, frequencies, size_t(rope_dims / 2) * 4, "rope frequencies");
-    op_span(value, q, size_t(rows * heads * dim) * 4, "attention queries");
-    op_span(value, gate, size_t(rows * heads * dim) * 4, "attention gates");
-    op_span(value, keys, size_t(context) * kv_width * 4, "a key cache");
-    op_span(value, values, size_t(context) * kv_width * 4, "a value cache");
-    const dim3 grid(unsigned(heads + 2 * kv_heads), unsigned(rows));
+    const size_t kv_width = checked_product({kv_heads, dim});
+    op_span(value, q_full, checked_floats({rows, heads, 2 * dim}), "an attention query projection");
+    op_span(value, k, checked_floats({rows, kv_width}), "attention keys");
+    op_span(value, v, checked_floats({rows, kv_width}), "attention values");
+    op_span(value, q_weight, checked_floats({dim}), "a query norm weight");
+    op_span(value, k_weight, checked_floats({dim}), "a key norm weight");
+    op_span(value, positions, checked_floats({rows}), "rope positions");
+    if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
+    op_span(value, q, checked_floats({rows, heads, dim}), "attention queries");
+    op_span(value, gate, checked_floats({rows, heads, dim}), "attention gates");
+    op_span(value, keys, checked_floats({context, kv_width}), "a key cache");
+    op_span(value, values, checked_floats({context, kv_width}), "a value cache");
+    const dim3 grid(checked_dim(heads + 2 * kv_heads), checked_dim(rows));
     tm_attention_prepare_kernel<<<grid, 256, 0, value.stream>>>(q_full, k, v, size_t(heads), size_t(kv_heads), size_t(dim), q_weight,
                                                                 k_weight, eps, size_t(rope_dims / 2), positions, frequencies, q, gate,
-                                                                keys, values);
+                                                                keys, values, size_t(context));
     SD_OP_END
 }
 
 int sd_op_split(void* handle, const float* x, uint64_t rows, uint64_t width, float* first, float* second) {
     SD_OP_BEGIN
     if (!rows || !width) throw std::runtime_error("invalid Straydog split shape");
-    op_span(value, x, size_t(rows * 2 * width) * 4, "a split input");
-    op_span(value, first, size_t(rows * width) * 4, "a split output");
-    op_span(value, second, size_t(rows * width) * 4, "a split output");
-    tm_split_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(x, size_t(rows * width), size_t(width), first, second);
+    op_span(value, x, checked_floats({rows, 2, width}), "a split input");
+    op_span(value, first, checked_floats({rows, width}), "a split output");
+    op_span(value, second, checked_floats({rows, width}), "a split output");
+    const size_t count = checked_product({rows, width});
+    tm_split_kernel<<<checked_blocks(count), 256, 0, value.stream>>>(x, count, size_t(width), first, second);
     SD_OP_END
 }
 
@@ -619,11 +647,11 @@ int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, u
                       const int32_t* positions, const float* frequencies) {
     SD_OP_BEGIN
     if (!rows || !vectors || !rope_dims || rope_dims % 2 || rope_dims > width) throw std::runtime_error("invalid Straydog rope shape");
-    op_span(value, x, size_t(rows * vectors * width) * 4, "a rotated buffer");
-    op_span(value, positions, size_t(rows) * 4, "rope positions");
-    op_span(value, frequencies, size_t(rope_dims / 2) * 4, "rope frequencies");
-    const size_t count = size_t(rows * vectors * (rope_dims / 2));
-    tm_rope_halves_kernel<<<op_blocks(count), 256, 0, value.stream>>>(x, count, size_t(vectors), size_t(width), size_t(rope_dims / 2),
+    op_span(value, x, checked_floats({rows, vectors, width}), "a rotated buffer");
+    op_span(value, positions, checked_floats({rows}), "rope positions");
+    op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
+    const size_t count = checked_product({rows, vectors, rope_dims / 2});
+    tm_rope_halves_kernel<<<checked_blocks(count), 256, 0, value.stream>>>(x, count, size_t(vectors), size_t(width), size_t(rope_dims / 2),
                                                                      positions, frequencies);
     SD_OP_END
 }
@@ -632,18 +660,19 @@ int sd_op_attention(void* handle, const float* q, const float* keys, const float
                     uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch,
                     uint64_t scratch_bytes, float* out) {
     SD_OP_BEGIN
-    if (!rows || !heads || !kv_heads || heads % kv_heads || !dim || dim > tm_attention_max_dim || !context || rows * heads > 65535 * 64)
+    if (!rows || !heads || !kv_heads || heads % kv_heads || !dim || dim > tm_attention_max_dim || !context ||
+        checked_product({rows, heads}) > 65535 * 64)
         throw std::runtime_error("invalid Straydog attention shape");
-    op_span(value, q, size_t(rows * heads * dim) * 4, "attention queries");
-    op_span(value, keys, size_t(context * kv_heads * dim) * 4, "attention keys");
-    op_span(value, values, size_t(context * kv_heads * dim) * 4, "attention values");
-    op_span(value, positions, size_t(rows) * 4, "attention positions");
-    if (gate) op_span(value, gate, size_t(rows * heads * dim) * 4, "an attention gate");
-    op_span(value, out, size_t(rows * heads * dim) * 4, "an attention output");
+    op_span(value, q, checked_floats({rows, heads, dim}), "attention queries");
+    op_span(value, keys, checked_floats({context, kv_heads, dim}), "attention keys");
+    op_span(value, values, checked_floats({context, kv_heads, dim}), "attention values");
+    op_span(value, positions, checked_floats({rows}), "attention positions");
+    if (gate) op_span(value, gate, checked_floats({rows, heads, dim}), "an attention gate");
+    op_span(value, out, checked_floats({rows, heads, dim}), "an attention output");
     // Many rows (a prefill pass): blocks of 16 rows sharing each tile of keys.
     if (rows >= 16 && dim == tm_rows_dim && (rows + tm_rows_r - 1) / tm_rows_r <= 65535 && heads <= 65535) {
         tm_attention_rows_kernel<<<dim3(unsigned((rows + tm_rows_r - 1) / tm_rows_r), unsigned(heads)), 256, 0, value.stream>>>(
-            q, keys, values, positions, size_t(rows), size_t(heads), size_t(kv_heads), scale, gate, out);
+            q, keys, values, positions, size_t(context), size_t(rows), size_t(heads), size_t(kv_heads), scale, gate, out);
         check(hipGetLastError());
         return 0;
     }
@@ -663,16 +692,19 @@ int sd_op_attention(void* handle, const float* q, const float* keys, const float
 
 int sd_op_add(void* handle, const float* x, uint64_t count, float* out) {
     SD_OP_BEGIN
-    op_span(value, x, size_t(count) * 4, "an addend");
-    op_span(value, out, size_t(count) * 4, "a sum");
-    tm_add_kernel<<<op_blocks(size_t(count)), 256, 0, value.stream>>>(x, size_t(count), out);
+    if (!count) throw std::runtime_error("invalid Straydog add shape");
+    op_span(value, x, checked_floats({count}), "an addend");
+    op_span(value, out, checked_floats({count}), "a sum");
+    tm_add_kernel<<<checked_blocks(size_t(count)), 256, 0, value.stream>>>(x, size_t(count), out);
     SD_OP_END
 }
 
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width) {
     SD_OP_BEGIN
-    op_span(value, x, size_t(rows * width) * 4, "scaled rows");
-    op_span(value, scalars, size_t(rows) * 4, "row scalars");
-    tm_scale_rows_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(x, scalars, size_t(rows * width), size_t(width));
+    if (!rows || !width) throw std::runtime_error("invalid Straydog scale shape");
+    op_span(value, x, checked_floats({rows, width}), "scaled rows");
+    op_span(value, scalars, checked_floats({rows}), "row scalars");
+    const size_t count = checked_product({rows, width});
+    tm_scale_rows_kernel<<<checked_blocks(count), 256, 0, value.stream>>>(x, scalars, count, size_t(width));
     SD_OP_END
 }

@@ -181,11 +181,12 @@ void fused_matrices(Device& value, const sd_linear* items, size_t count, const f
     output = nullptr;
     for (size_t i = 0; i < count; ++i) {
         const sd_linear& item = items[i];
-        if (!item.rows || !item.cols || item.input != input || uintptr_t(item.output) % 4)
+        if (!item.rows || item.rows > (uint64_t(1) << 24) || item.first_row > (uint64_t(1) << 32) || !item.cols || item.cols > 8192 ||
+            item.input != input || uintptr_t(item.output) % 4)
             throw std::runtime_error("invalid Straydog fused linear");
         const size_t row_bytes = matrix_row_bytes(item.kind, item.cols);
-        op_span(value, item.weights, size_t(item.first_row + item.rows) * row_bytes, "a weight matrix");
-        op_span(value, item.output, size_t(item.rows) * 4, "a linear output");
+        op_span(value, item.weights, checked_product({item.first_row + item.rows, row_bytes}), "a weight matrix");
+        op_span(value, item.output, checked_floats({item.rows}), "a linear output");
         matrices[i] = {static_cast<const uint8_t*>(item.weights) + item.first_row * row_bytes, row_bytes, size_t(item.rows),
                        size_t(item.cols), 0, 0, 0, item.kind};
         output = !output || item.output < output ? item.output : output;
@@ -242,20 +243,20 @@ namespace {
 void swiglu_linear(Device& value, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up,
                    const float* scale, float* hidden, float* out, const float* route_logits, uint64_t route_k, int32_t* route_ids,
                    float* route_weights) {
-    if (!rows || !cols || cols > 8192) throw std::runtime_error("invalid Straydog SwiGLU linear");
+    if (!rows || rows > (uint64_t(1) << 24) || !cols || cols > 8192) throw std::runtime_error("invalid Straydog SwiGLU linear");
     if (route_logits) {
         if (!route_k || route_k > 64) throw std::runtime_error("invalid Straydog route shape");
         op_span(value, route_logits, 256 * 4, "router logits");
         op_span(value, route_ids, size_t(route_k) * 4, "routed experts");
         op_span(value, route_weights, size_t(route_k) * 4, "routing weights");
     }
-    op_span(value, gate, size_t(cols) * 4, "a gate projection");
-    op_span(value, up, size_t(cols) * 4, "an up projection");
+    op_span(value, gate, checked_floats({cols}), "a gate projection");
+    op_span(value, up, checked_floats({cols}), "an up projection");
     if (scale) op_span(value, scale, 4, "a row scale");
-    op_span(value, hidden, size_t(cols) * 4, "a SwiGLU output");
+    op_span(value, hidden, checked_floats({cols}), "a SwiGLU output");
     const size_t row_bytes = matrix_row_bytes(kind, cols);
-    op_span(value, weights, size_t(rows) * row_bytes, "a weight matrix");
-    op_span(value, out, size_t(rows) * 4, "a linear output");
+    op_span(value, weights, checked_product({rows, row_bytes}), "a weight matrix");
+    op_span(value, out, checked_floats({rows}), "a linear output");
     const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
     FixedGemv list;
     size_t waves = 0;

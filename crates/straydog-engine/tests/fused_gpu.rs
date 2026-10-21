@@ -7,6 +7,7 @@
 //! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
 //!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
 //!   64 rotated dimensions): the same bits.
+//! - shapes whose sizes overflow, or whose launch would not fit, are refused;
 //! - sd_op_swiglu_linear_route against sd_op_swiglu_linear and sd_op_route (Qwen3.6's shared expert
 //!   down on one of two GPUs, 256 experts, top 8): the same bits.
 //!
@@ -213,4 +214,26 @@ fn routes_picked_beside_the_shared_expert_match_the_route_op() {
     assert_eq!(read(&mut gpu, &out_1, rows), read(&mut gpu, &out_2, rows), "outputs");
     assert_eq!(read(&mut gpu, &ids_1, k), read(&mut gpu, &ids_2, k), "routes");
     assert_eq!(read(&mut gpu, &weights_1, k), read(&mut gpu, &weights_2, k), "weights");
+}
+
+#[test]
+fn shapes_that_overflow_are_refused() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let buffer = gpu.buffer(1 << 20).unwrap();
+    let floats = upload(&mut gpu, &[0.0; 256]);
+    let huge = 1u64 << 62;
+    // counts whose products wrap past the address space
+    assert!(gpu.add(buffer.base(), huge, buffer.base()).is_err());
+    assert!(gpu.split(buffer.base(), huge, 8, buffer.base(), buffer.base()).is_err());
+    assert!(gpu.gated_norm(buffer.base(), buffer.base(), &floats, huge, 1 << 4, 1e-6, buffer.base()).is_err());
+    assert!(gpu.rope_halves(buffer.base(), huge, 4, 8, 4, &floats, &floats).is_err());
+    assert!(gpu.scale_rows(buffer.base(), buffer.base(), 4, huge).is_err());
+    // heads beyond a launch's dimensions, a context whose cache size wraps
+    assert!(gpu.attention_prepare(buffer.base(), buffer.base(), buffer.base(), 1, 1 << 40, 1, 64, &floats, &floats, 1e-6, 0, &floats,
+                                  &floats, buffer.base(), buffer.base(), buffer.base(), buffer.base(), 16).is_err());
+    assert!(gpu.attention_prepare(buffer.base(), buffer.base(), buffer.base(), 1, 1, 1 << 40, 64, &floats, &floats, 1e-6, 0, &floats,
+                                  &floats, buffer.base(), buffer.base(), buffer.base(), buffer.base(), 16).is_err());
+    assert!(gpu.attention_prepare(buffer.base(), buffer.base(), buffer.base(), 1, 1, 1, 64, &floats, &floats, 1e-6, 0, &floats, &floats,
+                                  buffer.base(), buffer.base(), buffer.base(), buffer.base(), huge).is_err());
+    assert!(gpu.swiglu_linear(&buffer, 8, huge, 256, buffer.base(), buffer.base(), None, buffer.base(), buffer.base()).is_err());
 }

@@ -181,12 +181,13 @@ int sd_op_linear_link_sum(void* handle, const void* weights, int kind, uint64_t 
                           float* out) {
     SD_OP_BEGIN
     SumLink& link = value.sums;
-    if (!link.peer || !rows || !cols || rows > link.capacity) throw std::runtime_error("invalid Straydog linked linear");
+    if (!link.peer || !rows || !cols || cols > (uint64_t(1) << 24) || rows > link.capacity)
+        throw std::runtime_error("invalid Straydog linked linear");
     const size_t row_bytes = matrix_row_bytes(kind, cols);
-    op_span(value, weights, size_t(rows) * row_bytes, "a weight matrix");
-    op_span(value, input, size_t(cols) * 4, "a linear input");
-    op_span(value, part, size_t(rows) * 4, "a linked sum's part");
-    op_span(value, out, size_t(rows) * 4, "a linked sum");
+    op_span(value, weights, checked_product({rows, row_bytes}), "a weight matrix");
+    op_span(value, input, checked_floats({cols}), "a linear input");
+    op_span(value, part, checked_floats({rows}), "a linked sum's part");
+    op_span(value, out, checked_floats({rows}), "a linked sum");
     const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
     const LinkTail tail{part, uint32_t(rows), link.state, link.peer_flag, link.peer_inbox, link.inbox, uint32_t(link.capacity), 1,
                         value.await_timeout, out};
@@ -202,18 +203,18 @@ int sd_op_experts_table_link_sum(void* handle, const uint64_t* table, uint64_t c
                                  const float* input, const float* weights, float* product, float* part, float* out) {
     SD_OP_BEGIN
     SumLink& link = value.sums;
-    if (!offsets || !kinds || !hidden || !ffn || !top_k || top_k > 64 || !count || count > (uint64_t(1) << 24) || !link.peer ||
-        hidden > link.capacity)
+    if (!offsets || !kinds || !hidden || !ffn || ffn > (uint64_t(1) << 20) || !top_k || top_k > 64 || !count ||
+        count > (uint64_t(1) << 24) || !link.peer || hidden > link.capacity)
         throw std::runtime_error("invalid Straydog linked experts");
     const sd_expert_split whole{0, ffn, 0, hidden, 3};
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, whole);
-    op_span(value, table, size_t(count) * 8, "an expert table");
-    op_span(value, ids, size_t(top_k) * 4, "expert routes");
-    op_span(value, input, size_t(hidden) * 4, "an expert input");
-    if (weights) op_span(value, weights, size_t(top_k) * 4, "route weights");
-    op_span(value, product, size_t(top_k * ffn) * 4, "an expert product");
-    op_span(value, part, size_t(hidden) * 4, "a linked sum's part");
-    op_span(value, out, size_t(hidden) * 4, "a linked sum");
+    op_span(value, table, checked_product({count, 8}), "an expert table");
+    op_span(value, ids, checked_floats({top_k}), "expert routes");
+    op_span(value, input, checked_floats({hidden}), "an expert input");
+    if (weights) op_span(value, weights, checked_floats({top_k}), "route weights");
+    op_span(value, product, checked_floats({top_k, ffn}), "an expert product");
+    op_span(value, part, checked_floats({hidden}), "a linked sum's part");
+    op_span(value, out, checked_floats({hidden}), "a linked sum");
     plan.top_k = uint32_t(top_k);
     plan.product_stride = uint32_t(ffn);
     plan.clamp = 0.0f;
