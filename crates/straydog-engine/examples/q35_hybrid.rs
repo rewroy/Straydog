@@ -94,9 +94,19 @@ fn main() -> Result<(), String> {
     let parts: Vec<_> = if split == 0 { std::iter::once(0..layers).collect() } else { vec![0..split, split..layers] };
     let started = std::time::Instant::now();
     let mut engines = Vec::new();
+    // The host tier shared out as the server does: by the expert bytes each part's slots leave.
     let host_bytes = (host_gb as u64) << 30;
+    let expert_bytes = |range: &std::ops::Range<usize>| -> u64 {
+        let layer_of = |name: &str| name.split('.').nth(1).and_then(|layer| layer.parse::<usize>().ok());
+        files.header.tensors.iter()
+            .filter(|tensor| tensor.name.ends_with("_exps.weight") && layer_of(&tensor.name).is_some_and(|layer| range.contains(&layer)))
+            .map(|tensor| tensor.bytes).sum()
+    };
+    let beyond: Vec<f64> = parts.iter().map(|range| {
+        expert_bytes(range) as f64 * (1.0 - slots as f64 / (range.len() * hp.experts) as f64).max(0.0)
+    }).collect();
     for (index, part) in parts.iter().enumerate() {
-        let share = (host_bytes as f64 * part.len() as f64 / layers as f64) as u64;
+        let share = (host_bytes as f64 * beyond[index] / beyond.iter().sum::<f64>().max(1.0)) as u64;
         let settings = Settings { context, batch: chunk.max(1), expert_slots: slots, host_expert_bytes: share, scratch_bytes: 512 << 20,
                                   layers: part.clone(), checkpoints: 0, resident: false, part: Part::WHOLE, half_gemm: false };
         engines.push(Engine::new(hp.clone(), &files, gpu + index, 31 << 30, settings)?);

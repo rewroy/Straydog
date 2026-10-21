@@ -246,8 +246,13 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let in_vram: u64 = parts.iter().enumerate()
         .map(|(part, range)| if resident[part] { part_experts[part] } else { slots[part] as u64 * slot_bytes(range) }).sum();
     let host = served::host_tier(settings, total_experts.saturating_sub(in_vram));
-    // The page-locked host tier is shared out by the other parts' expert bytes.
-    let tiered: u64 = part_experts.iter().zip(&resident).filter(|(_, &resident)| !resident).map(|(bytes, _)| bytes).sum();
+    // The page-locked host tier is shared out among the parts not all resident by the expert bytes
+    // each one's VRAM leaves: a part given less reads some of its experts from the drive again
+    // whenever a pass (a long prompt's) goes through them all, while another has room to spare.
+    let beyond: Vec<u64> = parts.iter().enumerate().map(|(part, range)| {
+        if resident[part] { 0 } else { part_experts[part].saturating_sub(slots[part] as u64 * slot_bytes(range)) }
+    }).collect();
+    let tiered: u64 = beyond.iter().sum();
     let end = end_tokens(root, &pins, &files)?;
     let turn_start = files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
         .and_then(|tokens| tokens.iter().position(|token| token.text() == Some("<|im_start|>")))
@@ -278,7 +283,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     context: settings.context,
                     batch,
                     expert_slots: slots[part],
-                    host_expert_bytes: if resident[part] { 0 } else { (host as f64 * part_experts[part] as f64 / tiered.max(1) as f64) as u64 },
+                    host_expert_bytes: if resident[part] { 0 } else { (host as f64 * beyond[part] as f64 / tiered.max(1) as f64) as u64 },
                     scratch_bytes: SCRATCH,
                     layers: range.clone(),
                     checkpoints: CHECKPOINTS,
