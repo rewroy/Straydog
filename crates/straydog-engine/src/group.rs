@@ -4,13 +4,19 @@
 //! GPUs holding the whole model, every layer's routed experts are split between them
 //! instead (expert parallelism): both evaluate their half of each layer's routes at once.
 
-use crate::gpu::{Backend, Head, Operand, Result, WIDTH};
+use crate::gpu::{Backend, Head, Operand, Result, StatePart, WIDTH};
 use crate::weights::layer_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitMode {
     Layer,
     Experts,
+}
+
+/// Positional state copied out of every device from position `from` (see [`Group::save_positions`]).
+pub struct Positions {
+    pub from: u64,
+    parts: Vec<Vec<StatePart>>,
 }
 
 pub struct Group {
@@ -548,6 +554,21 @@ impl Group {
 
     pub fn checkpoint(&mut self, slot: usize, save: bool) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.checkpoint(slot, save))
+    }
+
+    /// Host bytes [`save_positions`](Self::save_positions) takes per position.
+    pub fn position_bytes(&self) -> u64 {
+        self.backends.iter().map(Backend::position_bytes).sum()
+    }
+
+    /// Every device's positional state over positions `from..to` (see [`Backend::save_positions`]).
+    pub fn save_positions(&mut self, from: u64, to: u64, history: bool) -> Result<Positions> {
+        let parts = self.backends.iter_mut().map(|backend| backend.save_positions(from, to, history)).collect::<Result<_>>()?;
+        Ok(Positions { from, parts })
+    }
+
+    pub fn restore_positions(&mut self, positions: &mut Positions) -> Result<()> {
+        self.backends.iter_mut().zip(&mut positions.parts).try_for_each(|(backend, parts)| backend.restore_positions(parts))
     }
 
     /// Allocated bytes and budgets summed over the devices.

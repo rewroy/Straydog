@@ -54,6 +54,7 @@
 #define hipMalloc cudaMalloc
 #define hipFree cudaFree
 #define hipMemcpyAsync cudaMemcpyAsync
+#define hipMemcpy2DAsync cudaMemcpy2DAsync
 #define hipMemcpyPeerAsync cudaMemcpyPeerAsync
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
@@ -1858,6 +1859,32 @@ int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t cou
             }
             host += bytes;
         }
+        check(hipStreamSynchronize(value.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// Part of a sequence state to (save) or from host memory: `height` runs of `width` floats,
+// `pitch` floats apart, from float `offset` (a K/V state's positions are one run, an indexer's
+// pooled blocks one run per column). A restore truncates the K/V mirrors and stage at the first
+// position it rewrites (`first`).
+int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, uint64_t width, uint64_t height,
+                  float* host, uint64_t first, int save) {
+    try {
+        auto& value = device(handle);
+        const auto found = value.allocations.find(state);
+        if (found == value.allocations.end() || !host || !width || !height || pitch < width)
+            throw std::runtime_error("invalid Straydog state copy");
+        const uint64_t floats = found->second / 4;
+        if (offset > floats || height - 1 > (floats - offset) / pitch || width > floats - offset - (height - 1) * pitch)
+            throw std::runtime_error("Straydog state copy outside its state");
+        float* base = static_cast<float*>(state) + offset;
+        kv_stage_settle(value);
+        if (!save) kv_invalidate_write(value, state, size_t(first));
+        if (save)
+            check(hipMemcpy2DAsync(host, width * 4, base, pitch * 4, width * 4, height, hipMemcpyDefault, value.stream));
+        else
+            check(hipMemcpy2DAsync(base, pitch * 4, host, width * 4, width * 4, height, hipMemcpyDefault, value.stream));
         check(hipStreamSynchronize(value.stream));
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

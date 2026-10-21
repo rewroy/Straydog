@@ -150,6 +150,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_state_copy(
+        handle: *mut ::std::os::raw::c_void,
+        state: *mut ::std::os::raw::c_void,
+        offset: u64,
+        pitch: u64,
+        width: u64,
+        height: u64,
+        host: *mut f32,
+        first: u64,
+        save: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_host_pin(pointer: *mut ::std::os::raw::c_void, bytes: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

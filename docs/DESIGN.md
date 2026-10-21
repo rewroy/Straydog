@@ -260,6 +260,14 @@ authentication: no worker starts without them.
   A request that ends with a tool message continues the assistant's reply; one that
   ends with a user message starts a new one. That is all the cache needs from a
   client.
+- A prompt that departs from the held sequence at least 1024 tokens below its end parks
+  it: its K/V and indexer positions from the departure on go to host memory (up to an
+  eighth of it), its recurrent state to a page-locked slot. A later prompt that resumes
+  further on the parked sequence (it continues it, or one of its checkpoints) than on the
+  held one brings it back, the held one parked in its place when it is as long. So a
+  one-off request with another prefix (a title, a summary, a subagent) no longer costs
+  the conversation it interrupted its whole prompt again (`parked`: `saved` or `restored`
+  in the request's metrics, with `park_seconds`).
 - Reasoning sent back in assistant messages is part of the prompt the official
   template renders, so a client that returns it keeps the conversation cache warm.
 - Errors are OpenAI-style objects. Before the first byte of a stream the status says

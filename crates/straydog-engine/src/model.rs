@@ -17,7 +17,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, HIDDEN, WIDTH};
-use crate::group::{row_count, Group};
+use crate::group::{row_count, Group, Positions};
 use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
 
@@ -42,6 +42,11 @@ const DRAFT_CUT: f32 = 0.6;
 /// root (the end of the system prompt), turn (where the reply to the last user message
 /// began), prior (the same for the message before) and step (the reply to the last tool result).
 const CHECKPOINTS: [&str; 4] = ["root", "turn", "prior", "step"];
+/// Recurrent-state slots after the checkpoints' for parked sequences: one parked, one for the
+/// live sequence it trades places with.
+const PARK_SLOTS: [usize; 2] = [CHECKPOINTS.len(), CHECKPOINTS.len() + 1];
+/// A live sequence is parked when a prompt departs from it at least this far below its end.
+const PARK_MINIMUM: usize = 1024;
 /// Only a system prompt this long is worth a copy.
 const ROOT_MINIMUM: usize = 2048;
 const VOCABULARY: usize = 248320;
@@ -71,6 +76,28 @@ struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
+}
+
+/// A sequence a prompt departed from, kept in host memory to come back to: its positional state
+/// from where the live sequence then left it (later prompts that departed below that added the
+/// positions under it, in `saved` after the first), and its recurrent state in a slot. Below the
+/// lowest saved position, the live sequence holds the same tokens.
+struct Parked {
+    tokens: Vec<u32>,
+    final_hidden: Option<Vec<f32>>,
+    slot: usize,
+    saved: Vec<Positions>,
+}
+
+impl Parked {
+    fn from(&self) -> usize {
+        self.saved.last().map_or(self.tokens.len(), |positions| positions.from as usize)
+    }
+}
+
+/// How many leading tokens two sequences share.
+fn shared(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 pub struct Settings {
@@ -194,6 +221,9 @@ pub struct Model {
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
     checkpoints: IndexMap<&'static str, Checkpoint>,
+    parked: Option<Parked>,
+    /// Host bytes parked positions may take.
+    park_budget: u64,
     pub last_metrics: Map<String, Value>,
     /// When set, the SHA-256 of every logits vector the model returns (a determinism check).
     pub logits_digests: Option<Vec<String>>,
@@ -258,7 +288,7 @@ impl Model {
             return Err(format!("Straydog context state needs {state_bytes} bytes, over its RAM budget"));
         }
         group.reserve_model_state(context64, batch as u64, drafting, host)?;
-        let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len())?;
+        let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len() + PARK_SLOTS.len())?;
         let mut load_seconds = vec![("state", lap(&mut clock))];
         let mut model = Model {
             group,
@@ -274,6 +304,8 @@ impl Model {
             history: Vec::new(),
             final_hidden: None,
             checkpoints: IndexMap::new(),
+            parked: None,
+            park_budget: crate::host::host_memory_bytes() / 8,
             last_metrics: Map::new(),
             logits_digests: None,
             logits_capture: None,
@@ -594,6 +626,64 @@ impl Model {
             final_hidden: self.final_hidden.clone(),
         });
         Ok(())
+    }
+
+    /// Park the live sequence's positions from `from` and its recurrent state (in `slot`).
+    fn park(&mut self, from: usize, slot: usize) -> Result<Parked> {
+        let positions = self.group.save_positions(from as u64, self.history.len() as u64, true)?;
+        self.group.checkpoint(slot, true)?;
+        Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, saved: vec![positions] })
+    }
+
+    /// Whether parking the live sequence from `from` fits the host budget.
+    fn parkable(&self, from: usize) -> bool {
+        let count = self.history.len().saturating_sub(from);
+        count >= PARK_MINIMUM && count as u64 * self.group.position_bytes() <= self.park_budget
+    }
+
+    /// Before `tokens` overwrite the live sequence. A parked sequence the prompt resumes further
+    /// than the live one (it continues the parked sequence, or one of its checkpoints, past what
+    /// it shares with the live one) becomes the live sequence again, the live one parked in its
+    /// place when long. Otherwise a long live sequence the prompt departs from is parked; or the
+    /// parked one takes the positions the prompt will overwrite below its own.
+    fn park_or_restore(&mut self, tokens: &[u32]) -> Result<Option<&'static str>> {
+        let limit = tokens.len() - 1;
+        let live = shared(&self.history, &tokens[..limit]);
+        if let Some(parked) = &self.parked {
+            let back = shared(&parked.tokens, &tokens[..limit]);
+            let resumable = back == parked.tokens.len()
+                || self.checkpoints.values().any(|checkpoint| {
+                    let position = checkpoint.tokens.len();
+                    position > live && position <= back && checkpoint.tokens[..] == tokens[..position]
+                });
+            // Below its lowest saved position the live sequence must hold the parked tokens.
+            let common = shared(&self.history, &parked.tokens);
+            if back > live && resumable && common >= parked.from() {
+                let mut parked = self.parked.take().unwrap();
+                let slot = if parked.slot == PARK_SLOTS[0] { PARK_SLOTS[1] } else { PARK_SLOTS[0] };
+                let swapped = if self.parkable(common) { Some(self.park(common, slot)?) } else { None };
+                // Lowest first: a pooled block two of them hold ends as the higher one has it.
+                for positions in parked.saved.iter_mut().rev() {
+                    self.group.restore_positions(positions)?;
+                }
+                self.group.checkpoint(parked.slot, false)?;
+                self.history = parked.tokens;
+                self.final_hidden = parked.final_hidden;
+                self.parked = swapped;
+                return Ok(Some("restored"));
+            }
+        }
+        if live < self.history.len() && self.parkable(live) {
+            let slot = self.parked.take().map_or(PARK_SLOTS[0], |parked| parked.slot);
+            self.parked = Some(self.park(live, slot)?);
+            return Ok(Some("saved"));
+        }
+        if let Some(from) = self.parked.as_ref().map(Parked::from).filter(|from| live < *from) {
+            // Positions `live..from` are the same tokens in both: the parked sequence keeps them.
+            let positions = self.group.save_positions(live as u64, from as u64, false)?;
+            self.parked.as_mut().unwrap().saved.push(positions);
+        }
+        Ok(None)
     }
 
     /// Prompt tokens already held, after restoring the state they need; at least one token is
@@ -1170,9 +1260,13 @@ impl Model {
         }
         sampling.check()?;
         self.weights.check_unchanged()?;
+        let parking = Instant::now();
+        let parked = self.park_or_restore(tokens)?;
+        let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
+            "parked": parked, "park_seconds": park_seconds,
             "decode_forward_tokens": 0, "decode_seconds": 0.0, "decode_tokens_per_second": null,
             "generated_tokens": 0, "ttft_seconds": null,
         })

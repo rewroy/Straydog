@@ -46,6 +46,8 @@ int sd_host_state_supported(void* handle);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
+int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, uint64_t width, uint64_t height,
+                  float* host, uint64_t first, int save);
 /* Asynchronous copies: page-locked host memory (sd_host_register, or sd_host_pin where devices
  * also write it) to and from allocations, beside the device's compute stream (stream 0): uploads
  * on stream 1 (and stream 3, a second upload queue for copies that may wait), downloads on

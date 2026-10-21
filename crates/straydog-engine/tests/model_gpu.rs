@@ -22,6 +22,80 @@ fn digest(values: &[f32]) -> String {
     format!("{:x}", Sha256::digest(&bytes))
 }
 
+/// The model as a golden placement describes it.
+fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &str, placement: &Json) -> Model {
+    let devices: Vec<usize> = serde_json::from_value(placement["devices"].clone()).unwrap();
+    let budget = (placement["vram_gib"].as_f64().unwrap() * (1u64 << 30) as f64) as u64;
+    let split = if placement["split_mode"] == "layer" { SplitMode::Layer } else { SplitMode::Experts };
+    let speculative = placement["speculative"].as_u64().unwrap() as usize;
+    let mut group = Group::new(&devices, budget, split).unwrap();
+    group.configure_gemm(2, true).unwrap();
+    let mut weights = Weights::open(&PathBuf::from(model_root), quantization,
+                                    (speculative > 0).then(|| PathBuf::from(drafter)).as_deref(),
+                                    straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    // With STRAYDOG_DATA_DIR (the shards' verity trees there), what is read again after
+    // loading is checked block by block: the generations must not change.
+    if let Some(data_dir) = std::env::var_os("STRAYDOG_DATA_DIR") {
+        weights.open_trees(std::path::Path::new(&data_dir)).unwrap();
+    }
+    let settings = Settings {
+        context: placement["context"].as_u64().unwrap() as usize,
+        state_budget_bytes: 13 << 30,
+        prefill_batch_size: 4096,
+        speculative,
+        cpu_threads: 0,
+        row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES,
+    };
+    Model::new(weights, group, &settings, &|_, _, _| {}).unwrap()
+}
+
+/// A request's greedy tokens and logits digests.
+fn run(model: &mut Model, request: &Json) -> (Vec<u32>, Vec<String>) {
+    let prompt: Vec<u32> = serde_json::from_value(request["prompt"].clone()).unwrap();
+    model.logits_digests = Some(Vec::new());
+    let mut tokens = Vec::new();
+    model.generate(&prompt, request["max_new"].as_u64().unwrap() as usize, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| false,
+                   &mut |_, _| {}, request["turn"].as_bool().unwrap(), request["checkpoint"].as_bool().unwrap(),
+                   &mut |token| tokens.push(token)).unwrap();
+    (tokens, model.logits_digests.take().unwrap())
+}
+
+/// A conversation another prompt departs from is parked and comes back: the root request, then
+/// the tools one (another conversation: the root's is parked), then the live one, which continues
+/// the root's. It resumes on the restored sequence (or its checkpoint) as it does straight after
+/// the root request, with the same logits (pinned), with the K/V in VRAM and in host memory.
+#[test]
+fn a_parked_conversation_comes_back() {
+    let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
+                                             common::model_env("STRAYDOG_DRAFTER", "the drafter directory"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
+    let golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let quantization = golden["quantization"].as_str().unwrap();
+    for name in ["two-gpu-experts-mtp", "two-gpu-host-kv-mtp"] {
+        let expected = &golden["placements"][name];
+        let request = |label: &str| expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == label).unwrap();
+        let mut model = open(&model_root, &drafter, quantization, &expected["placement"]);
+        run(&mut model, request("root"));
+        run(&mut model, request("tools"));
+        assert_eq!(model.last_metrics["parked"], "saved", "{name}: the root conversation parked");
+        let saved = model.last_metrics["park_seconds"].as_f64().unwrap();
+        let (tokens, logits) = run(&mut model, request("live"));
+        assert_eq!(model.last_metrics["parked"], "restored", "{name}: the root conversation back");
+        // The same position (the tools request's own checkpoint may have renamed the root's turn
+        // checkpoint "prior").
+        assert_eq!(model.last_metrics["cached_tokens"], request("live")["metrics"]["cached_tokens"], "{name}: cached tokens");
+        assert_ne!(model.last_metrics["resumed_from"], "none", "{name}");
+        let pinned: Vec<u32> = serde_json::from_value(request("live")["tokens"].clone()).unwrap();
+        let digests: Vec<String> = serde_json::from_value(request("live")["logits"].clone()).unwrap();
+        assert_eq!(tokens, pinned, "{name}: tokens");
+        assert_eq!(logits, digests, "{name}: logits");
+        eprintln!("{name}: parked in {saved:.3} s, restored in {:.3} s", model.last_metrics["park_seconds"].as_f64().unwrap());
+    }
+}
+
 #[test]
 fn generations_equal_the_reference() {
     let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
@@ -38,31 +112,8 @@ fn generations_equal_the_reference() {
         if only.as_ref().is_some_and(|only| only != name) {
             continue;
         }
-        let placement = &expected["placement"];
         eprintln!("placement {name}");
-        let devices: Vec<usize> = serde_json::from_value(placement["devices"].clone()).unwrap();
-        let budget = (placement["vram_gib"].as_f64().unwrap() * (1u64 << 30) as f64) as u64;
-        let split = if placement["split_mode"] == "layer" { SplitMode::Layer } else { SplitMode::Experts };
-        let speculative = placement["speculative"].as_u64().unwrap() as usize;
-        let mut group = Group::new(&devices, budget, split).unwrap();
-        group.configure_gemm(2, true).unwrap();
-        let mut weights = Weights::open(&PathBuf::from(&model_root), &quantization,
-                                        (speculative > 0).then(|| PathBuf::from(&drafter)).as_deref(),
-                                        straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
-        // With STRAYDOG_DATA_DIR (the shards' verity trees there), what is read again after
-        // loading is checked block by block: the generations must not change.
-        if let Some(data_dir) = std::env::var_os("STRAYDOG_DATA_DIR") {
-            weights.open_trees(std::path::Path::new(&data_dir)).unwrap();
-        }
-        let settings = Settings {
-            context: placement["context"].as_u64().unwrap() as usize,
-            state_budget_bytes: 13 << 30,
-            prefill_batch_size: 4096,
-            speculative,
-            cpu_threads: 0,
-            row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES,
-        };
-        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+        let mut model = open(&model_root, &drafter, &quantization, &expected["placement"]);
         if update {
             expected["resident"] = model.resident.into();
             expected["partial"] = model.partial.into();
@@ -79,7 +130,6 @@ fn generations_equal_the_reference() {
         assert_eq!(model.state_bytes, expected["state_bytes"].as_u64().unwrap(), "{name}: state bytes");
         for request in expected["requests"].as_array_mut().unwrap() {
             let label = format!("{name}/{}", request["name"].as_str().unwrap());
-            let prompt: Vec<u32> = serde_json::from_value(request["prompt"].clone()).unwrap();
             // Partial residency swaps expert slots asynchronously during decode, so whether an
             // expert runs on the GPU or the CPU (the same F32 weights, summed in another order)
             // depends on timing, and the reference does not reproduce its own decode bit for bit.
@@ -88,17 +138,13 @@ fn generations_equal_the_reference() {
             let resumed = request["metrics"]["resumed_from"].as_str().unwrap();
             let fresh = request["metrics"]["cached_tokens"].as_u64() == Some(0);
             let comparable = !model.partial || fresh || resumed == "root";
-            model.logits_digests = Some(Vec::new());
-            let mut tokens = Vec::new();
-            model.generate(&prompt, request["max_new"].as_u64().unwrap() as usize, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| false, &mut |_, _| {},
-                           request["turn"].as_bool().unwrap(), request["checkpoint"].as_bool().unwrap(),
-                           &mut |token| tokens.push(token)).unwrap();
+            let (tokens, logits) = run(&mut model, request);
             if update {
                 request["tokens"] = serde_json::to_value(&tokens).unwrap();
                 for (key, value) in request["metrics"].as_object_mut().unwrap() {
                     *value = model.last_metrics.get(key).cloned().unwrap_or(Json::Null);
                 }
-                request["logits"] = serde_json::to_value(model.logits_digests.take().unwrap()).unwrap();
+                request["logits"] = serde_json::to_value(&logits).unwrap();
                 if let Some(hidden) = model.final_hidden() {
                     request["final_hidden"] = digest(hidden).into();
                 }
@@ -120,7 +166,7 @@ fn generations_equal_the_reference() {
                 }
             }
             let digests: Vec<String> = serde_json::from_value(request["logits"].clone()).unwrap();
-            let actual = model.logits_digests.take().unwrap();
+            let actual = logits;
             if model.partial {
                 assert_eq!(actual[0], digests[0], "{label}: prompt logits");
             } else {
