@@ -58,8 +58,48 @@ __global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* outp
     gemv_rows<kind, 1>(matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, cached, 0, output, 0, list.residual);
 }
 
+// The same over items of two kinds (each wave runs its item's kind): the F32 router or a DeltaNet's
+// F32 beta and alpha in the launch of the Q8_0 or BF16 projections beside them.
+template<int K1, int K2>
+__global__ void gemv_prologue_kind2(FixedGemv list, GemvPrologue pro, float* output) {
+    extern __shared__ __align__(16) float cached[];
+    __shared__ float sums[256];
+    __shared__ float total;
+    const unsigned tid = threadIdx.x;
+    if (pro.mode == 2) {
+        float sum = 0.0f;
+        for (size_t col = tid; col < pro.width; col += blockDim.x) sum += pro.x[col] * pro.x[col];
+        sums[tid] = sum;
+        __syncthreads();
+        if (tid < 32) {
+            const float value = tree256_first_wave(sums, tid);
+            if (!tid) total = value;
+        }
+        __syncthreads();
+        const float scale = rsqrtf(total / float(pro.width) + pro.eps);
+        for (size_t col = tid; col < pro.width; col += blockDim.x) {
+            const float value = pro.x[col] * scale * pro.y[col];
+            cached[col] = value;
+            if (!blockIdx.x && pro.normed) pro.normed[col] = value;
+        }
+    } else {
+        for (size_t col = tid; col < pro.width; col += blockDim.x) cached[col] = pro.x[col];
+    }
+    __syncthreads();
+    const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + tid / 32;
+    unsigned selected = 0;
+    for (unsigned i = 1; i < list.count; ++i) if (list.items[i].first_wave <= wave) selected = i;
+    const GemvItem& item = list.items[selected];
+    Matrix matrix = item.matrix;
+    matrix.input_offset = 0;
+    const size_t first = (wave - item.first_wave) * (32 / item.lanes);
+    if (matrix.kind == K1) gemv_rows<K1, 1>(matrix, first, item.lanes, cached, 0, output, 0, list.residual);
+    else gemv_rows<K2, 1>(matrix, first, item.lanes, cached, 0, output, 0, list.residual);
+}
+
 // The rows' plan as gemv() makes it for one vector (lanes per row, waves), so each row's dot is
-// the plain GEMV's; false when a matrix takes the reference decoder or the kinds differ.
+// the plain GEMV's; false when a matrix takes the reference decoder or there are more than two
+// kinds.
 bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input, unsigned min_lanes, FixedGemv& list,
                         size_t& waves) {
     if (!count || count > gemv_fixed_items) return false;
@@ -70,7 +110,14 @@ bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input
         size_t alignment = 0;
         if (lanes == 2 && min_lanes > 2 && matrices[i].cols / gemv_unit(matrices[i].kind, alignment) >= 32)
             lanes = std::min(32u, min_lanes);
-        if (!lanes || matrices[i].kind != matrices[0].kind) return false;
+        if (!lanes) return false;
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j) seen |= matrices[j].kind == matrices[i].kind;
+        if (!seen) {
+            bool second = false;
+            for (size_t j = 0; j < i; ++j) second |= matrices[j].kind != matrices[0].kind;
+            if (second && matrices[i].kind != matrices[0].kind) return false;   // a third kind
+        }
         list.items[i] = {matrices[i], uint32_t(waves), lanes};
         waves += gemv_waves(matrices[i], lanes);
     }
@@ -83,6 +130,16 @@ bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input
 bool gemv_prologue_launch(Device& d, const FixedGemv& list, size_t waves, const GemvPrologue& pro, float* output) {
     const unsigned blocks = unsigned((waves + 7) / 8);
     const size_t shared = size_t(pro.width) * 4;
+    int other = list.items[0].matrix.kind;
+    for (unsigned i = 1; i < list.count; ++i) if (list.items[i].matrix.kind != other) { other = list.items[i].matrix.kind; break; }
+    if (other != list.items[0].matrix.kind) {
+        if (pro.mode == 1) return false;
+        const int a = std::min(other, list.items[0].matrix.kind), b = std::max(other, list.items[0].matrix.kind);
+        if (a == 0 && b == 8) gemv_prologue_kind2<8, 0><<<blocks, 256, shared, d.stream>>>(list, pro, output);
+        else if (a == 0 && b == 30) gemv_prologue_kind2<30, 0><<<blocks, 256, shared, d.stream>>>(list, pro, output);
+        else return false;
+        return true;
+    }
     #define SD_PROLOGUE(format) case format: gemv_prologue_kind<format><<<blocks, 256, shared, d.stream>>>(list, pro, output); return true;
     switch (list.items[0].matrix.kind) {
         SD_FAST_FORMATS(SD_PROLOGUE)
@@ -148,7 +205,24 @@ int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64
         return 0;
     }
     op_rms_norm_kernel<<<1, 256, 0, value.stream>>>(x, weight, size_t(width), eps, normed);
-    gemv(value, matrices, size_t(count), normed, output, 1, 0, 0, {}, op_lanes);
+    // a launch per kind, as sd_op_linears groups them
+    bool done[gemv_fixed_items]{};
+    for (size_t i = 0; i < count; ++i) {
+        if (done[i]) continue;
+        Matrix group[gemv_fixed_items];
+        size_t size = 0;
+        float* group_output = nullptr;
+        for (size_t j = i; j < count; ++j)
+            if (!done[j] && matrices[j].kind == matrices[i].kind) {
+                group[size] = matrices[j];
+                float* at = output + matrices[j].output_offset;
+                group_output = !group_output || at < group_output ? at : group_output;
+                ++size;
+                done[j] = true;
+            }
+        for (size_t j = 0; j < size; ++j) group[j].output_offset = size_t(output + group[j].output_offset - group_output);
+        gemv(value, group, size, normed, group_output, 1, 0, 0, {}, op_lanes);
+    }
     SD_OP_END
 }
 

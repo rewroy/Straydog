@@ -147,6 +147,81 @@ __global__ void __launch_bounds__(32) tm_delta_rule_wave_kernel(const float* qkv
     for (int i = 0; i < DIM; ++i) state[(h * DIM + i) * DIM + j] = column[i];
 }
 
+// One decode step of a DeltaNet's token mixing (one row, DIM 128), fused: the convolution (as
+// tm_conv_silu_kernel), the gated delta rule (as tm_delta_rule_wave_kernel) and the gated norm (as
+// tm_gated_norm_kernel: its 256-thread tree over 128 values is tm_tree128's sum), each with the
+// separate kernel's arithmetic, so the same bits. A block per key head kh takes its q and k
+// channels and the R value heads that read it (kh, kh + k_heads, ...), a thread per value head's
+// column; two barriers in place of two launches.
+template<int R>
+__global__ void __launch_bounds__(R * 128) tm_delta_step_kernel(const float* qkv, float* history, const float* taps, size_t kernel,
+                                                                 const float* beta, const float* alpha, const float* dt, const float* a,
+                                                                 float* state, size_t k_heads, size_t v_heads, float eps,
+                                                                 const float* gate, const float* weight, float* out) {
+    constexpr int DIM = 128;
+    const size_t kh = blockIdx.x, t = threadIdx.x;
+    const size_t channels = (2 * k_heads + v_heads) * DIM;
+    __shared__ float conv[(2 + R) * DIM], qn[DIM], kn[DIM], core[R][DIM], scales[R];
+    for (size_t i = t; i < size_t(2 + R) * DIM; i += R * DIM) {
+        const size_t c = i < DIM ? kh * DIM + i
+                       : i < 2 * DIM ? k_heads * DIM + kh * DIM + (i - DIM)
+                       : 2 * k_heads * DIM + (kh + (i - 2 * DIM) / DIM * k_heads) * DIM + (i - 2 * DIM) % DIM;
+        float window[tm_max_kernel];
+        for (size_t j = 0; j + 1 < kernel; ++j) window[j] = history[j * channels + c];
+        window[kernel - 1] = qkv[c];
+        float sum = 0.0f;
+        for (size_t j = 0; j < kernel; ++j) sum += window[j] * taps[c * kernel + j];
+        for (size_t j = 0; j + 1 < kernel; ++j) history[j * channels + c] = window[j + 1];
+        conv[i] = tm_silu(sum);
+    }
+    __syncthreads();
+    if (t < 32) {
+        float qv[4], kv[4];
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) { qv[m] = conv[t + 32 * m]; kv[m] = conv[DIM + t + 32 * m]; }
+        const float q_sum = tm_tree128(qv), k_sum = tm_tree128(kv);
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            qn[t + 32 * m] = qv[m] / sqrtf(q_sum + eps) / sqrtf(float(DIM));
+            kn[t + 32 * m] = kv[m] / sqrtf(k_sum + eps);
+        }
+    }
+    __syncthreads();
+    const size_t r = t / DIM, j = t % DIM, h = kh + r * k_heads;
+    float column[DIM];
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) column[i] = state[(h * DIM + i) * DIM + j];
+    const float g = expf(a[h] * tm_softplus(alpha[h] + dt[h]));
+    const float b = tm_sigmoid(beta[h]);
+    const float value = conv[2 * DIM + r * DIM + j];
+    float predicted = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) {
+        column[i] *= g;
+        predicted += column[i] * kn[i];
+    }
+    const float delta = (value - predicted) * b;
+    float result = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) {
+        column[i] += kn[i] * delta;
+        result += column[i] * qn[i];
+    }
+    #pragma unroll
+    for (int i = 0; i < DIM; ++i) state[(h * DIM + i) * DIM + j] = column[i];
+    core[r][j] = result;
+    __syncthreads();
+    if (j < 32) {
+        float x[4];
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) x[m] = core[r][j + 32 * m];
+        const float total = tm_tree128(x);
+        if (!j) scales[r] = rsqrtf(total / float(DIM) + eps);
+    }
+    __syncthreads();
+    out[h * DIM + j] = core[r][j] * scales[r] * weight[j] * tm_silu(gate[h * DIM + j]);
+}
+
 // A block (256 threads) per row of width values: x / sqrt(mean(x^2) + eps) * weight * SiLU(gate).
 __global__ void tm_gated_norm_kernel(const float* x, const float* gate, const float* weight, size_t width, float eps, float* out) {
     const float* row = x + size_t(blockIdx.x) * width;
@@ -401,6 +476,28 @@ int sd_op_delta_rule(void* handle, const float* qkv, const float* beta, const fl
     else
         tm_delta_rule_kernel<64><<<unsigned(v_heads), 64, 0, value.stream>>>(qkv, beta, alpha, dt, a, state, size_t(k_heads),
                                                                          size_t(v_heads), size_t(steps), eps, out);
+    SD_OP_END
+}
+
+int sd_op_delta_step(void* handle, const float* qkv, float* history, const float* taps, uint64_t kernel, const float* beta,
+                     const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim,
+                     float eps, const float* gate, const float* weight, float* out) {
+    SD_OP_BEGIN
+    if (dim != 128 || !k_heads || v_heads != 2 * k_heads || !kernel || kernel > tm_max_kernel) return 1;   // not taken
+    const size_t channels = size_t((2 * k_heads + v_heads) * dim);
+    op_span(value, qkv, channels * 4, "a delta step input");
+    if (kernel > 1) op_span(value, history, (size_t(kernel) - 1) * channels * 4, "a convolution history");
+    op_span(value, taps, size_t(kernel) * channels * 4, "convolution taps");
+    op_span(value, beta, size_t(v_heads) * 4, "delta rule betas");
+    op_span(value, alpha, size_t(v_heads) * 4, "delta rule alphas");
+    op_span(value, dt, size_t(v_heads) * 4, "a delta rule time step bias");
+    op_span(value, a, size_t(v_heads) * 4, "delta rule decays");
+    op_span(value, state, size_t(v_heads * dim * dim) * 4, "a delta rule state");
+    op_span(value, gate, size_t(v_heads * dim) * 4, "a gated norm gate");
+    op_span(value, weight, size_t(dim) * 4, "a gated norm weight");
+    op_span(value, out, size_t(v_heads * dim) * 4, "a gated norm output");
+    tm_delta_step_kernel<2><<<unsigned(k_heads), 256, 0, value.stream>>>(qkv, history, taps, size_t(kernel), beta, alpha, dt, a, state,
+                                                                       size_t(k_heads), size_t(v_heads), eps, gate, weight, out);
     SD_OP_END
 }
 

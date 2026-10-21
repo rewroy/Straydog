@@ -191,6 +191,11 @@ int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t group
 int sd_op_conv_silu(void* handle, float* x, float* history, const float* taps, uint64_t channels, uint64_t kernel, uint64_t steps);
 int sd_op_delta_rule(void* handle, const float* qkv, const float* beta, const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim, uint64_t steps, float eps, float* out);
 int sd_op_gated_norm(void* handle, const float* x, const float* gate, const float* weight, uint64_t rows, uint64_t width, float eps, float* out);
+/* One decode step (one row) of a DeltaNet: sd_op_conv_silu, sd_op_delta_rule and sd_op_gated_norm
+   (out = the gated norm of the rule's output with gate and weight) in one launch, the same
+   results; qkv is left as it was (its convolution is not stored). 1 when not taken (dim 128 and
+   two value heads a key head only): the caller runs the three. */
+int sd_op_delta_step(void* handle, const float* qkv, float* history, const float* taps, uint64_t kernel, const float* beta, const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim, float eps, const float* gate, const float* weight, float* out);
 int sd_op_split(void* handle, const float* x, uint64_t rows, uint64_t width, float* first, float* second);
 int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies);
 int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch, uint64_t scratch_bytes, float* out);

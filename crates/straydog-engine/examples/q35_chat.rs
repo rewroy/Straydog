@@ -173,7 +173,9 @@ fn main() -> Result<(), String> {
     let mut logits = Vec::new();
     for piece in prompt.chunks(chunk.max(1)) {
         logits = forward(&mut engines, piece)?;
-        probes.rows.push(logits.clone());
+        if record.is_some() || against.is_some() {
+            probes.rows.push(logits.clone());
+        }
     }
     let prefill = started.elapsed().as_secs_f64();
     println!("prompt of {} tokens in {prefill:.2} s ({:.1} tok/s)", prompt.len(), prompt.len() as f64 / prefill);
@@ -198,7 +200,9 @@ fn main() -> Result<(), String> {
     let mut fed = vec![if teacher { *continuation.first().ok_or("--teacher needs a continuation")? } else { output[0] }];
     while output.len() < generate.max(1) {
         logits = forward(&mut engines, &fed[fed.len() - 1..])?;
-        probes.rows.push(logits.clone());
+        if record.is_some() || against.is_some() {
+            probes.rows.push(logits.clone());
+        }
         output.push(argmax(&logits) as u32);
         fed.push(if teacher { *continuation.get(fed.len()).ok_or("--teacher past the continuation")? } else { output[output.len() - 1] });
     }

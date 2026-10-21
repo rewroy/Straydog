@@ -382,6 +382,21 @@ impl Backend {
 
     /// rms_norm(x) * weight * SiLU(gate) per row.
     #[allow(clippy::too_many_arguments)]
+    /// One decode step of a DeltaNet: [`conv_silu`](Self::conv_silu), [`delta_rule`](Self::delta_rule)
+    /// and [`gated_norm`](Self::gated_norm) in one launch, the same results (`qkv` keeps its values).
+    /// False when not taken (the caller runs the three).
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_step(&mut self, qkv: P, history: M, taps: P, kernel: u64, beta: P, alpha: P, dt: P, a: P, state: M, k_heads: u64,
+                      v_heads: u64, dim: u64, eps: f32, gate: P, weight: &Buffer, out: M) -> Result<bool> {
+        // SAFETY: as above.
+        let state_ = unsafe {
+            ffi::sd_op_delta_step(self.handle(), qkv.cast(), history.cast(), taps.cast(), kernel, beta.cast(), alpha.cast(), dt.cast(),
+                                  a.cast(), state.cast(), k_heads, v_heads, dim, eps, gate.cast(), weight.pointer.cast(), out.cast())
+        };
+        check(state_.min(0))?;
+        Ok(state_ == 0)
+    }
+
     pub fn gated_norm(&mut self, x: P, gate: P, weight: &Buffer, rows: u64, width: u64, eps: f32, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_gated_norm(self.handle(), x.cast(), gate.cast(), weight.pointer.cast(), rows, width, eps, out.cast()) })

@@ -376,21 +376,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         let scratch = self.scratch;
-        let mut groups = groups.into_iter();
+        let groups = groups.into_iter();
         if let Some((name, raw)) = norm {
             let weight = self.dense(name)?;
             let (width, eps) = (self.hp.width, self.hp.norm_eps);
-            match groups.next() {
-                Some((_, group)) if steps == 1 => {
-                    self.gpu.norm_linears(raw, &weight.buffer, width as u64, eps, input.cast_mut(), &group)?;
-                }
-                first => {
-                    self.gpu.rms_norm(raw, &weight.buffer, steps as u64, width as u64, eps, input.cast_mut())?;
-                    if let Some((_, group)) = first {
-                        self.gpu.linears(&group, steps as u64, 0, 0, &scratch)?;
-                    }
-                }
+            if steps == 1 {
+                // one launch for them all (two weight formats share it)
+                let all: Vec<Linear> = groups.flat_map(|(_, group)| group).collect();
+                return self.gpu.norm_linears(raw, &weight.buffer, width as u64, eps, input.cast_mut(), &all);
             }
+            self.gpu.rms_norm(raw, &weight.buffer, steps as u64, width as u64, eps, input.cast_mut())?;
         }
         for (_, group) in groups {
             self.gpu.linears(&group, steps as u64, 0, 0, &scratch)?;
@@ -813,14 +808,22 @@ impl<'a, T: Tensors> Engine<'a, T> {
             State::Attention { .. } => return Err("a DeltaNet layer without its state".into()),
         };
         let taps = self.dense(&name(layer, "ssm_conv1d"))?;
-        self.gpu.conv_silu(work.qkv.base(), history.base(), taps.buffer.base(), channels as u64, hp.conv_kernel as u64, n as u64)?;
-        self.check("conv_output_silu", layer, work.qkv, n, channels)?;
         let dt = self.dense(&format!("blk.{layer}.ssm_dt.bias"))?;
         let a = self.dense(&format!("blk.{layer}.ssm_a"))?;
+        let norm = self.dense(&name(layer, "ssm_norm"))?;
+        // A decode step: the convolution, the rule and the gated norm in one launch.
+        if n == 1 && self.compare.is_none()
+            && self.gpu.delta_step(work.qkv.base(), history.base(), taps.buffer.base(), hp.conv_kernel as u64, work.beta.base(),
+                                   work.alpha.base(), dt.buffer.base(), a.buffer.base(), recurrent.base(), hp.k_heads as u64,
+                                   v_heads as u64, dim as u64, hp.norm_eps, work.z.base(), &norm.buffer, work.normed.base())?
+        {
+            return self.linear(&name(layer, "ssm_out"), work.normed.base(), n, work.mixed.base());
+        }
+        self.gpu.conv_silu(work.qkv.base(), history.base(), taps.buffer.base(), channels as u64, hp.conv_kernel as u64, n as u64)?;
+        self.check("conv_output_silu", layer, work.qkv, n, channels)?;
         self.gpu.delta_rule(work.qkv.base(), work.beta.base(), work.alpha.base(), dt.buffer.base(), a.buffer.base(), recurrent.base(),
                             hp.k_heads as u64, v_heads as u64, dim as u64, n as u64, hp.norm_eps, work.core.base())?;
         self.check("attn_output", layer, work.core, n, v_heads * dim)?;
-        let norm = self.dense(&name(layer, "ssm_norm"))?;
         self.gpu.gated_norm(work.core.base(), work.z.base(), &norm.buffer, (n * v_heads) as u64, dim as u64, hp.norm_eps,
                             work.normed.base())?;
         self.linear(&name(layer, "ssm_out"), work.normed.base(), n, work.mixed.base())?;

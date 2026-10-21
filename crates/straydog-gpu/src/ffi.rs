@@ -719,6 +719,27 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_delta_step(
+        handle: *mut ::std::os::raw::c_void,
+        qkv: *const f32,
+        history: *mut f32,
+        taps: *const f32,
+        kernel: u64,
+        beta: *const f32,
+        alpha: *const f32,
+        dt: *const f32,
+        a: *const f32,
+        state: *mut f32,
+        k_heads: u64,
+        v_heads: u64,
+        dim: u64,
+        eps: f32,
+        gate: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_split(
         handle: *mut ::std::os::raw::c_void,
         x: *const f32,
