@@ -105,14 +105,29 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         let address = format!("{}:{}", settings.host, settings.port);
         let listener = tokio::net::TcpListener::bind(&address).await.map_err(|exc| format!("{address}: {exc}"))?;
         tracing::info!("Straydog listening on http://{address}");
-        let served = axum::serve(listener, router).with_graceful_shutdown(shutdown()).await.map_err(|exc| exc.to_string());
+        // A worker that fails (to start or later) leaves nothing to serve: the server ends with
+        // its failure, so that whatever runs it can start it again.
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let stop = {
+            let (failed, failure) = (engine.failed(), failure.clone());
+            async move {
+                tokio::select! {
+                    () = shutdown() => {}
+                    message = failed => *failure.lock().unwrap() = Some(message),
+                }
+            }
+        };
+        let served = axum::serve(listener, router).with_graceful_shutdown(stop).await.map_err(|exc| exc.to_string());
         monitor.stop().await;
         drop(monitor);
-        // The router and the sampler are gone; the worker exits before the server does.
+        // The router and the sampler are gone; the worker exits, and its GPU memory is free,
+        // before the server does.
         if let Some(engine) = Arc::into_inner(engine) {
             engine.close().await;
         }
-        served
+        served?;
+        let failure = failure.lock().unwrap().take();
+        failure.map_or(Ok(()), Err)
     })
 }
 

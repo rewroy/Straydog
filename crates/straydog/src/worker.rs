@@ -8,7 +8,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use serde_json::{json, Value};
@@ -147,9 +147,37 @@ fn warm_up(model: &mut Model) -> Result<(), String> {
     model.reset()
 }
 
+/// How long a GPU's memory held by another process is waited for.
+const VRAM_PATIENCE: Duration = Duration::from_secs(60);
+
+/// Wait until every GPU has the budget free. A worker started right after the last one ended
+/// (a restart) can find its memory still held while the driver frees it; memory another
+/// process keeps fails the start after [`VRAM_PATIENCE`]. A GPU smaller than the budget is
+/// left to fail as it does.
+fn await_vram(devices: &[usize], budget: u64, report: &dyn Fn(&str, u64, u64)) -> Result<(), String> {
+    let started = Instant::now();
+    for &device in devices {
+        loop {
+            let (_, free, total) = straydog_gpu::device_info(device).map_err(|exc| exc.to_string())?;
+            if free >= budget || total < budget {
+                break;
+            }
+            if started.elapsed() >= VRAM_PATIENCE {
+                let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+                return Err(format!("GPU {device} has {:.1} GiB free for a {:.1} GiB budget after {} s: another process holds its memory",
+                                   gib(free), gib(budget), VRAM_PATIENCE.as_secs()));
+            }
+            report("vram", free, budget);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}
+
 pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
+    await_vram(&args.devices, args.vram_bytes, &|stage, done, total| loading.report(stage, done, total))?;
     if straydog_engine::bundle::is_on_demand(&args.quant) {
         return crate::worker_on_demand::main(&args, output, &|stage, done, total| loading.report(stage, done, total));
     }

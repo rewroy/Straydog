@@ -16,7 +16,7 @@ use straydog_api::{Engine, EngineState, Generation, SubmitError};
 use straydog_engine::pyjson;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::{Gemm, Settings, SplitMode};
 use crate::worker::FRAME_BYTES;
@@ -61,6 +61,8 @@ struct Job {
 
 struct Shared {
     phase: Mutex<Phase>,
+    /// The failure once the worker has failed (to start or later).
+    failure: watch::Sender<Option<String>>,
     jobs: AtomicUsize,
     cancelled: Mutex<HashSet<String>>,
     stderr_tail: Mutex<Vec<u8>>,
@@ -290,6 +292,9 @@ fn stage_name(stage: &str, total: u64) -> String {
         "prepare" => "placing the model on the GPUs".into(),
         "load" => format!("reading and authenticating the model into place{size}"),
         "warm" => "warming up the GPU code".into(),
+        "vram" if total > 0 => format!("waiting for another process to free GPU memory ({:.1} GiB needed on each GPU)",
+                                       total as f64 / (1u64 << 30) as f64),
+        "vram" => "waiting for another process to free GPU memory".into(),
         other => format!("{other}{size}"),
     }
 }
@@ -311,12 +316,84 @@ pub fn request_summary(event: &Value) -> String {
     )
 }
 
+/// How long a stopped worker's processes and GPU memory are waited for.
+const RELEASE_PATIENCE: Duration = Duration::from_secs(60);
+
+/// The processes under `root`, it included, from /proc's parent links (Linux; elsewhere none).
+fn descendants(root: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+            // The parent is the second field after the command name's closing parenthesis.
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+            if let Some(parent) = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok()) {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+        let (mut found, mut todo) = (Vec::new(), vec![root]);
+        while let Some(pid) = todo.pop() {
+            found.push(pid);
+            todo.extend(children.remove(&pid).unwrap_or_default());
+        }
+        found
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Vec::new()
+    }
+}
+
+/// Whether `pid` still runs or still holds GPU memory: a process that has not exited (a zombie
+/// has), or one whose memory the amdgpu driver is still freeing, which it does after the
+/// process is gone (its entry under /sys/class/kfd/kfd/proc goes then).
+#[cfg(target_os = "linux")]
+fn holding(pid: u32) -> bool {
+    let running = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|stat| stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()) != Some("Z"));
+    running || std::path::Path::new(&format!("/sys/class/kfd/kfd/proc/{pid}")).exists()
+}
+
+/// Wait until the worker's processes have exited and the GPU driver has let go of their
+/// memory, so that a server started next finds the GPUs free (up to [`RELEASE_PATIENCE`]).
+async fn released(holders: &[u32]) {
+    #[cfg(target_os = "linux")]
+    {
+        let started = Instant::now();
+        let mut said = false;
+        loop {
+            let held = holders.iter().filter(|&&pid| holding(pid)).count();
+            if held == 0 {
+                if said {
+                    tracing::info!("Straydog's worker released the GPUs after {:.1} s", started.elapsed().as_secs_f64());
+                }
+                return;
+            }
+            if started.elapsed() >= RELEASE_PATIENCE {
+                tracing::warn!("Straydog's worker has not released the GPUs after {} s", RELEASE_PATIENCE.as_secs());
+                return;
+            }
+            if !said && started.elapsed() >= Duration::from_millis(500) {
+                tracing::info!("Straydog waiting for its worker to exit and release the GPUs");
+                said = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = holders;
+}
+
 /// The worker's pipes, and the process tree it heads (the sandbox and the worker in it).
 struct Process {
     child: Child,
     tree: straydog_isolation::ProcessTree,
     stdin: ChildStdin,
     stdout: Frames<BufReader<ChildStdout>>,
+    /// The tree's processes as last seen (the sandbox's leave the child's process group).
+    holders: Vec<u32>,
 }
 
 /// Newline-terminated JSON frames from the worker. A read may be dropped midway (a control
@@ -350,6 +427,17 @@ impl<R: AsyncBufRead + Unpin> Frames<R> {
 }
 
 impl Process {
+    /// Add the tree's running processes to [`Process::holders`].
+    fn note_holders(&mut self) {
+        if let Some(root) = self.child.id() {
+            for pid in descendants(root) {
+                if !self.holders.contains(&pid) {
+                    self.holders.push(pid);
+                }
+            }
+        }
+    }
+
     /// End the whole tree: ask, then after `grace` force, and reap the child.
     async fn end(&mut self, grace: Duration) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -397,6 +485,7 @@ impl Runtime {
     pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
+            failure: watch::Sender::new(None),
             jobs: AtomicUsize::new(0),
             cancelled: Mutex::new(HashSet::new()),
             stderr_tail: Mutex::new(Vec::new()),
@@ -436,8 +525,21 @@ impl Runtime {
         self.shared.activity.lock().unwrap().snapshot_live()
     }
 
-    /// Finish the queued generations, stop the worker and wait until it has exited (its
-    /// GPU memory is free again).
+    /// The failure, once the worker has failed to start or later failed: the runtime serves
+    /// nothing more (the server then ends).
+    pub fn failed(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        let mut failure = self.shared.failure.subscribe();
+        async move {
+            let message = failure.wait_for(Option::is_some).await.map(|message| message.clone().unwrap_or_default());
+            match message {
+                Ok(message) => message,
+                Err(_) => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Finish the queued generations, stop the worker and wait until it has exited and the
+    /// GPU driver has let go of its memory.
     pub async fn close(self) {
         let Runtime { queue, driver, .. } = self;
         drop(queue);
@@ -469,37 +571,45 @@ impl Driver {
 
     fn fail(&self, message: String) {
         tracing::error!("{message}");
-        self.set(Phase::Failed(message));
+        self.set(Phase::Failed(message.clone()));
+        self.shared.failure.send_replace(Some(message));
     }
 
     async fn run(self, prepare: Prepare, mut jobs: mpsc::UnboundedReceiver<Job>,
                  mut controls: mpsc::UnboundedReceiver<Control>) {
         let launched = match self.prepare(prepare).await {
             Ok(command) => self.launch(command).await,
-            Err(message) => Err(format!("Straydog failed to start ({message}); see the server log and restart the server")),
+            Err(message) => Err((format!("Straydog failed to start ({message}); see the server log and restart the server"),
+                                 Vec::new())),
         };
-        match launched {
+        let holders = match launched {
             Ok(mut process) => {
                 self.restore_warm_state(&mut process).await;
                 let changed = self.serve(&mut process, &mut jobs, &mut controls).await;
                 if changed {
                     self.save_warm_state(&mut process).await;
                 }
+                process.note_holders();
                 let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
                                           ("command", pyjson::Value::Str("shutdown".into()))]);
                 let _ = process.send(&shutdown).await;
                 if tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await.is_err() {
                     process.end(Duration::from_secs(5)).await;
                 }
+                process.holders
             }
-            Err(message) => self.fail(message),
-        }
+            Err((message, holders)) => {
+                self.fail(message);
+                holders
+            }
+        };
         // The worker is gone: every queued generation fails instead of waiting forever.
         jobs.close();
         while let Some(job) = jobs.recv().await {
             let _ = job.events.send(json!({"event": "error", "message": self.failure(), "fatal": true})).await;
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
         }
+        released(&holders).await;
     }
 
     fn failure(&self) -> String {
@@ -646,7 +756,9 @@ impl Driver {
         .map_err(|exc| exc.to_string())?
     }
 
-    async fn launch(&self, (program, args): Command) -> Result<Process, String> {
+    /// Start the worker and wait until it is ready; on failure the message and the worker's
+    /// processes (gone, or going, by then).
+    async fn launch(&self, (program, args): Command) -> Result<Process, (String, Vec<u32>)> {
         let mut command = std::process::Command::new(&program);
         command
             .args(&args)
@@ -660,12 +772,13 @@ impl Driver {
         straydog_isolation::prepare(&mut command);
         let mut command = tokio::process::Command::from(command);
         command.kill_on_drop(true);
-        let mut child = command.spawn().map_err(|exc| format!("Straydog failed to start ({}: {exc})", program.display()))?;
+        let mut child = command.spawn()
+            .map_err(|exc| (format!("Straydog failed to start ({}: {exc})", program.display()), Vec::new()))?;
         #[cfg(unix)]
         let tree = straydog_isolation::ProcessTree::from_pid(child.id().unwrap_or(0));
         #[cfg(windows)]
         let tree = straydog_isolation::ProcessTree::from_handle(child.raw_handle().unwrap_or(std::ptr::null_mut()));
-        let tree = tree.map_err(|exc| format!("Straydog failed to start ({exc})"))?;
+        let tree = tree.map_err(|exc| (format!("Straydog failed to start ({exc})"), Vec::new()))?;
         let stderr = child.stderr.take().unwrap();
         let (shared, verbose) = (self.shared.clone(), self.verbose);
         tokio::spawn(async move {
@@ -689,6 +802,7 @@ impl Driver {
             stdout: Frames::new(BufReader::new(child.stdout.take().unwrap())),
             child,
             tree,
+            holders: Vec::new(),
         };
         self.set(Phase::Loading(json!({})));
         let started = Instant::now();
@@ -701,6 +815,10 @@ impl Driver {
                 let frame = tokio::time::timeout(remaining, process.read())
                     .await
                     .map_err(|_| "Straydog did not load within its startup timeout".to_string())??;
+                // The worker (in its sandbox) is running: its processes are the ones to see gone.
+                if process.holders.is_empty() {
+                    process.note_holders();
+                }
                 if frame["event"] == "loading" {
                     let stage = frame["stage"].as_str().unwrap_or("").chars().take(32).collect::<String>();
                     let (done, total) = (frame["done"].as_u64().unwrap_or(0), frame["total"].as_u64().unwrap_or(0));
@@ -741,6 +859,7 @@ impl Driver {
                 Ok(process)
             }
             Err(message) => {
+                process.note_holders();
                 process.end(Duration::from_secs(2)).await;
                 // Let the last stderr lines arrive: the worker's last line names the cause.
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -748,7 +867,7 @@ impl Driver {
                 let reason = tail.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_string();
                 let reason = if reason.is_empty() { message } else { reason.chars().rev().take(500).collect::<Vec<_>>()
                     .into_iter().rev().collect() };
-                Err(format!("Straydog failed to start ({reason}); see the server log and restart the server"))
+                Err((format!("Straydog failed to start ({reason}); see the server log and restart the server"), process.holders))
             }
         }
     }
