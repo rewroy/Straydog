@@ -297,3 +297,84 @@ fn a_cancelled_prefetch_taken_before_it_lands() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// A pipelined decode step's use of the store: experts the table does not show found on the host
+/// (either layout) or read there from the drive, VRAM experts copied out, experts moved between the
+/// tiers (promote, demote); every byte the host or a slot holds is the file's.
+#[test]
+fn experts_moved_for_a_decode_table() {
+    use straydog_engine::experts::HostSource;
+    use straydog_engine::transfer::{self, Stream};
+    let layers = roles();
+    let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-decode", std::process::id()));
+    std::fs::write(&path, (0..end + 333).map(byte).collect::<Vec<u8>>()).unwrap();
+    let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), None).unwrap());
+    let host_budget = 24 * (STRIDES.iter().sum::<u64>() + 4 * 4096).next_multiple_of(4096);
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, host_budget).unwrap();
+    let slot_bytes = store.slot_size(0).unwrap() as usize;
+    let mut copy = straydog_engine::storage::Buffer::new(slot_bytes);
+    // SAFETY: unpinned below, after the last copy into it was waited for.
+    unsafe { transfer::pin_host(copy.as_mut_slice().as_mut_ptr(), copy.capacity()).unwrap() };
+    let mut random = Random(0x5eed_1234);
+    let (mut from_host, mut from_drive, mut from_vram, mut promoted, mut demoted) = (0, 0, 0, 0, 0);
+    for step in 0..400 {
+        let layer = if step % 2 == 0 { 0 } else { 2 };
+        let roles = layers[layer].as_ref().unwrap();
+        let expert = random.below(EXPERTS);
+        let want = expected(roles, expert);
+        let generation = store.vram_generation();
+        if store.vram_ready(&mut gpu, layer, expert).unwrap().is_some() || store.in_vram(layer, expert) {
+            // SAFETY: page-locked, of a slot's bytes.
+            assert!(unsafe { store.copy_out(&mut gpu, layer, expert, copy.as_mut_slice().as_mut_ptr()).unwrap() });
+            assert!(copy.as_slice()[..want.len()] == want[..], "step {step}: a VRAM copy differs from the file");
+            from_vram += 1;
+            // Now and then it goes back to the host tier, its slot reused only after this point.
+            if random.below(3) == 0 {
+                let after = gpu.mark(Stream::Compute).unwrap();
+                assert!(store.demote(&mut gpu, layer, expert, after).unwrap());
+                assert!(store.vram_generation() != generation);
+                demoted += 1;
+            }
+            continue;
+        }
+        let mut source = store.host_source(&mut gpu, layer, expert).unwrap();
+        if matches!(source, HostSource::Absent) {
+            store.fetch_host(&mut gpu, layer, expert, random.below(2) == 0).unwrap();
+            from_drive += 1;
+        } else {
+            from_host += 1;
+        }
+        while matches!(source, HostSource::Absent | HostSource::Reading) {
+            if matches!(source, HostSource::Reading) {
+                store.wait_reads(&mut gpu).unwrap();
+            }
+            source = store.host_source(&mut gpu, layer, expert).unwrap();
+        }
+        let HostSource::Ready(pointers) = source else { panic!("step {step}: neither tier nor VRAM holds the expert") };
+        let mut at = 0;
+        for (role, pointer) in roles.iter().zip(pointers) {
+            // SAFETY: the role's bytes in the host tier, untouched until the store's next change.
+            let got = unsafe { std::slice::from_raw_parts(pointer, role.bytes as usize) };
+            assert!(got == &want[at..at + role.bytes as usize], "step {step}: a host copy differs from the file");
+            at += role.bytes as usize;
+        }
+        // Now and then it moves into a free slot (once its upload lands, the slot holds it).
+        if random.below(2) == 0 {
+            if let Some((_, mark)) = store.promote(&mut gpu, layer, expert).unwrap() {
+                assert!(gpu.mark_done(mark, true).unwrap());
+                assert!(store.vram_ready(&mut gpu, layer, expert).unwrap().is_some());
+                assert!(!store.in_host(layer, expert));
+                promoted += 1;
+            }
+        }
+    }
+    store.settle(&mut gpu).unwrap();
+    // SAFETY: pinned above; every copy into it was waited for.
+    unsafe { transfer::unpin_host(copy.as_mut_slice().as_mut_ptr()).unwrap() };
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+    assert!(from_host > 0 && from_drive > 0 && from_vram > 0 && promoted > 0 && demoted > 0,
+            "host {from_host}, drive {from_drive}, VRAM {from_vram}, promoted {promoted}, demoted {demoted}");
+}

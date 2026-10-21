@@ -545,8 +545,8 @@ Where its experts go depends on what the GPUs hold:
   slot is filled for it); each layer also exports the next layer's router applied to its own MoE
   input, and the experts that guess names and no tier holds start reading a layer early (a guess
   only moves reads). The table changes only between steps: experts the CPU ran often (a count of
-  their routes decaying 5% a step) move into VRAM, up to four a step, into a free slot or one a
-  clearly weaker expert gives up (its entry cleared before the step and its slot written only once
+  their routes decaying 5% a step) move into VRAM: into free slots, up to 32 a step, and up to four
+  a step into slots clearly weaker experts give up (its entry cleared before the step and its slot written only once
   the GPU passed that point); each uploads once the host has served its layer, and enters the
   table at the next step. A pass that changes the slots otherwise (a prompt's waves) has the table
   built from the store again. A failure cancels the GPU's waits (they then take zeros and the

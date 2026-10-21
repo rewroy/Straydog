@@ -112,7 +112,7 @@ impl Exchange {
     }
 
     fn range(&self, offset: u64, count: usize) -> Result<()> {
-        if offset < HEADER || offset % 4 != 0 || offset + count as u64 * 4 > self.bytes {
+        if offset < HEADER || !offset.is_multiple_of(4) || offset + count as u64 * 4 > self.bytes {
             return Err("a range outside the host exchange".into());
         }
         Ok(())

@@ -634,12 +634,24 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// the stream handed over to it ([`Engine::hand_over`]); the last returns the logits after the
     /// last token.
     pub fn pass(&mut self, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
+        self.prepare(tokens.len())?;
         self.queue(tokens)?;
         self.finish(tokens.len())
     }
 
-    /// Queue a pass over `tokens` ([`finish`](Self::finish) completes it): a partially resident
-    /// decode step's device work, whose host part then waits for the finish.
+    /// Ready a pass of `n` tokens before any engine's is queued: a pipelined decode step's table
+    /// and graph. The host may wait for the device here; once the steps are queued, a later
+    /// engine's device waits for an earlier one, which waits for the host.
+    fn prepare(&mut self, n: usize) -> Result<()> {
+        if self.hybrid_step(n)? {
+            self.hybrid_prepare()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Queue a prepared pass over `tokens` ([`finish`](Self::finish) completes it): a partially
+    /// resident decode step's device work, whose host part then waits for the finish.
     fn queue(&mut self, tokens: &[u32]) -> Result<()> {
         let n = tokens.len();
         self.begin(tokens)?;
@@ -1259,6 +1271,9 @@ pub fn forward_parts<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) 
 /// host serves each engine's layers in turn.
 pub fn forward_split<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) -> Result<Vec<f32>> {
     let count = engines.len();
+    for engine in engines.iter_mut() {
+        engine.prepare(tokens.len())?;
+    }
     for index in 0..count {
         let (head, tail) = engines.split_at_mut(index + 1);
         let queued = head[index].queue(tokens).and_then(|()| match tail.first_mut() {

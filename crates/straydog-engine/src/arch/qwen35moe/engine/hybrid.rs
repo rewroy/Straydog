@@ -11,11 +11,11 @@
 //! drive a layer early (the guess only moves reads: every route still runs its own expert).
 //!
 //! The device reads the table during a step, so it changes only between steps. Experts the CPU ran
-//! often (a decaying count of their routes) move into VRAM: into a free slot, or one a clearly
-//! weaker expert leaves (its entry cleared before the step, its slot written only once the device
-//! has passed that point); each is uploaded once the host has served its layer in the step, and
-//! enters the table at the next. A pass that takes slots otherwise (a prompt's) has the table built
-//! from the store again.
+//! often (a decaying count of their routes) move into VRAM: into free slots (up to 32 a step), and
+//! (up to four a step) into slots clearly weaker experts leave (their entries cleared before the
+//! step, their slots written only once the device has passed that point); each is uploaded once the
+//! host has served its layer in the step, and enters the table at the next. A pass that takes slots
+//! otherwise (a prompt's) has the table built from the store again.
 
 use std::collections::HashMap;
 
@@ -29,9 +29,13 @@ use crate::transfer::{self, Mark, Stream};
 
 /// The graph a partially resident decode step records.
 const HYBRID_GRAPH: u64 = 2;
-/// Experts moved into VRAM at most per step.
+/// Experts moved into VRAM a step at most: into free slots, and in place of weaker ones (more
+/// swaps' copies slowed the GPU's own work by more than they saved the CPU).
+const FILLS: usize = 32;
 const SWAPS: usize = 4;
-/// A route's count decays by this per step (about the last 20 steps count).
+/// Layers ahead whose routes a layer guesses (to start their drive reads early).
+const GUESSED: usize = 1;
+/// A route's count decays by this per step (about the last 20 steps count; 0.99 chose alike).
 const DECAY: f32 = 0.95;
 
 fn round(bytes: u64) -> u64 {
@@ -70,8 +74,8 @@ pub(super) struct Hybrid {
     queuing: bool,
     /// The step queued and not yet served: the exports before it, and a mark after it.
     pending: Option<(u32, Mark)>,
-    /// The next layer's routes as guessed from a layer's MoE input: router logits, then the top
-    /// experts and their weights.
+    /// The next layers' routes as guessed from a layer's MoE input: router logits, then each
+    /// guessed layer's top experts, then their weights.
     guess: Buffer,
     /// A page-locked copy of one expert, for one only VRAM holds (rare: the table not yet showing it).
     scratch: Option<storage::Buffer>,
@@ -81,8 +85,10 @@ pub(super) struct Hybrid {
     /// between steps on the table, queuing the step; and the steps.
     timing: [f64; 5],
     steps: u64,
-    /// Routes that waited for a drive read, and reads started on a guess.
+    /// Routes that waited for a drive read (started then, or earlier on a guess), and reads started
+    /// on a guess.
     waits: u64,
+    late: u64,
     guesses: u64,
 }
 
@@ -111,10 +117,10 @@ impl<T: Tensors> Engine<'_, T> {
         }
         let hp = self.hp.clone();
         let (layers, experts, k, w) = (self.settings.layers.len(), hp.experts, hp.experts_used, hp.width);
-        let (export_stride, result_stride) = (round(((3 * k + w) * 4) as u64), round((w * 4) as u64));
+        let (export_stride, result_stride) = (round(((2 * k + w + GUESSED * k) * 4) as u64), round((w * 4) as u64));
         let exchange = self.gpu.exchange(HEADER + layers as u64 * (export_stride + result_stride))?;
         let table = self.gpu.buffer((layers * experts * 8) as u64)?;
-        let guess = self.gpu.buffer(((experts + 2 * k) * 4) as u64)?;
+        let guess = self.gpu.buffer(((experts + 2 * GUESSED * k) * 4) as u64)?;
         let slot_bytes = self.settings.layers.clone()
             .map(|layer| self.experts.slot_size(layer).ok_or_else(|| format!("layer {layer} has no expert slots")))
             .collect::<Result<Vec<u64>>>()?;
@@ -124,7 +130,7 @@ impl<T: Tensors> Engine<'_, T> {
             exchange, table, entries: vec![0; layers * experts], slot_bytes, kinds, offsets, dirty: vec![true; layers], built: None,
             planned: vec![Vec::new(); layers], landing: Vec::new(), scores: vec![0.0; layers * experts], recent: Vec::new(),
             export_stride, result_stride, graph: false, queuing: false, pending: None, guess, scratch: None, gpu_routes: 0,
-            timing: [0.0; 5], steps: 0, waits: 0, guesses: 0,
+            timing: [0.0; 5], steps: 0, waits: 0, late: 0, guesses: 0,
         });
         Ok(true)
     }
@@ -143,42 +149,50 @@ impl<T: Tensors> Engine<'_, T> {
     /// exports, running CPU experts, waiting for drive reads, keeping the table between steps,
     /// queuing the steps; then the routes that waited for a drive read and the reads started on a
     /// guess.
-    pub fn hybrid_timing(&self) -> (u64, [f64; 5], [u64; 2]) {
-        self.hybrid.as_ref().map_or((0, [0.0; 5], [0; 2]), |hybrid| (hybrid.steps, hybrid.timing, [hybrid.waits, hybrid.guesses]))
+    pub fn hybrid_timing(&self) -> (u64, [f64; 5], [u64; 3]) {
+        self.hybrid.as_ref().map_or((0, [0.0; 5], [0; 3]), |hybrid| {
+            (hybrid.steps, hybrid.timing, [hybrid.waits, hybrid.late, hybrid.guesses])
+        })
     }
 
     fn hybrid_mut(&mut self) -> Result<&mut Hybrid> {
         self.hybrid.as_mut().ok_or_else(|| "no partially resident decode state".into())
     }
 
-    /// Queue a decode step (its positions and embedding written): the table brought up to date,
-    /// then the step's graph (recorded its first time).
-    pub(super) fn hybrid_queue(&mut self) -> Result<()> {
+    /// Ready a decode step: the table brought up to date, the step's graph recorded its first time.
+    pub(super) fn hybrid_prepare(&mut self) -> Result<()> {
         let started = std::time::Instant::now();
         self.hybrid_table()?;
+        let direct = std::env::var_os("Q35_HYBRID_GRAPH").is_some_and(|value| value == "0");
+        if !direct && !self.hybrid_mut()?.graph {
+            self.gpu.graph_begin()?;
+            self.hybrid_mut()?.queuing = true;
+            let recorded = self.layers_and_head(1);
+            self.hybrid_mut()?.queuing = false;
+            self.gpu.graph_end(HYBRID_GRAPH, recorded.is_ok())?;
+            recorded?;
+            self.hybrid_mut()?.graph = true;
+        }
         let hybrid = self.hybrid_mut()?;
         hybrid.timing[3] += started.elapsed().as_secs_f64();
         hybrid.steps += 1;
+        Ok(())
+    }
+
+    /// Queue a prepared decode step (its positions and embedding written): its graph, or its ops
+    /// one by one (Q35_HYBRID_GRAPH=0). Nothing here waits for the device.
+    pub(super) fn hybrid_queue(&mut self) -> Result<()> {
         let started = std::time::Instant::now();
-        let direct = std::env::var_os("Q35_HYBRID_GRAPH").is_some_and(|value| value == "0");
-        let hybrid = self.hybrid_mut()?;
-        let before = hybrid.exchange.exported();
-        let recorded = hybrid.graph;
-        if direct || !recorded {
-            if !direct {
-                self.gpu.graph_begin()?;
+        let before = self.hybrid_mut()?.exchange.exported();
+        if self.hybrid_mut()?.graph {
+            if !self.gpu.graph_run(HYBRID_GRAPH)? {
+                return Err("the qwen35moe decode graph went missing".into());
             }
+        } else {
             self.hybrid_mut()?.queuing = true;
             let queued = self.layers_and_head(1);
             self.hybrid_mut()?.queuing = false;
-            if !direct {
-                self.gpu.graph_end(HYBRID_GRAPH, queued.is_ok())?;
-            }
             queued?;
-            self.hybrid_mut()?.graph = !direct;
-        }
-        if !direct && !self.gpu.graph_run(HYBRID_GRAPH)? {
-            return Err("the qwen35moe decode graph went missing".into());
         }
         let end = self.gpu.mark(Stream::Compute)?;
         let hybrid = self.hybrid_mut()?;
@@ -196,10 +210,15 @@ impl<T: Tensors> Engine<'_, T> {
         let (exchange, offset, guess) = (hybrid.exchange, HEADER + index as u64 * hybrid.export_stride, hybrid.guess);
         let mut parts = vec![(work.ids.base().cast_const(), k as u64), (work.weights.base().cast_const(), k as u64),
                              (work.x.base().cast_const(), w as u64)];
-        if layer + 1 < self.settings.layers.end {
-            self.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, guess.base())?;
-            self.gpu.route(guess.base(), None, 1, experts as u64, k as u64, 0, true, 1.0, guess.at(experts), guess.at(experts + k))?;
-            parts.push((guess.at(experts).cast_const(), k as u64));
+        let ahead = GUESSED.min(self.settings.layers.end - layer - 1);
+        for step in 0..ahead {
+            // (the logits are read by the route before the next guess writes them)
+            self.linear(&name(layer + 1 + step, "ffn_gate_inp"), work.x.base(), 1, guess.base())?;
+            self.gpu.route(guess.base(), None, 1, experts as u64, k as u64, 0, true, 1.0, guess.at(experts + step * k),
+                           guess.at(experts + (GUESSED + step) * k))?;
+        }
+        if ahead > 0 {
+            parts.push((guess.at(experts).cast_const(), (ahead * k) as u64));
         }
         self.gpu.export(&parts, &exchange, offset)
     }
@@ -229,8 +248,8 @@ impl<T: Tensors> Engine<'_, T> {
         let generation = self.experts.vram_generation();
         let hybrid = self.hybrid.as_mut().ok_or("no partially resident decode state")?;
         if hybrid.built != Some(generation) {
+            // (promotions uploading enter with the rest once ready; those planned still go ahead)
             hybrid.landing.clear();
-            hybrid.planned.iter_mut().for_each(Vec::clear);
             let old = std::mem::replace(&mut hybrid.entries, vec![0; hybrid.scores.len()]);
             let mut complete = true;
             for (layer, expert) in self.experts.vram_keys() {
@@ -298,7 +317,7 @@ impl<T: Tensors> Engine<'_, T> {
         }
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
         candidates.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
-        candidates.truncate(SWAPS);
+        candidates.truncate(FILLS);
         // The weakest experts the table runs, weakest first.
         let mut residents: Vec<(f32, usize, usize)> = self.experts.vram_keys().into_iter()
             .filter(|&(layer, _)| self.settings.layers.contains(&layer))
@@ -322,6 +341,9 @@ impl<T: Tensors> Engine<'_, T> {
             if self.experts.free_slots(layer) > *reserved {
                 *reserved += 1;
                 hybrid.planned[index].push(expert);
+                continue;
+            }
+            if victims.len() == SWAPS {
                 continue;
             }
             // Hysteresis: only a clearly weaker expert gives its slot up.
@@ -392,8 +414,8 @@ impl<T: Tensors> Engine<'_, T> {
         let started = std::time::Instant::now();
         exchange.wait_export(&mut self.gpu, count, end)?;
         let waited = std::time::Instant::now();
-        let guessed = layer + 1 < self.settings.layers.end;
-        let mut packed = vec![0f32; if guessed { 3 * k + w } else { 2 * k + w }];
+        let ahead = GUESSED.min(self.settings.layers.end - layer - 1);
+        let mut packed = vec![0f32; 2 * k + w + ahead * k];
         exchange.read(export, &mut packed)?;
         let ids: Vec<usize> = packed[..k].iter().map(|id| id.to_bits() as usize).collect();
         let next: Vec<usize> = packed[2 * k + w..].iter().map(|id| id.to_bits() as usize).collect();
@@ -413,21 +435,14 @@ impl<T: Tensors> Engine<'_, T> {
                 continue;
             }
             hybrid.recent.push((index, id));
-            if matches!(self.experts.host_source(&mut self.gpu, layer, id)?, HostSource::Absent) {
-                self.experts.fetch_host(&mut self.gpu, layer, id, true)?;
+            match self.experts.host_source(&mut self.gpu, layer, id)? {
+                HostSource::Absent => self.experts.fetch_host(&mut self.gpu, layer, id, true)?,
+                HostSource::Reading => self.hybrid_mut()?.late += 1,
+                _ => {}
             }
             cpu.push(route);
         }
-        // The next layer's guessed experts that neither tier holds, read behind this layer's.
-        for &id in &next {
-            let hybrid = self.hybrid.as_ref().ok_or("no partially resident decode state")?;
-            if hybrid.entries[(index + 1) * experts + id] == 0
-                && matches!(self.experts.host_source(&mut self.gpu, layer + 1, id)?, HostSource::Absent)
-            {
-                self.experts.fetch_host(&mut self.gpu, layer + 1, id, false)?;
-                self.hybrid_mut()?.guesses += 1;
-            }
-        }
+        self.fetch_guesses(index, &next)?;
         self.hybrid_mut()?.gpu_routes += gpu_routes;
         let mut sum = vec![0f32; w];
         let mut waiting = Vec::new();
@@ -477,6 +492,24 @@ impl<T: Tensors> Engine<'_, T> {
             hybrid.follow(before, now);
             if let Some((base, mark)) = promoted {
                 hybrid.landing.push((index, expert, base, mark));
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the drive reads of the next layers' guessed experts that no tier holds, behind the
+    /// reads passes wait for (guessing fewer of them, or reading them as urgently, measured slower).
+    fn fetch_guesses(&mut self, index: usize, next: &[usize]) -> Result<()> {
+        let (k, experts) = (self.hp.experts_used, self.hp.experts);
+        let layer = self.settings.layers.start + index;
+        for (at, &id) in next.iter().enumerate() {
+            let step = 1 + at / k;
+            let hybrid = self.hybrid.as_ref().ok_or("no partially resident decode state")?;
+            if hybrid.entries[(index + step) * experts + id] == 0
+                && matches!(self.experts.host_source(&mut self.gpu, layer + step, id)?, HostSource::Absent)
+            {
+                self.experts.fetch_host(&mut self.gpu, layer + step, id, false)?;
+                self.hybrid_mut()?.guesses += 1;
             }
         }
         Ok(())

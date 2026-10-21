@@ -2,7 +2,7 @@
 //! experts of a layer (random ones of the layer each call) run from host memory, on 1 and on all
 //! cores; GB/s of expert weights. Development only (unauthenticated weights).
 //!
-//! q35_cpu_bench MODEL.gguf LAYER [THREADS]
+//! q35_cpu_bench MODEL.gguf LAYER [THREADS] [EXPERTS a call, default the model's top-k]
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -11,12 +11,14 @@ use straydog_gpu::ffi;
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [path, layer, rest @ ..] = &args[..] else { return Err("usage: q35_cpu_bench MODEL.gguf LAYER [THREADS]".into()) };
+    let [path, layer, rest @ ..] = &args[..] else { return Err("usage: q35_cpu_bench MODEL.gguf LAYER [THREADS] [EXPERTS]".into()) };
     let threads: u32 = rest.first().map_or(Ok(6), |value| value.parse()).map_err(|_| "THREADS must be a number")?;
+    let per_call: Option<usize> = rest.get(1).map(|value| value.parse()).transpose().map_err(|_| "EXPERTS must be a number")?;
     let mut file = File::open(path).map_err(|exc| exc.to_string())?;
     let header = straydog_gguf::inspect(&mut file).map_err(|exc| exc.to_string())?;
     let hp = straydog_engine::arch::qwen35moe::Hparams::from_header(&header)?;
-    let (hidden, ffn, experts, top_k) = (hp.width, hp.expert_ff, hp.experts, hp.experts_used);
+    let (hidden, ffn, experts) = (hp.width, hp.expert_ff, hp.experts);
+    let top_k = per_call.unwrap_or(hp.experts_used).clamp(1, experts);
     // Each role's whole bank (every expert) of the layer, read into memory.
     let mut roles = Vec::new();
     for role in ["gate", "up", "down"] {

@@ -5,11 +5,12 @@
 //! on GPU 0 and the rest on GPU 1. Reports the decode rate over the steps after --settle steps,
 //! routes per token by tier, and the CPU expert engine's time; --record FILE writes the logits after
 //! every prefill chunk and decode step, --against FILE compares this run's with them (KL, top-1,
-//! equal logits); --save FILE writes the prompt and the greedy tokens as a tokens file. Development
-//! only (unauthenticated weights).
+//! equal logits); --save FILE writes the prompt and the greedy tokens as a tokens file; --again N
+//! runs the prompt N more times after the decode (the tiers warm), timed. Development only
+//! (unauthenticated weights).
 //!
 //! q35_hybrid MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--settle N] [--slots N] [--host-gb N] [--cpu N] [--split L]
-//!            [--context N] [--gpu N] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE] [--save FILE]
+//!            [--context N] [--gpu N] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE] [--save FILE] [--again N]
 
 #[path = "common/files.rs"]
 mod files;
@@ -73,7 +74,7 @@ fn main() -> Result<(), String> {
     });
     let (chunk, generate, settle, slots) = (option("--chunk", 64), option("--generate", 128), option("--settle", 32), option("--slots", 226));
     let (host_gb, cpu_threads, split, context) = (option("--host-gb", 22), option("--cpu", 6), option("--split", 0), option("--context", 16384));
-    let (gpu, teacher) = (option("--gpu", 0), option("--teacher", 0) > 0);
+    let (gpu, teacher, again) = (option("--gpu", 0), option("--teacher", 0) > 0, option("--again", 0));
     let mut text_option = |flag: &str| args.iter().position(|arg| arg == flag).map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -90,7 +91,7 @@ fn main() -> Result<(), String> {
     let parse = |line: Option<&str>| -> Vec<u32> { line.unwrap_or("").split_whitespace().map(|id| id.parse().unwrap()).collect() };
     let (prompt, continuation) = (parse(lines.next()), parse(lines.next()));
     let layers = hp.layers();
-    let parts: Vec<_> = if split == 0 { vec![0..layers] } else { vec![0..split, split..layers] };
+    let parts: Vec<_> = if split == 0 { std::iter::once(0..layers).collect() } else { vec![0..split, split..layers] };
     let started = std::time::Instant::now();
     let mut engines = Vec::new();
     let host_bytes = (host_gb as u64) << 30;
@@ -128,8 +129,8 @@ fn main() -> Result<(), String> {
     let (mut before, mut cpu_before, mut started, mut routes_before) = (counts(&engines), cpu_stats(), std::time::Instant::now(), 0u64);
     let mut step_seconds = Vec::new();
     let timing = |engines: &[Engine<'_, files::Files>]| engines.iter().map(Engine::hybrid_timing)
-        .fold((0u64, [0f64; 5], [0u64; 2]), |a, b| (a.0 + b.0, std::array::from_fn(|i| a.1[i] + b.1[i]), [a.2[0] + b.2[0],
-                                                                                                          a.2[1] + b.2[1]]));
+        .fold((0u64, [0f64; 5], [0u64; 3]), |a, b| (a.0 + b.0, std::array::from_fn(|i| a.1[i] + b.1[i]),
+                                                    std::array::from_fn(|i| a.2[i] + b.2[i])));
     let mut timing_before = timing(&engines);
     while output.len() < generate.max(1) {
         if output.len() == settle + 1 {
@@ -168,8 +169,9 @@ fn main() -> Result<(), String> {
     println!("host per token (pipelined steps {}): waiting for exports {:.2} ms, CPU experts {:.2} ms, drive reads {:.2} ms, table \
               {:.2} ms, queuing {:.2} ms, the rest {:.2} ms", timing_after.0 - timing_before.0, host_ms(0), host_ms(1), host_ms(2),
              host_ms(3), host_ms(4), seconds / steps * 1e3 - served);
-    println!("drive: per token {:.2} routes waited for a read, {:.2} reads started on a guess",
-             (timing_after.2[0] - timing_before.2[0]) as f64 / steps, (timing_after.2[1] - timing_before.2[1]) as f64 / steps);
+    let count = |index: usize| (timing_after.2[index] - timing_before.2[index]) as f64 / steps;
+    println!("drive: per token {:.2} routes waited for a read ({:.2} of them read on a guess), {:.2} reads started on a guess",
+             count(0), count(1), count(2));
     println!("greedy:    {:?}", &output[..output.len().min(64)]);
     if !teacher {
         let same = output.iter().zip(&continuation).take_while(|(a, b)| a == b).count();
@@ -187,6 +189,20 @@ fn main() -> Result<(), String> {
     }
     if let Some(path) = &against {
         compare(&rows, path, prefill_probes)?;
+    }
+    // The prompt again, `again` times, with the tiers as the run left them (warm).
+    for round in 0..again {
+        for engine in &mut engines {
+            engine.reset()?;
+        }
+        let (before, started) = (counts(&engines), std::time::Instant::now());
+        for piece in prompt.chunks(chunk.max(1)) {
+            forward_split(&mut engines, piece)?;
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        let after = counts(&engines);
+        println!("prompt again ({}): {} tokens in {seconds:.2} s ({:.1} tok/s); {} VRAM hits, {} host hits, {} drive reads", round + 1,
+                 prompt.len(), prompt.len() as f64 / seconds, after.0 - before.0, after.1 - before.1, after.2 - before.2);
     }
     for engine in &mut engines {
         engine.settle()?;

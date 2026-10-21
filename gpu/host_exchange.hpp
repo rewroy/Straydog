@@ -92,8 +92,9 @@ void* sd_exchange(void* handle, uint64_t bytes) {
             std::memset(area.host, 0, area.bytes);
             check(hipHostGetDevicePointer(reinterpret_cast<void**>(&area.view), area.host, 0));
             area.count = static_cast<uint32_t*>(allocate(value, 256));
+            // (zeroed in stream order before any op uses it: no wait, so a stream that waits for
+            // another device's work may take an exchange)
             check(hipMemsetAsync(area.count, 0, 256, value.stream));
-            check(hipStreamSynchronize(value.stream));
             value.exchanges.emplace(area.host, area);
         } catch (...) {
             cleanup(hipHostFree(area.host));
