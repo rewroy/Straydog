@@ -248,6 +248,20 @@ impl Backend {
         })
     }
 
+    /// [`swiglu_linear`](Self::swiglu_linear), and meanwhile [`route`](Self::route) of one row of
+    /// 256 router `logits` (softmax gating, normalized, no bias, scale 1) into `ids` and
+    /// `route_weights`; the same results, in one launch where the GEMV takes it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_linear_route(&mut self, weights: &Buffer, kind: u32, rows: u64, cols: u64, gate: P, up: P, scale: Option<P>,
+                               hidden: M, out: M, logits: P, k: u64, ids: M, route_weights: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_swiglu_linear_route(self.handle(), weights.pointer.cast_const(), kind as i32, rows, cols, gate.cast(), up.cast(),
+                                           scale.map_or(std::ptr::null(), |scale| scale.cast()), hidden.cast(), out.cast(), logits.cast(),
+                                           k, ids.cast(), route_weights.cast())
+        })
+    }
+
     pub fn rms_norm(&mut self, input: P, weight: &Buffer, rows: u64, width: u64, eps: f32, output: M)
                     -> Result<()> {
         // SAFETY: as above.
@@ -380,8 +394,6 @@ impl Backend {
         })
     }
 
-    /// rms_norm(x) * weight * SiLU(gate) per row.
-    #[allow(clippy::too_many_arguments)]
     /// One decode step of a DeltaNet: [`conv_silu`](Self::conv_silu), [`delta_rule`](Self::delta_rule)
     /// and [`gated_norm`](Self::gated_norm) in one launch, the same results (`qkv` keeps its values).
     /// False when not taken (the caller runs the three).
@@ -397,9 +409,27 @@ impl Backend {
         Ok(state_ == 0)
     }
 
+    /// rms_norm(x) * weight * SiLU(gate) per row.
+    #[allow(clippy::too_many_arguments)]
     pub fn gated_norm(&mut self, x: P, gate: P, weight: &Buffer, rows: u64, width: u64, eps: f32, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_gated_norm(self.handle(), x.cast(), gate.cast(), weight.pointer.cast(), rows, width, eps, out.cast()) })
+    }
+
+    /// An attention step's inputs in one launch: [`split`](Self::split) of `q_full` (rows x heads x
+    /// [query | gate]) into `q` and `gate`, [`rms_norm`](Self::rms_norm) of the queries and of `k`'s
+    /// heads (in place), [`rope_halves`](Self::rope_halves) of both, and [`scatter`](Self::scatter)
+    /// of `k` and `v` to rows `positions` of `keys` and `values` (`context` rows each); the same results.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prepare(&mut self, q_full: P, k: M, v: P, rows: u64, heads: u64, kv_heads: u64, dim: u64, q_weight: &Buffer,
+                             k_weight: &Buffer, eps: f32, rope_dims: u64, positions: &Buffer, frequencies: &Buffer, q: M, gate: M,
+                             keys: M, values: M, context: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_attention_prepare(self.handle(), q_full.cast(), k.cast(), v.cast(), rows, heads, kv_heads, dim,
+                                         q_weight.pointer.cast(), k_weight.pointer.cast(), eps, rope_dims, positions.pointer.cast(),
+                                         frequencies.pointer.cast(), q.cast(), gate.cast(), keys.cast(), values.cast(), context)
+        })
     }
 
     /// Rows of [first | second] (2 x width values) into two buffers of rows.
@@ -445,6 +475,33 @@ impl Backend {
     pub fn link_sum(&mut self, part: P, count: u64, out: M, accumulate: bool) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_link_sum(self.handle(), part.cast(), count, out.cast(), i32::from(accumulate)) })
+    }
+
+    /// One vector through a matrix into `part`, this device's part of a linked sum then added into
+    /// `out` as [`link_sum`](Self::link_sum) adds it (accumulating), in one launch where the GEMV
+    /// takes it: the same results as [`linear`](Self::linear) and `link_sum`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_link_sum(&mut self, weights: &Buffer, kind: u32, rows: u64, cols: u64, input: P, part: M, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_linear_link_sum(self.handle(), weights.pointer.cast_const(), kind as i32, rows, cols, input.cast(), part.cast(),
+                                       out.cast())
+        })
+    }
+
+    /// [`experts_table`](Self::experts_table) of one row (clamp 0, accumulating into `part`), then
+    /// `part` added into `out` as [`link_sum`](Self::link_sum) adds it, the sum in the down
+    /// stage's launch where it takes it: the same results.
+    #[allow(clippy::too_many_arguments)]
+    pub fn experts_table_link_sum(&mut self, table: &Buffer, count: u64, ids: P, slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3],
+                                  hidden: u64, ffn: u64, top_k: u64, input: P, weights: P, product: M, part: M, out: M) -> Result<()> {
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: as experts_table.
+        check(unsafe {
+            ffi::sd_op_experts_table_link_sum(self.handle(), table.pointer.cast(), count, ids.cast(), slot_bytes, offsets.as_ptr(),
+                                              kinds.as_ptr(), hidden, ffn, top_k, input.cast(), weights.cast(), product.cast(), part.cast(),
+                                              out.cast())
+        })
     }
 
     /// Queue a copy of the link's failure word into `out` (nonzero after a wait gave up): read with

@@ -109,6 +109,28 @@ fn main() -> Result<(), String> {
             gpu.norm_linears(x.base(), &weight, WIDTH as u64, 1e-6, normed.base(), &[linear(bank[at], kind, rows, WIDTH, &normed, &out)])
         })?;
     }
+    // A tensor-parallel part's fused decode projections, streamed from VRAM: a DeltaNet's (norm +
+    // Q8_0 qkv 4096 and gate 2048 rows, F32 beta and alpha 16 rows) and a MoE's (norm + F32 router
+    // 256 rows, Q8_0 shared gate and up 256 rows each, F32 shared-expert gate 1 row).
+    let row8 = WIDTH / 32 * 34;
+    for (label, items) in [("DeltaNet projections", vec![(8u32, 4096usize), (8, 2048), (0, 16), (0, 16)]),
+                           ("MoE projections", vec![(0, 256), (8, 256), (8, 256), (0, 1)])] {
+        let bytes: usize = items.iter().map(|&(kind, rows)| rows * if kind == 0 { WIDTH * 4 } else { row8 }).sum();
+        let count = (320 << 20) / bytes;
+        let sets: Vec<Vec<Buffer>> = (0..count)
+            .map(|_| items.iter().map(|&(kind, rows)| gpu.upload_bytes(&vec![0u8; rows * if kind == 0 { WIDTH * 4 } else { row8 }]))
+                .collect::<Result<_, _>>())
+            .collect::<Result<_, _>>()?;
+        let outs: Vec<Buffer> = items.iter().map(|&(_, rows)| floats(&mut gpu, rows)).collect::<Result<_, _>>()?;
+        let mut at = 0;
+        let each = time(&mut gpu, next(), &format!("norm + {label}, from VRAM, fused"), &out, &mut |gpu| {
+            at = (at + 1) % count;
+            let linears: Vec<Linear> = items.iter().zip(&sets[at]).zip(&outs)
+                .map(|((&(kind, rows), weights), output)| linear(*weights, kind, rows, WIDTH, &normed, output)).collect();
+            gpu.norm_linears(x.base(), &weight, WIDTH as u64, 1e-6, normed.base(), &linears)
+        })?;
+        println!("    {:.0} GB/s ({:.2} MB)", bytes as f64 / 1e9 / (each * 1e-6), bytes as f64 / 1e6);
+    }
     println!("(a bare add: {base:.2} us)");
     Ok(())
 }

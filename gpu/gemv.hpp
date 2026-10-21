@@ -694,12 +694,15 @@ constexpr int gemv_max_vectors = 4;
 // decoder residual update, with vector v at hidden + v*hidden_stride, mix + v*mix_stride.
 // Or (gate, without hidden) store vector v's y times sigmoid(gate[v]), as tm_scale_rows_kernel
 // scales a row.
-struct GemvResidual { float* hidden; const float* mix; uint32_t hidden_stride, mix_stride; const float* gate = nullptr; };
+// peer: each stored value also into the other device's inbox, at its output index (link_tail.hpp).
+struct GemvResidual { float* hidden; const float* mix; uint32_t hidden_stride, mix_stride; const float* gate = nullptr; float* peer = nullptr; };
 struct FixedGemv { GemvItem items[gemv_fixed_items]; uint32_t count, input_stride, output_stride; GemvResidual residual; };
 __device__ __forceinline__ void gemv_store(const Matrix& m, size_t row, int v, float total, float* output, uint32_t output_stride,
                                            const GemvResidual& residual) {
     if (!residual.hidden) {
-        output[m.output_offset + row + v * output_stride] = residual.gate ? total * (1.0f / (1.0f + expf(-residual.gate[v]))) : total;
+        const float value = residual.gate ? total * (1.0f / (1.0f + expf(-residual.gate[v]))) : total;
+        output[m.output_offset + row + v * output_stride] = value;
+        if (residual.peer) link_send(residual.peer + m.output_offset + row + v * output_stride, value);
         return;
     }
     #pragma unroll
@@ -788,6 +791,18 @@ __global__ void gemv_fixed_kind(FixedGemv list, const float* input, float* outpu
     const GemvItem& item = list.items[selected];
     gemv_rows<kind, V>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, input, list.input_stride,
                        output, list.output_stride, list.residual);
+}
+// gemv_fixed_kind of one matrix and one vector whose output is this device's part of a linked sum:
+// the rows also go to the other device's inbox, and the last block adds the parts (link_tail).
+template<int kind>
+__global__ void gemv_linked_kind(FixedGemv list, const float* input, float* output, LinkTail tail) {
+    const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    const GemvItem& item = list.items[0];
+    GemvResidual residual = list.residual;
+    residual.peer = link_tail_slot(tail);
+    gemv_rows<kind, 1>(item.matrix, wave * (32 / item.lanes), item.lanes, input, list.input_stride, output, list.output_stride,
+                       residual);
+    link_tail(tail);
 }
 __global__ void gemv_list(const GemvItem* items, size_t count, const float* input, float* output) {
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
@@ -966,6 +981,26 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
         }
     } else gemv_fixed<V><<<blocks, 256, 0, d.stream>>>(list, input, output);
     #undef SD_UNIFORM
+}
+// One vector through one matrix into `output`, this device's part of `tail`'s linked sum, in one
+// launch: gemv()'s rows, lanes and dots (min_lanes as given it) on the kernel it would take,
+// gemv_fixed_kind; false (nothing launched) where it would take another.
+bool gemv_linked_launch(Device& d, const Matrix& matrix, const float* input, float* output, const LinkTail& tail, unsigned min_lanes) {
+    unsigned lanes = gemv_lanes(matrix, input);
+    size_t alignment = 0;
+    if (lanes == 2 && min_lanes > 2 && matrix.cols / gemv_unit(matrix.kind, alignment) >= 32) lanes = std::min(32u, min_lanes);
+    // (BF16 rows may read their input from shared memory, and 2560 x 6144 has kernels of its own)
+    if (!lanes || matrix.kind == 30 || (matrix.rows == 2560 && matrix.cols == 6144)) return false;
+    FixedGemv list{};
+    list.items[0] = {matrix, 0, lanes};
+    list.count = 1;
+    const unsigned blocks = unsigned((gemv_waves(matrix, lanes) + 7) / 8);
+    #define SD_LINKED(format) case format: gemv_linked_kind<format><<<blocks, 256, 0, d.stream>>>(list, input, output, tail); return true;
+    switch (matrix.kind) {
+        SD_FAST_FORMATS(SD_LINKED)
+    }
+    #undef SD_LINKED
+    return false;
 }
 // Launch up to 24 independent row ranges in one dispatch, for up to four vectors. min_lanes (a
 // power of two) widens a row that gemv_lanes splits over only two lanes, when it has at least 32

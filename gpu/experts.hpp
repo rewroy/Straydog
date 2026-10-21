@@ -397,8 +397,10 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
 }
 // blockIdx.y selects a token; the waves cover the output rows, each summed over the token's routes
 // in route order, then added to `out` (or stored, without `accumulate`).
+// (each value also into `peer` at its index from out, when given: link_tail.hpp)
 template<int kind>
-__global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) {
+__device__ __forceinline__ void slot_down_rows(const SlotExperts& plan, const uint64_t* bases, const float* product, float* out,
+                                               size_t out_stride, float* peer) {
     const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
     const Matrix& down = plan.role[2];
     const unsigned lanes = plan.lanes[1], lane = threadIdx.x % 32, sub = lane % lanes;
@@ -416,13 +418,30 @@ __global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* 
     sum = slot_reduce(sum, lanes);
     if (sub || row >= down.rows) return;
     float* target = out + size_t(blockIdx.y) * out_stride + plan.out_first + row;
-    *target = plan.accumulate ? *target + sum : sum;
+    const float value = plan.accumulate ? *target + sum : sum;
+    *target = value;
+    if (peer) link_send(peer + (target - out), value);
+}
+template<int kind>
+__global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) {
+    slot_down_rows<kind>(plan, bases, product, out, out_stride, nullptr);
+}
+// slot_down whose output is this device's part of a linked sum (one row): the last block adds the
+// parts (link_tail).
+template<int kind>
+__global__ void slot_down_linked(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride,
+                                 LinkTail tail) {
+    slot_down_rows<kind>(plan, bases, product, out, out_stride, link_tail_slot(tail));
+    link_tail(tail);
 }
 // The stages (1 gate/up, 2 down) for `tokens` rows: product = SwiGLU of every route (tokens x top_k
 // rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
 // of different formats, takes the reference decoder a row per wave.
-void slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases, size_t tokens, const float* input,
-                  size_t input_stride, const float* weights, float* product, float* out, size_t out_stride) {
+// With a tail (one row, both stages), out is this device's part of its linked sum, the down stage's
+// kernel adding the parts; false (nothing launched) when the down rows take the reference decoder.
+bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases, size_t tokens, const float* input,
+                  size_t input_stride, const float* weights, float* product, float* out, size_t out_stride,
+                  const LinkTail* tail = nullptr) {
     const Matrix &gate = plan.role[0], &up = plan.role[1], &down = plan.role[2];
     auto fast = [](int kind) {
         switch (kind) {
@@ -442,6 +461,7 @@ void slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
     plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
     plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
+    if (tail && (down_kind < 0 || stages != 3 || tokens != 1)) return false;
     const dim3 first(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
     const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));
     #define SD_SLOT_GATE(format) case format: \
@@ -454,7 +474,17 @@ void slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
         check(hipGetLastError());
     }
     #undef SD_SLOT_GATE
-    if (!(stages & 2)) return;
+    if (!(stages & 2)) return true;
+    if (tail) {
+        #define SD_SLOT_LINKED(format) case format: \
+            slot_down_linked<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride, *tail); break;
+        switch (down_kind) {
+            SD_FAST_FORMATS(SD_SLOT_LINKED)
+        }
+        #undef SD_SLOT_LINKED
+        check(hipGetLastError());
+        return true;
+    }
     #define SD_SLOT_DOWN(format) case format: \
         slot_down<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride); break;
     switch (down_kind) {
@@ -463,4 +493,5 @@ void slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     }
     #undef SD_SLOT_DOWN
     check(hipGetLastError());
+    return true;
 }

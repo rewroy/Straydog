@@ -251,6 +251,16 @@ __global__ void tm_split_kernel(const float* x, size_t count, size_t width, floa
     second[index] = x[row * 2 * width + width + col];
 }
 
+// A pair (first, second) rotated by position * frequency, the angle formed in double.
+__device__ __forceinline__ void tm_rope_pair(float* first, float* second, int32_t position, float frequency) {
+    const double angle = double(position) * double(frequency);
+    double s, c;
+    sincos(angle, &s, &c);
+    const double a = *first, b = *second;
+    *first = float(a * c - b * s);
+    *second = float(a * s + b * c);
+}
+
 // The leading 2 * pairs values of each vector rotated: pair i is (i, i + pairs), by the row's
 // position times frequencies[i] (angles in double, as the other rotary ops).
 __global__ void tm_rope_halves_kernel(float* x, size_t count, size_t vectors, size_t width, size_t pairs,
@@ -260,12 +270,68 @@ __global__ void tm_rope_halves_kernel(float* x, size_t count, size_t vectors, si
     const size_t row = index / (vectors * pairs), rest = index % (vectors * pairs);
     const size_t vector = rest / pairs, pair = rest % pairs;
     float* v = x + (row * vectors + vector) * width;
-    const double angle = double(positions[row]) * double(frequencies[pair]);
-    double s, c;
-    sincos(angle, &s, &c);
-    const double a = v[pair], b = v[pair + pairs];
-    v[pair] = float(a * c - b * s);
-    v[pair + pairs] = float(a * s + b * c);
+    tm_rope_pair(v + pair, v + pair + pairs, positions[row], frequencies[pair]);
+}
+
+// An attention step's inputs in one launch, a block (256 threads) per vector of a row (blockIdx.y):
+// - a query head (blockIdx.x < heads): its [query | gate] of q_full split (tm_split_kernel), the
+//   query rms-normed with q_weight (op_rms_norm_kernel's arithmetic) and its leading 2 * pairs
+//   values rotated (tm_rope_halves_kernel's), into q and gate;
+// - a key head (the next kv_heads): normed with k_weight and rotated alike, back into k and into
+//   row positions[row] of keys (op_scatter_kernel's);
+// - a value head (the last kv_heads): into row positions[row] of values.
+constexpr size_t tm_prepare_max_dim = 1024;
+__global__ void tm_attention_prepare_kernel(const float* q_full, float* k, const float* v, size_t heads, size_t kv_heads, size_t dim,
+                                            const float* q_weight, const float* k_weight, float eps, size_t pairs,
+                                            const int32_t* positions, const float* frequencies, float* q, float* gate, float* keys,
+                                            float* values) {
+    const size_t row = blockIdx.y, vector = blockIdx.x, kv_width = kv_heads * dim;
+    const unsigned t = threadIdx.x;
+    const int32_t at = positions[row];
+    const size_t position = size_t(at);
+    if (vector >= heads + kv_heads) {
+        const size_t head = vector - heads - kv_heads;
+        const float* source = v + (row * kv_heads + head) * dim;
+        float* target = values + position * kv_width + head * dim;
+        for (size_t col = t; col < dim; col += blockDim.x) target[col] = source[col];
+        return;
+    }
+    const bool query = vector < heads;
+    const float* x = query ? q_full + (row * heads + vector) * 2 * dim : k + (row * kv_heads + (vector - heads)) * dim;
+    const float* weight = query ? q_weight : k_weight;
+    if (query) {
+        float* g = gate + (row * heads + vector) * dim;
+        for (size_t col = t; col < dim; col += blockDim.x) g[col] = x[dim + col];
+    }
+    __shared__ float sums[256];
+    __shared__ float total;
+    __shared__ float normed[tm_prepare_max_dim];
+    float sum = 0.0f;
+    for (size_t col = t; col < dim; col += blockDim.x) sum += x[col] * x[col];
+    sums[t] = sum;
+    __syncthreads();
+    if (t < 32) {
+        const float value = tree256_first_wave(sums, t);
+        if (!t) total = value;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(total / float(dim) + eps);
+    for (size_t col = t; col < dim; col += blockDim.x) normed[col] = x[col] * scale * weight[col];
+    __syncthreads();
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) tm_rope_pair(normed + pair, normed + pair + pairs, at, frequencies[pair]);
+    __syncthreads();
+    if (query) {
+        float* target = q + (row * heads + vector) * dim;
+        for (size_t col = t; col < dim; col += blockDim.x) target[col] = normed[col];
+    } else {
+        const size_t head = vector - heads;
+        float* own = k + (row * kv_heads + head) * dim;
+        float* cached = keys + position * kv_width + head * dim;
+        for (size_t col = t; col < dim; col += blockDim.x) {
+            own[col] = normed[col];
+            cached[col] = normed[col];
+        }
+    }
 }
 
 constexpr size_t tm_attention_threads = 256;
@@ -510,6 +576,32 @@ int sd_op_gated_norm(void* handle, const float* x, const float* gate, const floa
     op_span(value, weight, size_t(width) * 4, "a gated norm weight");
     op_span(value, out, size_t(rows * width) * 4, "a gated norm output");
     tm_gated_norm_kernel<<<unsigned(rows), 256, 0, value.stream>>>(x, gate, weight, size_t(width), eps, out);
+    SD_OP_END
+}
+
+int sd_op_attention_prepare(void* handle, const float* q_full, float* k, const float* v, uint64_t rows, uint64_t heads,
+                            uint64_t kv_heads, uint64_t dim, const float* q_weight, const float* k_weight, float eps, uint64_t rope_dims,
+                            const int32_t* positions, const float* frequencies, float* q, float* gate, float* keys, float* values,
+                            uint64_t context) {
+    SD_OP_BEGIN
+    if (!rows || rows > 65535 || !heads || !kv_heads || !dim || dim > tm_prepare_max_dim || rope_dims % 2 || rope_dims > dim)
+        throw std::runtime_error("invalid Straydog attention prepare shape");
+    const size_t kv_width = size_t(kv_heads * dim);
+    op_span(value, q_full, size_t(rows * heads * 2 * dim) * 4, "an attention query projection");
+    op_span(value, k, size_t(rows) * kv_width * 4, "attention keys");
+    op_span(value, v, size_t(rows) * kv_width * 4, "attention values");
+    op_span(value, q_weight, size_t(dim) * 4, "a query norm weight");
+    op_span(value, k_weight, size_t(dim) * 4, "a key norm weight");
+    op_span(value, positions, size_t(rows) * 4, "rope positions");
+    if (rope_dims) op_span(value, frequencies, size_t(rope_dims / 2) * 4, "rope frequencies");
+    op_span(value, q, size_t(rows * heads * dim) * 4, "attention queries");
+    op_span(value, gate, size_t(rows * heads * dim) * 4, "attention gates");
+    op_span(value, keys, size_t(context) * kv_width * 4, "a key cache");
+    op_span(value, values, size_t(context) * kv_width * 4, "a value cache");
+    const dim3 grid(unsigned(heads + 2 * kv_heads), unsigned(rows));
+    tm_attention_prepare_kernel<<<grid, 256, 0, value.stream>>>(q_full, k, v, size_t(heads), size_t(kv_heads), size_t(dim), q_weight,
+                                                                k_weight, eps, size_t(rope_dims / 2), positions, frequencies, q, gate,
+                                                                keys, values);
     SD_OP_END
 }
 

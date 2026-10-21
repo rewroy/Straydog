@@ -3,7 +3,12 @@
 //!   DeltaNet shape: 8 key heads, 16 value heads of 128, a 4-tap convolution): the same history,
 //!   states and outputs within F32 rounding;
 //! - sd_op_norm_linears over Q8_0 and F32 rows in one launch against sd_op_rms_norm and a
-//!   sd_op_linears launch per format: the same bits.
+//!   sd_op_linears launch per format: the same bits;
+//! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
+//!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
+//!   64 rotated dimensions): the same bits.
+//! - sd_op_swiglu_linear_route against sd_op_swiglu_linear and sd_op_route (Qwen3.6's shared expert
+//!   down on one of two GPUs, 256 experts, top 8): the same bits.
 //!
 //! cargo test --release -p straydog-engine --features hip --test fused_gpu, under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -132,4 +137,80 @@ fn norm_linears_of_two_formats_match_a_launch_per_format() {
     for (index, &(kind, rows)) in shapes.iter().enumerate() {
         assert_eq!(read(&mut gpu, &outs_1[index], rows), read(&mut gpu, &outs_2[index], rows), "kind {kind}, {rows} rows");
     }
+}
+
+#[test]
+fn a_prepared_attention_step_matches_its_ops() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x6a09_e667_f3bc_c908);
+    let (rows, heads, kv_heads, dim, rope_dims, context) = (3usize, 8usize, 1usize, 256usize, 64usize, 16usize);
+    let kv_width = kv_heads * dim;
+    let q_full = upload(&mut gpu, &random.floats(rows * heads * 2 * dim, 4.0));
+    let k = random.floats(rows * kv_width, 4.0);
+    let v = upload(&mut gpu, &random.floats(rows * kv_width, 4.0));
+    let (q_weight, k_weight) = (upload(&mut gpu, &random.floats(dim, 2.0)), upload(&mut gpu, &random.floats(dim, 2.0)));
+    let frequencies: Vec<f32> = (0..rope_dims / 2).map(|i| 1e7f32.powf(-(2.0 * i as f32) / rope_dims as f32)).collect();
+    let frequencies = upload(&mut gpu, &frequencies);
+    // positions out of order, and the rotation's angles large
+    let positions = [9i32, 2, 13];
+    let position_buffer = gpu.buffer((rows * 4) as u64).unwrap();
+    gpu.write_buffer(&position_buffer, 0, &positions).unwrap();
+    let cache = random.floats(context * kv_width, 1.0);
+    let eps = 1e-6;
+    let outputs = |gpu: &mut Backend| -> [Buffer; 5] {
+        [gpu.buffer((rows * heads * dim * 4) as u64).unwrap(), gpu.buffer((rows * heads * dim * 4) as u64).unwrap(), upload(gpu, &k),
+         upload(gpu, &cache), upload(gpu, &cache)]
+    };
+    // the ops
+    let [q_1, gate_1, k_1, keys_1, values_1] = outputs(&mut gpu);
+    gpu.split(q_full.base(), (rows * heads) as u64, dim as u64, q_1.base(), gate_1.base()).unwrap();
+    gpu.rms_norm(q_1.base(), &q_weight, (rows * heads) as u64, dim as u64, eps, q_1.base()).unwrap();
+    gpu.rms_norm(k_1.base(), &k_weight, (rows * kv_heads) as u64, dim as u64, eps, k_1.base()).unwrap();
+    gpu.rope_halves(q_1.base(), rows as u64, heads as u64, dim as u64, rope_dims as u64, &position_buffer, &frequencies).unwrap();
+    gpu.rope_halves(k_1.base(), rows as u64, kv_heads as u64, dim as u64, rope_dims as u64, &position_buffer, &frequencies).unwrap();
+    gpu.scatter(k_1.base(), position_buffer.base(), rows as u64, kv_width as u64, keys_1.base(), context as u64).unwrap();
+    gpu.scatter(v.base(), position_buffer.base(), rows as u64, kv_width as u64, values_1.base(), context as u64).unwrap();
+    // one launch
+    let [q_2, gate_2, k_2, keys_2, values_2] = outputs(&mut gpu);
+    gpu.attention_prepare(q_full.base(), k_2.base(), v.base(), rows as u64, heads as u64, kv_heads as u64, dim as u64, &q_weight, &k_weight,
+                          eps, rope_dims as u64, &position_buffer, &frequencies, q_2.base(), gate_2.base(), keys_2.base(), values_2.base(),
+                          context as u64).unwrap();
+    for (label, first, second, count) in [("queries", &q_1, &q_2, rows * heads * dim), ("gates", &gate_1, &gate_2, rows * heads * dim),
+                                          ("keys", &k_1, &k_2, rows * kv_width), ("key cache", &keys_1, &keys_2, context * kv_width),
+                                          ("value cache", &values_1, &values_2, context * kv_width)] {
+        assert_eq!(read(&mut gpu, first, count), read(&mut gpu, second, count), "{label}");
+    }
+}
+
+#[test]
+fn routes_picked_beside_the_shared_expert_match_the_route_op() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0xbb67_ae85_84ca_a73b);
+    let (rows, cols, experts, k) = (2048usize, 256usize, 256usize, 8usize);
+    // Q8_0 rows (34-byte blocks: an FP16 scale between 2^-7 and 2^-3, then 32 quants)
+    let mut bytes = Vec::with_capacity(rows * cols / 32 * 34);
+    for _ in 0..rows * cols / 32 {
+        let bits = ((random.next() & 1) << 15) | ((8 + random.next() % 5) << 10) | (random.next() & 0x3ff);
+        bytes.extend_from_slice(&(bits as u16).to_le_bytes());
+        for _ in 0..32 {
+            bytes.push(random.next() as u8);
+        }
+    }
+    let down = gpu.upload_bytes(&bytes).unwrap();
+    let (gate, up) = (upload(&mut gpu, &random.floats(cols, 3.0)), upload(&mut gpu, &random.floats(cols, 3.0)));
+    let scale = upload(&mut gpu, &random.floats(1, 2.0));
+    let logits = upload(&mut gpu, &random.floats(experts, 4.0));
+    let buffers = |gpu: &mut Backend| -> [Buffer; 4] {
+        [gpu.buffer((cols * 4) as u64).unwrap(), gpu.buffer((rows * 4) as u64).unwrap(), gpu.buffer((k * 4) as u64).unwrap(),
+         gpu.buffer((k * 4) as u64).unwrap()]
+    };
+    let [hidden_1, out_1, ids_1, weights_1] = buffers(&mut gpu);
+    gpu.swiglu_linear(&down, 8, rows as u64, cols as u64, gate.base(), up.base(), Some(scale.base()), hidden_1.base(), out_1.base()).unwrap();
+    gpu.route(logits.base(), None, 1, experts as u64, k as u64, 0, true, 1.0, ids_1.base(), weights_1.base()).unwrap();
+    let [hidden_2, out_2, ids_2, weights_2] = buffers(&mut gpu);
+    gpu.swiglu_linear_route(&down, 8, rows as u64, cols as u64, gate.base(), up.base(), Some(scale.base()), hidden_2.base(), out_2.base(),
+                            logits.base(), k as u64, ids_2.base(), weights_2.base()).unwrap();
+    assert_eq!(read(&mut gpu, &out_1, rows), read(&mut gpu, &out_2, rows), "outputs");
+    assert_eq!(read(&mut gpu, &ids_1, k), read(&mut gpu, &ids_2, k), "routes");
+    assert_eq!(read(&mut gpu, &weights_1, k), read(&mut gpu, &weights_2, k), "weights");
 }

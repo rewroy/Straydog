@@ -16,6 +16,12 @@ struct GemvPrologue {
     uint32_t width;
     float eps;
     float* normed;         // mode 2: where block 0 stores the normed vector (or null)
+    // With route_logits (one GEMV kind, one more block): that block's first wave picks a row of
+    // routes meanwhile, as op_route_softmax256_kernel does (256 experts, normalized).
+    const float* route_logits;
+    uint32_t route_k;
+    int32_t* route_ids;
+    float* route_weights;
 };
 
 template<int kind>
@@ -24,6 +30,10 @@ __global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* outp
     __shared__ float sums[256];
     __shared__ float total;
     const unsigned tid = threadIdx.x;
+    if (pro.route_logits && blockIdx.x == gridDim.x - 1) {
+        if (tid < 32) op_route_softmax256_wave(pro.route_logits, pro.route_k, 1, pro.route_ids, pro.route_weights, tid);
+        return;
+    }
     if (pro.mode == 2) {
         float sum = 0.0f;
         for (size_t col = tid; col < pro.width; col += blockDim.x) sum += pro.x[col] * pro.x[col];
@@ -128,12 +138,12 @@ bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input
 // Launch the prologue GEMV over `list` (its rows' kind must have a fast unit); false when the
 // kind has none here.
 bool gemv_prologue_launch(Device& d, const FixedGemv& list, size_t waves, const GemvPrologue& pro, float* output) {
-    const unsigned blocks = unsigned((waves + 7) / 8);
+    const unsigned blocks = unsigned((waves + 7) / 8) + (pro.route_logits ? 1 : 0);
     const size_t shared = size_t(pro.width) * 4;
     int other = list.items[0].matrix.kind;
     for (unsigned i = 1; i < list.count; ++i) if (list.items[i].matrix.kind != other) { other = list.items[i].matrix.kind; break; }
     if (other != list.items[0].matrix.kind) {
-        if (pro.mode == 1) return false;
+        if (pro.mode == 1 || pro.route_logits) return false;
         const int a = std::min(other, list.items[0].matrix.kind), b = std::max(other, list.items[0].matrix.kind);
         if (a == 0 && b == 8) gemv_prologue_kind2<8, 0><<<blocks, 256, shared, d.stream>>>(list, pro, output);
         else if (a == 0 && b == 30) gemv_prologue_kind2<30, 0><<<blocks, 256, shared, d.stream>>>(list, pro, output);
@@ -226,10 +236,19 @@ int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64
     SD_OP_END
 }
 
-int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate,
-                        const float* up, const float* scale, float* hidden, float* out) {
-    SD_OP_BEGIN
+namespace {
+// sd_op_swiglu_linear, and with route_logits sd_op_route's softmax routes of that row (256 experts,
+// normalized) in the same launch (else after it).
+void swiglu_linear(Device& value, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up,
+                   const float* scale, float* hidden, float* out, const float* route_logits, uint64_t route_k, int32_t* route_ids,
+                   float* route_weights) {
     if (!rows || !cols || cols > 8192) throw std::runtime_error("invalid Straydog SwiGLU linear");
+    if (route_logits) {
+        if (!route_k || route_k > 64) throw std::runtime_error("invalid Straydog route shape");
+        op_span(value, route_logits, 256 * 4, "router logits");
+        op_span(value, route_ids, size_t(route_k) * 4, "routed experts");
+        op_span(value, route_weights, size_t(route_k) * 4, "routing weights");
+    }
     op_span(value, gate, size_t(cols) * 4, "a gate projection");
     op_span(value, up, size_t(cols) * 4, "an up projection");
     if (scale) op_span(value, scale, 4, "a row scale");
@@ -242,14 +261,33 @@ int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t ro
     size_t waves = 0;
     if (gemv_prologue_plan(&matrix, 1, hidden, op_lanes, list, waves)) {
         list.residual.gate = scale;
-        if (gemv_prologue_launch(value, list, waves, GemvPrologue{1, gate, up, uint32_t(cols), 0.0f, nullptr}, out)) {
+        const GemvPrologue pro{1, gate, up, uint32_t(cols), 0.0f, nullptr, route_logits, uint32_t(route_k), route_ids, route_weights};
+        if (gemv_prologue_launch(value, list, waves, pro, out)) {
             check(hipGetLastError());
-            return 0;
+            return;
         }
     }
     op_swiglu_kernel<<<op_blocks(size_t(cols)), 256, 0, value.stream>>>(gate, up, 1, size_t(cols), 0.0f, nullptr, hidden);
     GemvResidual gated{};
     gated.gate = scale;
     gemv(value, &matrix, 1, hidden, out, 1, 0, 0, gated, op_lanes);
+    if (route_logits) op_route_softmax256_kernel<<<1, 32, 0, value.stream>>>(route_logits, size_t(route_k), 1, route_ids, route_weights);
+    check(hipGetLastError());
+}
+} // namespace
+
+int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate,
+                        const float* up, const float* scale, float* hidden, float* out) {
+    SD_OP_BEGIN
+    swiglu_linear(value, weights, kind, rows, cols, gate, up, scale, hidden, out, nullptr, 0, nullptr, nullptr);
+    SD_OP_END
+}
+
+int sd_op_swiglu_linear_route(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate,
+                              const float* up, const float* scale, float* hidden, float* out, const float* logits, uint64_t k,
+                              int32_t* ids, float* route_weights) {
+    SD_OP_BEGIN
+    if (!logits) throw std::runtime_error("invalid Straydog route shape");
+    swiglu_linear(value, weights, kind, rows, cols, gate, up, scale, hidden, out, logits, k, ids, route_weights);
     SD_OP_END
 }

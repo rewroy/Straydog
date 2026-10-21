@@ -14,15 +14,6 @@
 // errors the pass instead of hanging it; sd_link_reset starts both counts over.
 // Included in the GPU TU after peer.hpp (peer_load, peer_store, peer_clock).
 
-// A value of this device's inbox as the other device wrote it (never a stale cached line).
-__device__ inline float link_load(const float* value) {
-#if defined(__HIPCC__)
-    return __hip_atomic_load(value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#else
-    return *static_cast<const volatile float*>(value);
-#endif
-}
-
 __global__ void link_copy_kernel(const float* part, size_t count, float* peer_inbox, const uint32_t* state, size_t capacity) {
     const size_t slot = size_t((state[0] + 1) & 1) * capacity;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x)
@@ -182,4 +173,60 @@ int sd_link_reset(void* handle) {
             on_device(side->ordinal, [&]() { check(hipMemset(side->sums.state, 0, 256)); check(hipDeviceSynchronize()); });
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// A decode step's linked sums folded into the kernels forming their parts (link_tail.hpp): a
+// fallback runs the part's kernels and then sd_op_link_sum's.
+int sd_op_linear_link_sum(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* input, float* part,
+                          float* out) {
+    SD_OP_BEGIN
+    SumLink& link = value.sums;
+    if (!link.peer || !rows || !cols || rows > link.capacity) throw std::runtime_error("invalid Straydog linked linear");
+    const size_t row_bytes = matrix_row_bytes(kind, cols);
+    op_span(value, weights, size_t(rows) * row_bytes, "a weight matrix");
+    op_span(value, input, size_t(cols) * 4, "a linear input");
+    op_span(value, part, size_t(rows) * 4, "a linked sum's part");
+    op_span(value, out, size_t(rows) * 4, "a linked sum");
+    const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
+    const LinkTail tail{part, uint32_t(rows), link.state, link.peer_flag, link.peer_inbox, link.inbox, uint32_t(link.capacity), 1,
+                        value.await_timeout, out};
+    if (rows > link_single_floats || !gemv_linked_launch(value, matrix, input, part, tail, op_lanes)) {
+        gemv(value, &matrix, 1, input, part, 1, 0, 0, {}, op_lanes);
+        if (sd_op_link_sum(handle, part, rows, out, 1)) throw std::runtime_error(last_error);
+    }
+    SD_OP_END
+}
+
+int sd_op_experts_table_link_sum(void* handle, const uint64_t* table, uint64_t count, const int32_t* ids, uint64_t slot_bytes,
+                                 const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t top_k,
+                                 const float* input, const float* weights, float* product, float* part, float* out) {
+    SD_OP_BEGIN
+    SumLink& link = value.sums;
+    if (!offsets || !kinds || !hidden || !ffn || !top_k || top_k > 64 || !count || count > (uint64_t(1) << 24) || !link.peer ||
+        hidden > link.capacity)
+        throw std::runtime_error("invalid Straydog linked experts");
+    const sd_expert_split whole{0, ffn, 0, hidden, 3};
+    SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, whole);
+    op_span(value, table, size_t(count) * 8, "an expert table");
+    op_span(value, ids, size_t(top_k) * 4, "expert routes");
+    op_span(value, input, size_t(hidden) * 4, "an expert input");
+    if (weights) op_span(value, weights, size_t(top_k) * 4, "route weights");
+    op_span(value, product, size_t(top_k * ffn) * 4, "an expert product");
+    op_span(value, part, size_t(hidden) * 4, "a linked sum's part");
+    op_span(value, out, size_t(hidden) * 4, "a linked sum");
+    plan.top_k = uint32_t(top_k);
+    plan.product_stride = uint32_t(ffn);
+    plan.clamp = 0.0f;
+    plan.accumulate = 1;
+    plan.table = table;
+    plan.ids = ids;
+    plan.table_count = uint32_t(count);
+    const LinkTail tail{part, uint32_t(hidden), link.state, link.peer_flag, link.peer_inbox, link.inbox, uint32_t(link.capacity), 1,
+                        value.await_timeout, out};
+    if (hidden > link_single_floats ||
+        !slot_experts(value, plan, 3, nullptr, 1, input, size_t(hidden), weights, product, part, size_t(hidden), &tail)) {
+        slot_experts(value, plan, 3, nullptr, 1, input, size_t(hidden), weights, product, part, size_t(hidden));
+        if (sd_op_link_sum(handle, part, hidden, out, 1)) throw std::runtime_error(last_error);
+    }
+    SD_OP_END
 }

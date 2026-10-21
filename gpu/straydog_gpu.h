@@ -109,6 +109,10 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
    times sigmoid(*scale) when scale is given. The results are those of the separate ops. */
 int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_linear* items, uint64_t count);
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
+/* sd_op_swiglu_linear, and meanwhile (one launch where the GEMV takes it) the routes of one row of
+   256 router logits as sd_op_route picks them with softmax gating, normalized, no bias, scale 1:
+   the same results as the two ops. */
+int sd_op_swiglu_linear_route(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out, const float* logits, uint64_t k, int32_t* ids, float* route_weights);
 int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, float* output);
 /* rms_norm, then sd_op_rope's rotation of the last rope_dims values (0: none), stored at row
    out_rows[row] of out (out_count rows), or at row `row` without out_rows. */
@@ -197,6 +201,11 @@ int sd_op_gated_norm(void* handle, const float* x, const float* gate, const floa
    two value heads a key head only): the caller runs the three. */
 int sd_op_delta_step(void* handle, const float* qkv, float* history, const float* taps, uint64_t kernel, const float* beta, const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim, float eps, const float* gate, const float* weight, float* out);
 int sd_op_split(void* handle, const float* x, uint64_t rows, uint64_t width, float* first, float* second);
+/* An attention step's inputs in one launch: sd_op_split of q_full (rows x heads x [query | gate], each
+   dim) into q and gate, sd_op_rms_norm of the queries (q_weight) and of k's heads (k_weight, in place),
+   sd_op_rope_halves of both (rope_dims), and sd_op_scatter of k and v (rows x kv_heads x dim) to rows
+   positions of keys and values (context rows each); the same results. */
+int sd_op_attention_prepare(void* handle, const float* q_full, float* k, const float* v, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, const float* q_weight, const float* k_weight, float eps, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* q, float* gate, float* keys, float* values, uint64_t context);
 int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies);
 int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
@@ -209,6 +218,12 @@ int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
    wait gave up) into out; sd_link_reset waits for both devices' streams and starts their counts
    over. */
 int sd_link_sums(void* first, void* second, uint64_t capacity);
+/* A decode step's linked sum folded into the kernel forming this device's part of it (the last
+   block adds the parts), the same results as forming the part and then sd_op_link_sum (out += this
+   part + the other's): sd_op_linear_link_sum, one vector through rows x cols into part;
+   sd_op_experts_table_link_sum, sd_op_experts_table of one row (clamp 0, accumulating into part). */
+int sd_op_linear_link_sum(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* input, float* part, float* out);
+int sd_op_experts_table_link_sum(void* handle, const uint64_t* table, uint64_t count, const int32_t* ids, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t top_k, const float* input, const float* weights, float* product, float* part, float* out);
 int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, int accumulate);
 int sd_link_failed(void* handle);
 int sd_op_link_status(void* handle, uint32_t* out);

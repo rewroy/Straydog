@@ -425,10 +425,9 @@ __device__ __forceinline__ void route_take(float& value, int32_t& index, float o
 // exponentials in its tree's order (tree256_first_wave over the thread terms), the same
 // probabilities, then each pick the highest (lowest index on ties) of those left, as a wave
 // argmax; the normalized weights summed in slot order. The same bits, without barriers.
-__global__ void op_route_softmax256_kernel(const float* logits, size_t k, int normalize, int32_t* ids, float* weights) {
-    const size_t row = blockIdx.x;
-    const unsigned lane = threadIdx.x;
-    const float* l = logits + row * 256;
+// A row's routes by one wave (lane = its lane): its ids and weights at ids[slot] and weights[slot].
+__device__ __forceinline__ void op_route_softmax256_wave(const float* l, size_t k, int normalize, int32_t* ids, float* weights,
+                                                         unsigned lane) {
     float p[8];
     float top = -INFINITY;
     #pragma unroll
@@ -461,9 +460,13 @@ __global__ void op_route_softmax256_kernel(const float* logits, size_t k, int no
     float sum = 0.0f;
     for (size_t slot = 0; slot < k; ++slot) sum += chosen[slot];
     for (size_t slot = 0; slot < k; ++slot) {
-        ids[row * k + slot] = chosen_ids[slot];
-        weights[row * k + slot] = (normalize && k > 1 ? chosen[slot] / (sum + 1e-20f) : chosen[slot]) * 1.0f;
+        ids[slot] = chosen_ids[slot];
+        weights[slot] = (normalize && k > 1 ? chosen[slot] / (sum + 1e-20f) : chosen[slot]) * 1.0f;
     }
+}
+__global__ void op_route_softmax256_kernel(const float* logits, size_t k, int normalize, int32_t* ids, float* weights) {
+    const size_t row = blockIdx.x;
+    op_route_softmax256_wave(logits + row * 256, k, normalize, ids + row * k, weights + row * k, threadIdx.x);
 }
 
 __global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,

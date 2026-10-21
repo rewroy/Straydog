@@ -368,6 +368,24 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_swiglu_linear_route(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        gate: *const f32,
+        up: *const f32,
+        scale: *const f32,
+        hidden: *mut f32,
+        out: *mut f32,
+        logits: *const f32,
+        k: u64,
+        ids: *mut i32,
+        route_weights: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_rms_norm(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,
@@ -750,6 +768,29 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_attention_prepare(
+        handle: *mut ::std::os::raw::c_void,
+        q_full: *const f32,
+        k: *mut f32,
+        v: *const f32,
+        rows: u64,
+        heads: u64,
+        kv_heads: u64,
+        dim: u64,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        eps: f32,
+        rope_dims: u64,
+        positions: *const i32,
+        frequencies: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        keys: *mut f32,
+        values: *mut f32,
+        context: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_rope_halves(
         handle: *mut ::std::os::raw::c_void,
         x: *mut f32,
@@ -793,6 +834,37 @@ unsafe extern "C" {
         first: *mut ::std::os::raw::c_void,
         second: *mut ::std::os::raw::c_void,
         capacity: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_linear_link_sum(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        input: *const f32,
+        part: *mut f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_experts_table_link_sum(
+        handle: *mut ::std::os::raw::c_void,
+        table: *const u64,
+        count: u64,
+        ids: *const i32,
+        slot_bytes: u64,
+        offsets: *const u64,
+        kinds: *const ::std::os::raw::c_int,
+        hidden: u64,
+        ffn: u64,
+        top_k: u64,
+        input: *const f32,
+        weights: *const f32,
+        product: *mut f32,
+        part: *mut f32,
+        out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

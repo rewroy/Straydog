@@ -971,6 +971,7 @@ Device& device(void* handle) {
 }
 #include "host_io.hpp"
 #include "peer.hpp"
+#include "link_tail.hpp"
 #include "gemv.hpp"
 #include "graph_cache.hpp"
 #include "hc_decode.hpp"

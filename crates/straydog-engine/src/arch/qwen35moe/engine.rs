@@ -352,6 +352,24 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// out = W . input over `steps` rows (a whole resident matrix; a vector is one row).
+    /// Whether this pass's linked sums fold into the kernels forming their parts: a tensor-parallel
+    /// decode step (its experts resident, as a part's always are).
+    fn folds_sums(&self, n: usize) -> bool {
+        n == 1 && !self.settings.part.is_whole() && self.resident.is_some() && self.compare.is_none()
+    }
+
+    /// A mixer's out-projection of `input` into `mixed`; when the pass's sums fold
+    /// ([`folds_sums`](Self::folds_sums)), added with the other part's into the stream.
+    fn out_projection(&mut self, name: &str, input: P, n: usize) -> Result<()> {
+        let work = self.work;
+        if !self.folds_sums(n) {
+            return self.linear(name, input, n, work.mixed.base());
+        }
+        let weight = self.dense(name)?;
+        let (cols, rows) = (weight.dims[0] as u64, weight.dims.get(1).copied().unwrap_or(1) as u64);
+        self.gpu.linear_link_sum(&weight.buffer, weight.kind, rows, cols, input, work.mixed.base(), work.stream.base())
+    }
+
     fn linear(&mut self, name: &str, input: P, steps: usize, out: M) -> Result<()> {
         let weight = self.dense(name)?;
         let (cols, rows) = (weight.dims[0] as u64, weight.dims.get(1).copied().unwrap_or(1) as u64);
@@ -774,7 +792,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         if self.settings.part.is_whole() {
             self.gpu.add(work.mixed.base(), (n * w) as u64, work.stream.base())?;
-        } else {
+        } else if !self.folds_sums(n) {
             self.gpu.link_sum(work.mixed.base(), (n * w) as u64, work.stream.base(), true)?;
         }
         self.check("attn_residual", layer, work.stream, n, w)
@@ -788,7 +806,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if self.settings.part.is_whole() {
             self.check("ffn_out", layer, work.out, n, w)?;
             self.gpu.add(work.out.base(), (n * w) as u64, work.stream.base())?;
-        } else {
+        } else if !self.folds_sums(n) {
             self.gpu.link_sum(work.out.base(), (n * w) as u64, work.stream.base(), true)?;
         }
         self.check("l_out", layer, work.stream, n, w)
@@ -817,7 +835,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                    work.alpha.base(), dt.buffer.base(), a.buffer.base(), recurrent.base(), hp.k_heads as u64,
                                    v_heads as u64, dim as u64, hp.norm_eps, work.z.base(), &norm.buffer, work.normed.base())?
         {
-            return self.linear(&name(layer, "ssm_out"), work.normed.base(), n, work.mixed.base());
+            return self.out_projection(&name(layer, "ssm_out"), work.normed.base(), n);
         }
         self.gpu.conv_silu(work.qkv.base(), history.base(), taps.buffer.base(), channels as u64, hp.conv_kernel as u64, n as u64)?;
         self.check("conv_output_silu", layer, work.qkv, n, channels)?;
@@ -826,7 +844,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.check("attn_output", layer, work.core, n, v_heads * dim)?;
         self.gpu.gated_norm(work.core.base(), work.z.base(), &norm.buffer, (n * v_heads) as u64, dim as u64, hp.norm_eps,
                             work.normed.base())?;
-        self.linear(&name(layer, "ssm_out"), work.normed.base(), n, work.mixed.base())?;
+        self.out_projection(&name(layer, "ssm_out"), work.normed.base(), n)?;
         self.check("linear_attn_out", layer, work.mixed, n, hp.width)
     }
 
@@ -837,6 +855,35 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (heads, kv_heads, dim) = (hp.heads, hp.kv_heads, hp.head_dim);
         self.linears(&[(name(layer, "attn_q"), work.q_full.base()), (name(layer, "attn_k"), work.k.base()),
                        (name(layer, "attn_v"), work.v.base())], work.x.base(), n, norm)?;
+        let (keys, values) = match &self.states[&layer] {
+            State::Attention { keys, values } => (*keys, *values),
+            State::DeltaNet { .. } => return Err("an attention layer without its K/V".into()),
+        };
+        let context = self.settings.context as u64;
+        // The split, the norms, the rotations and the cache's new rows in one launch.
+        if self.compare.is_none() {
+            let (q_norm, k_norm) = (self.dense(&name(layer, "attn_q_norm"))?, self.dense(&name(layer, "attn_k_norm"))?);
+            let frequencies = self.frequencies;
+            self.gpu.attention_prepare(work.q_full.base(), work.k.base(), work.v.base(), n as u64, heads as u64, kv_heads as u64,
+                                       dim as u64, &q_norm.buffer, &k_norm.buffer, hp.norm_eps, hp.rope_dims as u64, &work.positions,
+                                       &frequencies, work.q.base(), work.gate.base(), keys.base(), values.base(), context)?;
+        } else {
+            self.attention_inputs(layer, n, keys, values)?;
+        }
+        let scale = 1.0 / (dim as f32).sqrt();
+        let scratch = self.scratch;
+        self.gpu.attention(work.q.base(), keys.base(), values.base(), context, work.positions.base(), n as u64, heads as u64,
+                           kv_heads as u64, dim as u64, scale, Some(work.gate.base()), &scratch, work.attended.base())?;
+        self.out_projection(&name(layer, "attn_output"), work.attended.base(), n)?;
+        self.check("attn_output", layer, work.mixed, n, hp.width)
+    }
+
+    /// An attention layer's queries, gates, normed and rotated keys and the cache's new rows, op by op
+    /// (each checked against the reference).
+    fn attention_inputs(&mut self, layer: usize, n: usize, keys: Buffer, values: Buffer) -> Result<()> {
+        let hp = self.hp.clone();
+        let work = self.work;
+        let (heads, kv_heads, dim) = (hp.heads, hp.kv_heads, hp.head_dim);
         // Each head's projection holds its query, then its gate.
         self.gpu.split(work.q_full.base(), (n * heads) as u64, dim as u64, work.q.base(), work.gate.base())?;
         self.norm(&name(layer, "attn_q_norm"), work.q.base(), n * heads, dim, work.q.base())?;
@@ -846,19 +893,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.gpu.rope_halves(work.k.base(), n as u64, kv_heads as u64, dim as u64, hp.rope_dims as u64, &work.positions, &frequencies)?;
         self.check("Qcur", layer, work.q, n, heads * dim)?;
         self.check("Kcur", layer, work.k, n, kv_heads * dim)?;
-        let (keys, values) = match &self.states[&layer] {
-            State::Attention { keys, values } => (*keys, *values),
-            State::DeltaNet { .. } => return Err("an attention layer without its K/V".into()),
-        };
         let (kv_width, context) = ((kv_heads * dim) as u64, self.settings.context as u64);
         self.gpu.scatter(work.k.base(), work.positions.base(), n as u64, kv_width, keys.base(), context)?;
-        self.gpu.scatter(work.v.base(), work.positions.base(), n as u64, kv_width, values.base(), context)?;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let scratch = self.scratch;
-        self.gpu.attention(work.q.base(), keys.base(), values.base(), context, work.positions.base(), n as u64, heads as u64,
-                           kv_heads as u64, dim as u64, scale, Some(work.gate.base()), &scratch, work.attended.base())?;
-        self.linear(&name(layer, "attn_output"), work.attended.base(), n, work.mixed.base())?;
-        self.check("attn_output", layer, work.mixed, n, hp.width)
+        self.gpu.scatter(work.v.base(), work.positions.base(), n as u64, kv_width, values.base(), context)
     }
 
     /// The MoE of `x` into `out`: the sigmoid-gated shared expert, then the routed ones added.
@@ -872,8 +909,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.linears(&[(name(layer, "ffn_gate_inp"), work.router.base()), (name(layer, "ffn_gate_shexp"), work.ffn_gate.base()),
                        (name(layer, "ffn_up_shexp"), work.ffn_up.base()), (name(layer, "ffn_gate_inp_shexp"), work.shared_gate.base())],
                      work.x.base(), n, Some((norm.as_str(), work.stream.base().cast_const())))?;
-        self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
-                       work.weights.base())?;
+        // A resident decode step picks its routes in the launch of the shared expert's down.
+        let route_beside = n == 1 && self.resident.is_some() && hp.experts == 256;
+        if !route_beside {
+            self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
+                           work.weights.base())?;
+        }
         let resident = self.resident.is_some();
         let hybrid = n == 1 && !resident && self.cpu.is_some();
         // The routes travel to the host while the shared expert runs (resident experts take them
@@ -890,8 +931,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if n == 1 {
             let down = self.dense(&name(layer, "ffn_down_shexp"))?;
             let (cols, rows) = (down.dims[0] as u64, down.dims.get(1).copied().unwrap_or(1) as u64);
-            self.gpu.swiglu_linear(&down.buffer, down.kind, rows, cols, work.ffn_gate.base(), work.ffn_up.base(),
-                                   Some(work.shared_gate.base()), work.hidden.base(), work.out.base())?;
+            if route_beside {
+                self.gpu.swiglu_linear_route(&down.buffer, down.kind, rows, cols, work.ffn_gate.base(), work.ffn_up.base(),
+                                             Some(work.shared_gate.base()), work.hidden.base(), work.out.base(), work.router.base(),
+                                             k as u64, work.ids.base(), work.weights.base())?;
+            } else {
+                self.gpu.swiglu_linear(&down.buffer, down.kind, rows, cols, work.ffn_gate.base(), work.ffn_up.base(),
+                                       Some(work.shared_gate.base()), work.hidden.base(), work.out.base())?;
+            }
         } else {
             self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
             self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
@@ -905,6 +952,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (gate_bytes, up_bytes, down_bytes) =
             ((ff * row_bytes(gate.kind, w)?) as u64, (ff * row_bytes(up.kind, w)?) as u64, (w * row_bytes(down.kind, ff)?) as u64);
         let offsets = [0, gate_bytes, gate_bytes + up_bytes];
+        let folds = self.folds_sums(n);
         if let Some(resident) = &mut self.resident {
             let index = layer - self.settings.layers.start;
             let table = resident.table.slice((index * hp.experts * 8) as u64, (hp.experts * 8) as u64);
@@ -923,6 +971,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                             w as u64, ff as u64, kinds, work.x.base(), &scratch, work.out.base())?
             {
                 return Ok(());
+            }
+            // (a folded sum: the routed experts' down adds the parts)
+            if folds {
+                return self.gpu.experts_table_link_sum(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64,
+                                                       ff as u64, k as u64, work.x.base(), work.weights.base(), work.hidden.base(),
+                                                       work.out.base(), work.stream.base());
             }
             return self.gpu.experts_table(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64, ff as u64,
                                           n as u64, k as u64, work.x.base(), Some(work.weights.base()), 0.0, true, work.hidden.base(),
