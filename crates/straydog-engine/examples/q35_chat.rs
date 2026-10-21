@@ -13,7 +13,8 @@
 //! Against another run: --tokens FILE takes the prompt (and continuation) from FILE instead of
 //! DUMP_DIR/tokens.txt (no reference logits then); --teacher 1 feeds the continuation's tokens
 //! instead of the greedy ones; --record FILE writes the logits after every prefill chunk and decode
-//! step, and --against FILE compares this run's with them (KL, top-1, equal logits).
+//! step, and --against FILE compares this run's with them (KL, top-1, equal logits). --warm 1 first
+//! runs what the server warms up with (four tokens, a decode step) and resets.
 //!
 //! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N] [--resident 1]
 //!          [--cpu N] [--tp 1] [--tokens FILE] [--teacher 1] [--record FILE] [--against FILE]
@@ -23,7 +24,7 @@ mod files;
 
 use std::path::Path;
 
-use straydog_engine::arch::qwen35moe::engine::{forward_parts, forward_split, link, Engine, Settings};
+use straydog_engine::arch::qwen35moe::engine::{forward_parts, forward_split, link, reset_parts, Engine, Settings};
 use straydog_engine::arch::qwen35moe::part::Part;
 use straydog_engine::arch::qwen35moe::Hparams;
 
@@ -95,6 +96,7 @@ fn main() -> Result<(), String> {
     let resident = option("--resident", 0) > 0 || tp;
     let cpu_threads = option("--cpu", 0);
     let teacher = option("--teacher", 0) > 0;
+    let warm = option("--warm", 0);
     let mut text_option = |flag: &str| args.iter().position(|arg| arg == flag).map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -136,6 +138,17 @@ fn main() -> Result<(), String> {
         if tp { forward_parts(engines, tokens) } else { forward_split(engines, tokens) }
     };
     let mut probes = Probes { rows: Vec::new() };
+    // As the server warms up: four tokens and a decode step, then the sequence forgotten (--warm 1;
+    // 2: without starting the linked sums over).
+    if warm > 0 {
+        forward(&mut engines, &[0, 1000, 2000, 3000])?;
+        forward(&mut engines, &[198])?;
+        if tp && warm == 1 {
+            reset_parts(&mut engines)?;
+        } else {
+            engines.iter_mut().try_for_each(Engine::reset)?;
+        }
+    }
     if cpu_threads > 0 {
         let cpu = std::rc::Rc::new(straydog_engine::gpu::CpuExperts::new(cpu_threads as u32)?);
         for engine in &mut engines {

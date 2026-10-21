@@ -411,12 +411,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.experts.contents()
     }
 
-    /// Warm the expert store up with an earlier run's contents of this engine's layers.
+    /// Warm the expert store up with an earlier run's contents of this engine's layers (of its part's
+    /// experts). Resident experts are all in place already: nothing is read, so no read can take a
+    /// resident expert's slot (whose address the expert table holds).
     pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+        if self.resident.is_some() {
+            return Ok(0);
+        }
         let layers = self.settings.layers.clone();
-        let experts = self.hp.experts;
+        let experts = self.settings.part.experts(&self.hp);
         let mine = |keys: &[(usize, usize)]| -> Vec<(usize, usize)> {
-            keys.iter().copied().filter(|&(layer, expert)| layers.contains(&layer) && expert < experts).collect()
+            keys.iter().copied().filter(|&(layer, expert)| layers.contains(&layer) && experts.contains(&expert)).collect()
         };
         let (vram, host) = (mine(vram), mine(host));
         self.experts.warm(&mut self.gpu, &vram, &host)
