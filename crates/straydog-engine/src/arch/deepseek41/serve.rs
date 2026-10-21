@@ -20,8 +20,14 @@ use crate::gpu::Backend;
 use crate::group::SplitMode;
 use crate::pinned::Pinned;
 
-use served::{RESERVE, SCRATCH};
+use served::SCRATCH;
 
+/// Per GPU: VRAM kept beside what the placement counts (dense weights, state, a pass's rows, the
+/// scratch and the expert slots) for the runtime's own memory, which Straydog's budget does not
+/// see: code, BLAS handles, graphs, kernels' scratch. Measured on two R9700s at --vram 30 (both
+/// split modes, a 12.9K-token prefill included): the counted peak equals the steady state, and
+/// the card used 0.83-0.97 GiB more than counted; with this the card stays within the budget.
+const RESERVE: u64 = 3 << 29;
 
 /// DeepSeek-V4.1 served: its placed engines in a session.
 pub type Model = Session<Engines>;
