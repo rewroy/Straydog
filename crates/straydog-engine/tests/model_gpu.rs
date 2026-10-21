@@ -22,6 +22,9 @@ fn digest(values: &[f32]) -> String {
     format!("{:x}", Sha256::digest(&bytes))
 }
 
+/// The tests load the model on the same GPUs: one at a time.
+static GPUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The model as a golden placement describes it.
 fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &str, placement: &Json) -> Model {
     let devices: Vec<usize> = serde_json::from_value(placement["devices"].clone()).unwrap();
@@ -74,6 +77,7 @@ fn a_parked_conversation_comes_back() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
     let golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let quantization = golden["quantization"].as_str().unwrap();
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for name in ["two-gpu-experts-mtp", "two-gpu-host-kv-mtp"] {
         let expected = &golden["placements"][name];
         let request = |label: &str| expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == label).unwrap();
@@ -106,6 +110,7 @@ fn generations_equal_the_reference() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
     let mut golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let update = std::env::var_os("STRAYDOG_GOLDEN_UPDATE").is_some();
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let only = std::env::var("STRAYDOG_PLACEMENT").ok();
     let quantization = golden["quantization"].as_str().unwrap().to_string();
     for (name, expected) in golden["placements"].as_object_mut().unwrap() {
