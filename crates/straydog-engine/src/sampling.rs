@@ -121,6 +121,9 @@ impl Distribution {
 /// time, so that a large `top_k` cannot cost a pass per kept token.
 const SCANNED_TOP_K: usize = 64;
 
+/// Tokens a scan for the top k passes over at once when none of them can be kept.
+const SKIPPED_RUN: usize = 64;
+
 /// Most likely first; the lower token on a tie.
 fn descending(a: &(f64, u32), b: &(f64, u32)) -> std::cmp::Ordering {
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
@@ -146,14 +149,26 @@ pub fn distribution(logits: &[f32], sampling: &Sampling, generated: &Generated) 
     let top_k = sampling.top_k.min(logits.len());
     let mut candidates: Vec<(f64, u32)> = if (1..=SCANNED_TOP_K).contains(&top_k) {
         let mut best: Vec<(f64, u32)> = Vec::with_capacity(top_k + 1);
-        for index in 0..logits.len() {
-            let logit = penalized(logits, index, sampling, generated);
-            if best.len() == top_k && logit <= best[best.len() - 1].0 {
-                continue;
+        // A token whose logit, raised by the most the penalty can raise it, is at most the last
+        // kept cannot be kept (the last kept only rises): a run of such tokens is passed over at
+        // once, in a loop that vectorizes, and the scan keeps the same candidates.
+        let raise = (-sampling.presence_penalty).max(0.0);
+        for (run, chunk) in logits.chunks(SKIPPED_RUN).enumerate() {
+            if best.len() == top_k {
+                let last = best[top_k - 1].0;
+                if chunk.iter().fold(true, |all, &logit| all & (f64::from(logit) + raise <= last)) {
+                    continue;
+                }
             }
-            let at = best.partition_point(|(other, _)| *other >= logit);
-            best.insert(at, (logit, index as u32));
-            best.truncate(top_k);
+            for index in run * SKIPPED_RUN..run * SKIPPED_RUN + chunk.len() {
+                let logit = penalized(logits, index, sampling, generated);
+                if best.len() == top_k && logit <= best[best.len() - 1].0 {
+                    continue;
+                }
+                let at = best.partition_point(|(other, _)| *other >= logit);
+                best.insert(at, (logit, index as u32));
+                best.truncate(top_k);
+            }
         }
         best
     } else {
@@ -290,6 +305,30 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(tokens(1_000_000), all);
         assert!(started.elapsed().as_secs_f64() < 1.0);
+    }
+
+    #[test]
+    fn the_scan_for_a_small_top_k_keeps_what_a_full_sort_keeps() {
+        // A vocabulary's worth of logits, with ties, and every penalty sign: the candidates of a
+        // full sort (most likely first, the lower token on a tie) through the large-top_k path.
+        let mut rng = Rng::new(11);
+        let logits: Vec<f32> = (0..248_320).map(|_| ((rng.random() * 4000.0).floor() / 200.0) as f32).collect();
+        let mut generated = Generated::new(logits.len());
+        for _ in 0..300 {
+            generated.insert((rng.random() * logits.len() as f64) as u32);
+        }
+        for penalty in [0.0, 1.5, -1.5] {
+            for top_k in [1, 20, SCANNED_TOP_K] {
+                let sampling = Sampling { temperature: 1.0, top_k, min_p: 1e-12, presence_penalty: penalty, ..Sampling::GREEDY };
+                let scanned: Vec<u32> = sparse(distribution(&logits, &sampling, &generated)).iter().map(|(token, _)| *token).collect();
+                let mut sorted: Vec<(f64, u32)> =
+                    (0..logits.len()).map(|index| (penalized(&logits, index, &sampling, &generated), index as u32)).collect();
+                sorted.sort_by(descending);
+                let peak = sorted[0].0;
+                let kept: Vec<u32> = sorted.iter().take(top_k).filter(|(logit, _)| (logit - peak).exp() >= 1e-12).map(|(_, token)| *token).collect();
+                assert_eq!(scanned, kept, "penalty {penalty}, top_k {top_k}");
+            }
+        }
     }
 
     #[test]
