@@ -67,7 +67,7 @@ std::vector<GROUP_AFFINITY> physical_cores() {
     return cores;
 }
 #elif defined(__linux__)
-std::vector<cpu_set_t> physical_cores() {
+std::vector<cpu_set_t> read_physical_cores() {
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (sched_getaffinity(0, sizeof(allowed), &allowed)) return {};
@@ -88,6 +88,11 @@ std::vector<cpu_set_t> physical_cores() {
     }
     return cores;
 }
+// The CPUs the process started with, by core. A thread's own affinity is narrower once a pool
+// has bound it, and a pool made from such a thread would put every worker on that one core
+// (six threads ran at a fifth of one thread's speed): the set is read once, at load.
+const std::vector<cpu_set_t> process_cores = read_physical_cores();
+std::vector<cpu_set_t> physical_cores() { return process_cores; }
 #endif
 
 // A dispatch owns its cursor and callback. A worker delayed before claiming
@@ -161,8 +166,8 @@ public:
         for (auto& thread : threads_) thread.join();
     }
     void run_blocks(size_t rows, size_t block, std::function<void(size_t, size_t)> job) {
-        thread_local const Workers* bound = nullptr;
-        if (bound != this) { bind(0); bound = this; }
+        // The calling thread is not bound (it also drives the GPUs): the workers take cores 1 on,
+        // core 0 is left to it.
         if (count_ == 1) {
             for (size_t first = 0; first < rows; first += block) job(first, std::min(rows, first + block));
             return;
@@ -201,10 +206,11 @@ public:
     }
 private:
     void bind(size_t index) {
-#if defined(__linux__)
-        // Best effort: placement only affects speed, never results.
-        if (!cores_.empty()) pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cores_[index % cores_.size()]);
-#elif defined(_WIN32)
+        // Best effort: placement only affects speed, never results. Linux threads float: bound
+        // to cores they ran no faster with one per core and slower with more threads than cores,
+        // and a busy core held its worker (Qwen3.6 Q8_0 experts, Ryzen 7500F: 50 GB/s on six
+        // unbound threads).
+#if defined(_WIN32)
         if (!cores_.empty()) SetThreadGroupAffinity(GetCurrentThread(), &cores_[index % cores_.size()], nullptr);
 #else
         (void)index;

@@ -131,5 +131,29 @@ int main() {
         });
         for (int n : output) require(n == 7);
     }
-    std::cout << "CPU worker unique row ownership / exceptions / 8000 phases passed\n";
+#if defined(__linux__)
+    // The cores come from the process, not from the calling thread: a thread bound to one CPU
+    // (as an earlier pool once bound its caller) still sees every core, and the pool leaves it
+    // bound as it was.
+    {
+        const size_t cores = sd_cpu::physical_cores().size();
+        cpu_set_t before, one;
+        require(pthread_getaffinity_np(pthread_self(), sizeof(before), &before) == 0);
+        CPU_ZERO(&one);
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &before)) { CPU_SET(cpu, &one); break; }
+        require(pthread_setaffinity_np(pthread_self(), sizeof(one), &one) == 0);
+        require(sd_cpu::physical_cores().size() == cores);
+        {
+            Workers pool(2);
+            std::vector<int> output(64, 0);
+            pool.run_blocks(output.size(), 8, [&](size_t first, size_t last) { for (size_t i = first; i < last; ++i) output[i] = 1; });
+            for (int n : output) require(n == 1);
+        }
+        cpu_set_t after;
+        require(pthread_getaffinity_np(pthread_self(), sizeof(after), &after) == 0 && CPU_EQUAL(&after, &one));
+        require(pthread_setaffinity_np(pthread_self(), sizeof(before), &before) == 0);
+    }
+#endif
+    std::cout << "CPU worker unique row ownership / exceptions / 8000 phases / process cores passed\n";
 }

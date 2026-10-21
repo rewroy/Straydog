@@ -583,10 +583,9 @@ size_t lane_position(size_t index) {
 }
 
 // Hardware threads grouped by physical core (Linux sysfs, within the process
-// affinity; Windows processor-core records, per processor group), ordered by their
-// lowest CPU. Each worker is bound to one core's siblings: two workers never share
-// a core, yet the scheduler may still pick either sibling. Elsewhere, or without
-// topology, threads float.
+// affinity at load; Windows processor-core records, per processor group), ordered by
+// their lowest CPU: one worker per core by default. On Windows each worker is bound to
+// one core's siblings; elsewhere threads float.
 #if defined(__linux__) || defined(_WIN32)
 using sd_cpu::physical_cores;
 #endif
