@@ -276,8 +276,11 @@ __global__ void op_hc_step_kernel(const float* x, const float* residual, const f
         for (unsigned w = 0; w < blockDim.x / 32; ++w) v += reduce[w][threadIdx.x];
         row_partial[block * SUMS + threadIdx.x] = v;
     }
-    // The row's last block to finish sees every block's sums and columns.
+    // The row's last block to finish sees every block's sums and columns: every wave's writes are
+    // out (its fence) before the block counts itself done (else the last block may read a column
+    // another wave of this block has not written yet).
     __threadfence();
+    __syncthreads();
     unsigned* counter = counters + row;
     if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == blocks - 1;
     __syncthreads();
