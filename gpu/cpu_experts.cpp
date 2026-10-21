@@ -209,6 +209,13 @@ void decode_q8_0(const uint8_t* b, float* out) {
     const float d = half_at(b);
     for (int i = 0; i < 32; ++i) out[i] = d * float(int8_t(b[2 + i]));
 }
+// BF16, taken 32 values (64 bytes) at a time: each the high half of an F32.
+void decode_bf16(const uint8_t* b, float* out) {
+    for (int i = 0; i < 32; ++i) {
+        const uint32_t bits = uint32_t(b[2 * i] | b[2 * i + 1] << 8) << 16;
+        std::memcpy(out + i, &bits, 4);
+    }
+}
 void decode_iq4_nl(const uint8_t* b, float* out) {
     const float d = half_at(b);
     for (int i = 0; i < 16; ++i) { out[i] = d * float(iq4_values[b[2 + i] & 15]); out[i + 16] = d * float(iq4_values[b[2 + i] >> 4]); }
@@ -512,6 +519,7 @@ CpuFormat cpu_format(int kind) {
 #endif
     switch (kind) {
         case 8: return {32, 34, decode_q8_0, SD_WIDE(decode_q8_0), SD_ROWS(8)};
+        case 30: return {32, 64, decode_bf16, decode_bf16, nullptr};
         case 20: return {32, 18, decode_iq4_nl, SD_WIDE(decode_iq4_nl), SD_ROWS(20)};
         case 23: return {256, 136, decode_iq4_xs, SD_WIDE(decode_iq4_xs), SD_ROWS(23)};
         case 16: return {256, 66, decode_iq2_xxs, SD_WIDE(decode_iq2_xxs), SD_ROWS(16)};

@@ -1160,6 +1160,30 @@ impl CpuExperts {
     pub fn handle(&self) -> *mut c_void {
         self.handle
     }
+
+    /// out = the sum over the experts of weight x down . (SiLU(gate . x) * (up . x)), each
+    /// expert's three matrices (of `kinds`, `inter` x `hidden`, `hidden` x `inter`) in host memory.
+    ///
+    /// # Safety
+    /// Every pointer must address its whole matrix, unchanged for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run(&self, kinds: [u32; 3], gate: &[*const u8], up: &[*const u8], down: &[*const u8], weights: &[f32], hidden: usize,
+                      inter: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let count = weights.len();
+        if gate.len() != count || up.len() != count || down.len() != count || x.len() != hidden || out.len() != hidden {
+            return Err("CPU expert operands do not match".into());
+        }
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: the caller's matrices; the counts and lengths checked above.
+        let status = unsafe {
+            ffi::sd_cpu_experts_run(self.handle, kinds.as_ptr(), gate.as_ptr(), up.as_ptr(), down.as_ptr(), weights.as_ptr(), count as u32,
+                                    hidden as u64, inter as u64, x.as_ptr(), out.as_mut_ptr())
+        };
+        if status != 0 {
+            return Err(format!("Straydog CPU experts: {}", cpu_error()));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CpuExperts {

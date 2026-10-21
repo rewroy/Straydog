@@ -6,9 +6,11 @@
 //! prompt in one chunk). With --checkpoint N, the prompt is run again with a checkpoint N tokens
 //! before its end, other tokens after it, the checkpoint restored and the last N run again: the
 //! logits must be the same. With --resident 1, every expert is read into VRAM first and run by
-//! table (a decode step as one recorded graph); --slots is then unused.
+//! table (a decode step as one recorded graph); --slots is then unused. With --cpu N, a decode
+//! step's routes to experts in the host tier run on the CPU (N threads).
 //!
 //! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N] [--resident 1]
+//!          [--cpu N]
 
 #[path = "common/files.rs"]
 mod files;
@@ -32,9 +34,10 @@ fn main() -> Result<(), String> {
     let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 16), option("--slots", 2000), option("--split", 0));
     let (host_gb, context, checkpoint) = (option("--host-gb", 0), option("--context", 4096), option("--checkpoint", 0));
     let resident = option("--resident", 0) > 0;
+    let cpu_threads = option("--cpu", 0);
     let [dir, dump] = &args[..] else {
         return Err("usage: q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] \
-                    [--checkpoint N] [--resident 1]".into());
+                    [--checkpoint N] [--resident 1] [--cpu N]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
@@ -53,6 +56,12 @@ fn main() -> Result<(), String> {
     }
     println!("{} layers on {} GPU(s), placed in {:.1} s (resident experts: {})", layers, engines.len(), started.elapsed().as_secs_f64(),
              engines.iter().all(Engine::is_resident));
+    if cpu_threads > 0 {
+        let cpu = std::rc::Rc::new(straydog_engine::gpu::CpuExperts::new(cpu_threads as u32)?);
+        for engine in &mut engines {
+            engine.set_cpu(cpu.clone());
+        }
+    }
     let counts = |engines: &[Engine<'_, files::Files>]| engines.iter().map(|engine| engine.cache_counts())
         .fold((0u64, 0u64, 0u64), |a, b| (a.0 + b.hits, a.1 + b.host_hits, a.2 + b.drive_reads));
     let started = std::time::Instant::now();
@@ -90,8 +99,10 @@ fn main() -> Result<(), String> {
     let seconds = started.elapsed().as_secs_f64();
     let after = counts(&engines);
     let steps = (output.len() - 1).max(1) as f64;
-    println!("decode: {} tokens at {:.1} tok/s; per token {:.1} VRAM hits, {:.1} host hits, {:.1} drive reads", output.len() - 1,
-             steps / seconds, (after.0 - before.0) as f64 / steps, (after.1 - before.1) as f64 / steps, (after.2 - before.2) as f64 / steps);
+    let cpu_routes: u64 = engines.iter().map(Engine::cpu_routes).sum();
+    println!("decode: {} tokens at {:.1} tok/s; per token {:.1} VRAM hits, {:.1} host hits, {:.1} drive reads, {:.1} CPU routes",
+             output.len() - 1, steps / seconds, (after.0 - before.0) as f64 / steps, (after.1 - before.1) as f64 / steps,
+             (after.2 - before.2) as f64 / steps, cpu_routes as f64 / steps);
     println!("greedy:    {output:?}");
     println!("reference: {continuation:?}");
     let same = output.iter().zip(&continuation).take_while(|(a, b)| a == b).count();

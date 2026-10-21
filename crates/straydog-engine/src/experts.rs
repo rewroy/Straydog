@@ -524,6 +524,52 @@ impl DeviceExperts {
         Some((bases, self.classes[class].vram_bytes))
     }
 
+    /// Whether `layer`'s `expert` holds a VRAM slot (filled, or its fill queued).
+    pub fn in_vram(&self, layer: usize, expert: usize) -> bool {
+        self.map.contains_key(&(layer as u32, expert as u32))
+    }
+
+    /// Whether the host tier holds `layer`'s `expert` (outside VRAM), read or written back.
+    pub fn in_host(&self, layer: usize, expert: usize) -> bool {
+        let key = (layer as u32, expert as u32);
+        !self.map.contains_key(&key) && self.host_map.get(&key).is_some_and(|&host| {
+            self.host[host].failed.is_none() && !matches!(self.host[host].content, Content::Reading(_))
+        })
+    }
+
+    /// The host tier's copy of `layer`'s `expert` for the CPU to compute from: each role's bytes
+    /// in host memory (gate, up, down), the expert touched as used (None when the tier holds no
+    /// ready copy; a write-back still in flight is waited for). The bytes stay put until this
+    /// store next fills, reads or evicts.
+    pub fn host_roles(&mut self, gpu: &mut Backend, layer: usize, expert: usize) -> Result<Option<[*const u8; 3]>> {
+        if !self.in_host(layer, expert) {
+            return Ok(None);
+        }
+        let host = self.host_map[&(layer as u32, expert as u32)];
+        let base = self.host_pointer(host).cast_const();
+        let roles = match self.host[host].content {
+            Content::Read => {
+                let plan = self.layout.read_plan(layer, expert)?;
+                // SAFETY: each role's bytes lie inside the host slot (the read plan's spans).
+                [0, 1, 2].map(|role| unsafe { base.add(plan[role].data as usize) })
+            }
+            Content::Packed(written) => {
+                gpu.mark_done(written, true)?;
+                let bytes: Vec<u64> = self.layout.roles(layer)?.iter().map(|role| role.bytes).collect();
+                // SAFETY: the roles lie back to back inside the host slot, as written back.
+                [0, bytes[0], bytes[0] + bytes[1]].map(|at| unsafe { base.add(at as usize) })
+            }
+            Content::Reading(_) => return Ok(None),
+        };
+        self.clock += 1;
+        let entry = &mut self.host[host];
+        let class = &mut self.classes[entry.class];
+        class.host_lru.remove(&(entry.used, host));
+        entry.used = self.clock;
+        class.host_lru.insert((entry.used, host));
+        Ok(Some(roles))
+    }
+
     /// VRAM and host slots.
     pub fn capacity(&self) -> (usize, usize) {
         (self.slots.len(), self.classes.iter().map(|class| class.host_capacity).sum())

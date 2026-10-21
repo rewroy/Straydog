@@ -3,12 +3,14 @@
 //! after its dense weights, the sequence state (DeltaNet states, K/V) and the work buffers given to
 //! its layers' experts: all of them for good when they fit (resident: taken by table, a decode step
 //! one recorded graph), else expert slots, with the host memory planned for the experts' host tier
-//! behind them. Requests then run in a
+//! behind them (a decode step's routes to experts in the host tier then run on the CPU). Requests
+//! then run in a
 //! [`Session`]; a reply ends at any of the official generation config's end tokens. The DeltaNets'
 //! state is checkpointed where each reply's generation prompt begins ([`CHECKPOINTS`] copies), so
 //! a next turn resumes there when the template renders the reply otherwise than it ran.
 
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Instant;
 
 use serde_json::json;
@@ -18,7 +20,7 @@ use super::{Hparams, Mixer};
 use crate::arch::served::{self, Placed, Session, Settings, RESERVE, SCRATCH};
 use crate::bundle;
 use crate::experts::Contents;
-use crate::gpu::Backend;
+use crate::gpu::{Backend, CpuExperts};
 use crate::pinned::Pinned;
 
 /// Qwen3.5 MoE served: its placed engines in a session.
@@ -26,6 +28,8 @@ pub type Model = Session<Engines>;
 
 /// Copies of the DeltaNets' state each engine keeps: the last turn's and the one before.
 pub const CHECKPOINTS: usize = 2;
+/// The CPU expert engine's threads.
+const CPU_THREADS: u32 = 6;
 
 /// The engines of consecutive layer ranges, one per device.
 pub struct Engines {
@@ -47,6 +51,10 @@ impl served::Engines for Engines {
     fn counts(&self) -> (u64, u64, u64) {
         self.engines.iter().map(Engine::cache_counts)
             .fold((0, 0, 0), |sum, counts| (sum.0 + counts.hits, sum.1 + counts.host_hits, sum.2 + counts.drive_reads))
+    }
+
+    fn cpu_routes(&self) -> u64 {
+        self.engines.iter().map(Engine::cpu_routes).sum()
     }
 
     fn contents(&self) -> Contents {
@@ -187,7 +195,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let placed = Instant::now();
     let state_bytes = parts.iter().map(state).sum();
     let loading = std::sync::atomic::AtomicBool::new(true);
-    let engines = std::thread::scope(|scope| {
+    let mut engines = std::thread::scope(|scope| {
         // The dense weights verify as the engines take them: their bytes are the progress.
         scope.spawn(|| {
             while loading.load(std::sync::atomic::Ordering::Relaxed) {
@@ -215,6 +223,14 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         loading.store(false, std::sync::atomic::Ordering::Relaxed);
         result.map(|()| engines)
     })?;
+    // A decode step's routes to experts the host tier holds run on the CPU, shared by the GPUs
+    // whose experts are not all resident.
+    if resident.iter().any(|&resident| !resident) {
+        let cpu = Rc::new(CpuExperts::new(CPU_THREADS)?);
+        for (engine, _) in engines.iter_mut().zip(&resident).filter(|(_, &resident)| !resident) {
+            engine.set_cpu(cpu.clone());
+        }
+    }
     let place_seconds = placed.elapsed().as_secs_f64();
     let placement = json!({
         "split_mode": "layer",
@@ -227,6 +243,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "host_expert_bytes": host,
         "expert_bytes": total_experts,
         "resident_experts": resident,
+        "cpu_experts": resident.iter().any(|&resident| !resident),
         "prefill_batch_size": settings.batch,
     });
     Ok(Session::new(Placed {

@@ -16,7 +16,7 @@ use super::{Hparams, Mixer};
 use crate::arch::Tensors;
 use crate::experts::{Contents, Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
-use crate::gpu::{Backend, Result};
+use crate::gpu::{Backend, CpuExperts, Result};
 use crate::ops::{Buffer, Linear};
 
 type P = *const c_void;
@@ -114,6 +114,10 @@ struct Work {
     expert_weights: Buffer,
     positions: Buffer,
     head: Buffer,
+    /// A decode step's routes, their weights and the MoE input, together for the host.
+    exchange: Buffer,
+    /// The CPU's share of a decode step's routed experts.
+    cpu_out: Buffer,
 }
 
 pub struct Engine<'a, T: Tensors> {
@@ -128,6 +132,9 @@ pub struct Engine<'a, T: Tensors> {
     saved: Vec<Saved>,
     experts: DeviceExperts,
     resident: Option<Resident>,
+    /// The host CPU's expert engine: a decode step's routes to experts in the host tier run there.
+    cpu: Option<Rc<CpuExperts>>,
+    cpu_routes: u64,
     frequencies: Buffer,
     position: usize,
     /// Q35_COMPARE: the reference's tensors to compare each layer's with (development).
@@ -187,6 +194,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             expert_weights: floats(&mut gpu, b)?,
             positions: floats(&mut gpu, b)?,
             head: floats(&mut gpu, if range.end == hp.layers() { hp.vocabulary } else { 1 })?,
+            exchange: floats(&mut gpu, 2 * k + w)?,
+            cpu_out: floats(&mut gpu, w)?,
         };
         let mut states = BTreeMap::new();
         for layer in range.clone() {
@@ -237,6 +246,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             saved,
             experts,
             resident: None,
+            cpu: None,
+            cpu_routes: 0,
             frequencies: frequency_buffer,
             position: 0,
             compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from),
@@ -378,6 +389,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
             roles[layer] = Some(layer_roles);
         }
         Ok(roles)
+    }
+
+    /// Run a decode step's routes to experts in the host tier on the CPU (their weights read where
+    /// they are, only activations crossing the bus), the rest on the GPU as before.
+    pub fn set_cpu(&mut self, cpu: Rc<CpuExperts>) {
+        self.cpu = Some(cpu);
+    }
+
+    /// Routes the CPU ran so far.
+    pub fn cpu_routes(&self) -> u64 {
+        self.cpu_routes
     }
 
     /// Whether every expert of this engine's layers is held in VRAM for good ([`Settings::resident`]).
@@ -658,9 +680,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
                        work.weights.base())?;
         let resident = self.resident.is_some();
+        let hybrid = n == 1 && !resident && self.cpu.is_some();
         // The routes travel to the host while the shared expert runs (resident experts take them
-        // on the device).
-        if !resident {
+        // on the device); for the CPU, with their weights and the input.
+        if hybrid {
+            self.gpu.copy(work.ids.base(), work.exchange.base(), (k * 4) as u64)?;
+            self.gpu.copy(work.weights.base(), work.exchange.at(k), (k * 4) as u64)?;
+            self.gpu.copy(work.x.base(), work.exchange.at(2 * k), (w * 4) as u64)?;
+            self.gpu.read_start(&work.exchange, 0, ((2 * k + w) * 4) as u64)?;
+        } else if !resident {
             self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
         }
         self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
@@ -685,6 +713,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return self.gpu.experts_table(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64, ff as u64,
                                           n as u64, k as u64, work.x.base(), Some(work.weights.base()), 0.0, true, work.hidden.base(),
                                           work.out.base());
+        }
+        if hybrid {
+            return self.moe_hybrid(layer, kinds, offsets);
         }
         let mut routes = vec![0i32; n * k];
         self.gpu.read_finish(&mut routes)?;
@@ -740,6 +771,85 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.experts.release(&mut self.gpu)?;
         }
         Ok(())
+    }
+}
+
+impl<T: Tensors> Engine<'_, T> {
+    /// A decode step's routed experts: those the host tier holds on the CPU, from host memory (the
+    /// step's input and their weights read back with the routes), the others on the GPU from VRAM
+    /// slots (acquired as before: the drive's go through the host tier into VRAM). The CPU's sum
+    /// is added to the GPU's.
+    fn moe_hybrid(&mut self, layer: usize, kinds: [u32; 3], offsets: [u64; 3]) -> Result<()> {
+        let hp = self.hp.clone();
+        let work = self.work;
+        let (w, k, ff) = (hp.width, hp.experts_used, hp.expert_ff);
+        let mut packed = vec![0f32; 2 * k + w];
+        self.gpu.read_finish(&mut packed)?;
+        let ids: Vec<usize> = packed[..k].iter().map(|id| id.to_bits() as usize).collect();
+        if ids.iter().any(|&id| id >= hp.experts) {
+            return Err("a qwen35moe route outside the experts".into());
+        }
+        // The host tier's experts go to the CPU, the rest to the GPU. A GPU fill may take a host
+        // slot: the CPU's are taken after the GPU's acquire, and any the fill took join the GPU's.
+        let mut on_cpu: Vec<bool> = ids.iter().map(|&id| self.experts.in_host(layer, id)).collect();
+        let mut gpu_experts: Vec<usize> = Vec::new();
+        let mut slots: Vec<Buffer> = Vec::new();
+        let take = |list: Vec<usize>, engine: &mut Self, gpu_experts: &mut Vec<usize>, slots: &mut Vec<Buffer>| -> Result<()> {
+            let list: Vec<usize> = list.into_iter().filter(|id| !gpu_experts.contains(id)).collect::<BTreeSet<_>>().into_iter().collect();
+            if !list.is_empty() {
+                slots.extend(engine.experts.acquire(&mut engine.gpu, layer, &list)?);
+                gpu_experts.extend(list);
+            }
+            Ok(())
+        };
+        let first: Vec<usize> = ids.iter().zip(&on_cpu).filter(|(_, &cpu)| !cpu).map(|(&id, _)| id).collect();
+        take(first, self, &mut gpu_experts, &mut slots)?;
+        let mut roles: Vec<Option<[*const u8; 3]>>;
+        loop {
+            roles = Vec::with_capacity(k);
+            let mut lost = Vec::new();
+            for route in 0..k {
+                if !on_cpu[route] {
+                    roles.push(None);
+                    continue;
+                }
+                let found = self.experts.host_roles(&mut self.gpu, layer, ids[route])?;
+                if found.is_none() {
+                    on_cpu[route] = false;
+                    lost.push(ids[route]);
+                }
+                roles.push(found);
+            }
+            if lost.is_empty() {
+                break;
+            }
+            take(lost, self, &mut gpu_experts, &mut slots)?;
+        }
+        if !gpu_experts.is_empty() {
+            let bases: Vec<u64> = (0..k).map(|route| {
+                if on_cpu[route] { 0 } else { slots[gpu_experts.iter().position(|&id| id == ids[route]).unwrap()].base() as u64 }
+            }).collect();
+            let slot_bytes = slots[0].bytes;
+            self.gpu.experts(Some(&bases), slot_bytes, offsets, kinds, w as u64, ff as u64, 1, k as u64, work.x.base(), 0,
+                             Some(work.weights.base()), 0.0, true, work.hidden.base(), work.out.base(), 0, None)?;
+        }
+        let cpu: Vec<(usize, [*const u8; 3])> = roles.iter().enumerate().filter_map(|(route, roles)| roles.map(|roles| (route, roles))).collect();
+        if cpu.is_empty() {
+            return self.experts.release(&mut self.gpu);
+        }
+        let pick = |role: usize| -> Vec<*const u8> { cpu.iter().map(|(_, roles)| roles[role]).collect() };
+        let weights: Vec<f32> = cpu.iter().map(|&(route, _)| packed[k + route]).collect();
+        let mut out = vec![0f32; w];
+        let engine = self.cpu.clone().ok_or("no CPU expert engine")?;
+        // SAFETY: each expert's matrices lie in its host slot, which nothing fills, reads into or
+        // evicts before this call returns: this thread drives the store, and releases the step's
+        // slots (whose reserve refill writes VRAM experts back into the host tier) only after it.
+        let ran = unsafe { engine.run(kinds, &pick(0), &pick(1), &pick(2), &weights, w, ff, &packed[2 * k..], &mut out) };
+        self.experts.release(&mut self.gpu)?;
+        ran?;
+        self.cpu_routes += cpu.len() as u64;
+        self.gpu.write_buffer(&work.cpu_out, 0, &out)?;
+        self.gpu.add(work.cpu_out.base(), w as u64, work.out.base())
     }
 }
 

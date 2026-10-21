@@ -491,3 +491,16 @@ the GPU where each prompt's generation prompt begins (its last `<|im_start|>`), 
 two. A prompt that extends such a checkpoint, while the held sequence matches it that far (so the
 K/V rows below it are the checkpoint's), restores it and runs only the rest (`resumed_from`
 "turn" or "prior").
+
+Where its experts go depends on what the GPUs hold:
+- **All of a GPU's experts fit in its VRAM** (Qwen3.6 on two GPUs): they are read in at
+  placement into slots sized per size class and kept for good. A pass looks each route's slot
+  up on the GPU in a table (`sd_op_experts_table`), so no routes come back to the host. A decode
+  step then has no host data past its position and embedding, and each GPU runs it as one
+  recorded graph.
+- **Otherwise**, the expert store's tiers serve them: VRAM slots, a page-locked host tier, the
+  drive. A decode step reads its routes, their weights and its MoE input back each layer.
+  Routes to experts in the host tier run on the CPU (`sd_cpu_experts_run`, Q8_0 and BF16) from
+  host memory, so only activations cross the bus; their sum is added to the GPU's. Experts in
+  VRAM run there. Experts only on the drive come through the host tier into VRAM, as before.
+  Prefill still uploads the experts it needs, in waves.

@@ -24,6 +24,10 @@ pub trait Engines {
     fn reset(&mut self);
     /// The expert stores' (VRAM hits, host-tier hits, drive reads) so far.
     fn counts(&self) -> (u64, u64, u64);
+    /// Routes the host CPU ran so far (experts computed where the host tier holds them).
+    fn cpu_routes(&self) -> u64 {
+        0
+    }
     /// The experts the stores hold, least recently used first: in VRAM, and only in the host tier.
     fn contents(&self) -> Contents;
     /// Start warming the stores up with these experts; the reads in flight.
@@ -298,6 +302,7 @@ impl<E: Engines> Session<E> {
         };
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
+        let cpu = self.engines.cpu_routes();
         let mut rng = Rng::new(seed);
         let mut generated = Generated::new(self.vocabulary);
         let (mut emitted, mut ttft) = (0usize, None);
@@ -325,6 +330,7 @@ impl<E: Engines> Session<E> {
         let decode_seconds = decoding.elapsed().as_secs_f64();
         let steps = emitted.saturating_sub(1);
         let (hits2, host2, drive2) = self.engines.counts();
+        let cpu2 = self.engines.cpu_routes();
         let per = |value: u64| if steps > 0 { json!(value as f64 / steps as f64) } else { Value::Null };
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed_from,
@@ -332,7 +338,7 @@ impl<E: Engines> Session<E> {
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": steps, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
-            "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive)},
+            "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
         })
         .as_object()
         .unwrap()
