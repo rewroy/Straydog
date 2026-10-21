@@ -24,10 +24,12 @@ use crate::sampling::{self, Generated, Sampling};
 /// the expert slots.
 const RESERVE: u64 = 2 << 30;
 const SCRATCH: u64 = 512 << 20;
-/// Without a host tier budget, the experts get this share of the host memory, less some for the
-/// rest of the system (the page cache holds the gathered table's rows).
-const HOST_SHARE: f64 = 0.5;
-const HOST_KEEP: u64 = 4 << 30;
+/// Without a host tier budget, Straydog takes this share of the host memory in all, and the
+/// experts' host tier what its other host memory leaves of it: the row cache, and the rest below.
+const HOST_SHARE: f64 = 0.75;
+/// The worker's host memory beside the tier and the row cache: the GPU runtime, the verity
+/// trees' level-0 caches, read buffers and the passes' host copies.
+const HOST_OTHER: u64 = 2 << 30;
 
 pub struct Settings {
     pub devices: Vec<usize>,
@@ -186,7 +188,9 @@ impl Model {
         }
         let in_vram: u64 = groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).sum();
         let host = settings.host_expert_bytes.unwrap_or_else(|| {
-            ((settings.host_memory_bytes as f64 * HOST_SHARE) as u64).saturating_sub(HOST_KEEP).min(total_experts.saturating_sub(in_vram))
+            ((settings.host_memory_bytes as f64 * HOST_SHARE) as u64)
+                .saturating_sub(settings.row_cache_bytes + HOST_OTHER)
+                .min(total_experts.saturating_sub(in_vram))
         });
         let whole_bytes = files.whole_bytes(|_| true);
         let files: &'static Pinned = Box::leak(Box::new(files));
