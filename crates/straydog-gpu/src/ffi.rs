@@ -761,6 +761,12 @@ unsafe extern "C" {
     pub fn sd_link_failed(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_link_status(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_link_reset(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

@@ -169,6 +169,36 @@ impl Backend {
         check(unsafe { ffi::sd_graph_end(self.handle(), key, i32::from(keep)) })
     }
 
+    /// Queue the graph stored under `key` on every one of `gpus` at once (a thread for each past the
+    /// first): a launch takes host time for every op it holds, so devices that wait on each other
+    /// start together. False when one has none.
+    pub fn graph_run_all(gpus: &mut [&mut Backend], key: u64) -> Result<bool> {
+        struct Handle(*mut c_void);
+        // SAFETY: a device handle is used on one thread at a time: each launch's own thread, while
+        // the caller holds every Backend mutably.
+        unsafe impl Send for Handle {}
+        let run = |handle: Handle| -> Result<bool> {
+            // SAFETY: a live handle.
+            let state = unsafe { ffi::sd_graph_run(handle.0, key) };
+            check(state.min(0))?;
+            Ok(state == 0)
+        };
+        let mut handles = gpus.iter().map(|gpu| Handle(gpu.handle()));
+        let Some(first) = handles.next() else { return Ok(true) };
+        std::thread::scope(|scope| {
+            let others: Vec<_> = handles.map(|handle| scope.spawn(move || run(handle))).collect();
+            let mut all = run(first);
+            for other in others {
+                let ran = other.join().map_err(|_| "a graph launch panicked".to_string())?;
+                all = match (all, ran) {
+                    (Ok(a), Ok(b)) => Ok(a && b),
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                };
+            }
+            all
+        })
+    }
+
     /// Queue the graph stored under `key`; false when there is none.
     pub fn graph_run(&mut self, key: u64) -> Result<bool> {
         // SAFETY: a live handle.
@@ -372,6 +402,13 @@ impl Backend {
     pub fn link_sum(&mut self, part: P, count: u64, out: M, accumulate: bool) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_link_sum(self.handle(), part.cast(), count, out.cast(), i32::from(accumulate)) })
+    }
+
+    /// Queue a copy of the link's failure word into `out` (nonzero after a wait gave up): read with
+    /// a pass's results, it tells whether they are void without another wait.
+    pub fn link_status(&mut self, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_link_status(self.handle(), out.cast()) })
     }
 
     /// Wait for both linked devices' streams and start their sums' counts over (after a failed pass).

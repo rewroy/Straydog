@@ -94,6 +94,16 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
     SD_OP_END
 }
 
+__global__ void link_status_kernel(const uint32_t* state, uint32_t* out) { *out = state[2]; }
+
+int sd_op_link_status(void* handle, uint32_t* out) {
+    SD_OP_BEGIN
+    if (!value.sums.peer) throw std::runtime_error("no Straydog sum link");
+    op_span(value, out, 4, "a link status");
+    link_status_kernel<<<1, 1, 0, value.stream>>>(value.sums.state, out);
+    SD_OP_END
+}
+
 int sd_link_failed(void* handle) {
     try {
         Device& value = device(handle);

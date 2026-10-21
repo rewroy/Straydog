@@ -193,11 +193,13 @@ int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
    device's part + the other's part of the same sum (count floats; out may be part; accumulate:
    out += that sum), waiting on the device, so no host data goes with it and a graph may record
    it; the two devices' results are equal. sd_link_failed (after the stream is idle): 1 when a wait
-   gave up (the sums since are void); sd_link_reset waits for both devices' streams and starts
-   their counts over. */
+   gave up (the sums since are void); sd_op_link_status queues a copy of that word (nonzero after a
+   wait gave up) into out; sd_link_reset waits for both devices' streams and starts their counts
+   over. */
 int sd_link_sums(void* first, void* second, uint64_t capacity);
 int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, int accumulate);
 int sd_link_failed(void* handle);
+int sd_op_link_status(void* handle, uint32_t* out);
 int sd_link_reset(void* handle);
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width);
 

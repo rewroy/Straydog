@@ -84,8 +84,9 @@ struct Resident {
     slot_bytes: Vec<u64>,
     /// Routes run through the table (the store counts none of them).
     routes: u64,
-    /// A decode step's graph being recorded.
+    /// A decode step's graph being recorded, and recorded.
     recording: bool,
+    graph: bool,
 }
 
 /// Work buffers sized for a batch.
@@ -227,7 +228,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             expert_rows: floats(&mut gpu, b)?,
             expert_weights: floats(&mut gpu, b)?,
             positions: floats(&mut gpu, b)?,
-            head: floats(&mut gpu, if range.end == hp.layers() { hp.vocabulary } else { 1 })?,
+            // (a part's logits are followed by its link's failure word)
+            head: floats(&mut gpu, if range.end == hp.layers() { hp.vocabulary + 1 } else { 1 })?,
             exchange: floats(&mut gpu, 2 * k + w)?,
             cpu_out: floats(&mut gpu, w)?,
         };
@@ -484,7 +486,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.gpu.expert_table(&part, &layer_bases, bytes)?;
             slot_bytes.push(bytes);
         }
-        self.resident = Some(Resident { table, slot_bytes, routes: 0, recording: false });
+        self.resident = Some(Resident { table, slot_bytes, routes: 0, recording: false, graph: false });
         Ok(())
     }
 
@@ -580,24 +582,33 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// Queue a decode step's graph (recorded its first time).
     fn decode_graph(&mut self) -> Result<()> {
+        self.prepare_decode_graph()?;
+        if !self.gpu.graph_run(DECODE_GRAPH)? {
+            return Err("the qwen35moe decode graph went missing".into());
+        }
+        Ok(())
+    }
+
+    /// Before a decode step's graph runs: count its routes, and record it the first time.
+    fn prepare_decode_graph(&mut self) -> Result<()> {
         let routes = (self.settings.layers.len() * self.hp.experts_used) as u64;
         let counted = self.settings.part.index == 0;
-        if let Some(resident) = &mut self.resident {
-            // (a split model's first part counts the routes for all)
-            if counted {
-                resident.routes += routes;
-            }
+        let Some(resident) = &mut self.resident else { return Err("a qwen35moe decode graph needs resident experts".into()) };
+        // (a split model's first part counts the routes for all)
+        if counted {
+            resident.routes += routes;
         }
-        if !self.gpu.graph_run(DECODE_GRAPH)? {
-            self.gpu.graph_begin()?;
-            self.set_recording(true);
-            let recorded = self.layers_and_head(1);
-            self.set_recording(false);
-            self.gpu.graph_end(DECODE_GRAPH, recorded.is_ok())?;
-            recorded?;
-            if !self.gpu.graph_run(DECODE_GRAPH)? {
-                return Err("the qwen35moe decode graph went missing".into());
-            }
+        if resident.graph {
+            return Ok(());
+        }
+        self.gpu.graph_begin()?;
+        self.set_recording(true);
+        let recorded = self.layers_and_head(1);
+        self.set_recording(false);
+        self.gpu.graph_end(DECODE_GRAPH, recorded.is_ok())?;
+        recorded?;
+        if let Some(resident) = &mut self.resident {
+            resident.graph = true;
         }
         Ok(())
     }
@@ -605,6 +616,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// The queued pass of `n` tokens done: the logits after its last token (a split model's part:
     /// its rows of the vocabulary) when this engine has the head.
     fn collect(&mut self, n: usize) -> Result<Option<Vec<f32>>> {
+        if !self.settings.part.is_whole() {
+            self.collect_start()?;
+            return self.collect_finish(n).map(Some);
+        }
         let logits = if self.settings.layers.end == self.hp.layers() {
             let mut logits = vec![0f32; self.hp.vocabulary];
             self.gpu.read_buffer(&self.work.head, 0, &mut logits)?;
@@ -612,7 +627,21 @@ impl<'a, T: Tensors> Engine<'a, T> {
         } else {
             None
         };
-        if !self.settings.part.is_whole() && self.gpu.link_failed()? {
+        self.position += n;
+        Ok(logits)
+    }
+
+    /// A part's queued pass: start reading back its logits and its link's failure word.
+    fn collect_start(&mut self) -> Result<()> {
+        self.gpu.read_start(&self.work.head, 0, ((self.hp.vocabulary + 1) * 4) as u64)
+    }
+
+    /// A part's queued pass done: its rows of the logits after its last token (an error when a sum
+    /// of it waited too long for the other part).
+    fn collect_finish(&mut self, n: usize) -> Result<Vec<f32>> {
+        let mut logits = vec![0f32; self.hp.vocabulary + 1];
+        self.gpu.read_finish(&mut logits)?;
+        if logits.pop().is_some_and(|status| status.to_bits() != 0) {
             return Err("a qwen35moe GPU waited too long for its peer's part of a sum".into());
         }
         self.position += n;
@@ -641,6 +670,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let (w, work) = (self.hp.width, self.work);
             self.norm("output_norm.weight", work.stream.at((n - 1) * w), 1, w, work.x.base())?;
             self.linear("output.weight", work.x.base(), 1, work.head.base())?;
+            if !self.settings.part.is_whole() {
+                self.gpu.link_status(work.head.at(self.hp.vocabulary))?;
+            }
         }
         Ok(())
     }
@@ -987,7 +1019,12 @@ pub fn forward_parts<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) 
             engine.begin(tokens)?;
         }
         if engines.iter().all(|engine| engine.graphed(n)) {
-            return engines.iter_mut().try_for_each(Engine::decode_graph);
+            engines.iter_mut().try_for_each(Engine::prepare_decode_graph)?;
+            let mut gpus: Vec<&mut Backend> = engines.iter_mut().map(|engine| &mut engine.gpu).collect();
+            return match Backend::graph_run_all(&mut gpus, DECODE_GRAPH)? {
+                true => Ok(()),
+                false => Err("the qwen35moe decode graph went missing".into()),
+            };
         }
         let layers = engines.first().map_or(0..0, |engine| engine.settings.layers.clone());
         for layer in layers {
@@ -1000,12 +1037,17 @@ pub fn forward_parts<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32]) 
         }
         engines.iter_mut().try_for_each(|engine| engine.head(n))
     })();
-    let mut logits = Vec::new();
+    // Every part's read starts before any is waited for.
     let mut failed = queued.err();
     for engine in engines.iter_mut() {
-        match engine.collect(n) {
-            Ok(Some(part)) => logits.extend(part),
-            Ok(None) => failed = failed.or(Some("a qwen35moe part without the head".into())),
+        if let Err(error) = engine.collect_start() {
+            failed = failed.or(Some(error));
+        }
+    }
+    let mut logits = Vec::new();
+    for engine in engines.iter_mut() {
+        match engine.collect_finish(n) {
+            Ok(part) => logits.extend(part),
             Err(error) => failed = failed.or(Some(error)),
         }
     }
