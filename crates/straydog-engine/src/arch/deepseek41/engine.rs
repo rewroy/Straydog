@@ -1282,10 +1282,14 @@ fn compress(shard: &mut Shard, hp: &Hparams, layer: usize, n: usize, freqs: Buff
 
 /// Whether an engine over several devices divides this resident tensor among them (each holds its
 /// part: of the head and the attention's q_b, sinks and output its heads' or groups', of a shared
-/// expert its rows); every other resident tensor is whole on each device.
+/// expert its rows); every other resident tensor is whole on each device (the indexer's among
+/// them: its q_b is not the attention's).
 pub fn divided(name: &str) -> bool {
-    ["attn_q_b", "attn_sinks", "attn_output_a", "attn_output_b", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].iter()
-        .any(|role| name.ends_with(&format!(".{role}.weight"))) || name == "output.weight"
+    match name.strip_prefix("blk.").and_then(|rest| rest.split_once('.')) {
+        Some((_, role)) => ["attn_q_b", "attn_sinks", "attn_output_a", "attn_output_b", "ffn_gate_shexp", "ffn_up_shexp",
+                            "ffn_down_shexp"].iter().any(|divided| role.strip_suffix(".weight") == Some(divided)),
+        None => name == "output.weight",
+    }
 }
 
 /// One pass over engines that run consecutive layers (on their own devices): each hands the stream
@@ -1313,6 +1317,22 @@ impl Work {
             expert_rows: self.expert_rows, expert_weights: self.expert_weights, xe: self.xe, gate: self.gate, up: self.up,
             hidden: self.hidden, y: self.y, engram_rows: self.engram_rows, engram_kv: self.engram_kv, head: self.head,
             hc_workspace: self.hc_workspace,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::divided;
+
+    #[test]
+    fn only_the_attention_and_the_shared_experts_and_the_head_are_divided() {
+        for name in ["blk.2.attn_q_b.weight", "blk.39.attn_output_b.weight", "blk.0.ffn_down_shexp.weight", "output.weight"] {
+            assert!(divided(name), "{name}");
+        }
+        for name in ["blk.2.indexer.attn_q_b.weight", "blk.2.indexer.attn_k.weight", "blk.2.attn_q_a.weight", "output_norm.weight",
+                     "blk.2.attn_q_b.bias", "token_embd.weight"] {
+            assert!(!divided(name), "{name}");
         }
     }
 }

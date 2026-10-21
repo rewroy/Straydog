@@ -8,7 +8,9 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL]
-//! --show prints every position whose KL exceeds KL, with both sides' top tokens.
+//! --show prints every position whose KL exceeds KL, with both sides' top tokens. With
+//! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
+//! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
 //! Each TOKENS file is the probe's prompt-N.tokens; its logits are read from prompt-N.logits beside it.
 
 #[path = "common/files.rs"]
@@ -132,14 +134,19 @@ fn main() -> Result<(), String> {
         }
         let mut prompt_hash = 0xcbf2_9ce4_8422_2325u64;
         hash(&mut prompt_hash, &logits);
+        let mut saved: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
         let mut steps = vec![compare(&logits, &row(kept - 1), generated.first().map(|&token| token as usize))];
         for step in 0..decode_rows.min(generated.len()).min(max_steps) {
             logits = forward_split(&mut engines, &generated[step..step + 1])?;
             hash(&mut prompt_hash, &logits);
+            saved.extend(logits.iter().flat_map(|value| value.to_le_bytes()));
             steps.push(compare(&logits, &row(kept + step), generated.get(step + 1).map(|&token| token as usize)));
         }
         hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
         println!("{} | logits hash {prompt_hash:016x}", summary(&format!("prompt {index}"), &steps));
+        if let Some(dir) = std::env::var_os("DS41_QUALITY_SAVE") {
+            std::fs::write(Path::new(&dir).join(format!("prompt-{index}.logits")), &saved).map_err(|exc| exc.to_string())?;
+        }
         if let Some(threshold) = show {
             for (at, step) in steps.iter().enumerate().filter(|(_, step)| step.kl > threshold) {
                 // position: the prompt's last (step 0), then after each generated token
