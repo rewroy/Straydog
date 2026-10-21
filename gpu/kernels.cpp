@@ -2635,6 +2635,20 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
 }
 
 constexpr size_t slot_route_capacity = 65536;
+// An expert's three matrices in its slot (rows of each as `part` takes them), checked to lie inside it.
+static SlotExperts slot_plan(uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn,
+                             const sd_expert_split& part) {
+    SlotExperts plan{};
+    for (int role = 0; role < 3; ++role) {
+        const size_t matrix_rows = size_t(role == 2 ? part.hidden_rows : part.ffn_rows), cols = size_t(role == 2 ? ffn : hidden);
+        const size_t row_bytes = matrix_row_bytes(kinds[role], cols);
+        if (offsets[role] > slot_bytes || matrix_rows * row_bytes > slot_bytes - offsets[role])
+            throw std::runtime_error("an expert's matrices lie outside its slot");
+        plan.role[role] = {reinterpret_cast<const uint8_t*>(offsets[role]), row_bytes, matrix_rows, cols, 0, 0, 0, kinds[role]};
+    }
+    return plan;
+}
+
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds,
                   uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride,
                   const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride,
@@ -2649,14 +2663,7 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
         part.hidden_first > hidden - part.hidden_rows)
         throw std::runtime_error("invalid Straydog experts shape");
-    SlotExperts plan{};
-    for (int role = 0; role < 3; ++role) {
-        const size_t matrix_rows = size_t(role == 2 ? part.hidden_rows : part.ffn_rows), cols = size_t(role == 2 ? ffn : hidden);
-        const size_t row_bytes = matrix_row_bytes(kinds[role], cols);
-        if (offsets[role] > slot_bytes || matrix_rows * row_bytes > slot_bytes - offsets[role])
-            throw std::runtime_error("an expert's matrices lie outside its slot");
-        plan.role[role] = {reinterpret_cast<const uint8_t*>(offsets[role]), row_bytes, matrix_rows, cols, 0, 0, 0, kinds[role]};
-    }
+    SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, part);
     const size_t routes = size_t(rows * top_k);
     if (!bases && value.slot_routes_count != routes) throw std::runtime_error("no Straydog expert routes to reuse");
     bool uniform = bases != nullptr && top_k == 1;
@@ -2689,6 +2696,44 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     }
     slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
                  size_t(out_stride));
+    SD_OP_END
+}
+
+int sd_expert_table(void* handle, uint64_t* table, const uint64_t* bases, uint64_t count, uint64_t slot_bytes) {
+    SD_OP_BEGIN
+    if (!bases || !count || count > (uint64_t(1) << 24) || !slot_bytes) throw std::runtime_error("invalid Straydog expert table");
+    op_span(value, table, size_t(count) * 8, "an expert table");
+    for (size_t index = 0; index < count; ++index) {
+        if (bases[index] % 256) throw std::runtime_error("an expert slot is not 256-byte aligned");
+        op_span(value, reinterpret_cast<const void*>(bases[index]), size_t(slot_bytes), "an expert slot");
+    }
+    upload(value, table, bases, size_t(count) * 8);
+    SD_OP_END
+}
+
+int sd_op_experts_table(void* handle, const uint64_t* table, uint64_t count, const int32_t* ids, uint64_t slot_bytes,
+                        const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k,
+                        const float* input, const float* weights, float clamp, int accumulate, float* product, float* out) {
+    SD_OP_BEGIN
+    if (!offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 || !count ||
+        count > (uint64_t(1) << 24) || !(clamp >= 0.0f))
+        throw std::runtime_error("invalid Straydog experts shape");
+    const sd_expert_split whole{0, ffn, 0, hidden, 3};
+    SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, whole);
+    op_span(value, table, size_t(count) * 8, "an expert table");
+    op_span(value, ids, size_t(rows * top_k) * 4, "expert routes");
+    op_span(value, input, size_t(rows * hidden) * 4, "an expert input");
+    if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
+    op_span(value, product, size_t(rows * top_k * ffn) * 4, "an expert product");
+    op_span(value, out, size_t(rows * hidden) * 4, "an expert output");
+    plan.top_k = uint32_t(top_k);
+    plan.product_stride = uint32_t(ffn);
+    plan.clamp = clamp;
+    plan.accumulate = accumulate ? 1 : 0;
+    plan.table = table;
+    plan.ids = ids;
+    plan.table_count = uint32_t(count);
+    slot_experts(value, plan, 3, nullptr, size_t(rows), input, size_t(hidden), weights, product, out, size_t(hidden));
     SD_OP_END
 }
 

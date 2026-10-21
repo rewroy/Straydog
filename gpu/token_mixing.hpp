@@ -124,68 +124,93 @@ __global__ void tm_rope_halves_kernel(float* x, size_t count, size_t vectors, si
     v[pair + pairs] = float(a * s + b * c);
 }
 
-constexpr size_t tm_attention_tile = 256;
+constexpr size_t tm_attention_threads = 256;
+constexpr size_t tm_attention_tile = 64;
 constexpr size_t tm_attention_max_dim = 1024;
+constexpr size_t tm_attention_max_splits = 64;
 
-// Causal grouped-query attention, a block per (row, head): q [rows][heads][dim] at positions[row]
-// attends the cache's keys and values [0, position] ([context][kv_heads][dim]; head h reads kv
-// head h / (heads / kv_heads)) by an online softmax over tiles of 256 keys; out [rows][heads][dim],
-// times sigmoid(gate) when a gate is given.
-__global__ void tm_attention_kernel(const float* q, const float* keys, const float* values, const int32_t* positions, size_t heads,
-                                    size_t kv_heads, size_t dim, float scale, const float* gate, float* out) {
-    const size_t row = blockIdx.x / heads, h = blockIdx.x % heads, kh = h / (heads / kv_heads), tid = threadIdx.x;
+// Causal grouped-query attention, split over the keys (flash decoding): block (row * heads + h,
+// split) takes its share of keys [0, positions[row]] (an equal share of each row's length, so a
+// fixed grid serves any length) for q's row and head h (kv head h / (heads / kv_heads)); a warp
+// scores a key (lanes over the dimensions), then an online softmax over tiles of 64 keys sums the
+// values (a thread per dimension). The split's max score, exp-sum and unnormalized sum go to
+// partial[(row * heads + h) * splits + split] (dim + 2 values).
+__global__ void tm_attention_split_kernel(const float* q, const float* keys, const float* values, size_t context,
+                                          const int32_t* positions, size_t heads, size_t kv_heads, size_t dim, float scale,
+                                          float* partial) {
+    const size_t pair = blockIdx.x, split = blockIdx.y, splits = gridDim.y;
+    const size_t row = pair / heads, h = pair % heads, kh = h / (heads / kv_heads);
+    const unsigned tid = threadIdx.x, lane = tid % 32, warp = tid / 32, warps = blockDim.x / 32;
     extern __shared__ float shared[];
     float* qs = shared;
-    float* p = shared + dim;
-    float* reduce = p + tm_attention_tile;
-    for (size_t d = tid; d < dim; d += blockDim.x) qs[d] = q[(row * heads + h) * dim + d];
+    float* scores = shared + dim;
+    for (size_t d = tid; d < dim; d += blockDim.x) qs[d] = q[pair * dim + d];
+    const size_t length = std::min(size_t(positions[row]) + 1, context);
+    const size_t share = (length + splits - 1) / splits;
+    const size_t begin = std::min(length, split * share), end = std::min(length, begin + share);
     __syncthreads();
-    const size_t last = size_t(positions[row]);
-    float acc[tm_attention_max_dim / tm_attention_tile] = {};
+    float acc[tm_attention_max_dim / tm_attention_threads] = {};
     float m = -INFINITY, l = 0.0f;
-    for (size_t start = 0; start <= last; start += tm_attention_tile) {
-        const size_t s = start + tid;
-        float score = -INFINITY;
-        if (s <= last) {
-            const float* key = keys + (s * kv_heads + kh) * dim;
+    for (size_t start = begin; start < end; start += tm_attention_tile) {
+        const size_t count = std::min(tm_attention_tile, end - start);
+        for (size_t i = warp; i < count; i += warps) {
+            const float* key = keys + ((start + i) * kv_heads + kh) * dim;
             float sum = 0.0f;
-            for (size_t d = 0; d < dim; ++d) sum += qs[d] * key[d];
-            score = sum * scale;
+            for (size_t d = lane; d < dim; d += 32) sum += qs[d] * key[d];
+            for (unsigned offset = 16; offset; offset /= 2) sum += __shfl_xor(sum, offset, 32);
+            if (!lane) scores[i] = sum * scale;
         }
-        reduce[tid] = score;
         __syncthreads();
-        for (unsigned stride = tm_attention_tile / 2; stride; stride /= 2) {
-            if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
-            __syncthreads();
-        }
-        const float next = fmaxf(m, reduce[0]);
+        float top = -INFINITY;
+        for (size_t i = 0; i < count; ++i) top = fmaxf(top, scores[i]);
+        const float next = fmaxf(m, top), correction = expf(m - next);
         __syncthreads();
-        const float correction = expf(m - next);
-        const float weight = s <= last ? expf(score - next) : 0.0f;
-        p[tid] = weight;
-        reduce[tid] = weight;
+        if (tid < count) scores[tid] = expf(scores[tid] - next);
         __syncthreads();
-        for (unsigned stride = tm_attention_tile / 2; stride; stride /= 2) {
-            if (tid < stride) reduce[tid] += reduce[tid + stride];
-            __syncthreads();
-        }
-        l = l * correction + reduce[0];
-        const size_t count = last + 1 - start < tm_attention_tile ? last + 1 - start : tm_attention_tile;
-        for (size_t a = 0; a * tm_attention_tile < dim; ++a) {
-            const size_t d = tid + a * tm_attention_tile;
+        float total = 0.0f;
+        for (size_t i = 0; i < count; ++i) total += scores[i];
+        l = l * correction + total;
+        for (size_t a = 0; a * tm_attention_threads < dim; ++a) {
+            const size_t d = tid + a * tm_attention_threads;
             if (d >= dim) break;
             float value = acc[a] * correction;
-            for (size_t i = 0; i < count; ++i) value += p[i] * values[((start + i) * kv_heads + kh) * dim + d];
+            for (size_t i = 0; i < count; ++i) value += scores[i] * values[((start + i) * kv_heads + kh) * dim + d];
             acc[a] = value;
         }
         m = next;
         __syncthreads();
     }
-    for (size_t a = 0; a * tm_attention_tile < dim; ++a) {
-        const size_t d = tid + a * tm_attention_tile;
-        if (d >= dim) break;
-        const size_t at = (row * heads + h) * dim + d;
-        float value = acc[a] / l;
+    float* mine = partial + (pair * splits + split) * (dim + 2);
+    for (size_t a = 0; a * tm_attention_threads < dim; ++a) {
+        const size_t d = tid + a * tm_attention_threads;
+        if (d < dim) mine[d] = acc[a];
+    }
+    if (!tid) {
+        mine[dim] = m;
+        mine[dim + 1] = l;
+    }
+}
+
+// The splits of a (row, head) combined (each scaled by exp(its max - the max)), normalized, and
+// times sigmoid(gate) when a gate is given: out [rows][heads][dim].
+__global__ void tm_attention_combine_kernel(const float* partial, size_t splits, size_t dim, const float* gate, float* out) {
+    const size_t pair = blockIdx.x;
+    const float* first = partial + pair * splits * (dim + 2);
+    float top = -INFINITY;
+    for (size_t s = 0; s < splits; ++s) top = fmaxf(top, first[s * (dim + 2) + dim]);
+    float total = 0.0f;
+    for (size_t s = 0; s < splits; ++s) {
+        const float* split = first + s * (dim + 2);
+        total += split[dim + 1] * expf(split[dim] - top);
+    }
+    for (size_t d = threadIdx.x; d < dim; d += blockDim.x) {
+        float sum = 0.0f;
+        for (size_t s = 0; s < splits; ++s) {
+            const float* split = first + s * (dim + 2);
+            sum += split[d] * expf(split[dim] - top);
+        }
+        const size_t at = pair * dim + d;
+        float value = sum / total;
         if (gate) value *= tm_sigmoid(gate[at]);
         out[at] = value;
     }
@@ -271,9 +296,10 @@ int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, u
 }
 
 int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions,
-                    uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* out) {
+                    uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch,
+                    uint64_t scratch_bytes, float* out) {
     SD_OP_BEGIN
-    if (!rows || !heads || !kv_heads || heads % kv_heads || !dim || dim > tm_attention_max_dim || !context)
+    if (!rows || !heads || !kv_heads || heads % kv_heads || !dim || dim > tm_attention_max_dim || !context || rows * heads > 65535 * 64)
         throw std::runtime_error("invalid Straydog attention shape");
     op_span(value, q, size_t(rows * heads * dim) * 4, "attention queries");
     op_span(value, keys, size_t(context * kv_heads * dim) * 4, "attention keys");
@@ -281,10 +307,17 @@ int sd_op_attention(void* handle, const float* q, const float* keys, const float
     op_span(value, positions, size_t(rows) * 4, "attention positions");
     if (gate) op_span(value, gate, size_t(rows * heads * dim) * 4, "an attention gate");
     op_span(value, out, size_t(rows * heads * dim) * 4, "an attention output");
-    // Positions past the cache read past it: the caller keeps them inside [0, context).
-    const size_t shared = (size_t(dim) + 2 * tm_attention_tile) * 4;
-    tm_attention_kernel<<<unsigned(rows * heads), unsigned(tm_attention_tile), shared, value.stream>>>(
-        q, keys, values, positions, size_t(heads), size_t(kv_heads), size_t(dim), scale, gate, out);
+    // Enough blocks to fill the device whatever the rows: few rows split their keys further.
+    const size_t pairs = size_t(rows * heads);
+    const size_t splits = std::min(tm_attention_max_splits, std::max<size_t>(1, 256 / pairs));
+    const size_t partial_bytes = pairs * splits * (size_t(dim) + 2) * 4;
+    if (!scratch || scratch_bytes < partial_bytes) throw std::runtime_error("Straydog attention scratch too small");
+    op_span(value, scratch, partial_bytes, "attention scratch");
+    const size_t shared = (size_t(dim) + tm_attention_tile) * 4;
+    tm_attention_split_kernel<<<dim3(unsigned(pairs), unsigned(splits)), unsigned(tm_attention_threads), shared, value.stream>>>(
+        q, keys, values, size_t(context), positions, size_t(heads), size_t(kv_heads), size_t(dim), scale, scratch);
+    check(hipGetLastError());
+    tm_attention_combine_kernel<<<unsigned(pairs), 256, 0, value.stream>>>(scratch, splits, size_t(dim), gate, out);
     SD_OP_END
 }
 

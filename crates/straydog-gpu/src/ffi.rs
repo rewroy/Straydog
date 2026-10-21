@@ -541,6 +541,36 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_expert_table(
+        handle: *mut ::std::os::raw::c_void,
+        table: *mut u64,
+        bases: *const u64,
+        count: u64,
+        slot_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_experts_table(
+        handle: *mut ::std::os::raw::c_void,
+        table: *const u64,
+        count: u64,
+        ids: *const i32,
+        slot_bytes: u64,
+        offsets: *const u64,
+        kinds: *const ::std::os::raw::c_int,
+        hidden: u64,
+        ffn: u64,
+        rows: u64,
+        top_k: u64,
+        input: *const f32,
+        weights: *const f32,
+        clamp: f32,
+        accumulate: ::std::os::raw::c_int,
+        product: *mut f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_sum_devices(
         handles: *const *mut ::std::os::raw::c_void,
         outs: *const *mut f32,
@@ -685,6 +715,8 @@ unsafe extern "C" {
         dim: u64,
         scale: f32,
         gate: *const f32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
         out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }

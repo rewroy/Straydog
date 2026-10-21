@@ -1,7 +1,9 @@
 //! Qwen3.5 MoE served (docs/DESIGN.md §10): the authenticated GGUF ([`Pinned`]) placed on the
 //! GPUs, one engine per GPU over a range of layers balancing the dense bytes; each GPU's VRAM left
 //! after its dense weights, the sequence state (DeltaNet states, K/V) and the work buffers given to
-//! expert slots, and the host memory planned for the experts' host tier. Requests then run in a
+//! its layers' experts: all of them for good when they fit (resident: taken by table, a decode step
+//! one recorded graph), else expert slots, with the host memory planned for the experts' host tier
+//! behind them. Requests then run in a
 //! [`Session`]; a reply ends at any of the official generation config's end tokens. The DeltaNets'
 //! state is checkpointed where each reply's generation prompt begins ([`CHECKPOINTS`] copies), so
 //! a next turn resumes there when the template renders the reply otherwise than it ran.
@@ -159,16 +161,22 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         }).sum()
     };
     let total_experts: u64 = expert_bytes.iter().sum();
-    let mut slots = Vec::new();
+    let (mut slots, mut resident) = (Vec::new(), Vec::new());
     for range in &parts {
         let fixed = load(range.clone()) + state(range) + SCRATCH + RESERVE;
         let free = settings.vram_bytes.checked_sub(fixed).ok_or_else(|| {
             format!("layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64)
         })?;
+        // A GPU with room for every expert of its layers keeps them all.
+        resident.push(Engine::<Pinned>::resident_bytes(&hp, &files, range.clone())? <= free);
         slots.push(((free / slot_bytes(range)) as usize).min(range.len() * hp.experts));
     }
-    let in_vram: u64 = parts.iter().zip(&slots).map(|(range, &slots)| slots as u64 * slot_bytes(range)).sum();
+    let part_experts: Vec<u64> = parts.iter().map(|range| expert_bytes[range.clone()].iter().sum()).collect();
+    let in_vram: u64 = parts.iter().enumerate()
+        .map(|(part, range)| if resident[part] { part_experts[part] } else { slots[part] as u64 * slot_bytes(range) }).sum();
     let host = served::host_tier(settings, total_experts.saturating_sub(in_vram));
+    // The page-locked host tier is shared out by the other parts' expert bytes.
+    let tiered: u64 = part_experts.iter().zip(&resident).filter(|(_, &resident)| !resident).map(|(bytes, _)| bytes).sum();
     let end = end_tokens(root, &pins, &files)?;
     let turn_start = files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
         .and_then(|tokens| tokens.iter().position(|token| token.text() == Some("<|im_start|>")))
@@ -178,8 +186,6 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let files: &'static Pinned = Box::leak(Box::new(files));
     let placed = Instant::now();
     let state_bytes = parts.iter().map(state).sum();
-    // The page-locked host tier is shared out by the parts' expert bytes.
-    let part_experts: Vec<u64> = parts.iter().map(|range| expert_bytes[range.clone()].iter().sum()).collect();
     let loading = std::sync::atomic::AtomicBool::new(true);
     let engines = std::thread::scope(|scope| {
         // The dense weights verify as the engines take them: their bytes are the progress.
@@ -191,15 +197,16 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         });
         let mut engines = Vec::new();
         let result = (|| {
-            for ((&device, range), (&slots, &experts)) in settings.devices.iter().zip(&parts).zip(slots.iter().zip(&part_experts)) {
+            for (part, (&device, range)) in settings.devices.iter().zip(&parts).enumerate() {
                 let engine_settings = EngineSettings {
                     context: settings.context,
                     batch: settings.batch,
-                    expert_slots: slots,
-                    host_expert_bytes: (host as f64 * experts as f64 / total_experts.max(1) as f64) as u64,
+                    expert_slots: slots[part],
+                    host_expert_bytes: if resident[part] { 0 } else { (host as f64 * part_experts[part] as f64 / tiered.max(1) as f64) as u64 },
                     scratch_bytes: SCRATCH,
                     layers: range.clone(),
                     checkpoints: CHECKPOINTS,
+                    resident: resident[part],
                 };
                 engines.push(Engine::new(hp.clone(), files, device, settings.vram_bytes, engine_settings)?);
             }
@@ -215,15 +222,18 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "devices": settings.devices.iter().take(parts.len()).map(|&device| vec![device]).collect::<Vec<_>>(),
         "expert_slots": engines.iter().map(|engine| engine.expert_capacity().0).collect::<Vec<_>>(),
         "host_expert_slots": engines.iter().map(|engine| engine.expert_capacity().1).collect::<Vec<_>>(),
-        "expert_vram_bytes": parts.iter().zip(&slots).map(|(range, &slots)| slots as u64 * slot_bytes(range)).collect::<Vec<_>>(),
+        "expert_vram_bytes": parts.iter().enumerate()
+            .map(|(part, range)| if resident[part] { part_experts[part] } else { slots[part] as u64 * slot_bytes(range) }).collect::<Vec<_>>(),
         "host_expert_bytes": host,
         "expert_bytes": total_experts,
+        "resident_experts": resident,
         "prefill_batch_size": settings.batch,
     });
     Ok(Session::new(Placed {
         engines: Engines { engines },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch, end, turn_start,
         card,
-        placement, state_bytes, load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
+        placement, state_bytes,
+        load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
     }))
 }

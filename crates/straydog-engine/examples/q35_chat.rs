@@ -5,9 +5,10 @@
 //! rest on GPU 1. Q35_COMPARE=DIR compares each layer's tensors with DIR's as the passes go (the
 //! prompt in one chunk). With --checkpoint N, the prompt is run again with a checkpoint N tokens
 //! before its end, other tokens after it, the checkpoint restored and the last N run again: the
-//! logits must be the same.
+//! logits must be the same. With --resident 1, every expert is read into VRAM first and run by
+//! table (a decode step as one recorded graph); --slots is then unused.
 //!
-//! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N]
+//! q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] [--checkpoint N] [--resident 1]
 
 #[path = "common/files.rs"]
 mod files;
@@ -30,9 +31,10 @@ fn main() -> Result<(), String> {
     });
     let (chunk, generate, slots, split) = (option("--chunk", 16), option("--generate", 16), option("--slots", 2000), option("--split", 0));
     let (host_gb, context, checkpoint) = (option("--host-gb", 0), option("--context", 4096), option("--checkpoint", 0));
+    let resident = option("--resident", 0) > 0;
     let [dir, dump] = &args[..] else {
         return Err("usage: q35_chat MODEL_DIR DUMP_DIR [--chunk N] [--generate N] [--slots N] [--split L] [--host-gb N] [--context N] \
-                    [--checkpoint N]".into());
+                    [--checkpoint N] [--resident 1]".into());
     };
     let files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_header(&files.header)?;
@@ -46,10 +48,11 @@ fn main() -> Result<(), String> {
     let mut engines = Vec::new();
     for (device, part) in parts.into_iter().enumerate() {
         let settings = Settings { context, batch: chunk.max(1), expert_slots: slots, host_expert_bytes: (host_gb as u64) << 30,
-                                  scratch_bytes: 512 << 20, layers: part, checkpoints: usize::from(checkpoint > 0) };
+                                  scratch_bytes: 512 << 20, layers: part, checkpoints: usize::from(checkpoint > 0), resident };
         engines.push(Engine::new(hp.clone(), &files, device, 31 << 30, settings)?);
     }
-    println!("{} layers on {} GPU(s), placed in {:.1} s", layers, engines.len(), started.elapsed().as_secs_f64());
+    println!("{} layers on {} GPU(s), placed in {:.1} s (resident experts: {})", layers, engines.len(), started.elapsed().as_secs_f64(),
+             engines.iter().all(Engine::is_resident));
     let counts = |engines: &[Engine<'_, files::Files>]| engines.iter().map(|engine| engine.cache_counts())
         .fold((0u64, 0u64, 0u64), |a, b| (a.0 + b.hits, a.1 + b.host_hits, a.2 + b.drive_reads));
     let started = std::time::Instant::now();
@@ -105,7 +108,9 @@ fn main() -> Result<(), String> {
             engine.checkpoint(0, true)?;
         }
         let first = forward_split(&mut engines, &prompt[cut..])?;
-        forward_split(&mut engines, &output)?;
+        for piece in output.chunks(chunk.max(1)) {
+            forward_split(&mut engines, piece)?;
+        }
         for engine in &mut engines {
             engine.checkpoint(0, false)?;
         }

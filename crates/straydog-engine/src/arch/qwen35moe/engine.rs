@@ -28,6 +28,8 @@ const READERS: usize = 32;
 const SLOT_ROWS: usize = 4;
 /// Experts a prefill wave holds at once.
 const WAVE: usize = 32;
+/// The graph a decode step records when the experts are resident.
+const DECODE_GRAPH: u64 = 1;
 
 pub struct Settings {
     /// Longest sequence (positions) the state holds.
@@ -43,6 +45,10 @@ pub struct Settings {
     pub layers: std::ops::Range<usize>,
     /// Copies of the DeltaNets' state a session can save and restore ([`Engine::checkpoint`]).
     pub checkpoints: usize,
+    /// Every expert of the layers read into VRAM at creation and kept there (no host tier;
+    /// `expert_slots` and `host_expert_bytes` unused): passes take them by table, with no routes
+    /// read back, and a decode step runs as one recorded graph.
+    pub resident: bool,
 }
 
 #[derive(Clone)]
@@ -63,6 +69,17 @@ enum State {
 struct Saved {
     buffers: Vec<Buffer>,
     position: usize,
+}
+
+/// Every expert of the engine's layers held in VRAM for good: per layer, its experts' slot
+/// addresses in `table` (from `(layer - first) * experts`) and its slots' bytes.
+struct Resident {
+    table: Buffer,
+    slot_bytes: Vec<u64>,
+    /// Routes run through the table (the store counts none of them).
+    routes: u64,
+    /// A decode step's graph being recorded.
+    recording: bool,
 }
 
 /// Work buffers sized for a batch.
@@ -110,6 +127,7 @@ pub struct Engine<'a, T: Tensors> {
     states: BTreeMap<usize, State>,
     saved: Vec<Saved>,
     experts: DeviceExperts,
+    resident: Option<Resident>,
     frequencies: Buffer,
     position: usize,
     /// Q35_COMPARE: the reference's tensors to compare each layer's with (development).
@@ -198,23 +216,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let frequencies: Vec<f32> = hp.rope_frequencies().into_iter().map(|f| f as f32).collect();
         let frequency_buffer = floats(&mut gpu, frequencies.len())?;
         gpu.write_buffer(&frequency_buffer, 0, &frequencies)?;
-        // Each layer's routed experts as three roles of the file (a slot holds them back to back).
         let files = tensors.files()?;
-        let mut roles = vec![None; hp.layers()];
-        for layer in range.clone() {
-            let mut layer_roles = Vec::new();
-            for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
-                let tensor_name = name(layer, role);
-                let tensor = tensors.tensor(&tensor_name)?;
-                let (file, base) = tensors.location(&tensor_name).ok_or("the expert store needs the model's files")?;
-                let bytes = (row_bytes(tensor.kind, tensor.dims[0])? * tensor.dims[1]) as u64;
-                layer_roles.push(Role { file, base, stride: bytes, bytes });
-            }
-            roles[layer] = Some(layer_roles);
-        }
+        let roles = Self::roles(&hp, tensors, range.clone())?;
         let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
-        let experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots,
-                                         settings.host_expert_bytes)?;
+        let reader = Arc::new(Reader::new(READERS));
+        let experts = if settings.resident {
+            DeviceExperts::resident(&mut gpu, layout, reader, hp.experts)?
+        } else {
+            DeviceExperts::new(&mut gpu, layout, reader, settings.expert_slots, settings.host_expert_bytes)?
+        };
         let mut engine = Engine {
             hp: Rc::new(hp),
             tensors,
@@ -226,11 +236,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
             states,
             saved,
             experts,
+            resident: None,
             frequencies: frequency_buffer,
             position: 0,
             compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from),
         };
         engine.upload_dense()?;
+        if engine.settings.resident {
+            engine.load_resident()?;
+        }
         Ok(engine)
     }
 
@@ -317,7 +331,65 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     pub fn cache_counts(&self) -> Counts {
-        self.experts.counts()
+        let mut counts = self.experts.counts();
+        counts.hits += self.resident.as_ref().map_or(0, |resident| resident.routes);
+        counts
+    }
+
+    /// The VRAM bytes the resident experts of `layers` take ([`Settings::resident`]).
+    pub fn resident_bytes(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>) -> Result<u64> {
+        Ok(DeviceExperts::resident_bytes(&Self::roles(hp, tensors, layers)?, hp.experts))
+    }
+
+    /// Each of `layers`' routed experts as three roles of the file (a slot holds them back to back).
+    fn roles(hp: &Hparams, tensors: &T, layers: std::ops::Range<usize>) -> Result<Vec<Option<Vec<Role>>>> {
+        let mut roles = vec![None; hp.layers()];
+        for layer in layers {
+            let mut layer_roles = Vec::new();
+            for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+                let tensor_name = name(layer, role);
+                let tensor = tensors.tensor(&tensor_name)?;
+                let (file, base) = tensors.location(&tensor_name).ok_or("the expert store needs the model's files")?;
+                let bytes = (row_bytes(tensor.kind, tensor.dims[0])? * tensor.dims[1]) as u64;
+                layer_roles.push(Role { file, base, stride: bytes, bytes });
+            }
+            roles[layer] = Some(layer_roles);
+        }
+        Ok(roles)
+    }
+
+    /// Whether every expert of this engine's layers is held in VRAM for good ([`Settings::resident`]).
+    pub fn is_resident(&self) -> bool {
+        self.resident.is_some()
+    }
+
+    /// Read every expert of this engine's layers into the resident store's slots and write their
+    /// table.
+    fn load_resident(&mut self) -> Result<()> {
+        let range = self.settings.layers.clone();
+        let experts = self.hp.experts;
+        let all: Vec<usize> = (0..experts).collect();
+        // Every layer's reads start at once; then each layer takes its experts whole.
+        for layer in range.clone() {
+            self.experts.prefetch(&mut self.gpu, layer, &all, true)?;
+        }
+        for layer in range.clone() {
+            self.experts.acquire(&mut self.gpu, layer, &all)?;
+            self.experts.release(&mut self.gpu)?;
+        }
+        let mut bases = Vec::with_capacity(range.len());
+        for layer in range.clone() {
+            bases.push(self.experts.resident_bases(layer, experts).ok_or("a resident expert left its slot")?);
+        }
+        let table = self.gpu.buffer((range.len() * experts * 8) as u64)?;
+        let mut slot_bytes = Vec::with_capacity(range.len());
+        for (index, (layer_bases, bytes)) in bases.into_iter().enumerate() {
+            let part = table.slice((index * experts * 8) as u64, (experts * 8) as u64);
+            self.gpu.expert_table(&part, &layer_bases, bytes)?;
+            slot_bytes.push(bytes);
+        }
+        self.resident = Some(Resident { table, slot_bytes, routes: 0, recording: false });
+        Ok(())
     }
 
     /// Wait for the expert store's reads and copies (before dropping the engine).
@@ -391,13 +463,27 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             self.gpu.write_buffer(&work.stream, 0, &rows)?;
         }
-        for layer in range.clone() {
-            self.layer(layer, n)?;
+        // With the experts resident a decode step has no host data past the positions and the
+        // embedding: it runs as the graph its first time recorded.
+        if n == 1 && self.resident.is_some() && self.compare.is_none() {
+            if let Some(resident) = &mut self.resident {
+                resident.routes += (range.len() * hp.experts_used) as u64;
+            }
+            if !self.gpu.graph_run(DECODE_GRAPH)? {
+                self.gpu.graph_begin()?;
+                self.set_recording(true);
+                let recorded = self.layers_and_head(1);
+                self.set_recording(false);
+                self.gpu.graph_end(DECODE_GRAPH, recorded.is_ok())?;
+                recorded?;
+                if !self.gpu.graph_run(DECODE_GRAPH)? {
+                    return Err("the qwen35moe decode graph went missing".into());
+                }
+            }
+        } else {
+            self.layers_and_head(n)?;
         }
         let logits = if range.end == hp.layers() {
-            let last = (n - 1) * w;
-            self.norm("output_norm.weight", work.stream.at(last), 1, w, work.x.base())?;
-            self.linear("output.weight", work.x.base(), 1, work.head.base())?;
             let mut logits = vec![0f32; hp.vocabulary];
             self.gpu.read_buffer(&work.head, 0, &mut logits)?;
             Some(logits)
@@ -406,6 +492,27 @@ impl<'a, T: Tensors> Engine<'a, T> {
         };
         self.position += n;
         Ok(logits)
+    }
+
+    fn set_recording(&mut self, recording: bool) {
+        if let Some(resident) = &mut self.resident {
+            resident.recording = recording;
+        }
+    }
+
+    /// This engine's layers over the `n` rows in the stream, then (on the last engine) the head's
+    /// logits after the last row into `work.head`.
+    fn layers_and_head(&mut self, n: usize) -> Result<()> {
+        let range = self.settings.layers.clone();
+        for layer in range.clone() {
+            self.layer(layer, n)?;
+        }
+        if range.end == self.hp.layers() {
+            let (w, work) = (self.hp.width, self.work);
+            self.norm("output_norm.weight", work.stream.at((n - 1) * w), 1, w, work.x.base())?;
+            self.linear("output.weight", work.x.base(), 1, work.head.base())?;
+        }
+        Ok(())
     }
 
     /// Hand the stream of the pass that just ran over `rows` tokens to the engine of the next layers.
@@ -513,8 +620,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.gpu.scatter(work.k.base(), work.positions.base(), n as u64, kv_width, keys.base(), context)?;
         self.gpu.scatter(work.v.base(), work.positions.base(), n as u64, kv_width, values.base(), context)?;
         let scale = 1.0 / (dim as f32).sqrt();
+        let scratch = self.scratch;
         self.gpu.attention(work.q.base(), keys.base(), values.base(), context, work.positions.base(), n as u64, heads as u64,
-                           kv_heads as u64, dim as u64, scale, Some(work.gate.base()), work.attended.base())?;
+                           kv_heads as u64, dim as u64, scale, Some(work.gate.base()), &scratch, work.attended.base())?;
         self.linear(&name(layer, "attn_output"), work.attended.base(), n, work.mixed.base())?;
         self.check("attn_output", layer, work.mixed, n, hp.width)
     }
@@ -527,8 +635,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
         self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
                        work.weights.base())?;
-        // The routes travel to the host while the shared expert runs.
-        self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
+        let resident = self.resident.is_some();
+        // The routes travel to the host while the shared expert runs (resident experts take them
+        // on the device).
+        if !resident {
+            self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
+        }
         self.linear(&name(layer, "ffn_gate_shexp"), work.x.base(), n, work.ffn_gate.base())?;
         self.linear(&name(layer, "ffn_up_shexp"), work.x.base(), n, work.ffn_up.base())?;
         self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
@@ -536,8 +648,6 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.linear(&name(layer, "ffn_gate_inp_shexp"), work.x.base(), n, work.shared_gate.base())?;
         self.gpu.scale_rows(work.out.base(), work.shared_gate.base(), n as u64, w as u64)?;
         self.check("ffn_shexp_gated", layer, work.out, n, w)?;
-        let mut routes = vec![0i32; n * k];
-        self.gpu.read_finish(&mut routes)?;
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
         let up = self.tensors.tensor(&name(layer, "ffn_up_exps"))?;
         let down = self.tensors.tensor(&name(layer, "ffn_down_exps"))?;
@@ -545,6 +655,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (gate_bytes, up_bytes, down_bytes) =
             ((ff * row_bytes(gate.kind, w)?) as u64, (ff * row_bytes(up.kind, w)?) as u64, (w * row_bytes(down.kind, ff)?) as u64);
         let offsets = [0, gate_bytes, gate_bytes + up_bytes];
+        if let Some(resident) = &mut self.resident {
+            let index = layer - self.settings.layers.start;
+            let table = resident.table.slice((index * hp.experts * 8) as u64, (hp.experts * 8) as u64);
+            // (a decode step's graph counts its routes as it runs)
+            if !resident.recording {
+                resident.routes += (n * k) as u64;
+            }
+            let slot_bytes = resident.slot_bytes[index];
+            return self.gpu.experts_table(&table, hp.experts as u64, work.ids.base(), slot_bytes, offsets, kinds, w as u64, ff as u64,
+                                          n as u64, k as u64, work.x.base(), Some(work.weights.base()), 0.0, true, work.hidden.base(),
+                                          work.out.base());
+        }
+        let mut routes = vec![0i32; n * k];
+        self.gpu.read_finish(&mut routes)?;
         let distinct: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<BTreeSet<_>>().into_iter().collect();
         // A few rows run over their experts' slots in one launch, when the store's smallest size
         // class can hold them all at once (a store of few slots takes them in waves instead).

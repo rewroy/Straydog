@@ -141,6 +141,13 @@ typedef struct sd_expert_split {
     int stages;
 } sd_expert_split;
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride, const sd_expert_split* split);
+/* Experts by table, for experts that stay in their slots: sd_expert_table writes count slot
+   addresses (each slot_bytes, 256-byte aligned, inside this device's allocations; checked) into
+   the device array table. sd_op_experts_table runs as sd_op_experts does without split, route r
+   taking the slot table[ids[r]] (ids on the device, as sd_op_route leaves them; an id outside the
+   table runs nothing), so no host data goes with it and a graph may record it. */
+int sd_expert_table(void* handle, uint64_t* table, const uint64_t* bases, uint64_t count, uint64_t slot_bytes);
+int sd_op_experts_table(void* handle, const uint64_t* table, uint64_t count, const int32_t* ids, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, const float* weights, float clamp, int accumulate, float* product, float* out);
 /* Tensor parallel: every device's outs[i] = parts[0] + parts[1] + ... (count values, in device
    order), each device's stream waiting for the others' parts and reading them over peer access.
    A part must stay unchanged until every device's sum has run; an out is never a part. */
@@ -168,14 +175,16 @@ int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t group
    per row. split: rows of [first | second] (2 x width) into two. rope_halves: the leading rope_dims
    values of each vector, pair i = (i, i + rope_dims / 2), rotated by position * frequencies[i].
    attention: causal grouped-query attention of q (rows x heads x dim) at positions over the
-   cache's keys and values (context x kv_heads x dim) up to each position, times sigmoid(gate)
-   when given. add: out += x. scale_rows: each row of x times sigmoid of its scalar. */
+   cache's keys and values (context x kv_heads x dim) up to each position (within the cache),
+   times sigmoid(gate) when given; the keys are split among blocks (flash decoding) whose partial
+   results take scratch: rows x heads x splits x (dim + 2) values, splits = min(64, max(1, 256 /
+   (rows x heads))). add: out += x. scale_rows: each row of x times sigmoid of its scalar. */
 int sd_op_conv_silu(void* handle, float* x, float* history, const float* taps, uint64_t channels, uint64_t kernel, uint64_t steps);
 int sd_op_delta_rule(void* handle, const float* qkv, const float* beta, const float* alpha, const float* dt, const float* a, float* state, uint64_t k_heads, uint64_t v_heads, uint64_t dim, uint64_t steps, float eps, float* out);
 int sd_op_gated_norm(void* handle, const float* x, const float* gate, const float* weight, uint64_t rows, uint64_t width, float eps, float* out);
 int sd_op_split(void* handle, const float* x, uint64_t rows, uint64_t width, float* first, float* second);
 int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies);
-int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* out);
+int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width);
 

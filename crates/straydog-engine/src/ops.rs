@@ -347,14 +347,16 @@ impl Backend {
     }
 
     /// Causal grouped-query attention of `q` (rows x heads x dim) at `positions` over the cache's
-    /// keys and values (context x kv_heads x dim), times sigmoid(gate) when given.
+    /// keys and values (context x kv_heads x dim), times sigmoid(gate) when given; the keys split
+    /// among blocks whose partial results take `scratch` (see the C header).
     #[allow(clippy::too_many_arguments)]
     pub fn attention(&mut self, q: P, keys: P, values: P, context: u64, positions: P, rows: u64, heads: u64, kv_heads: u64, dim: u64,
-                     scale: f32, gate: Option<P>, out: M) -> Result<()> {
+                     scale: f32, gate: Option<P>, scratch: &Buffer, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe {
             ffi::sd_op_attention(self.handle(), q.cast(), keys.cast(), values.cast(), context, positions.cast(), rows, heads, kv_heads,
-                                 dim, scale, gate.map_or(std::ptr::null(), |g| g.cast()), out.cast())
+                                 dim, scale, gate.map_or(std::ptr::null(), |g| g.cast()), scratch.pointer.cast(), scratch.bytes,
+                                 out.cast())
         })
     }
 
@@ -389,6 +391,32 @@ impl Backend {
                                input.cast(), input_stride, weights.map_or(std::ptr::null(), |w| w.cast()), clamp,
                                i32::from(accumulate), product.cast(), out.cast(), out_stride,
                                split.as_ref().map_or(std::ptr::null(), |split| split as *const ffi::sd_expert_split))
+        })
+    }
+
+    /// Write `bases` (slot addresses, each `slot_bytes`; checked) into the device array `table`, for
+    /// [`experts_table`](Self::experts_table).
+    pub fn expert_table(&mut self, table: &Buffer, bases: &[u64], slot_bytes: u64) -> Result<()> {
+        if bases.len() as u64 * 8 > table.bytes {
+            return Err("an expert table past its buffer".into());
+        }
+        // SAFETY: a live handle; the library checks the table and every slot against its allocations.
+        check(unsafe { ffi::sd_expert_table(self.handle(), table.pointer.cast(), bases.as_ptr(), bases.len() as u64, slot_bytes) })
+    }
+
+    /// [`experts`](Self::experts) for whole experts, route `r` taking the slot `table[ids[r]]` (`count`
+    /// entries; the ids on the device): no host data, so a graph may record it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn experts_table(&mut self, table: &Buffer, count: u64, ids: P, slot_bytes: u64, offsets: [u64; 3], kinds: [u32; 3], hidden: u64,
+                         ffn: u64, rows: u64, top_k: u64, input: P, weights: Option<P>, clamp: f32, accumulate: bool, product: M,
+                         out: M) -> Result<()> {
+        let kinds = kinds.map(|kind| kind as i32);
+        // SAFETY: a live handle; the library checks every range against its allocations (the
+        // table's slots were checked as written).
+        check(unsafe {
+            ffi::sd_op_experts_table(self.handle(), table.pointer.cast(), count, ids.cast(), slot_bytes, offsets.as_ptr(), kinds.as_ptr(),
+                                     hidden, ffn, rows, top_k, input.cast(), weights.map_or(std::ptr::null(), |w| w.cast()), clamp,
+                                     i32::from(accumulate), product.cast(), out.cast())
         })
     }
 

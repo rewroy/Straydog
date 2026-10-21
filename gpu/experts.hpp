@@ -307,9 +307,18 @@ struct SlotExperts {
     uint32_t top_k, lanes[2], waves[2], accumulate, product_stride, product_first, out_first;
     float clamp;
     uint64_t uniform;
+    // With a table: route r takes the slot table[ids[r]] (none for an id outside the table).
+    const uint64_t* table;
+    const int32_t* ids;
+    uint32_t table_count;
 };
 __device__ __forceinline__ uint64_t slot_base(const SlotExperts& plan, const uint64_t* bases, size_t index) {
-    return plan.uniform ? plan.uniform : bases[index];
+    if (plan.uniform) return plan.uniform;
+    if (plan.table) {
+        const int32_t id = plan.ids[index];
+        return id >= 0 && uint32_t(id) < plan.table_count ? plan.table[id] : 0;
+    }
+    return bases[index];
 }
 
 __host__ __device__ constexpr bool slot_heavy(int kind) {

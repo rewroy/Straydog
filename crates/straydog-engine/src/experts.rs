@@ -269,6 +269,9 @@ impl Pinner {
 
 type Key = (u32, u32);
 
+/// The most VRAM slots a size class keeps free (its reserve).
+const MAX_RESERVE: usize = 32;
+
 /// A store's experts as (layer, expert), least recently used first: those in VRAM slots, and
 /// those only in the host tier (see [`DeviceExperts::contents`]).
 pub type Contents = (Vec<(usize, usize)>, Vec<(usize, usize)>);
@@ -419,31 +422,62 @@ impl DeviceExperts {
     /// tier, both shared among the layers.
     pub fn new(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, slots: usize, host_budget: u64)
                -> Result<DeviceExperts> {
-        // Each layer's experts' bytes in a VRAM slot (roles back to back) and in a host slot
-        // (room for either layout there: each role's whole blocks as read, or the VRAM slot's).
-        let sizes: Vec<Option<(u64, u64)>> = layout.layers.iter().map(|roles| roles.as_ref().map(|roles| {
-            let vram: u64 = roles.iter().map(|role| role.bytes).sum();
-            let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
-            (vram.next_multiple_of(256), read.max(vram).next_multiple_of(ALIGN as u64))
-        })).collect();
-        let largest = sizes.iter().flatten().map(|size| size.0).max().unwrap_or(0);
+        let largest = Self::sizes(&layout.layers).iter().flatten().map(|size| size.0).max().unwrap_or(0);
         if slots < 16 || largest == 0 {
             return Err("an expert store needs at least 16 VRAM slots and a layer of experts".into());
         }
+        let vram_budget = largest * slots as u64;
+        Self::build(gpu, layout, reader, host_budget, &|share, layers, vram_bytes| ((vram_budget * share / layers) / vram_bytes).max(16) as usize)
+    }
+
+    /// A store with VRAM slots for every expert of its layers (`experts` a layer) and each size
+    /// class's reserve, and no host tier: once each expert is acquired, none is ever evicted
+    /// (see [`resident_bases`](Self::resident_bases)).
+    pub fn resident(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, experts: usize) -> Result<DeviceExperts> {
+        if experts == 0 || Self::sizes(&layout.layers).iter().flatten().next().is_none() {
+            return Err("an expert store needs a layer of experts".into());
+        }
+        Self::build(gpu, layout, reader, 0, &|share, _, _| share as usize * experts + MAX_RESERVE)
+    }
+
+    /// The VRAM bytes [`resident`](Self::resident) takes for these layers' roles, `experts` a layer.
+    pub fn resident_bytes(layers: &[Option<Vec<Role>>], experts: usize) -> u64 {
+        let sizes = Self::sizes(layers);
+        let mut distinct: Vec<u64> = sizes.iter().flatten().map(|size| size.0).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let layers = |bytes: u64| sizes.iter().flatten().filter(|size| size.0 == bytes).count() as u64;
+        distinct.iter().map(|&bytes| bytes * (layers(bytes) * experts as u64 + MAX_RESERVE as u64)).sum()
+    }
+
+    /// Each layer's experts' bytes in a VRAM slot (roles back to back) and in a host slot (room for
+    /// either layout there: each role's whole blocks as read, or the VRAM slot's).
+    fn sizes(layers: &[Option<Vec<Role>>]) -> Vec<Option<(u64, u64)>> {
+        layers.iter().map(|roles| roles.as_ref().map(|roles| {
+            let vram: u64 = roles.iter().map(|role| role.bytes).sum();
+            let read: u64 = roles.iter().map(|role| role.bytes.next_multiple_of(ALIGN as u64) + ALIGN as u64).sum();
+            (vram.next_multiple_of(256), read.max(vram).next_multiple_of(ALIGN as u64))
+        })).collect()
+    }
+
+    /// A class per experts' size, each with `count(its layers, all layers, its slot bytes)` VRAM
+    /// slots, and its layers' share of `host_budget`.
+    fn build(gpu: &mut Backend, layout: Arc<Layout>, reader: Arc<Reader>, host_budget: u64, count: &dyn Fn(u64, u64, u64) -> usize)
+             -> Result<DeviceExperts> {
+        let sizes = Self::sizes(&layout.layers);
         let mut distinct: Vec<(u64, u64)> = sizes.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
         let class_of: Vec<Option<usize>> = sizes.iter()
             .map(|size| size.map(|size| distinct.iter().position(|&other| other == size).unwrap())).collect();
         let layers = class_of.iter().flatten().count() as u64;
-        let vram_budget = largest * slots as u64;
         let mut classes = Vec::new();
         let mut all_slots = Vec::new();
         for (index, &(vram_bytes, host_bytes)) in distinct.iter().enumerate() {
             let share = class_of.iter().filter(|class| **class == Some(index)).count() as u64;
-            let count = ((vram_budget * share / layers) / vram_bytes).max(16) as usize;
+            let count = count(share, layers, vram_bytes);
             let host_capacity = ((host_budget * share / layers) / host_bytes) as usize;
-            let reserve = (count / 64).clamp(4, 32);
+            let reserve = (count / 64).clamp(4, MAX_RESERVE);
             // Small tiers (and staging alone) take one arena of just their size.
             let per_arena = ((ARENA as u64 / host_bytes) as usize).clamp(1, host_capacity.max(reserve));
             let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_bytes as usize);
@@ -473,6 +507,21 @@ impl DeviceExperts {
     /// class's slots beyond its reserve, so the next wave's prefetch fits beside it.
     pub fn wave_limit(&self) -> usize {
         self.classes.iter().map(|class| class.count.saturating_sub(class.reserve) / 2).min().unwrap_or(0).max(1)
+    }
+
+    /// When every expert of `layer` (`0..experts`) is in a VRAM slot with no fill pending: their
+    /// slots' addresses in expert order and the slots' bytes (else None). For a caller that then
+    /// reads them without acquiring: it must keep them from eviction (slots for every expert and
+    /// their reserve, no other expert brought in), and its compute stream must already wait for
+    /// their uploads (an acquire of each did).
+    pub fn resident_bases(&self, layer: usize, experts: usize) -> Option<(Vec<u64>, u64)> {
+        let class = self.class_of.get(layer).copied().flatten()?;
+        let bases = (0..experts).map(|expert| {
+            let &slot = self.map.get(&(layer as u32, expert as u32))?;
+            let entry = &self.slots[slot];
+            (entry.waiting.is_none() && entry.key == Some((layer as u32, expert as u32))).then(|| self.slot_buffer(slot).base() as u64)
+        }).collect::<Option<Vec<u64>>>()?;
+        Some((bases, self.classes[class].vram_bytes))
     }
 
     /// VRAM and host slots.
