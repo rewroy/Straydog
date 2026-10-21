@@ -24,6 +24,10 @@
 //! continues (window rings, compressed rows, their tails and index keys) is that of every row
 //! computed; DS41_FULL_DECODER computes every row, for comparisons.
 //!
+//! A pass of up to [`VERIFY_ROWS`] tokens can be taken back but for its first few ([`Engine::rewind`]):
+//! it keeps the counters of the sequence state from before it, and each ratio-2 kv source's
+//! compressor rows of its tokens (one of them waits in the source's tail after a rewind).
+//!
 //! A decode row can predict the next layer's experts (its router on this layer's input) and
 //! prefetch the DS41_PREDICT best (up to 8) from the host tier, DS41_PREDICT_DRIVE also from the
 //! drive. It is off: on two GPUs most of the prefetches were never used, and each one cost an
@@ -110,12 +114,24 @@ struct Source {
 }
 
 /// A device's copy of a kv source layer's compressed rows and index keys, and of the rows of its
-/// incomplete group.
+/// incomplete group (at most one: the ratio is 1 or 2).
 struct SourceRows {
     rows: Buffer,
     keys: Buffer,
     tail_kv: Buffer,
     tail_gate: Buffer,
+    /// The compressor rows of the last pass that can be taken back (of more than one token, the
+    /// ratio 2), after the row waiting before it: what a rewind leaves in the tail.
+    pass_kv: Buffer,
+    pass_gate: Buffer,
+}
+
+/// The sequence state before the last pass that can be taken back ([`Engine::rewind`]): its first
+/// position, its tokens, and each kv source's groups and rows waiting.
+struct Rewind {
+    start: usize,
+    rows: usize,
+    sources: BTreeMap<usize, (usize, usize)>,
 }
 
 /// A pass's work buffers. Those of every row (the stream and its coefficients, the attention's and
@@ -204,6 +220,8 @@ const READERS: usize = 32;
 /// Passes of up to this many rows run the routed experts over their slots (decode); longer ones
 /// expert by expert.
 const SLOT_ROWS: usize = 4;
+/// Most tokens a pass that can be taken back takes (its experts run over their slots).
+pub const VERIFY_ROWS: usize = SLOT_ROWS;
 
 /// One device's share of the engine: its weights (its parts of the split ones), its copy of the
 /// sequence state and work buffers, and its expert store.
@@ -237,6 +255,8 @@ pub struct Engine<'a, T: Tensors> {
     /// The first layer of the decoder (the last kv source), whose layers run only the rows the last
     /// row's output needs (see the module documentation); None: every layer runs every row.
     decoder: Option<usize>,
+    /// The state before the last pass, when it can be taken back.
+    rewind: Option<Rewind>,
     /// How many of a decode row's predicted next-layer experts are prefetched (DS41_PREDICT, up to
     /// [`PREDICTED`]; 0, the default, predicts nothing).
     prefetches: usize,
@@ -311,6 +331,8 @@ impl Shard {
                     keys: floats(&mut gpu, groups * hp.index_dim)?,
                     tail_kv: floats(&mut gpu, hp.head_dim)?,
                     tail_gate: floats(&mut gpu, hp.head_dim)?,
+                    pass_kv: floats(&mut gpu, (VERIFY_ROWS + 1) * hp.head_dim)?,
+                    pass_gate: floats(&mut gpu, (VERIFY_ROWS + 1) * hp.head_dim)?,
                 });
             }
         }
@@ -508,6 +530,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut engine = Engine {
             ring: hp.window + settings.batch,
             decoder,
+            rewind: None,
             hp: std::rc::Rc::new(hp),
             tensors,
             settings,
@@ -716,6 +739,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     pub fn reset(&mut self) {
         self.position = 0;
         self.history.clear();
+        self.rewind = None;
         for source in self.sources.values_mut() {
             source.groups = 0;
             source.tail = 0;
@@ -763,6 +787,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             *since = std::time::Instant::now();
         }
         let start = self.position;
+        // A pass of a few tokens can be taken back (Engine::rewind): the state from before it.
+        let rewind = self.rewindable(n).then(|| Rewind {
+            start,
+            rows: n,
+            sources: self.sources.iter().map(|(&layer, source)| (layer, (source.groups, source.tail))).collect(),
+        });
+        self.rewind = None;
         let positions: Vec<i32> = (start..start + n).map(|p| p as i32).collect();
         let ring_rows: Vec<i32> = (start..start + n).map(|p| (p % self.ring) as i32).collect();
         let visible: Vec<Vec<i32>> = (0..3).map(|ratio| (start..start + n).map(|p| ((p + 1) / ratio.max(1)) as i32).collect()).collect();
@@ -836,7 +867,45 @@ impl<'a, T: Tensors> Engine<'a, T> {
         };
         self.history.extend_from_slice(tokens);
         self.position += n;
+        self.rewind = rewind;
         Ok(logits)
+    }
+
+    /// Whether a pass of `n` tokens can be taken back: at most [`VERIFY_ROWS`], in one batch.
+    fn rewindable(&self, n: usize) -> bool {
+        n <= VERIFY_ROWS && n <= self.settings.batch
+    }
+
+    /// Take back the last pass but its first `keep` tokens: the sequence state as if only those had
+    /// been fed. Only a pass of at most [`VERIFY_ROWS`] tokens can be, and only until the next pass
+    /// or a reset. The window rings need nothing: a row of a token taken back sits where no later
+    /// token's window reaches before it is written again; nor do the compressed rows and index
+    /// keys beyond the groups kept, written before any pass reads them.
+    pub fn rewind(&mut self, keep: usize) -> Result<()> {
+        let rows = self.rewind.as_ref().ok_or("no pass of a few tokens to take back")?.rows;
+        if keep > rows {
+            return Err(format!("cannot keep {keep} tokens of a pass of {rows}"));
+        }
+        let point = self.rewind.take().ok_or("no pass of a few tokens to take back")?;
+        let dim = self.hp.head_dim;
+        self.position = point.start + keep;
+        self.history.truncate(self.history.len() - (point.rows - keep));
+        for (layer, (groups, tail)) in point.sources {
+            let source = self.sources.get_mut(&layer).ok_or("a kv source went missing")?;
+            source.groups = groups + (tail + keep) / source.ratio;
+            source.tail = (tail + keep) % source.ratio;
+            // The row now waiting is the pass's compressor row `keep` (0: the one waiting before it,
+            // where a pass of one token leaves it).
+            if source.tail > 0 && keep < point.rows && point.rows > 1 {
+                for shard in &mut self.shards {
+                    let rows = &shard.sources[&layer];
+                    let (pass_kv, pass_gate, tail_kv, tail_gate) = (rows.pass_kv, rows.pass_gate, rows.tail_kv, rows.tail_gate);
+                    shard.gpu.copy(pass_kv.at(keep * dim) as P, tail_kv.base(), (dim * 4) as u64)?;
+                    shard.gpu.copy(pass_gate.at(keep * dim) as P, tail_gate.base(), (dim * 4) as u64)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Hand the stream of the pass that just ran over `rows` tokens to the engine of the next layers.
@@ -885,6 +954,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // a layer that compresses or indexes changes its launches from token to token
         let fixed = plan.compressed.is_none_or(|c| c.kv_source != layer && c.index_source != layer);
         let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && self.prefetches > 0;
+        // A pass that can be taken back keeps its compressor rows (its one batch); of one token it
+        // needs none (Engine::rewind).
+        let saves = n > 1 && self.rewindable(n);
         // The Engram rows of every token, before the layer (each batch takes its own).
         let engram = match plan.engram {
             Some(module) => Some(self.engram_rows(module, tokens)?),
@@ -910,7 +982,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 }
                 self.mark("engram")?;
             }
-            let attention = self.attention_plan(layer, first, end, kv_from, full_from);
+            let attention = self.attention_plan(layer, first, end, kv_from, full_from, saves);
             let key = |segment: u64| (layer as u64) << 8 | segment << 4 | u64::from(expand) << 1 | u64::from(attention.groups > 0);
             // the rows of the batch that attend, from this row
             let attending = first + attention.full_from;
@@ -974,8 +1046,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// What every device's attention of `layer` needs to know of a batch of a pass (its rows
-    /// `first..end`, those the layer runs from `kv_from` and `full_from` on) and of the sequence.
-    fn attention_plan(&self, layer: usize, first: usize, end: usize, kv_from: usize, full_from: usize) -> AttentionPlan {
+    /// `first..end`, those the layer runs from `kv_from` and `full_from` on; with `saves`, the
+    /// pass's one) and of the sequence.
+    fn attention_plan(&self, layer: usize, first: usize, end: usize, kv_from: usize, full_from: usize, saves: bool) -> AttentionPlan {
         let compressed = self.hp.layers[layer].compressed;
         AttentionPlan {
             layer,
@@ -991,6 +1064,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // the kv source has compressed (at least) through the batch's last row
             groups: compressed.map_or(0, |c| (self.position + end) / c.ratio),
             ring_rows: self.ring as u64,
+            saves,
         }
     }
 
@@ -1358,7 +1432,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
 /// the batch's rows, the first only compressed (a kv source's beyond the decoder's reach), from
 /// `kv_from` those whose K/V go to the window ring, from `full_from` those that attend; the
 /// compressed rows a kv source appends (ratio, rows waiting, first group), and those the batch's
-/// last row sees.
+/// last row sees; whether a kv source keeps its compressor rows for a rewind.
 struct AttentionPlan {
     layer: usize,
     rows: usize,
@@ -1370,6 +1444,7 @@ struct AttentionPlan {
     appended: Option<(usize, usize, usize)>,
     groups: usize,
     ring_rows: u64,
+    saves: bool,
 }
 
 /// Queue `ops` on a device from the graph recorded under `key`, recording it the first time.
@@ -1454,7 +1529,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     let mut compressed = None;
     if let Some(c) = plan.compressed {
         if let Some((ratio, tail, first_group)) = plan.appended {
-            compress(shard, work, hp, layer, plan.rows, freqs, ratio, tail, first_group)?;
+            compress(shard, work, hp, layer, plan.rows, freqs, ratio, tail, first_group, plan.saves)?;
         }
         if c.index_source == layer && plan.groups > 0 && n > 0 {
             let keys = shard.sources[&c.kv_source].keys;
@@ -1512,23 +1587,31 @@ fn router_ops(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usi
 
 /// Append this pass's complete groups of a kv source layer to a device's compressed rows and index
 /// keys (from `first_group`, with `tail` rows of an incomplete group waiting); the rows of a still
-/// incomplete group wait in its tail. The groups appended and the rows left over.
+/// incomplete group wait in its tail. With `save` (a pass that can be taken back) and groups of 2,
+/// the compressor rows (the one waiting first) are kept for a rewind. The groups appended and the
+/// rows left over.
 #[allow(clippy::too_many_arguments)]
 fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, freqs: Buffer, ratio: usize, tail: usize,
-            first_group: usize) -> Result<(usize, usize)> {
+            first_group: usize, save: bool) -> Result<(usize, usize)> {
     let dim = hp.head_dim;
     // rows 1..=n take this pass; row 0 the waiting one, when there is one
     shard.linear(&name(layer, "attn_compressor_kv"), work.x.base(), n, work.pool_kv.at(dim))?;
     if ratio > 1 {
         shard.linear(&name(layer, "attn_compressor_gate"), work.x.base(), n, work.pool_gate.at(dim))?;
     }
-    let (rows, keys, tail_kv, tail_gate) = {
+    let (rows, keys, tail_kv, tail_gate, pass_kv, pass_gate) = {
         let source = &shard.sources[&layer];
-        (source.rows, source.keys, source.tail_kv, source.tail_gate)
+        (source.rows, source.keys, source.tail_kv, source.tail_gate, source.pass_kv, source.pass_gate)
     };
     if tail > 0 {
         shard.gpu.gather(tail_kv.base(), 1, work.all_rows.base(), 1, dim as u64, work.pool_kv.base())?;
         shard.gpu.gather(tail_gate.base(), 1, work.all_rows.base(), 1, dim as u64, work.pool_gate.base())?;
+    }
+    if save && ratio > 1 {
+        // (the next kv source's pass reuses the pool)
+        let bytes = ((n + 1) * dim * 4) as u64;
+        shard.gpu.copy(work.pool_kv.base() as P, pass_kv.base(), bytes)?;
+        shard.gpu.copy(work.pool_gate.base() as P, pass_gate.base(), bytes)?;
     }
     let first_row = 1 - tail;
     let groups = (tail + n) / ratio;
