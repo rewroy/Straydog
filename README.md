@@ -118,7 +118,9 @@ Where it rounds, and how to turn it off:
 How this is checked: the pinned GPU generations reproduce every greedy token, logits
 vector and final hidden state bit for bit in each placement; a deliberate numerical change
 is first compared with an F32-GEMM run, by KL divergence and top-1 agreement, then pinned
-anew. With the FP16 long-prompt attention, KL against `--gemm f32` averaged 3.4e-3 over 12
+anew, and F32 products take the same kernels in every process (rocBLAS's own library: on
+RDNA4, hipBLASLt's choice of F32 kernels changed from one process to another).
+With the FP16 long-prompt attention, KL against `--gemm f32` averaged 3.4e-3 over 12
 prompts of 8K-40K (3.9e-3 before it; top-1 12/12), while reordering one sum alone moves it
 by 3.0e-3. DeepSeek-V4.1
 computes in F32 throughout and keeps its K/V in F32 (the model was trained for FP4/FP8
@@ -141,9 +143,11 @@ keeps it in that tab.
 ```bash
 # Rust tests; STRAYDOG_MODEL enables the golden tests on a real bundle
 ROCM_PATH=/opt/rocm/core-10.0 cargo test --workspace --features straydog/hip,straydog-provision/hip
-# GPU tests, one at a time: the pinned generations bit for bit, the runtime end to end
+# GPU tests, one at a time: the pinned generations bit for bit, the runtime end to end, the
+# F32 products' bits the same in every process
 STRAYDOG_MODEL=DIR STRAYDOG_DRAFTER=DIR cargo test -p straydog-engine --features hip --test model_gpu
 STRAYDOG_MODEL=DIR cargo test -p straydog --features hip --test runtime_gpu
+cargo test -p straydog-engine --features hip --test gemm_gpu
 # A/B of this build against another
 cargo run --release --features hip --example ab -- --baseline BIN --model DIR --drafter DIR --output ab.json
 # The dashboard over a simulated engine (no GPU, no model): http://127.0.0.1:18090/dashboard

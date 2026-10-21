@@ -56,7 +56,7 @@ void hc_project(Device& d, const Matrix& matrix, size_t steps, const float* inpu
         } else {
             const float* weights = reinterpret_cast<const float*>(matrix.data);
             if (matrix.kind != 0) { expand(matrix, d.expanded, d.stream, false); weights = d.expanded; }
-            blas_check(hipblasSgemm(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N,
+            blas_check(hipblasSgemm(d.blas_f32, HIPBLAS_OP_T, HIPBLAS_OP_N,
                 int(matrix.rows), int(steps), int(matrix.cols), &alpha, weights, int(matrix.cols),
                 input, int(matrix.cols), &beta, output, int(matrix.rows)));
         }

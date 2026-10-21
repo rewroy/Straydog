@@ -111,7 +111,7 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
         const size_t count = std::min(piece, rows - done);
         const Matrix part{matrix.data + done * row_bytes, row_bytes, count, cols, 0, 0, 0, kind};
         expand(part, scratch, d.stream, false);
-        blas_check(hipblasSgemm(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha,
+        blas_check(hipblasSgemm(d.blas_f32, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha,
                                 scratch, int(cols), input, int(input_stride), &beta, output + done, int(output_stride)));
     }
 }

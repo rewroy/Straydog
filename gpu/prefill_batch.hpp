@@ -15,7 +15,7 @@ void batch_project(Device& d, const Matrix& m, size_t steps, const float* input,
         } else {
             const float* weights = reinterpret_cast<const float*>(m.data);
             if (m.kind != 0) { expand(m, d.expanded, d.stream, false); weights = d.expanded; }
-            blas_check(hipblasSgemm(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(m.rows), int(steps), int(m.cols), &alpha,
+            blas_check(hipblasSgemm(d.blas_f32, HIPBLAS_OP_T, HIPBLAS_OP_N, int(m.rows), int(steps), int(m.cols), &alpha,
                 weights, int(m.cols), input, int(m.cols), &beta, output, int(m.rows)));
         }
         ++d.gemm_calls; d.gemm_vectors += steps;

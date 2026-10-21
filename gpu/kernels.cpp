@@ -125,6 +125,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -255,6 +256,34 @@ void cleanup(hipError_t error) noexcept {
     if (error != hipSuccess) std::fprintf(stderr, "Straydog GPU cleanup: %s\n", hipGetErrorString(error));
 }
 
+// A BLAS handle for F32 products whose kernel choice is the same in every process. On ROCm,
+// rocBLAS hands GEMMs to hipBLASLt, whose ranking of F32 kernels changes with the process's
+// address layout on RDNA4 (one process in five to thirty ranks them otherwise, for every shape
+// at once; with address randomization off, never; its FP16 ranking is stable), so the same F32
+// product summed in another order and gave other bits from one run to the next. rocBLAS's own
+// kernel library chooses from a fixed table. rocBLAS reads ROCBLAS_USE_HIPBLASLT when a handle
+// is created, so this handle is created with it set to 0, and the variable is put back.
+// Changing the environment races with getenv on other threads: it is done at device creation,
+// before this device's readers and loaders start, under one lock for the process; what can still
+// read the environment meanwhile is the HIP runtime's own threads.
+hipblasHandle_t create_f32_blas() {
+    hipblasHandle_t handle = nullptr;
+#if defined(__HIPCC__) && !defined(_WIN32)
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    constexpr const char* name = "ROCBLAS_USE_HIPBLASLT";
+    const char* set = std::getenv(name);
+    const std::string before = set ? set : "";
+    setenv(name, "0", 1);
+    const hipblasStatus_t status = hipblasCreate(&handle);
+    if (set) setenv(name, before.c_str(), 1);
+    else unsetenv(name);
+    blas_check(status);
+#else
+    blas_check(hipblasCreate(&handle));
+#endif
+    return handle;
+}
 
 // One job at a time on a thread of its own with the device current. Bounded slot
 // swaps issue their copies from pageable mappings here (hybrid_rebalance), so the
@@ -355,6 +384,7 @@ struct Device {
     float* output = nullptr;
     GemvItem* matrices = nullptr;
     hipblasHandle_t blas = nullptr;
+    hipblasHandle_t blas_f32 = nullptr;   // F32 products: see create_f32_blas
     float* expanded = nullptr;
     __half* half_input = nullptr;
     float* attention_scores = nullptr;
@@ -454,8 +484,9 @@ struct Device {
         if (cpu_partial) cleanup(hipFree(cpu_partial));
         if (copy_stream) cleanup(hipStreamDestroy(copy_stream));
         if (swapped) cleanup(hipEventDestroy(swapped));
-        if (blas && hipblasDestroy(blas) != HIPBLAS_STATUS_SUCCESS)
-            std::fprintf(stderr, "Straydog BLAS cleanup failed\n");
+        for (hipblasHandle_t handle : {blas, blas_f32})
+            if (handle && hipblasDestroy(handle) != HIPBLAS_STATUS_SUCCESS)
+                std::fprintf(stderr, "Straydog BLAS cleanup failed\n");
         if (expanded) cleanup(hipFree(expanded));
         if (half_input) cleanup(hipFree(half_input));
         if (attention_scores) cleanup(hipFree(attention_scores));
@@ -1602,9 +1633,13 @@ void* sd_create(int ordinal, uint64_t budget) {
             check(hipMalloc(reinterpret_cast<void**>(&value->attention_scores), attention_score_bytes));
             value->used += gemm_elements * 4 + blas_workspace_bytes + value->input_capacity * 2 + attention_score_bytes;
             blas_check(hipblasCreate(&value->blas));
-            blas_check(hipblasSetStream(value->blas, value->stream));
-            blas_check(hipblasSetWorkspace(value->blas, value->blas_workspace, blas_workspace_bytes));
-            blas_check(hipblasSetMathMode(value->blas, HIPBLAS_DEFAULT_MATH));
+            value->blas_f32 = create_f32_blas();
+            // Both handles run on the device's stream, so they share its workspace.
+            for (hipblasHandle_t handle : {value->blas, value->blas_f32}) {
+                blas_check(hipblasSetStream(handle, value->stream));
+                blas_check(hipblasSetWorkspace(handle, value->blas_workspace, blas_workspace_bytes));
+                blas_check(hipblasSetMathMode(handle, HIPBLAS_DEFAULT_MATH));
+            }
         }
         return value.release();
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
@@ -2010,7 +2045,7 @@ int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds,
                 } else {
                     const float* matrix = reinterpret_cast<const float*>(item.data);
                     if (item.kind != 0) { expand(item, value.expanded, value.stream, false); matrix = value.expanded; }
-                    blas_check(hipblasSgemm(value.blas, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                    blas_check(hipblasSgemm(value.blas_f32, HIPBLAS_OP_T, HIPBLAS_OP_N,
                         int(item.rows), int(members), int(item.cols), &alpha, matrix, int(item.cols),
                         value.input + item.input_offset, int(item.cols), &beta,
                         value.output + item.output_offset, int(item.rows)));
