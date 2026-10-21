@@ -54,7 +54,7 @@ pub struct Options {
     #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u32).range(1..=262144))]
     pub ctx_size: Option<u32>,
-    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget]
+    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for DeepSeek-V4.1, 64 for the other models read on demand]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=4096))]
     pub batch_size: Option<u16>,
@@ -334,8 +334,11 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         return Err("--vram must be between 0.01 and 256 GiB".into());
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
-    // A bundle read on demand prefills in passes of 64 tokens.
-    let batch_size = options.batch_size.unwrap_or(if on_demand { 64 } else if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
+    // DeepSeek-V4.1 prefills layer by layer, reading each routed expert once per pass: the
+    // longer the pass, the fewer reads. The other bundles read on demand prefill 64 tokens at a time.
+    let batch_size = options.batch_size.unwrap_or(if on_demand {
+        if bundle::on_demand(&quant)?.architecture == "deepseek41" { 4096 } else { 64 }
+    } else if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
     let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
@@ -505,7 +508,7 @@ mod tests {
         assert_eq!(beside.data_dir, model.canonicalize().unwrap().join(".straydog"));
         let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
         assert_eq!((settings.quant.as_str(), settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-UD-IQ2_XXS"));
-        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (64, Some(48.0), data.canonicalize().unwrap()));
+        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (4096, Some(48.0), data.canonicalize().unwrap()));
         assert!(parse(&["--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
         let worker = crate::runtime::worker_args(&settings);
         let text: Vec<String> = worker.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
