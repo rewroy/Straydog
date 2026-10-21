@@ -17,7 +17,7 @@ use crate::arch::Tensors;
 use crate::experts::{Contents, Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, Result};
-use crate::ops::Buffer;
+use crate::ops::{Buffer, Linear};
 
 type P = *const c_void;
 type M = *mut c_void;
@@ -287,6 +287,28 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (cols, rows) = (weight.dims[0] as u64, weight.dims.get(1).copied().unwrap_or(1) as u64);
         let scratch = self.scratch;
         self.gpu.linear(&weight.buffer, weight.kind, rows, cols, 0, input, 0, steps as u64, out, 0, &scratch)
+    }
+
+    /// Several resident matrices over the same `input` (`steps` rows) into their packed outputs: a
+    /// launch per weight format when the GEMV takes them.
+    fn linears(&mut self, items: &[(String, M)], input: P, steps: usize) -> Result<()> {
+        let mut groups: Vec<(u32, Vec<Linear>)> = Vec::new();
+        for (name, output) in items {
+            let weight = self.dense(name)?;
+            let linear = Linear {
+                weights: weight.buffer, kind: weight.kind, rows: weight.dims.get(1).copied().unwrap_or(1) as u64, cols: weight.dims[0] as u64,
+                first_row: 0, input, output: *output,
+            };
+            match groups.iter_mut().find(|(kind, _)| *kind == weight.kind) {
+                Some((_, group)) => group.push(linear),
+                None => groups.push((weight.kind, vec![linear])),
+            }
+        }
+        let scratch = self.scratch;
+        for (_, group) in groups {
+            self.gpu.linears(&group, steps as u64, 0, 0, &scratch)?;
+        }
+        Ok(())
     }
 
     fn norm(&mut self, name: &str, input: P, rows: usize, width: usize, out: M) -> Result<()> {
@@ -572,10 +594,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let work = self.work;
         let (dim, v_heads) = (hp.state_dim, hp.v_heads);
         let channels = hp.conv_channels();
-        self.linear(&name(layer, "attn_qkv"), work.x.base(), n, work.qkv.base())?;
-        self.linear(&name(layer, "attn_gate"), work.x.base(), n, work.z.base())?;
-        self.linear(&name(layer, "ssm_beta"), work.x.base(), n, work.beta.base())?;
-        self.linear(&name(layer, "ssm_alpha"), work.x.base(), n, work.alpha.base())?;
+        self.linears(&[(name(layer, "attn_qkv"), work.qkv.base()), (name(layer, "attn_gate"), work.z.base()),
+                       (name(layer, "ssm_beta"), work.beta.base()), (name(layer, "ssm_alpha"), work.alpha.base())], work.x.base(), n)?;
         let (history, recurrent) = match &self.states[&layer] {
             State::DeltaNet { history, recurrent } => (*history, *recurrent),
             State::Attention { .. } => return Err("a DeltaNet layer without its state".into()),
@@ -600,9 +620,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let work = self.work;
         let (heads, kv_heads, dim) = (hp.heads, hp.kv_heads, hp.head_dim);
-        self.linear(&name(layer, "attn_q"), work.x.base(), n, work.q_full.base())?;
-        self.linear(&name(layer, "attn_k"), work.x.base(), n, work.k.base())?;
-        self.linear(&name(layer, "attn_v"), work.x.base(), n, work.v.base())?;
+        self.linears(&[(name(layer, "attn_q"), work.q_full.base()), (name(layer, "attn_k"), work.k.base()),
+                       (name(layer, "attn_v"), work.v.base())], work.x.base(), n)?;
         // Each head's projection holds its query, then its gate.
         self.gpu.split(work.q_full.base(), (n * heads) as u64, dim as u64, work.q.base(), work.gate.base())?;
         self.norm(&name(layer, "attn_q_norm"), work.q.base(), n * heads, dim, work.q.base())?;
@@ -632,7 +651,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let work = self.work;
         let (w, k, ff, shared_ff) = (hp.width, hp.experts_used, hp.expert_ff, hp.shared_ff);
-        self.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
+        // The router, the shared expert's gate and up and its own gate, over the same input.
+        self.linears(&[(name(layer, "ffn_gate_inp"), work.router.base()), (name(layer, "ffn_gate_shexp"), work.ffn_gate.base()),
+                       (name(layer, "ffn_up_shexp"), work.ffn_up.base()), (name(layer, "ffn_gate_inp_shexp"), work.shared_gate.base())],
+                     work.x.base(), n)?;
         self.gpu.route(work.router.base(), None, n as u64, hp.experts as u64, k as u64, 0, true, 1.0, work.ids.base(),
                        work.weights.base())?;
         let resident = self.resident.is_some();
@@ -641,11 +663,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if !resident {
             self.gpu.read_start(&work.ids, 0, (n * k * 4) as u64)?;
         }
-        self.linear(&name(layer, "ffn_gate_shexp"), work.x.base(), n, work.ffn_gate.base())?;
-        self.linear(&name(layer, "ffn_up_shexp"), work.x.base(), n, work.ffn_up.base())?;
         self.gpu.swiglu(work.ffn_gate.base(), work.ffn_up.base(), n as u64, shared_ff as u64, 0.0, None, work.hidden.base())?;
         self.linear(&name(layer, "ffn_down_shexp"), work.hidden.base(), n, work.out.base())?;
-        self.linear(&name(layer, "ffn_gate_inp_shexp"), work.x.base(), n, work.shared_gate.base())?;
         self.gpu.scale_rows(work.out.base(), work.shared_gate.base(), n as u64, w as u64)?;
         self.check("ffn_shexp_gated", layer, work.out, n, w)?;
         let gate = self.tensors.tensor(&name(layer, "ffn_gate_exps"))?;
