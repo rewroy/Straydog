@@ -54,7 +54,7 @@ pub struct Options {
     #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u32).range(1..=262144))]
     pub ctx_size: Option<u32>,
-    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for DeepSeek-V4.1, 64 for the other models read on demand]
+    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for the models read on demand (Qwen3.5 MoE: fewer when an eighth of the GPU budget, or a quarter of what its weights and state leave, cannot hold them)]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=4096))]
     pub batch_size: Option<u16>,
@@ -334,11 +334,10 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         return Err("--vram must be between 0.01 and 256 GiB".into());
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
-    // DeepSeek-V4.1 prefills layer by layer, reading each routed expert once per pass: the
-    // longer the pass, the fewer reads. The other bundles read on demand prefill 64 tokens at a time.
-    let batch_size = options.batch_size.unwrap_or(if on_demand {
-        if bundle::on_demand(&quant)?.architecture == "deepseek41" { 4096 } else { 64 }
-    } else if gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
+    // The bundles read on demand read each routed expert a pass needs once per pass: the longer
+    // the pass, the fewer reads. Qwen3.5 MoE's placement takes fewer rows when the GPU budget
+    // has not the room.
+    let batch_size = options.batch_size.unwrap_or(if on_demand || gpu.len() as f64 * vram >= 48.0 { 4096 } else { 1024 });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
     let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
@@ -526,7 +525,7 @@ mod tests {
         for (quant, alias) in [("UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL"), ("Q8_0", "Ornith-1.5-122B-Q8_0")] {
             let model = bundle_directory(quant);
             let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
-            assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, 64));
+            assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, 4096));
             let shard = model.join(&bundle::shards(quant).unwrap()[0].name);
             assert_eq!(resolve(Options { model: Some(shard), ..Options::default() }).unwrap().quant, quant);
             std::fs::remove_dir_all(model).unwrap();

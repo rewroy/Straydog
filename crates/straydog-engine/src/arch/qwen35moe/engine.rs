@@ -145,6 +145,22 @@ fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
     formats::matrix_bytes(kind, 1, cols).ok_or_else(|| format!("unsupported tensor type {kind}"))
 }
 
+/// Bytes of an engine's work buffers per batch row: those of [`Engine::new`]'s Work that grow
+/// with the batch (keep the two together).
+pub fn batch_row_bytes(hp: &Hparams) -> u64 {
+    let (w, k) = (hp.width, hp.experts_used.max(1));
+    let v_width = hp.v_heads * hp.state_dim;
+    let attention_width = hp.heads * hp.head_dim;
+    let kv_width = hp.kv_heads * hp.head_dim;
+    let ff = hp.expert_ff.max(hp.shared_ff);
+    // stream, x, mixed, out, xe, y; qkv; z, core, normed; beta, alpha; q_full, q, gate, attended;
+    // k, v; router; ids, weights; ffn_gate, hidden, ffn_up; shared_gate, expert_rows,
+    // expert_weights, positions.
+    let floats = 6 * w + hp.conv_channels() + 3 * v_width + 2 * hp.v_heads + 5 * attention_width + 2 * kv_width + hp.experts
+        + 2 * k + (2 * k + 1) * ff + 4;
+    floats as u64 * 4
+}
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}.weight")
 }

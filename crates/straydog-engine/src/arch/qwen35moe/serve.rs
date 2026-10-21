@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{forward_split, Engine, Settings as EngineSettings};
+use super::engine::{self, forward_split, Engine, Settings as EngineSettings};
 use super::{Hparams, Mixer};
 use crate::arch::served::{self, Placed, Session, Settings, RESERVE, SCRATCH};
 use crate::bundle;
@@ -168,10 +168,19 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
             bytes as u64
         }).sum()
     };
+    // A prefill pass reads each routed expert its rows need once: the longer the pass, the fewer
+    // reads (with 64 rows, a 4K-token prompt read nearly every expert 64 times). Its rows' work
+    // buffers take at most an eighth of each GPU's budget and a quarter of what the GPU with the
+    // least room has left after its fixed bytes; the expert slots keep the rest.
+    let row_bytes = engine::batch_row_bytes(&hp);
+    let base = |range: &std::ops::Range<usize>| load(range.clone()) + state(range) + SCRATCH + RESERVE;
+    let room = parts.iter().map(|range| settings.vram_bytes.saturating_sub(base(range))).min().unwrap_or(0);
+    let fits = ((settings.vram_bytes / 8).min(room / 4) / row_bytes) as usize / 64 * 64;
+    let batch = settings.batch.min(fits.max(64));
     let total_experts: u64 = expert_bytes.iter().sum();
     let (mut slots, mut resident) = (Vec::new(), Vec::new());
     for range in &parts {
-        let fixed = load(range.clone()) + state(range) + SCRATCH + RESERVE;
+        let fixed = base(range) + batch as u64 * row_bytes;
         let free = settings.vram_bytes.checked_sub(fixed).ok_or_else(|| {
             format!("layers {range:?} need more than {:.1} GiB of VRAM per GPU", settings.vram_bytes as f64 / (1u64 << 30) as f64)
         })?;
@@ -208,7 +217,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
             for (part, (&device, range)) in settings.devices.iter().zip(&parts).enumerate() {
                 let engine_settings = EngineSettings {
                     context: settings.context,
-                    batch: settings.batch,
+                    batch,
                     expert_slots: slots[part],
                     host_expert_bytes: if resident[part] { 0 } else { (host as f64 * part_experts[part] as f64 / tiered.max(1) as f64) as u64 },
                     scratch_bytes: SCRATCH,
@@ -244,11 +253,11 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "expert_bytes": total_experts,
         "resident_experts": resident,
         "cpu_experts": resident.iter().any(|&resident| !resident),
-        "prefill_batch_size": settings.batch,
+        "prefill_batch_size": batch,
     });
     Ok(Session::new(Placed {
         engines: Engines { engines },
-        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch, end, turn_start,
+        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch, end, turn_start,
         card,
         placement, state_bytes,
         load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
