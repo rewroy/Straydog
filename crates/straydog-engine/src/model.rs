@@ -520,6 +520,13 @@ impl Model {
                     registered += 1;
                 }
             });
+            // Locked, the banks' pages stay as they are now: with the shards' verity trees, check
+            // them (they may have been read again since loading verified their chunks).
+            for layer in &layers[..registered] {
+                for role in ["gate", "up", "down"] {
+                    weights.verify_mapped(&format!("blk.{layer}.ffn_{role}_exps.weight"))?;
+                }
+            }
         }
         if registered > 0 {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the

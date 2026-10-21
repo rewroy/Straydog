@@ -33,6 +33,10 @@ const SEND_PATIENCE: Duration = Duration::from_secs(30);
 /// The program and arguments that start the worker (isolated, in production).
 pub type Command = (PathBuf, Vec<OsString>);
 
+/// What runs before the worker starts and yields its command (building missing verity trees,
+/// then the isolation command over them), reporting (stage, done, total).
+pub type Prepare = Box<dyn FnOnce(&(dyn Fn(&str, u64, u64) + Sync)) -> Result<Command, String> + Send>;
+
 /// One startup progress frame or the state the server reports.
 #[derive(Debug, Clone)]
 enum Phase {
@@ -152,34 +156,46 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
     // expert banks) must see the memory this process tree may actually use.
     push("host-memory-bytes", straydog_engine::host::host_memory_bytes().to_string());
-    if let Some(dir) = &settings.data_dir {
-        push("data-dir", dir.display().to_string());
-    }
+    push("data-dir", settings.data_dir.display().to_string());
     if let Some(gib) = settings.expert_ram {
         push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
     }
     args
 }
 
-/// What the worker reads: the pinned files and their directories, never the API key file. A bundle
-/// read on demand: its shards and their verity trees in the data directory.
+/// The verity trees the worker reads: the pinned shards' in the data directory.
+fn trees(settings: &Settings) -> Result<Vec<PathBuf>, String> {
+    use straydog_engine::bundle;
+    Ok(bundle::verity_pins(&settings.quant)?.iter().map(|(asset, _)| bundle::tree_path(&settings.data_dir, asset)).collect())
+}
+
+/// Whether verity trees are still to be built before the worker can start.
+pub fn missing_trees(settings: &Settings) -> Result<bool, String> {
+    Ok(trees(settings)?.iter().any(|tree| !tree.is_file()))
+}
+
+/// The worker's isolated command (its trees must exist).
+pub fn worker_command(settings: &Settings) -> Result<Command, String> {
+    straydog_isolation::worker_command(&worker_args(settings), &exposure(settings)?)
+}
+
+/// What the worker reads (never writes): the pinned files and their directories, never the API
+/// key file, and the shards' verity trees in the data directory.
 pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, String> {
     use straydog_engine::bundle;
+    let trees = trees(settings)?;
+    if let Some(tree) = trees.iter().find(|tree| !tree.is_file()) {
+        return Err(format!("no verity tree {}: it is built at the server's start, or by `straydog verify`", tree.display()));
+    }
+    let tree_directory = Some(settings.data_dir.join("verity")).filter(|directory| directory.is_dir());
     if bundle::is_on_demand(&settings.quant) {
         let shards = bundle::on_demand(&settings.quant)?.shards;
-        let data_dir = settings.data_dir.as_ref().ok_or("a bundle read on demand needs --data-dir")?;
         let mut files: Vec<PathBuf> = shards.iter().map(|asset| settings.model.join(&asset.name)).collect();
-        files.extend(shards.iter().map(|asset| bundle::tree_path(data_dir, asset)));
-        for tree in &files[shards.len()..] {
-            if !tree.is_file() {
-                return Err(format!("no verity tree {}: build the trees with `straydog verify -m {} --quant {} --data-dir {}`",
-                                   tree.display(), settings.model.display(), settings.quant, data_dir.display()));
-            }
-        }
+        files.extend(trees);
         return Ok(straydog_isolation::Exposure {
             executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
             files,
-            directories: vec![settings.model.clone(), data_dir.join("verity")],
+            directories: [settings.model.clone()].into_iter().chain(tree_directory).collect(),
             working_directory: settings.model.clone(),
             secrets: settings.api_key_file.iter().cloned().collect(),
         });
@@ -192,6 +208,8 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
         files.push(drafter.join(&pins.drafter.name));
         directories.push(drafter.clone());
     }
+    files.extend(trees);
+    directories.extend(tree_directory);
     Ok(straydog_isolation::Exposure {
         executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
         files,
@@ -371,6 +389,11 @@ fn new_id() -> String {
 impl Runtime {
     /// Start the worker from `command` and drive it; generations wait until it is ready.
     pub fn start(settings: &Settings, command: Command) -> Runtime {
+        Runtime::start_prepared(settings, Box::new(move |_| Ok(command)))
+    }
+
+    /// [`Runtime::start`] once `prepare` has run (shown as loading) and given the command.
+    pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
             jobs: AtomicUsize::new(0),
@@ -386,7 +409,7 @@ impl Runtime {
             expected: (settings.ctx_size as u64, settings.quant.clone()),
             verbose: settings.verbose,
         };
-        let driver = tokio::spawn(driver.run(command, jobs, controls));
+        let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
     }
 
@@ -440,9 +463,13 @@ impl Driver {
         self.set(Phase::Failed(message));
     }
 
-    async fn run(self, command: Command, mut jobs: mpsc::UnboundedReceiver<Job>,
+    async fn run(self, prepare: Prepare, mut jobs: mpsc::UnboundedReceiver<Job>,
                  mut controls: mpsc::UnboundedReceiver<Control>) {
-        match self.launch(command).await {
+        let launched = match self.prepare(prepare).await {
+            Ok(command) => self.launch(command).await,
+            Err(message) => Err(format!("Straydog failed to start ({message}); see the server log and restart the server")),
+        };
+        match launched {
             Ok(mut process) => {
                 self.serve(&mut process, &mut jobs, &mut controls).await;
                 let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
@@ -494,6 +521,28 @@ impl Driver {
             }
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+
+    /// Run the preparation on a blocking thread, its progress shown as loading.
+    async fn prepare(&self, prepare: Prepare) -> Result<Command, String> {
+        let shared = self.shared.clone();
+        let logged = Mutex::new((String::new(), 0u64));
+        tokio::task::spawn_blocking(move || {
+            prepare(&|stage: &str, done: u64, total: u64| {
+                let mut logged = logged.lock().unwrap();
+                let quarter = (done.min(total) * 4).checked_div(total).unwrap_or(0);
+                if stage != logged.0 {
+                    tracing::info!("Straydog preparing: {stage}");
+                    *logged = (stage.to_string(), 0);
+                } else if quarter > logged.1 {
+                    tracing::info!("Straydog preparing: {stage} {}%", quarter * 25);
+                    logged.1 = quarter;
+                }
+                *shared.phase.lock().unwrap() = Phase::Loading(json!({"stage": stage, "done": done, "total": total}));
+            })
+        })
+        .await
+        .map_err(|exc| exc.to_string())?
     }
 
     async fn launch(&self, (program, args): Command) -> Result<Process, String> {

@@ -44,7 +44,10 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     if let Some(reason) = straydog_isolation::unavailable_reason() {
         return Err(reason);
     }
-    let command = straydog_isolation::worker_command(&runtime::worker_args(&settings), &runtime::exposure(&settings)?)?;
+    // Verity trees missing from the data directory are built before the worker starts (shown as
+    // loading); without that, the worker's command is checked here, before the server listens.
+    let missing_trees = runtime::missing_trees(&settings)?;
+    let command = if missing_trees { None } else { Some(runtime::worker_command(&settings)?) };
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
         tracing::info!(
@@ -60,7 +63,18 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
                 _ => "no drafter".into(),
             },
         );
-        let engine = Arc::new(Runtime::start(&settings, command));
+        let engine = Arc::new(match command {
+            Some(command) => Runtime::start(&settings, command),
+            None => {
+                let prepared = settings.clone();
+                Runtime::start_prepared(&settings, Box::new(move |progress| {
+                    for name in straydog_provision::ensure_trees(&prepared.model, &prepared.quant, &prepared.data_dir, progress)? {
+                        tracing::info!("Straydog verified {name} (its verity tree is built)");
+                    }
+                    runtime::worker_command(&prepared)
+                }))
+            }
+        });
         let api = straydog_api::ApiConfig {
             model_id: settings.alias.clone(),
             context: u64::from(settings.ctx_size),

@@ -43,7 +43,7 @@ fn settings() -> Settings {
         startup_timeout: 5.0,
         log_file: None,
         verbose: false,
-        data_dir: None,
+        data_dir: PathBuf::from("/nonexistent/.straydog"),
         expert_ram: None,
     }
 }

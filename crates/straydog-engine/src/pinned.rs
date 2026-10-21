@@ -28,24 +28,12 @@ const HEADER_BYTES: u64 = 16 << 20;
 const TREE_CACHE_BYTES: usize = 32 << 20;
 /// A whole tensor is verified by this many threads when it is large.
 const THREADS: usize = 8;
-const PIECE: usize = 16 << 20;
 
 type Signature = (u64, Option<SystemTime>);
 
 fn signature(file: &File) -> Result<Signature, String> {
     let metadata = file.metadata().map_err(|exc| exc.to_string())?;
     Ok((metadata.len(), metadata.modified().ok()))
-}
-
-fn hex_digest(text: &str) -> Result<crate::verity::Hash, String> {
-    let mut digest = [0u8; 32];
-    if text.len() != 64 {
-        return Err("invalid Straydog verity digest".into());
-    }
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).map_err(|_| "invalid Straydog verity digest")?;
-    }
-    Ok(digest)
 }
 
 /// Whether the engine gathers rows of a table rather than taking it whole.
@@ -95,7 +83,7 @@ impl Pinned {
                     "no verity tree for {} in {}: build the trees with `straydog verify -m {} --quant {} --data-dir {}`",
                     asset.name, data_dir.display(), root.display(), pins.quantization, data_dir.display()));
             }
-            let verifier = Verifier::open(&tree, asset.bytes, &hex_digest(digest)?, TREE_CACHE_BYTES)
+            let verifier = Verifier::open(&tree, asset.bytes, &crate::verity::parse_digest(digest)?, TREE_CACHE_BYTES)
                 .map_err(|exc| format!("Straydog verity tree of {}: {exc}", asset.name))?;
             // SAFETY: a read-only mapping; every byte used is verified first and the file is
             // checked unchanged before each generation.
@@ -190,45 +178,8 @@ impl Pinned {
 
     /// Verify bytes `offset .. offset + length` of shard `file`, as the whole blocks around them.
     fn check(&self, file: usize, offset: u64, length: u64) -> Result<(), String> {
-        let map = &self.maps[file];
-        let size = map.len() as u64;
-        let start = offset / BLOCK as u64 * BLOCK as u64;
-        let end = (offset + length).next_multiple_of(BLOCK as u64);
-        let verifier = &self.verifiers[file];
-        // Whole blocks within the file go straight from the mapping; a last partial one is padded.
-        let whole_end = end.min(size / BLOCK as u64 * BLOCK as u64).max(start);
-        let pieces: Vec<(u64, u64)> = (start..whole_end).step_by(PIECE).map(|at| (at, (at + PIECE as u64).min(whole_end))).collect();
-        let failure = Mutex::new(None);
-        let check = |(from, to): (u64, u64)| {
-            if let Err(error) = verifier.verify(from, &map[from as usize..to as usize]) {
-                failure.lock().unwrap().get_or_insert(error);
-            }
-        };
-        if pieces.len() > 1 {
-            let next = AtomicU64::new(0);
-            std::thread::scope(|scope| {
-                for _ in 0..THREADS.min(pieces.len()) {
-                    scope.spawn(|| loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed) as usize;
-                        let Some(piece) = pieces.get(index) else { return };
-                        check(*piece);
-                    });
-                }
-            });
-        } else {
-            pieces.into_iter().for_each(check);
-        }
-        if end > whole_end && whole_end < size {
-            let mut last = vec![0u8; BLOCK];
-            last[..(size - whole_end) as usize].copy_from_slice(&map[whole_end as usize..]);
-            if let Err(error) = verifier.verify(whole_end, &last) {
-                failure.lock().unwrap().get_or_insert(error);
-            }
-        }
-        match failure.into_inner().unwrap() {
-            Some(error) => Err(format!("Straydog model bytes do not verify: {error}")),
-            None => Ok(()),
-        }
+        crate::verity::verify_mapped(&self.maps[file], &self.verifiers[file], offset, length, THREADS)
+            .map_err(|error| format!("Straydog model bytes do not verify: {error}"))
     }
 
 }
@@ -280,14 +231,16 @@ impl Tensors for Pinned {
             return table.read(rows);
         }
         let (file, info) = self.tensors.get(name).ok_or_else(|| format!("tensor {name} is missing"))?;
-        let width = info.bytes / table_rows(name, info)?;
-        let tensor = self.tensor(name)?;
+        let (count, width) = (table_rows(name, info)?, info.bytes / table_rows(name, info)?);
         let mut out = Vec::with_capacity(rows.len() * width as usize);
         for &row in rows {
-            let at = row as u64 * width;
-            let data = tensor.data.get(at as usize..(at + width) as usize).ok_or_else(|| format!("{name} has no row {row}"))?;
-            self.check(*file, info.offset + at, width)?;
-            out.extend_from_slice(data);
+            if row as u64 >= count {
+                return Err(format!("{name} has no row {row}"));
+            }
+            let at = info.offset + row as u64 * width;
+            let data = crate::verity::read_verified(&self.maps[*file], &self.verifiers[*file], at, width)
+                .map_err(|error| format!("Straydog model bytes do not verify: {error}"))?;
+            out.extend_from_slice(&data);
         }
         Ok(out)
     }

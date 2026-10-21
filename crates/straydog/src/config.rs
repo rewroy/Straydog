@@ -126,7 +126,7 @@ pub struct Options {
     #[arg(short = 'v', long, env = "STRAYDOG_VERBOSE")]
     #[serde(default)]
     pub verbose: bool,
-    /// Straydog's data directory: the verity trees `straydog verify` builds for a bundle read on demand
+    /// Where Straydog keeps the shards' verity trees (built at the first start) and the experts' warm-up state [default: .straydog in the model directory]
     #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
     /// Host memory for routed experts outside VRAM, in GiB, for a bundle read on demand [default: half the host memory, less 4 GiB]
@@ -168,8 +168,8 @@ pub struct Settings {
     pub startup_timeout: f64,
     pub log_file: Option<PathBuf>,
     pub verbose: bool,
-    /// Required for a bundle read on demand (its verity trees).
-    pub data_dir: Option<PathBuf>,
+    /// The shards' verity trees and the warm-up state: `--data-dir`, or `.straydog` in the model directory.
+    pub data_dir: PathBuf,
     /// Unset: planned from the host memory.
     pub expert_ram: Option<f64>,
 }
@@ -301,15 +301,12 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S or UD-IQ2_XXS")),
         None => detect_quantization(&model)?,
     };
-    // A bundle read on demand is checked against verity trees in the data directory, and has no MTP drafter.
+    // The shards' verity trees and the warm-up state: beside the model unless given elsewhere
+    // (made there by the server, never by its worker). A bundle read on demand has no MTP drafter.
     let on_demand = bundle::is_on_demand(&quant);
     let data_dir = match options.data_dir {
-        Some(dir) => Some(dir.canonicalize().map_err(|exc| format!("data directory {}: {exc}", dir.display()))?),
-        None if on_demand => {
-            return Err(format!("the {quant} bundle needs --data-dir: the directory its verity trees are built into \
-                                (straydog verify -m {} --quant {quant} --data-dir DIR)", model.display()));
-        }
-        None => None,
+        Some(dir) => dir.canonicalize().map_err(|exc| format!("data directory {}: {exc}", dir.display()))?,
+        None => bundle::default_data_dir(&model),
     };
     if on_demand && options.model_draft.is_some() {
         return Err(format!("the {quant} bundle has no MTP drafter"));
@@ -456,7 +453,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("startup_timeout", settings.startup_timeout.to_string()),
         ("log_file", path(&settings.log_file)),
         ("verbose", settings.verbose.to_string()),
-        ("data_dir", path(&settings.data_dir)),
+        ("data_dir", settings.data_dir.display().to_string()),
         ("expert_ram", settings.expert_ram.map_or_else(|| "(planned)".into(), |gib| gib.to_string())),
     ];
     values
@@ -492,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_read_on_demand_needs_its_data_directory() {
+    fn a_bundle_read_on_demand_keeps_its_trees_beside_it_or_in_the_data_directory() {
         let model = bundle_directory("UD-IQ2_XXS");
         let data = std::env::temp_dir().join(format!("straydog-config-data-{}", std::process::id()));
         std::fs::create_dir_all(&data).unwrap();
@@ -502,16 +499,53 @@ mod tests {
             let matches = command().try_get_matches_from(all).map_err(|exc| exc.to_string())?;
             resolve(Options::from_arg_matches(&matches).map_err(|exc| exc.to_string())?)
         };
-        assert!(parse(&[]).unwrap_err().contains("--data-dir"));
+        // By default beside the model (options alone: STRAYDOG_DATA_DIR may be set around the
+        // tests); --data-dir moves the trees and the warm-up state.
+        let beside = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        assert_eq!(beside.data_dir, model.canonicalize().unwrap().join(".straydog"));
         let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
         assert_eq!((settings.quant.as_str(), settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-UD-IQ2_XXS"));
-        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (64, Some(48.0), Some(data.canonicalize().unwrap())));
-        assert!(parse(&["--data-dir", data.to_str().unwrap(), "--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
+        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (64, Some(48.0), data.canonicalize().unwrap()));
+        assert!(parse(&["--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
         let worker = crate::runtime::worker_args(&settings);
         let text: Vec<String> = worker.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert!(text.windows(2).any(|pair| pair[0] == "--host-expert-bytes" && pair[1] == (48u64 << 30).to_string()));
-        // The trees are what the worker reads beside the shards; without them the server does not start.
-        assert!(crate::runtime::exposure(&settings).unwrap_err().contains("straydog verify"));
+        assert!(text.windows(2).any(|pair| pair[0] == "--data-dir" && pair[1] == data.canonicalize().unwrap().display().to_string()));
+        // The trees are what the worker reads beside the shards: they are built before it starts.
+        assert!(crate::runtime::missing_trees(&settings).unwrap());
+        assert!(crate::runtime::exposure(&settings).unwrap_err().contains("no verity tree"));
+        std::fs::remove_dir_all(model).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn verity_trees_in_the_data_directory_are_built_before_the_worker_reads_them() {
+        let model = bundle_directory("IQ3_XXS");
+        let data = std::env::temp_dir().join(format!("straydog-config-trees-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let parse = |args: &[&str]| {
+            let mut all = vec!["-m", model.to_str().unwrap()];
+            all.extend_from_slice(args);
+            resolve(Options::from_arg_matches(&command().try_get_matches_from(all).unwrap()).unwrap()).unwrap()
+        };
+        let pins = bundle::verity_pins("IQ3_XXS").unwrap();
+        assert_eq!(pins.len(), 2, "both IQ3_XXS shards have pinned verity digests");
+        // Beside the model (options alone: STRAYDOG_DATA_DIR may be set around the tests), or given.
+        let beside = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        for settings in [beside, parse(&["--data-dir", data.to_str().unwrap()])] {
+            assert!(crate::runtime::missing_trees(&settings).unwrap());
+            assert!(crate::runtime::exposure(&settings).unwrap_err().contains("no verity tree"));
+            for (asset, _) in &pins {
+                let tree = bundle::tree_path(&settings.data_dir, asset);
+                std::fs::create_dir_all(tree.parent().unwrap()).unwrap();
+                std::fs::write(tree, b"").unwrap();
+            }
+            assert!(!crate::runtime::missing_trees(&settings).unwrap());
+            let exposure = crate::runtime::exposure(&settings).unwrap();
+            let verity = settings.data_dir.join("verity");
+            assert!(exposure.directories.contains(&verity));
+            assert!(pins.iter().all(|(asset, _)| exposure.files.contains(&verity.join(format!("{}.verity", asset.name)))));
+        }
         std::fs::remove_dir_all(model).unwrap();
         std::fs::remove_dir_all(data).unwrap();
     }

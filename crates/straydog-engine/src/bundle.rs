@@ -8,6 +8,11 @@ pub const QUANTIZATIONS: [&str; 4] = ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"];
 /// The chunk digests of pinned files (see `digest::CHUNK_BYTES`), by whole-file SHA-256:
 /// taken from files that matched their pins, compiled in like the manifest.
 pub const CHUNKS: &str = include_str!("asset_chunks.json");
+/// The fs-verity digests of pinned files (`crate::verity`), by whole-file SHA-256: taken from
+/// files that matched their pins, compiled in like the chunk digests. A file's tree, built into
+/// Straydog's data directory ([`tree_path`]), lets what is read again after loading be checked
+/// block by block.
+pub const VERITY: &str = include_str!("asset_verity.json");
 pub const MODEL: &str = "Qwen3.8-Flash-Next";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +82,37 @@ pub fn chunk_digests(sha256: &str) -> Result<Option<Vec<String>>, String> {
         .map(|digest| digest.as_str().map(str::to_string).ok_or_else(|| "invalid Straydog chunk digests".to_string()))
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+/// The pinned fs-verity digest (hex) of the file whose whole SHA-256 is `sha256`, if any.
+pub fn verity_digest(sha256: &str) -> Result<Option<String>, String> {
+    let table: Value = serde_json::from_str(VERITY).map_err(|exc| exc.to_string())?;
+    if table["block_bytes"].as_u64() != Some(crate::verity::BLOCK as u64) {
+        return Err("unsupported Straydog verity digests".into());
+    }
+    match table["files"].get(sha256) {
+        None => Ok(None),
+        Some(Value::String(digest)) if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            Ok(Some(digest.clone()))
+        }
+        Some(_) => Err("invalid Straydog verity digests".into()),
+    }
+}
+
+/// A quantization's shards that have a pinned fs-verity digest, with it (hex): every shard of a
+/// bundle read on demand, and of the others those pinned in [`VERITY`].
+pub fn verity_pins(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
+    if is_on_demand(quantization) {
+        let pins = on_demand(quantization)?;
+        return Ok(pins.shards.into_iter().zip(pins.verity).collect());
+    }
+    let mut pins = Vec::new();
+    for asset in bundle(quantization)?.shards {
+        if let Some(digest) = verity_digest(&asset.sha256)? {
+            pins.push((asset, digest));
+        }
+    }
+    Ok(pins)
 }
 
 /// The repository the resources (tokenizer, template, config) come from, at the manifest's
@@ -271,8 +307,18 @@ pub fn shards(quantization: &str) -> Result<Vec<Asset>, String> {
     if is_on_demand(quantization) { Ok(on_demand(quantization)?.shards) } else { Ok(bundle(quantization)?.shards) }
 }
 
-/// The verity tree of an on-demand shard in Straydog's data directory: built there from the file
-/// (`straydog verify`), never next to the model, and checked against the pinned digest when opened.
+/// Where Straydog keeps what it makes for a model (its shards' verity trees, the expert store's
+/// warm-up state) unless told otherwise: this directory in the model's.
+pub const DATA_DIRECTORY: &str = ".straydog";
+
+/// The data directory of the model in `model` when none is given: [`DATA_DIRECTORY`] there.
+pub fn default_data_dir(model: &std::path::Path) -> std::path::PathBuf {
+    model.join(DATA_DIRECTORY)
+}
+
+/// The verity tree of a pinned shard in Straydog's data directory: built there from the file (at
+/// the server's first start, or by `straydog verify`) by the server, never by its worker, and
+/// checked against the pinned digest when opened.
 pub fn tree_path(data_dir: &std::path::Path, shard: &Asset) -> std::path::PathBuf {
     data_dir.join("verity").join(format!("{}.verity", shard.name))
 }

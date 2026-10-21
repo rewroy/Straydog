@@ -24,6 +24,18 @@ const BUILD_STEP: u64 = 16 * FAN;
 
 pub type Hash = [u8; 32];
 
+/// A digest written as 64 hex digits (as the pins are).
+pub fn parse_digest(text: &str) -> Result<Hash, String> {
+    let mut digest = [0u8; 32];
+    if text.len() != 64 || !text.is_ascii() {
+        return Err("invalid Straydog verity digest".into());
+    }
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).map_err(|_| "invalid Straydog verity digest")?;
+    }
+    Ok(digest)
+}
+
 /// A file's tree: tree blocks per level (level 0 hashes the data), and where each level starts
 /// in the tree file, which stores the top level first (as the kernel does).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +191,70 @@ fn write_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
 }
 
 /// Checks blocks of one file against its tree, from any thread.
+/// Bytes `offset .. offset + length` of a mapped file, copied out of the whole blocks around them
+/// once that copy verified: what is checked is what is used, whatever the page cache does meanwhile.
+pub fn read_verified(map: &[u8], verifier: &Verifier, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+    let size = map.len() as u64;
+    if offset.checked_add(length).is_none_or(|end| end > size) {
+        return Err("a verified read past the file's end".into());
+    }
+    let start = offset / BLOCK as u64 * BLOCK as u64;
+    let end = (offset + length).next_multiple_of(BLOCK as u64);
+    let mut blocks = vec![0u8; (end - start) as usize];
+    let present = (end.min(size) - start) as usize;
+    blocks[..present].copy_from_slice(&map[start as usize..start as usize + present]);
+    verifier.verify(start, &blocks)?;
+    let from = (offset - start) as usize;
+    Ok(blocks[from..from + length as usize].to_vec())
+}
+
+/// Check bytes `offset .. offset + length` of a mapped file in place, as the whole blocks around
+/// them, in pieces on up to `threads` threads: for memory that cannot change under the check
+/// (page-locked, or used only after a copy). A last partial block is checked zero-padded.
+pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, threads: usize) -> Result<(), String> {
+    const PIECE: u64 = 16 << 20;
+    let size = map.len() as u64;
+    if offset.checked_add(length).is_none_or(|end| end > size) {
+        return Err("a verified range past the file's end".into());
+    }
+    let start = offset / BLOCK as u64 * BLOCK as u64;
+    let end = (offset + length).next_multiple_of(BLOCK as u64);
+    // Whole blocks within the file go straight from the mapping; a last partial one is padded.
+    let whole_end = end.min(size / BLOCK as u64 * BLOCK as u64).max(start);
+    let pieces: Vec<(u64, u64)> = (start..whole_end).step_by(PIECE as usize).map(|at| (at, (at + PIECE).min(whole_end))).collect();
+    let failure = Mutex::new(None);
+    let check = |(from, to): (u64, u64)| {
+        if let Err(error) = verifier.verify(from, &map[from as usize..to as usize]) {
+            failure.lock().unwrap().get_or_insert(error);
+        }
+    };
+    if pieces.len() > 1 && threads > 1 {
+        let next = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(pieces.len()) {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    let Some(piece) = pieces.get(index) else { return };
+                    check(*piece);
+                });
+            }
+        });
+    } else {
+        pieces.into_iter().for_each(check);
+    }
+    if end > whole_end && whole_end < size {
+        let mut last = vec![0u8; BLOCK];
+        last[..(size - whole_end) as usize].copy_from_slice(&map[whole_end as usize..]);
+        if let Err(error) = verifier.verify(whole_end, &last) {
+            failure.lock().unwrap().get_or_insert(error);
+        }
+    }
+    match failure.into_inner().unwrap() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 pub struct Verifier {
     geometry: Geometry,
     tree: File,
@@ -254,6 +330,8 @@ impl Verifier {
             return Err("a verified read must be whole blocks".into());
         }
         let size = self.geometry.size;
+        // The level-0 tree block of the blocks being checked: taken once per FAN data blocks.
+        let mut current: Option<(u64, Box<[u8; BLOCK]>)> = None;
         for (index, block) in data.chunks(BLOCK).enumerate() {
             let at = offset + (index * BLOCK) as u64;
             if at >= size {
@@ -270,22 +348,26 @@ impl Verifier {
                 }
                 continue;
             }
-            if self.entry(number)? != hash {
+            let tree_block = number / FAN;
+            if current.as_ref().is_none_or(|(held, _)| *held != tree_block) {
+                current = Some((tree_block, self.level0_block(tree_block)?));
+            }
+            let entries = &current.as_ref().unwrap().1;
+            let entry = ((number % FAN) * 32) as usize;
+            if entries[entry..entry + 32] != hash {
                 return Err(format!("block {number} does not verify"));
             }
         }
         Ok(())
     }
 
-    /// Data block `number`'s hash from its (checked) level-0 tree block.
-    fn entry(&self, number: u64) -> Result<Hash, String> {
-        let tree_block = number / FAN;
-        let at = ((number % FAN) * 32) as usize;
+    /// A (checked) level-0 tree block: the hashes of FAN data blocks.
+    fn level0_block(&self, tree_block: u64) -> Result<Box<[u8; BLOCK]>, String> {
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some((block, used)) = cache.blocks.get_mut(&tree_block) {
                 *used = true;
-                return Ok(block[at..at + 32].try_into().unwrap());
+                return Ok(block.clone());
             }
         }
         let mut block = Box::new([0u8; BLOCK]);
@@ -299,12 +381,11 @@ impl Verifier {
         if !good {
             return Err(format!("tree block (0, {tree_block}) does not verify"));
         }
-        let hash = block[at..at + 32].try_into().unwrap();
         let mut cache = self.cache.lock().unwrap();
         // Readers verify in parallel: another may have cached this block since the check above.
         if let Some(entry) = cache.blocks.get_mut(&tree_block) {
             entry.1 = true;
-            return Ok(hash);
+            return Ok(block);
         }
         if cache.blocks.len() >= cache.capacity {
             // CLOCK: pass over used blocks, clearing their bit; evict the first clear one.
@@ -324,7 +405,7 @@ impl Verifier {
         } else {
             cache.order.push(tree_block);
         }
-        cache.blocks.insert(tree_block, (block, true));
-        Ok(hash)
+        cache.blocks.insert(tree_block, (block.clone(), true));
+        Ok(block)
     }
 }

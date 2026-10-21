@@ -37,7 +37,14 @@ logic: they follow from the official chat template and the OpenAI message format
   access: bubblewrap on Linux, an AppContainer of its own on Windows. The worker is
   the same executable. Every model and drafter file is pinned by SHA-256 and
   authenticated before use; the shards of a model read on demand also by their
-  fs-verity digests, every 4 KiB block checked against its Merkle tree before use.
+  fs-verity digests, every 4 KiB block checked against its Merkle tree before use. The
+  other bundles' shards are pinned by fs-verity digest too, and what is read again after
+  loading (the PLE table's rows, the expert banks partial residency page-locks in host
+  memory) is checked against their trees. Partial residency's banks left to the page cache
+  (when host memory cannot lock them all) are read through the mapping unchecked after
+  loading verified their chunks. The trees live in the data directory (`.straydog` in the
+  model's by default, `--data-dir` elsewhere), written by the server, never by the worker,
+  and checked against the compiled-in digests whenever they are opened.
   The SSD is read-only: no swap, weight or K/V files.
 - **Measurement.** Performance claims come from alternating A/B runs on the same
   machine, under a GPU lock.
@@ -157,9 +164,8 @@ drafts' while the first layer does. Decoding waits only for rows still on their 
 A table can take a verifier of each block read, between read and use (`crate::verity`'s, as
 the expert store does; a block that fails fails its read, and a later use reads it again).
 DeepSeek-V4.1's Engram table, whose file is not read whole at load, takes its shard's fs-verity
-tree as that verifier (and through the mapping, with `--row-cache 0`, each row's blocks are
-checked the same way); the PLE table takes none yet: its rows are as authentic as the mapping's
-(the file verified at load and checked unchanged before each generation).
+tree as that verifier, and so does the PLE table (through the mapping, with `--row-cache 0`,
+each row is copied out of its blocks and checked the same way).
 With the IQ3_S bundle on two R9700s, a fresh 4096-token prompt prefills in 1.3 s with the table
 in the page cache, as through the mapping, and in 1.5 s with it evicted (through the mapping
 3.0-3.3 s); decode is unchanged (75 and 125 tokens/s after 1000 and 4096), peak memory
@@ -184,7 +190,7 @@ option, named as llama-server names it where it has the same setting.
 | `--vram GIB` | VRAM budget per GPU | 6 |
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--row-cache MIB` | host memory caching rows of the PLE table (or a model's Engram table), read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
-| `--data-dir DIR` | Straydog's data directory: the verity trees of a model read on demand | none (required for such a model) |
+| `--data-dir DIR` | Straydog's data directory: the shards' verity trees, built there at the first start (reads after loading are checked against them, §3), and the expert store's warm-up state | `.straydog` in the model directory |
 | `--expert-ram GIB` | host memory for routed experts outside VRAM (a model read on demand) | half the host memory, less 4 GiB |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
@@ -209,11 +215,14 @@ There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authentic
 before use. The pins are compiled into the executable.
 
 Subcommands: `straydog fetch`, `straydog verify`, `straydog fetch-mtp` (provisioning).
-There is no setup command: a model is fetched once, then given by path. For a model read
-on demand, `fetch` and `verify` also build each shard's verity tree into the data
-directory (`<data-dir>/verity/<shard>.verity`, one read of the files) and keep it only when
-its digest is the pinned one; the model directory is never written, and the server refuses
-to start without the trees.
+There is no setup command: a model is fetched once, then given by path. `fetch` and
+`verify` also build each shard's verity tree into the data directory
+(`<data-dir>/verity/<shard>.verity`, by default `<model>/.straydog/verity/`, one read of the
+files) and keep it only when its digest is the pinned one; the server builds the trees it
+lacks the same way at its start, before the worker starts (shown as loading). Only the data
+directory is written, and only by these, never by the worker; when it cannot be written the
+start fails, naming `--data-dir`. For a model read on demand the trees are its
+authentication: no worker starts without them.
 
 ## 6. API
 
@@ -350,6 +359,11 @@ to start without the trees.
 6. Sampling with a temperature uses Straydog's own RNG; a seed is reproducible
    within Straydog, not across the reference. The defaults are the model card's
    sampling settings for the request's mode, not greedy decoding, which loops.
+7. (2026-10-21) What Straydog makes for a model, its shards' verity trees and the expert
+   store's warm-up state, is kept with the model (`<model>/.straydog`) unless
+   `--data-dir` says elsewhere: no flag is needed. The server writes it (at provisioning
+   or before it starts the worker), never the worker; the trees are as trustworthy
+   anywhere, being checked against the compiled-in digests.
 
 ## 10. Model architectures
 
@@ -420,7 +434,7 @@ page-locked RAM, a token costs 20-25 ms on two R9700s; the goal is 30 tokens/s.
   default.
 - **D6**: the block drafter, two-GPU strategies, tuning to the goal.
 
-It is served like the Qwen model: `straydog -m DIR --data-dir DIR ...` with the same API,
+It is served like the Qwen model: `straydog -m DIR ...` with the same API,
 isolation and dashboard. The bundle's pins name the architecture; the worker opens the six
 shards against their trees and places them by `--split-mode`: `experts` (the default) splits
 every layer across the GPUs, each holding its part of the attention and the head and its rows of

@@ -154,3 +154,36 @@ fn parallel_verification_through_a_small_cache() {
     std::fs::remove_file(&file_path).unwrap();
     std::fs::remove_file(&tree_path).unwrap();
 }
+
+/// Reads of a mapped file as the weights make them: unaligned bytes copied out of their verified
+/// blocks (`read_verified`), and long ranges checked in place on several threads
+/// (`verify_mapped`), the last partial block zero-padded; one changed byte refuses either.
+#[test]
+fn mapped_ranges_verify_in_place_and_by_copy() {
+    let size = 67121157u64;
+    let mut data: Vec<u8> = (0..size).map(byte).collect();
+    let (file_path, tree_path) = (scratch("mapped"), scratch("mapped.tree"));
+    std::fs::write(&file_path, &data).unwrap();
+    let digest = verity::build(&std::fs::File::open(&file_path).unwrap(), &tree_path, &|_| {}).unwrap();
+    let verifier = Verifier::open(&tree_path, size, &digest, 4 * BLOCK).unwrap();
+    for (offset, length) in [(0u64, 1u64), (4095, 2), (12345, 176), (size - 100, 100), (size - 1, 1)] {
+        let read = verity::read_verified(&data, &verifier, offset, length).unwrap();
+        assert_eq!(read, &data[offset as usize..(offset + length) as usize]);
+    }
+    assert!(verity::read_verified(&data, &verifier, size - 10, 11).is_err());
+    for threads in [1, 8] {
+        verity::verify_mapped(&data, &verifier, 0, size, threads).unwrap();
+        verity::verify_mapped(&data, &verifier, 100_000, 40 << 20, threads).unwrap();
+    }
+    for at in [17u64 << 20, size - 3] {
+        data[at as usize] ^= 1;
+        let start = at.saturating_sub(5000);
+        assert!(verity::read_verified(&data, &verifier, at, 1).is_err());
+        assert!(verity::verify_mapped(&data, &verifier, start, size - start, 8).is_err());
+        // Bytes elsewhere still verify.
+        verity::verify_mapped(&data, &verifier, 0, 1 << 20, 8).unwrap();
+        data[at as usize] ^= 1;
+    }
+    std::fs::remove_file(&file_path).unwrap();
+    std::fs::remove_file(&tree_path).unwrap();
+}

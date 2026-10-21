@@ -46,17 +46,17 @@ enum Command {
         /// Authenticate what is there; download nothing
         #[arg(long)]
         offline: bool,
-        /// Straydog's data directory, where a bundle read on demand gets its verity trees
+        /// Where the shards' verity trees go [default: .straydog in the bundle directory]
         #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
-    /// Authenticate a model bundle (a bundle read on demand: build its verity trees)
+    /// Authenticate a model bundle and build its shards' verity trees
     Verify {
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
         #[arg(long, value_name = "NAME")]
         quant: String,
-        /// Straydog's data directory, where a bundle read on demand gets its verity trees
+        /// Where the shards' verity trees go [default: .straydog in the bundle directory]
         #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },

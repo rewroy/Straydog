@@ -5,7 +5,10 @@
 //! verifying it before its bytes reach the GPUs or the host copies kept here (token
 //! embeddings, vectors, the operands passes upload at first use). Only what the engine
 //! reads through the mapping at run time, the PLE table and partial residency's expert
-//! banks, is used from the page cache after its chunk was verified.
+//! banks, is used from the page cache after its chunk was verified. With the shards' verity
+//! trees ([`Weights::open_trees`]) the PLE table's rows are checked block by block as they are
+//! read and the expert banks page-locked in host memory once locked; the banks left to the page
+//! cache are not (docs/DESIGN.md §3).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -21,6 +24,7 @@ use crate::bundle::{self, Asset};
 use crate::digest::{self, CHUNK_BYTES};
 use crate::formats;
 use crate::rows::{ReadPool, RowTable};
+use crate::verity;
 
 pub const CONTEXT_LIMIT: usize = 262144;
 const TENSOR_COUNT: usize = 1224;
@@ -32,6 +36,8 @@ const ROW_THREADS: usize = 16;
 /// Decoded token embeddings kept: 4096 rows of 2560 floats (40 MiB), for batches up to eight.
 const CACHED_BATCH: usize = 8;
 const CACHED_ROWS: usize = 4096;
+/// Checked level-0 tree blocks kept per file.
+const TREE_CACHE_BYTES: usize = 32 << 20;
 /// The drafter's tensors (the pinned MTP layer).
 pub const DRAFTER_TENSORS: [&str; 33] = [
     "mtp.embed_norm.weight", "mtp.fc_embedding.weight", "mtp.hidden_norm.weight", "mtp.fc_hidden.weight",
@@ -115,6 +121,8 @@ pub struct Weights {
     authenticated: bool,
     /// Tables read through a row cache instead of the mapping (see `crate::rows`).
     row_tables: HashMap<String, RowTable>,
+    /// Per file: its verity tree, when opened ([`Weights::open_trees`]).
+    verifiers: Vec<Option<Arc<verity::Verifier>>>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
     embeddings: Mutex<EmbeddingCache>,
 }
@@ -229,6 +237,7 @@ impl Weights {
             kept: HashMap::new(),
             authenticated: false,
             row_tables: HashMap::new(),
+            verifiers: Vec::new(),
             vectors: Mutex::new(HashMap::new()),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
@@ -272,6 +281,42 @@ impl Weights {
             }
         }
         Ok(weights)
+    }
+
+    /// Open the pinned shards' verity trees in `data_dir` (`bundle::tree_path`, checked against
+    /// their pinned digests): from then on the PLE table's rows are checked block by block as they
+    /// are read, and partial residency's page-locked expert banks once locked.
+    pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
+        let mut verifiers = vec![None; self.files.len()];
+        for (asset, digest) in bundle::verity_pins(&self.quantization)? {
+            let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
+            let tree = bundle::tree_path(data_dir, &asset);
+            let verifier = verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(&digest)?, TREE_CACHE_BYTES)
+                .map_err(|error| format!("Straydog verity tree of {}: {error}", asset.name))?;
+            verifiers[index] = Some(Arc::new(verifier));
+        }
+        self.verifiers = verifiers;
+        Ok(())
+    }
+
+    fn verifier_of(&self, file: usize) -> Option<&Arc<verity::Verifier>> {
+        self.verifiers.get(file).and_then(Option::as_ref)
+    }
+
+    /// Whether a tensor's reads after loading are checked against its file's verity tree.
+    pub fn verified(&self, name: &str) -> bool {
+        self.tensor(name).is_ok_and(|tensor| self.verifier_of(tensor.file).is_some())
+    }
+
+    /// Check a tensor's bytes in the mapping, block by block on every core, against its file's
+    /// tree: for bytes that cannot change under the check (page-locked). Ok(false) without a tree.
+    pub fn verify_mapped(&self, name: &str) -> Result<bool, String> {
+        let tensor = self.tensor(name)?;
+        let Some(verifier) = self.verifier_of(tensor.file) else { return Ok(false) };
+        let threads = std::thread::available_parallelism().map_or(8, |count| count.get());
+        verity::verify_mapped(&self.maps[tensor.file], verifier, tensor.offset, tensor.bytes, threads)
+            .map_err(|error| format!("Straydog model bytes do not verify ({name}): {error}"))?;
+        Ok(true)
     }
 
     /// Read and verify every chunk, keeping host copies of the token embeddings (for callers
@@ -465,12 +510,19 @@ impl Weights {
     }
 
     /// Read a table's rows through a cache of `budget` bytes (`crate::rows`) instead of the
-    /// mapping: from the authenticated file, as aligned blocks, past the page cache.
+    /// mapping: from the authenticated file, as aligned blocks, past the page cache, each read
+    /// checked against the file's verity tree when it is open.
     pub fn cache_rows(&mut self, name: &str, budget: u64) -> Result<(), String> {
         let tensor = self.tensor(name)?;
         let [_, count] = tensor.dims[..] else { return Err(format!("{name} is not a table of rows")) };
         let pool = Arc::new(ReadPool::new(crate::rows::THREADS));
-        let table = RowTable::new(&self.files[tensor.file], tensor.offset, (tensor.bytes / count) as usize, count, budget, pool, None)
+        let verifier = self.verifier_of(tensor.file).cloned().map(|verifier| -> crate::rows::Verifier {
+            Arc::new(move |offset: u64, data: &[u8]| {
+                verifier.verify(offset, data).map_err(|error| format!("Straydog model bytes do not verify: {error}"))
+            })
+        });
+        let table = RowTable::new(&self.files[tensor.file], tensor.offset, (tensor.bytes / count) as usize, count, budget, pool,
+                                  verifier)
             .map_err(|exc| format!("{name}: {exc}"))?;
         self.row_tables.insert(name.to_string(), table);
         Ok(())
@@ -540,11 +592,22 @@ impl Weights {
         let row_bytes = (tensor.bytes / count) as usize;
         let width = width as usize;
         // The rows' bytes: through the table's row cache when it has one (see `crate::rows`),
-        // else from the mapping, every row's read started at once so that decoding waits on the
-        // slowest rather than on each in turn.
-        let fetched = match self.row_tables.get(name) {
-            Some(rows) => Some(rows.read(&indices.iter().map(|&index| index as u32).collect::<Vec<_>>())?),
-            None => {
+        // else copied from the mapping and checked when the file's tree is open, else from the
+        // mapping, every row's read started at once so that decoding waits on the slowest rather
+        // than on each in turn.
+        let verifier = self.verifier_of(tensor.file).filter(|_| !self.kept.contains_key(name));
+        let fetched = match (self.row_tables.get(name), verifier) {
+            (Some(rows), _) => Some(rows.read(&indices.iter().map(|&index| index as u32).collect::<Vec<_>>())?),
+            (None, Some(verifier)) => {
+                let mut bytes = Vec::with_capacity(indices.len() * row_bytes);
+                for &index in indices {
+                    let at = tensor.offset + index as u64 * row_bytes as u64;
+                    bytes.extend(verity::read_verified(&self.maps[tensor.file], verifier, at, row_bytes as u64)
+                        .map_err(|error| format!("Straydog model bytes do not verify: {error}"))?);
+                }
+                Some(bytes)
+            }
+            (None, None) => {
                 if !self.kept.contains_key(name) {
                     crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * row_bytes..(index as usize + 1) * row_bytes]));
                 }

@@ -52,7 +52,7 @@ impl Served for Handle {
 }
 
 pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
-    let data_dir = args.data_dir.as_deref().ok_or("a bundle read on demand needs Straydog's data directory (--data-dir)")?;
+    let data_dir = args.data_dir.as_deref().ok_or("a bundle read on demand needs its data directory (the verity trees)")?;
     let host_memory_bytes = if args.host_memory_bytes > 0 { args.host_memory_bytes } else { straydog_engine::host::host_memory_bytes() };
     let settings = Settings {
         devices: args.devices.clone(),

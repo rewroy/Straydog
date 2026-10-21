@@ -56,7 +56,7 @@ pub struct WorkerArgs {
     /// Host memory available to the worker (its cgroup limits are invisible inside isolation).
     #[arg(long, default_value_t = 0)]
     pub host_memory_bytes: u64,
-    /// Straydog's data directory: the verity trees of a bundle read on demand.
+    /// Straydog's data directory: the shards' verity trees (read only).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
     /// The routed experts' host tier of a bundle read on demand [default: planned from host memory].
@@ -154,7 +154,11 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
             .and_then(|mut group| group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16").map(|()| group));
         (group, weights.join().unwrap())
     });
-    let (group, weights) = (group?, weights?);
+    let (group, mut weights) = (group?, weights?);
+    // With the shards' verity trees, what is read again after loading is checked block by block.
+    if let Some(data_dir) = &args.data_dir {
+        weights.open_trees(data_dir)?;
+    }
     let open_seconds = opened.elapsed().as_secs_f64();
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));

@@ -46,9 +46,14 @@ fn generations_equal_the_reference() {
         let speculative = placement["speculative"].as_u64().unwrap() as usize;
         let mut group = Group::new(&devices, budget, split).unwrap();
         group.configure_gemm(2, true).unwrap();
-        let weights = Weights::open(&PathBuf::from(&model_root), &quantization,
-                                    (speculative > 0).then(|| PathBuf::from(&drafter)).as_deref(),
-                                    straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        let mut weights = Weights::open(&PathBuf::from(&model_root), &quantization,
+                                        (speculative > 0).then(|| PathBuf::from(&drafter)).as_deref(),
+                                        straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        // With STRAYDOG_DATA_DIR (the shards' verity trees there), what is read again after
+        // loading is checked block by block: the generations must not change.
+        if let Some(data_dir) = std::env::var_os("STRAYDOG_DATA_DIR") {
+            weights.open_trees(std::path::Path::new(&data_dir)).unwrap();
+        }
         let settings = Settings {
             context: placement["context"].as_u64().unwrap() as usize,
             state_budget_bytes: 13 << 30,

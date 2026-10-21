@@ -27,6 +27,9 @@ struct Args {
     model: PathBuf,
     #[arg(long)]
     drafter: Option<PathBuf>,
+    /// Where the shards' verity trees are (built there first if missing) [default: .straydog in the model directory]
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', default_value = "0,1")]
     devices: Vec<usize>,
     #[arg(long, default_value_t = 30.0)]
@@ -169,9 +172,12 @@ fn main() {
         gpu: Some(args.devices.clone()),
         vram: Some(args.vram),
         ctx_size: Some(args.ctx),
+        data_dir: args.data_dir.clone(),
         ..Options::default()
     };
     let settings = config::resolve(options).unwrap();
+    // The workers read the shards' verity trees: built first where missing, as the server does.
+    straydog_provision::ensure_trees(&settings.model, &settings.quant, &settings.data_dir, &|_, _, _| {}).unwrap();
     let cases: Vec<Value> =
         serde_json::from_str::<Vec<Value>>(&std::fs::read_to_string(args.repo.join("bench/cases.json")).unwrap())
             .unwrap()

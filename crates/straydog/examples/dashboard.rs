@@ -62,7 +62,7 @@ fn main() {
         startup_timeout: 60.0,
         log_file: None,
         verbose: false,
-        data_dir: None,
+        data_dir: PathBuf::from("/nonexistent/.straydog"),
         expert_ram: None,
     };
     let command = (std::env::current_exe().unwrap(), vec!["simulate-worker".into()]);

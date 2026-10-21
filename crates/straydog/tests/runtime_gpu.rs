@@ -60,9 +60,17 @@ fn main() {
         gpu: Some(vec![0, 1]),
         vram: Some(30.0),
         ctx_size: Some(32768),
+        // The shards' verity trees: in STRAYDOG_DATA_DIR, else a scratch directory (built there
+        // first, as the server does; the bundle's own directory is only read here).
+        data_dir: Some(std::env::var_os("STRAYDOG_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| {
+            let scratch = std::env::temp_dir().join(format!("straydog-runtime-gpu-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch).unwrap();
+            scratch
+        })),
         ..Options::default()
     };
     let settings = config::resolve(options).unwrap();
+    straydog_provision::ensure_trees(&settings.model, &settings.quant, &settings.data_dir, &|_, _, _| {}).unwrap();
     let command = (std::env::current_exe().unwrap(), runtime::worker_args(&settings));
     let tokio = tokio::runtime::Runtime::new().unwrap();
     tokio.block_on(async {
@@ -116,4 +124,7 @@ fn main() {
         assert!(matches!(engine.state(), EngineState::Ready { .. }));
         println!("runtime_gpu: ok");
     });
+    if std::env::var_os("STRAYDOG_DATA_DIR").is_none() {
+        let _ = std::fs::remove_dir_all(&settings.data_dir);
+    }
 }

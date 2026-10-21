@@ -2,7 +2,8 @@
 //! drafter built from the official tensors equals its pin byte for byte.
 //!
 //! cargo test -p straydog-provision --features hip --test pinned -- --nocapture, with
-//! - STRAYDOG_MODEL: an IQ3_S bundle directory, only read (about 30 s with the files cached);
+//! - STRAYDOG_MODEL: an IQ3_S bundle directory, only read (about 30 s with the files cached); its
+//!   verity trees go to STRAYDOG_DATA_DIR if set (else a scratch directory, removed after);
 //! - STRAYDOG_DRAFTER_BUILD: a directory to build the drafter in. It downloads the official
 //!   tensors (5.2 GB) and leaves the drafter there; the tensors are deleted.
 
@@ -51,13 +52,25 @@ fn a_bundle_authenticates() {
         eprintln!("skipped: set STRAYDOG_MODEL to an IQ3_S bundle directory");
         return;
     };
+    // The trees go to STRAYDOG_DATA_DIR (kept there) or a scratch directory, never the bundle's.
+    let given = std::env::var_os("STRAYDOG_DATA_DIR").map(PathBuf::from);
+    let data = given.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("straydog-pinned-{}", std::process::id())));
     let stages = Stages::new();
-    straydog_provision::verify(&root, "IQ3_S", None, &|stage, done, total| stages.report(stage, done, total)).unwrap();
+    straydog_provision::verify(&root, "IQ3_S", Some(&data), &|stage, done, total| stages.report(stage, done, total)).unwrap();
     let pins = bundle::bundle("IQ3_S").unwrap();
     let total: u64 = pins.shards.iter().chain(&pins.resources).map(|asset| asset.bytes).sum();
-    assert_eq!(*stages.0.lock().unwrap(), [("authenticating 5 present file(s)".to_string(), total, total)]);
+    let reported = stages.0.lock().unwrap().clone();
+    assert_eq!(reported[0], ("authenticating 5 present file(s)".to_string(), total, total));
+    // Then the verity trees the data directory lacked, each built whole.
+    assert!(reported[1..].iter().all(|(stage, done, total)| stage.starts_with("building the verity tree of ") && done == total));
+    for (asset, _) in bundle::verity_pins("IQ3_S").unwrap() {
+        assert!(bundle::tree_path(&data, &asset).is_file(), "{}", asset.name);
+    }
+    if given.is_none() {
+        fs::remove_dir_all(&data).unwrap();
+    }
     // The Q2_0 bundle's first shard is not there.
-    let message = straydog_provision::verify(&root, "Q2_0", None, &|_, _, _| {}).unwrap_err();
+    let message = straydog_provision::verify(&root, "Q2_0", Some(&data), &|_, _, _| {}).unwrap_err();
     assert!(message.contains("Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"), "{message}");
 }
 
