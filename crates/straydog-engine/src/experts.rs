@@ -355,6 +355,8 @@ pub struct Counts {
     pub prefetched: u64,
     /// Prefetched experts their layer then did not use.
     pub prefetch_unused: u64,
+    /// Failed reads no pass waited for (dropped from both tiers; read again on their next use).
+    pub failed_unwaited: u64,
     /// Seconds the host waited for drive reads.
     pub wait_seconds: f64,
     /// Seconds the host waited for a host slot's copy to finish before reusing it.
@@ -377,6 +379,7 @@ impl std::ops::Add for Counts {
             writebacks: self.writebacks + other.writebacks,
             prefetched: self.prefetched + other.prefetched,
             prefetch_unused: self.prefetch_unused + other.prefetch_unused,
+            failed_unwaited: self.failed_unwaited + other.failed_unwaited,
             wait_seconds: self.wait_seconds + other.wait_seconds,
             slot_wait_seconds: self.slot_wait_seconds + other.slot_wait_seconds,
             pin_seconds: self.pin_seconds + other.pin_seconds,
@@ -797,8 +800,10 @@ impl DeviceExperts {
     /// least one read first.
     ///
     /// An expert whose read failed (an I/O error, or a block that did not verify) leaves both
-    /// tiers: its bytes are never uploaded, and a later use reads it again. Every landed read is
-    /// accounted for before the first error returns.
+    /// tiers: its bytes are never uploaded, and a later use reads it again. Only a pass holding
+    /// the expert fails with it; a read no pass waits for (a prefetch) fails nothing, whichever
+    /// call happens to take it, and is counted. Every landed read is accounted for before the
+    /// first error returns.
     fn pump(&mut self, gpu: &mut Backend, block: bool) -> Result<()> {
         let mut landed = Vec::new();
         if block {
@@ -835,8 +840,13 @@ impl DeviceExperts {
                 continue;
             }
             if let Some(error) = self.host[host].failed.take() {
+                let needed = waiting.is_some_and(|slot| self.slots[slot].held);
                 self.discard(host, waiting);
-                first_error.get_or_insert(error);
+                if needed {
+                    first_error.get_or_insert(error);
+                } else {
+                    self.counts.failed_unwaited += 1;
+                }
                 continue;
             }
             match waiting {

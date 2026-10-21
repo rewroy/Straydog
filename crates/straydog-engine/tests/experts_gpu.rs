@@ -62,12 +62,15 @@ impl Random {
 }
 
 fn run(host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
-    run_with(roles(), host_budget_slots, steps)
+    run_with(roles(), 16, host_budget_slots, steps)
 }
 
-fn run_with(layers: Vec<Option<Vec<Role>>>, host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
+fn run_with(layers: Vec<Option<Vec<Role>>>, slots: usize, host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
     let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
-    let path = std::env::temp_dir().join(format!("straydog-experts-{}-{host_budget_slots}-{end}", std::process::id()));
+    // A file of its own per run: tests run in parallel, and some share a capacity.
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-run{run}", std::process::id()));
     {
         let mut file = File::create(&path).unwrap();
         let bytes: Vec<u8> = (0..end + 333).map(byte).collect();
@@ -91,7 +94,7 @@ fn run_with(layers: Vec<Option<Vec<Role>>>, host_budget_slots: u64, steps: usize
     let layout = Arc::new(Layout::new(&[file], layers.clone(), Some(verifier)).unwrap());
     let host_budget = host_budget_slots * (STRIDES.iter().sum::<u64>() + 4 * 4096).next_multiple_of(4096);
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
-    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, host_budget).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), slots, host_budget).unwrap();
     let mut random = Random(0x1234_5678);
     for step in 0..steps {
         let layer = if step % 2 == 0 { 0 } else { 2 };
@@ -133,8 +136,10 @@ fn experts_with_staging_only() {
     assert!(counts.drive_reads > 0 && counts.host_hits == 0 && counts.writebacks == 0);
 }
 
-/// A read that fails (here: a block that does not verify) fails its pass, puts nothing in
-/// either tier, and leaves the store usable: the expert is read again on its next use.
+/// A read that fails (here: a block that does not verify) puts nothing in either tier and fails
+/// only a pass holding its expert: a failed prefetch no pass took fails nothing (counted), one a
+/// pass took fails that pass, as does the pass's own read; the expert is read again on its next
+/// use, and the store stays usable.
 #[test]
 fn a_failed_read_leaves_both_tiers() {
     let layers = roles();
@@ -144,11 +149,13 @@ fn a_failed_read_leaves_both_tiers() {
     let role = layers[0].as_ref().unwrap()[1];
     // A block in the middle of expert 5's up rows (an edge block is shared with a neighbour).
     let bad = (role.base + 5 * role.stride + role.stride / 2) & !4095;
-    let failures = Arc::new(AtomicU64::new(2));
+    let failures = Arc::new(AtomicU64::new(0));
     let left = failures.clone();
+    // A failing read takes 100 ms: a pass issued right after a prefetch finds it still in flight.
     let verifier: Verifier = Arc::new(move |_, offset, data: &[u8]| {
         let covers = (offset..offset + data.len() as u64).contains(&bad);
         if covers && left.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             left.fetch_sub(1, Ordering::Relaxed);
             return Err(format!("block {bad} does not verify"));
         }
@@ -157,24 +164,29 @@ fn a_failed_read_leaves_both_tiers() {
     let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), Some(verifier)).unwrap());
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, 1 << 26).unwrap();
-    // A prefetch of the bad expert, then passes that use it fail twice, the neighbours still served.
+    // A prefetch whose read fails, taken by no pass.
+    failures.store(1, Ordering::Relaxed);
     store.prefetch(&mut gpu, 0, &[5], true).unwrap();
-    for attempt in 0..3 {
-        let result = store.acquire(&mut gpu, 0, &[4, 5, 6]);
-        if attempt < 2 {
-            assert!(result.unwrap_err().contains("does not verify"), "attempt {attempt}");
-        } else {
-            let slots = result.unwrap();
-            for (expert, slot) in [4, 5, 6].into_iter().zip(&slots) {
-                let want = expected(layers[0].as_ref().unwrap(), expert);
-                let mut got = vec![0u8; want.len()];
-                gpu.read_buffer(slot, 0, &mut got).unwrap();
-                assert!(got == want, "expert {expert} differs after the failed reads");
-            }
-        }
-        store.release(&mut gpu).unwrap();
-    }
     store.settle(&mut gpu).unwrap();
+    assert_eq!(store.counts().failed_unwaited, 1);
+    // A prefetch a pass takes before its read fails, then the pass's own read of it.
+    failures.store(1, Ordering::Relaxed);
+    store.prefetch(&mut gpu, 0, &[5], true).unwrap();
+    assert!(store.acquire(&mut gpu, 0, &[4, 5, 6]).unwrap_err().contains("does not verify"), "the taken prefetch");
+    store.release(&mut gpu).unwrap();
+    failures.store(1, Ordering::Relaxed);
+    assert!(store.acquire(&mut gpu, 0, &[4, 5, 6]).unwrap_err().contains("does not verify"), "the pass's own read");
+    store.release(&mut gpu).unwrap();
+    let slots = store.acquire(&mut gpu, 0, &[4, 5, 6]).unwrap();
+    for (expert, slot) in [4, 5, 6].into_iter().zip(&slots) {
+        let want = expected(layers[0].as_ref().unwrap(), expert);
+        let mut got = vec![0u8; want.len()];
+        gpu.read_buffer(slot, 0, &mut got).unwrap();
+        assert!(got == want, "expert {expert} differs after the failed reads");
+    }
+    store.release(&mut gpu).unwrap();
+    store.settle(&mut gpu).unwrap();
+    assert_eq!(store.counts().failed_unwaited, 1);
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
@@ -183,9 +195,31 @@ fn a_failed_read_leaves_both_tiers() {
 /// through drive reads, host hits, write-backs and prefetches in both classes.
 #[test]
 fn experts_of_two_sizes() {
-    let counts = run_with(sized_roles(STRIDES, [90_001, 30_011, 120_007]), 30, 400);
+    let counts = run_with(sized_roles(STRIDES, [90_001, 30_011, 120_007]), 16, 30, 400);
     eprintln!("{counts:?}");
     assert!(counts.drive_reads > 0 && counts.host_hits > 0 && counts.writebacks > 0 && counts.prefetched > 0);
+}
+
+/// From the fewest slots a store takes to more than every expert, with no host tier, a host tier
+/// of one slot, and one that holds every expert: each pass gets the file's bytes (checked in
+/// `run_with`), and with room for every expert in either tier an expert leaves the drive once
+/// (again only when a prefetch of it was cancelled before its read landed).
+#[test]
+fn experts_at_several_capacities() {
+    for (slots, host) in [(16, 0), (16, 1), (16, 7), (40, 7), (40, 100), (100, 0), (100, 100)] {
+        let counts = run_with(roles(), slots, host, 300);
+        eprintln!("{slots} slots, {host} host slots: {counts:?}");
+        let experts = 2 * EXPERTS as u64;
+        if slots >= 2 * EXPERTS + 4 || host >= 2 * EXPERTS as u64 {
+            assert!(counts.drive_reads <= experts + counts.prefetch_unused, "{slots}/{host}: {counts:?}");
+        }
+        if slots >= 2 * EXPERTS + 4 {
+            assert_eq!(counts.writebacks, 0, "{slots}/{host}: every expert fits in VRAM");
+        }
+        if host == 0 {
+            assert_eq!(counts.host_hits + counts.writebacks, 0, "{slots}/{host}: no host tier");
+        }
+    }
 }
 
 /// A verifier that panics fails its read like a refused block: the pass gets an error, the
