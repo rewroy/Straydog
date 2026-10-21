@@ -24,9 +24,10 @@
 //! continues (window rings, compressed rows, their tails and index keys) is that of every row
 //! computed; DS41_FULL_DECODER computes every row, for comparisons.
 //!
-//! A decode row's next-layer experts are predicted and prefetched from the host tier; for
-//! measurements, DS41_NO_PREDICT turns that off and DS41_PREDICT_DRIVE also reads predicted
-//! experts from the drive (so far no faster: wrong guesses spend the drive's time).
+//! A decode row can predict the next layer's experts (its router on this layer's input) and
+//! prefetch the DS41_PREDICT best (up to 8) from the host tier, DS41_PREDICT_DRIVE also from the
+//! drive. It is off: on two GPUs most of the prefetches were never used, and each one cost an
+//! upload and, the tiers being exclusive, a write-back over the GPU's bus.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
@@ -191,7 +192,7 @@ struct Work {
 /// Experts acquired at a time by a pass of many rows (each wave's reads overlap the one before's
 /// compute), fewer when a size of experts has few slots (DeviceExperts::wave_limit).
 const WAVE: usize = 32;
-/// Experts of the next layer prefetched from its router applied to this layer's input (decode):
+/// Experts of the next layer a decode row predicts from its router applied to this layer's input:
 /// the 8 best hold 79% of the 6 it takes.
 const PREDICTED: usize = 8;
 /// A pass whose next layer routes at least this many times as many times as there are experts
@@ -236,6 +237,9 @@ pub struct Engine<'a, T: Tensors> {
     /// The first layer of the decoder (the last kv source), whose layers run only the rows the last
     /// row's output needs (see the module documentation); None: every layer runs every row.
     decoder: Option<usize>,
+    /// How many of a decode row's predicted next-layer experts are prefetched (DS41_PREDICT, up to
+    /// [`PREDICTED`]; 0, the default, predicts nothing).
+    prefetches: usize,
     /// Next-layer experts predicted by this pass, prefetched after the layer's own.
     predicted: Vec<usize>,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end.
@@ -509,6 +513,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             position: 0,
             history: Vec::new(),
             sources,
+            prefetches: std::env::var("DS41_PREDICT").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(PREDICTED),
             predicted: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
         };
@@ -876,7 +881,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let record = n == 1 && self.profile.is_none() && std::env::var_os("DS41_NO_GRAPHS").is_none();
         // a layer that compresses or indexes changes its launches from token to token
         let fixed = plan.compressed.is_none_or(|c| c.kv_source != layer && c.index_source != layer);
-        let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && std::env::var_os("DS41_NO_PREDICT").is_none();
+        let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && self.prefetches > 0;
         // The Engram rows of every token, before the layer (each batch takes its own).
         let engram = match plan.engram {
             Some(module) => Some(self.engram_rows(module, tokens)?),
@@ -1048,7 +1053,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
         self.shards[0].gpu.read_finish(&mut routes)?;
-        self.predicted = routes.split_off(rows * k).into_iter().map(|expert| expert as usize).collect();
+        self.predicted = routes.split_off(rows * k).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         self.routed(layer, first, rows, &routes)
     }
 
@@ -1111,7 +1116,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
         self.shards[0].gpu.read_finish(&mut routes)?;
-        let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().map(|expert| expert as usize).collect();
+        let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
             .into_iter().collect();
         let wave = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
