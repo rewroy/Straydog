@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use serde_json::{json, Map, Value};
 
+use crate::drafts::{Ngrams, Policy};
 use crate::experts::Contents;
 use crate::gpu::Backend;
 use crate::group::SplitMode;
@@ -48,6 +49,21 @@ pub trait Engines {
     /// A restore keeps the K/V below the checkpoint's position, which must be its sequence's.
     fn checkpoint(&mut self, _slot: usize, _save: bool) -> Result<(), String> {
         Err("these engines keep no checkpoints".into())
+    }
+    /// The most tokens [`Engines::verify`] takes in a pass (1: the engines verify no drafts).
+    fn verify_rows(&self) -> usize {
+        1
+    }
+    /// One pass over `tokens` (at most [`Engines::verify_rows`]) continuing the held sequence: the
+    /// logits after each, `tokens.len()` rows of the vocabulary. Each row is what feeding the
+    /// tokens one at a time gives.
+    fn verify(&mut self, _tokens: &[u32]) -> Result<Vec<f32>, String> {
+        Err("these engines verify no drafts".into())
+    }
+    /// After a verify: keep the first `keep` of its tokens, the state as though only they had been
+    /// fed.
+    fn rewind(&mut self, _keep: usize) -> Result<(), String> {
+        Err("these engines verify no drafts".into())
     }
 }
 
@@ -208,6 +224,97 @@ pub fn card(header: &straydog_gguf::ModelHeader) -> Result<Sampling, String> {
     Ok(card)
 }
 
+/// What a reply's decoding did: tokens emitted, tokens fed in how many passes, drafts verified and
+/// accepted.
+#[derive(Debug, Default, PartialEq)]
+struct Decoded {
+    emitted: usize,
+    fed: usize,
+    passes: usize,
+    drafted: usize,
+    accepted: usize,
+}
+
+/// Sample from `logits` (after the held sequence, `history`) and continue it: up to `max_new`
+/// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
+/// each token is fed with the drafts the sequence proposes after it (drafts::Ngrams), in one pass;
+/// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
+/// emitted after it and kept, the rest rewound.
+#[allow(clippy::too_many_arguments)]
+fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>, vocabulary: usize, end: &[u32], max_new: usize,
+                      sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32))
+                      -> Result<Decoded, String> {
+    let mut rng = Rng::new(seed);
+    let mut generated = Generated::new(vocabulary);
+    let rows = engines.verify_rows();
+    let mut ngrams = Ngrams::new();
+    if rows > 1 {
+        ngrams.extend(history);
+    }
+    let mut policy = Policy::new(rows);
+    let mut done = Decoded::default();
+    let mut next = sampling::choose(&logits, sampling, &generated, &mut rng);
+    loop {
+        if cancelled() || end.contains(&next) {
+            break;
+        }
+        generated.insert(next);
+        emit(next);
+        done.emitted += 1;
+        if done.emitted == max_new {
+            break;
+        }
+        let drafts = if rows > 1 {
+            ngrams.push(next);
+            let (proposal, matched) = ngrams.propose(rows - 1);
+            let width = policy.width(matched).min(proposal.len()).min(max_new - done.emitted);
+            proposal[..width].to_vec()
+        } else {
+            Vec::new()
+        };
+        if drafts.is_empty() {
+            let logits = engines.forward(&[next])?;
+            history.push(next);
+            (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
+            next = sampling::choose(&logits, sampling, &generated, &mut rng);
+            continue;
+        }
+        let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
+        let rows_logits = engines.verify(&fed)?;
+        if rows_logits.len() != fed.len() * vocabulary {
+            return Err("Straydog engines verified the wrong number of logits".into());
+        }
+        (done.passes, done.fed, done.drafted) = (done.passes + 1, done.fed + fed.len(), done.drafted + drafts.len());
+        let (accepted, token) = sampling::accept(&drafts, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
+        policy.record(drafts.len(), accepted);
+        // The accepted drafts go out in order: an end token among them ends the reply unsent, the
+        // last token allowed ends it sent; either is left out of the state, as without drafts.
+        let (mut kept, mut stop) = (accepted, false);
+        for (index, &draft) in drafts[..accepted].iter().enumerate() {
+            if end.contains(&draft) {
+                (kept, stop) = (index, true);
+                break;
+            }
+            emit(draft);
+            done.emitted += 1;
+            if done.emitted == max_new {
+                (kept, stop) = (index, true);
+                break;
+            }
+        }
+        engines.rewind(1 + kept)?;
+        done.accepted += kept;
+        history.push(next);
+        history.extend_from_slice(&drafts[..kept]);
+        ngrams.extend(&drafts[..kept]);
+        if stop {
+            break;
+        }
+        next = token;
+    }
+    Ok(done)
+}
+
 impl<E: Engines> Session<E> {
     pub fn new(placed: Placed<E>) -> Session<E> {
         Session {
@@ -302,37 +409,28 @@ impl<E: Engines> Session<E> {
             self.save_turn()?;
             fed = start;
         }
-        let Some(mut logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
+        let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
             return Ok(());
         };
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
         let cpu = self.engines.cpu_routes();
-        let mut rng = Rng::new(seed);
-        let mut generated = Generated::new(self.vocabulary);
-        let (mut emitted, mut ttft) = (0usize, None);
+        let mut ttft = None;
         let decoding = Instant::now();
-        loop {
-            if cancelled() {
-                break;
+        let decoded = decode(&mut self.engines, &mut self.history, logits, self.vocabulary, &self.end, max_new, sampling, seed, cancelled,
+                             &mut |token| {
+                                 ttft.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                                 emit(token);
+                             });
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset();
+                return Err(error);
             }
-            let token = sampling::choose(&logits, sampling, &generated, &mut rng);
-            if self.end.contains(&token) {
-                break;
-            }
-            generated.insert(token);
-            ttft.get_or_insert_with(|| started.elapsed().as_secs_f64());
-            emit(token);
-            emitted += 1;
-            if emitted == max_new {
-                break;
-            }
-            match self.feed(&[token], &|| false, &mut |_| {})? {
-                Some(next) => logits = next,
-                None => break,
-            }
-        }
+        };
         let decode_seconds = decoding.elapsed().as_secs_f64();
+        let emitted = decoded.emitted;
         let steps = emitted.saturating_sub(1);
         let (hits2, host2, drive2) = self.engines.counts();
         let cpu2 = self.engines.cpu_routes();
@@ -341,7 +439,8 @@ impl<E: Engines> Session<E> {
             "cached_tokens": reused, "resumed_from": resumed_from,
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
-            "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": steps, "decode_seconds": decode_seconds,
+            "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
+            "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
         })
@@ -454,5 +553,148 @@ impl<E: Engines> Session<E> {
     /// Wait for the expert stores' reads and copies (before the process ends).
     pub fn settle(&mut self) -> Result<(), String> {
         self.engines.settle()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A toy model over a small vocabulary: after a sequence it favors the token that followed the
+    /// last token's previous occurrence (else a fixed successor), with smaller logits for the rest
+    /// that depend on the whole sequence. It verifies up to `rows` tokens a pass.
+    struct Toy {
+        vocabulary: usize,
+        rows: usize,
+        held: Vec<u32>,
+        verified_from: Option<usize>,
+    }
+
+    impl Toy {
+        fn logits(&self) -> Vec<f32> {
+            let seq = &self.held;
+            let last = *seq.last().unwrap();
+            let favored = seq[..seq.len() - 1].iter().rposition(|&token| token == last)
+                .map_or((last * 3 + 1) % self.vocabulary as u32, |at| seq[at + 1]);
+            let mut hash = seq.iter().fold(0x9e37_79b9_7f4a_7c15u64, |hash, &token| (hash ^ u64::from(token)).wrapping_mul(0x100_0000_01b3));
+            (0..self.vocabulary as u32).map(|token| {
+                hash = hash.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                (hash >> 40) as f32 / (1u64 << 24) as f32 + if token == favored { 2.0 } else { 0.0 }
+            }).collect()
+        }
+    }
+
+    impl Engines for Toy {
+        fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+            self.held.extend_from_slice(tokens);
+            self.verified_from = None;
+            Ok(self.logits())
+        }
+        fn reset(&mut self) {
+            self.held.clear();
+        }
+        fn counts(&self) -> (u64, u64, u64) {
+            (0, 0, 0)
+        }
+        fn contents(&self) -> Contents {
+            (Vec::new(), Vec::new())
+        }
+        fn warm(&mut self, _: &[(usize, usize)], _: &[(usize, usize)]) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn poll(&mut self) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn devices_per_expert(&self) -> usize {
+            1
+        }
+        fn gpus(&self) -> Vec<&Backend> {
+            Vec::new()
+        }
+        fn settle(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn verify_rows(&self) -> usize {
+            self.rows
+        }
+        fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+            assert!(tokens.len() <= self.rows);
+            self.verified_from = Some(self.held.len());
+            let mut rows = Vec::new();
+            for &token in tokens {
+                self.held.push(token);
+                rows.extend(self.logits());
+            }
+            Ok(rows)
+        }
+        fn rewind(&mut self, keep: usize) -> Result<(), String> {
+            let from = self.verified_from.take().ok_or("no verify to rewind")?;
+            self.held.truncate(from + keep);
+            Ok(())
+        }
+    }
+
+    fn run(rows: usize, prompt: &[u32], end: &[u32], max_new: usize, sampling: &Sampling, seed: u64) -> (Vec<u32>, Decoded) {
+        let mut toy = Toy { vocabulary: 8, rows, held: Vec::new(), verified_from: None };
+        let mut history = prompt.to_vec();
+        let logits = toy.forward(prompt).unwrap();
+        let mut out = Vec::new();
+        let decoded = decode(&mut toy, &mut history, logits, 8, end, max_new, sampling, seed, &|| false, &mut |token| out.push(token)).unwrap();
+        // the engines hold what the session thinks they hold
+        assert_eq!(toy.held, history);
+        assert_eq!(history.len(), prompt.len() + decoded.emitted - usize::from(decoded.emitted == max_new), "{decoded:?}");
+        (out, decoded)
+    }
+
+    const PROMPT: [u32; 9] = [1, 2, 3, 4, 5, 1, 2, 3, 6];
+
+    #[test]
+    fn greedy_drafts_change_nothing_but_the_passes() {
+        let greedy = Sampling { temperature: 0.0, ..Sampling::recommended(false) };
+        let (plain, plain_done) = run(1, &PROMPT, &[], 300, &greedy, 1);
+        assert_eq!((plain_done.drafted, plain_done.passes), (0, 299));
+        for rows in [2, 3, 4] {
+            let (drafted, done) = run(rows, &PROMPT, &[], 300, &greedy, 1);
+            assert_eq!(drafted, plain, "{rows} rows");
+            assert!(done.accepted > 0 && done.passes < plain_done.passes, "{rows} rows: {done:?}");
+        }
+    }
+
+    #[test]
+    fn an_end_token_or_the_limit_ends_a_reply_as_without_drafts() {
+        let greedy = Sampling { temperature: 0.0, ..Sampling::recommended(false) };
+        for end in [vec![5], vec![6], vec![0]] {
+            for max_new in [1, 2, 7, 40] {
+                let (plain, _) = run(1, &PROMPT, &end, max_new, &greedy, 3);
+                let (drafted, _) = run(4, &PROMPT, &end, max_new, &greedy, 3);
+                assert_eq!(drafted, plain, "end {end:?}, at most {max_new}");
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_drafts_keep_the_target_distribution() {
+        let sampling = Sampling { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, presence_penalty: 0.0 };
+        let trials = 6000;
+        let mut counts = [[[0usize; 8]; 6]; 2];
+        let mut accepted = 0;
+        for (side, rows) in [1, 4].into_iter().enumerate() {
+            for seed in 0..trials {
+                let (out, done) = run(rows, &PROMPT, &[], 6, &sampling, seed as u64 * 7919 + 13);
+                accepted += done.accepted;
+                for (position, &token) in out.iter().enumerate() {
+                    counts[side][position][token as usize] += 1;
+                }
+            }
+        }
+        // (the favored token's probability is about a half, so about every other draft is taken)
+        assert!(accepted > trials / 10, "drafts were accepted ({accepted})");
+        // every position's token frequencies agree within sampling noise
+        for (position, (plain, drafted)) in counts[0].iter().zip(&counts[1]).enumerate() {
+            for (token, (&a, &b)) in plain.iter().zip(drafted).enumerate() {
+                let (a, b) = (a as f64 / trials as f64, b as f64 / trials as f64);
+                assert!((a - b).abs() < 0.03, "position {position}, token {token}: {a:.3} vs {b:.3}");
+            }
+        }
     }
 }

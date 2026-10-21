@@ -5,6 +5,7 @@ pub mod arch;
 pub mod bundle;
 pub mod chat;
 pub mod digest;
+pub mod drafts;
 pub mod exchange;
 pub mod experts;
 pub mod formats;
