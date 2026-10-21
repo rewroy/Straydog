@@ -189,8 +189,9 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
     }
     let tree_directory = Some(settings.data_dir.join("verity")).filter(|directory| directory.is_dir());
     if bundle::is_on_demand(&settings.quant) {
-        let shards = bundle::on_demand(&settings.quant)?.shards;
-        let mut files: Vec<PathBuf> = shards.iter().map(|asset| settings.model.join(&asset.name)).collect();
+        let pins = bundle::on_demand(&settings.quant)?;
+        let mut files: Vec<PathBuf> =
+            pins.shards.iter().chain(&pins.resources).map(|asset| settings.model.join(&asset.name)).collect();
         files.extend(trees);
         return Ok(straydog_isolation::Exposure {
             executable: std::env::current_exe().map_err(|exc| exc.to_string())?,

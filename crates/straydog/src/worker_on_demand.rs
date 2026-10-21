@@ -1,13 +1,17 @@
-//! The worker's DeepSeek-V4.1 side: a bundle read on demand ([`straydog_engine::pinned`]), its
-//! tokenizer and chat template from the GGUF's own metadata, and the request loop of
-//! [`crate::worker`] over [`straydog_engine::arch::deepseek41::serve::Model`].
+//! The worker's side of a bundle read on demand ([`straydog_engine::pinned`]): the architecture the
+//! bundle's pins name places its engines (DeepSeek-V4.1, Qwen3.5 MoE) into a served session, the
+//! tokenizer and chat template come from the model's pinned resources (else the GGUF's own
+//! metadata), and the request loop of [`crate::worker`] runs over it.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use straydog_engine::arch::deepseek41::serve::{Model, Settings};
+use straydog_engine::arch::served::{Engines, Session, Settings};
+use straydog_engine::arch::{deepseek41, qwen35moe};
+use straydog_engine::bundle;
 use straydog_engine::chat::ChatTemplate;
 use straydog_engine::group::SplitMode;
 use straydog_engine::pyjson;
@@ -18,10 +22,15 @@ use crate::worker::{refused, serve, Failure, Output, Served, WorkerArgs};
 
 /// The model and its template, on the thread that made them: the engines hold device state that
 /// stays on one thread.
-struct DeepSeek {
-    model: Model,
+struct Loaded<E: Engines> {
+    model: Session<E>,
     template: ChatTemplate,
+    /// Whether the template takes a reasoning effort of its own (DeepSeek-V4.1's levels).
+    efforts: bool,
 }
+
+/// How an architecture's engines are placed.
+type Place<E> = fn(&Path, &str, &Path, &Settings, &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Session<E>, String>;
 
 /// A request for the model's thread.
 enum Job {
@@ -69,6 +78,15 @@ impl Served for Handle {
 }
 
 pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
+    match bundle::architecture_of(&args.quant)?.as_str() {
+        "deepseek41" => run::<deepseek41::serve::Engines>(args, output, report, deepseek41::serve::place),
+        "qwen35moe" => run::<qwen35moe::serve::Engines>(args, output, report, qwen35moe::serve::place),
+        other => Err(format!("no engine for the {other} architecture")),
+    }
+}
+
+fn run<E: Engines + 'static>(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync), place: Place<E>)
+                             -> Result<(), String> {
     let data_dir = args.data_dir.as_deref().ok_or("a bundle read on demand needs its data directory (the verity trees)")?;
     let host_memory_bytes = if args.host_memory_bytes > 0 { args.host_memory_bytes } else { straydog_engine::host::host_memory_bytes() };
     let settings = Settings {
@@ -85,10 +103,10 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let mut deepseek = match load(args, data_dir, &settings, report) {
-                Ok((deepseek, frame, text)) => {
+            let mut served = match load(args, data_dir, &settings, report, place) {
+                Ok((served, frame, text)) => {
                     let _ = loaded.send(Ok((frame, text)));
-                    deepseek
+                    served
                 }
                 Err(error) => {
                     let _ = loaded.send(Err(error));
@@ -102,7 +120,7 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
                     Some(_) => match queue.recv_timeout(std::time::Duration::from_millis(2)) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            match deepseek.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
+                            match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                 Ok(false) => {}
                                 Ok(true) => {
                                     eprintln!("Straydog warmed up in {:.1} s", warming.unwrap().elapsed().as_secs_f64());
@@ -124,16 +142,16 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
                 };
                 match job {
                     Job::Run { body, id, output, cancel, started, text, reply } => {
-                        let _ = reply.send(deepseek.run(&text, &output, &id, &body, &cancel, started));
+                        let _ = reply.send(served.run(&text, &output, &id, &body, &cancel, started));
                     }
                     Job::Reset(reply) => {
-                        deepseek.model.reset();
+                        served.model.reset();
                         let _ = reply.send(Ok(()));
                     }
                     Job::WarmState(reply) => {
-                        let _ = reply.send(deepseek.model.warm_state());
+                        let _ = reply.send(served.model.warm_state());
                     }
-                    Job::Warm(state) => match deepseek.model.warm(&state) {
+                    Job::Warm(state) => match served.model.warm(&state) {
                         Ok(count) => {
                             eprintln!("Straydog warming up with {count} experts");
                             warming = Some(Instant::now());
@@ -142,7 +160,7 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
                     },
                 }
             }
-            if let Err(error) = deepseek.model.settle() {
+            if let Err(error) = served.model.settle() {
                 eprintln!("Straydog could not settle the expert store: {error}");
             }
         });
@@ -153,17 +171,28 @@ pub(crate) fn main(args: &WorkerArgs, output: Output, report: &(dyn Fn(&str, u64
 }
 
 /// Open, authenticate and place the model; the ready frame.
-fn load(args: &WorkerArgs, data_dir: &std::path::Path, settings: &Settings, report: &(dyn Fn(&str, u64, u64) + Sync))
-        -> Result<(DeepSeek, Value, Arc<Text>), String> {
+fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, report: &(dyn Fn(&str, u64, u64) + Sync),
+                    place: Place<E>) -> Result<(Loaded<E>, Value, Arc<Text>), String> {
     report("open", 0, 0);
-    let mut model = Model::new(&args.model, &args.quant, data_dir, settings, report)?;
+    let mut model = place(&args.model, &args.quant, data_dir, settings, report)?;
     report("prepare", 0, 0);
     let header = model.header();
-    let text = Text::from_gguf(header).map_err(|exc| exc.to_string())?;
-    let source = header.metadata.get("tokenizer.chat_template").and_then(|value| value.text())
-        .ok_or("the GGUF has no chat template")?;
-    let template = ChatTemplate::new(source).map_err(|exc| exc.0)?;
     let architecture = header.architecture.clone();
+    // The official tokenizer and chat template when the bundle pins them, else the GGUF's.
+    let resources = bundle::on_demand(&args.quant)?.resources;
+    let resource = |name: &str| resources.iter().find(|asset| asset.name == name)
+        .map(|asset| straydog_engine::pinned::resource(&args.model, asset)).transpose();
+    let text = match resource("tokenizer.json")? {
+        Some(json) => Text::new(&json),
+        None => Text::from_gguf(header),
+    }.map_err(|exc| exc.to_string())?;
+    let source = match resource("chat_template.jinja")? {
+        Some(bytes) => String::from_utf8(bytes).map_err(|exc| exc.to_string())?,
+        None => header.metadata.get("tokenizer.chat_template").and_then(|value| value.text())
+            .ok_or("the GGUF has no chat template")?.to_string(),
+    };
+    let template = ChatTemplate::new(&source).map_err(|exc| exc.0)?;
+    let efforts = architecture == "deepseek41";
     report("warm", 0, 0);
     let warming = Instant::now();
     // One short prompt and a token, so no request pays for the first passes' setup.
@@ -185,23 +214,26 @@ fn load(args: &WorkerArgs, data_dir: &std::path::Path, settings: &Settings, repo
         "load_seconds": seconds,
         "gpu": model.info()?,
     });
-    Ok((DeepSeek { model, template }, frame, Arc::new(text)))
+    Ok((Loaded { model, template, efforts }, frame, Arc::new(text)))
 }
 
-impl DeepSeek {
+impl<E: Engines> Loaded<E> {
     fn run(&mut self, text: &Text, output: &Output, id: &str, body: &pyjson::Value, cancel: &AtomicBool, started: Instant)
            -> Result<Value, Failure> {
         use pyjson::Value as Py;
         let messages = body.get("messages").ok_or_else(|| refused("'messages'"))?;
         let tools = body.get("tools").cloned().unwrap_or(Py::Null);
         let thinking = body.get("thinking").is_some_and(Py::truthy);
-        // The template's own levels (low 50, medium 62, high 75, max 100); it refuses others.
-        let effort = match body.get("reasoning_effort") {
-            None | Some(Py::Null) => Py::Str("high".into()),
-            Some(effort @ Py::Str(_)) => effort.clone(),
-            Some(_) => return Err(refused("invalid Straydog reasoning effort")),
-        };
-        let variables = [("enable_thinking", Py::Bool(thinking)), ("reasoning_effort", effort)];
+        let mut variables = vec![("enable_thinking", Py::Bool(thinking))];
+        if self.efforts {
+            // The template's own levels (low 50, medium 62, high 75, max 100); it refuses others.
+            let effort = match body.get("reasoning_effort") {
+                None | Some(Py::Null) => Py::Str("high".into()),
+                Some(effort @ Py::Str(_)) => effort.clone(),
+                Some(_) => return Err(refused("invalid Straydog reasoning effort")),
+            };
+            variables.push(("reasoning_effort", effort));
+        }
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
         let ids = text.encode(&prompt).map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
         let encode_seconds = started.elapsed().as_secs_f64();

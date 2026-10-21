@@ -204,9 +204,12 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
 /// Bundles read on demand (docs/DESIGN.md §10): too large to hash whole at each start, each shard
 /// is pinned by size, SHA-256 and the fs-verity digest of its Merkle tree (`crate::verity`). The
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
-/// worker checks every block it uses against them.
-pub const ON_DEMAND_MANIFEST: &str = include_str!("assets_deepseek41.json");
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 1] = ["UD-IQ2_XXS"];
+/// worker checks every block it uses against them. A model whose official repository gives its
+/// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
+pub const ON_DEMAND_MANIFESTS: [&str; 3] =
+    [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"), include_str!("assets_ornith.json")];
+/// Every on-demand quantization, with the manifest that pins it.
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 3] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -217,22 +220,25 @@ pub struct OnDemand {
     pub shards: Vec<Asset>,
     /// Each shard's fs-verity digest, hex.
     pub verity: Vec<String>,
+    /// Official files beside the shards (tokenizer, chat template, generation config), if any.
+    pub resources: Vec<Asset>,
 }
 
-fn on_demand_manifest() -> Result<Value, String> {
-    let manifest: Value = serde_json::from_str(ON_DEMAND_MANIFEST).map_err(|exc| exc.to_string())?;
-    if manifest["schema"] != 1 || !manifest["model"].is_string() || !manifest["architecture"].is_string() {
+/// The manifest pinning an on-demand quantization.
+fn on_demand_manifest(quantization: &str) -> Result<Value, String> {
+    let index = ON_DEMAND_QUANTIZATIONS.iter().position(|known| *known == quantization)
+        .ok_or_else(|| format!("unsupported Straydog model quantization: {quantization}"))?;
+    let manifest: Value = serde_json::from_str(ON_DEMAND_MANIFESTS[index]).map_err(|exc| exc.to_string())?;
+    if manifest["schema"] != 1 || !manifest["model"].is_string() || !manifest["architecture"].is_string()
+        || !manifest["bundles"][quantization].is_object() {
         return Err("unsupported Straydog on-demand manifest".into());
     }
     Ok(manifest)
 }
 
-/// One on-demand quantization's shards and their digests.
+/// One on-demand quantization's shards, their digests and the model's resources.
 pub fn on_demand(quantization: &str) -> Result<OnDemand, String> {
-    if !ON_DEMAND_QUANTIZATIONS.contains(&quantization) {
-        return Err(format!("unsupported Straydog model quantization: {quantization}"));
-    }
-    let manifest = on_demand_manifest()?;
+    let manifest = on_demand_manifest(quantization)?;
     let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
     let shards = listed.iter().map(asset).collect::<Result<Vec<_>, _>>()?;
     let verity = listed
@@ -242,32 +248,47 @@ pub fn on_demand(quantization: &str) -> Result<OnDemand, String> {
             _ => Err("manifest asset without a verity digest".to_string()),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let resources = match manifest["resources"]["assets"].as_array() {
+        Some(items) => items.iter().map(asset).collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
     Ok(OnDemand {
         model: manifest["model"].as_str().unwrap().to_string(),
         architecture: manifest["architecture"].as_str().unwrap().to_string(),
         quantization: quantization.to_string(),
         shards,
         verity,
+        resources,
     })
 }
 
-/// Where every shard of an on-demand quantization comes from (provisioning only).
+/// Where every file of an on-demand quantization comes from: its shards, then the resources
+/// (provisioning only).
 pub fn on_demand_sources(quantization: &str) -> Result<Vec<Source>, String> {
     let pins = on_demand(quantization)?;
-    let manifest = on_demand_manifest()?;
+    let manifest = on_demand_manifest(quantization)?;
     let text = |value: &Value, what: &str| -> Result<String, String> {
         value.as_str().map(str::to_string).ok_or_else(|| format!("manifest without {what}"))
     };
     let repository = text(&manifest["repository"], "a repository")?;
     let revision = text(&manifest["revision"], "a revision")?;
     let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
-    pins.shards
+    let mut sources = pins.shards
         .into_iter()
         .zip(listed)
         .map(|(asset, item)| {
             Ok(Source { asset, repository: repository.clone(), revision: revision.clone(), path: text(&item["source_path"], "a source path")? })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    if !pins.resources.is_empty() {
+        let resources = &manifest["resources"];
+        let (repository, revision) = (text(&resources["repository"], "a resource repository")?, text(&resources["revision"], "a resource revision")?);
+        for asset in pins.resources {
+            let path = asset.name.clone();
+            sources.push(Source { asset, repository: repository.clone(), revision: revision.clone(), path });
+        }
+    }
+    Ok(sources)
 }
 
 /// Whether a quantization names an on-demand bundle.
@@ -321,4 +342,31 @@ pub fn default_data_dir(model: &std::path::Path) -> std::path::PathBuf {
 /// checked against the pinned digest when opened.
 pub fn tree_path(data_dir: &std::path::Path, shard: &Asset) -> std::path::PathBuf {
     data_dir.join("verity").join(format!("{}.verity", shard.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every on-demand quantization has its manifest: a model, an architecture, verity digests for
+    /// every shard, and its official resources from their own repository.
+    #[test]
+    fn on_demand_bundles_pin_their_shards_and_resources() {
+        for quantization in ON_DEMAND_QUANTIZATIONS {
+            let pins = on_demand(quantization).unwrap();
+            assert_eq!(pins.verity.len(), pins.shards.len(), "{quantization}");
+            assert!(!pins.shards.is_empty() && pins.shards.iter().all(|asset| asset.sha256.len() == 64), "{quantization}");
+            let sources = on_demand_sources(quantization).unwrap();
+            assert_eq!(sources.len(), pins.shards.len() + pins.resources.len(), "{quantization}");
+            assert!(is_on_demand(quantization) && !QUANTIZATIONS.contains(&quantization));
+        }
+        assert_eq!((model_of("UD-Q8_K_XL").unwrap().as_str(), architecture_of("UD-Q8_K_XL").unwrap().as_str()),
+                   ("Qwen3.6-35B-A3B", "qwen35moe"));
+        assert_eq!((model_of("Q8_0").unwrap().as_str(), architecture_of("Q8_0").unwrap().as_str()), ("Ornith-1.5-122B", "qwen35moe"));
+        let qwen = on_demand_sources("UD-Q8_K_XL").unwrap();
+        let tokenizer = qwen.iter().find(|source| source.asset.name == "tokenizer.json").unwrap();
+        assert_eq!((tokenizer.repository.as_str(), tokenizer.path.as_str()), ("Qwen/Qwen3.6-35B-A3B", "tokenizer.json"));
+        assert!(on_demand("UD-IQ2_XXS").unwrap().resources.is_empty());
+        assert!(on_demand("IQ3_S").is_err());
+    }
 }

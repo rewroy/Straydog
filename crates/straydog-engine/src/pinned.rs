@@ -184,6 +184,25 @@ impl Pinned {
 
 }
 
+/// The largest resource (tokenizer, chat template, generation config) read whole.
+const RESOURCE_LIMIT: u64 = 32 << 20;
+
+/// A bundle's resource in `root`, read whole and checked against its pinned size and SHA-256.
+pub fn resource(root: &Path, asset: &bundle::Asset) -> Result<Vec<u8>, String> {
+    use sha2::Digest;
+    if asset.bytes > RESOURCE_LIMIT {
+        return Err(format!("Straydog resource {} exceeds the size limit", asset.name));
+    }
+    let mut file = File::open(root.join(&asset.name)).map_err(|exc| format!("{}: {exc}", asset.name))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, RESOURCE_LIMIT + 1), &mut data).map_err(|exc| exc.to_string())?;
+    let digest: String = sha2::Sha256::digest(&data).iter().map(|byte| format!("{byte:02x}")).collect();
+    if data.len() as u64 != asset.bytes || digest != asset.sha256 {
+        return Err(format!("Straydog asset digest mismatch: {}", asset.name));
+    }
+    Ok(data)
+}
+
 /// Rows of a table tensor (its second dimension).
 fn table_rows(name: &str, info: &TensorInfo) -> Result<u64, String> {
     info.dimensions.get(1).copied().filter(|&rows| rows > 0 && info.bytes.is_multiple_of(rows))
@@ -339,7 +358,7 @@ mod tests {
             verity.push(digest.iter().map(|byte| format!("{byte:02x}")).collect());
             assets.push(asset);
         }
-        let pins = OnDemand { model: "test".into(), architecture: "deepseek41".into(), quantization: "TEST".into(), shards: assets, verity };
+        let pins = OnDemand { model: "test".into(), architecture: "deepseek41".into(), quantization: "TEST".into(), shards: assets, verity, resources: Vec::new() };
         Bundle { root, pins }
     }
 

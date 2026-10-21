@@ -453,3 +453,33 @@ shutdown, and keeps them in the data directory (`<data-dir>/warm/<quant>-<key>.j
 hashing the pinned shards and the placement, written by the runtime: the worker has no write
 access). After the next start with the same model and placement is ready, the worker reads those
 experts back while no request runs, a few reads at a time behind any pass's.
+
+### 10.3 Qwen3.5 MoE (Qwen3.6-35B-A3B UD-Q8_K_XL, Ornith-1.5-122B Q8_0)
+
+The `qwen35moe` architecture: one residual stream through blocks whose mixer is either a Gated
+DeltaNet (three of every four) or gated full attention, each followed by a softmax top-8 MoE
+with a sigmoid-gated shared expert. Its definitions follow the reference implementation
+(llama.cpp `qwen35moe` at ead9f32, over the same GGUF), checked layer by layer on a fixed prompt
+(examples/q35_reference on the CPU in F64-accumulated F32, examples/q35_chat on the GPU engine).
+
+- **DeltaNet**: `attn_qkv` gives [q (key heads) | k (key heads) | v (value heads)], convolved per
+  channel over the last `ssm.conv_kernel` inputs and passed through SiLU; q and k are
+  L2-normalized per head (q also scaled by 1/sqrt(dim)); value head h reads key head
+  h mod (key heads); the state decays by exp(`ssm_a` * softplus(alpha + `ssm_dt`)), takes the
+  delta rule with sigmoid(beta), and is read by q; the output is RMS-normed per head and gated by
+  SiLU of `attn_gate` (the reference's gate: SiLU, where Qwen3.8's is a sigmoid), then `ssm_out`.
+- **Attention**: `attn_q` gives each head's query then its gate; q and k are RMS-normed per head,
+  the leading `rope.dimension_count` values rotate in pairs (i, i + half) at the text position
+  (every IMRoPE section reads the same position for text), causal grouped-query attention over
+  the K/V, times sigmoid of the gate, then `attn_output`.
+- **MoE**: softmax over the experts, the top `expert_used_count` weighted by their normalized
+  probabilities, SwiGLU experts; the shared expert's output scaled by sigmoid(`ffn_gate_inp_shexp`
+  · x). The MTP block after the main layers is not run.
+
+Served as a bundle read on demand: the GGUF pinned by size, SHA-256 and fs-verity digest, the
+official tokenizer, chat template and generation config pinned as resources (read whole and
+hashed; Unsloth's GGUF embeds a modified template, which is not used). Its layers are split across
+the GPUs balancing the dense bytes, each GPU's VRAM left after its dense weights, DeltaNet states
+and K/V going to expert slots sized per layer's experts (Qwen3.6 mixes Q8_0 and BF16 experts), and
+the host tier as for DeepSeek-V4.1. Replies split as Qwen's do (`</think>`, `<tool_call>`) and end
+at the generation config's end tokens; unset sampling follows `general.sampling.*`.

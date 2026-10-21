@@ -6,4 +6,4 @@ pub mod monitor;
 pub mod progress;
 pub mod runtime;
 pub mod worker;
-mod worker_deepseek41;
+mod worker_on_demand;

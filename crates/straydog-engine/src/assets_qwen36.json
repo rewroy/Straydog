@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "model": "Qwen3.6-35B-A3B",
+  "architecture": "qwen35moe",
+  "repository": "unsloth/Qwen3.6-35B-A3B-GGUF",
+  "revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+  "resources": {
+    "repository": "Qwen/Qwen3.6-35B-A3B",
+    "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    "assets": [
+      {"name": "tokenizer.json", "bytes": 12807982, "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"},
+      {"name": "chat_template.jinja", "bytes": 7764, "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"},
+      {"name": "generation_config.json", "bytes": 202, "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"}
+    ]
+  },
+  "bundles": {
+    "UD-Q8_K_XL": {
+      "assets": [
+        {
+          "name": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+          "source_path": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+          "bytes": 38451182560,
+          "sha256": "b762215c5f507f4865df4ac3d1afa803828afa41e05ecac3fac431a67bbd88e8",
+          "verity": "553f7132b68a8813dc3a20554b8e827c04697776edfc5c57f01f059292f63ad7"
+        }
+      ]
+    }
+  }
+}

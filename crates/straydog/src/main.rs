@@ -40,7 +40,7 @@ enum Command {
         /// The bundle directory
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
-        /// Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB) or UD-IQ2_XXS (DeepSeek-V4.1-Flash, 300.5 GB)
+        /// Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB), UD-IQ2_XXS (DeepSeek-V4.1-Flash, 300.5 GB), UD-Q8_K_XL (Qwen3.6-35B-A3B, 38.5 GB) or Q8_0 (Ornith-1.5-122B, 132.6 GB)
         #[arg(long, value_name = "NAME")]
         quant: String,
         /// Authenticate what is there; download nothing

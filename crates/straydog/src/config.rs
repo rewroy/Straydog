@@ -41,7 +41,7 @@ pub struct Options {
     /// Model bundle: its directory (the pinned GGUF shards and tokenizer files of one quantization) or one of its shards
     #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "PATH")]
     pub model: Option<PathBuf>,
-    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next) or UD-IQ2_XXS (DeepSeek-V4.1-Flash) [default: detected from its files]
+    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), UD-IQ2_XXS (DeepSeek-V4.1-Flash), UD-Q8_K_XL (Qwen3.6-35B-A3B) or Q8_0 (Ornith-1.5-122B) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
     /// MTP drafter: its directory or its GGUF file (also -md)
@@ -298,7 +298,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     }
     let quant = match options.quant.or(shard_quant) {
         Some(quant) if bundle::quantizations().any(|known| known == quant) => quant,
-        Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S or UD-IQ2_XXS")),
+        Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S, UD-IQ2_XXS, UD-Q8_K_XL or Q8_0")),
         None => detect_quantization(&model)?,
     };
     // The shards' verity trees and the warm-up state: beside the model unless given elsewhere
@@ -516,6 +516,18 @@ mod tests {
         assert!(crate::runtime::exposure(&settings).unwrap_err().contains("no verity tree"));
         std::fs::remove_dir_all(model).unwrap();
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn the_qwen35_bundles_are_found_by_their_files() {
+        for (quant, alias) in [("UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL"), ("Q8_0", "Ornith-1.5-122B-Q8_0")] {
+            let model = bundle_directory(quant);
+            let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+            assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, 64));
+            let shard = model.join(&bundle::shards(quant).unwrap()[0].name);
+            assert_eq!(resolve(Options { model: Some(shard), ..Options::default() }).unwrap().quant, quant);
+            std::fs::remove_dir_all(model).unwrap();
+        }
     }
 
     #[test]

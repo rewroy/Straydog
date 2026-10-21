@@ -151,7 +151,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     if straydog_engine::bundle::is_on_demand(&args.quant) {
-        return crate::worker_deepseek41::main(&args, output, &|stage, done, total| loading.report(stage, done, total));
+        return crate::worker_on_demand::main(&args, output, &|stage, done, total| loading.report(stage, done, total));
     }
     let split = if args.split_mode == "layer" { SplitMode::Layer } else { SplitMode::Experts };
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);

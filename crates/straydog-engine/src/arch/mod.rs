@@ -3,6 +3,7 @@
 
 pub mod deepseek41;
 pub mod qwen35moe;
+pub mod served;
 
 use straydog_gguf::{Metadata, ModelHeader};
 
