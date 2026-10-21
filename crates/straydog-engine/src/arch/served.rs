@@ -67,10 +67,14 @@ pub trait Engines {
     }
 }
 
-/// Per GPU: VRAM kept for the runtime's own buffers, the passes' work buffers and their scratch
-/// (measured with a 64-row batch: 1.3-1.5 GiB), beside the dense weights, the sequence state and
-/// the expert slots.
-pub const RESERVE: u64 = 2 << 30;
+/// Per GPU: VRAM kept beside what a placement counts (dense weights, sequence state, a pass's rows,
+/// the scratch and the expert slots) for the runtime's own memory, which Straydog's budget does
+/// not see: code, BLAS handles, graphs, kernels' scratch. Measured as the card's peak (sysfs) less
+/// the counted bytes over cold, follow-up, 4K-document and warm requests: DeepSeek-V4.1 on two
+/// R9700s 0.83-0.97 GiB (a 12.9K-token prefill included), Qwen3.6 at --vram 6 on one 0.93-1.04
+/// GiB (more with a larger prefill batch). 1.5 GiB left the card 0.06 GiB under the budget at its
+/// peak; this keeps ~0.2 GiB.
+pub const RESERVE: u64 = 13 << 27;
 pub const SCRATCH: u64 = 512 << 20;
 /// Without a host tier budget, Straydog takes this share of the host memory in all, and the
 /// experts' host tier what its other host memory leaves of it: the row cache, and the rest below.
