@@ -164,6 +164,9 @@ pub struct Engine<'a, T: Tensors> {
     /// Partially resident decode steps pipelined with the CPU (made at the first), or not possible.
     hybrid: Option<hybrid::Hybrid>,
     hybrid_off: bool,
+    /// A prompt wave's expert table for the grouped GEMMs (made at the first; experts outside the
+    /// wave are empty entries).
+    wave_groups: Option<Buffer>,
 }
 
 fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
@@ -313,6 +316,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             compare: std::env::var_os("Q35_COMPARE").map(PathBuf::from).filter(|_| part.is_whole()),
             hybrid: None,
             hybrid_off: false,
+            wave_groups: None,
         };
         engine.upload_dense()?;
         if engine.settings.resident {
@@ -1089,12 +1093,22 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let by_expert: Vec<(usize, Users)> = by_expert.into_iter().collect();
         let waves: Vec<&[(usize, Users)]> = by_expert.chunks(WAVE.min(self.experts.wave_limit())).collect();
         let scratch = self.scratch;
+        // Many rows: each wave's experts as grouped GEMMs over all of their rows, as resident
+        // experts run (when this device takes them), else expert by expert.
+        let mut grouped = n >= GROUPED_ROWS && std::env::var_os("Q35_WAVE_GROUPED").is_none_or(|value| value != "0");
         for (index, wave) in waves.iter().enumerate() {
             let experts: Vec<usize> = wave.iter().map(|(expert, _)| *expert).collect();
             let slots = self.experts.acquire(&mut self.gpu, layer, &experts)?;
             if let Some(next) = waves.get(index + 1) {
                 let experts: Vec<usize> = next.iter().map(|(expert, _)| *expert).collect();
                 self.experts.prefetch(&mut self.gpu, layer, &experts, true)?;
+            }
+            if grouped {
+                grouped = self.wave_grouped(n, &experts, &slots, kinds, offsets)?;
+                if grouped {
+                    self.experts.release(&mut self.gpu)?;
+                    continue;
+                }
             }
             for ((_, (rows, user_weights)), slot) in wave.iter().zip(slots) {
                 let count = rows.len() as u64;
@@ -1118,6 +1132,24 @@ impl<'a, T: Tensors> Engine<'a, T> {
 }
 
 impl<T: Tensors> Engine<'_, T> {
+    /// A prompt wave's experts (in `slots`) over the pass's `n` rows as grouped GEMMs, the routes
+    /// to other experts left out, added to `out`; false when this device does not take them.
+    fn wave_grouped(&mut self, n: usize, experts: &[usize], slots: &[Buffer], kinds: [u32; 3], offsets: [u64; 3]) -> Result<bool> {
+        let hp = self.hp.clone();
+        let (w, k, ff, count, work, scratch) = (hp.width, hp.experts_used, hp.expert_ff, hp.experts, self.work, self.scratch);
+        let groups = match self.wave_groups {
+            Some(groups) => groups,
+            None => *self.wave_groups.insert(self.gpu.buffer(count as u64 * Backend::moe_group_bytes())?),
+        };
+        let mut bases = vec![0u64; count];
+        for (&expert, slot) in experts.iter().zip(slots) {
+            bases[expert] = slot.base() as u64;
+        }
+        self.gpu.moe_groups(&groups, &bases, offsets, kinds, w as u64, ff as u64)?;
+        self.gpu.experts_grouped(groups.base(), count as u64, work.ids.base(), work.weights.base(), n as u64, k as u64, w as u64, ff as u64,
+                                 kinds, work.x.base(), &scratch, work.out.base())
+    }
+
     /// A decode step's routed experts: those the host tier holds on the CPU, from host memory (the
     /// step's input and their weights read back with the routes), the others on the GPU from VRAM
     /// slots (acquired as before: the drive's go through the host tier into VRAM). The CPU's sum

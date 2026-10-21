@@ -551,4 +551,6 @@ Where its experts go depends on what the GPUs hold:
   table at the next step. A pass that changes the slots otherwise (a prompt's waves) has the table
   built from the store again. A failure cancels the GPU's waits (they then take zeros and the
   step errors); a wait that outlasts ten seconds gives up the same way.
-  Prefill still uploads the experts it needs, in waves.
+  Prefill still uploads the experts it needs, in waves; a pass of 16 rows or more runs each wave's
+  experts as the resident grouped GEMMs (an expert table holding the wave's slots, the others
+  empty entries), all of the pass's routes to them at once.
