@@ -566,13 +566,28 @@ impl DeviceExperts {
                 }
             }
         }
-        // Fills waiting for the drive upload as their reads land.
-        while slots.iter().any(|&slot| self.slots[slot].waiting.is_some()) {
-            self.pump(gpu, true)?;
-        }
-        for (&expert, &slot) in experts.iter().zip(&slots) {
-            if self.slots[slot].key != Some((layer as u32, expert as u32)) {
-                return Err(format!("expert {expert} of layer {layer} was not filled"));
+        // Fills waiting for the drive upload as their reads land. A prefetch an earlier pass of this
+        // layer cancelled may be taken before its read lands: the read then drops the expert, and
+        // it is read again here (an urgent read, never cancelled, so this ends).
+        loop {
+            while slots.iter().any(|&slot| self.slots[slot].waiting.is_some()) {
+                self.pump(gpu, true)?;
+            }
+            let mut again = false;
+            for (index, &expert) in experts.iter().enumerate() {
+                let key = (layer as u32, expert as u32);
+                if self.slots[slots[index]].key != Some(key) {
+                    let slot = match self.map.get(&key) {
+                        Some(&slot) => slot,
+                        None => self.fill(gpu, key, true)?,
+                    };
+                    self.hold(slot);
+                    slots[index] = slot;
+                    again = true;
+                }
+            }
+            if !again {
+                break;
             }
         }
         // Each upload stream runs in order: its newest mark among these slots covers its others.

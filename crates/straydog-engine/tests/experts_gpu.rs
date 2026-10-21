@@ -223,3 +223,43 @@ fn a_panicking_verifier_fails_its_read() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// A prefetch an earlier pass of its layer cancelled, taken by a later pass before its read
+/// lands: the pass still gets the expert (read again), with the file's bytes.
+#[test]
+fn a_cancelled_prefetch_taken_before_it_lands() {
+    let layers = roles();
+    let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-cancelled", std::process::id()));
+    std::fs::write(&path, (0..end + 333).map(byte).collect::<Vec<u8>>()).unwrap();
+    // Slow reads on one reader thread: the prefetch's later chunks are still queued when its
+    // layer's next pass cancels it.
+    let verifier: Verifier = Arc::new(|_, _, _: &[u8]| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(())
+    });
+    let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), Some(verifier)).unwrap());
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(1)), 16, 1 << 26).unwrap();
+    // Expert 3 resident first, so the pass that cancels the prefetch waits for no read of its own.
+    drop(store.acquire(&mut gpu, 0, &[3]).unwrap());
+    store.release(&mut gpu).unwrap();
+    store.settle(&mut gpu).unwrap();
+    store.prefetch(&mut gpu, 0, &[9], true).unwrap();
+    // This pass of layer 0 does not take expert 9: its read is cancelled midway.
+    drop(store.acquire(&mut gpu, 0, &[3]).unwrap());
+    store.release(&mut gpu).unwrap();
+    // The next pass takes it at once, before the cancelled read lands.
+    let slots = store.acquire(&mut gpu, 0, &[9, 3]).unwrap();
+    for (expert, slot) in [9, 3].into_iter().zip(&slots) {
+        let want = expected(layers[0].as_ref().unwrap(), expert);
+        let mut got = vec![0u8; want.len()];
+        gpu.read_buffer(slot, 0, &mut got).unwrap();
+        assert!(got == want, "expert {expert} differs after the cancelled prefetch");
+    }
+    store.release(&mut gpu).unwrap();
+    assert!(store.counts().prefetch_unused >= 1);
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
