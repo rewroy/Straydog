@@ -97,7 +97,14 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
     assert_eq!(samples[0]["decode"], 0.0);
     let since = samples[0]["time"].as_f64().unwrap();
     let (_, _, body) = get(&router, &format!("/dashboard/status?since={since}"), Some("sk-dashboard")).await;
-    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["samples"], serde_json::json!([]));
+    let newer = serde_json::from_slice::<Value>(&body).unwrap()["samples"].as_array().unwrap().clone();
+    // The sampler's first read can be slow enough to meet the next one-second tick.
+    // What this names is already returned, so it must not come back; a newer point may.
+    assert!(newer.len() <= 1, "{newer:?}");
+    assert!(newer.iter().all(|sample| sample["time"].as_f64().unwrap() > since), "{newer:?}");
+    for sample in &newer {
+        assert_eq!(sample["decode"], 0.0);
+    }
 
     let (_, _, body) = get(&router, "/dashboard/logs?after=0", Some("sk-dashboard")).await;
     let logs: Value = serde_json::from_slice(&body).unwrap();
