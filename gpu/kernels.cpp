@@ -102,6 +102,9 @@
 #define hipHostMallocPortable cudaHostAllocPortable
 #define hipEventDisableTiming cudaEventDisableTiming
 #define hipEventBlockingSync cudaEventBlockingSync
+#define hipDeviceSynchronize cudaDeviceSynchronize
+// (CUDA's page-locked memory is coherent with the devices that map it)
+#define hipHostMallocCoherent cudaHostAllocDefault
 // MSVC host compilation has no GNU attributes; CUDA's __align__ maps to the host's form.
 #define SD_ALIGN(n) __align__(n)
 #include <mma.h>
@@ -1003,6 +1006,51 @@ Device& device(void* handle) {
     auto& value = *static_cast<Device*>(handle);
     check(hipSetDevice(value.ordinal));
     return value;
+}
+// The host's side of words a device also reads or writes (a mapped flag): release stores, acquire
+// loads and a spin's pause, by GCC/Clang builtins or MSVC's volatile accesses with fences; and
+// size arithmetic that reports a wrap, by builtins or by hand.
+inline void host_store_release(unsigned* word, unsigned value) {
+#if defined(_MSC_VER)
+    std::atomic_thread_fence(std::memory_order_release);
+    *static_cast<volatile unsigned*>(word) = value;
+#else
+    __atomic_store_n(word, value, __ATOMIC_RELEASE);
+#endif
+}
+inline unsigned host_load_acquire(const unsigned* word) {
+#if defined(_MSC_VER)
+    const unsigned value = *static_cast<const volatile unsigned*>(word);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return value;
+#else
+    return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+#endif
+}
+inline void host_pause() {
+#ifdef __x86_64__
+    __builtin_ia32_pause();
+#elif defined(_M_X64)
+    _mm_pause();
+#endif
+}
+inline bool mul_overflows(uint64_t a, uint64_t b, uint64_t* product) {
+#if defined(_MSC_VER)
+    if (b && a > UINT64_MAX / b) return true;
+    *product = a * b;
+    return false;
+#else
+    return __builtin_mul_overflow(a, b, product);
+#endif
+}
+inline bool add_overflows(uint64_t a, uint64_t b, uint64_t* sum) {
+#if defined(_MSC_VER)
+    if (a > UINT64_MAX - b) return true;
+    *sum = a + b;
+    return false;
+#else
+    return __builtin_add_overflow(a, b, sum);
+#endif
 }
 #include "host_io.hpp"
 #include "peer.hpp"
@@ -2197,7 +2245,7 @@ int sd_buffer_read_start(void* handle, const void* buffer, uint64_t offset, uint
         if (!bytes || bytes > readback_capacity || offset > UINT64_MAX - bytes) throw std::runtime_error("invalid Straydog read");
         op_span(value, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes), "a read buffer");
         if (!value.readback) {
-            check(hipHostMalloc(reinterpret_cast<void**>(&value.readback), readback_capacity));
+            check(hipHostMalloc(reinterpret_cast<void**>(&value.readback), readback_capacity, hipHostMallocDefault));
             check(hipEventCreateWithFlags(&value.readback_done, hipEventDisableTiming));
         }
         check(hipMemcpyAsync(value.readback, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes), hipMemcpyDeviceToHost,
@@ -2444,7 +2492,7 @@ int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t
 inline size_t checked_product(std::initializer_list<uint64_t> factors) {
     uint64_t product = 1;
     for (const uint64_t factor : factors)
-        if (__builtin_mul_overflow(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
+        if (mul_overflows(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
     return size_t(product);
 }
 inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
@@ -2453,7 +2501,7 @@ inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
 inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
     uint64_t sum = 0;
     for (const uint64_t term : terms)
-        if (__builtin_add_overflow(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
+        if (add_overflows(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
     return size_t(sum);
 }
 inline unsigned checked_blocks(size_t count) {
@@ -2671,7 +2719,7 @@ int sd_route_mailbox_clear(void* handle) {
         if (!value.route_mailbox)   // (made here, outside any graph being recorded)
             check(hipHostMalloc(reinterpret_cast<void**>(&value.route_mailbox), 64 + route_mailbox_ids * 4,
                                 hipHostMallocCoherent | hipHostMallocMapped));
-        __atomic_store_n(reinterpret_cast<unsigned*>(value.route_mailbox), 0u, __ATOMIC_RELEASE);
+        host_store_release(reinterpret_cast<unsigned*>(value.route_mailbox), 0u);
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -2682,8 +2730,8 @@ int sd_route_mailbox_wait(void* handle, int32_t* out, uint64_t count) {
         if (!value.route_mailbox || !out || !count || count > route_mailbox_ids) throw std::runtime_error("no Straydog route mailbox");
         const auto* flag = reinterpret_cast<const unsigned*>(value.route_mailbox);
         const auto started = std::chrono::steady_clock::now();
-        for (unsigned spins = 1; __atomic_load_n(flag, __ATOMIC_ACQUIRE) != 1u; ++spins) {
-            __builtin_ia32_pause();
+        for (unsigned spins = 1; host_load_acquire(flag) != 1u; ++spins) {
+            host_pause();
             if (spins % 4096 == 0) {
                 // A stream that failed never raises the flag: its error instead of a wait without end.
                 const hipError_t state = hipStreamQuery(value.stream);
@@ -2851,8 +2899,8 @@ struct DeviceParts { const float* parts[sum_devices_max]; };
 __global__ void sum_devices_kernel(DeviceParts list, unsigned devices, size_t count, float* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
-    float sum = __hip_atomic_load(list.parts[0] + index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    for (unsigned d = 1; d < devices; ++d) sum += __hip_atomic_load(list.parts[d] + index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    float sum = link_load(list.parts[0] + index);
+    for (unsigned d = 1; d < devices; ++d) sum += link_load(list.parts[d] + index);
     out[index] = sum;
 }
 

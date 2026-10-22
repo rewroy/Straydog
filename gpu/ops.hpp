@@ -261,7 +261,11 @@ constexpr size_t hc_step_columns = 64;
 constexpr unsigned hc_step_threads = 256;   // a block's threads (its last block's loads are counted by them)
 // The last block reads what other blocks wrote from the device-wide cache, without ordering the loads.
 __device__ __forceinline__ float hc_step_load(float* at) {
+#if defined(__HIPCC__)
     return __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    return *static_cast<volatile float*>(at);
+#endif
 }
 template<int HC>
 __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
@@ -629,7 +633,11 @@ __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* outp
     // (thread 0 wrote every row's published ids)
     if (tail.flag && threadIdx.x == 0) {
         __threadfence_system();
+#if defined(__HIPCC__)
         __hip_atomic_store(tail.flag, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        *static_cast<volatile unsigned*>(tail.flag) = 1u;
+#endif
     }
 }
 // gemv() of one matrix (an F32, F16 or BF16 router) for 1-4 vectors with the rows' routes in its
