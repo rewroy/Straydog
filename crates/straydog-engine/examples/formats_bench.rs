@@ -8,7 +8,6 @@
 
 use std::ffi::c_void;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use straydog_gguf::ModelHeader;
@@ -61,7 +60,7 @@ fn bank(files: &[File], headers: &[ModelHeader], name: &str) -> Role {
     let mut real = vec![0u8; per * 8];
     for i in 0..8 {
         let expert = (i * 47) % count;
-        files[file].read_exact_at(&mut real[i * per..(i + 1) * per], tensor.offset + (expert * per) as u64).unwrap();
+        straydog_engine::storage::read_at(&files[file], tensor.offset + (expert * per) as u64, &mut real[i * per..(i + 1) * per]).unwrap();
     }
     (tensor.quant_type, per, (0..BANK).flat_map(|e| real[(e % 8) * per..(e % 8 + 1) * per].to_vec()).collect())
 }

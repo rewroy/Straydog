@@ -5,7 +5,6 @@
 //! q35_cpu_bench MODEL.gguf LAYER [THREADS] [EXPERTS a call, default the model's top-k]
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 
 use straydog_gpu::ffi;
 
@@ -25,7 +24,7 @@ fn main() -> Result<(), String> {
         let name = format!("blk.{layer}.ffn_{role}_exps.weight");
         let info = header.tensors.iter().find(|tensor| tensor.name == name).ok_or(format!("no {name}"))?;
         let mut bank = vec![0u8; info.bytes as usize];
-        file.read_exact_at(&mut bank, info.offset).map_err(|exc| exc.to_string())?;
+        straydog_engine::storage::read_at(&file, info.offset, &mut bank).map_err(|exc| exc.to_string())?;
         roles.push((info.quant_type as i32, bank.len() / experts, bank));
     }
     let kinds = [roles[0].0, roles[1].0, roles[2].0];
