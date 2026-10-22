@@ -349,11 +349,24 @@ constexpr size_t tm_attention_max_splits = 64;
 // sum by shuffles); thread (row, d) accumulates dimensions d, d + 16, ... of the row's output.
 // F32 throughout; keys past a row's position are left out. Output times sigmoid(gate) when given.
 constexpr int tm_rows_r = 16, tm_rows_k = 16, tm_rows_dim = 256;
+constexpr size_t tm_rows_smem_bytes =
+    (size_t(tm_rows_r) * tm_rows_dim + size_t(tm_rows_k) * (tm_rows_dim + 1) + size_t(tm_rows_k) * tm_rows_dim +
+     size_t(tm_rows_r) * tm_rows_k) *
+    sizeof(float);
 __global__ void __launch_bounds__(256) tm_attention_rows_kernel(const float* q, const float* keys, const float* values,
                                                                const int32_t* positions, size_t context, size_t rows, size_t heads,
                                                                size_t kv_heads, float scale, const float* gate, float* out) {
     constexpr int R = tm_rows_r, K = tm_rows_k, D = tm_rows_dim;
+#if defined(__HIPCC__)
     __shared__ float qs[R][D], ks[K][D + 1], vs[K][D], ps[R][K];
+#else
+    // 50240 bytes is over CUDA's default 48KiB static shared limit. Same layout as the HIP arrays.
+    extern __shared__ __align__(16) float tm_rows_dynamic[];
+    float (*qs)[D] = reinterpret_cast<float(*)[D]>(tm_rows_dynamic);
+    float (*ks)[D + 1] = reinterpret_cast<float(*)[D + 1]>(tm_rows_dynamic + R * D);
+    float (*vs)[D] = reinterpret_cast<float(*)[D]>(tm_rows_dynamic + R * D + K * (D + 1));
+    float (*ps)[K] = reinterpret_cast<float(*)[K]>(tm_rows_dynamic + R * D + K * (D + 1) + K * D);
+#endif
     const size_t h = blockIdx.y, kh = h / (heads / kv_heads), r0 = size_t(blockIdx.x) * R;
     const unsigned t = threadIdx.x, row = t / 16, sub = t % 16;
     const size_t my_row = r0 + row;
@@ -651,7 +664,16 @@ int sd_op_attention(void* handle, const float* q, const float* keys, const float
     op_span(value, out, checked_floats({rows, heads, dim}), "an attention output");
     // Many rows (a prefill pass): blocks of 16 rows sharing each tile of keys.
     if (rows >= 16 && dim == tm_rows_dim && (rows + tm_rows_r - 1) / tm_rows_r <= 65535 && heads <= 65535) {
-        tm_attention_rows_kernel<<<dim3(unsigned((rows + tm_rows_r - 1) / tm_rows_r), unsigned(heads)), 256, 0, value.stream>>>(
+#if !defined(__HIPCC__)
+        check(cudaFuncSetAttribute(tm_attention_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tm_rows_smem_bytes)));
+#endif
+        tm_attention_rows_kernel<<<dim3(unsigned((rows + tm_rows_r - 1) / tm_rows_r), unsigned(heads)), 256,
+#if defined(__HIPCC__)
+                                   0,
+#else
+                                   tm_rows_smem_bytes,
+#endif
+                                   value.stream>>>(
             q, keys, values, positions, size_t(context), size_t(rows), size_t(heads), size_t(kv_heads), scale, gate, out);
         check(hipGetLastError());
         return 0;
