@@ -699,6 +699,30 @@ int sd_op_add(void* handle, const float* x, uint64_t count, float* out) {
     SD_OP_END
 }
 
+__global__ void debug_checksum_kernel(const uint32_t* words, size_t count, unsigned long long* partials) {
+    __shared__ unsigned long long sums[256];
+    unsigned long long sum = 0;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x)
+        sum += (unsigned long long)words[i] * (i % 251 + 1);
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned half = blockDim.x / 2; half; half /= 2) {
+        if (threadIdx.x < half) sums[threadIdx.x] += sums[threadIdx.x + half];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[blockIdx.x] = sums[0];
+}
+
+int sd_debug_checksum(void* handle, const void* data, uint64_t bytes, uint64_t* partials) {
+    SD_OP_BEGIN
+    if (!bytes || bytes % 4) throw std::runtime_error("invalid Straydog checksum range");
+    op_span(value, data, size_t(bytes), "a checksummed range");
+    op_span(value, partials, 64 * 8, "checksum partials");
+    debug_checksum_kernel<<<64, 256, 0, value.stream>>>(static_cast<const uint32_t*>(data), size_t(bytes / 4),
+                                                        reinterpret_cast<unsigned long long*>(partials));
+    SD_OP_END
+}
+
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width) {
     SD_OP_BEGIN
     if (!rows || !width) throw std::runtime_error("invalid Straydog scale shape");

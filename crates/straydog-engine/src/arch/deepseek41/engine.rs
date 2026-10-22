@@ -244,6 +244,36 @@ struct Shard {
     compressed_rope: Buffer,
     work: Work,
     experts: DeviceExperts,
+    checks: Option<SlotChecks>,
+}
+
+/// Checksums a pass queues at most (DS41_CHECK_SLOTS).
+const CHECKS: usize = 32768;
+
+/// DS41_CHECK_SLOTS (development): each routed expert's slot is checksummed on the compute stream
+/// when acquired and again just before its release; when the pass ends, the two are compared (the
+/// slot changed while in use) and the first with the expert's first checksum on this device
+/// (another copy of it, from the host tier or the drive, differs).
+struct SlotChecks {
+    partials: Buffer,
+    /// Each queued checksum's layer, expert, slot address and whether it follows the use.
+    queued: Vec<(usize, usize, u64, bool)>,
+    first: HashMap<(usize, usize), u64>,
+    mismatches: u64,
+}
+
+/// Queue checksums of `experts`' slots, `bytes` each (DS41_CHECK_SLOTS; nothing otherwise).
+fn check_slots(shard: &mut Shard, layer: usize, experts: &[usize], slots: &[Buffer], bytes: u64, after: bool) -> Result<()> {
+    let Some(checks) = shard.checks.as_mut() else { return Ok(()) };
+    for (&expert, slot) in experts.iter().zip(slots) {
+        if checks.queued.len() == CHECKS {
+            break;
+        }
+        let partials = checks.partials.base().wrapping_byte_add(checks.queued.len() * 64 * 8);
+        shard.gpu.debug_checksum(slot.base() as P, bytes & !3, partials)?;
+        checks.queued.push((layer, expert, slot.base() as u64, after));
+    }
+    Ok(())
 }
 
 pub struct Engine<'a, T: Tensors> {
@@ -271,8 +301,10 @@ pub struct Engine<'a, T: Tensors> {
     predicted: Vec<usize>,
     /// Decode runs the experts VRAM holds while the others land (DS41_HITS_FIRST=0: all at once).
     hits_first: bool,
-    /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end.
+    /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
+    /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
+    profile_sync: bool,
 }
 
 /// A resident tensor (or a layer's shared expert: gate, up and down) for a device's upload thread.
@@ -413,7 +445,12 @@ impl Shard {
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
         let experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots * parts,
                                          settings.host_expert_bytes)?;
+        let checks = match std::env::var_os("DS41_CHECK_SLOTS") {
+            Some(_) => Some(SlotChecks { partials: gpu.buffer((CHECKS * 64 * 8) as u64)?, queued: Vec::new(), first: HashMap::new(), mismatches: 0 }),
+            None => None,
+        };
         Ok(Shard {
+            checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
             compressed_rope: compressed_buffer, work, experts,
@@ -550,6 +587,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             predicted: Vec::new(),
             hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
+            profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
         };
         engine.upload_dense()?;
         Ok(engine)
@@ -625,12 +663,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         })
     }
 
-    /// Attribute the time since the last mark to `phase` (profiling only: waits for the GPUs).
+    /// Attribute the time since the last mark to `phase` (profiling only: waits for the GPUs, but
+    /// for the host's time alone).
     fn mark(&mut self, phase: &'static str) -> Result<()> {
         if self.profile.is_none() {
             return Ok(());
         }
-        for shard in &mut self.shards {
+        for shard in self.shards.iter_mut().filter(|_| self.profile_sync) {
             let mut one = [0f32; 1];
             let x = shard.work.x;
             shard.gpu.read_buffer(&x, 0, &mut one)?;
@@ -915,10 +954,53 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.mark("head")?;
             Some(logits)
         };
+        self.verify_slot_checks()?;
         self.history.extend_from_slice(tokens);
         self.position += n;
         self.rewind = rewind;
         Ok(logits)
+    }
+
+    /// Compare the pass's slot checksums (DS41_CHECK_SLOTS), reporting each mismatch.
+    fn verify_slot_checks(&mut self) -> Result<()> {
+        let position = self.position;
+        for (device, shard) in self.shards.iter_mut().enumerate() {
+            let Some(checks) = shard.checks.as_mut() else { continue };
+            if checks.queued.is_empty() {
+                continue;
+            }
+            let mut partials = vec![0u64; checks.queued.len() * 64];
+            shard.gpu.read_buffer(&checks.partials, 0, &mut partials)?;
+            let mut before = HashMap::new();
+            for (index, &(layer, expert, slot, after)) in checks.queued.iter().enumerate() {
+                let sum = partials[index * 64..(index + 1) * 64].iter().fold(0u64, |total, &part| total.wrapping_add(part));
+                let what = if after {
+                    before.get(&(layer, expert, slot)).filter(|&&was| was != sum).map(|_| "changed while in use")
+                } else {
+                    before.insert((layer, expert, slot), sum);
+                    match checks.first.get(&(layer, expert)) {
+                        Some(&first) if first != sum => Some("differs from its first copy"),
+                        Some(_) => None,
+                        None => {
+                            checks.first.insert((layer, expert), sum);
+                            None
+                        }
+                    }
+                };
+                if let Some(what) = what {
+                    checks.mismatches += 1;
+                    eprintln!("DS41_CHECK_SLOTS: device {device}, the pass from position {position}: layer {layer} expert {expert} \
+                               (slot {slot:#x}) {what}");
+                }
+            }
+            checks.queued.clear();
+        }
+        Ok(())
+    }
+
+    /// Slot checksums that disagreed so far (DS41_CHECK_SLOTS).
+    pub fn slot_mismatches(&self) -> u64 {
+        self.shards.iter().filter_map(|shard| shard.checks.as_ref()).map(|checks| checks.mismatches).sum()
     }
 
     /// Whether a pass of `n` tokens can be taken back: at most [`VERIFY_ROWS`], in one batch.
@@ -1000,7 +1082,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (from, kv_from, full_from) = self.rows_of(layer, n);
         // Decode repeats a layer's launches every token: a device queues each run of them that
         // takes no host data at once, from a graph recorded the first time (not while profiling).
-        let record = n == 1 && self.profile.is_none() && std::env::var_os("DS41_NO_GRAPHS").is_none();
+        let record = n == 1 && (self.profile.is_none() || !self.profile_sync) && std::env::var_os("DS41_NO_GRAPHS").is_none();
         // a layer that compresses or indexes changes its launches from token to token
         let fixed = plan.compressed.is_none_or(|c| c.kv_source != layer && c.index_source != layer);
         let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && self.prefetches > 0;
@@ -1189,12 +1271,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// `out`.
     fn routed(&mut self, layer: usize, first: usize, rows: usize, routes: &[i32]) -> Result<()> {
         let (w, ff) = (self.hp.width, self.hp.expert_ff);
-        let (gate_bytes, _, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
+        let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
         let shard = &mut self.shards[0];
         let work = shard.work.view(first);
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
             .into_iter().collect();
         let slots = shard.experts.acquire(&mut shard.gpu, layer, &experts)?;
+        check_slots(shard, layer, &experts, &slots, 2 * gate_bytes + down_bytes, false)?;
         // The next layer's predicted experts start their reads and copies behind this layer's.
         let predicted = std::mem::take(&mut self.predicted);
         if !predicted.is_empty() {
@@ -1210,6 +1293,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         shard.gpu.experts(Some(&bases), slot_bytes, offsets, kinds, w as u64, ff as u64, rows as u64, self.hp.experts_used as u64,
                           work.x.base(), 0, Some(work.weights.base()), self.hp.layers[layer].clamp_routed, true, work.hidden.base(),
                           work.out.base(), 0, None)?;
+        check_slots(shard, layer, &experts, &slots, 2 * gate_bytes + down_bytes, true)?;
         shard.experts.release(&mut shard.gpu)?;
         self.mark("routed experts")
     }
@@ -1243,6 +1327,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
         self.shards[0].gpu.read_finish(&mut routes)?;
+        self.mark("route readback")?;
         let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
             .into_iter().collect();
@@ -1261,12 +1346,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         // every device holds as many rows of an expert
-        let (gate_bytes, _, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
+        let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
+        let expert_bytes = 2 * gate_bytes + down_bytes;
         for (index, wave) in waves.iter().enumerate() {
             let buffer = index % 2;
             let mut acquired = Vec::with_capacity(self.shards.len());
             for shard in &mut self.shards {
                 acquired.push(shard.experts.acquire(&mut shard.gpu, layer, wave)?);
+                check_slots(shard, layer, wave, acquired.last().unwrap(), expert_bytes, false)?;
                 if let Some(next) = waves.get(index + 1) {
                     shard.experts.prefetch(&mut shard.gpu, layer, next, true)?;
                 } else if !predicted.is_empty() {
@@ -1302,6 +1389,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 shard.gpu.experts(None, slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, rows as u64, k as u64,
                                   work.x.base(), 0, None, hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(),
                                   0, Some(shard.rows.split(2)))?;
+                check_slots(shard, layer, wave, slots, expert_bytes, true)?;
                 shard.experts.release(&mut shard.gpu)?;
             }
         }
@@ -1319,11 +1407,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let hp = self.hp.clone();
         let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
         let routed_rows = rows * k;
-        let (gate_bytes, _, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
-        let offsets = [0, gate_bytes, 2 * gate_bytes];
+        let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
+        let (offsets, expert_bytes) = ([0, gate_bytes, 2 * gate_bytes], 2 * gate_bytes + down_bytes);
         for shard in &mut self.shards {
             shard.experts.request(&mut shard.gpu, layer, misses)?;
         }
+        self.mark("misses requested")?;
         // A route to an expert of the other list has no slot here (a zero base: skipped).
         let bases = |list: &[usize], slots: &[Buffer]| -> Vec<u64> {
             routes.iter().map(|&expert| list.binary_search(&(expert as usize)).map_or(0, |at| slots[at].base() as u64)).collect()
@@ -1331,15 +1420,19 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut held = Vec::with_capacity(self.shards.len());
         for shard in &mut self.shards {
             let slots = shard.experts.acquire(&mut shard.gpu, layer, hits)?;
+            check_slots(shard, layer, hits, &slots, expert_bytes, false)?;
             let work = shard.work.view(first);
             shard.gpu.experts(Some(&bases(hits, &slots)), slots[0].bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0,
                               Some(work.weights.base()), hp.layers[layer].clamp_routed, true, work.products[0].base(),
                               work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
             held.push(slots);
         }
+        self.mark("hits' gate/up")?;
         let mut every = Vec::with_capacity(self.shards.len());
+        let mut filled = Vec::with_capacity(self.shards.len());
         for (shard, held) in self.shards.iter_mut().zip(&held) {
             let slots = shard.experts.acquire(&mut shard.gpu, layer, misses)?;
+            check_slots(shard, layer, misses, &slots, expert_bytes, false)?;
             if !predicted.is_empty() {
                 shard.experts.prefetch(&mut shard.gpu, layer + 1, predicted, drive)?;
             }
@@ -1349,6 +1442,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
             let both: Vec<u64> = bases(hits, held).into_iter().zip(bases(misses, &slots)).map(|(hit, miss)| hit | miss).collect();
             every.push((both, slots[0].bytes));
+            filled.push(slots);
         }
         self.mark("expert fills")?;
         // Every device's share of the activations, the shared expert's too.
@@ -1356,7 +1450,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
         let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[0].base() as P).collect();
         ops::sum_devices(&devices, &outs, &parts, (routed_rows + rows) as u64 * ff)?;
-        for (shard, (both, slot_bytes)) in self.shards.iter_mut().zip(&every) {
+        for (((shard, (both, slot_bytes)), held), filled) in self.shards.iter_mut().zip(&every).zip(&held).zip(&filled) {
             let work = shard.work.view(first);
             let shared = shard.shared[&layer];
             shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; rows]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
@@ -1364,6 +1458,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
             shard.gpu.experts(Some(both), *slot_bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0, None,
                               hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
+            check_slots(shard, layer, hits, held, expert_bytes, true)?;
+            check_slots(shard, layer, misses, filled, expert_bytes, true)?;
             shard.experts.release(&mut shard.gpu)?;
         }
         self.mark("routed experts")
@@ -1433,6 +1529,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let mut acquired = Vec::with_capacity(self.shards.len());
             for shard in &mut self.shards {
                 acquired.push(shard.experts.acquire(&mut shard.gpu, layer, &experts(wave))?);
+                check_slots(shard, layer, &experts(wave), acquired.last().unwrap(), 2 * gate_bytes + down_bytes, false)?;
                 if let Some(next) = waves.get(index + 1) {
                     shard.experts.prefetch(&mut shard.gpu, layer, &experts(next), true)?;
                 } else if !ahead.is_empty() {
@@ -1459,6 +1556,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     moe::down(&mut shard.gpu, slot, &shape, &scratch, input.at((span.first - base) * ff), span.routes,
                               work.route_rows.at(span.first), target.base(), rows)?;
                 }
+                check_slots(shard, layer, &experts(wave), slots, 2 * gate_bytes + down_bytes, true)?;
                 shard.experts.release(&mut shard.gpu)?;
             }
         }

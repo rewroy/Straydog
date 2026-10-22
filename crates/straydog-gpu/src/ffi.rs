@@ -851,6 +851,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_debug_checksum(
+        handle: *mut ::std::os::raw::c_void,
+        data: *const ::std::os::raw::c_void,
+        bytes: u64,
+        partials: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_link_sums(
         first: *mut ::std::os::raw::c_void,
         second: *mut ::std::os::raw::c_void,

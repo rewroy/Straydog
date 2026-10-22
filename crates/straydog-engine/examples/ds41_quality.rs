@@ -7,10 +7,11 @@
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
-//!     [--steps N] [--show KL] [--context N] [--verify N]
+//!     [--steps N] [--show KL] [--context N] [--verify N[,N...]] [--accept-all]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
-//! the decode path, so the hashes must not change.
+//! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
+//! N rows throughout, for their cost); several N run the prompts once each, in turn.
 //! --show prints every position whose KL exceeds KL, with both sides' top tokens. With
 //! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
 //! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
@@ -90,7 +91,12 @@ fn main() -> Result<(), String> {
     // rows the attention runs at a time within a pass of up to --chunk tokens
     let batch = option("--batch", 256);
     let context = option("--context", 8192);
-    let verify = option("--verify", 0);
+    let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
+        let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
+        args.drain(at..at + 2);
+        value
+    });
+    let accept_all = args.iter().position(|arg| arg == "--accept-all").map(|at| args.remove(at)).is_some();
     let show = args.iter().position(|arg| arg == "--show").map(|at| {
         let value: f64 = args[at + 1].parse().unwrap();
         args.drain(at..at + 2);
@@ -98,7 +104,7 @@ fn main() -> Result<(), String> {
     });
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
-                    [--row-cache MIB] [--steps N] [--context N] [--verify N]".into());
+                    [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     if row_cache > 0 && straydog_engine::arch::Tensors::tensor(&files, "per_layer_token_embd.weight").is_ok() {
@@ -119,70 +125,104 @@ fn main() -> Result<(), String> {
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
-    let mut all = Vec::new();
-    let mut run_hash = 0xcbf2_9ce4_8422_2325u64;
-    for (index, tokens_file) in tokens_files.split(',').enumerate() {
-        let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
-        let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
-        let (count, kept) = (ints[0] as usize, ints[1] as usize);
-        let prompt: Vec<u32> = ints[3..3 + count].iter().map(|&id| id as u32).collect();
-        let generated: Vec<u32> = ints[3 + count..].iter().map(|&id| id as u32).collect();
-        let logits_path = Path::new(tokens_file).with_extension("logits");
-        let bytes = std::fs::read(&logits_path).map_err(|exc| format!("{}: {exc}", logits_path.display()))?;
-        let rows: Vec<&[u8]> = bytes.chunks_exact(vocabulary * 4).collect();
-        let row = |at: usize| -> Vec<f32> { rows[at].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
-        // Rows: the prompt's last `kept` positions, then one after each generated token but an
-        // end-of-generation one.
-        let decode_rows = rows.len().saturating_sub(kept);
-        engines.iter_mut().for_each(|engine| engine.reset());
-        let mut logits = Vec::new();
-        for piece in prompt.chunks(chunk) {
-            logits = forward_split(&mut engines, piece)?;
-        }
-        let mut prompt_hash = 0xcbf2_9ce4_8422_2325u64;
-        hash(&mut prompt_hash, &logits);
-        let mut saved: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
-        let mut steps = vec![compare(&logits, &row(kept - 1), generated.first().map(|&token| token as usize))];
-        let (decode_steps, decoding) = (decode_rows.min(generated.len()).min(max_steps), std::time::Instant::now());
-        let (mut step, mut seed, mut passes) = (0, 0x9e37_79b9_7f4a_7c15u64 ^ index as u64, 0);
-        while step < decode_steps {
-            let width = verify.clamp(1, decode_steps - step);
-            let rows = if verify == 0 {
-                forward_split(&mut engines, &generated[step..step + 1])?
-            } else {
-                verify_split(&mut engines, &generated[step..step + width])?
+    for (run, &verify) in widths.iter().enumerate() {
+        let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
+        let mut run_hash = 0xcbf2_9ce4_8422_2325u64;
+        // DS41_PROFILE: the decode passes' phases, and the store's counters over them
+        let (mut phases, mut stores) = (std::collections::BTreeMap::<&str, f64>::new(), straydog_engine::experts::Counts::default());
+        for (index, tokens_file) in tokens_files.split(',').enumerate() {
+            let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
+            let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+            let (count, kept) = (ints[0] as usize, ints[1] as usize);
+            let prompt: Vec<u32> = ints[3..3 + count].iter().map(|&id| id as u32).collect();
+            let generated: Vec<u32> = ints[3 + count..].iter().map(|&id| id as u32).collect();
+            let logits_path = Path::new(tokens_file).with_extension("logits");
+            let bytes = std::fs::read(&logits_path).map_err(|exc| format!("{}: {exc}", logits_path.display()))?;
+            let rows: Vec<&[u8]> = bytes.chunks_exact(vocabulary * 4).collect();
+            let row = |at: usize| -> Vec<f32> { rows[at].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+            // Rows: the prompt's last `kept` positions, then one after each generated token but an
+            // end-of-generation one.
+            let decode_rows = rows.len().saturating_sub(kept);
+            engines.iter_mut().for_each(|engine| engine.reset());
+            let mut logits = Vec::new();
+            for piece in prompt.chunks(chunk) {
+                logits = forward_split(&mut engines, piece)?;
+            }
+            let mut prompt_hash = 0xcbf2_9ce4_8422_2325u64;
+            hash(&mut prompt_hash, &logits);
+            let mut saved: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let mut steps = vec![compare(&logits, &row(kept - 1), generated.first().map(|&token| token as usize))];
+            engines.iter_mut().for_each(|engine| drop(engine.take_profile()));
+            let counted = |engines: &[Engine<'_, files::Files>]| {
+                engines.iter().map(Engine::cache_counts).fold(straydog_engine::experts::Counts::default(), |a, b| a + b)
             };
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let accepted = 1 + (seed % width as u64) as usize;
-            for (at, logits) in rows.chunks_exact(vocabulary).take(accepted).enumerate() {
-                hash(&mut prompt_hash, logits);
-                saved.extend(logits.iter().flat_map(|value| value.to_le_bytes()));
-                steps.push(compare(logits, &row(kept + step + at), generated.get(step + at + 1).map(|&token| token as usize)));
+            let before = counted(&engines);
+            let (decode_steps, decoding) = (decode_rows.min(generated.len()).min(max_steps), std::time::Instant::now());
+            let (mut step, mut seed, mut passes) = (0, 0x9e37_79b9_7f4a_7c15u64 ^ index as u64, 0);
+            while step < decode_steps {
+                let width = verify.clamp(1, decode_steps - step);
+                let rows = if verify == 0 {
+                    forward_split(&mut engines, &generated[step..step + 1])?
+                } else {
+                    verify_split(&mut engines, &generated[step..step + width])?
+                };
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let accepted = if accept_all { width } else { 1 + (seed % width as u64) as usize };
+                for (at, logits) in rows.chunks_exact(vocabulary).take(accepted).enumerate() {
+                    hash(&mut prompt_hash, logits);
+                    saved.extend(logits.iter().flat_map(|value| value.to_le_bytes()));
+                    steps.push(compare(logits, &row(kept + step + at), generated.get(step + at + 1).map(|&token| token as usize)));
+                }
+                if accepted < width {
+                    engines.iter_mut().try_for_each(|engine| engine.rewind(accepted))?;
+                }
+                step += accepted;
+                passes += 1;
             }
-            if accepted < width {
-                engines.iter_mut().try_for_each(|engine| engine.rewind(accepted))?;
+            let seconds = decoding.elapsed().as_secs_f64();
+            for engine in &mut engines {
+                for (phase, spent) in engine.take_profile() {
+                    *phases.entry(phase).or_default() += spent;
+                }
             }
-            step += accepted;
-            passes += 1;
-        }
-        let seconds = decoding.elapsed().as_secs_f64();
-        hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
-        println!("{} | logits hash {prompt_hash:016x} | {decode_steps} tokens in {passes} passes, {seconds:.2} s", summary(&format!("prompt {index}"), &steps));
-        if let Some(dir) = std::env::var_os("DS41_QUALITY_SAVE") {
-            std::fs::write(Path::new(&dir).join(format!("prompt-{index}.logits")), &saved).map_err(|exc| exc.to_string())?;
-        }
-        if let Some(threshold) = show {
-            for (at, step) in steps.iter().enumerate().filter(|(_, step)| step.kl > threshold) {
-                // position: the prompt's last (step 0), then after each generated token
-                println!("  position {}: KL {:.3e}, ours {} ({:.3}), reference {} ({:.3})", count - 1 + at, step.kl, step.tops[0].0,
-                         step.tops[0].1, step.tops[1].0, step.tops[1].1);
+            let after = counted(&engines);
+            stores.hits += after.hits - before.hits;
+            stores.host_hits += after.host_hits - before.host_hits;
+            stores.drive_reads += after.drive_reads - before.drive_reads;
+            (decode_tokens, decode_passes, decode_seconds) =
+                (decode_tokens + decode_steps, decode_passes + passes, decode_seconds + seconds);
+            hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
+            println!("{} | logits hash {prompt_hash:016x} | {decode_steps} tokens in {passes} passes, {seconds:.2} s",
+                     summary(&format!("prompt {index}"), &steps));
+            if let Some(dir) = std::env::var_os("DS41_QUALITY_SAVE") {
+                let name = if widths.len() > 1 { format!("prompt-{index}-run{run}.logits") } else { format!("prompt-{index}.logits") };
+                std::fs::write(Path::new(&dir).join(name), &saved).map_err(|exc| exc.to_string())?;
             }
+            if let Some(threshold) = show {
+                for (at, step) in steps.iter().enumerate().filter(|(_, step)| step.kl > threshold) {
+                    // position: the prompt's last (step 0), then after each generated token
+                    println!("  position {}: KL {:.3e}, ours {} ({:.3}), reference {} ({:.3})", count - 1 + at, step.kl, step.tops[0].0,
+                             step.tops[0].1, step.tops[1].0, step.tops[1].1);
+                }
+            }
+            all.extend(steps);
         }
-        all.extend(steps);
+        let label = if widths.len() > 1 { format!("all, verify {verify}") } else { "all".to_string() };
+        println!("{} | run hash {run_hash:016x} | {decode_tokens} tokens in {decode_passes} passes, {decode_seconds:.2} s",
+                 summary(&label, &all));
+        let per_pass = |count: u64| count as f64 / decode_passes.max(1) as f64;
+        println!("  a decode pass: {:.2} ms, {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads", 1e3 * decode_seconds / decode_passes.max(1) as f64,
+                 per_pass(stores.hits), per_pass(stores.host_hits), per_pass(stores.drive_reads));
+        if !phases.is_empty() {
+            let line: Vec<String> = phases.iter().map(|(phase, spent)| format!("{phase} {:.2}", 1e3 * spent / decode_passes.max(1) as f64)).collect();
+            println!("  phases, ms a pass: {}", line.join(", "));
+        }
     }
-    println!("{} | run hash {run_hash:016x}", summary("all", &all));
+    if std::env::var_os("DS41_CHECK_SLOTS").is_some() {
+        println!("slot checks: {} mismatches", engines.iter().map(Engine::slot_mismatches).sum::<u64>());
+    }
     let counts = engines.iter().map(|engine| engine.cache_counts()).fold(straydog_engine::experts::Counts::default(), |a, b| a + b);
     println!("experts: {} VRAM hits, {} host-tier fills, {} drive reads, {} write-backs", counts.hits, counts.host_hits,
              counts.drive_reads, counts.writebacks);

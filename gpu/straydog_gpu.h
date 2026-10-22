@@ -212,6 +212,9 @@ int sd_op_attention_prepare(void* handle, const float* q_full, float* k, const f
 int sd_op_rope_halves(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies);
 int sd_op_attention(void* handle, const float* q, const float* keys, const float* values, uint64_t context, const int32_t* positions, uint64_t rows, uint64_t heads, uint64_t kv_heads, uint64_t dim, float scale, const float* gate, float* scratch, uint64_t scratch_bytes, float* out);
 int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
+/* Development: 64 partial sums (each 32-bit word times a weight of its position, wrapping) of the
+   bytes at data (a multiple of 4), queued into partials, for telling a range's contents apart. */
+int sd_debug_checksum(void* handle, const void* data, uint64_t bytes, uint64_t* partials);
 /* Tensor-parallel sums of two devices (gpu/device_link.hpp): sd_link_sums joins them (peer access
    needed) with inboxes for parts of up to `capacity` floats; sd_op_link_sum queues out = this
    device's part + the other's part of the same sum (count floats; out may be part; accumulate:

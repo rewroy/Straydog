@@ -540,6 +540,13 @@ impl Backend {
         Ok(state == 1)
     }
 
+    /// Development: queue 64 partial sums of the 32-bit words of `bytes` at `data` (each weighted
+    /// by its position) into `partials` (64 u64), to tell a range's contents apart.
+    pub fn debug_checksum(&mut self, data: P, bytes: u64, partials: M) -> Result<()> {
+        // SAFETY: a live handle; the library checks both ranges against its allocations.
+        check(unsafe { ffi::sd_debug_checksum(self.handle(), data.cast(), bytes, partials.cast()) })
+    }
+
     /// out += x (count values).
     pub fn add(&mut self, x: P, count: u64, out: M) -> Result<()> {
         // SAFETY: as above.
