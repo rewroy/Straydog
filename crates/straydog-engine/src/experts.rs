@@ -385,7 +385,9 @@ struct Class {
     vram: Buffer,
     first: usize,
     count: usize,
-    free: Vec<usize>,
+    /// Free slots, the longest free first: a fill takes the slot whose write-back (an evicted
+    /// expert's, to the host tier) had the longest to finish, so its upload seldom waits for one.
+    free: VecDeque<usize>,
     /// Slots holding an expert, by last use.
     lru: BTreeSet<(u64, usize)>,
     /// Free slots kept ahead of need, their experts written back meanwhile.
@@ -553,7 +555,7 @@ impl DeviceExperts {
                 key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
             }));
             classes.push(Class {
-                vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).rev().collect(),
+                vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).collect(),
                 lru: BTreeSet::new(), reserve, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), hosts: 0,
                 host_free: VecDeque::new(), host_lru: BTreeSet::new(),
             });
@@ -816,7 +818,7 @@ impl DeviceExperts {
             self.slots[slot].held = false;
         }
         self.requested.clear();
-        self.keep_free(gpu)
+        self.keep_free(gpu, mark)
     }
 
     fn slot_buffer(&self, slot: usize) -> Buffer {
@@ -853,7 +855,7 @@ impl DeviceExperts {
         entry.speculative = false;
         let class = &mut self.classes[entry.class];
         class.lru.remove(&(entry.used, slot));
-        class.free.push(slot);
+        class.free.push_back(slot);
         self.map.remove(&key);
         Some(key)
     }
@@ -1073,7 +1075,7 @@ impl DeviceExperts {
             let victim = self.victim(class)?;
             self.evict(gpu, victim)?;
         }
-        self.classes[class].free.pop().ok_or_else(|| "no free expert slot after an eviction".into())
+        self.classes[class].free.pop_front().ok_or_else(|| "no free expert slot after an eviction".into())
     }
 
     fn victim(&self, class: usize) -> Result<usize> {
@@ -1083,11 +1085,20 @@ impl DeviceExperts {
     }
 
     /// Keep each class's `reserve` VRAM slots free, writing their experts back to the host tier,
-    /// so a miss never waits for a write-back before its upload.
-    fn keep_free(&mut self, gpu: &mut Backend) -> Result<()> {
+    /// so a miss never waits for a write-back before its upload. The write-backs start once the
+    /// compute stream passes `after` (the release's work): queued at once, they ran beside that
+    /// work's uploads, sharing the bus (an expert's upload on two R9700s took 250 us instead of
+    /// 200) and holding the compute stream's start after an upload back by ~130 us. A fill of a
+    /// slot so freed still waits for its write-back (the slot's guard).
+    fn keep_free(&mut self, gpu: &mut Backend, after: Mark) -> Result<()> {
+        let mut waited = false;
         for class in 0..self.classes.len() {
             while self.classes[class].free.len() < self.classes[class].reserve {
                 let victim = self.victim(class)?;
+                if !waited {
+                    gpu.wait_mark(Stream::Download, after)?;
+                    waited = true;
+                }
                 self.evict(gpu, victim)?;
             }
         }

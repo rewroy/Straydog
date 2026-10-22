@@ -65,7 +65,9 @@ fn run(host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts
     run_with(roles(), 16, host_budget_slots, steps)
 }
 
-fn run_with(layers: Vec<Option<Vec<Role>>>, slots: usize, host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
+/// A store over a generated file of `layers`' experts: its file (removed by the caller), the
+/// GPU, the store, and the count of verified drive reads.
+fn open(layers: &[Option<Vec<Role>>], slots: usize, host_budget_slots: u64) -> (std::path::PathBuf, Backend, DeviceExperts, Arc<AtomicU64>) {
     let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
     // A file of its own per run: tests run in parallel, and some share a capacity.
     static RUNS: AtomicU64 = AtomicU64::new(0);
@@ -91,10 +93,25 @@ fn run_with(layers: Vec<Option<Vec<Role>>>, slots: usize, host_budget_slots: u64
         counted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     });
-    let layout = Arc::new(Layout::new(&[file], layers.clone(), Some(verifier)).unwrap());
+    let layout = Arc::new(Layout::new(&[file], layers.to_vec(), Some(verifier)).unwrap());
     let host_budget = host_budget_slots * (STRIDES.iter().sum::<u64>() + 4 * 4096).next_multiple_of(4096);
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
-    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), slots, host_budget).unwrap();
+    let store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), slots, host_budget).unwrap();
+    (path, gpu, store, reads)
+}
+
+/// Read every slot back and compare it with the file's bytes of its expert.
+fn check_slots(gpu: &mut Backend, roles: &[Role], experts: &[usize], slots: &[straydog_engine::ops::Buffer], what: &str) {
+    for (&expert, slot) in experts.iter().zip(slots) {
+        let want = expected(roles, expert);
+        let mut got = vec![0u8; want.len()];
+        gpu.read_buffer(slot, 0, &mut got).unwrap();
+        assert!(got == want, "{what}: expert {expert} differs from the file");
+    }
+}
+
+fn run_with(layers: Vec<Option<Vec<Role>>>, slots: usize, host_budget_slots: u64, steps: usize) -> straydog_engine::experts::Counts {
+    let (path, mut gpu, mut store, reads) = open(&layers, slots, host_budget_slots);
     let mut random = Random(0x1234_5678);
     for step in 0..steps {
         let layer = if step % 2 == 0 { 0 } else { 2 };
@@ -106,12 +123,7 @@ fn run_with(layers: Vec<Option<Vec<Role>>>, slots: usize, host_budget_slots: u64
             store.prefetch(&mut gpu, 2 - layer, &next, true).unwrap();
         }
         let slots = store.acquire(&mut gpu, layer, &experts).unwrap();
-        for (&expert, slot) in experts.iter().zip(&slots) {
-            let want = expected(layers[layer].as_ref().unwrap(), expert);
-            let mut got = vec![0u8; want.len()];
-            gpu.read_buffer(slot, 0, &mut got).unwrap();
-            assert!(got == want, "step {step}: layer {layer} expert {expert} differs from the file");
-        }
+        check_slots(&mut gpu, layers[layer].as_ref().unwrap(), &experts, &slots, &format!("step {step}: layer {layer}"));
         store.release(&mut gpu).unwrap();
     }
     store.settle(&mut gpu).unwrap();
@@ -127,6 +139,49 @@ fn experts_through_a_host_tier() {
     let counts = run(30, 400);
     eprintln!("{counts:?}");
     assert!(counts.drive_reads > 0 && counts.host_hits > 0 && counts.writebacks > 0 && counts.prefetched > 0);
+}
+
+/// A release's write-backs wait for the compute stream to pass the release; a fill that takes a
+/// slot so freed (the free slots having run out) waits for the write-back before its upload, or
+/// it would overwrite the expert being written back. Here the compute stream is kept busy past
+/// the release, so the write-backs start well after the next fills are queued.
+#[test]
+fn a_fill_waits_for_a_write_back_behind_the_pass() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    // 16 slots and a reserve of 4; a host tier for every expert
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let first: Vec<usize> = (0..12).collect();
+    let slots = store.acquire(&mut gpu, 0, &first).unwrap();
+    check_slots(&mut gpu, &roles, &first, &slots, "the first twelve");
+    store.release(&mut gpu).unwrap();
+    // Work on the compute stream (a few ms of GEMVs over a 64 MB matrix), then four more experts:
+    // they take the four free slots, and their release writes the four oldest back behind it.
+    let (rows, cols) = (4096u64, 4096u64);
+    let matrix = gpu.buffer(rows * cols * 4).unwrap();
+    gpu.write_buffer(&matrix, 0, &vec![0.001f32; (rows * cols) as usize]).unwrap();
+    let (input, output, scratch) = (gpu.buffer(cols * 4).unwrap(), gpu.buffer(rows * 4).unwrap(), gpu.buffer(1 << 20).unwrap());
+    for _ in 0..200 {
+        gpu.linear(&matrix, 0, rows, cols, 0, input.base(), 0, 1, output.base(), 0, &scratch).unwrap();
+    }
+    let second: Vec<usize> = (12..16).collect();
+    store.acquire(&mut gpu, 0, &second).unwrap();
+    store.release(&mut gpu).unwrap();
+    // No free slot is left but those four: these fills wait for their write-backs.
+    let third: Vec<usize> = (16..20).collect();
+    let slots = store.acquire(&mut gpu, 0, &third).unwrap();
+    check_slots(&mut gpu, &roles, &third, &slots, "fills of slots being written back");
+    store.release(&mut gpu).unwrap();
+    // The four written back come from the host tier as they were.
+    let back: Vec<usize> = (0..4).collect();
+    let slots = store.acquire(&mut gpu, 0, &back).unwrap();
+    check_slots(&mut gpu, &roles, &back, &slots, "experts written back");
+    store.release(&mut gpu).unwrap();
+    store.settle(&mut gpu).unwrap();
+    let counts = store.counts();
+    assert!(counts.writebacks >= 4 && counts.host_hits >= 4, "{counts:?}");
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[test]
