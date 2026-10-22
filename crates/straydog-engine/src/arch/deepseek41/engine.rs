@@ -1551,6 +1551,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let next_rows = if self.settings.layers.contains(&(layer + 1)) { n - self.rows_of(layer + 1, n).2 } else { 0 };
         let ahead: Vec<usize> = if next_rows * k >= AHEAD * hp.experts { (0..limit.min(hp.experts)).collect() } else { Vec::new() };
         for (index, wave) in waves.iter().enumerate() {
+            // A wave's gate and up write the activations again: each device first waits until the
+            // others' last sum (the shared expert's, or the wave before's) has read its activations,
+            // which a sum reads where they lie.
+            if split {
+                let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+                ops::devices_settle(&devices)?;
+            }
             let mut acquired = Vec::with_capacity(self.shards.len());
             for shard in &mut self.shards {
                 acquired.push(shard.experts.acquire(&mut shard.gpu, layer, &experts(wave))?);

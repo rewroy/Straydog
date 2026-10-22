@@ -15,11 +15,15 @@ use straydog_engine::ops::Buffer;
 const WIDTH: usize = 2048;
 
 fn pair() -> Option<(Backend, Backend)> {
-    let (Ok(mut first), Ok(mut second)) = (Backend::new(0, 1 << 30), Backend::new(1, 1 << 30)) else {
+    pair_of(64 * WIDTH)
+}
+
+fn pair_of(capacity: usize) -> Option<(Backend, Backend)> {
+    let (Ok(mut first), Ok(mut second)) = (Backend::new(0, 2 << 30), Backend::new(1, 2 << 30)) else {
         eprintln!("skipped: linked sums need two GPUs");
         return None;
     };
-    Backend::link_sums(&mut first, &mut second, (64 * WIDTH) as u64).unwrap();
+    Backend::link_sums(&mut first, &mut second, capacity as u64).unwrap();
     Some((first, second))
 }
 
@@ -41,6 +45,70 @@ fn check(a: &[f32], b: &[f32], first: &[f32], second: &[f32], base: &[f32]) {
         assert_eq!(a[i].to_bits(), expected.to_bits(), "device 0 value {i}: {} against {expected}", a[i]);
         assert_eq!(b[i].to_bits(), expected.to_bits(), "device 1 value {i}: {} against {expected}", b[i]);
     }
+}
+
+/// DeepSeek-V4.1's decode sums (an attention's or the experts' output, a row's activations, a
+/// verify pass's), thousands queued on both devices without waiting, between work that keeps one
+/// device busier than the other at times: every result exact, so no part was read before it landed.
+#[test]
+fn linked_sums_of_decode_sizes() {
+    let Some((mut a, mut b)) = pair_of(64_512) else { return };
+    let busy = a.buffer(64 << 20).unwrap();
+    for (round, (count, sums)) in [(5120, 1500), (16_128, 600), (64_512, 120), (5120, 1500)].into_iter().enumerate() {
+        let (first, second) = (parts(0, sums, count, count + round), parts(1, sums, count, count + round));
+        let bytes = (sums * count * 4) as u64;
+        let (part_a, part_b, out_a, out_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap(), a.buffer(bytes).unwrap(),
+                                              b.buffer(bytes).unwrap());
+        a.write_buffer(&part_a, 0, &first).unwrap();
+        b.write_buffer(&part_b, 0, &second).unwrap();
+        for sum in 0..sums {
+            let at = sum * count;
+            // (every so often device 0 copies 64 MB first, so it falls behind and then catches up)
+            if sum % 97 == 0 {
+                a.copy(busy.base().cast_const(), busy.at(8 << 20), 32 << 20).unwrap();
+            }
+            a.link_sum(part_a.at(at), count as u64, out_a.at(at), false).unwrap();
+            b.link_sum(part_b.at(at), count as u64, out_b.at(at), false).unwrap();
+        }
+        let (result_a, result_b) = (read(&mut a, &out_a, sums * count), read(&mut b, &out_b, sums * count));
+        assert!(!a.link_failed().unwrap() && !b.link_failed().unwrap());
+        check(&result_a, &result_b, &first, &second, &vec![0.0; sums * count]);
+    }
+}
+
+/// sum_devices reads each other device's part where it lies: a device that writes its part buffer
+/// again right after a sum (as a pass's next wave of experts writes its activations) must not
+/// change what another device's sum reads. Each round writes new parts into the same buffers, sums
+/// them, and the next round overwrites them at once; every round's sums must be its own parts'.
+#[test]
+fn device_sums_read_parts_before_they_are_written_again() {
+    let (Ok(mut a), Ok(mut b)) = (Backend::new(0, 2 << 30), Backend::new(1, 2 << 30)) else {
+        eprintln!("skipped: device sums need two GPUs");
+        return;
+    };
+    let (count, rounds) = (WIDTH * 8, 400);
+    let (first, second) = (parts(0, rounds, count, 5), parts(1, rounds, count, 6));
+    let bytes = (rounds * count * 4) as u64;
+    let (source_a, source_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap());
+    a.write_buffer(&source_a, 0, &first).unwrap();
+    b.write_buffer(&source_b, 0, &second).unwrap();
+    let (part_a, part_b) = (a.buffer((count * 4) as u64).unwrap(), b.buffer((count * 4) as u64).unwrap());
+    let (out_a, out_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap());
+    let busy = b.buffer(64 << 20).unwrap();
+    for round in 0..rounds {
+        let at = round * count;
+        // (now and then the second device falls behind)
+        if round % 7 == 0 {
+            b.copy(busy.base().cast_const(), busy.at(8 << 20), 32 << 20).unwrap();
+        }
+        straydog_engine::ops::devices_settle(&[&a, &b]).unwrap();
+        a.copy(source_a.at(at).cast_const(), part_a.base(), (count * 4) as u64).unwrap();
+        b.copy(source_b.at(at).cast_const(), part_b.base(), (count * 4) as u64).unwrap();
+        straydog_engine::ops::sum_devices(&[&a, &b], &[out_a.at(at), out_b.at(at)], &[part_a.base().cast_const(), part_b.base().cast_const()],
+                                          count as u64).unwrap();
+    }
+    let (result_a, result_b) = (read(&mut a, &out_a, rounds * count), read(&mut b, &out_b, rounds * count));
+    check(&result_a, &result_b, &first, &second, &vec![0.0; rounds * count]);
 }
 
 #[test]

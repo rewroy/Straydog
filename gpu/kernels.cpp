@@ -446,6 +446,7 @@ struct Device {
     uint64_t inline_routes[32] = {};
     size_t inline_routes_count = 0;
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
+    hipEvent_t parts_read = nullptr;    // sd_op_sum_devices: this device has read the others' parts
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
     hipEvent_t readback_done = nullptr;
@@ -513,6 +514,7 @@ struct Device {
         if (route_mailbox) cleanup(hipHostFree(route_mailbox));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
+        if (parts_read) cleanup(hipEventDestroy(parts_read));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
         if (copy_stream) cleanup(hipStreamDestroy(copy_stream));
         if (swapped) cleanup(hipEventDestroy(swapped));
@@ -2829,6 +2831,24 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 sum_devices_kernel<<<unsigned((count + 255) / 256), 256, 0, list[i]->stream>>>(all, unsigned(devices), size_t(count),
                                                                                              outs[i]);
                 check(hipGetLastError());
+                if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
+                check(hipEventRecord(list[i]->parts_read, list[i]->stream));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// Every device's later work waits until each other device's last sd_op_sum_devices has read its
+// part: before a device writes a summed part's buffer again (another device's sum reads it there).
+int sd_devices_settle(void* const* handles, uint64_t devices) {
+    try {
+        if (!handles || devices < 1 || devices > sum_devices_max) throw std::runtime_error("invalid Straydog devices");
+        std::vector<Device*> list;
+        for (size_t i = 0; i < devices; ++i) list.push_back(&device(handles[i]));
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                for (Device* other : list)
+                    if (other != d && other->parts_read) check(hipStreamWaitEvent(d->stream, other->parts_read, 0));
             });
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

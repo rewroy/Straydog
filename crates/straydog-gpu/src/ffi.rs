@@ -689,6 +689,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_devices_settle(
+        handles: *const *mut ::std::os::raw::c_void,
+        devices: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_sparse_attention(
         handle: *mut ::std::os::raw::c_void,
         q: *const f32,

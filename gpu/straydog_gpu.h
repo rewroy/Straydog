@@ -176,6 +176,9 @@ int sd_op_experts_table(void* handle, const uint64_t* table, uint64_t count, con
    order), each device's stream waiting for the others' parts and reading them over peer access.
    A part must stay unchanged until every device's sum has run; an out is never a part. */
 int sd_op_sum_devices(void* const* handles, float* const* outs, const float* const* parts, uint64_t devices, uint64_t count);
+/* Every device's later work waits until each other device's last sd_op_sum_devices has read its
+   part (that sum reads it in place): before a device writes a summed part's buffer again. */
+int sd_devices_settle(void* const* handles, uint64_t devices);
 /* Latent attention: each query attends to the window rows of `raw` ending at its position
    (position p in row p % raw_rows, so `raw` may be a ring) and
    the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio

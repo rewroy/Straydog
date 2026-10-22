@@ -77,6 +77,15 @@ pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) ->
     check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
+/// Every device's later work waits until each other device's last [`sum_devices`] has read its
+/// part (that sum reads the parts where they lie): before a device writes a summed part's buffer
+/// again, as a pass's next wave of experts writes its activations.
+pub fn devices_settle(devices: &[&Backend]) -> Result<()> {
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    // SAFETY: live handles.
+    check(unsafe { ffi::sd_devices_settle(handles.as_ptr(), handles.len() as u64) })
+}
+
 impl Backend {
     /// A zeroed device buffer.
     pub fn buffer(&mut self, bytes: u64) -> Result<Buffer> {
