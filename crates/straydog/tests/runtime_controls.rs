@@ -65,13 +65,16 @@ fn stand_in(marker: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
                                       "model": straydog_engine::bundle::MODEL, "quantization": QUANT}));
 }
 
 /// A worker whose process (as a sandbox's) leaves the tree's process group and outlives the
-/// worker by a second; its id goes to MARKER.
+/// worker by a second; its id goes to MARKER. Linux process groups have no Windows counterpart
+/// here; the Job Object path is covered by the isolation tests.
+#[cfg(unix)]
 #[allow(clippy::zombie_processes)] // the process outlives this one on purpose (its new parent reaps it)
 fn lingering(marker: &Path) {
     use std::os::unix::process::CommandExt;
@@ -87,6 +90,7 @@ fn lingering(marker: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn grandchild() {
     let parent = std::os::unix::process::parent_id();
     while std::os::unix::process::parent_id() == parent {
@@ -96,6 +100,7 @@ fn grandchild() {
 }
 
 /// Whether `pid` runs (a zombie has exited).
+#[cfg(unix)]
 fn running(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .is_ok_and(|stat| stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()) != Some("Z"))
@@ -110,7 +115,9 @@ fn main() {
             eprintln!("Straydog VRAM budget is unavailable");
             std::process::exit(1);
         }
+        #[cfg(unix)]
         Some("lingers") => return lingering(Path::new(&args[2])),
+        #[cfg(unix)]
         Some("grandchild") => return grandchild(),
         _ => {}
     }
@@ -165,20 +172,26 @@ fn main() {
         engine.close().await;
 
         // Closing waits for the worker's processes, the one outside its process group too.
-        let pid_file = scratch.join("grandchild");
-        let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(),
-                                                vec!["lingers".into(), PathBuf::from(&pid_file).into_os_string()]));
-        let started = Instant::now();
-        while !matches!(engine.state(), EngineState::Ready { .. }) {
-            assert!(started.elapsed() < Duration::from_secs(10), "the lingering worker did not start: {:?}", engine.state());
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Windows has no process-group escape of this shape; Job Object cleanup is tested elsewhere.
+        #[cfg(unix)]
+        {
+            let pid_file = scratch.join("grandchild");
+            let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(),
+                                                    vec!["lingers".into(), PathBuf::from(&pid_file).into_os_string()]));
+            let started = Instant::now();
+            while !matches!(engine.state(), EngineState::Ready { .. }) {
+                assert!(started.elapsed() < Duration::from_secs(10), "the lingering worker did not start: {:?}", engine.state());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let grandchild: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+            let closing = Instant::now();
+            engine.close().await;
+            assert!(!running(grandchild), "the runtime closed while its worker's sandboxed process still ran");
+            println!("runtime_controls: a failed start fails the runtime; closing waited {:.1} s for the worker's last process",
+                     closing.elapsed().as_secs_f64());
         }
-        let grandchild: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-        let closing = Instant::now();
-        engine.close().await;
-        assert!(!running(grandchild), "the runtime closed while its worker's sandboxed process still ran");
-        println!("runtime_controls: a failed start fails the runtime; closing waited {:.1} s for the worker's last process",
-                 closing.elapsed().as_secs_f64());
+        #[cfg(not(unix))]
+        println!("runtime_controls: a failed start fails the runtime");
     });
     std::fs::remove_dir_all(&scratch).unwrap();
 }
