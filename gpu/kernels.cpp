@@ -2438,6 +2438,34 @@ int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// An op's sizes from the caller's counts, checked: the product of counts (an error when it
+// overflows, so that an op_span check never passes on a wrapped size), the bytes of that many
+// floats, blocks of 256 threads over a count, and a launch dimension (at most `limit`).
+inline size_t checked_product(std::initializer_list<uint64_t> factors) {
+    uint64_t product = 1;
+    for (const uint64_t factor : factors)
+        if (__builtin_mul_overflow(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(product);
+}
+inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
+    return checked_product({uint64_t(checked_product(factors)), 4});
+}
+inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
+    uint64_t sum = 0;
+    for (const uint64_t term : terms)
+        if (__builtin_add_overflow(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(sum);
+}
+inline unsigned checked_blocks(size_t count) {
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
+    return unsigned(blocks);
+}
+inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
+    if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
+    return unsigned(count);
+}
+
 #define SD_OP_BEGIN try { auto& value = device(handle);
 #define SD_OP_END check(hipGetLastError()); return 0; } catch (const std::exception& e) { last_error = e.what(); return -1; }
 static unsigned op_blocks(size_t count) { return unsigned((count + 255) / 256); }
@@ -2905,10 +2933,13 @@ constexpr size_t slot_route_capacity = 65536;
 static SlotExperts slot_plan(uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn,
                              const sd_expert_split& part) {
     SlotExperts plan{};
+    // (hidden and ffn bounded, the rows a split's: a matrix's bytes cannot wrap)
+    if (hidden > (uint64_t(1) << 24) || ffn > (uint64_t(1) << 24) || part.hidden_rows > hidden || part.ffn_rows > ffn)
+        throw std::runtime_error("invalid Straydog experts shape");
     for (int role = 0; role < 3; ++role) {
         const size_t matrix_rows = size_t(role == 2 ? part.hidden_rows : part.ffn_rows), cols = size_t(role == 2 ? ffn : hidden);
         const size_t row_bytes = matrix_row_bytes(kinds[role], cols);
-        if (offsets[role] > slot_bytes || matrix_rows * row_bytes > slot_bytes - offsets[role])
+        if (offsets[role] > slot_bytes || checked_product({matrix_rows, row_bytes}) > slot_bytes - offsets[role])
             throw std::runtime_error("an expert's matrices lie outside its slot");
         plan.role[role] = {reinterpret_cast<const uint8_t*>(offsets[role]), row_bytes, matrix_rows, cols, 0, 0, 0, kinds[role]};
     }
@@ -2929,17 +2960,10 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
         part.hidden_first > hidden - part.hidden_rows || (part.send && !(part.stages & 2)))
         throw std::runtime_error("invalid Straydog experts shape");
-    // The input's and out's floats ((rows - 1) * stride + hidden) and the product's, without wrapping.
-    const auto floats_of = [](uint64_t rows, uint64_t stride, uint64_t width) {
-        uint64_t floats = 0;
-        if (__builtin_mul_overflow(rows - 1, stride, &floats) || __builtin_add_overflow(floats, width, &floats) ||
-            floats > (uint64_t(1) << 60))
-            throw std::runtime_error("invalid Straydog experts shape");
-        return floats;
-    };
-    const uint64_t input_floats = floats_of(rows, input_stride, hidden), out_floats = floats_of(rows, out_stride, hidden);
-    if (ffn > UINT32_MAX) throw std::runtime_error("invalid Straydog experts shape");
-    const uint64_t product_floats = floats_of(rows * top_k, ffn, ffn);
+    // The input's and out's floats ((rows - 1) * stride + hidden) and the product's, checked.
+    const uint64_t input_floats = checked_sum({checked_product({rows - 1, input_stride}), hidden});
+    const uint64_t out_floats = checked_sum({checked_product({rows - 1, out_stride}), hidden});
+    const uint64_t product_floats = checked_product({rows, top_k, ffn});
     // (sending: the down stage's rows of out also go to the other device, its flag raised after them)
     const LinkTail tail = part.send ? part_send_tail(value, part.send - 1) : LinkTail{};
     if (part.send && out_floats > tail.capacity) throw std::runtime_error("an experts part exceeds its inbox");
@@ -2955,11 +2979,11 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         op_span(value, reinterpret_cast<const void*>(bases[route]), size_t(slot_bytes), "an expert slot");
     }
     if (part.stages & 1) {
-        op_span(value, input, size_t(input_floats) * 4, "an expert input");
+        op_span(value, input, checked_floats({input_floats}), "an expert input");
         if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
     }
-    op_span(value, product, size_t(product_floats) * 4, "an expert product");
-    if (part.stages & 2) op_span(value, out, size_t(out_floats) * 4, "an expert output");
+    op_span(value, product, checked_floats({product_floats}), "an expert product");
+    if (part.stages & 2) op_span(value, out, checked_floats({out_floats}), "an expert output");
     plan.top_k = uint32_t(top_k);
     plan.product_stride = uint32_t(ffn);
     plan.product_first = uint32_t(part.ffn_first);
@@ -3018,11 +3042,11 @@ int sd_op_experts_table(void* handle, const uint64_t* table, uint64_t count, con
     const sd_expert_split whole{0, ffn, 0, hidden, 3};
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, whole);
     op_span(value, table, size_t(count) * 8, "an expert table");
-    op_span(value, ids, size_t(rows * top_k) * 4, "expert routes");
-    op_span(value, input, size_t(rows * hidden) * 4, "an expert input");
-    if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
-    op_span(value, product, size_t(rows * top_k * ffn) * 4, "an expert product");
-    op_span(value, out, size_t(rows * hidden) * 4, "an expert output");
+    op_span(value, ids, checked_floats({rows, top_k}), "expert routes");
+    op_span(value, input, checked_floats({rows, hidden}), "an expert input");
+    if (weights) op_span(value, weights, checked_floats({rows, top_k}), "route weights");
+    op_span(value, product, checked_floats({rows, top_k, ffn}), "an expert product");
+    op_span(value, out, checked_floats({rows, hidden}), "an expert output");
     plan.top_k = uint32_t(top_k);
     plan.product_stride = uint32_t(ffn);
     plan.clamp = clamp;

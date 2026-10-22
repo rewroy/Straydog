@@ -516,33 +516,6 @@ __global__ void tm_scale_rows_kernel(float* x, const float* scalars, size_t coun
     if (index < count) x[index] *= tm_sigmoid(scalars[index / width]);
 }
 
-// An op's sizes from the caller's counts, checked: the product of counts (an error when it
-// overflows, so that an op_span check never passes on a wrapped size), the bytes of that many
-// floats, blocks of 256 threads over a count, and a launch dimension (at most `limit`).
-inline size_t checked_product(std::initializer_list<uint64_t> factors) {
-    uint64_t product = 1;
-    for (const uint64_t factor : factors)
-        if (__builtin_mul_overflow(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
-    return size_t(product);
-}
-inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
-    return checked_product({uint64_t(checked_product(factors)), 4});
-}
-inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
-    uint64_t sum = 0;
-    for (const uint64_t term : terms)
-        if (__builtin_add_overflow(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
-    return size_t(sum);
-}
-inline unsigned checked_blocks(size_t count) {
-    const size_t blocks = count / 256 + (count % 256 != 0);
-    if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
-    return unsigned(blocks);
-}
-inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
-    if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
-    return unsigned(count);
-}
 
 int sd_op_conv_silu(void* handle, float* x, float* history, const float* taps, uint64_t channels, uint64_t kernel, uint64_t steps) {
     SD_OP_BEGIN
