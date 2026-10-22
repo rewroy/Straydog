@@ -375,7 +375,7 @@ mod tests {
     /// while a mapping of the file is still open (`ERROR_USER_MAPPED_FILE`).
     fn tamper(bundle: &Bundle, shard: usize, offset: u64) {
         let path = bundle.root.join(&bundle.pins.shards[shard].name);
-        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
         let mut byte = [0u8; 1];
         crate::storage::read_at(&file, offset, &mut byte).unwrap();
         byte[0] ^= 1;
