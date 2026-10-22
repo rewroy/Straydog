@@ -284,7 +284,7 @@ int sd_op_linear_send(void* handle, int channel, const void* weights, int kind, 
                       uint64_t steps, float* output) {
     SD_OP_BEGIN
     const LinkTail tail = part_send_tail(value, channel);
-    if (!rows || !cols || cols > (uint64_t(1) << 24) || !steps || steps > uint64_t(gemv_max_vectors) || steps * rows > tail.capacity)
+    if (!rows || !cols || cols > (uint64_t(1) << 24) || !steps || steps > uint64_t(gemv_max_vectors) || rows > tail.capacity / steps)
         throw std::runtime_error("invalid Straydog sent linear");
     const size_t row_bytes = matrix_row_bytes(kind, cols);
     op_span(value, weights, checked_product({rows, row_bytes}), "a weight matrix");
@@ -303,9 +303,10 @@ int sd_op_linear_send(void* handle, int channel, const void* weights, int kind, 
 
 int sd_op_part_send(void* handle, int channel, const float* part, uint64_t rows, uint64_t stride, uint64_t first, uint64_t count) {
     SD_OP_BEGIN
-    if (!rows || !count || rows > (uint64_t(1) << 24) || stride > (uint64_t(1) << 26) || first + count > stride)
+    if (!rows || !count || rows > (uint64_t(1) << 24) || stride > (uint64_t(1) << 26) || first > stride || count > stride - first)
         throw std::runtime_error("invalid Straydog part send");
-    op_span(value, part, checked_floats({rows - 1, stride}) + size_t(first + count) * 4, "a sum's part");
+    op_span(value, part, checked_sum({checked_floats({rows - 1, stride}), checked_floats({first}), checked_floats({count})}),
+            "a sum's part");
     part_send(value, channel, part, size_t(rows), size_t(stride), size_t(first), size_t(count));
     SD_OP_END
 }

@@ -528,6 +528,12 @@ inline size_t checked_product(std::initializer_list<uint64_t> factors) {
 inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
     return checked_product({uint64_t(checked_product(factors)), 4});
 }
+inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
+    uint64_t sum = 0;
+    for (const uint64_t term : terms)
+        if (__builtin_add_overflow(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(sum);
+}
 inline unsigned checked_blocks(size_t count) {
     const size_t blocks = count / 256 + (count % 256 != 0);
     if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");

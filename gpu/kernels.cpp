@@ -2489,10 +2489,12 @@ static int hc_step_op(void* handle, int channel, const float* x, const float* re
                       float norm_eps, const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width,
                       float* workspace, uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out) {
     SD_OP_BEGIN
-    if (!rows || rows > 65535 || !hc || hc > 8 || !width || (x && stream == residual) || (channel >= 0 && !x))
+    // (rows, hc and width bounded so that no size below wraps)
+    if (!rows || rows > 65535 || !hc || hc > 8 || !width || width > (uint64_t(1) << 24) || (x && stream == residual) ||
+        (channel >= 0 && !x))
         throw std::runtime_error("invalid Straydog hyper-connection step");
     const PartRead link = channel >= 0 ? part_read(value, channel) : PartRead{};
-    if (channel >= 0 && rows * width > link.capacity) throw std::runtime_error("a linked hyper-connection step exceeds its inbox");
+    if (channel >= 0 && width > link.capacity / rows) throw std::runtime_error("a linked hyper-connection step exceeds its inbox");
     const size_t mix = size_t((2 + hc) * hc), flat = size_t(rows * hc * width);
     op_span(value, stream, flat * 4, "a stream");
     if (x) {
@@ -2927,9 +2929,20 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
         part.hidden_first > hidden - part.hidden_rows || (part.send && !(part.stages & 2)))
         throw std::runtime_error("invalid Straydog experts shape");
+    // The input's and out's floats ((rows - 1) * stride + hidden) and the product's, without wrapping.
+    const auto floats_of = [](uint64_t rows, uint64_t stride, uint64_t width) {
+        uint64_t floats = 0;
+        if (__builtin_mul_overflow(rows - 1, stride, &floats) || __builtin_add_overflow(floats, width, &floats) ||
+            floats > (uint64_t(1) << 60))
+            throw std::runtime_error("invalid Straydog experts shape");
+        return floats;
+    };
+    const uint64_t input_floats = floats_of(rows, input_stride, hidden), out_floats = floats_of(rows, out_stride, hidden);
+    if (ffn > UINT32_MAX) throw std::runtime_error("invalid Straydog experts shape");
+    const uint64_t product_floats = floats_of(rows * top_k, ffn, ffn);
     // (sending: the down stage's rows of out also go to the other device, its flag raised after them)
     const LinkTail tail = part.send ? part_send_tail(value, part.send - 1) : LinkTail{};
-    if (part.send && (rows - 1) * out_stride + hidden > tail.capacity) throw std::runtime_error("an experts part exceeds its inbox");
+    if (part.send && out_floats > tail.capacity) throw std::runtime_error("an experts part exceeds its inbox");
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, part);
     const size_t routes = size_t(rows * top_k);
     if (!bases && (value.inline_routes_count ? value.inline_routes_count : value.slot_routes_count) != routes)
@@ -2942,11 +2955,11 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         op_span(value, reinterpret_cast<const void*>(bases[route]), size_t(slot_bytes), "an expert slot");
     }
     if (part.stages & 1) {
-        op_span(value, input, size_t((rows - 1) * input_stride + hidden) * 4, "an expert input");
+        op_span(value, input, size_t(input_floats) * 4, "an expert input");
         if (weights) op_span(value, weights, size_t(rows * top_k) * 4, "route weights");
     }
-    op_span(value, product, size_t(rows * top_k * ffn) * 4, "an expert product");
-    if (part.stages & 2) op_span(value, out, size_t((rows - 1) * out_stride + hidden) * 4, "an expert output");
+    op_span(value, product, size_t(product_floats) * 4, "an expert product");
+    if (part.stages & 2) op_span(value, out, size_t(out_floats) * 4, "an expert output");
     plan.top_k = uint32_t(top_k);
     plan.product_stride = uint32_t(ffn);
     plan.product_first = uint32_t(part.ffn_first);

@@ -207,7 +207,11 @@ __global__ void part_signal_kernel(uint32_t* state, uint32_t* peer_flag) {
 }
 inline void part_send(Device& d, int channel, const float* part, size_t rows, size_t stride, size_t first, size_t count) {
     const LinkTail tail = part_send_tail(d, channel);
-    if (!rows || !count || (rows - 1) * stride + first + count > tail.capacity) throw std::runtime_error("a part exceeds its inbox");
+    // (the part's end in floats, (rows - 1) * stride + first + count, without wrapping)
+    uint64_t end = 0;
+    if (!rows || !count || __builtin_mul_overflow(uint64_t(rows - 1), uint64_t(stride), &end) ||
+        __builtin_add_overflow(end, uint64_t(first), &end) || __builtin_add_overflow(end, uint64_t(count), &end) || end > tail.capacity)
+        throw std::runtime_error("a part exceeds its inbox");
     const unsigned blocks = unsigned(std::min<size_t>((rows * count + 255) / 256, 1024));
     part_copy_kernel<<<blocks, 256, 0, d.stream>>>(part, rows, stride, first, count, tail.peer_inbox, tail.state, tail.capacity);
     check(hipGetLastError());
