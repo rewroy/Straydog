@@ -496,17 +496,16 @@ __global__ void op_route_softmax256_kernel(const float* logits, size_t k, int no
     op_route_softmax256_wave(logits + row * 256, k, normalize, ids + row * k, weights + row * k, threadIdx.x);
 }
 
-__global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
-                                int normalize, float scale, int32_t* ids, float* weights) {
-    const size_t row = blockIdx.x;
-    extern __shared__ float scores[];   // the scores, then the scores + bias
+// One row's routes by the block (256 threads, `experts` x 2 floats of dynamic LDS at `scores`): its
+// logits read through the device-wide cache (another block of the launch may have written them).
+__device__ void route_row(const float* l, const float* bias, size_t experts, size_t k, int gating, int normalize, float scale,
+                          int32_t* ids, float* weights, float* scores) {
     float* biased = scores + experts;
     __shared__ float reduce[256];
     __shared__ int32_t picked[64], best[8];
     __shared__ float best_value[8];
-    const float* l = logits + row * experts;
     for (size_t e = threadIdx.x; e < experts; e += blockDim.x) {
-        const float x = l[e];
+        const float x = hc_step_load(const_cast<float*>(l + e));
         scores[e] = gating == 1 ? 1.0f / (1.0f + expf(-x)) : gating == 2 ? sqrtf(x > 20.0f ? x : log1pf(expf(x))) : x;
     }
     __syncthreads();
@@ -562,9 +561,74 @@ __global__ void op_route_kernel(const float* logits, const float* bias, size_t e
     for (size_t slot = 0; slot < k; ++slot) sum += scores[picked[slot]];
     for (size_t slot = 0; slot < k; ++slot) {
         const float chosen = scores[picked[slot]];
-        ids[row * k + slot] = picked[slot];
-        weights[row * k + slot] = (normalize && k > 1 ? chosen / (sum + 1e-20f) : chosen) * scale;
+        ids[slot] = picked[slot];
+        weights[slot] = (normalize && k > 1 ? chosen / (sum + 1e-20f) : chosen) * scale;
     }
+}
+__global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
+                                int normalize, float scale, int32_t* ids, float* weights) {
+    extern __shared__ float scores[];   // the scores, then the scores + bias
+    const size_t row = blockIdx.x;
+    route_row(logits + row * experts, bias, experts, k, gating, normalize, scale, ids + row * k, weights + row * k, scores);
+}
+// A router's logits (gemv_fixed_kind's rows, lanes and dots: the same bits) and, in the launch's
+// last block to finish, every row's routes as op_route_kernel forms them: one launch for two.
+struct RouteTail {
+    const float* bias;
+    size_t experts, k;
+    int gating, normalize;
+    float scale;
+    int32_t* ids;
+    float* weights;
+    unsigned* counter;   // zero between launches: the last block resets it
+};
+template<int kind, int V>
+__global__ void gemv_routed_kind(FixedGemv list, const float* input, float* output, RouteTail tail) {
+    extern __shared__ float scores[];
+    const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    const GemvItem& item = list.items[0];
+    gemv_rows<kind, V>(item.matrix, wave * (32 / item.lanes), item.lanes, input, list.input_stride, output, list.output_stride,
+                       list.residual);
+    // Every block's logits are out before it counts itself done.
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(tail.counter, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x == 0) *tail.counter = 0;
+    const size_t stride = V > 1 ? list.output_stride : 0;
+    for (int row = 0; row < V; ++row) {
+        route_row(output + row * stride, tail.bias, tail.experts, tail.k, tail.gating, tail.normalize, tail.scale, tail.ids + row * tail.k,
+                  tail.weights + row * tail.k, scores);
+        __syncthreads();
+    }
+}
+// gemv() of one matrix (an F32, F16 or BF16 router) for 1-4 vectors with the rows' routes in its
+// last block, on the kernel and lanes gemv() would take; false (nothing launched) otherwise.
+bool gemv_route_launch(Device& d, const Matrix& matrix, const float* input, float* output, size_t vectors, size_t input_stride,
+                       size_t output_stride, RouteTail tail, unsigned min_lanes) {
+    if (matrix.kind != 0 && matrix.kind != 1 || vectors < 1 || vectors > 4) return false;
+    unsigned lanes = gemv_lanes(matrix, input);
+    size_t alignment = 0;
+    if (lanes == 2 && min_lanes > 2 && matrix.cols / gemv_unit(matrix.kind, alignment) >= 32) lanes = std::min(32u, min_lanes);
+    if (!lanes) return false;
+    FixedGemv list{};
+    list.items[0] = {matrix, 0, lanes};
+    list.count = 1;
+    list.input_stride = uint32_t(input_stride);
+    list.output_stride = uint32_t(output_stride);
+    const unsigned blocks = unsigned((gemv_waves(matrix, lanes) + 7) / 8);
+    const size_t shared = tail.experts * 8;
+    #define SD_ROUTED(format, v) gemv_routed_kind<format, v><<<blocks, 256, shared, d.stream>>>(list, input, output, tail)
+    if (matrix.kind == 0) {
+        switch (vectors) { case 1: SD_ROUTED(0, 1); break; case 2: SD_ROUTED(0, 2); break; case 3: SD_ROUTED(0, 3); break; default: SD_ROUTED(0, 4); }
+    } else {
+        switch (vectors) { case 1: SD_ROUTED(1, 1); break; case 2: SD_ROUTED(1, 2); break; case 3: SD_ROUTED(1, 3); break; default: SD_ROUTED(1, 4); }
+    }
+    #undef SD_ROUTED
+    return true;
 }
 
 // out = silu(min(gate, c)) * clamp(up, -c, c) * row_weight (c = 0: no clamp; weights optional).

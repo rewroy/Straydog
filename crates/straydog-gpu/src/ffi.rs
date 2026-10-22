@@ -522,6 +522,27 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_linear_route(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        experts: u64,
+        cols: u64,
+        input: *const f32,
+        steps: u64,
+        logits: *mut f32,
+        bias: *const f32,
+        k: u64,
+        gating: ::std::os::raw::c_int,
+        normalize: ::std::os::raw::c_int,
+        scale: f32,
+        ids: *mut i32,
+        route_weights: *mut f32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_swiglu(
         handle: *mut ::std::os::raw::c_void,
         gate: *const f32,

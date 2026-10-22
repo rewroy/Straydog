@@ -435,6 +435,7 @@ struct Device {
     // sd_op_experts' route addresses (an allocation of slot_route_capacity entries), and the
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
+    unsigned* route_counter = nullptr;   // sd_op_linear_route's (zero between launches)
     // sd_op_sparse_attention's tile counters (zero between launches: each tile's last share resets its own)
     unsigned* attention_tiles = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
@@ -2528,6 +2529,43 @@ int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t r
         op_route_kernel<<<unsigned(rows), 256, size_t(experts) * 8, value.stream>>>(logits, bias, size_t(experts), size_t(k), gating,
                                                                                   normalize, scale, ids, weights);
     SD_OP_END
+}
+
+int sd_op_linear_route(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input, uint64_t steps,
+                       float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale, int32_t* ids,
+                       float* route_weights, float* scratch, uint64_t scratch_bytes) {
+    try {
+        auto& value = device(handle);
+        // (the softmax router of 256 experts has a one-wave route kernel of its own)
+        const bool fused = (kind == 0 || kind == 1) && steps >= 1 && steps <= 4 && !(experts == 256 && gating == 0 && !bias && scale == 1.0f);
+        if (!fused) {
+            if (sd_op_linear(handle, weights, kind, experts, cols, 0, input, 0, steps, logits, 0, scratch, scratch_bytes)) return -1;
+            return sd_op_route(handle, logits, bias, steps, experts, k, gating, normalize, scale, ids, route_weights);
+        }
+        if (!experts || !cols || !k || k > 64 || k > experts || gating < 0 || gating > 2 || experts * 8 > 48 * 1024)
+            throw std::runtime_error("invalid Straydog router shape");
+        const size_t row_bytes = matrix_row_bytes(kind, cols);
+        op_span(value, weights, size_t(experts) * row_bytes, "a router matrix");
+        op_span(value, input, size_t(steps * cols) * 4, "a router input");
+        op_span(value, logits, size_t(steps * experts) * 4, "router logits");
+        if (bias) op_span(value, bias, size_t(experts) * 4, "a router bias");
+        op_span(value, ids, size_t(steps * k) * 4, "routed experts");
+        op_span(value, route_weights, size_t(steps * k) * 4, "routing weights");
+        if (!value.route_counter) {
+            value.route_counter = static_cast<unsigned*>(allocate(value, 4));
+            check(hipMemsetAsync(value.route_counter, 0, 4, value.stream));
+        }
+        const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(experts), size_t(cols), 0, 0, 0, kind};
+        const RouteTail tail{bias, size_t(experts), size_t(k), gating, normalize, scale, ids, route_weights, value.route_counter};
+        // (strides in values, as op_linear passes them: a contiguous input and output)
+        if (!gemv_route_launch(value, matrix, input, logits, size_t(steps), steps > 1 ? size_t(cols) : 0, steps > 1 ? size_t(experts) : 0,
+                               tail, op_lanes)) {
+            if (sd_op_linear(handle, weights, kind, experts, cols, 0, input, 0, steps, logits, 0, scratch, scratch_bytes)) return -1;
+            return sd_op_route(handle, logits, bias, steps, experts, k, gating, normalize, scale, ids, route_weights);
+        }
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
 int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp,

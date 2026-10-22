@@ -351,6 +351,21 @@ impl Backend {
         })
     }
 
+    /// [`Backend::linear`] of a router (`experts` rows, `steps` contiguous rows of input and logits)
+    /// then [`Backend::route`] over its logits, in one launch where the router is F32 or F16 (the
+    /// same results as the two).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_route(&mut self, weights: &Buffer, kind: u32, experts: u64, cols: u64, input: P, steps: u64, logits: M,
+                        bias: Option<P>, k: u64, gating: i32, normalize: bool, scale: f32, ids: M, route_weights: M,
+                        scratch: &Buffer) -> Result<()> {
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linear_route(self.handle(), weights.pointer.cast_const(), kind as i32, experts, cols, input.cast(), steps,
+                                    logits.cast(), bias.map_or(std::ptr::null(), |b| b.cast()), k, gating, i32::from(normalize),
+                                    scale, ids.cast(), route_weights.cast(), scratch.pointer.cast(), scratch.bytes)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn swiglu(&mut self, gate: P, up: P, rows: u64, width: u64, clamp: f32, row_weights: Option<P>, out: M) -> Result<()> {
         // SAFETY: as above.

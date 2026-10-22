@@ -135,6 +135,9 @@ int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float*
 /* Experts: routes (gating 0 softmax, 1 sigmoid, 2 square-root softplus; bias steers the choice,
    not the weights), clamped SwiGLU with optional row weights, row gather and scatter-add. */
 int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t rows, uint64_t experts, uint64_t k, int gating, int normalize, float scale, int32_t* ids, float* weights);
+/* sd_op_linear (rows = experts, 1-4 steps, a contiguous output) then sd_op_route over its logits,
+   in one launch where the router is F32 or F16 (the same results as the two ops), else as the two. */
+int sd_op_linear_route(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input, uint64_t steps, float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale, int32_t* ids, float* route_weights, float* scratch, uint64_t scratch_bytes);
 int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp, const float* row_weights, float* out);
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
 int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);

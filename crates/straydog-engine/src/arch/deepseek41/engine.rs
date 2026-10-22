@@ -1622,10 +1622,13 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
 fn router_ops(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, predict: bool) -> Result<()> {
     let k = hp.experts_used;
     let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
-    shard.linear(&name(layer, "ffn_gate_inp"), work.x.base(), n, work.router.base())?;
+    // (the router and its routes in one launch where it can)
+    let router = shard.dense(&name(layer, "ffn_gate_inp"))?;
     let bias = shard.dense(&format!("blk.{layer}.exp_probs_b.bias"))?;
-    shard.gpu.route(work.router.base(), Some(bias.buffer.base()), n as u64, hp.experts as u64, k as u64, gating, hp.route_normalize,
-                    hp.route_scale, work.ids.base(), work.weights.base())?;
+    let scratch = shard.scratch;
+    shard.gpu.linear_route(&router.buffer, router.kind, router.dims[1] as u64, router.dims[0] as u64, work.x.base(), n as u64,
+                           work.router.base(), Some(bias.buffer.base()), k as u64, gating, hp.route_normalize, hp.route_scale,
+                           work.ids.base(), work.weights.base(), &scratch)?;
     if predict {
         let next_bias = shard.dense(&format!("blk.{}.exp_probs_b.bias", layer + 1))?;
         shard.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, work.router.at(hp.experts))?;
