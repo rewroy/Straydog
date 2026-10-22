@@ -2,9 +2,9 @@
 //! pinner made resident are unpinned and freed. Alone in its binary, so that the process's
 //! resident size measures this store only.
 //!
-//! cargo test --release -p straydog-engine --features hip --test experts_drop, under the GPU lock.
-// Resident size comes from /proc/self/statm. A Windows working-set equivalent is a separate measurement.
-#![cfg(all(target_os = "linux", any(feature = "hip", feature = "cuda")))]
+//! cargo test --release -p straydog-engine --features hip --test experts_drop, under the GPU lock
+//! (on Windows, `--features cuda`).
+#![cfg(any(feature = "hip", feature = "cuda"))]
 
 use std::fs::File;
 use std::sync::Arc;
@@ -15,12 +15,43 @@ use straydog_engine::gpu::Backend;
 const EXPERTS: usize = 40;
 const STRIDES: [u64; 3] = [70_001, 70_001, 50_003];
 
-/// The process's resident bytes.
+/// Bytes held for the store's arenas.
+///
+/// Linux reports the resident set. Page-locking puts the arenas into it, and freeing them
+/// takes them out, which is what `/proc/self/statm`'s resident field counts.
+///
+/// Windows reports `PrivateUsage`, the private commit charge. The arenas are private heap
+/// blocks (`storage::Buffer`); dropping a settled store frees those blocks, and that charge is
+/// the amount released. `WorkingSetSize` also counts file-backed pages, and Windows trims it
+/// on its own, so a change there is not the amount this store released.
 fn resident() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
-    let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
-    // SAFETY: sysconf has no preconditions.
-    pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        // SAFETY: sysconf has no preconditions.
+        pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        // SAFETY: the structure's size is set, so the call fills PrivateUsage. The process
+        // handle is a pseudo-handle and is not closed.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+                counters.cb,
+            )
+        };
+        assert_ne!(ok, 0, "GetProcessMemoryInfo: {}", std::io::Error::last_os_error());
+        counters.PrivateUsage as u64
+    }
 }
 
 /// A store over `layout` with `host_slots` of host tier, through 120 passes that write back and
