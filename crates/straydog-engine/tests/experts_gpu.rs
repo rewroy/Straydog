@@ -433,3 +433,64 @@ fn experts_moved_for_a_decode_table() {
     assert!(from_host > 0 && from_drive > 0 && from_vram > 0 && promoted > 0 && demoted > 0,
             "host {from_host}, drive {from_drive}, VRAM {from_vram}, promoted {promoted}, demoted {demoted}");
 }
+
+/// A region lent to the store ([`DeviceExperts::lend`]) holds experts like the store's own slots;
+/// the lender takes the region's start back between passes (the experts there go to the host
+/// tier, the compute stream waiting for their copies) and overwrites it on the compute stream;
+/// given back, its slots fill after that work. Every expert reads back as the file has it.
+#[test]
+fn a_lent_region_holds_experts_and_goes_back_to_its_lender() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    // 16 slots and a reserve of 4; a host tier for every expert
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let slot_bytes = store.slot_size(0).unwrap();
+    let region = gpu.buffer(slot_bytes * 12 + 1000).unwrap();
+    assert_eq!(store.lend(region).unwrap(), 12);
+    assert_eq!(store.lent_slots(), (12, 12));
+    // 24 experts: more than the store's own slots hold beside their reserve
+    for batch in [(0..8).collect::<Vec<usize>>(), (8..16).collect(), (16..24).collect()] {
+        let slots = store.acquire(&mut gpu, 0, &batch).unwrap();
+        check_slots(&mut gpu, &roles, &batch, &slots, "into own and lent slots");
+        store.release(&mut gpu).unwrap();
+    }
+    // The lender takes back the region's first half (six slots) and overwrites it on the compute
+    // stream.
+    let half = slot_bytes * 6;
+    store.reclaim(&mut gpu, half).unwrap();
+    assert_eq!(store.lent_slots(), (6, 12));
+    let floats = half / 4;
+    let (gate, up) = (gpu.buffer(floats * 4).unwrap(), gpu.buffer(floats * 4).unwrap());
+    gpu.write_buffer(&gate, 0, &vec![1.5f32; floats as usize]).unwrap();
+    gpu.write_buffer(&up, 0, &vec![2.0f32; floats as usize]).unwrap();
+    for _ in 0..20 {
+        gpu.swiglu(gate.base(), up.base(), 1, floats, 0.0, None, region.base()).unwrap();
+    }
+    // Every expert, wherever it went, reads back intact (those taken back from the host tier).
+    for batch in [(0..8).collect::<Vec<usize>>(), (8..16).collect(), (16..24).collect()] {
+        let slots = store.acquire(&mut gpu, 0, &batch).unwrap();
+        check_slots(&mut gpu, &roles, &batch, &slots, "after the region's start was taken back");
+        for slot in &slots {
+            let start = slot.base() as u64;
+            assert!(start < region.base() as u64 || start >= region.base() as u64 + half, "an expert in a slot taken back");
+        }
+        store.release(&mut gpu).unwrap();
+    }
+    // Given back after more work on its bytes: fills into it wait for that work.
+    for _ in 0..20 {
+        gpu.swiglu(gate.base(), up.base(), 1, floats, 0.0, None, region.base()).unwrap();
+    }
+    let after = gpu.mark(straydog_engine::transfer::Stream::Compute).unwrap();
+    store.restore(after);
+    assert_eq!(store.lent_slots(), (12, 12));
+    for batch in [(24..32).collect::<Vec<usize>>(), (32..40).collect(), (0..8).collect()] {
+        let slots = store.acquire(&mut gpu, 0, &batch).unwrap();
+        check_slots(&mut gpu, &roles, &batch, &slots, "after the region came back");
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    let counts = store.counts();
+    assert!(counts.writebacks > 0 && counts.host_hits > 0, "{counts:?}");
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}

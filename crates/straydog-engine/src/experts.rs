@@ -372,6 +372,20 @@ struct VramSlot {
     /// Acquired or requested since the last release: not evicted before it.
     held: bool,
     class: usize,
+    /// A slot in a region lent to the store ([`DeviceExperts::lend`]): its bytes there (else its
+    /// class's).
+    place: Option<Buffer>,
+    /// A lent slot its lender has back ([`DeviceExperts::reclaim`]): no expert goes in.
+    taken_back: bool,
+}
+
+/// A slot of the region lent to the store: where its bytes begin there, and whether the lender
+/// has it back ([`DeviceExperts::reclaim`]).
+#[derive(Clone, Copy)]
+struct LentSlot {
+    slot: usize,
+    offset: u64,
+    out: bool,
 }
 
 /// The experts of one size (the layers whose experts take the same bytes): its VRAM slots and
@@ -473,6 +487,8 @@ pub struct DeviceExperts {
     /// Changes to which experts VRAM slots hold and which of them are ready (see
     /// [`vram_generation`](Self::vram_generation)).
     vram_changes: u64,
+    /// The slots of the region lent to the store, from its start.
+    lent: Vec<LentSlot>,
 }
 
 impl DeviceExperts {
@@ -552,7 +568,8 @@ impl DeviceExperts {
             let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_bytes as usize);
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
+                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index, place: None,
+                taken_back: false,
             }));
             classes.push(Class {
                 vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).collect(),
@@ -564,7 +581,7 @@ impl DeviceExperts {
         Ok(DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
-            counts: Counts::default(), settled: false, vram_changes: 0,
+            counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(),
         })
     }
 
@@ -780,6 +797,9 @@ impl DeviceExperts {
                 gpu.wait_mark(Stream::Compute, mark)?;
             }
         }
+        if slots.iter().any(|&slot| self.slots[slot].taken_back) {
+            return Err("an acquire found an expert in a lent slot its lender has back".into());
+        }
         Ok(slots.iter().map(|&slot| self.slot_buffer(slot)).collect())
     }
 
@@ -821,8 +841,101 @@ impl DeviceExperts {
         self.keep_free(gpu, mark)
     }
 
+    /// Take `region` (VRAM its lender has no use for now) as more slots, free: as many as fit,
+    /// shared among the classes as their layers share the store (each next slot the class's
+    /// furthest below its share), one after another from the region's start. The lender takes
+    /// them back from the start ([`reclaim`](Self::reclaim)). [`wave_limit`](Self::wave_limit) and
+    /// [`pass_limit`](Self::pass_limit) count only the store's own slots. Returns the slots made.
+    pub fn lend(&mut self, region: Buffer) -> Result<usize> {
+        if !self.lent.is_empty() {
+            return Err("an expert store takes one lent region".into());
+        }
+        let shares: Vec<u64> = (0..self.classes.len())
+            .map(|class| self.class_of.iter().filter(|other| **other == Some(class)).count() as u64).collect();
+        let mut taken = vec![0u64; self.classes.len()];
+        let mut at = 0u64;
+        while let Some(class) = (0..self.classes.len()).filter(|&class| shares[class] > 0)
+            .min_by(|&a, &b| (taken[a] * shares[b]).cmp(&(taken[b] * shares[a])).then(a.cmp(&b))) {
+            let (bytes, start) = (self.classes[class].vram_bytes, at.next_multiple_of(256));
+            if start + bytes > region.bytes {
+                break;
+            }
+            let slot = self.slots.len();
+            self.slots.push(VramSlot {
+                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class,
+                place: Some(region.slice(start, bytes)), taken_back: false,
+            });
+            self.classes[class].free.push_back(slot);
+            self.lent.push(LentSlot { slot, offset: start, out: false });
+            taken[class] += 1;
+            at = start + bytes;
+        }
+        Ok(self.lent.len())
+    }
+
+    /// Take back the lent slots whose bytes begin within the region's first `bytes`, for work
+    /// the compute stream queues next: their experts are written back to the host tier (as an
+    /// eviction would), a fill still waiting for the drive leaves its read to the host tier, and
+    /// the compute stream waits for every copy into or out of them. Between passes (no slot held).
+    pub fn reclaim(&mut self, gpu: &mut Backend, bytes: u64) -> Result<()> {
+        let mut waits = Vec::new();
+        let mut taken = Vec::new();
+        for index in 0..self.lent.len() {
+            let LentSlot { slot, offset, out } = self.lent[index];
+            if out || offset >= bytes {
+                continue;
+            }
+            if self.slots[slot].held {
+                return Err("a lent expert slot is taken back while a pass holds it".into());
+            }
+            if let Some(host) = self.slots[slot].waiting.take() {
+                // the read lands in the host tier, for no slot
+                self.host[host].waiter = None;
+                self.empty_slot(slot);
+            } else {
+                self.evict(gpu, slot)?;
+            }
+            let entry = &mut self.slots[slot];
+            waits.extend(entry.ready.take().map(|(_, mark)| mark));
+            waits.extend(std::mem::take(&mut entry.guards).into_iter().flatten());
+            self.classes[entry.class].free.retain(|&free| free != slot);
+            entry.taken_back = true;
+            self.lent[index].out = true;
+            taken.push(slot);
+        }
+        for list in self.speculative.values_mut() {
+            list.retain(|slot| !taken.contains(slot));
+        }
+        for mark in waits {
+            gpu.wait_mark(Stream::Compute, mark)?;
+        }
+        Ok(())
+    }
+
+    /// Give the lent slots taken back ([`reclaim`](Self::reclaim)) to the store again, free: a
+    /// fill's upload into one waits for the compute stream to pass `after` (the lender's last use
+    /// of its bytes).
+    pub fn restore(&mut self, after: Mark) {
+        for lent in self.lent.iter_mut().filter(|lent| lent.out) {
+            lent.out = false;
+            let entry = &mut self.slots[lent.slot];
+            entry.taken_back = false;
+            entry.guards[0] = Some(after);
+            self.classes[entry.class].free.push_back(lent.slot);
+        }
+    }
+
+    /// The lent slots the store has (not taken back), and all of them.
+    pub fn lent_slots(&self) -> (usize, usize) {
+        (self.lent.iter().filter(|lent| !lent.out).count(), self.lent.len())
+    }
+
     fn slot_buffer(&self, slot: usize) -> Buffer {
-        let class = &self.classes[self.slots[slot].class];
+        let entry = &self.slots[slot];
+        if let Some(place) = entry.place {
+            return place;
+        }
+        let class = &self.classes[entry.class];
         class.vram.slice((slot - class.first) as u64 * class.vram_bytes, class.vram_bytes)
     }
 
@@ -897,6 +1010,9 @@ impl DeviceExperts {
     /// Upload host slot `host` into VRAM slot `slot` on `stream`; the host tier gives the expert up.
     fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<()> {
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
+        if self.slots[slot].taken_back {
+            return Err("an upload into a lent expert slot its lender has back".into());
+        }
         if let Some(error) = &self.host[host].failed {
             return Err(error.clone());
         }
@@ -1075,7 +1191,11 @@ impl DeviceExperts {
             let victim = self.victim(class)?;
             self.evict(gpu, victim)?;
         }
-        self.classes[class].free.pop_front().ok_or_else(|| "no free expert slot after an eviction".into())
+        let slot = self.classes[class].free.pop_front().ok_or("no free expert slot after an eviction")?;
+        if self.slots[slot].taken_back {
+            return Err("a lent expert slot its lender has back came free".into());
+        }
+        Ok(slot)
     }
 
     fn victim(&self, class: usize) -> Result<usize> {

@@ -406,6 +406,12 @@ impl Backend {
         check(unsafe { ffi::sd_route_mailbox_wait(self.handle(), out.as_mut_ptr(), out.len() as u64) })
     }
 
+    /// Zero `buffer` on the compute stream.
+    pub fn zero(&mut self, buffer: &Buffer) -> Result<()> {
+        // SAFETY: a live handle; the library checks the range lies in its allocations.
+        check(unsafe { ffi::sd_op_zero(self.handle(), buffer.pointer, buffer.bytes) })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn swiglu(&mut self, gate: P, up: P, rows: u64, width: u64, clamp: f32, row_weights: Option<P>, out: M) -> Result<()> {
         // SAFETY: as above.

@@ -586,6 +586,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_zero(
+        handle: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_gather(
         handle: *mut ::std::os::raw::c_void,
         x: *const f32,

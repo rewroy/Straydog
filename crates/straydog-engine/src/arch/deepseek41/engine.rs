@@ -49,6 +49,7 @@ use crate::formats;
 use crate::gpu::{Backend, Result};
 use crate::moe;
 use crate::ops::{self, Buffer, Linear};
+use crate::transfer::Stream;
 
 type P = *const c_void;
 type M = *mut c_void;
@@ -242,9 +243,59 @@ struct Shard {
     sources: BTreeMap<usize, SourceRows>,
     plain: Buffer,
     compressed_rope: Buffer,
+    /// The pass's buffers (see [`Engine::select_work`]).
     work: Work,
+    /// Its own buffers, with those of every row for [`OWN_ROWS`] (a pass of more takes `arena`'s).
+    own: Work,
+    /// The buffers of every row of a pass of more than [`OWN_ROWS`] (laid out for its rows by
+    /// [`Work::in_arena`]), lent to the expert store between such passes (DS41_LEND=0: not lent).
+    arena: Option<Buffer>,
+    shape: RowShape,
+    /// The bytes of `arena` the store gave back for the passes since the last of a few rows.
+    reclaimed: u64,
     experts: DeviceExperts,
     checks: Option<SlotChecks>,
+}
+
+/// Rows of a pass on a device's own buffers of every row: decode, verify, a short prompt. A
+/// longer pass takes the arena lent to the expert store back as far as its rows reach (T8).
+pub const OWN_ROWS: usize = 64;
+
+/// What sizes a device's buffers of every row: hc, width, routes a row, the experts' width,
+/// selections a row, the index source layers (in order), whether the device has parts of sums,
+/// and the routes a wave of a pass's experts takes at most.
+#[derive(Clone)]
+struct RowShape {
+    hc: usize,
+    w: usize,
+    k: usize,
+    ff: usize,
+    top_k: usize,
+    chosen: Vec<usize>,
+    split: bool,
+    capacity: usize,
+}
+
+impl RowShape {
+    /// The floats of each buffer of every row but identity for a pass of `rows`, in the order
+    /// [`Work::in_arena`] lays them out.
+    fn floats(&self, rows: usize) -> Vec<usize> {
+        let (hc, w, k, ff) = (self.hc, self.w, self.k, self.ff);
+        let split = if self.split { rows } else { 0 };
+        // a wave's activations: at most the pass's routes and a wave's
+        let routes = (rows * k).min(self.capacity).max(rows);
+        let mut floats = vec![rows * hc * w, rows * hc * w, rows * hc, rows * hc, rows * hc * hc, rows * hc, rows * hc, rows * hc,
+                              rows * hc * hc, rows * w, rows * w, split * w, split * w, rows, rows, rows, rows, rows];
+        floats.extend(self.chosen.iter().map(|_| rows * self.top_k));
+        floats.extend([rows * k + PREDICTED, rows * k, rows * k, (rows * k).max(PREDICTED), rows * w, rows * ff, rows * ff,
+                       routes * ff, if self.split { routes } else { 0 } * ff, rows * w]);
+        floats
+    }
+
+    /// The bytes those buffers take one after another, each from a 256-byte boundary.
+    fn bytes(&self, rows: usize) -> u64 {
+        self.floats(rows).iter().fold(0, |at: u64, &floats| at.next_multiple_of(256) + (floats.max(1) * 4) as u64)
+    }
 }
 
 /// Checksums a pass queues at most (DS41_CHECK_SLOTS).
@@ -361,6 +412,8 @@ impl Shard {
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
         let (r, k, ff) = (settings.rows.max(b), hp.experts_used, hp.expert_ff);
+        // the buffers of every row for this device's own rows (a longer pass's in the arena)
+        let own = OWN_ROWS.min(r);
         let ring = hp.window + b;
         let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count.max(1) * 4) as u64);
         let rings = range.clone().map(|layer| Ok((layer, floats(&mut gpu, ring * hp.head_dim)?))).collect::<Result<BTreeMap<_, _>>>()?;
@@ -384,30 +437,32 @@ impl Shard {
         let mut chosen = BTreeMap::new();
         for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
             if plan.compressed.is_some_and(|c| c.index_source == layer) {
-                chosen.insert(layer, floats(&mut gpu, r * hp.index_top_k)?);
+                chosen.insert(layer, floats(&mut gpu, own * hp.index_top_k)?);
             }
         }
         // with one device, no parts and no sums
-        let split = if parts > 1 { r } else { 0 };
+        let split = if parts > 1 { own } else { 0 };
+        // a wave's activations: at most the pass's routes and a wave's
+        let routes = (own * k).min(r).max(own);
         let work = Work {
-            stream: floats(&mut gpu, r * hc * w)?,
-            stream2: floats(&mut gpu, r * hc * w)?,
-            pre_a: floats(&mut gpu, r * hc)?,
-            post_a: floats(&mut gpu, r * hc)?,
-            comb_a: floats(&mut gpu, r * hc * hc)?,
-            pre_f: [floats(&mut gpu, r * hc)?, floats(&mut gpu, r * hc)?],
-            post_f: floats(&mut gpu, r * hc)?,
-            comb_f: floats(&mut gpu, r * hc * hc)?,
+            stream: floats(&mut gpu, own * hc * w)?,
+            stream2: floats(&mut gpu, own * hc * w)?,
+            pre_a: floats(&mut gpu, own * hc)?,
+            post_a: floats(&mut gpu, own * hc)?,
+            comb_a: floats(&mut gpu, own * hc * hc)?,
+            pre_f: [floats(&mut gpu, own * hc)?, floats(&mut gpu, own * hc)?],
+            post_f: floats(&mut gpu, own * hc)?,
+            comb_f: floats(&mut gpu, own * hc * hc)?,
             identity: floats(&mut gpu, r * hc)?,
-            x: floats(&mut gpu, r * w)?,
-            out: floats(&mut gpu, r * w)?,
+            x: floats(&mut gpu, own * w)?,
+            out: floats(&mut gpu, own * w)?,
             parts: [floats(&mut gpu, split * w)?, floats(&mut gpu, split * w)?],
-            positions: floats(&mut gpu, r)?,
-            ring_rows: floats(&mut gpu, r)?,
-            visible: [floats(&mut gpu, r)?, floats(&mut gpu, r)?, floats(&mut gpu, r)?],
+            positions: floats(&mut gpu, own)?,
+            ring_rows: floats(&mut gpu, own)?,
+            visible: [floats(&mut gpu, own)?, floats(&mut gpu, own)?, floats(&mut gpu, own)?],
             chosen,
-            ids: floats(&mut gpu, r * k + PREDICTED)?,
-            weights: floats(&mut gpu, r * k)?,
+            ids: floats(&mut gpu, own * k + PREDICTED)?,
+            weights: floats(&mut gpu, own * k)?,
             qr: floats(&mut gpu, b * hp.q_rank)?,
             q: floats(&mut gpu, b * hp.heads * hp.head_dim)?,
             kv: floats(&mut gpu, b * hp.head_dim)?,
@@ -428,14 +483,14 @@ impl Shard {
             products: [floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?, floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?],
             product: floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?,
             hidden: floats(&mut gpu, SLOT_ROWS * k * ff)?,
-            route_rows: floats(&mut gpu, r * k)?,
-            route_weights: floats(&mut gpu, (r * k).max(PREDICTED))?,
-            xe: floats(&mut gpu, r * w)?,
-            gate: floats(&mut gpu, r * ff)?,
-            up: floats(&mut gpu, r * ff)?,
-            act: floats(&mut gpu, r * ff)?,
-            act_sum: floats(&mut gpu, split * ff)?,
-            y: floats(&mut gpu, r * w)?,
+            route_rows: floats(&mut gpu, own * k)?,
+            route_weights: floats(&mut gpu, (own * k).max(PREDICTED))?,
+            xe: floats(&mut gpu, own * w)?,
+            gate: floats(&mut gpu, own * ff)?,
+            up: floats(&mut gpu, own * ff)?,
+            act: floats(&mut gpu, routes * ff)?,
+            act_sum: floats(&mut gpu, if parts > 1 { routes } else { 0 } * ff)?,
+            y: floats(&mut gpu, own * w)?,
             widths: (hc, w, k, hp.index_top_k),
         };
         gpu.write_buffer(&work.identity, 0, &identity)?;
@@ -446,8 +501,15 @@ impl Shard {
         gpu.write_buffer(&plain_buffer, 0, &plain)?;
         let compressed_buffer = floats(&mut gpu, compressed.len())?;
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
-        let experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots * parts,
-                                         settings.host_expert_bytes)?;
+        let mut experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots * parts,
+                                             settings.host_expert_bytes)?;
+        let shape = RowShape {
+            hc, w, k, ff, top_k: hp.index_top_k, chosen: work.chosen.keys().copied().collect(), split: parts > 1, capacity: r,
+        };
+        let arena = if r > own { Some(gpu.buffer(shape.bytes(r))?) } else { None };
+        if let Some(arena) = arena.filter(|_| std::env::var("DS41_LEND").map_or(true, |value| value != "0")) {
+            experts.lend(arena)?;
+        }
         let checks = match std::env::var_os("DS41_CHECK_SLOTS") {
             Some(_) => Some(SlotChecks { partials: gpu.buffer((CHECKS * 64 * 8) as u64)?, queued: Vec::new(), first: HashMap::new(), mismatches: 0 }),
             None => None,
@@ -456,7 +518,7 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
-            compressed_rope: compressed_buffer, work, experts,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, experts,
         })
     }
 
@@ -861,6 +923,43 @@ impl<'a, T: Tensors> Engine<'a, T> {
         VERIFY_ROWS.min(self.settings.batch).min(experts / self.hp.experts_used).max(1)
     }
 
+    /// Each device's buffers for a pass of `n`: its own for at most [`OWN_ROWS`] (the arena given
+    /// back to its expert store, whose fills into it wait for the passes before), else the arena's,
+    /// laid out for `n`, the store giving back the lent slots as far as they reach.
+    fn select_work(&mut self, n: usize) -> Result<()> {
+        let split = self.shards.len() > 1;
+        for shard in &mut self.shards {
+            match shard.arena {
+                Some(arena) if n > OWN_ROWS => {
+                    let work = shard.own.in_arena(arena, n, &shard.shape)?;
+                    let reach = shard.shape.bytes(n);
+                    if reach > shard.reclaimed {
+                        shard.experts.reclaim(&mut shard.gpu, reach)?;
+                        shard.reclaimed = reach;
+                    }
+                    // With several devices, each writes only its columns of an expert's gate, up and
+                    // output and of the experts' part, the others zero: the arena held other passes'
+                    // buffers and lent slots' experts.
+                    if split {
+                        for buffer in [work.gate, work.up, work.y, work.parts[1]] {
+                            shard.gpu.zero(&buffer)?;
+                        }
+                    }
+                    shard.work = work;
+                }
+                _ => {
+                    if shard.reclaimed > 0 {
+                        let after = shard.gpu.mark(Stream::Compute)?;
+                        shard.experts.restore(after);
+                        shard.reclaimed = 0;
+                    }
+                    shard.work = shard.own.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A pass over `tokens` whose last `outputs` rows leave it: on the last engine, the logits
     /// after each of those tokens, one row after another.
     fn run(&mut self, tokens: &[u32], outputs: usize) -> Result<Option<Vec<f32>>> {
@@ -868,6 +967,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if n == 0 || n > self.settings.rows.max(self.settings.batch) || self.position + n > self.settings.context {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
+        self.select_work(n)?;
         let hp = self.hp.clone();
         let (hc, w) = (hp.hc, hp.width);
         let range = self.settings.layers.clone();
@@ -1063,6 +1163,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if next.settings.layers.start != self.settings.layers.end {
             return Err("DeepSeek-V4.1 engines hand over between adjacent layers only".into());
         }
+        next.select_work(rows)?;
         let from = &mut self.shards[0];
         let (stream, coefficients) = (from.work.stream, from.work.pre_f[pre]);
         for to in &mut next.shards {
@@ -1883,6 +1984,29 @@ fn split_pass<T: Tensors>(engines: &mut [Engine<'_, T>], tokens: &[u32], verify:
 }
 
 impl Work {
+    /// These buffers with those of every row but identity for a pass of `rows` laid out in
+    /// `arena`, one after another from its start ([`RowShape::floats`]).
+    fn in_arena(&self, arena: Buffer, rows: usize, shape: &RowShape) -> Result<Work> {
+        if shape.bytes(rows) > arena.bytes {
+            return Err("a DeepSeek-V4.1 pass's rows exceed their arena".into());
+        }
+        let mut at = 0u64;
+        let mut buffers = shape.floats(rows).into_iter().map(|floats| {
+            let (start, bytes) = (at.next_multiple_of(256), (floats.max(1) * 4) as u64);
+            at = start + bytes;
+            arena.slice(start, bytes)
+        });
+        let mut next = || buffers.next().expect("a buffer of every row for each in RowShape::floats");
+        // (fields are taken in the order written, as RowShape::floats lists them)
+        Ok(Work {
+            stream: next(), stream2: next(), pre_a: next(), post_a: next(), comb_a: next(), pre_f: [next(), next()], post_f: next(),
+            comb_f: next(), x: next(), out: next(), parts: [next(), next()], positions: next(), ring_rows: next(),
+            visible: [next(), next(), next()], chosen: self.chosen.keys().map(|&layer| (layer, next())).collect(), ids: next(),
+            weights: next(), route_rows: next(), route_weights: next(), xe: next(), gate: next(), up: next(), act: next(),
+            act_sum: next(), y: next(), ..self.clone()
+        })
+    }
+
     /// The buffers with those of every row starting at row `first` (the rest as they are).
     fn view(&self, first: usize) -> Work {
         let (hc, w, k, top_k) = self.widths;

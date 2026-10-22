@@ -147,6 +147,8 @@ int sd_op_linear_route_published(void* handle, const void* weights, int kind, ui
 int sd_route_mailbox_clear(void* handle);
 int sd_route_mailbox_wait(void* handle, int32_t* out, uint64_t count);
 int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp, const float* row_weights, float* out);
+/* Zero `bytes` from `pointer` (inside an allocation of the device), queued on its stream. */
+int sd_op_zero(void* handle, void* pointer, uint64_t bytes);
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
 int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);

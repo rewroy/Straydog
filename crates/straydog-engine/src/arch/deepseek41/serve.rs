@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, ATTENTION_ROWS};
+use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, ATTENTION_ROWS, OWN_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Placed, Session, Settings};
 use crate::bundle;
@@ -178,8 +178,9 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let parts = devices.len() as u64;
         let head = if range.end == layers { head_whole + head_parted.div_ceil(parts) } else { 0 };
         let resident: u64 = range.clone().map(|layer| whole[layer] + parted[layer].div_ceil(parts)).sum::<u64>() + head;
-        // a pass of up to the batch's rows, layer by layer: its buffers of every row
-        let rows = settings.batch as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
+        // a pass of up to the batch's rows, layer by layer: its buffers of every row (in the arena
+        // lent to the expert store between long passes), and a few rows' own
+        let rows = (settings.batch + OWN_ROWS.min(settings.batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
         let fixed = resident + state(range) + rows + SCRATCH + RESERVE;
         let free = vram.checked_sub(fixed)
             .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM on GPU {devices:?}", vram as f64 / (1u64 << 30) as f64))?;

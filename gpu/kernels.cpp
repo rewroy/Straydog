@@ -2631,6 +2631,13 @@ int sd_route_mailbox_wait(void* handle, int32_t* out, uint64_t count) {
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_op_zero(void* handle, void* pointer, uint64_t bytes) {
+    SD_OP_BEGIN
+    op_span(value, pointer, size_t(bytes), "a zeroed range");
+    check(hipMemsetAsync(pointer, 0, size_t(bytes), value.stream));
+    SD_OP_END
+}
+
 int sd_op_swiglu(void* handle, const float* gate, const float* up, uint64_t rows, uint64_t width, float clamp,
                  const float* row_weights, float* out) {
     SD_OP_BEGIN
