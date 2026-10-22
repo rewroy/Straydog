@@ -369,12 +369,25 @@ mod tests {
         Pinned::open(&bundle.root, &bundle.root.join("data"), &bundle.pins)
     }
 
-    /// Overwrite one byte of a shard (after its tree was built).
+    /// Flip one byte of a shard (after its tree was built).
+    ///
+    /// The length stays the same. Replacing the file truncates it, and Windows refuses that
+    /// while a mapping of the file is still open (`ERROR_USER_MAPPED_FILE`).
     fn tamper(bundle: &Bundle, shard: usize, offset: u64) {
         let path = bundle.root.join(&bundle.pins.shards[shard].name);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[offset as usize] ^= 1;
-        std::fs::write(path, bytes).unwrap();
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut byte = [0u8; 1];
+        crate::storage::read_at(&file, offset, &mut byte).unwrap();
+        byte[0] ^= 1;
+        assert_eq!(write_at(&file, &byte, offset).unwrap(), 1);
+    }
+
+    fn write_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let count = std::os::unix::fs::FileExt::write_at(file, buffer, offset)?;
+        #[cfg(windows)]
+        let count = std::os::windows::fs::FileExt::seek_write(file, buffer, offset)?;
+        Ok(count)
     }
 
     #[test]
