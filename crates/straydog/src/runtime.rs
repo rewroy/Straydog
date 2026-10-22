@@ -318,6 +318,9 @@ pub fn request_summary(event: &Value) -> String {
 }
 
 /// How long a stopped worker's processes and GPU memory are waited for.
+///
+/// Only the Linux wait reads it. Elsewhere there is no driver path to wait on.
+#[cfg(target_os = "linux")]
 const RELEASE_PATIENCE: Duration = Duration::from_secs(60);
 
 /// The processes under `root`, it included, from /proc's parent links (Linux; elsewhere none).
