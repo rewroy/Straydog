@@ -435,6 +435,8 @@ struct Device {
     // sd_op_experts' route addresses (an allocation of slot_route_capacity entries), and the
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
+    // sd_op_sparse_attention's tile counters (zero between launches: each tile's last share resets its own)
+    unsigned* attention_tiles = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
     // Or, when the last call passed its few routes by value, those (reused alike).
     uint64_t inline_routes[8] = {};
@@ -2609,11 +2611,20 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         float* denominators = sums + size_t(rows * heads) * shares * dim;
         if (shares > 1) op_span(value, sums, share_bytes, "attention scratch");
         const dim3 grid(unsigned(dim / 64), unsigned((heads + attention_out_heads - 1) / attention_out_heads), unsigned(rows * shares));
+        // The shares' sums finish in the output kernel's last share of each tile, with counters for
+        // up to this many tiles; beyond, in a kernel of their own.
+        constexpr size_t tile_capacity = 16384;
+        const size_t tiles = size_t(grid.x) * grid.y * size_t(rows);
+        if (shares > 1 && tiles <= tile_capacity && !value.attention_tiles) {
+            value.attention_tiles = static_cast<unsigned*>(allocate(value, tile_capacity * 4));
+            check(hipMemsetAsync(value.attention_tiles, 0, tile_capacity * 4, value.stream));
+        }
+        unsigned* counters = shares > 1 && tiles <= tile_capacity ? value.attention_tiles : nullptr;
         op_attention_output_kernel<<<grid, 128, share_keys * sizeof(float*), value.stream>>>(
             scores, partial, chunks, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections),
             sinks, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies, stride, shares, share_keys, sums, denominators,
-            out);
-        if (shares > 1) {
+            out, counters);
+        if (shares > 1 && !counters) {
             check(hipGetLastError());
             op_attention_combine_kernel<<<op_blocks(size_t(rows * heads * dim / 4)), 256, 0, value.stream>>>(
                 sums, denominators, positions, size_t(rows), shares, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies,

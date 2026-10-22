@@ -785,7 +785,7 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
         const float* scores, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
         size_t window, const float* compressed, const int32_t* selected, size_t selections, const float* sinks, size_t heads,
         size_t dim, size_t pairs, const float* frequencies, size_t stride, size_t shares, size_t share_keys, float* sums,
-        float* head_denominators, float* out) {
+        float* head_denominators, float* out, unsigned* tiles) {
     const size_t row = blockIdx.z / shares, share = blockIdx.z % shares;
     const size_t head0 = size_t(blockIdx.y) * attention_out_heads, d0 = size_t(blockIdx.x) * 64;
     const int64_t p = positions[row];
@@ -855,11 +855,36 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
         __syncthreads();
     }
     const size_t head = head0 + local, col = d0 + 4 * quad;
-    if (head >= heads) return;
+    const bool valid = head < heads;
     if (shares > 1) {
-        *reinterpret_cast<float4*>(sums + ((row * shares + share) * heads + head) * dim + col) = acc;
+        if (valid) *reinterpret_cast<float4*>(sums + ((row * shares + share) * heads + head) * dim + col) = acc;
+        if (!tiles) return;
+        // With tile counters: the tile's last share to finish adds the shares' sums in order and
+        // finishes them, as op_attention_combine_kernel does (the same denominators: every block
+        // forms its heads' alike). Every share's writes are out before it counts itself done.
+        __shared__ bool last;
+        __threadfence();
+        __syncthreads();
+        unsigned* tile = tiles + (row * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+        if (t == 0) last = atomicAdd(tile, 1u) == shares - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        if (t == 0) *tile = 0;
+        if (!valid) return;
+        float total[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (size_t other = 0; other < shares; ++other) {
+            float* at = sums + ((row * shares + other) * heads + head) * dim + col;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) total[i] += hc_step_load(at + i);
+        }
+        const float denominator = denominators[local];
+        float o[4] = {total[0] / denominator, total[1] / denominator, total[2] / denominator, total[3] / denominator};
+        attention_unrotate(o, p, col, dim - 2 * pairs, frequencies);
+        *reinterpret_cast<float4*>(out + (row * heads + head) * dim + col) = make_float4(o[0], o[1], o[2], o[3]);
         return;
     }
+    if (!valid) return;
     const float denominator = denominators[local];
     float o[4] = {acc.x / denominator, acc.y / denominator, acc.z / denominator, acc.w / denominator};
     attention_unrotate(o, p, col, dim - 2 * pairs, frequencies);
