@@ -352,6 +352,9 @@ pub struct Engine<'a, T: Tensors> {
     predicted: Vec<usize>,
     /// Decode runs the experts VRAM holds while the others land (DS41_HITS_FIRST=0: all at once).
     hits_first: bool,
+    /// Decode's fills start their gate and up once those are in, their downs landing meanwhile
+    /// (DS41_GATE_UP_FIRST=0: once all of them is in).
+    gate_up_first: bool,
     /// A pass of a few rows has the first device's router publish its routes to page-locked host
     /// memory, for the host to take without a readback (DS41_ROUTE_READBACK: read them back).
     mailbox: bool,
@@ -651,6 +654,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             prefetches: std::env::var("DS41_PREDICT").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(PREDICTED),
             predicted: Vec::new(),
             hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
+            gate_up_first: std::env::var("DS41_GATE_UP_FIRST").map_or(true, |value| value != "0"),
             mailbox: std::env::var_os("DS41_ROUTE_READBACK").is_none(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
@@ -1441,6 +1445,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// every device before any waits, and the next wave's while this one computes.
     fn experts_split(&mut self, layer: usize, first: usize, rows: usize, read: usize, published: bool) -> Result<()> {
         let hp = self.hp.clone();
+        let gate_up_first = self.gate_up_first;
         let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
         let routed_rows = rows * k;
         for shard in &mut self.shards {
@@ -1478,7 +1483,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let buffer = index % 2;
             let mut acquired = Vec::with_capacity(self.shards.len());
             for shard in &mut self.shards {
-                acquired.push(shard.experts.acquire(&mut shard.gpu, layer, wave)?);
+                // gate and up start once theirs are in (as in experts_hits_first)
+                acquired.push(if shard.checks.is_some() || !gate_up_first { shard.experts.acquire(&mut shard.gpu, layer, wave)? }
+                              else { shard.experts.acquire_gate_up(&mut shard.gpu, layer, wave)? });
                 check_slots(shard, layer, wave, acquired.last().unwrap(), expert_bytes, false)?;
                 if let Some(next) = waves.get(index + 1) {
                     shard.experts.prefetch(&mut shard.gpu, layer, next, true)?;
@@ -1512,6 +1519,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                       w, ff, rows as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
                                       work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
                 }
+                shard.experts.await_rest(&mut shard.gpu)?;
                 shard.gpu.experts(None, slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, rows as u64, k as u64,
                                   work.x.base(), 0, None, hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(),
                                   0, Some(shard.rows.split(2)))?;
@@ -1531,6 +1539,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     fn experts_hits_first(&mut self, layer: usize, first: usize, rows: usize, routes: &[i32], hits: &[usize], misses: &[usize],
                           predicted: &[usize], drive: bool) -> Result<()> {
         let hp = self.hp.clone();
+        let gate_up_first = self.gate_up_first;
         let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
         let routed_rows = rows * k;
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
@@ -1557,7 +1566,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut every = Vec::with_capacity(self.shards.len());
         let mut filled = Vec::with_capacity(self.shards.len());
         for (shard, held) in self.shards.iter_mut().zip(&held) {
-            let slots = shard.experts.acquire(&mut shard.gpu, layer, misses)?;
+            // the misses' gate and up start once theirs are in, their downs landing meanwhile
+            // (whole fills under DS41_CHECK_SLOTS, whose checksums read every byte)
+            let slots = if shard.checks.is_some() || !gate_up_first { shard.experts.acquire(&mut shard.gpu, layer, misses)? }
+                        else { shard.experts.acquire_gate_up(&mut shard.gpu, layer, misses)? };
             check_slots(shard, layer, misses, &slots, expert_bytes, false)?;
             if !predicted.is_empty() {
                 shard.experts.prefetch(&mut shard.gpu, layer + 1, predicted, drive)?;
@@ -1582,6 +1594,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; rows]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
                               rows as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
                               work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
+            shard.experts.await_rest(&mut shard.gpu)?;
             shard.gpu.experts(Some(both), *slot_bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0, None,
                               hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
             check_slots(shard, layer, hits, held, expert_bytes, true)?;

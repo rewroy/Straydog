@@ -494,3 +494,29 @@ fn a_lent_region_holds_experts_and_goes_back_to_its_lender() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// Fills taken by [`DeviceExperts::acquire_gate_up`] read back whole once [`await_rest`] waited for
+/// their downs, and a release before that wait fails.
+#[test]
+fn a_fill_taken_at_its_gate_and_up_is_whole_after_the_rest() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let mut random = Random(0x9876_5432);
+    for step in 0..60 {
+        let mut experts: Vec<usize> = (0..1 + random.below(6)).map(|_| random.below(EXPERTS)).collect();
+        experts.sort_unstable();
+        experts.dedup();
+        let slots = store.acquire_gate_up(&mut gpu, 0, &experts).unwrap();
+        if step == 0 {
+            assert!(store.release(&mut gpu).is_err(), "a release before the downs were waited for");
+        }
+        store.await_rest(&mut gpu).unwrap();
+        check_slots(&mut gpu, &roles, &experts, &slots, &format!("step {step}"));
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    assert!(store.counts().host_hits > 0, "{:?}", store.counts());
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}

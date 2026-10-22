@@ -362,6 +362,9 @@ struct VramSlot {
     key: Option<Key>,
     /// The upload (and its stream) after this slot's fill, until known complete.
     ready: Option<(Stream, Mark)>,
+    /// That upload's mark once its gate and up are in (down follows): see
+    /// [`DeviceExperts::acquire_gate_up`].
+    ready_first: Option<(Stream, Mark)>,
     /// Marks the slot's bytes must outlive: its last compute use, and a download from it.
     guards: [Option<Mark>; 2],
     /// A fill waiting for the drive: the host slot whose reads it uploads once they land.
@@ -489,6 +492,8 @@ pub struct DeviceExperts {
     vram_changes: u64,
     /// The slots of the region lent to the store, from its start.
     lent: Vec<LentSlot>,
+    /// Slots acquired with only their gate and up waited for ([`acquire_gate_up`](Self::acquire_gate_up)).
+    rest: Vec<usize>,
 }
 
 impl DeviceExperts {
@@ -568,7 +573,8 @@ impl DeviceExperts {
             let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_bytes as usize);
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index, place: None,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
+                place: None,
                 taken_back: false,
             }));
             classes.push(Class {
@@ -581,7 +587,7 @@ impl DeviceExperts {
         Ok(DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
-            counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(),
+            counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), rest: Vec::new(),
         })
     }
 
@@ -670,10 +676,28 @@ impl DeviceExperts {
     /// Make these experts of `layer` resident here; the compute stream waits for their copies.
     /// Their slots (each roles one after another) stay until [`release`](Self::release).
     pub fn acquire(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
+        self.acquire_with(gpu, layer, experts, false)
+    }
+
+    /// [`acquire`](Self::acquire) where the compute stream waits only for the fills' gate and up:
+    /// their downs may still be landing until [`await_rest`](Self::await_rest), which must come
+    /// before anything reads them (a release before it fails).
+    pub fn acquire_gate_up(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
+        self.acquire_with(gpu, layer, experts, true)
+    }
+
+    /// The compute stream waits for the rest of the fills [`acquire_gate_up`](Self::acquire_gate_up)
+    /// took (their downs).
+    pub fn await_rest(&mut self, gpu: &mut Backend) -> Result<()> {
+        let rest = std::mem::take(&mut self.rest);
+        self.wait_uploads(gpu, &rest, false)
+    }
+
+    fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
         self.settled = false;
         let started = std::time::Instant::now();
         let held = self.in_use.len();
-        let result = self.acquire_slots(gpu, layer, experts);
+        let result = self.acquire_slots(gpu, layer, experts, first);
         if result.is_err() {
             for slot in self.in_use.split_off(held) {
                 self.slots[slot].held = false;
@@ -714,7 +738,7 @@ impl DeviceExperts {
         result
     }
 
-    fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<Vec<Buffer>> {
+    fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
         self.pump(gpu, false)?;
         // Every hit is held before any miss is filled: a miss never evicts a slot this same
         // request uses later. Experts a request() started were counted there; those of a later
@@ -784,23 +808,36 @@ impl DeviceExperts {
                 break;
             }
         }
-        // Each upload stream runs in order: its newest mark among these slots covers its others.
-        for stream in [Stream::Upload, Stream::LaterUpload] {
-            let newest = slots.iter().filter_map(|&slot| self.slots[slot].ready.filter(|ready| ready.0 == stream)).map(|ready| ready.1).max();
-            let Some(mark) = newest else { continue };
-            if gpu.mark_done(mark, false)? {
-                for &slot in &slots {
-                    let ready = &mut self.slots[slot].ready;
-                    *ready = ready.filter(|&(other, at)| other != stream || at > mark);
-                }
-            } else {
-                gpu.wait_mark(Stream::Compute, mark)?;
-            }
+        self.wait_uploads(gpu, &slots, first)?;
+        if first {
+            self.rest.extend(slots.iter().copied().filter(|&slot| self.slots[slot].ready.is_some()));
         }
         if slots.iter().any(|&slot| self.slots[slot].taken_back) {
             return Err("an acquire found an expert in a lent slot its lender has back".into());
         }
         Ok(slots.iter().map(|&slot| self.slot_buffer(slot)).collect())
+    }
+
+    /// The compute stream waits for these slots' uploads (with `first`, for their gate and up). Each
+    /// upload stream runs in order: its newest mark among them covers its others.
+    fn wait_uploads(&mut self, gpu: &mut Backend, slots: &[usize], first: bool) -> Result<()> {
+        for stream in [Stream::Upload, Stream::LaterUpload] {
+            // (an upload known complete has no mark left to wait for)
+            let mark_of = |slot: &VramSlot| if first { slot.ready.and(slot.ready_first) } else { slot.ready };
+            let newest = slots.iter().filter_map(|&slot| mark_of(&self.slots[slot]).filter(|ready| ready.0 == stream)).map(|ready| ready.1).max();
+            let Some(mark) = newest else { continue };
+            if gpu.mark_done(mark, false)? {
+                if !first {
+                    for &slot in slots {
+                        let entry = &mut self.slots[slot];
+                        entry.ready = entry.ready.filter(|&(other, at)| other != stream || at > mark);
+                    }
+                }
+            } else {
+                gpu.wait_mark(Stream::Compute, mark)?;
+            }
+        }
+        Ok(())
     }
 
     /// Start bringing these experts of `layer` in without waiting: from the host tier at once,
@@ -829,6 +866,9 @@ impl DeviceExperts {
     /// After the ops that read the acquired slots are queued: those slots may be evicted once
     /// the compute stream passes this point.
     pub fn release(&mut self, gpu: &mut Backend) -> Result<()> {
+        if !self.rest.is_empty() {
+            return Err("experts released before their downs were waited for (await_rest)".into());
+        }
         if self.in_use.is_empty() {
             return Ok(());
         }
@@ -862,8 +902,8 @@ impl DeviceExperts {
             }
             let slot = self.slots.len();
             self.slots.push(VramSlot {
-                key: None, ready: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class,
-                place: Some(region.slice(start, bytes)), taken_back: false,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false,
+                class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
             self.lent.push(LentSlot { slot, offset: start, out: false });
@@ -1022,28 +1062,40 @@ impl DeviceExperts {
         }
         let base = self.host_pointer(host);
         let target = self.slot_buffer(slot);
+        // a mark once the first two roles (gate and up) are in
+        let mut first = None;
         match self.host[host].content {
             Content::Read => {
                 let mut at = 0;
-                for span in self.layout.read_plan(layer as usize, expert as usize)? {
+                for (role, span) in self.layout.read_plan(layer as usize, expert as usize)?.into_iter().enumerate() {
                     // SAFETY: the host slot holds this expert as read, and gives it up below (only a
                     // resident store keeps columns: no CPU reads its host slots).
                     let bytes = unsafe { span.keep_columns(base) };
                     // SAFETY: the host slot holds this expert until the mark below completes (busy).
                     unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), bytes)? };
                     at += bytes;
+                    if role == 1 {
+                        first = Some(gpu.mark(stream)?);
+                    }
                 }
             }
             Content::Packed(written) => {
                 gpu.wait_mark(stream, written)?;
-                let bytes: u64 = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).sum();
+                let roles: Vec<u64> = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).collect();
+                let (head, bytes) = (roles.iter().take(2).sum::<u64>(), roles.iter().sum::<u64>());
                 // SAFETY: as above.
-                unsafe { gpu.transfer(stream, &target, 0, base, bytes)? };
+                unsafe { gpu.transfer(stream, &target, 0, base, head)? };
+                first = Some(gpu.mark(stream)?);
+                if bytes > head {
+                    // SAFETY: as above.
+                    unsafe { gpu.transfer(stream, &target, head, base.add(head as usize), bytes - head)? };
+                }
             }
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
         let mark = gpu.mark(stream)?;
         self.slots[slot].ready = Some((stream, mark));
+        self.slots[slot].ready_first = Some((stream, first.unwrap_or(mark)));
         self.vram_changes += 1;
         self.slots[slot].waiting = None;
         let entry = &mut self.host[host];
