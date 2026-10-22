@@ -440,7 +440,7 @@ struct Device {
     unsigned* attention_tiles = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
     // Or, when the last call passed its few routes by value, those (reused alike).
-    uint64_t inline_routes[8] = {};
+    uint64_t inline_routes[32] = {};
     size_t inline_routes_count = 0;
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
