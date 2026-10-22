@@ -3,7 +3,8 @@
 //! resident size measures this store only.
 //!
 //! cargo test --release -p straydog-engine --features hip --test experts_drop, under the GPU lock.
-#![cfg(any(feature = "hip", feature = "cuda"))]
+// Resident size comes from /proc/self/statm. A Windows working-set equivalent is a separate measurement.
+#![cfg(all(target_os = "linux", any(feature = "hip", feature = "cuda")))]
 
 use std::fs::File;
 use std::sync::Arc;
