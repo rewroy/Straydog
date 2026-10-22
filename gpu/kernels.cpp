@@ -1052,6 +1052,35 @@ inline bool add_overflows(uint64_t a, uint64_t b, uint64_t* sum) {
     return __builtin_add_overflow(a, b, sum);
 #endif
 }
+
+// An op's sizes from the caller's counts, checked: the product of counts (an error when it
+// overflows, so that an op_span check never passes on a wrapped size), the bytes of that many
+// floats, blocks of 256 threads over a count, and a launch dimension (at most `limit`).
+inline size_t checked_product(std::initializer_list<uint64_t> factors) {
+    uint64_t product = 1;
+    for (const uint64_t factor : factors)
+        if (mul_overflows(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(product);
+}
+inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
+    return checked_product({uint64_t(checked_product(factors)), 4});
+}
+inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
+    uint64_t sum = 0;
+    for (const uint64_t term : terms)
+        if (add_overflows(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
+    return size_t(sum);
+}
+inline unsigned checked_blocks(size_t count) {
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
+    return unsigned(blocks);
+}
+inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
+    if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
+    return unsigned(count);
+}
+
 #include "host_io.hpp"
 #include "peer.hpp"
 #include "link_tail.hpp"
@@ -1082,6 +1111,8 @@ inline bool add_overflows(uint64_t a, uint64_t b, uint64_t* sum) {
 #include "transfer.hpp"
 } // namespace
 
+// A function that throws keeps C++ linkage: outside this block, or in extern "C++" within it.
+// MSVC (/EHsc) takes a C function for one that never throws, and drops the catch around its call.
 extern "C" {
 int sd_ple(void* handle,void* const* pointers,const int* kinds,void* history,uint64_t steps,
             const float* embeddings,const float* hidden,float* output) {
@@ -2334,11 +2365,13 @@ int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uin
 
 // ---- Graphs of ops (kept in Device::graphs under "op" and the caller's key) ----
 
+extern "C++" {
 static std::string op_graph_key(uint64_t key) {
     std::string name("op");
     name.append(reinterpret_cast<const char*>(&key), sizeof(key));
     return name;
 }
+} // extern "C++"
 
 int sd_graph_begin(void* handle) {
     try {
@@ -2484,34 +2517,6 @@ int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t
         check(hipGetLastError());
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
-}
-
-// An op's sizes from the caller's counts, checked: the product of counts (an error when it
-// overflows, so that an op_span check never passes on a wrapped size), the bytes of that many
-// floats, blocks of 256 threads over a count, and a launch dimension (at most `limit`).
-inline size_t checked_product(std::initializer_list<uint64_t> factors) {
-    uint64_t product = 1;
-    for (const uint64_t factor : factors)
-        if (mul_overflows(product, factor, &product)) throw std::runtime_error("a Straydog op's shape overflows");
-    return size_t(product);
-}
-inline size_t checked_floats(std::initializer_list<uint64_t> factors) {
-    return checked_product({uint64_t(checked_product(factors)), 4});
-}
-inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
-    uint64_t sum = 0;
-    for (const uint64_t term : terms)
-        if (add_overflows(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
-    return size_t(sum);
-}
-inline unsigned checked_blocks(size_t count) {
-    const size_t blocks = count / 256 + (count % 256 != 0);
-    if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
-    return unsigned(blocks);
-}
-inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
-    if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
-    return unsigned(count);
 }
 
 #define SD_OP_BEGIN try { auto& value = device(handle);
@@ -2978,6 +2983,7 @@ int sd_devices_settle(void* const* handles, uint64_t devices) {
 
 constexpr size_t slot_route_capacity = 65536;
 // An expert's three matrices in its slot (rows of each as `part` takes them), checked to lie inside it.
+extern "C++" {
 static SlotExperts slot_plan(uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn,
                              const sd_expert_split& part) {
     SlotExperts plan{};
@@ -2993,6 +2999,7 @@ static SlotExperts slot_plan(uint64_t slot_bytes, const uint64_t* offsets, const
     }
     return plan;
 }
+} // extern "C++"
 
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds,
                   uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride,
