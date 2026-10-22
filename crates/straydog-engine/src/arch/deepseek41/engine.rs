@@ -114,11 +114,20 @@ impl Rows {
     fn sending(&self, stages: i32, channel: u32) -> ops::ExpertSplit {
         ops::ExpertSplit { send: channel as i32 + 1, ..self.split(stages) }
     }
+
+    /// The gate/up stage sending its columns of the product as part of a part link's sum on
+    /// `channel`, at `at` floats into the inbox; with `more`, a later call sends the sum's other
+    /// values and completes it.
+    fn sending_product(&self, channel: u32, at: usize, more: bool) -> ops::ExpertSplit {
+        ops::ExpertSplit { send: channel as i32 + 1, more: i32::from(more), send_at: at as u64, ..self.split(1) }
+    }
 }
 
-/// The part links' channels (see `Engine::linked`): the attention's output, the experts'.
+/// The part links' channels (see `Engine::linked`): the attention's output, the experts', and the
+/// experts' activations (their gate and up, the shared expert's too, each device its columns).
 const ATTENTION: u32 = 0;
 const EXPERTS: u32 = 1;
+const ACTIVATIONS: u32 = 2;
 
 /// A kv source layer's compressed rows so far (one per group of `ratio` positions), and the rows
 /// of its current incomplete group (`tail`).
@@ -669,7 +678,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let linked = shards.len() == 2 && std::env::var("DS41_LINK").map_or(true, |value| value != "0");
         if let [first, second] = &mut shards[..] {
             if linked {
-                Backend::link_parts(&mut first.gpu, &mut second.gpu, hp.width as u64)?;
+                // (a row's output, or a decode row's activations: every route's and the shared expert's)
+                Backend::link_parts(&mut first.gpu, &mut second.gpu, hp.width.max((hp.experts_used + 1) * hp.expert_ff) as u64)?;
             }
         }
         let mut engine = Engine {
@@ -1529,12 +1539,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let gate_up_first = self.gate_up_first;
         let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
         let routed_rows = rows * k;
+        // Decode sums the activations over a part link (one wave of experts: else with a kernel):
+        // the shared expert's row goes first, and the routes' gate and up complete the sum. (With
+        // more waves, the shared row's values wait unraised in the inbox slot the next sum fills.)
+        let link = self.link_pass;
         for shard in &mut self.shards {
             let work = shard.work.view(first);
             let shared = shard.shared[&layer];
+            let split = if link { shard.rows.sending_product(ACTIVATIONS, routed_rows * ff as usize, true) } else { shard.rows.split(1) };
             shard.gpu.experts(Some(&vec![shared.buffer.base() as u64; rows]), shared.buffer.bytes, shared.offsets, shared.kinds, w, ff,
                               rows as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
-                              work.products[0].at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+                              work.products[0].at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(split))?;
         }
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
@@ -1580,18 +1595,27 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let bases = |slots: &[Buffer]| -> Vec<u64> {
                 routes.iter().map(|&expert| wave.binary_search(&(expert as usize)).map_or(0, |at| slots[at].base() as u64)).collect()
             };
+            let linked = link && waves.len() == 1;
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let work = shard.work.view(first);
+                let split = if linked { shard.rows.sending_product(ACTIVATIONS, 0, false) } else { shard.rows.split(1) };
                 shard.gpu.experts(Some(&bases(slots)), slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, rows as u64,
                                   k as u64, work.x.base(), 0, Some(work.weights.base()), hp.layers[layer].clamp_routed, true,
-                                  work.products[buffer].base(), work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+                                  work.products[buffer].base(), work.parts[1].base(), 0, Some(split))?;
             }
             // Every device's share of the activations (of the shared expert's too, in the first wave).
             let summed = routed_rows + if index == 0 { rows } else { 0 };
-            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
-            let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
-            let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[buffer].base() as P).collect();
-            ops::sum_devices(&devices, &outs, &parts, summed as u64 * ff)?;
+            if linked {
+                for shard in &mut self.shards {
+                    let work = shard.work.view(first);
+                    shard.gpu.part_receive(ACTIVATIONS, work.products[buffer].base() as P, summed as u64 * ff, work.product.base())?;
+                }
+            } else {
+                let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+                let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
+                let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[buffer].base() as P).collect();
+                ops::sum_devices(&devices, &outs, &parts, summed as u64 * ff)?;
+            }
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let work = shard.work.view(first);
                 if index == 0 {
@@ -1640,9 +1664,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let slots = shard.experts.acquire(&mut shard.gpu, layer, hits)?;
             check_slots(shard, layer, hits, &slots, expert_bytes, false)?;
             let work = shard.work.view(first);
+            let split = if self.link_pass { shard.rows.sending_product(ACTIVATIONS, 0, true) } else { shard.rows.split(1) };
             shard.gpu.experts(Some(&bases(hits, &slots)), slots[0].bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0,
                               Some(work.weights.base()), hp.layers[layer].clamp_routed, true, work.products[0].base(),
-                              work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+                              work.parts[1].base(), 0, Some(split))?;
             held.push(slots);
         }
         self.mark("hits' gate/up")?;
@@ -1658,19 +1683,28 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 shard.experts.prefetch(&mut shard.gpu, layer + 1, predicted, drive)?;
             }
             let work = shard.work.view(first);
+            // (the misses' activations complete the device's part of the sum)
+            let split = if self.link_pass { shard.rows.sending_product(ACTIVATIONS, 0, false) } else { shard.rows.split(1) };
             shard.gpu.experts(Some(&bases(misses, &slots)), slots[0].bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0,
                               Some(work.weights.base()), hp.layers[layer].clamp_routed, true, work.products[0].base(),
-                              work.parts[1].base(), 0, Some(shard.rows.split(1)))?;
+                              work.parts[1].base(), 0, Some(split))?;
             let both: Vec<u64> = bases(hits, held).into_iter().zip(bases(misses, &slots)).map(|(hit, miss)| hit | miss).collect();
             every.push((both, slots[0].bytes));
             filled.push(slots);
         }
         self.mark("expert fills")?;
         // Every device's share of the activations, the shared expert's too.
-        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
-        let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
-        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[0].base() as P).collect();
-        ops::sum_devices(&devices, &outs, &parts, (routed_rows + rows) as u64 * ff)?;
+        if self.link_pass {
+            for shard in &mut self.shards {
+                let work = shard.work.view(first);
+                shard.gpu.part_receive(ACTIVATIONS, work.products[0].base() as P, (routed_rows + rows) as u64 * ff, work.product.base())?;
+            }
+        } else {
+            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+            let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
+            let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[0].base() as P).collect();
+            ops::sum_devices(&devices, &outs, &parts, (routed_rows + rows) as u64 * ff)?;
+        }
         for (((shard, (both, slot_bytes)), held), filled) in self.shards.iter_mut().zip(&every).zip(&held).zip(&filled) {
             let work = shard.work.view(first);
             let shared = shard.shared[&layer];
