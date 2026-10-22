@@ -22,6 +22,7 @@ use memmap2::Mmap;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use straydog_engine::bundle::SourceTensor;
+#[cfg(any(feature = "hip", feature = "cuda"))]
 use straydog_gpu::ffi;
 use ureq::Agent;
 
@@ -315,6 +316,15 @@ fn f32_bytes(data: &[u8], offset: Option<f32>) -> Vec<u8> {
         .collect()
 }
 
+/// The quantizer lives in the GPU library. Without hip or cuda that library is not linked.
+#[cfg(not(any(feature = "hip", feature = "cuda")))]
+fn quantize_q2_0(_bits: &[u16]) -> io::Result<Vec<u8>> {
+    Err(io::Error::other(
+        "the drafter quantizer links one GPU backend: build straydog-provision with --features hip or --features cuda",
+    ))
+}
+
+#[cfg(any(feature = "hip", feature = "cuda"))]
 fn quantize_q2_0(bits: &[u16]) -> io::Result<Vec<u8>> {
     let mut output = vec![0u8; bits.len() / 64 * 18];
     // SAFETY: the quantizer reads `bits.len()` values and writes 18 bytes per 64 of them; it
@@ -433,6 +443,7 @@ fn write_gguf(target: &Path, revision: &str, entries: &[Entry]) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     use std::cell::RefCell;
     use std::sync::atomic::AtomicU64;
 
@@ -521,6 +532,7 @@ mod tests {
 
     /// Every source tensor of the plan with arbitrary finite BF16 values: experts [3, 2560, 64],
     /// the indexer projection [640, 64], vectors [64] and matrices [8, 64].
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     fn synthetic_source(path: &Path) {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut tensors: Vec<(&str, Vec<usize>, Vec<u8>)> = Vec::new();
@@ -547,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "hip", feature = "cuda"))]
     fn drafter_experts_quantized_in_groups_match_one_call() {
         let scratch = Scratch::new("mtp-convert");
         let source = scratch.path().join("source.safetensors");
