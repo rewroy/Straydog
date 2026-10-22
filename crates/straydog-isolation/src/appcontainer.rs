@@ -585,7 +585,9 @@ mod tests {
         // Without that, the grant's failure is the launcher's.
         let fake = Fake { refused: [tree.clone()].into(), ..Fake::lacking(&[&tree, &dll]) };
         let error = grant_worker_access(&fake, &launch(vec![tree.clone()])).unwrap_err();
-        assert!(error.contains(&tree.display().to_string()), "{error}");
+        // join("cuda/bin") keeps the slash in Display. Resolution writes the platform separator.
+        let named = tree.display().to_string().replace('/', std::path::MAIN_SEPARATOR_STR);
+        assert!(error.contains(&named), "{error}");
     }
 
     #[test]
