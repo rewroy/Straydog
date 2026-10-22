@@ -436,7 +436,8 @@ __global__ void tm_attention_split_kernel(const float* q, const float* keys, con
     float acc[tm_attention_max_dim / tm_attention_threads] = {};
     float m = -INFINITY, l = 0.0f;
     for (size_t start = begin; start < end; start += tm_attention_tile) {
-        const size_t count = std::min(tm_attention_tile, end - start);
+        // A prvalue: std::min binds a reference, and CUDA device code cannot ODR-use the namespace constant.
+        const size_t count = std::min(size_t(tm_attention_tile), end - start);
         for (size_t i = warp; i < count; i += warps) {
             const float* key = keys + ((start + i) * kv_heads + kh) * dim;
             float sum = 0.0f;

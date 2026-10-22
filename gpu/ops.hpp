@@ -275,7 +275,8 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
                                   PartRead link) {
     constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
     const size_t row = blockIdx.y, block = blockIdx.x, blocks = gridDim.x;
-    const size_t first = block * hc_step_columns, columns = std::min(hc_step_columns, width - first);
+    // A prvalue: std::min binds a reference, and CUDA device code cannot ODR-use the namespace constant.
+    const size_t first = block * hc_step_columns, columns = std::min(size_t(hc_step_columns), width - first);
     const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
     __shared__ float values[HC][hc_step_columns];
     __shared__ float reduce[8][SUMS];
