@@ -11,10 +11,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "straydog"
 path = "src/main.rs"
+required-features = ["gpu"]
 
 [[test]]
 name = "runtime_gpu"
 harness = false
+required-features = ["gpu"]
 
 [[test]]
 name = "runtime_controls"
@@ -22,8 +24,10 @@ harness = false
 
 [features]
 # The GPU backend linked into the executable.
-hip = ["straydog-engine/hip"]
-cuda = ["straydog-engine/cuda", "nvml"]
+# `gpu` is how the binary and runtime_gpu require one of them.
+hip = ["straydog-engine/hip", "gpu"]
+cuda = ["straydog-engine/cuda", "nvml", "gpu"]
+gpu = []
 # NVIDIA telemetry for the dashboard through the driver's NVML, loaded at run time.
 nvml = ["dep:nvml-wrapper"]
 

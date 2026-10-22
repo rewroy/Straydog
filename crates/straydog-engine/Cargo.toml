@@ -20,8 +20,55 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [features]
 # The GPU backend to link (tests that run on a GPU need one).
-hip = ["straydog-gpu/hip"]
-cuda = ["straydog-gpu/cuda"]
+# `gpu` is how a target requires one of them: Cargo's required-features cannot say hip or cuda.
+hip = ["straydog-gpu/hip", "gpu"]
+cuda = ["straydog-gpu/cuda", "gpu"]
+gpu = []
+
+# These examples link the native GPU library. Without hip or cuda, cargo test skips them.
+[[example]]
+name = "ds41_chat"
+required-features = ["gpu"]
+
+[[example]]
+name = "ds41_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "ds41_kernels"
+required-features = ["gpu"]
+
+[[example]]
+name = "ds41_quality"
+required-features = ["gpu"]
+
+[[example]]
+name = "formats_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "op_latency"
+required-features = ["gpu"]
+
+[[example]]
+name = "placement"
+required-features = ["gpu"]
+
+[[example]]
+name = "prefill"
+required-features = ["gpu"]
+
+[[example]]
+name = "q35_chat"
+required-features = ["gpu"]
+
+[[example]]
+name = "q35_cpu_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "q35_hybrid"
+required-features = ["gpu"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
