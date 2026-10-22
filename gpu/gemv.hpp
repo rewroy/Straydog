@@ -793,7 +793,8 @@ __global__ void gemv_fixed_kind(FixedGemv list, const float* input, float* outpu
                        output, list.output_stride, list.residual);
 }
 // gemv_fixed_kind of one matrix and one vector whose output is this device's part of a linked sum:
-// the rows also go to the other device's inbox, and the last block adds the parts (link_tail).
+// the rows also go to the other device's inbox, and the last block adds the parts (link_tail; or,
+// sending only, raises the other's flag).
 template<int kind>
 __global__ void gemv_linked_kind(FixedGemv list, const float* input, float* output, LinkTail tail) {
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;

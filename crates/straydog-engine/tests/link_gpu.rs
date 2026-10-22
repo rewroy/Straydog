@@ -4,7 +4,9 @@
 //! fails instead of hanging, and a reset starts the counts over; sums folded into the kernels forming
 //! their parts (a projection's GEMV, the routed experts' down) give the bits of the ops they stand
 //! in for, also among plain sums in recorded graphs, also when the last block's waves of a folded
-//! sum run far apart (as they can on a GPU another process loads). Skipped without two GPUs.
+//! sum run far apart (as they can on a GPU another process loads). Part links, as tensor-parallel
+//! DeepSeek-V4.1 sums its decode steps' outputs (sent as they form, added as the next step reads
+//! them), give the bits of sd_op_sum_devices and the ops they stand in for. Skipped without two GPUs.
 //!
 //! cargo test --release -p straydog-engine --features hip --test link_gpu, under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -340,10 +342,345 @@ fn folded_sums_match_the_ops() {
     }
 }
 
+// ---- Part links (DeepSeek-V4.1's decode sums: parts sent as they form, added as they are read) ----
+
+/// DeepSeek-V4.1's width, and the rows of a part link's sum (a verify pass's).
+const DS_WIDTH: usize = 5120;
+const DS_ROWS: usize = 4;
+
+fn part_pair() -> Option<(Backend, Backend)> {
+    let (Ok(mut first), Ok(mut second)) = (Backend::new(0, 2 << 30), Backend::new(1, 2 << 30)) else {
+        eprintln!("skipped: part links need two GPUs");
+        return None;
+    };
+    Backend::link_parts(&mut first, &mut second, (DS_ROWS * DS_WIDTH) as u64).unwrap();
+    Some((first, second))
+}
+
+/// A device's columns of the experts' output (the down rows it holds): halves.
+fn owned(device: usize) -> (usize, usize) {
+    (device * DS_WIDTH / 2, DS_WIDTH / 2)
+}
+
+/// Random parts with exact zeros of both signs among them; with `columns`, zero (positive) outside
+/// them, as a device's part of the experts' output is.
+fn signed_parts(random: &mut Random, rows: usize, columns: Option<(usize, usize)>) -> Vec<f32> {
+    let mut values = random.floats(rows * DS_WIDTH, 3.0);
+    for (i, value) in values.iter_mut().enumerate() {
+        match random.next() % 9 {
+            0 => *value = -0.0,
+            1 => *value = 0.0,
+            _ => {}
+        }
+        if let Some((first, count)) = columns {
+            if !(first..first + count).contains(&(i % DS_WIDTH)) {
+                *value = 0.0;
+            }
+        }
+    }
+    values
+}
+
+/// Thousands of sums on both channels, queued on both devices without waiting (one device now and
+/// then behind), of one to four rows: the attention's channel sends whole rows, the experts' only
+/// the sender's columns. Every result is the two parts' sum as sd_op_sum_devices adds them, to the
+/// bit (zeros' signs too), on both devices.
+#[test]
+fn part_links_add_as_the_device_sum_does() {
+    let _gpus = gpus();
+    let Some((mut a, mut b)) = part_pair() else { return };
+    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let sums = 1200;
+    let rows_of = |sum: usize| 1 + (sum * 5 + sum / 7) % DS_ROWS;
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for sum in 0..sums {
+        let rows = rows_of(sum);
+        let experts = sum % 2 == 1;
+        let mut part = signed_parts(&mut random, rows, experts.then(|| owned(0)));
+        part.resize(DS_ROWS * DS_WIDTH, 0.0);
+        first.extend(part);
+        let mut part = signed_parts(&mut random, rows, experts.then(|| owned(1)));
+        part.resize(DS_ROWS * DS_WIDTH, 0.0);
+        second.extend(part);
+    }
+    let stride = DS_ROWS * DS_WIDTH;
+    let (part_a, part_b) = (upload(&mut a, &first), upload(&mut b, &second));
+    let bytes = (sums * stride * 4) as u64;
+    let (out_a, out_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap());
+    let busy = a.buffer(64 << 20).unwrap();
+    for sum in 0..sums {
+        let (rows, channel, at) = (rows_of(sum), (sum % 2) as u32, sum * stride);
+        if sum % 97 == 0 {
+            a.copy(busy.base().cast_const(), busy.at(8 << 20), 32 << 20).unwrap();
+        }
+        for (device, gpu, part, out) in [(0, &mut a, &part_a, &out_a), (1, &mut b, &part_b, &out_b)] {
+            let (columns_first, columns) = if channel == 1 { owned(device) } else { (0, DS_WIDTH) };
+            gpu.part_send(channel, part.at(at), rows as u64, DS_WIDTH as u64, columns_first as u64, columns as u64).unwrap();
+            gpu.part_receive(channel, part.at(at), (rows * DS_WIDTH) as u64, out.at(at)).unwrap();
+        }
+    }
+    let (result_a, result_b) = (read(&mut a, &out_a, sums * stride), read(&mut b, &out_b, sums * stride));
+    assert!(!a.part_failed().unwrap() && !b.part_failed().unwrap());
+    for sum in 0..sums {
+        for i in sum * stride..sum * stride + rows_of(sum) * DS_WIDTH {
+            let expected = (first[i] + second[i]).to_bits();
+            assert_eq!(result_a[i].to_bits(), expected, "sum {sum} value {i} on device 0: {} + {}", first[i], second[i]);
+            assert_eq!(result_b[i].to_bits(), expected, "sum {sum} value {i} on device 1: {} + {}", first[i], second[i]);
+        }
+    }
+    // A sum the other device never sends gives up after the await timeout; after a reset both count
+    // from zero again.
+    let started = std::time::Instant::now();
+    a.part_send(0, part_a.base(), 1, DS_WIDTH as u64, 0, DS_WIDTH as u64).unwrap();
+    a.part_receive(0, part_a.base(), DS_WIDTH as u64, out_a.base()).unwrap();
+    assert!(a.part_failed().unwrap(), "a lone sum must fail");
+    eprintln!("a lone part sum failed after {:.1} s", started.elapsed().as_secs_f64());
+    a.part_reset().unwrap();
+    assert!(!a.part_failed().unwrap() && !b.part_failed().unwrap());
+    for (gpu, part, out) in [(&mut a, &part_a, &out_a), (&mut b, &part_b, &out_b)] {
+        gpu.part_send(0, part.base(), 1, DS_WIDTH as u64, 0, DS_WIDTH as u64).unwrap();
+        gpu.part_receive(0, part.base(), DS_WIDTH as u64, out.base()).unwrap();
+    }
+    let (result_a, result_b) = (read(&mut a, &out_a, DS_WIDTH), read(&mut b, &out_b, DS_WIDTH));
+    for i in 0..DS_WIDTH {
+        let expected = (first[i] + second[i]).to_bits();
+        assert_eq!((result_a[i].to_bits(), result_b[i].to_bits()), (expected, expected), "after the reset, value {i}");
+    }
+}
+
+const DS_HC: usize = 4;
+const DS_MIX: usize = (2 + DS_HC) * DS_HC;
+const DS_COLS: usize = 1024;
+const DS_FFN: usize = 256;
+const DS_EXPERTS: usize = 8;
+const DS_TOP_K: usize = 4;
+
+/// One device's side of a DeepSeek-V4.1 decode step's two sums: the attention output projection
+/// (Q8_0, DS_COLS columns), the hyper-connection steps' weights and buffers (the same on both
+/// devices, as the stream is), eight routed experts (whole gate and up, this device's half of the
+/// down rows; Q8_0) and the shared expert's part of the output they add to (zero outside its
+/// columns).
+struct Step {
+    matrix: Buffer,
+    input: Buffer,
+    scratch: Buffer,
+    residual: Buffer,
+    post_in: Buffer,
+    comb_in: Buffer,
+    fn_: Buffer,
+    base: Buffer,
+    scale: Buffer,
+    collapse: Buffer,
+    norm: Buffer,
+    workspace: Buffer,
+    slots: Buffer,
+    route_weights: Buffer,
+    shared: Vec<f32>,
+    // outputs
+    parts: [Buffer; 2],
+    sums: [Buffer; 2],
+    stream: Buffer,
+    stream2: Buffer,
+    coefficients: [Buffer; 3],
+    x: Buffer,
+    product: Buffer,
+    received: Buffer,
+}
+
+fn step_side(gpu: &mut Backend, random: &mut Random, common: &mut Random, device: usize) -> Step {
+    let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count * 4) as u64).unwrap();
+    let rows = DS_ROWS;
+    let mut slots = Vec::new();
+    let slot = (2 * DS_FFN * (DS_WIDTH / 32 * 34) + DS_WIDTH / 2 * (DS_FFN / 32 * 34)).next_multiple_of(256);
+    for _ in 0..DS_EXPERTS {
+        let mut expert = random.q8(2 * DS_FFN, DS_WIDTH);
+        expert.extend(random.q8(DS_WIDTH / 2, DS_FFN));
+        expert.resize(slot, 0);
+        slots.extend(expert);
+    }
+    let (first, count) = owned(device);
+    let shared = signed_parts(random, rows, Some((first, count)));
+    Step {
+        matrix: gpu.upload_bytes(&random.q8(DS_WIDTH, DS_COLS)).unwrap(),
+        input: upload(gpu, &random.floats(rows * DS_COLS, 2.0)),
+        scratch: gpu.buffer(64 << 20).unwrap(),
+        residual: upload(gpu, &common.floats(rows * DS_HC * DS_WIDTH, 2.0)),
+        post_in: upload(gpu, &common.floats(rows * DS_HC, 1.0)),
+        comb_in: upload(gpu, &common.floats(rows * DS_HC * DS_HC, 0.5)),
+        fn_: upload(gpu, &common.floats(DS_MIX * DS_HC * DS_WIDTH, 0.01)),
+        base: upload(gpu, &common.floats(DS_MIX, 0.5)),
+        scale: upload(gpu, &common.floats(3, 0.5)),
+        collapse: upload(gpu, &common.floats(rows * DS_HC, 1.0)),
+        norm: upload(gpu, &common.floats(DS_WIDTH, 1.0)),
+        workspace: floats(gpu, 1 << 16),
+        slots: gpu.upload_bytes(&slots).unwrap(),
+        route_weights: upload(gpu, &common.floats(rows * DS_TOP_K, 0.5)),
+        shared,
+        parts: [floats(gpu, rows * DS_WIDTH), floats(gpu, rows * DS_WIDTH)],
+        sums: [floats(gpu, rows * DS_WIDTH), floats(gpu, rows * DS_WIDTH)],
+        stream: floats(gpu, rows * DS_HC * DS_WIDTH),
+        stream2: floats(gpu, rows * DS_HC * DS_WIDTH),
+        coefficients: [floats(gpu, rows * DS_HC), floats(gpu, rows * DS_HC), floats(gpu, rows * DS_HC * DS_HC)],
+        x: floats(gpu, rows * DS_WIDTH),
+        product: floats(gpu, rows * DS_TOP_K * DS_FFN),
+        received: floats(gpu, rows * DS_WIDTH),
+    }
+}
+
+/// A step's hyper-connection step from `x` (a sum, or with `link` this device's part of one).
+fn step_hc(gpu: &mut Backend, s: &Step, x: &Buffer, rows: usize, link: Option<u32>, stream: &Buffer) {
+    let [pre, post, comb] = &s.coefficients;
+    gpu.hc_step(Some((x.base().cast_const(), s.residual.base().cast_const(), s.post_in.base().cast_const(), s.comb_in.base().cast_const())),
+                stream.base(), Some((s.fn_.base().cast_const(), s.base.base().cast_const(), s.scale.base().cast_const(), pre.base(),
+                post.base(), comb.base())), 20, 1e-6, 1e-6, s.collapse.base().cast_const(), s.norm.base().cast_const(), rows as u64,
+                DS_HC as u64, DS_WIDTH as u64, &s.workspace, s.x.base(), link).unwrap();
+}
+
+/// A decode step of `rows` rows on both devices, linked or with device sums: the attention output
+/// projection, the step into the FFN, the experts (gate, up and this device's down rows) added to
+/// the shared expert's part, then the step into the next attention (`hc`) or the sum alone.
+fn decode_step(a: &mut Backend, b: &mut Backend, sides: &[Step; 2], rows: usize, link: bool, hc: bool, routes: &[u64; 2]) {
+    let slot = (2 * DS_FFN * (DS_WIDTH / 32 * 34) + DS_WIDTH / 2 * (DS_FFN / 32 * 34)).next_multiple_of(256) as u64;
+    let offsets = [0, (DS_FFN * (DS_WIDTH / 32 * 34)) as u64, (2 * DS_FFN * (DS_WIDTH / 32 * 34)) as u64];
+    let mut gpus = [a, b];
+    for (gpu, s) in gpus.iter_mut().zip(sides) {
+        gpu.write_buffer(&s.parts[1], 0, &s.shared[..rows * DS_WIDTH]).unwrap();
+    }
+    // the attention's sum
+    for (gpu, s) in gpus.iter_mut().zip(sides) {
+        if link {
+            gpu.linear_send(0, &s.matrix, 8, DS_WIDTH as u64, DS_COLS as u64, s.input.base().cast_const(), rows as u64, s.parts[0].base())
+                .unwrap();
+            step_hc(gpu, s, &s.parts[0], rows, Some(0), &s.stream2);
+        } else {
+            gpu.linear(&s.matrix, 8, DS_WIDTH as u64, DS_COLS as u64, 0, s.input.base().cast_const(), 0, rows as u64, s.parts[0].base(), 0,
+                       &s.scratch).unwrap();
+        }
+    }
+    if !link {
+        straydog_engine::ops::sum_devices(&[&*gpus[0], &*gpus[1]], &[sides[0].sums[0].base(), sides[1].sums[0].base()],
+                                          &[sides[0].parts[0].base().cast_const(), sides[1].parts[0].base().cast_const()],
+                                          (rows * DS_WIDTH) as u64).unwrap();
+        for (gpu, s) in gpus.iter_mut().zip(sides) {
+            step_hc(gpu, s, &s.sums[0], rows, None, &s.stream2);
+        }
+    }
+    // the experts' sum
+    for (device, (gpu, s)) in gpus.iter_mut().zip(sides).enumerate() {
+        let bases: Vec<u64> = (0..rows * DS_TOP_K).map(|r| s.slots.base() as u64 + ((routes[device] as usize + r * 3) % DS_EXPERTS) as u64 * slot)
+            .collect();
+        let (first, count) = owned(device);
+        let split = straydog_engine::ops::ExpertSplit { ffn_first: 0, ffn_rows: DS_FFN as u64, hidden_first: first as u64,
+                                                        hidden_rows: count as u64, stages: 3, send: if link { 2 } else { 0 } };
+        gpu.experts(Some(&bases), slot, offsets, [8; 3], DS_WIDTH as u64, DS_FFN as u64, rows as u64, DS_TOP_K as u64, s.x.base().cast_const(),
+                    0, Some(s.route_weights.base().cast_const()), 0.0, true, s.product.base(), s.parts[1].base(), 0, Some(split)).unwrap();
+        if link {
+            if hc {
+                step_hc(gpu, s, &s.parts[1], rows, Some(1), &s.stream);
+            } else {
+                gpu.part_receive(1, s.parts[1].base().cast_const(), (rows * DS_WIDTH) as u64, s.received.base()).unwrap();
+            }
+        }
+    }
+    if !link {
+        straydog_engine::ops::sum_devices(&[&*gpus[0], &*gpus[1]], &[sides[0].sums[1].base(), sides[1].sums[1].base()],
+                                          &[sides[0].parts[1].base().cast_const(), sides[1].parts[1].base().cast_const()],
+                                          (rows * DS_WIDTH) as u64).unwrap();
+        for (gpu, s) in gpus.iter_mut().zip(sides) {
+            if hc {
+                step_hc(gpu, s, &s.sums[1], rows, None, &s.stream);
+            } else {
+                gpu.copy(s.sums[1].base().cast_const(), s.received.base(), (rows * DS_WIDTH * 4) as u64).unwrap();
+            }
+        }
+    }
+}
+
+/// What a step leaves on a device, as bits: the streams, coefficients and collapsed input of its
+/// steps, and the experts' sum as received (without `hc`).
+fn step_bits(gpu: &mut Backend, s: &Step, rows: usize, hc: bool) -> Vec<u32> {
+    let mut all = Vec::new();
+    let last = if hc { (&s.stream, rows * DS_HC * DS_WIDTH) } else { (&s.received, rows * DS_WIDTH) };
+    for (buffer, count) in [(&s.stream2, rows * DS_HC * DS_WIDTH), (&s.coefficients[0], rows * DS_HC), (&s.coefficients[1], rows * DS_HC),
+                            (&s.coefficients[2], rows * DS_HC * DS_HC), (&s.x, rows * DS_WIDTH), last] {
+        all.extend(bits(gpu, buffer, count));
+    }
+    all
+}
+
+/// DeepSeek-V4.1's decode sums over part links (the attention output projection and the routed
+/// experts' down sending as they form, the hyper-connection steps and a plain receive adding the
+/// other's part as they read it) give the bits of the projection, the experts, sd_op_sum_devices
+/// and the steps they stand in for, on both devices, for one to four rows, back to back and in
+/// recorded graphs replayed.
+#[test]
+fn part_link_steps_match_the_device_sums() {
+    let _gpus = gpus();
+    let Some((mut a, mut b)) = part_pair() else { return };
+    // (the stream and the steps' weights the same on both devices)
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let common = || Random(0x1405_7b7e_f767_814f);
+    let sides = [step_side(&mut a, &mut random, &mut common(), 0), step_side(&mut b, &mut random, &mut common(), 1)];
+    let mut expected = Vec::new();
+    for (index, rows) in [1, 3, 4, 2, 1, 1].into_iter().enumerate() {
+        for hc in [true, false] {
+            let routes = [index as u64, index as u64 * 5 + 1];
+            decode_step(&mut a, &mut b, &sides, rows, false, hc, &routes);
+            let plain = (step_bits(&mut a, &sides[0], rows, hc), step_bits(&mut b, &sides[1], rows, hc));
+            assert_eq!(plain.0, plain.1, "rows {rows}: the devices' steps");
+            for round in 0..3 {
+                decode_step(&mut a, &mut b, &sides, rows, true, hc, &routes);
+                let linked = (step_bits(&mut a, &sides[0], rows, hc), step_bits(&mut b, &sides[1], rows, hc));
+                assert!(linked == plain, "rows {rows}, hc {hc}, round {round}: linked steps differ from the device sums'");
+            }
+            expected.push((rows, hc, routes, plain));
+        }
+    }
+    // Many steps queued without waiting, then compared against their last.
+    for &(rows, hc, routes, ref plain) in &expected {
+        for _ in 0..40 {
+            decode_step(&mut a, &mut b, &sides, rows, true, hc, &routes);
+        }
+        assert!((step_bits(&mut a, &sides[0], rows, hc), step_bits(&mut b, &sides[1], rows, hc)) == *plain, "rows {rows}: back to back");
+    }
+    // The attention's half recorded into graphs (with the experts' send and receive between
+    // replays, outside them), replayed: the counts carry on in device memory.
+    let rows = 1;
+    for (gpu, s) in [(&mut a, &sides[0]), (&mut b, &sides[1])] {
+        gpu.graph_begin().unwrap();
+        gpu.linear_send(0, &s.matrix, 8, DS_WIDTH as u64, DS_COLS as u64, s.input.base().cast_const(), rows as u64, s.parts[0].base()).unwrap();
+        step_hc(gpu, s, &s.parts[0], rows, Some(0), &s.stream2);
+        gpu.graph_end(11, true).unwrap();
+    }
+    let (_, _, routes, plain) = expected.iter().find(|(r, hc, _, _)| *r == rows && *hc).unwrap();
+    for replay in 0..30 {
+        for (gpu, s) in [(&mut a, &sides[0]), (&mut b, &sides[1])] {
+            gpu.write_buffer(&s.parts[1], 0, &s.shared[..rows * DS_WIDTH]).unwrap();
+        }
+        assert!(a.graph_run(11).unwrap() && b.graph_run(11).unwrap());
+        let slot = (2 * DS_FFN * (DS_WIDTH / 32 * 34) + DS_WIDTH / 2 * (DS_FFN / 32 * 34)).next_multiple_of(256) as u64;
+        let offsets = [0, (DS_FFN * (DS_WIDTH / 32 * 34)) as u64, (2 * DS_FFN * (DS_WIDTH / 32 * 34)) as u64];
+        for (device, (gpu, s)) in [(&mut a, &sides[0]), (&mut b, &sides[1])].into_iter().enumerate() {
+            let bases: Vec<u64> = (0..rows * DS_TOP_K)
+                .map(|r| s.slots.base() as u64 + ((routes[device] as usize + r * 3) % DS_EXPERTS) as u64 * slot).collect();
+            let (first, count) = owned(device);
+            let split = straydog_engine::ops::ExpertSplit { ffn_first: 0, ffn_rows: DS_FFN as u64, hidden_first: first as u64,
+                                                            hidden_rows: count as u64, stages: 3, send: 2 };
+            gpu.experts(Some(&bases), slot, offsets, [8; 3], DS_WIDTH as u64, DS_FFN as u64, rows as u64, DS_TOP_K as u64,
+                        s.x.base().cast_const(), 0, Some(s.route_weights.base().cast_const()), 0.0, true, s.product.base(),
+                        s.parts[1].base(), 0, Some(split)).unwrap();
+            step_hc(gpu, s, &s.parts[1], rows, Some(1), &s.stream);
+        }
+        assert!((step_bits(&mut a, &sides[0], rows, true), step_bits(&mut b, &sides[1], rows, true)) == *plain, "graph replay {replay}");
+    }
+    assert!(!a.part_failed().unwrap() && !b.part_failed().unwrap());
+}
+
 /// Wrong sums among `rounds` rounds of linked sums on two devices, one now and then behind: per
 /// round, 1500 sums of a decode step's width in one kernel each, 300 of a prefill row's in three,
-/// 600 folded into a projection's GEMV (each into its own zeroed out), and three-sum steps folded
-/// into the kernels forming their parts, plain and in recorded graphs. Each wrong sum of the first
+/// 600 folded into a projection's GEMV (each into its own zeroed out), 1500 over a part link, and
+/// three-sum steps folded into the kernels forming their parts, plain and in recorded graphs. Each wrong sum of the first
 /// three kinds is reported with what its wrong values hold.
 fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
     let busy = a.buffer(64 << 20).unwrap();
@@ -351,7 +688,8 @@ fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
     let mut random = Random(0x1234_5678_9abc_def1);
     let (matrix_a, matrix_b) = (a.upload_bytes(&random.q8(WIDTH, WIDTH)).unwrap(), b.upload_bytes(&random.q8(WIDTH, WIDTH)).unwrap());
     for round in 0..rounds {
-        for (kind, count, sums) in [("link sum", 5120, 1500), ("3-kernel link sum", 16_128, 300), ("folded GEMV", WIDTH, 600)] {
+        for (kind, count, sums) in [("link sum", 5120, 1500), ("3-kernel link sum", 16_128, 300), ("folded GEMV", WIDTH, 600),
+                                    ("part link", 5120, 1500)] {
             let folded = kind == "folded GEMV";
             let bytes = (sums * count * 4) as u64;
             let (part_a, part_b, out_a, out_b) = if folded {
@@ -368,6 +706,10 @@ fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
                 }
                 for (device, gpu, part, out) in [(0, &mut *a, &part_a, &out_a), (1, &mut *b, &part_b, &out_b)] {
                     match &inputs {
+                        _ if kind == "part link" => {
+                            gpu.part_send(0, part.at(at).cast_const(), 1, count as u64, 0, count as u64).unwrap();
+                            gpu.part_receive(0, part.at(at).cast_const(), count as u64, out.at(at)).unwrap();
+                        }
                         Some((input_a, input_b)) => {
                             let (matrix, input) = if device == 0 { (&matrix_a, input_a) } else { (&matrix_b, input_b) };
                             gpu.linear_link_sum(matrix, 8, WIDTH as u64, WIDTH as u64, input.at(at).cast_const(), part.at(at), out.at(at)).unwrap();
@@ -378,7 +720,8 @@ fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
             }
             let (result_a, result_b) = (read(a, &out_a, sums * count), read(b, &out_b, sums * count));
             let (first, second) = (read(a, &part_a, sums * count), read(b, &part_b, sums * count));
-            let failed = a.link_failed().unwrap() || b.link_failed().unwrap();
+            let failed = if kind == "part link" { a.part_failed().unwrap() || b.part_failed().unwrap() }
+                         else { a.link_failed().unwrap() || b.link_failed().unwrap() };
             for (device, result, mine, theirs) in [(0, &result_a, &first, &second), (1, &result_b, &second, &first)] {
                 for sum in 0..sums {
                     let mut held = std::collections::BTreeMap::new();
@@ -403,7 +746,7 @@ fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
             if failed {
                 wrong += 1;
                 eprintln!("round {round}, {kind}: a wait gave up");
-                a.link_reset().unwrap();
+                if kind == "part link" { a.part_reset().unwrap() } else { a.link_reset().unwrap() }
             }
         }
     }
@@ -428,6 +771,7 @@ fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
 fn folded_sums_hold_when_waves_run_apart() {
     let _gpus = gpus();
     let Some((mut a, mut b)) = pair_of(64 * WIDTH) else { return };
+    Backend::link_parts(&mut a, &mut b, 5120).unwrap();
     for gpu in [&mut a, &mut b] {
         gpu.link_skew(50).unwrap();
     }
@@ -442,6 +786,7 @@ fn folded_sums_hold_when_waves_run_apart() {
 fn links_hold_beside_bus_traffic() {
     let _gpus = gpus();
     let Some((mut a, mut b)) = pair_of(64 * WIDTH) else { return };
+    Backend::link_parts(&mut a, &mut b, 5120).unwrap();
     let rounds: usize = std::env::var("ROUNDS").ok().and_then(|value| value.parse().ok()).unwrap_or(3);
     // The stressor stops when told to, also when this test panics (else it would hold the GPUs).
     struct Stressor(std::path::PathBuf, std::process::Child);

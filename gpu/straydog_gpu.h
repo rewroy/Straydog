@@ -160,11 +160,14 @@ int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_
    With split (else whole experts, both stages): a device's rows of each expert (tensor parallel),
    gate and up rows [ffn_first, ffn_first + ffn_rows) writing product[r][ffn_first ..] (rows of ffn
    values), down rows [hidden_first, hidden_first + hidden_rows) writing out[t][hidden_first ..];
-   stages 1 runs gate/up, 2 down (from the whole product), 3 both. Without bases, the routes the
-   device last uploaded (a call of several routes per row; as many) are used again. */
+   stages 1 runs gate/up, 2 down (from the whole product), 3 both; send (two devices joined by
+   sd_link_parts; with the down stage), 1 + the part link channel its rows of out go to the other
+   device on, the sum's part as complete (else 0). Without bases, the routes the device last uploaded
+   (a call of several routes per row; as many) are used again. */
 typedef struct sd_expert_split {
     uint64_t ffn_first, ffn_rows, hidden_first, hidden_rows;
     int stages;
+    int send;
 } sd_expert_split;
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride, const sd_expert_split* split);
 /* Experts by table, for experts that stay in their slots: sd_expert_table writes count slot
@@ -252,6 +255,29 @@ int sd_link_reset(void* handle);
    a second; 0: none) before they add the parts, as waves of a block can run apart on a loaded GPU:
    tests widen the window of races between them. */
 int sd_link_skew(void* handle, uint64_t microseconds);
+/* Part links (gpu/link_tail.hpp, gpu/device_link.hpp): sums of two devices' parts whose producer
+   sends this device's part to the other as it forms it and whose consumer adds the two as it reads
+   them (this part + the other's, the addition sd_op_sum_devices makes), in two channels, each sum
+   a producer on both devices and then a consumer on both. sd_link_parts joins two devices (peer
+   access needed) with inboxes of up to `capacity` floats per channel. Producers:
+   sd_op_linear_send, `steps` (at most 4) vectors through rows x cols into output (as sd_op_linear),
+   sent; sd_op_experts with a split's send; sd_op_part_send, columns [first, first + count) of
+   `rows` rows `stride` floats apart of a part formed before. Consumers: sd_op_hc_step_linked,
+   sd_op_hc_step whose x is the sum of `part` (this device's) and the other's; sd_op_part_receive,
+   out = part + the other's (count floats). Values a producer sends land at their offsets from the
+   part's start; the inbox stays zero where the other never sends. A wait that gives up (the
+   device's await timeout) is recorded and the stream goes on (the sums since are void):
+   sd_op_part_status queues 1 | 2 by channel (0: none gave up) into out, sd_part_failed reads it
+   after the stream is idle, and sd_part_reset waits for both devices' streams and starts every
+   count over. */
+int sd_link_parts(void* first, void* second, uint64_t capacity);
+int sd_op_linear_send(void* handle, int channel, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* input, uint64_t steps, float* output);
+int sd_op_hc_step_linked(void* handle, int channel, const float* part, const float* residual, const float* post_in, const float* comb_in, float* stream, const float* fn, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps, const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width, float* workspace, uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out);
+int sd_op_part_send(void* handle, int channel, const float* part, uint64_t rows, uint64_t stride, uint64_t first, uint64_t count);
+int sd_op_part_receive(void* handle, int channel, const float* part, uint64_t count, float* out);
+int sd_op_part_status(void* handle, uint32_t* out);
+int sd_part_failed(void* handle);
+int sd_part_reset(void* handle);
 /* Routed experts of many rows at once (a prefill pass; gpu/moe_prefill.hpp): sd_moe_groups writes
    an expert table (experts entries of sd_moe_group_bytes() each) from each expert's slot address
    (0: an expert another device runs) and its gate, up and down byte offsets and kinds in the

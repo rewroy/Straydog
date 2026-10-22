@@ -72,7 +72,7 @@ fn main() -> Result<(), String> {
     let product = gpu.buffer((ROUTES * FFN * 4) as u64)?;
     let out = gpu.buffer((WIDTH * 4) as u64)?;
     let (ffn_rows, hidden_rows) = (FFN / PARTS, WIDTH / PARTS);
-    let split = |stages: i32| ExpertSplit { ffn_first: 0, ffn_rows: ffn_rows as u64, hidden_first: 0, hidden_rows: hidden_rows as u64, stages };
+    let split = |stages: i32| ExpertSplit { ffn_first: 0, ffn_rows: ffn_rows as u64, hidden_first: 0, hidden_rows: hidden_rows as u64, stages, send: 0 };
     // (gate and up, down): layer 0, 1-9, 10-19, 20-24, 25-34, 35-39; the shared expert
     for (label, gate, down) in [("IQ1_S / Q2_K", 19u32, 10u32), ("IQ1_S / IQ2_XS", 19, 17), ("IQ2_XXS / IQ2_S", 16, 22),
                                 ("IQ2_XXS / IQ3_XXS", 16, 18), ("IQ2_S / IQ3_XXS", 22, 18), ("IQ2_S / IQ2_S", 22, 22),
@@ -127,7 +127,7 @@ fn main() -> Result<(), String> {
         let fn_ = &fns[iteration % count];
         gpu.hc_step(Some((out.base(), stream.base(), post.base(), comb.base())), stream2.base(),
                     Some((fn_.base(), base.base(), scale.base(), pre_out.base(), post_out.base(), comb_out.base())), 20, 1e-6, 1e-20,
-                    pre.base(), norm.base(), 1, hc as u64, WIDTH as u64, &workspace, normed.base())?;
+                    pre.base(), norm.base(), 1, hc as u64, WIDTH as u64, &workspace, normed.base(), None)?;
     }
     let mut sink = [0f32; 1];
     gpu.read_buffer(&normed, 0, &mut sink)?;

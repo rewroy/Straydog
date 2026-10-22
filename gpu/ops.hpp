@@ -267,7 +267,8 @@ template<int HC>
 __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
                                   float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
                                   float eps, float norm_eps, const float* collapse, const float* norm_weight, size_t width,
-                                  unsigned* counters, float* partial, float* pre, float* post, float* comb, float* out) {
+                                  unsigned* counters, float* partial, float* pre, float* post, float* comb, float* out,
+                                  PartRead link) {
     constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
     const size_t row = blockIdx.y, block = blockIdx.x, blocks = gridDim.x;
     const size_t first = block * hc_step_columns, columns = std::min(hc_step_columns, width - first);
@@ -279,12 +280,28 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     __shared__ bool last;
     float acc[SUMS] = {};
     float* s_row = stream + row * HC * width;
+    // Linked (link.state): x is this device's part of the sublayer's output and the other's comes
+    // into the inbox (link_tail.hpp); the block's columns of their sum, formed once for every stream.
+    __shared__ float summed[hc_step_columns];
+    if (link.state) {
+        __shared__ uint32_t n;
+        if (!threadIdx.x) n = part_wait(link);
+        __syncthreads();
+        const float* theirs = link.inbox + size_t(n & 1) * link.capacity;
+        for (size_t c = threadIdx.x; c < columns; c += blockDim.x) {
+            const size_t at = row * width + first + c;
+            summed[c] = x[at] + link_load(theirs + at);
+        }
+        __syncthreads();
+        if (!threadIdx.x) part_read_done(link, n);
+    }
     for (size_t pair = threadIdx.x; pair < HC * hc_step_columns; pair += blockDim.x) {
         const size_t j = pair / hc_step_columns, c = pair % hc_step_columns, col = first + c;
         if (c >= columns) continue;
         float v;
         if (x) {
-            v = post_in[row * HC + j] * x[row * width + col];
+            const float xv = link.state ? summed[c] : x[row * width + col];
+            v = post_in[row * HC + j] * xv;
             #pragma unroll
             for (int i = 0; i < HC; ++i) v += comb_in[(row * HC + i) * HC + j] * residual[(row * HC + i) * width + col];
             s_row[j * width + col] = v;

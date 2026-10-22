@@ -447,7 +447,12 @@ isolation and dashboard. The bundle's pins name the architecture; the worker ope
 shards against their trees and places them by `--split-mode`: `experts` (the default) splits
 every layer across the GPUs, each holding its part of the attention and the head and its rows of
 every expert; `layer` gives each GPU a range of layers, cut where no layer reads another part's
-compressed rows (balancing the dense bytes). Each GPU's VRAM left after its resident weights and
+compressed rows (balancing the dense bytes). Split by experts, a decode pass sums the GPUs' parts of
+the attention's and the experts' outputs over part links (`gpu/link_tail.hpp`): the kernels forming
+them also store them into the other GPU's inbox and raise its flag, and the hyper-connection step
+reading the sum waits for the flag and adds the other's part as it reads it; a pass of several rows
+(verify, prefill) sums them with a kernel once both are done, as storing its values one by one
+across the bus costs more than the sum's launch. Each GPU's VRAM left after its resident weights and
 sequence state goes to expert slots, and the host tier gets what Straydog's other host memory
 leaves of three quarters of the host memory (as the server measures it, cgroup limits included).
 Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the official

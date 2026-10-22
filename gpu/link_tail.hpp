@@ -24,6 +24,8 @@ __device__ __forceinline__ void link_send(float* at, float value) {
 #endif
 }
 
+// Without out, the tail only sends: the last block raises the other's flag (a part link's sum,
+// below, whose consumer adds the parts).
 struct LinkTail {
     const float* part;      // this device's part of the sum (count floats), as the kernel stores it
     uint32_t count;
@@ -75,6 +77,16 @@ __device__ inline void link_tail(const LinkTail& tail) {
     }
     __threadfence();
     const uint32_t sent = count + 1;
+    if (!tail.out) {
+        // a part sent as it formed (part_wait's sums): the other adds it as it reads it
+        if (!threadIdx.x) {
+            tail.state[3] = 0;
+            tail.state[0] = sent;
+            __threadfence_system();
+            peer_store(tail.peer_flag, sent);
+        }
+        return;
+    }
     const size_t slot = size_t(sent & 1) * tail.capacity;
     if (!threadIdx.x) {
         tail.state[3] = 0;
@@ -114,4 +126,91 @@ __device__ inline void link_tail(const LinkTail& tail) {
             tail.out[i] = tail.accumulate ? old[j] + sum : sum;
         }
     }
+}
+
+// ---- Parts sent as they form (a part link: device_link.hpp, sd_link_parts) ----
+// A decode sum of two devices whose producer sends this device's part into the other's inbox as it
+// stores it and raises the other's flag (a LinkTail without out), and whose consumer, a later
+// kernel, waits for its own flag and adds the two parts as it reads them: own + theirs, the one
+// addition sd_op_sum_devices makes (two terms commute exactly). Before reading sum n, a consumer
+// also waits until the other has read this device's sum n - 1: the producer of n + 1, after it in
+// the stream, writes that sum's slot of the other's inbox. Each consumer counts its read of sum n
+// into the other's state once all its blocks have read.
+struct PartRead {
+    const float* inbox;     // this device's inbox: two slots of capacity floats, the other writes
+    uint32_t* state;        // this device's: [0] sums sent, [1] its flag, [2] a failed wait, [3] the
+                            // producer's blocks in, [4] the other's reads of its sums, [5] the
+                            // consumer's blocks done reading
+    uint32_t* peer_reads;   // the other's state[4]
+    uint32_t capacity;
+    uint64_t timeout;
+};
+
+// One thread of a consumer's block: the count of the sum to read (its slot is count & 1), once
+// the other's part is in and the other has read this device's sum before. A wait that gives up,
+// or any wait after one did, records the failure and goes on (the pass's results are void).
+__device__ inline uint32_t part_wait(const PartRead& link) {
+    const uint32_t n = *static_cast<volatile uint32_t*>(link.state);
+    const uint64_t start = peer_clock();
+    while (int32_t(peer_load(link.state + 1) - n) < 0 || int32_t(peer_load(link.state + 4) - (n - 1)) < 0) {
+        if (*static_cast<volatile uint32_t*>(link.state + 2) || peer_clock() - start > link.timeout) {
+            link.state[2] = n;
+            break;
+        }
+#if defined(__HIPCC__)
+        __builtin_amdgcn_s_sleep(1);
+#endif
+    }
+    return n;
+}
+
+// One thread of a consumer's block, after every thread's reads of the inbox returned: the last
+// block of the grid tells the other this sum is read.
+__device__ inline void part_read_done(const PartRead& link, uint32_t n) {
+    if (atomicAdd(link.state + 5, 1u) != gridDim.x * gridDim.y - 1) return;
+    link.state[5] = 0;
+    peer_store(link.peer_reads, n);
+}
+
+// A part link's channel of a device (two linked devices), as its kernels take it.
+inline PartLink& part_link(Device& d, int channel) {
+    if (!d.part_peer || channel < 0 || channel >= int(sizeof(d.part_links) / sizeof(d.part_links[0])))
+        throw std::runtime_error("no Straydog part link");
+    return d.part_links[channel];
+}
+inline LinkTail part_send_tail(Device& d, int channel) {
+    PartLink& link = part_link(d, channel);
+    return LinkTail{nullptr, 0, link.state, link.peer_state + 1, link.peer_inbox, link.inbox, uint32_t(link.capacity), 0,
+                    d.await_timeout, nullptr};
+}
+inline PartRead part_read(Device& d, int channel) {
+    PartLink& link = part_link(d, channel);
+    return PartRead{link.inbox, link.state, link.peer_state + 4, uint32_t(link.capacity), d.await_timeout};
+}
+
+// A part's columns [first, first + count) of `rows` rows (`stride` floats apart) into the other's
+// inbox at their places, then its flag raised (after the kernels forming the part, when they could
+// not send it themselves): link_copy_kernel and link_signal_kernel's steps without the wait.
+__global__ void part_copy_kernel(const float* part, size_t rows, size_t stride, size_t first, size_t count, float* peer_inbox,
+                                 const uint32_t* state, size_t capacity) {
+    float* slot = peer_inbox + size_t((state[0] + 1) & 1) * capacity;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < rows * count; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t at = (i / count) * stride + first + i % count;
+        link_send(slot + at, part[at]);
+    }
+}
+__global__ void part_signal_kernel(uint32_t* state, uint32_t* peer_flag) {
+    const uint32_t sent = state[0] + 1;
+    state[0] = sent;
+    __threadfence_system();
+    peer_store(peer_flag, sent);
+}
+inline void part_send(Device& d, int channel, const float* part, size_t rows, size_t stride, size_t first, size_t count) {
+    const LinkTail tail = part_send_tail(d, channel);
+    if (!rows || !count || (rows - 1) * stride + first + count > tail.capacity) throw std::runtime_error("a part exceeds its inbox");
+    const unsigned blocks = unsigned(std::min<size_t>((rows * count + 255) / 256, 1024));
+    part_copy_kernel<<<blocks, 256, 0, d.stream>>>(part, rows, stride, first, count, tail.peer_inbox, tail.state, tail.capacity);
+    check(hipGetLastError());
+    part_signal_kernel<<<1, 1, 0, d.stream>>>(tail.state, tail.peer_flag);
+    check(hipGetLastError());
 }

@@ -82,25 +82,30 @@ __global__ void link_sum_kernel(const float* part, size_t count, uint32_t* state
 }
 #endif
 
+// Peer access both ways between two devices (once; an error without it).
+static void link_peers(Device& a, Device& b) {
+    int ab = 0, ba = 0;
+    check(hipDeviceCanAccessPeer(&ab, a.ordinal, b.ordinal));
+    check(hipDeviceCanAccessPeer(&ba, b.ordinal, a.ordinal));
+    if (!ab || !ba) throw std::runtime_error("Straydog tensor-parallel sums need peer access between the GPUs");
+    auto enable = [](int from, int to) {
+        on_device(from, [&]() {
+            const hipError_t state = hipDeviceEnablePeerAccess(to, 0);
+            if (state == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
+            else check(state);
+        });
+    };
+    enable(a.ordinal, b.ordinal);
+    enable(b.ordinal, a.ordinal);
+}
+
 int sd_link_sums(void* first, void* second, uint64_t capacity) {
     try {
         Device& a = device(first);
         Device& b = device(second);
         if (&a == &b || a.sums.peer || b.sums.peer || !capacity || capacity > (uint64_t(1) << 26))
             throw std::runtime_error("invalid Straydog sum link");
-        int ab = 0, ba = 0;
-        check(hipDeviceCanAccessPeer(&ab, a.ordinal, b.ordinal));
-        check(hipDeviceCanAccessPeer(&ba, b.ordinal, a.ordinal));
-        if (!ab || !ba) throw std::runtime_error("Straydog tensor-parallel sums need peer access between the GPUs");
-        auto enable = [](int from, int to) {
-            on_device(from, [&]() {
-                const hipError_t state = hipDeviceEnablePeerAccess(to, 0);
-                if (state == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
-                else check(state);
-            });
-        };
-        enable(a.ordinal, b.ordinal);
-        enable(b.ordinal, a.ordinal);
+        link_peers(a, b);
         for (Device* side : {&a, &b}) {
             on_device(side->ordinal, [&]() {
                 side->sums.inbox = static_cast<float*>(allocate(*side, capacity * 2 * 4));
@@ -240,4 +245,134 @@ int sd_op_experts_table_link_sum(void* handle, const uint64_t* table, uint64_t c
         if (sd_op_link_sum(handle, part, hidden, out, 1)) throw std::runtime_error(last_error);
     }
     SD_OP_END
+}
+
+// ---- Part links (link_tail.hpp): a decode sum's parts sent as they form, added as they are read ----
+
+int sd_link_parts(void* first, void* second, uint64_t capacity) {
+    try {
+        Device& a = device(first);
+        Device& b = device(second);
+        if (&a == &b || a.part_peer || b.part_peer || !capacity || capacity > (uint64_t(1) << 26))
+            throw std::runtime_error("invalid Straydog part link");
+        link_peers(a, b);
+        for (Device* side : {&a, &b}) {
+            on_device(side->ordinal, [&]() {
+                for (PartLink& link : side->part_links) {
+                    link.inbox = static_cast<float*>(allocate(*side, capacity * 2 * 4));
+                    link.state = static_cast<uint32_t*>(allocate(*side, 256));
+                    // (on the device's stream: no legacy-stream ordering against other work on the device)
+                    check(hipMemsetAsync(link.inbox, 0, capacity * 2 * 4, side->stream));
+                    check(hipMemsetAsync(link.state, 0, 256, side->stream));
+                    link.capacity = size_t(capacity);
+                }
+                check(hipStreamSynchronize(side->stream));
+            });
+        }
+        a.part_peer = &b; b.part_peer = &a;
+        for (size_t channel = 0; channel < sizeof(a.part_links) / sizeof(a.part_links[0]); ++channel) {
+            a.part_links[channel].peer_inbox = b.part_links[channel].inbox;
+            b.part_links[channel].peer_inbox = a.part_links[channel].inbox;
+            a.part_links[channel].peer_state = b.part_links[channel].state;
+            b.part_links[channel].peer_state = a.part_links[channel].state;
+        }
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_linear_send(void* handle, int channel, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* input,
+                      uint64_t steps, float* output) {
+    SD_OP_BEGIN
+    const LinkTail tail = part_send_tail(value, channel);
+    if (!rows || !cols || cols > (uint64_t(1) << 24) || !steps || steps > uint64_t(gemv_max_vectors) || steps * rows > tail.capacity)
+        throw std::runtime_error("invalid Straydog sent linear");
+    const size_t row_bytes = matrix_row_bytes(kind, cols);
+    op_span(value, weights, checked_product({rows, row_bytes}), "a weight matrix");
+    op_span(value, input, checked_floats({steps, cols}), "a linear input");
+    op_span(value, output, checked_floats({steps, rows}), "a sum's part");
+    const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
+    // (several vectors: their GEMV, then the part sent in one copy; each value stored on its own across the bus cost
+    // more than the sum it saves)
+    if (steps != 1 || !gemv_linked_launch(value, matrix, input, output, tail, op_lanes)) {
+        op_linear(value, static_cast<const uint8_t*>(weights), kind, size_t(rows), size_t(cols), 0, input, size_t(cols), size_t(steps),
+                  output, size_t(rows), nullptr, 0);
+        part_send(value, channel, output, size_t(steps), size_t(rows), 0, size_t(rows));
+    }
+    SD_OP_END
+}
+
+int sd_op_part_send(void* handle, int channel, const float* part, uint64_t rows, uint64_t stride, uint64_t first, uint64_t count) {
+    SD_OP_BEGIN
+    if (!rows || !count || rows > (uint64_t(1) << 24) || stride > (uint64_t(1) << 26) || first + count > stride)
+        throw std::runtime_error("invalid Straydog part send");
+    op_span(value, part, checked_floats({rows - 1, stride}) + size_t(first + count) * 4, "a sum's part");
+    part_send(value, channel, part, size_t(rows), size_t(stride), size_t(first), size_t(count));
+    SD_OP_END
+}
+
+// out = this device's part + the other's, as part_wait's consumers add them (for one that is no
+// hyper-connection step).
+__global__ void part_receive_kernel(const float* part, size_t count, PartRead link, float* out) {
+    __shared__ uint32_t n;
+    if (!threadIdx.x) n = part_wait(link);
+    __syncthreads();
+    const float* theirs = link.inbox + size_t(n & 1) * link.capacity;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x)
+        out[i] = part[i] + link_load(theirs + i);
+    __syncthreads();
+    if (!threadIdx.x) part_read_done(link, n);
+}
+
+int sd_op_part_receive(void* handle, int channel, const float* part, uint64_t count, float* out) {
+    SD_OP_BEGIN
+    const PartRead link = part_read(value, channel);
+    if (!count || count > link.capacity) throw std::runtime_error("invalid Straydog part receive");
+    op_span(value, part, size_t(count) * 4, "a sum's part");
+    op_span(value, out, size_t(count) * 4, "a sum");
+    part_receive_kernel<<<unsigned(std::min<size_t>((size_t(count) + 255) / 256, 80)), 256, 0, value.stream>>>(part, size_t(count),
+                                                                                                                 link, out);
+    SD_OP_END
+}
+
+__global__ void part_status_kernel(const uint32_t* first, const uint32_t* second, uint32_t* out) {
+    *out = (first[2] ? 1u : 0u) | (second[2] ? 2u : 0u);
+}
+
+int sd_op_part_status(void* handle, uint32_t* out) {
+    SD_OP_BEGIN
+    if (!value.part_peer) throw std::runtime_error("no Straydog part link");
+    op_span(value, out, 4, "a link status");
+    part_status_kernel<<<1, 1, 0, value.stream>>>(value.part_links[0].state, value.part_links[1].state, out);
+    SD_OP_END
+}
+
+int sd_part_failed(void* handle) {
+    try {
+        Device& value = device(handle);
+        if (!value.part_peer) return 0;
+        check(hipStreamSynchronize(value.stream));
+        int failed = 0;
+        for (PartLink& link : value.part_links) {
+            uint32_t state[3] = {};
+            check(hipMemcpy(state, link.state, sizeof(state), hipMemcpyDeviceToHost));
+            failed |= state[2] != 0;
+        }
+        return failed;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_part_reset(void* handle) {
+    try {
+        Device& value = device(handle);
+        Device* peer = value.part_peer;
+        if (!peer) return 0;
+        // Both streams idle (a wait gives up within the await timeout), then every count from zero.
+        for (Device* side : {&value, peer}) on_device(side->ordinal, [&]() { check(hipStreamSynchronize(side->stream)); });
+        for (Device* side : {&value, peer})
+            on_device(side->ordinal, [&]() {
+                for (PartLink& link : side->part_links) check(hipMemsetAsync(link.state, 0, 256, side->stream));
+                check(hipStreamSynchronize(side->stream));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

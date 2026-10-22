@@ -456,7 +456,8 @@ __global__ void slot_down_linked(SlotExperts plan, const uint64_t* bases, const 
 // rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
 // of different formats, takes the reference decoder a row per wave.
 // With a tail (one row, both stages), out is this device's part of its linked sum, the down stage's
-// kernel adding the parts; false (nothing launched) when the down rows take the reference decoder.
+// kernel adding the parts (a tail that only sends: any rows, with the down stage); false (nothing
+// launched) when the down rows take the reference decoder.
 bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases, size_t tokens, const float* input,
                   size_t input_stride, const float* weights, float* product, float* out, size_t out_stride,
                   const LinkTail* tail = nullptr) {
@@ -479,7 +480,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
     plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
     plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
-    if (tail && (down_kind < 0 || stages != 3 || tokens != 1)) return false;
+    if (tail && (down_kind < 0 || !(stages & 2) || (tail->out && (stages != 3 || tokens != 1)))) return false;
     const dim3 first(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
     const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));
     #define SD_SLOT_GATE(format) case format: \

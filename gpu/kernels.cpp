@@ -358,6 +358,16 @@ struct SumLink {
     size_t capacity = 0;
     uint64_t skew = 0;   // sd_link_skew's, in clock ticks
 };
+// A channel of two devices' part link (device_link.hpp: sd_link_parts, link_tail.hpp): this
+// device's inbox (two slots of `capacity` floats, which the other writes; zero where it never
+// does) and state, both in its own VRAM, and the other's as this device writes them.
+struct PartLink {
+    float* inbox = nullptr;
+    float* peer_inbox = nullptr;
+    uint32_t* state = nullptr;
+    uint32_t* peer_state = nullptr;
+    size_t capacity = 0;
+};
 // This device's side of a two-GPU link: an inbox the peer writes rows
 // into, a flag the peer raises per message, and this device's message counters.
 struct PeerLink {
@@ -398,6 +408,8 @@ struct Device {
     hipStream_t helper_stream = nullptr;
     PeerLink link;
     SumLink sums;
+    Device* part_peer = nullptr;
+    PartLink part_links[2];
     std::unordered_map<size_t, void*> helper_moe;   // layer -> this device's expert part, when it helps the owner
     uint8_t* io = nullptr;   // page-locked staging for caller-memory transfers (host_io.hpp)
     size_t io_used = 0;
@@ -2471,13 +2483,16 @@ int sd_op_hc_expand(void* handle, const float* x, const float* residual, const f
     SD_OP_END
 }
 
-int sd_op_hc_step(void* handle, const float* x, const float* residual, const float* post_in, const float* comb_in, float* stream,
-                  const float* fn, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps,
-                  const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width, float* workspace,
-                  uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out) {
+// sd_op_hc_step; with `channel` (0 or 1, else -1), x is this device's part of a part link's sum.
+static int hc_step_op(void* handle, int channel, const float* x, const float* residual, const float* post_in, const float* comb_in,
+                      float* stream, const float* fn, const float* base, const float* scale, uint64_t iterations, float eps,
+                      float norm_eps, const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width,
+                      float* workspace, uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out) {
     SD_OP_BEGIN
-    if (!rows || rows > 65535 || !hc || hc > 8 || !width || (x && stream == residual))
+    if (!rows || rows > 65535 || !hc || hc > 8 || !width || (x && stream == residual) || (channel >= 0 && !x))
         throw std::runtime_error("invalid Straydog hyper-connection step");
+    const PartRead link = channel >= 0 ? part_read(value, channel) : PartRead{};
+    if (channel >= 0 && rows * width > link.capacity) throw std::runtime_error("a linked hyper-connection step exceeds its inbox");
     const size_t mix = size_t((2 + hc) * hc), flat = size_t(rows * hc * width);
     op_span(value, stream, flat * 4, "a stream");
     if (x) {
@@ -2505,10 +2520,31 @@ int sd_op_hc_step(void* handle, const float* x, const float* residual, const flo
     const dim3 grid(unsigned((width + hc_step_columns - 1) / hc_step_columns), unsigned(rows));
     #define SD_HC_STEP(n) case n: op_hc_step_kernel<n><<<grid, hc_step_threads, 0, value.stream>>>(x, residual, post_in, comb_in, stream, fn, \
         base, scale, size_t(iterations), eps, norm_eps, collapse, norm_weight, size_t(width), counters, workspace + capacity, pre, \
-        post, comb, out); break;
+        post, comb, out, link); break;
     switch (hc) { SD_HC_STEP(1) SD_HC_STEP(2) SD_HC_STEP(3) SD_HC_STEP(4) SD_HC_STEP(5) SD_HC_STEP(6) SD_HC_STEP(7) SD_HC_STEP(8) }
     #undef SD_HC_STEP
     SD_OP_END
+}
+
+int sd_op_hc_step(void* handle, const float* x, const float* residual, const float* post_in, const float* comb_in, float* stream,
+                  const float* fn, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps,
+                  const float* collapse, const float* norm_weight, uint64_t rows, uint64_t hc, uint64_t width, float* workspace,
+                  uint64_t workspace_bytes, float* pre, float* post, float* comb, float* out) {
+    return hc_step_op(handle, -1, x, residual, post_in, comb_in, stream, fn, base, scale, iterations, eps, norm_eps, collapse,
+                      norm_weight, rows, hc, width, workspace, workspace_bytes, pre, post, comb, out);
+}
+
+int sd_op_hc_step_linked(void* handle, int channel, const float* part, const float* residual, const float* post_in,
+                         const float* comb_in, float* stream, const float* fn, const float* base, const float* scale,
+                         uint64_t iterations, float eps, float norm_eps, const float* collapse, const float* norm_weight, uint64_t rows,
+                         uint64_t hc, uint64_t width, float* workspace, uint64_t workspace_bytes, float* pre, float* post, float* comb,
+                         float* out) {
+    if (channel < 0) {
+        last_error = "invalid Straydog part link channel";
+        return -1;
+    }
+    return hc_step_op(handle, channel, part, residual, post_in, comb_in, stream, fn, base, scale, iterations, eps, norm_eps, collapse,
+                      norm_weight, rows, hc, width, workspace, workspace_bytes, pre, post, comb, out);
 }
 
 int sd_op_engram_gate(void* handle, float* stream, const float* kv, const float* weight, uint64_t rows, uint64_t hc,
@@ -2889,8 +2925,11 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     if (!offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 ||
         rows * top_k > slot_route_capacity || input_stride < hidden || out_stride < hidden || !(clamp >= 0.0f) ||
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
-        part.hidden_first > hidden - part.hidden_rows)
+        part.hidden_first > hidden - part.hidden_rows || (part.send && !(part.stages & 2)))
         throw std::runtime_error("invalid Straydog experts shape");
+    // (sending: the down stage's rows of out also go to the other device, its flag raised after them)
+    const LinkTail tail = part.send ? part_send_tail(value, part.send - 1) : LinkTail{};
+    if (part.send && (rows - 1) * out_stride + hidden > tail.capacity) throw std::runtime_error("an experts part exceeds its inbox");
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, part);
     const size_t routes = size_t(rows * top_k);
     if (!bases && (value.inline_routes_count ? value.inline_routes_count : value.slot_routes_count) != routes)
@@ -2933,8 +2972,13 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         std::copy(value.inline_routes, value.inline_routes + value.inline_routes_count, plan.inline_bases);
         plan.inline_count = uint32_t(value.inline_routes_count);
     }
-    slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
-                 size_t(out_stride));
+    if (!part.send || !slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights,
+                                    product, out, size_t(out_stride), &tail)) {
+        slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
+                     size_t(out_stride));
+        if (part.send)
+            part_send(value, part.send - 1, out, size_t(rows), size_t(out_stride), size_t(part.hidden_first), size_t(part.hidden_rows));
+    }
     SD_OP_END
 }
 

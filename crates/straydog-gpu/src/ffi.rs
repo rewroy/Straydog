@@ -633,6 +633,7 @@ pub struct sd_expert_split {
     pub hidden_first: u64,
     pub hidden_rows: u64,
     pub stages: ::std::os::raw::c_int,
+    pub send: ::std::os::raw::c_int,
 }
 unsafe extern "C" {
     pub fn sd_op_experts(
@@ -966,6 +967,86 @@ unsafe extern "C" {
         handle: *mut ::std::os::raw::c_void,
         microseconds: u64,
     ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_link_parts(
+        first: *mut ::std::os::raw::c_void,
+        second: *mut ::std::os::raw::c_void,
+        capacity: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_linear_send(
+        handle: *mut ::std::os::raw::c_void,
+        channel: ::std::os::raw::c_int,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        input: *const f32,
+        steps: u64,
+        output: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_hc_step_linked(
+        handle: *mut ::std::os::raw::c_void,
+        channel: ::std::os::raw::c_int,
+        part: *const f32,
+        residual: *const f32,
+        post_in: *const f32,
+        comb_in: *const f32,
+        stream: *mut f32,
+        fn_: *const f32,
+        base: *const f32,
+        scale: *const f32,
+        iterations: u64,
+        eps: f32,
+        norm_eps: f32,
+        collapse: *const f32,
+        norm_weight: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        workspace: *mut f32,
+        workspace_bytes: u64,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_part_send(
+        handle: *mut ::std::os::raw::c_void,
+        channel: ::std::os::raw::c_int,
+        part: *const f32,
+        rows: u64,
+        stride: u64,
+        first: u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_part_receive(
+        handle: *mut ::std::os::raw::c_void,
+        channel: ::std::os::raw::c_int,
+        part: *const f32,
+        count: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_part_status(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_part_failed(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_part_reset(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_moe_group_bytes() -> u64;

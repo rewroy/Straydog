@@ -106,9 +106,19 @@ impl Rows {
 
     fn split(&self, stages: i32) -> ops::ExpertSplit {
         ops::ExpertSplit { ffn_first: self.ffn.0 as u64, ffn_rows: self.ffn.1 as u64, hidden_first: self.hidden.0 as u64,
-                           hidden_rows: self.hidden.1 as u64, stages }
+                           hidden_rows: self.hidden.1 as u64, stages, send: 0 }
+    }
+
+    /// [`Rows::split`] whose down stage completes this device's part of a part link's sum on
+    /// `channel`, sending it.
+    fn sending(&self, stages: i32, channel: u32) -> ops::ExpertSplit {
+        ops::ExpertSplit { send: channel as i32 + 1, ..self.split(stages) }
     }
 }
+
+/// The part links' channels (see `Engine::linked`): the attention's output, the experts'.
+const ATTENTION: u32 = 0;
+const EXPERTS: u32 = 1;
 
 /// A kv source layer's compressed rows so far (one per group of `ratio` positions), and the rows
 /// of its current incomplete group (`tail`).
@@ -358,6 +368,15 @@ pub struct Engine<'a, T: Tensors> {
     /// A pass of a few rows has the first device's router publish its routes to page-locked host
     /// memory, for the host to take without a readback (DS41_ROUTE_READBACK: read them back).
     mailbox: bool,
+    /// On two devices, a decode pass (one row) sums the parts of the attention's and the experts'
+    /// outputs over part links: the kernels forming them send them to the other device, and the
+    /// hyper-connection step after them adds the two as it reads them, in place of a sum's launch
+    /// and its waits (DS41_LINK=0: a sum's launch).
+    linked: bool,
+    /// The running pass uses the part links.
+    link_pass: bool,
+    /// A pass using the part links did not complete: the next starts their counts over.
+    link_dirty: bool,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
     /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
@@ -481,7 +500,8 @@ impl Shard {
             all_rows: floats(&mut gpu, b)?,
             engram_rows: floats(&mut gpu, b * hp.engram_columns() * hp.engram.as_ref().map_or(1, |e| e.head_dim))?,
             engram_kv: floats(&mut gpu, b * (hc + 1) * w)?,
-            head: floats(&mut gpu, if range.end == hp.layers.len() { VERIFY_ROWS * hp.vocabulary / parts } else { 1 })?,
+            // (and a part link status after the logits)
+            head: floats(&mut gpu, if range.end == hp.layers.len() { VERIFY_ROWS * hp.vocabulary / parts + 1 } else { 1 })?,
             hc_workspace: floats(&mut gpu, b * w.div_ceil(64) * ((2 + hc) * hc + 2) + b)?,
             products: [floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?, floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?],
             product: floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?,
@@ -582,6 +602,13 @@ impl Shard {
                         &scratch)
     }
 
+    /// [`Shard::linear`] of a row into this device's part of a part link's sum on `channel`, sent as
+    /// it forms.
+    fn linear_send(&mut self, channel: u32, name: &str, input: P, steps: usize, out: M) -> Result<()> {
+        let weight = self.dense(name)?;
+        self.gpu.linear_send(channel, &weight.buffer, weight.kind, weight.dims[1] as u64, weight.dims[0] as u64, input, steps as u64, out)
+    }
+
     fn norm(&mut self, name: &str, x: M, rows: usize, width: usize, eps: f32) -> Result<()> {
         let weight = self.dense(name)?;
         self.gpu.rms_norm(x, &weight.buffer, rows as u64, width as u64, eps, x)
@@ -639,6 +666,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         let decoder = hp.layers.iter().enumerate().filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer).map(|_| layer))
             .max().filter(|_| std::env::var_os("DS41_FULL_DECODER").is_none());
+        let linked = shards.len() == 2 && std::env::var("DS41_LINK").map_or(true, |value| value != "0");
+        if let [first, second] = &mut shards[..] {
+            if linked {
+                Backend::link_parts(&mut first.gpu, &mut second.gpu, hp.width as u64)?;
+            }
+        }
         let mut engine = Engine {
             ring: hp.window + settings.batch,
             decoder,
@@ -656,6 +689,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
             gate_up_first: std::env::var("DS41_GATE_UP_FIRST").map_or(true, |value| value != "0"),
             mailbox: std::env::var_os("DS41_ROUTE_READBACK").is_none(),
+            linked,
+            link_pass: false,
+            link_dirty: false,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
         };
@@ -976,6 +1012,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (hc, w) = (hp.hc, hp.width);
         let range = self.settings.layers.clone();
         self.outputs = outputs;
+        // (a pass of several rows sums with a kernel: its parts' values, stored one by one into the
+        // other's inbox as they form, cost more than the sum's launch saves)
+        self.link_pass = self.linked && n == 1;
+        if self.link_pass && std::mem::replace(&mut self.link_dirty, true) {
+            self.shards[0].gpu.part_reset()?;
+        }
         if let Some((since, _)) = self.profile.as_mut() {
             // another engine's pass ran since this one's last mark
             *since = std::time::Instant::now();
@@ -1033,8 +1075,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let first = self.rows_of(last_layer, n).2;
             for shard in &mut self.shards {
                 let work = shard.work.view(first);
+                if self.link_pass {
+                    shard.gpu.part_receive(EXPERTS, work.parts[1].base() as P, ((n - first) * w) as u64, work.out.base())?;
+                }
                 shard.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), (n - first) as u64,
                                     hc as u64, w as u64, work.stream.base())?;
+            }
+            if self.link_pass {
+                for shard in &mut self.shards {
+                    if shard.gpu.part_failed()? {
+                        return Err("a DeepSeek-V4.1 part link's wait gave up: the pass is void".into());
+                    }
+                }
             }
             None
         } else {
@@ -1042,27 +1094,45 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // each device has its rows of the head.
             let (first, part_rows) = (n - outputs, hp.vocabulary / self.shards.len());
             let mut logits = vec![0f32; outputs * hp.vocabulary];
+            let link = self.link_pass;
             for shard in &mut self.shards {
                 let work = shard.work.clone();
                 let pre = work.pre_f[last_layer % 2];
                 let norm = shard.dense("output_norm.weight")?;
-                let expand = (work.out.at(first * w) as P, work.stream2.at(first * hc * w) as P, work.post_f.at(first * hc) as P,
+                let x = if link { work.parts[1] } else { work.out };
+                let expand = (x.at(first * w) as P, work.stream2.at(first * hc * w) as P, work.post_f.at(first * hc) as P,
                               work.comb_f.at(first * hc * hc) as P);
                 shard.gpu.hc_step(Some(expand), work.stream.at(first * hc * w), None, 0, 0.0, hp.norm_eps, pre.at(first * hc),
-                                  norm.buffer.base(), outputs as u64, hc as u64, w as u64, &work.hc_workspace, work.x.base())?;
+                                  norm.buffer.base(), outputs as u64, hc as u64, w as u64, &work.hc_workspace, work.x.base(),
+                                  link.then_some(EXPERTS))?;
                 shard.linear("output.weight", work.x.base(), outputs, work.head.base())?;
+                if link {
+                    // read with the logits, after them
+                    shard.gpu.part_status(work.head.at(outputs * part_rows))?;
+                }
             }
+            let mut failed = false;
+            let mut rows = vec![0f32; outputs * part_rows + 1];
             for (part, shard) in self.shards.iter_mut().enumerate() {
                 let head = shard.work.head;
+                let read = outputs * part_rows + usize::from(link);
+                shard.gpu.read_buffer(&head, 0, &mut rows[..read])?;
                 for row in 0..outputs {
                     let at = row * hp.vocabulary + part * part_rows;
-                    shard.gpu.read_buffer(&head, row * part_rows, &mut logits[at..at + part_rows])?;
+                    logits[at..at + part_rows].copy_from_slice(&rows[row * part_rows..(row + 1) * part_rows]);
                 }
+                failed |= link && rows[outputs * part_rows].to_bits() != 0;
+            }
+            if failed {
+                return Err("a DeepSeek-V4.1 part link's wait gave up: the pass is void".into());
             }
             self.mark("head")?;
             Some(logits)
         };
         self.verify_slot_checks()?;
+        if self.link_pass {
+            self.link_dirty = false;
+        }
         self.history.extend_from_slice(tokens);
         self.position += n;
         self.rewind = rewind;
@@ -1210,6 +1280,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // A pass that can be taken back keeps its compressor rows (its one batch); of one token it
         // needs none (Engine::rewind).
         let saves = n > 1 && self.rewindable(n);
+        // (its rows all in one batch, from the first: rows_of)
+        let link = self.link_pass;
         // The Engram rows of every token, before the layer (each batch takes its own).
         let engram = match plan.engram {
             Some(module) => Some(self.engram_rows(module, tokens)?),
@@ -1225,6 +1297,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 for shard in &mut self.shards {
                     let work = shard.work.view(first);
                     if expanding {
+                        if link {
+                            shard.gpu.part_receive(EXPERTS, work.parts[1].base() as P, rows * w, work.out.base())?;
+                        }
                         shard.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), rows, hc, w,
                                             work.stream.base())?;
                     }
@@ -1236,7 +1311,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 self.mark("engram")?;
             }
             let attention = self.attention_plan(layer, first, end, kv_from, full_from, saves);
-            let key = |segment: u64| (layer as u64) << 8 | segment << 4 | u64::from(expand) << 1 | u64::from(attention.groups > 0);
+            let key = |segment: u64| {
+                (layer as u64) << 8 | u64::from(link) << 5 | segment << 4 | u64::from(expand) << 1 | u64::from(attention.groups > 0)
+            };
             // the rows of the batch that attend, from this row
             let attending = first + attention.full_from;
             for index in 0..self.shards.len() {
@@ -1244,18 +1321,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 let shard = &mut self.shards[index];
                 if record && fixed {
                     recorded(shard, key(0), |shard| {
-                        hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous)?;
-                        attention_ops(shard, &work, &hp, &attention, target)
+                        hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
+                        attention_ops(shard, &work, &hp, &attention, target, link)
                     })?;
                 } else {
-                    hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous)?;
+                    hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
                 }
             }
             if !(record && fixed) {
                 self.mark("hyper-connections")?;
                 for index in 0..self.shards.len() {
                     let (work, target) = (self.shards[index].work.view(first), self.target(&self.shards[index].work.view(attending), 0));
-                    attention_ops(&mut self.shards[index], &work, &hp, &attention, target)?;
+                    attention_ops(&mut self.shards[index], &work, &hp, &attention, target, link)?;
                 }
             }
             if let Some((ratio, tail, _)) = attention.appended {
@@ -1267,7 +1344,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 continue;
             }
             let attended = end - attending;
-            self.sum_parts(0, attending, attended)?;
+            if !link {
+                self.sum_parts(0, attending, attended)?;
+            }
             self.mark("attention")?;
             // (the flag is lowered before the router is queued: it may run at once)
             let publish = self.publishes(layer, n, predict);
@@ -1280,11 +1359,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 let work = shard.work.view(attending);
                 if record {
                     recorded(shard, key(1) | u64::from(predict) << 2 | u64::from(publish) << 3, |shard| {
-                        hc_ffn(shard, &work, &hp, layer, attended)?;
+                        hc_ffn(shard, &work, &hp, layer, attended, link)?;
                         router_ops(shard, &work, &hp, layer, attended, predict, publish)
                     })?;
                 } else {
-                    hc_ffn(shard, &work, &hp, layer, attended)?;
+                    hc_ffn(shard, &work, &hp, layer, attended, link)?;
                 }
             }
             if !record {
@@ -1298,7 +1377,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         if full_from < n {
             self.moe(layer, full_from, n, predict)?;
-            self.sum_parts(1, full_from, n - full_from)?;
+            if !link {
+                self.sum_parts(1, full_from, n - full_from)?;
+            }
         }
         Ok(())
     }
@@ -1520,9 +1601,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                       work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
                 }
                 shard.experts.await_rest(&mut shard.gpu)?;
+                // (the last wave completes the device's part of the output: sent over the part link)
+                let split = if self.link_pass && index + 1 == waves.len() { shard.rows.sending(2, EXPERTS) } else { shard.rows.split(2) };
                 shard.gpu.experts(None, slots[0].bytes, [0, gate_bytes, 2 * gate_bytes], kinds, w, ff, rows as u64, k as u64,
                                   work.x.base(), 0, None, hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(),
-                                  0, Some(shard.rows.split(2)))?;
+                                  0, Some(split))?;
                 check_slots(shard, layer, wave, slots, expert_bytes, true)?;
                 shard.experts.release(&mut shard.gpu)?;
             }
@@ -1595,8 +1678,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               rows as u64, 1, work.x.base(), 0, None, hp.layers[layer].clamp_shared, false,
                               work.product.at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
             shard.experts.await_rest(&mut shard.gpu)?;
+            let split = if self.link_pass { shard.rows.sending(2, EXPERTS) } else { shard.rows.split(2) };
             shard.gpu.experts(Some(both), *slot_bytes, offsets, kinds, w, ff, rows as u64, k as u64, work.x.base(), 0, None,
-                              hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(shard.rows.split(2)))?;
+                              hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(split))?;
             check_slots(shard, layer, hits, held, expert_bytes, true)?;
             check_slots(shard, layer, misses, filled, expert_bytes, true)?;
             shard.experts.release(&mut shard.gpu)?;
@@ -1760,32 +1844,39 @@ fn sublayer(shard: &Shard, layer: usize, side: &str, norm: &str) -> Result<(Dens
 }
 
 /// The hyper-connection step into a layer's attention; with `expand`, the previous layer's FFN
-/// output (in `out`) is expanded into `stream` on the way in.
-fn hc_attention(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, expand: bool, pre_previous: Option<usize>)
-                -> Result<()> {
+/// output (in `out`, or with `link` the sum of the devices' parts over the part link) is expanded
+/// into `stream` on the way in.
+#[allow(clippy::too_many_arguments)]
+fn hc_attention(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, expand: bool, pre_previous: Option<usize>,
+                link: bool) -> Result<()> {
     let (fn_, base, scale, norm) = sublayer(shard, layer, "attn", "attn_norm")?;
     let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
-    let expansion = expand.then(|| (work.out.base() as P, work.stream2.base() as P, work.post_f.base() as P, work.comb_f.base() as P));
+    let x = if link { work.parts[1] } else { work.out };
+    let expansion = expand.then(|| (x.base() as P, work.stream2.base() as P, work.post_f.base() as P, work.comb_f.base() as P));
     shard.gpu.hc_step(expansion, work.stream.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(), work.pre_a.base(),
                       work.post_a.base(), work.comb_a.base())), hp.sinkhorn_iterations as u64, hp.hc_eps, hp.norm_eps, pre.base(),
-                      norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace, work.x.base())
+                      norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace, work.x.base(),
+                      (link && expand).then_some(EXPERTS))
 }
 
-/// The hyper-connection step from a layer's attention (in `out`) into its FFN.
-fn hc_ffn(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize) -> Result<()> {
+/// The hyper-connection step from a layer's attention (in `out`, or with `link` the sum of the
+/// devices' parts over the part link) into its FFN.
+fn hc_ffn(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, link: bool) -> Result<()> {
     let (fn_, base, scale, norm) = sublayer(shard, layer, "ffn", "ffn_norm")?;
-    let expansion = (work.out.base() as P, work.stream.base() as P, work.post_a.base() as P, work.comb_a.base() as P);
+    let x = if link { work.parts[0] } else { work.out };
+    let expansion = (x.base() as P, work.stream.base() as P, work.post_a.base() as P, work.comb_a.base() as P);
     shard.gpu.hc_step(Some(expansion), work.stream2.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
                       work.pre_f[layer % 2].base(), work.post_f.base(), work.comb_f.base())), hp.sinkhorn_iterations as u64, hp.hc_eps,
                       hp.norm_eps, work.pre_a.base(), norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace,
-                      work.x.base())
+                      work.x.base(), link.then_some(ATTENTION))
 }
 
 /// A device's attention of a batch of rows (`work` a view from its first): q_a, kv, the compressed
 /// rows and the indexer (as every device), and its heads of q, the attention, wo_a and wo_b into
-/// `target` (from the first row that attends). Rows before `kv_from` are only compressed, rows
-/// before `full_from` only append their K/V (see [`AttentionPlan`]).
-fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionPlan, target: M) -> Result<()> {
+/// `target` (from the first row that attends; with `link`, this device's part of the part link's
+/// sum, sent). Rows before `kv_from` are only compressed, rows before `full_from` only append their
+/// K/V (see [`AttentionPlan`]).
+fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionPlan, target: M, link: bool) -> Result<()> {
     let layer = plan.layer;
     let (kv_rows, n) = (plan.rows - plan.kv_from, plan.rows - plan.full_from);
     let (heads, dim, rope) = (hp.heads / plan.parts, hp.head_dim, hp.rope_dims as u64);
@@ -1858,6 +1949,9 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         input: work.attended.at(g * group_width) as P, output: work.low.at(g * hp.out_rank),
     }).collect();
     shard.gpu.linears(&projections, n as u64, (heads * dim) as u64, (groups * hp.out_rank) as u64, &scratch)?;
+    if link {
+        return shard.linear_send(ATTENTION, &name(layer, "attn_output_b"), work.low.base(), n, target);
+    }
     shard.linear(&name(layer, "attn_output_b"), work.low.base(), n, target)
 }
 

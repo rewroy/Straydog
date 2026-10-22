@@ -327,20 +327,30 @@ impl Backend {
 
     /// A sublayer boundary in one launch: `expand` = (x, residual, post, comb) expanded into `stream`
     /// (else `stream` is read); `coefficients` = (fn, base, scale, pre, post, comb) from it; and
-    /// `out` = rms_norm(stream collapsed by `collapse`) * `norm_weight`.
+    /// `out` = rms_norm(stream collapsed by `collapse`) * `norm_weight`. With `linked` (a part link's
+    /// channel, [`link_parts`](Self::link_parts)), x is this device's part of the sublayer's output
+    /// and the other device's is added as it is read: the same results as their sum expanded.
     #[allow(clippy::too_many_arguments)]
     pub fn hc_step(&mut self, expand: Option<(P, P, P, P)>, stream: M, coefficients: Option<(P, P, P, M, M, M)>, iterations: u64,
                    eps: f32, norm_eps: f32, collapse: P, norm_weight: P, rows: u64, hc: u64, width: u64, workspace: &Buffer,
-                   out: M) -> Result<()> {
+                   out: M, linked: Option<u32>) -> Result<()> {
         let null = std::ptr::null::<c_void>();
         let (x, residual, post_in, comb_in) = expand.unwrap_or((null, null, null, null));
         let mut_null = std::ptr::null_mut::<c_void>();
         let (fn_, base, scale, pre, post, comb) = coefficients.unwrap_or((null, null, null, mut_null, mut_null, mut_null));
         // SAFETY: a live handle; the library checks every range against its allocations.
         check(unsafe {
-            ffi::sd_op_hc_step(self.handle(), x.cast(), residual.cast(), post_in.cast(), comb_in.cast(), stream.cast(), fn_.cast(),
-                               base.cast(), scale.cast(), iterations, eps, norm_eps, collapse.cast(), norm_weight.cast(), rows, hc,
-                               width, workspace.pointer.cast(), workspace.bytes, pre.cast(), post.cast(), comb.cast(), out.cast())
+            match linked {
+                Some(channel) => ffi::sd_op_hc_step_linked(self.handle(), channel as i32, x.cast(), residual.cast(), post_in.cast(),
+                                                           comb_in.cast(), stream.cast(), fn_.cast(), base.cast(), scale.cast(), iterations,
+                                                           eps, norm_eps, collapse.cast(), norm_weight.cast(), rows, hc, width,
+                                                           workspace.pointer.cast(), workspace.bytes, pre.cast(), post.cast(), comb.cast(),
+                                                           out.cast()),
+                None => ffi::sd_op_hc_step(self.handle(), x.cast(), residual.cast(), post_in.cast(), comb_in.cast(), stream.cast(),
+                                           fn_.cast(), base.cast(), scale.cast(), iterations, eps, norm_eps, collapse.cast(),
+                                           norm_weight.cast(), rows, hc, width, workspace.pointer.cast(), workspace.bytes, pre.cast(),
+                                           post.cast(), comb.cast(), out.cast()),
+            }
         })
     }
 
@@ -592,6 +602,61 @@ impl Backend {
         let state = unsafe { ffi::sd_link_failed(self.handle()) };
         check(state.min(0))?;
         Ok(state == 1)
+    }
+
+    /// Join two devices with part links: sums whose producers send this device's part as they form
+    /// it ([`linear_send`](Self::linear_send), [`experts`](Self::experts) with a split's `send`) and
+    /// whose consumers add the other's as they read it ([`hc_step`](Self::hc_step) linked,
+    /// [`part_receive`](Self::part_receive)); two channels, inboxes of `capacity` floats.
+    pub fn link_parts(first: &mut Backend, second: &mut Backend, capacity: u64) -> Result<()> {
+        // SAFETY: two live handles.
+        check(unsafe { ffi::sd_link_parts(first.handle(), second.handle(), capacity) })
+    }
+
+    /// [`linear`](Self::linear) of `steps` (at most 4) vectors into `output`, this device's part of
+    /// a part link's sum on `channel`, sent to the other device as it forms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_send(&mut self, channel: u32, weights: &Buffer, kind: u32, rows: u64, cols: u64, input: P, steps: u64, output: M)
+                       -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_linear_send(self.handle(), channel as i32, weights.pointer.cast_const(), kind as i32, rows, cols, input.cast(), steps,
+                                   output.cast())
+        })
+    }
+
+    /// Send this device's part of a part link's sum on `channel`, formed before: columns
+    /// `first..first + count` of `rows` rows `stride` floats apart.
+    pub fn part_send(&mut self, channel: u32, part: P, rows: u64, stride: u64, first: u64, count: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_part_send(self.handle(), channel as i32, part.cast(), rows, stride, first, count) })
+    }
+
+    /// out = this device's part + the other's of a part link's sum on `channel` (`count` floats).
+    pub fn part_receive(&mut self, channel: u32, part: P, count: u64, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_part_receive(self.handle(), channel as i32, part.cast(), count, out.cast()) })
+    }
+
+    /// Queue the part links' failure word into `out` (nonzero after a wait gave up): read with a
+    /// pass's results, it tells whether they are void.
+    pub fn part_status(&mut self, out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_part_status(self.handle(), out.cast()) })
+    }
+
+    /// Whether a part link's wait gave up (waits for the stream; the sums since are void).
+    pub fn part_failed(&mut self) -> Result<bool> {
+        // SAFETY: a live handle.
+        let state = unsafe { ffi::sd_part_failed(self.handle()) };
+        check(state.min(0))?;
+        Ok(state == 1)
+    }
+
+    /// Wait for both part-linked devices' streams and start every count over.
+    pub fn part_reset(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_part_reset(self.handle()) })
     }
 
     /// Development: queue 64 partial sums of the 32-bit words of `bytes` at `data` (each weighted
