@@ -22,11 +22,10 @@ mod common;
 
 use std::ffi::c_void;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
-use straydog_engine::formats;
+use straydog_engine::{formats, storage};
 use straydog_gguf::{ModelHeader, TensorInfo};
 use straydog_gpu::{ffi, Device};
 
@@ -221,7 +220,7 @@ impl Shards {
         let per = tensor.bytes as usize / count;
         let mut data = vec![0u8; per * which.len()];
         for (slot, expert) in which.iter().enumerate() {
-            self.files[file].read_exact_at(&mut data[slot * per..(slot + 1) * per], tensor.offset + (expert * per) as u64)
+            storage::read_at(&self.files[file], tensor.offset + (expert * per) as u64, &mut data[slot * per..(slot + 1) * per])
                 .unwrap();
         }
         (tensor.quant_type, data)
