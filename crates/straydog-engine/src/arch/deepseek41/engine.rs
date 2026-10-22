@@ -106,7 +106,7 @@ impl Rows {
 
     fn split(&self, stages: i32) -> ops::ExpertSplit {
         ops::ExpertSplit { ffn_first: self.ffn.0 as u64, ffn_rows: self.ffn.1 as u64, hidden_first: self.hidden.0 as u64,
-                           hidden_rows: self.hidden.1 as u64, stages, send: 0 }
+                           hidden_rows: self.hidden.1 as u64, stages, send: 0, more: 0, send_at: 0 }
     }
 
     /// [`Rows::split`] whose down stage completes this device's part of a part link's sum on

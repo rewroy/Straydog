@@ -572,7 +572,7 @@ fn decode_step(a: &mut Backend, b: &mut Backend, sides: &[Step; 2], rows: usize,
             .collect();
         let (first, count) = owned(device);
         let split = straydog_engine::ops::ExpertSplit { ffn_first: 0, ffn_rows: DS_FFN as u64, hidden_first: first as u64,
-                                                        hidden_rows: count as u64, stages: 3, send: if link { 2 } else { 0 } };
+                                                        hidden_rows: count as u64, stages: 3, send: if link { 2 } else { 0 }, more: 0, send_at: 0 };
         gpu.experts(Some(&bases), slot, offsets, [8; 3], DS_WIDTH as u64, DS_FFN as u64, rows as u64, DS_TOP_K as u64, s.x.base().cast_const(),
                     0, Some(s.route_weights.base().cast_const()), 0.0, true, s.product.base(), s.parts[1].base(), 0, Some(split)).unwrap();
         if link {
@@ -666,13 +666,84 @@ fn part_link_steps_match_the_device_sums() {
                 .map(|r| s.slots.base() as u64 + ((routes[device] as usize + r * 3) % DS_EXPERTS) as u64 * slot).collect();
             let (first, count) = owned(device);
             let split = straydog_engine::ops::ExpertSplit { ffn_first: 0, ffn_rows: DS_FFN as u64, hidden_first: first as u64,
-                                                            hidden_rows: count as u64, stages: 3, send: 2 };
+                                                            hidden_rows: count as u64, stages: 3, send: 2, more: 0, send_at: 0 };
             gpu.experts(Some(&bases), slot, offsets, [8; 3], DS_WIDTH as u64, DS_FFN as u64, rows as u64, DS_TOP_K as u64,
                         s.x.base().cast_const(), 0, Some(s.route_weights.base().cast_const()), 0.0, true, s.product.base(),
                         s.parts[1].base(), 0, Some(split)).unwrap();
             step_hc(gpu, s, &s.parts[1], rows, Some(1), &s.stream);
         }
         assert!((step_bits(&mut a, &sides[0], rows, true), step_bits(&mut b, &sides[1], rows, true)) == *plain, "graph replay {replay}");
+    }
+    assert!(!a.part_failed().unwrap() && !b.part_failed().unwrap());
+}
+
+/// A decode row's expert activations over a part link: each device's gate and up (its half of the
+/// expert width) of a shared expert and of four routes send their columns as they form them (the
+/// shared expert's row first, at its place, completing nothing; the routes' then complete the sum),
+/// and part_receive's sum is sd_op_sum_devices' to the bit, sum after sum.
+#[test]
+fn activation_parts_match_the_device_sum() {
+    let _gpus = gpus();
+    let Some((mut a, mut b)) = part_pair() else { return };
+    const HIDDEN: usize = 1024;
+    const FFN: usize = 512;
+    const ROUTES: usize = 4;
+    const DOWN_ROWS: usize = 32;
+    let row = HIDDEN / 32 * 34;
+    let slot = (2 * (FFN / 2) * row + DOWN_ROWS * (FFN / 32 * 34)).next_multiple_of(256);
+    let offsets = [0, ((FFN / 2) * row) as u64, (2 * (FFN / 2) * row) as u64];
+    let mut random = Random(0x5151_7a7a_0b0b_3c3c);
+    let common = || Random(0x0123_4567_89ab_cdef);
+    struct Act { slots: Buffer, x: Buffer, weights: Buffer, products: Buffer, out: Buffer, sum: Buffer }
+    let mut sides = Vec::new();
+    for gpu in [&mut a, &mut b] {
+        // five experts (four routed, the shared one last): this device's half of each one's gate and up
+        let mut bytes = Vec::new();
+        for _ in 0..5 {
+            let mut expert = random.q8(FFN, HIDDEN);
+            expert.extend(random.q8(DOWN_ROWS, FFN));
+            expert.resize(slot, 0);
+            bytes.extend(expert);
+        }
+        let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count * 4) as u64).unwrap();
+        sides.push(Act {
+            slots: gpu.upload_bytes(&bytes).unwrap(), x: floats(gpu, HIDDEN), weights: upload(gpu, &common().floats(ROUTES, 0.5)),
+            products: floats(gpu, 5 * FFN), out: floats(gpu, 5 * FFN), sum: floats(gpu, 5 * FFN),
+        });
+    }
+    let split = |device: usize, send: i32, more: i32, send_at: usize| straydog_engine::ops::ExpertSplit {
+        ffn_first: (device * FFN / 2) as u64, ffn_rows: (FFN / 2) as u64, hidden_first: 0, hidden_rows: DOWN_ROWS as u64, stages: 1, send, more,
+        send_at: send_at as u64,
+    };
+    for round in 0..40 {
+        let x = Random(round as u64 * 7919 + 1).floats(HIDDEN, 2.0);
+        for linked in [false, true] {
+            for (device, (gpu, s)) in [(&mut a, &sides[0]), (&mut b, &sides[1])].into_iter().enumerate() {
+                gpu.write_buffer(&s.x, 0, &x).unwrap();
+                let base = s.slots.base() as u64;
+                let shared = [base + 4 * slot as u64];
+                let routes: Vec<u64> = (0..ROUTES).map(|r| base + ((r + round) % 4 * slot) as u64).collect();
+                let (send, more) = if linked { (3, 1) } else { (0, 0) };
+                gpu.experts(Some(&shared), slot as u64, offsets, [8; 3], HIDDEN as u64, FFN as u64, 1, 1, s.x.base().cast_const(), 0, None,
+                            0.0, false, s.products.at(ROUTES * FFN), s.products.base(), 0,
+                            Some(split(device, send, more, if linked { ROUTES * FFN } else { 0 }))).unwrap();
+                gpu.experts(Some(&routes), slot as u64, offsets, [8; 3], HIDDEN as u64, FFN as u64, 1, ROUTES as u64, s.x.base().cast_const(), 0,
+                            Some(s.weights.base().cast_const()), 0.0, true, s.products.base(), s.products.base(), 0,
+                            Some(split(device, send, 0, 0))).unwrap();
+                if linked {
+                    gpu.part_receive(2, s.products.base().cast_const(), (5 * FFN) as u64, s.out.base()).unwrap();
+                }
+            }
+            if !linked {
+                straydog_engine::ops::sum_devices(&[&a, &b], &[sides[0].sum.base(), sides[1].sum.base()],
+                                                  &[sides[0].products.base().cast_const(), sides[1].products.base().cast_const()],
+                                                  (5 * FFN) as u64).unwrap();
+            }
+        }
+        let (expected, got_a, got_b) = (bits(&mut a, &sides[0].sum, 5 * FFN), bits(&mut a, &sides[0].out, 5 * FFN),
+                                        bits(&mut b, &sides[1].out, 5 * FFN));
+        assert_eq!(bits(&mut b, &sides[1].sum, 5 * FFN), expected, "round {round}: the device sums");
+        assert!(got_a == expected && got_b == expected, "round {round}: the linked sums differ from the device sum");
     }
     assert!(!a.part_failed().unwrap() && !b.part_failed().unwrap());
 }

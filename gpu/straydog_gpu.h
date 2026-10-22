@@ -161,13 +161,17 @@ int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_
    gate and up rows [ffn_first, ffn_first + ffn_rows) writing product[r][ffn_first ..] (rows of ffn
    values), down rows [hidden_first, hidden_first + hidden_rows) writing out[t][hidden_first ..];
    stages 1 runs gate/up, 2 down (from the whole product), 3 both; send (two devices joined by
-   sd_link_parts; with the down stage), 1 + the part link channel its rows of out go to the other
-   device on, the sum's part as complete (else 0). Without bases, the routes the device last uploaded
+   sd_link_parts), 1 + the part link channel the last stage's values go to the other device on: the
+   down stage's rows of out, or the gate/up stage's (alone) columns of product, at send_at floats
+   into the inbox; more (gate/up alone): a later call sends more of the same sum, so this one raises
+   no flag (else 0: the sum's part is complete). Without bases, the routes the device last uploaded
    (a call of several routes per row; as many) are used again. */
 typedef struct sd_expert_split {
     uint64_t ffn_first, ffn_rows, hidden_first, hidden_rows;
     int stages;
     int send;
+    int more;
+    uint64_t send_at;
 } sd_expert_split;
 int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, const uint64_t* offsets, const int* kinds, uint64_t hidden, uint64_t ffn, uint64_t rows, uint64_t top_k, const float* input, uint64_t input_stride, const float* weights, float clamp, int accumulate, float* product, float* out, uint64_t out_stride, const sd_expert_split* split);
 /* Experts by table, for experts that stay in their slots: sd_expert_table writes count slot
@@ -257,7 +261,7 @@ int sd_link_reset(void* handle);
 int sd_link_skew(void* handle, uint64_t microseconds);
 /* Part links (gpu/link_tail.hpp, gpu/device_link.hpp): sums of two devices' parts whose producer
    sends this device's part to the other as it forms it and whose consumer adds the two as it reads
-   them (this part + the other's, the addition sd_op_sum_devices makes), in two channels, each sum
+   them (this part + the other's, the addition sd_op_sum_devices makes), in three channels, each sum
    a producer on both devices and then a consumer on both. sd_link_parts joins two devices (peer
    access needed) with inboxes of up to `capacity` floats per channel. Producers:
    sd_op_linear_send, `steps` (at most 4) vectors through rows x cols into output (as sd_op_linear),
@@ -267,7 +271,7 @@ int sd_link_skew(void* handle, uint64_t microseconds);
    out = part + the other's (count floats). Values a producer sends land at their offsets from the
    part's start; the inbox stays zero where the other never sends. A wait that gives up (the
    device's await timeout) is recorded and the stream goes on (the sums since are void):
-   sd_op_part_status queues 1 | 2 by channel (0: none gave up) into out, sd_part_failed reads it
+   sd_op_part_status queues 1 | 2 | 4 by channel (0: none gave up) into out, sd_part_failed reads it
    after the stream is idle, and sd_part_reset waits for both devices' streams and starts every
    count over. */
 int sd_link_parts(void* first, void* second, uint64_t capacity);

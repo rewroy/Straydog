@@ -634,6 +634,8 @@ pub struct sd_expert_split {
     pub hidden_rows: u64,
     pub stages: ::std::os::raw::c_int,
     pub send: ::std::os::raw::c_int,
+    pub more: ::std::os::raw::c_int,
+    pub send_at: u64,
 }
 unsafe extern "C" {
     pub fn sd_op_experts(

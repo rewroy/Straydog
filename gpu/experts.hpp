@@ -391,9 +391,10 @@ __device__ __forceinline__ float slot_reduce(float value, unsigned lanes) {
 }
 // blockIdx.y selects a token; the waves cover every route's rows. product[token][route][row] =
 // silu(min(gate, c)) * clamp(up, -c, c) * weight, as op_swiglu_kernel forms it.
+// (each value also into `peer` at its index from product, when given: link_tail.hpp)
 template<int kind>
-__global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
-                             const float* weights, float* product) {
+__device__ __forceinline__ void slot_gate_up_rows(const SlotExperts& plan, const uint64_t* bases, const float* input, size_t input_stride,
+                                                  const float* weights, float* product, float* peer) {
     const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
     const size_t route = wave / plan.waves[0];
     if (route >= plan.top_k) return;
@@ -411,7 +412,25 @@ __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const floa
     u = slot_reduce(u, lanes);
     if (sub || row >= gate.rows) return;
     if (plan.clamp > 0.0f) { g = fminf(g, plan.clamp); u = fminf(fmaxf(u, -plan.clamp), plan.clamp); }
-    product[index * plan.product_stride + plan.product_first + row] = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
+    const size_t at = index * plan.product_stride + plan.product_first + row;
+    const float value = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
+    product[at] = value;
+    if (peer) link_send(peer + at, value);
+}
+template<int kind>
+__global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
+                             const float* weights, float* product) {
+    slot_gate_up_rows<kind>(plan, bases, input, input_stride, weights, product, nullptr);
+}
+// slot_gate_up whose product is this device's part (its columns) of a part link's sum: each value
+// also goes to the other device's inbox, `send_at` floats in plus its index from product, and with
+// `raise`, the last block raises the other's flag (link_tail; without, a later call sends the sum's
+// other values and raises it).
+template<int kind>
+__global__ void slot_gate_up_sent(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
+                                  const float* weights, float* product, LinkTail tail, size_t send_at, int raise) {
+    slot_gate_up_rows<kind>(plan, bases, input, input_stride, weights, product, link_tail_slot(tail) + send_at);
+    if (raise) link_tail(tail);
 }
 // blockIdx.y selects a token; the waves cover the output rows, each summed over the token's routes
 // in route order, then added to `out` (or stored, without `accumulate`).
@@ -456,11 +475,12 @@ __global__ void slot_down_linked(SlotExperts plan, const uint64_t* bases, const 
 // rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
 // of different formats, takes the reference decoder a row per wave.
 // With a tail (one row, both stages), out is this device's part of its linked sum, the down stage's
-// kernel adding the parts (a tail that only sends: any rows, with the down stage); false (nothing
-// launched) when the down rows take the reference decoder.
+// kernel adding the parts (a tail that only sends: any rows, with the down stage; of the gate/up
+// stage alone, its product goes, at `send_at` floats into the inbox, the flag raised with `raise`);
+// false (nothing launched) when the down rows take the reference decoder.
 bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases, size_t tokens, const float* input,
                   size_t input_stride, const float* weights, float* product, float* out, size_t out_stride,
-                  const LinkTail* tail = nullptr) {
+                  const LinkTail* tail = nullptr, size_t send_at = 0, int raise = 1) {
     const Matrix &gate = plan.role[0], &up = plan.role[1], &down = plan.role[2];
     auto fast = [](int kind) {
         switch (kind) {
@@ -480,6 +500,20 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
     plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
     plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
+    if (tail && !tail->out && stages == 1) {
+        const dim3 blocks(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
+        #define SD_SLOT_GATE_SENT(format) case format: \
+            slot_gate_up_sent<format><<<blocks, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail, send_at, \
+                                                                    raise); break;
+        switch (gate_kind) {
+            SD_FAST_FORMATS(SD_SLOT_GATE_SENT)
+            default: slot_gate_up_sent<-1><<<blocks, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail,
+                                                                         send_at, raise);
+        }
+        #undef SD_SLOT_GATE_SENT
+        check(hipGetLastError());
+        return true;
+    }
     if (tail && (down_kind < 0 || !(stages & 2) || (tail->out && (stages != 3 || tokens != 1)))) return false;
     const dim3 first(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
     const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));

@@ -412,7 +412,7 @@ struct Device {
     PeerLink link;
     SumLink sums;
     Device* part_peer = nullptr;
-    PartLink part_links[2];
+    PartLink part_links[3];
     std::unordered_map<size_t, void*> helper_moe;   // layer -> this device's expert part, when it helps the owner
     uint8_t* io = nullptr;   // page-locked staging for caller-memory transfers (host_io.hpp)
     size_t io_used = 0;
@@ -3013,15 +3013,18 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     if (!offsets || !kinds || !hidden || !ffn || !rows || !top_k || top_k > 64 || rows > 65535 ||
         rows * top_k > slot_route_capacity || input_stride < hidden || out_stride < hidden || !(clamp >= 0.0f) ||
         part.stages < 1 || part.stages > 3 || !part.ffn_rows || part.ffn_first > ffn - part.ffn_rows || !part.hidden_rows ||
-        part.hidden_first > hidden - part.hidden_rows || (part.send && !(part.stages & 2)))
+        part.hidden_first > hidden - part.hidden_rows || (part.more && (!part.send || part.stages != 1)) ||
+        (part.send_at && part.stages != 1))
         throw std::runtime_error("invalid Straydog experts shape");
     // The input's and out's floats ((rows - 1) * stride + hidden) and the product's, checked.
     const uint64_t input_floats = checked_sum({checked_product({rows - 1, input_stride}), hidden});
     const uint64_t out_floats = checked_sum({checked_product({rows - 1, out_stride}), hidden});
     const uint64_t product_floats = checked_product({rows, top_k, ffn});
-    // (sending: the down stage's rows of out also go to the other device, its flag raised after them)
+    // (sending: the last stage's values also go to the other device, its flag raised after them)
     const LinkTail tail = part.send ? part_send_tail(value, part.send - 1) : LinkTail{};
-    if (part.send && out_floats > tail.capacity) throw std::runtime_error("an experts part exceeds its inbox");
+    if (part.send && (part.stages == 1 ? part.send_at > tail.capacity || product_floats > tail.capacity - part.send_at
+                                       : out_floats > tail.capacity))
+        throw std::runtime_error("an experts part exceeds its inbox");
     SlotExperts plan = slot_plan(slot_bytes, offsets, kinds, hidden, ffn, part);
     const size_t routes = size_t(rows * top_k);
     if (!bases && (value.inline_routes_count ? value.inline_routes_count : value.slot_routes_count) != routes)
@@ -3065,7 +3068,7 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
         plan.inline_count = uint32_t(value.inline_routes_count);
     }
     if (!part.send || !slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights,
-                                    product, out, size_t(out_stride), &tail)) {
+                                    product, out, size_t(out_stride), &tail, size_t(part.send_at), part.more ? 0 : 1)) {
         slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights, product, out,
                      size_t(out_stride));
         if (part.send)

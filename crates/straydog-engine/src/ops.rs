@@ -607,7 +607,7 @@ impl Backend {
     /// Join two devices with part links: sums whose producers send this device's part as they form
     /// it ([`linear_send`](Self::linear_send), [`experts`](Self::experts) with a split's `send`) and
     /// whose consumers add the other's as they read it ([`hc_step`](Self::hc_step) linked,
-    /// [`part_receive`](Self::part_receive)); two channels, inboxes of `capacity` floats.
+    /// [`part_receive`](Self::part_receive)); three channels, inboxes of `capacity` floats.
     pub fn link_parts(first: &mut Backend, second: &mut Backend, capacity: u64) -> Result<()> {
         // SAFETY: two live handles.
         check(unsafe { ffi::sd_link_parts(first.handle(), second.handle(), capacity) })

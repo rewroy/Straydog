@@ -335,15 +335,15 @@ int sd_op_part_receive(void* handle, int channel, const float* part, uint64_t co
     SD_OP_END
 }
 
-__global__ void part_status_kernel(const uint32_t* first, const uint32_t* second, uint32_t* out) {
-    *out = (first[2] ? 1u : 0u) | (second[2] ? 2u : 0u);
+__global__ void part_status_kernel(const uint32_t* first, const uint32_t* second, const uint32_t* third, uint32_t* out) {
+    *out = (first[2] ? 1u : 0u) | (second[2] ? 2u : 0u) | (third[2] ? 4u : 0u);
 }
 
 int sd_op_part_status(void* handle, uint32_t* out) {
     SD_OP_BEGIN
     if (!value.part_peer) throw std::runtime_error("no Straydog part link");
     op_span(value, out, 4, "a link status");
-    part_status_kernel<<<1, 1, 0, value.stream>>>(value.part_links[0].state, value.part_links[1].state, out);
+    part_status_kernel<<<1, 1, 0, value.stream>>>(value.part_links[0].state, value.part_links[1].state, value.part_links[2].state, out);
     SD_OP_END
 }
 
