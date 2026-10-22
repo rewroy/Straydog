@@ -3,7 +3,8 @@
 //! on both; the same through recorded graphs replayed with new parts; a sum whose peer never comes
 //! fails instead of hanging, and a reset starts the counts over; sums folded into the kernels forming
 //! their parts (a projection's GEMV, the routed experts' down) give the bits of the ops they stand
-//! in for, also among plain sums in recorded graphs. Skipped without two GPUs.
+//! in for, also among plain sums in recorded graphs, also when the last block's waves of a folded
+//! sum run far apart (as they can on a GPU another process loads). Skipped without two GPUs.
 //!
 //! cargo test --release -p straydog-engine --features hip --test link_gpu, under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -13,6 +14,15 @@ use straydog_engine::ops::Buffer;
 
 /// Width of a sum in floats (a decode step's stream; a prefill chunk's is 64 times this).
 const WIDTH: usize = 2048;
+
+/// The GPUs for one test at a time: while one test records a graph on its stream, some HIP calls of
+/// another thread of this process fail (hipBLASLt's, as a backend opens: "operation not permitted
+/// when stream is capturing"), and linked sums of tests run beside one recording went wrong now and
+/// then (never one test at a time, nor beside another process's load).
+fn gpus() -> std::sync::MutexGuard<'static, ()> {
+    static GPUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn pair() -> Option<(Backend, Backend)> {
     pair_of(64 * WIDTH)
@@ -52,6 +62,7 @@ fn check(a: &[f32], b: &[f32], first: &[f32], second: &[f32], base: &[f32]) {
 /// device busier than the other at times: every result exact, so no part was read before it landed.
 #[test]
 fn linked_sums_of_decode_sizes() {
+    let _gpus = gpus();
     let Some((mut a, mut b)) = pair_of(64_512) else { return };
     let busy = a.buffer(64 << 20).unwrap();
     for (round, (count, sums)) in [(5120, 1500), (16_128, 600), (64_512, 120), (5120, 1500)].into_iter().enumerate() {
@@ -82,6 +93,7 @@ fn linked_sums_of_decode_sizes() {
 /// them, and the next round overwrites them at once; every round's sums must be its own parts'.
 #[test]
 fn device_sums_read_parts_before_they_are_written_again() {
+    let _gpus = gpus();
     let (Ok(mut a), Ok(mut b)) = (Backend::new(0, 2 << 30), Backend::new(1, 2 << 30)) else {
         eprintln!("skipped: device sums need two GPUs");
         return;
@@ -113,6 +125,7 @@ fn device_sums_read_parts_before_they_are_written_again() {
 
 #[test]
 fn linked_sums() {
+    let _gpus = gpus();
     let Some((mut a, mut b)) = pair() else { return };
     // Many sums queued back to back without waiting (each reads an inbox slot the one two before
     // it read), of a decode step's width and of a prefill chunk's, with and without accumulating.
@@ -312,6 +325,7 @@ fn three_steps(a: &mut Backend, b: &mut Backend, sides: &[Side; 2], folded: [boo
 
 #[test]
 fn folded_sums_match_the_ops() {
+    let _gpus = gpus();
     let Some((mut a, mut b)) = pair() else { return };
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     // (both devices hold the same stream; their parts differ)
@@ -324,4 +338,163 @@ fn folded_sums_match_the_ops() {
     for replay in 0..20 {
         assert_eq!(three_steps(&mut a, &mut b, &sides, [true, false, true], true), expected, "graph replay {replay}");
     }
+}
+
+/// Wrong sums among `rounds` rounds of linked sums on two devices, one now and then behind: per
+/// round, 1500 sums of a decode step's width in one kernel each, 300 of a prefill row's in three,
+/// 600 folded into a projection's GEMV (each into its own zeroed out), and three-sum steps folded
+/// into the kernels forming their parts, plain and in recorded graphs. Each wrong sum of the first
+/// three kinds is reported with what its wrong values hold.
+fn wrong_linked_sums(a: &mut Backend, b: &mut Backend, rounds: usize) -> usize {
+    let busy = a.buffer(64 << 20).unwrap();
+    let mut wrong = 0;
+    let mut random = Random(0x1234_5678_9abc_def1);
+    let (matrix_a, matrix_b) = (a.upload_bytes(&random.q8(WIDTH, WIDTH)).unwrap(), b.upload_bytes(&random.q8(WIDTH, WIDTH)).unwrap());
+    for round in 0..rounds {
+        for (kind, count, sums) in [("link sum", 5120, 1500), ("3-kernel link sum", 16_128, 300), ("folded GEMV", WIDTH, 600)] {
+            let folded = kind == "folded GEMV";
+            let bytes = (sums * count * 4) as u64;
+            let (part_a, part_b, out_a, out_b) = if folded {
+                (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap(), a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap())
+            } else {
+                let (first, second) = (parts(0, sums, count, round * 2 + 1), parts(1, sums, count, round * 2 + 2));
+                (upload(a, &first), upload(b, &second), a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap())
+            };
+            let inputs = folded.then(|| (upload(a, &random.floats(sums * WIDTH, 2.0)), upload(b, &random.floats(sums * WIDTH, 2.0))));
+            for sum in 0..sums {
+                let at = sum * count;
+                if sum % 97 == 0 {
+                    a.copy(busy.base().cast_const(), busy.at(8 << 20), 32 << 20).unwrap();
+                }
+                for (device, gpu, part, out) in [(0, &mut *a, &part_a, &out_a), (1, &mut *b, &part_b, &out_b)] {
+                    match &inputs {
+                        Some((input_a, input_b)) => {
+                            let (matrix, input) = if device == 0 { (&matrix_a, input_a) } else { (&matrix_b, input_b) };
+                            gpu.linear_link_sum(matrix, 8, WIDTH as u64, WIDTH as u64, input.at(at).cast_const(), part.at(at), out.at(at)).unwrap();
+                        }
+                        None => gpu.link_sum(part.at(at), count as u64, out.at(at), false).unwrap(),
+                    }
+                }
+            }
+            let (result_a, result_b) = (read(a, &out_a, sums * count), read(b, &out_b, sums * count));
+            let (first, second) = (read(a, &part_a, sums * count), read(b, &part_b, sums * count));
+            let failed = a.link_failed().unwrap() || b.link_failed().unwrap();
+            for (device, result, mine, theirs) in [(0, &result_a, &first, &second), (1, &result_b, &second, &first)] {
+                for sum in 0..sums {
+                    let mut held = std::collections::BTreeMap::new();
+                    let (mut bad, mut low, mut high) = (0, usize::MAX, 0);
+                    for j in 0..count {
+                        let i = sum * count + j;
+                        if result[i].to_bits() == (first[i] + second[i]).to_bits() {
+                            continue;
+                        }
+                        bad += 1;
+                        (low, high) = (low.min(j), high.max(j));
+                        // the other's part of which sum, near this one
+                        let back = (1..=3).find(|&k| sum >= k && result[i].to_bits() == (mine[i] + theirs[i - k * count]).to_bits());
+                        *held.entry(back.map_or("other".to_string(), |k| format!("theirs of the sum {k} before"))).or_insert(0) += 1;
+                    }
+                    if bad > 0 {
+                        wrong += 1;
+                        eprintln!("round {round}, {kind}, device {device}, sum {sum}: {bad} values wrong (columns {low}..={high}): {held:?}");
+                    }
+                }
+            }
+            if failed {
+                wrong += 1;
+                eprintln!("round {round}, {kind}: a wait gave up");
+                a.link_reset().unwrap();
+            }
+        }
+    }
+    // three-sum steps, against the ops they stand in for
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let stream = random.floats(WIDTH, 4.0);
+    let sides = [side(a, &mut random, &stream), side(b, &mut random, &stream)];
+    let expected = three_steps(a, b, &sides, [false; 3], false);
+    for step in 0..rounds * 40 {
+        if three_steps(a, b, &sides, [true, false, true], step % 2 == 1) != expected {
+            wrong += 1;
+            eprintln!("folded step {step} wrong");
+        }
+    }
+    wrong
+}
+
+/// A folded sum's last block adds the slot of its own sum whenever its waves run apart: here the
+/// waves past the first wait 50 us before they add (sd_link_skew), as waves of a block can on a
+/// GPU another process loads (the last block's first wave stores the next count by then).
+#[test]
+fn folded_sums_hold_when_waves_run_apart() {
+    let _gpus = gpus();
+    let Some((mut a, mut b)) = pair_of(64 * WIDTH) else { return };
+    for gpu in [&mut a, &mut b] {
+        gpu.link_skew(50).unwrap();
+    }
+    assert_eq!(wrong_linked_sums(&mut a, &mut b, 1), 0, "wrong linked sums with the last blocks' waves apart");
+}
+
+/// Linked sums stay exact while another process loads the bus with copies both ways and linked sums
+/// of its own (link_traffic_stressor; without the load, STRESS=none). Ignored: it takes the GPUs
+/// for a minute or so (ROUNDS rounds, default 3).
+#[test]
+#[ignore]
+fn links_hold_beside_bus_traffic() {
+    let _gpus = gpus();
+    let Some((mut a, mut b)) = pair_of(64 * WIDTH) else { return };
+    let rounds: usize = std::env::var("ROUNDS").ok().and_then(|value| value.parse().ok()).unwrap_or(3);
+    // The stressor stops when told to, also when this test panics (else it would hold the GPUs).
+    struct Stressor(std::path::PathBuf, std::process::Child);
+    impl Drop for Stressor {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+            let _ = self.1.wait();
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let stop = std::env::temp_dir().join(format!("straydog-link-stressor-{}", std::process::id()));
+    let _ = std::fs::remove_file(&stop);
+    let stressor = (std::env::var("STRESS").as_deref() != Ok("none")).then(|| {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "link_traffic_stressor", "--ignored", "--nocapture"])
+            .env("STRESS_SECONDS", "600").env("STRESS_STOP", &stop)
+            .spawn().unwrap();
+        Stressor(stop.clone(), child)
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let wrong = wrong_linked_sums(&mut a, &mut b, rounds);
+    drop(stressor);
+    assert_eq!(wrong, 0, "wrong linked sums (and failed waits) beside the bus load");
+}
+
+/// Development (ignored, links_hold_beside_bus_traffic runs it in another process): STRESS_SECONDS
+/// (default 60, or until the file STRESS_STOP names exists) of copies across the bus both ways and
+/// within each device, with linked sums on a link of its own between them.
+#[test]
+#[ignore]
+fn link_traffic_stressor() {
+    let Some((mut a, mut b)) = pair_of(WIDTH * 8) else { return };
+    let seconds: u64 = std::env::var("STRESS_SECONDS").ok().and_then(|value| value.parse().ok()).unwrap_or(60);
+    let stop = std::env::var_os("STRESS_STOP").map(std::path::PathBuf::from);
+    let bytes = 32u64 << 20;
+    let (a1, a2, b1, b2) = (a.buffer(2 * bytes).unwrap(), a.buffer(2 * bytes).unwrap(), b.buffer(2 * bytes).unwrap(), b.buffer(2 * bytes).unwrap());
+    let started = std::time::Instant::now();
+    let mut rounds = 0u64;
+    while started.elapsed().as_secs() < seconds && !stop.as_ref().is_some_and(|path| path.exists()) {
+        for _ in 0..8 {
+            a.copy_to(a1.base().cast_const(), &mut b, b1.base(), bytes).unwrap();
+            b.copy_to(b2.base().cast_const(), &mut a, a2.base(), bytes).unwrap();
+            a.copy(a1.at((bytes / 4) as usize).cast_const(), a1.base(), bytes).unwrap();
+            b.copy(b1.at((bytes / 4) as usize).cast_const(), b2.base(), bytes).unwrap();
+            for sum in 0..50 {
+                a.link_sum(a2.at(sum * WIDTH * 4).cast_const(), (WIDTH * 4) as u64, a1.at((64 + sum) * WIDTH * 4), false).unwrap();
+                b.link_sum(b2.at(sum * WIDTH * 4).cast_const(), (WIDTH * 4) as u64, b1.at((64 + sum) * WIDTH * 4), false).unwrap();
+            }
+        }
+        let mut one = [0f32; 1];
+        a.read_buffer(&a1, 0, &mut one).unwrap();
+        b.read_buffer(&b1, 0, &mut one).unwrap();
+        rounds += 1;
+    }
+    eprintln!("stressor: {rounds} rounds");
 }

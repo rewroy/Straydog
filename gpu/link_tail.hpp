@@ -36,6 +36,8 @@ struct LinkTail {
     int accumulate;
     uint64_t timeout;
     float* out;
+    uint64_t skew = 0;      // development (sd_link_skew): the last block's waves past the first wait
+                            // this many clock ticks before they add
 };
 
 // The other's inbox slot this sum's part goes to (the count is the last sum's until the last block
@@ -46,18 +48,33 @@ __device__ __forceinline__ float* link_tail_slot(const LinkTail& tail) {
 
 // Every thread of every block, after its stores of the part and their link_send.
 __device__ inline void link_tail(const LinkTail& tail) {
-    __shared__ uint32_t last;
+    __shared__ uint32_t last, count;
 #if defined(__HIPCC__)
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 #else
     __threadfence();
 #endif
     __syncthreads();
-    if (!threadIdx.x) last = atomicAdd(tail.state + 3, 1u) == gridDim.x * gridDim.y - 1;
+    // The sum's count, read by one thread for the whole block before the barrier: thread 0 of the
+    // last block stores the next count right after it, and a wave that read the count after that
+    // store would add the other's part of the sum before (waves of a block can run far apart on a
+    // GPU another process loads).
+    if (!threadIdx.x) {
+        last = atomicAdd(tail.state + 3, 1u) == gridDim.x * gridDim.y - 1;
+        count = tail.state[0];
+    }
     __syncthreads();
     if (!last) return;
+    if (tail.skew && threadIdx.x >= 32) {
+        const uint64_t start = peer_clock();
+        while (peer_clock() - start < tail.skew) {
+#if defined(__HIPCC__)
+            __builtin_amdgcn_s_sleep(8);
+#endif
+        }
+    }
     __threadfence();
-    const uint32_t sent = tail.state[0] + 1;
+    const uint32_t sent = count + 1;
     const size_t slot = size_t(sent & 1) * tail.capacity;
     if (!threadIdx.x) {
         tail.state[3] = 0;

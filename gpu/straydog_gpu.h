@@ -245,6 +245,11 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
 int sd_link_failed(void* handle);
 int sd_op_link_status(void* handle, uint32_t* out);
 int sd_link_reset(void* handle);
+/* Development: in this device's folded linked sums (sd_op_linear_link_sum,
+   sd_op_experts_table_link_sum), the last block's waves past the first wait `microseconds` (at most
+   a second; 0: none) before they add the parts, as waves of a block can run apart on a loaded GPU:
+   tests widen the window of races between them. */
+int sd_link_skew(void* handle, uint64_t microseconds);
 /* Routed experts of many rows at once (a prefill pass; gpu/moe_prefill.hpp): sd_moe_groups writes
    an expert table (experts entries of sd_moe_group_bytes() each) from each expert's slot address
    (0: an expert another device runs) and its gate, up and down byte offsets and kinds in the

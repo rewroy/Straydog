@@ -141,6 +141,16 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
     SD_OP_END
 }
 
+int sd_link_skew(void* handle, uint64_t microseconds) {
+    try {
+        Device& value = device(handle);
+        if (!value.sums.peer || microseconds > 1000000) throw std::runtime_error("invalid Straydog link skew");
+        // (the await timeout is ten seconds of the clock, one with a watchdog)
+        value.sums.skew = microseconds * (value.await_timeout / (value.await_watchdog ? 1000000 : 10000000));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 __global__ void link_status_kernel(const uint32_t* state, uint32_t* out) { *out = state[2]; }
 
 int sd_op_link_status(void* handle, uint32_t* out) {
@@ -190,7 +200,7 @@ int sd_op_linear_link_sum(void* handle, const void* weights, int kind, uint64_t 
     op_span(value, out, checked_floats({rows}), "a linked sum");
     const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
     const LinkTail tail{part, uint32_t(rows), link.state, link.peer_flag, link.peer_inbox, link.inbox, uint32_t(link.capacity), 1,
-                        value.await_timeout, out};
+                        value.await_timeout, out, link.skew};
     if (rows > link_single_floats || !gemv_linked_launch(value, matrix, input, part, tail, op_lanes)) {
         gemv(value, &matrix, 1, input, part, 1, 0, 0, {}, op_lanes);
         if (sd_op_link_sum(handle, part, rows, out, 1)) throw std::runtime_error(last_error);
@@ -223,7 +233,7 @@ int sd_op_experts_table_link_sum(void* handle, const uint64_t* table, uint64_t c
     plan.ids = ids;
     plan.table_count = uint32_t(count);
     const LinkTail tail{part, uint32_t(hidden), link.state, link.peer_flag, link.peer_inbox, link.inbox, uint32_t(link.capacity), 1,
-                        value.await_timeout, out};
+                        value.await_timeout, out, link.skew};
     if (hidden > link_single_floats ||
         !slot_experts(value, plan, 3, nullptr, 1, input, size_t(hidden), weights, product, part, size_t(hidden), &tail)) {
         slot_experts(value, plan, 3, nullptr, 1, input, size_t(hidden), weights, product, part, size_t(hidden));

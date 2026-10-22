@@ -572,6 +572,14 @@ impl Backend {
         check(unsafe { ffi::sd_link_reset(self.handle()) })
     }
 
+    /// Development: make the last block's waves past the first of this device's folded linked sums
+    /// wait `microseconds` before they add the parts (0: none), to widen the window of races between
+    /// them (tests).
+    pub fn link_skew(&mut self, microseconds: u64) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_link_skew(self.handle(), microseconds) })
+    }
+
     /// Whether a linked sum's wait gave up (waits for the stream; the sums since are void).
     pub fn link_failed(&mut self) -> Result<bool> {
         // SAFETY: a live handle.

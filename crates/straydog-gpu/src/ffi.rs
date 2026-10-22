@@ -955,6 +955,12 @@ unsafe extern "C" {
     pub fn sd_link_reset(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_link_skew(
+        handle: *mut ::std::os::raw::c_void,
+        microseconds: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_moe_group_bytes() -> u64;
 }
 unsafe extern "C" {

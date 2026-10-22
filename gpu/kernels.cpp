@@ -356,6 +356,7 @@ struct SumLink {
     uint32_t* state = nullptr;
     uint32_t* peer_flag = nullptr;
     size_t capacity = 0;
+    uint64_t skew = 0;   // sd_link_skew's, in clock ticks
 };
 // This device's side of a two-GPU link: an inbox the peer writes rows
 // into, a flag the peer raises per message, and this device's message counters.
