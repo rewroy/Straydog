@@ -25,8 +25,9 @@ harness = false
 [features]
 # The GPU backend linked into the executable.
 # `gpu` is how the binary and runtime_gpu require one of them.
-hip = ["straydog-engine/hip", "gpu"]
-cuda = ["straydog-engine/cuda", "nvml", "gpu"]
+# Provision's quantizer follows its own hip/cuda feature, so the executable turns that on too.
+hip = ["straydog-engine/hip", "straydog-provision/hip", "gpu"]
+cuda = ["straydog-engine/cuda", "straydog-provision/cuda", "nvml", "gpu"]
 gpu = []
 # NVIDIA telemetry for the dashboard through the driver's NVML, loaded at run time.
 nvml = ["dep:nvml-wrapper"]
