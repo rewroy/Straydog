@@ -436,6 +436,9 @@ struct Device {
     // page-locked landing of an asynchronous read (sd_buffer_read_start) with its copy's event.
     uint64_t* slot_routes = nullptr;
     unsigned* route_counter = nullptr;   // sd_op_linear_route's (zero between launches)
+    // sd_op_linear_route_published's mailbox, coherent page-locked memory: its flag, then from byte
+    // 64 the routes.
+    uint8_t* route_mailbox = nullptr;
     // sd_op_sparse_attention's tile counters (zero between launches: each tile's last share resets its own)
     unsigned* attention_tiles = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
@@ -507,6 +510,7 @@ struct Device {
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (exchange) cleanup(hipHostFree(exchange));
         if (readback) cleanup(hipHostFree(readback));
+        if (route_mailbox) cleanup(hipHostFree(route_mailbox));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
@@ -2531,13 +2535,18 @@ int sd_op_route(void* handle, const float* logits, const float* bias, uint64_t r
     SD_OP_END
 }
 
-int sd_op_linear_route(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input, uint64_t steps,
-                       float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale, int32_t* ids,
-                       float* route_weights, float* scratch, uint64_t scratch_bytes) {
+// The routes a route mailbox holds at most.
+constexpr size_t route_mailbox_ids = 1024;
+
+static int linear_route(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input, uint64_t steps,
+                        float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale, int32_t* ids,
+                        float* route_weights, float* scratch, uint64_t scratch_bytes, bool publish) {
     try {
         auto& value = device(handle);
         // (the softmax router of 256 experts has a one-wave route kernel of its own)
         const bool fused = (kind == 0 || kind == 1) && steps >= 1 && steps <= 4 && !(experts == 256 && gating == 0 && !bias && scale == 1.0f);
+        if (publish && (!fused || !value.route_mailbox || steps * k > route_mailbox_ids))
+            throw std::runtime_error("Straydog routes are published by the fused router alone, into a cleared mailbox");
         if (!fused) {
             if (sd_op_linear(handle, weights, kind, experts, cols, 0, input, 0, steps, logits, 0, scratch, scratch_bytes)) return -1;
             return sd_op_route(handle, logits, bias, steps, experts, k, gating, normalize, scale, ids, route_weights);
@@ -2556,14 +2565,65 @@ int sd_op_linear_route(void* handle, const void* weights, int kind, uint64_t exp
             check(hipMemsetAsync(value.route_counter, 0, 4, value.stream));
         }
         const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(experts), size_t(cols), 0, 0, 0, kind};
-        const RouteTail tail{bias, size_t(experts), size_t(k), gating, normalize, scale, ids, route_weights, value.route_counter};
+        RouteTail tail{bias, size_t(experts), size_t(k), gating, normalize, scale, ids, route_weights, value.route_counter, nullptr, nullptr};
+        if (publish) {
+            check(hipHostGetDevicePointer(reinterpret_cast<void**>(&tail.flag), value.route_mailbox, 0));
+            tail.published = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(tail.flag) + 64);
+        }
         // (strides in values, as op_linear passes them: a contiguous input and output)
         if (!gemv_route_launch(value, matrix, input, logits, size_t(steps), steps > 1 ? size_t(cols) : 0, steps > 1 ? size_t(experts) : 0,
                                tail, op_lanes)) {
+            if (publish) throw std::runtime_error("Straydog routes are published by the fused router alone");
             if (sd_op_linear(handle, weights, kind, experts, cols, 0, input, 0, steps, logits, 0, scratch, scratch_bytes)) return -1;
             return sd_op_route(handle, logits, bias, steps, experts, k, gating, normalize, scale, ids, route_weights);
         }
         check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_linear_route(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input, uint64_t steps,
+                       float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale, int32_t* ids,
+                       float* route_weights, float* scratch, uint64_t scratch_bytes) {
+    return linear_route(handle, weights, kind, experts, cols, input, steps, logits, bias, k, gating, normalize, scale, ids, route_weights,
+                        scratch, scratch_bytes, false);
+}
+
+int sd_op_linear_route_published(void* handle, const void* weights, int kind, uint64_t experts, uint64_t cols, const float* input,
+                                 uint64_t steps, float* logits, const float* bias, uint64_t k, int gating, int normalize, float scale,
+                                 int32_t* ids, float* route_weights, float* scratch, uint64_t scratch_bytes) {
+    return linear_route(handle, weights, kind, experts, cols, input, steps, logits, bias, k, gating, normalize, scale, ids, route_weights,
+                        scratch, scratch_bytes, true);
+}
+
+int sd_route_mailbox_clear(void* handle) {
+    try {
+        auto& value = device(handle);
+        if (!value.route_mailbox)   // (made here, outside any graph being recorded)
+            check(hipHostMalloc(reinterpret_cast<void**>(&value.route_mailbox), 64 + route_mailbox_ids * 4,
+                                hipHostMallocCoherent | hipHostMallocMapped));
+        __atomic_store_n(reinterpret_cast<unsigned*>(value.route_mailbox), 0u, __ATOMIC_RELEASE);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_route_mailbox_wait(void* handle, int32_t* out, uint64_t count) {
+    try {
+        auto& value = device(handle);
+        if (!value.route_mailbox || !out || !count || count > route_mailbox_ids) throw std::runtime_error("no Straydog route mailbox");
+        const auto* flag = reinterpret_cast<const unsigned*>(value.route_mailbox);
+        const auto started = std::chrono::steady_clock::now();
+        for (unsigned spins = 1; __atomic_load_n(flag, __ATOMIC_ACQUIRE) != 1u; ++spins) {
+            __builtin_ia32_pause();
+            if (spins % 4096 == 0) {
+                // A stream that failed never raises the flag: its error instead of a wait without end.
+                const hipError_t state = hipStreamQuery(value.stream);
+                if (state != hipSuccess && state != hipErrorNotReady) check(state);
+                if (std::chrono::steady_clock::now() - started > std::chrono::seconds(60))
+                    throw std::runtime_error("Straydog routes never arrived (60 s)");
+            }
+        }
+        std::memcpy(out, value.route_mailbox + 64, size_t(count) * 4);
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

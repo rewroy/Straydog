@@ -366,6 +366,37 @@ impl Backend {
         })
     }
 
+    /// [`Backend::linear_route`] in its one launch (an F32 or F16 router of 1-4 rows), the routes also
+    /// going straight to this device's route mailbox in page-locked host memory, its flag raised once
+    /// every row's are there: [`Backend::route_mailbox_wait`] takes them without a readback.
+    /// [`Backend::route_mailbox_clear`] comes before it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_route_published(&mut self, weights: &Buffer, kind: u32, experts: u64, cols: u64, input: P, steps: u64, logits: M,
+                                  bias: Option<P>, k: u64, gating: i32, normalize: bool, scale: f32, ids: M, route_weights: M,
+                                  scratch: &Buffer) -> Result<()> {
+        // SAFETY: as linear_route.
+        check(unsafe {
+            ffi::sd_op_linear_route_published(self.handle(), weights.pointer.cast_const(), kind as i32, experts, cols, input.cast(),
+                                              steps, logits.cast(), bias.map_or(std::ptr::null(), |b| b.cast()), k, gating,
+                                              i32::from(normalize), scale, ids.cast(), route_weights.cast(), scratch.pointer.cast(),
+                                              scratch.bytes)
+        })
+    }
+
+    /// Lower the route mailbox's flag (and make the mailbox), before a published route is queued and
+    /// outside any graph being recorded.
+    pub fn route_mailbox_clear(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_route_mailbox_clear(self.handle()) })
+    }
+
+    /// Wait on the host for the published routes and take `out.len()` of them (an error after 60 s,
+    /// or when the stream failed).
+    pub fn route_mailbox_wait(&mut self, out: &mut [i32]) -> Result<()> {
+        // SAFETY: a live handle; `out` holds its count.
+        check(unsafe { ffi::sd_route_mailbox_wait(self.handle(), out.as_mut_ptr(), out.len() as u64) })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn swiglu(&mut self, gate: P, up: P, rows: u64, width: u64, clamp: f32, row_weights: Option<P>, out: M) -> Result<()> {
         // SAFETY: as above.

@@ -498,8 +498,9 @@ __global__ void op_route_softmax256_kernel(const float* logits, size_t k, int no
 
 // One row's routes by the block (256 threads, `experts` x 2 floats of dynamic LDS at `scores`): its
 // logits read through the device-wide cache (another block of the launch may have written them).
+// With `published`, the ids also go there (a route mailbox in host memory: sd_op_linear_route_published).
 __device__ void route_row(const float* l, const float* bias, size_t experts, size_t k, int gating, int normalize, float scale,
-                          int32_t* ids, float* weights, float* scores) {
+                          int32_t* ids, float* weights, float* scores, int32_t* published = nullptr) {
     float* biased = scores + experts;
     __shared__ float reduce[256];
     __shared__ int32_t picked[64], best[8];
@@ -563,6 +564,7 @@ __device__ void route_row(const float* l, const float* bias, size_t experts, siz
         const float chosen = scores[picked[slot]];
         ids[slot] = picked[slot];
         weights[slot] = (normalize && k > 1 ? chosen / (sum + 1e-20f) : chosen) * scale;
+        if (published) published[slot] = picked[slot];
     }
 }
 __global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
@@ -581,6 +583,9 @@ struct RouteTail {
     int32_t* ids;
     float* weights;
     unsigned* counter;   // zero between launches: the last block resets it
+    // A route mailbox (host memory): every row's ids there, then its flag raised (system scope).
+    int32_t* published;
+    unsigned* flag;
 };
 template<int kind, int V>
 __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* output, RouteTail tail) {
@@ -601,8 +606,13 @@ __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* outp
     const size_t stride = V > 1 ? list.output_stride : 0;
     for (int row = 0; row < V; ++row) {
         route_row(output + row * stride, tail.bias, tail.experts, tail.k, tail.gating, tail.normalize, tail.scale, tail.ids + row * tail.k,
-                  tail.weights + row * tail.k, scores);
+                  tail.weights + row * tail.k, scores, tail.published ? tail.published + row * tail.k : nullptr);
         __syncthreads();
+    }
+    // (thread 0 wrote every row's published ids)
+    if (tail.flag && threadIdx.x == 0) {
+        __threadfence_system();
+        __hip_atomic_store(tail.flag, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 // gemv() of one matrix (an F32, F16 or BF16 router) for 1-4 vectors with the rows' routes in its

@@ -301,6 +301,9 @@ pub struct Engine<'a, T: Tensors> {
     predicted: Vec<usize>,
     /// Decode runs the experts VRAM holds while the others land (DS41_HITS_FIRST=0: all at once).
     hits_first: bool,
+    /// A pass of a few rows has the first device's router publish its routes to page-locked host
+    /// memory, for the host to take without a readback (DS41_ROUTE_READBACK: read them back).
+    mailbox: bool,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
     /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
@@ -586,6 +589,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             prefetches: std::env::var("DS41_PREDICT").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(PREDICTED),
             predicted: Vec::new(),
             hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
+            mailbox: std::env::var_os("DS41_ROUTE_READBACK").is_none(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
         };
@@ -1003,6 +1007,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.iter().filter_map(|shard| shard.checks.as_ref()).map(|checks| checks.mismatches).sum()
     }
 
+    /// Whether a pass of `n` rows has the first device's router publish its routes (see `mailbox`):
+    /// a fused router's, of a few rows, with no prediction behind them.
+    fn publishes(&self, layer: usize, n: usize, predict: bool) -> bool {
+        self.mailbox && !predict && n <= SLOT_ROWS
+            && self.shards[0].dense.get(&name(layer, "ffn_gate_inp")).is_some_and(|router| router.kind == 0 || router.kind == 1)
+    }
+
+    /// The routes of the layer's router on the first device: published, or read back (read_start).
+    fn take_routes(&mut self, published: bool, routes: &mut [i32]) -> Result<()> {
+        if published { self.shards[0].gpu.route_mailbox_wait(routes) } else { self.shards[0].gpu.read_finish(routes) }
+    }
+
     /// Whether a pass of `n` tokens can be taken back: at most [`VERIFY_ROWS`], in one batch.
     fn rewindable(&self, n: usize) -> bool {
         n <= VERIFY_ROWS && n <= self.settings.batch
@@ -1148,14 +1164,19 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let attended = end - attending;
             self.sum_parts(0, attending, attended)?;
             self.mark("attention")?;
+            // (the flag is lowered before the router is queued: it may run at once)
+            let publish = self.publishes(layer, n, predict);
+            if publish {
+                self.shards[0].gpu.route_mailbox_clear()?;
+            }
             for (index, shard) in self.shards.iter_mut().enumerate() {
-                // the next layer's experts are predicted on the first device alone
-                let predict = predict && index == 0;
+                // the next layer's experts are predicted on the first device alone, which publishes the routes
+                let (predict, publish) = (predict && index == 0, publish && index == 0);
                 let work = shard.work.view(attending);
                 if record {
-                    recorded(shard, key(1) | u64::from(predict) << 2, |shard| {
+                    recorded(shard, key(1) | u64::from(predict) << 2 | u64::from(publish) << 3, |shard| {
                         hc_ffn(shard, &work, &hp, layer, attended)?;
-                        router_ops(shard, &work, &hp, layer, attended, predict)
+                        router_ops(shard, &work, &hp, layer, attended, predict, publish)
                     })?;
                 } else {
                     hc_ffn(shard, &work, &hp, layer, attended)?;
@@ -1165,7 +1186,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 self.mark("hyper-connections")?;
                 for (index, shard) in self.shards.iter_mut().enumerate() {
                     let work = shard.work.view(attending);
-                    router_ops(shard, &work, &hp, layer, attended, predict && index == 0)?;
+                    router_ops(shard, &work, &hp, layer, attended, predict && index == 0, publish && index == 0)?;
                 }
             }
             self.mark("router")?;
@@ -1245,12 +1266,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         let hp = self.hp.clone();
         let (w, ff, k) = (hp.width, hp.expert_ff, hp.experts_used);
-        // The routes (alike on every device) travel to the host while the shared expert runs.
+        // The routes (alike on every device) travel to the host while the shared expert runs:
+        // published by the router, or read back.
         let read = rows * k + if predict { PREDICTED } else { 0 };
-        let ids = self.shards[0].work.view(first).ids;
-        self.shards[0].gpu.read_start(&ids, 0, (read * 4) as u64)?;
+        let published = self.publishes(layer, n, predict);
+        if !published {
+            let ids = self.shards[0].work.view(first).ids;
+            self.shards[0].gpu.read_start(&ids, 0, (read * 4) as u64)?;
+        }
         if self.shards.len() > 1 {
-            return self.experts_split(layer, first, rows, read);
+            return self.experts_split(layer, first, rows, read, published);
         }
         // One device: the shared expert writes `out`, the routed ones add to it.
         let shard = &mut self.shards[0];
@@ -1261,7 +1286,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                           work.out.base(), 0, None)?;
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
-        self.shards[0].gpu.read_finish(&mut routes)?;
+        self.take_routes(published, &mut routes)?;
         self.predicted = routes.split_off(rows * k).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         self.routed(layer, first, rows, &routes)
     }
@@ -1313,7 +1338,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// of the width), the activations summed across devices, then its rows of down into its part of
     /// the output. The routes' experts come in waves (one for decode): a wave's fills start on
     /// every device before any waits, and the next wave's while this one computes.
-    fn experts_split(&mut self, layer: usize, first: usize, rows: usize, read: usize) -> Result<()> {
+    fn experts_split(&mut self, layer: usize, first: usize, rows: usize, read: usize, published: bool) -> Result<()> {
         let hp = self.hp.clone();
         let (w, ff, k) = (hp.width as u64, hp.expert_ff as u64, hp.experts_used);
         let routed_rows = rows * k;
@@ -1326,7 +1351,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         self.mark("shared expert")?;
         let mut routes = vec![0i32; read];
-        self.shards[0].gpu.read_finish(&mut routes)?;
+        self.take_routes(published, &mut routes)?;
         self.mark("route readback")?;
         let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
@@ -1717,16 +1742,23 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
 
 /// A layer's router on a device (every device routes alike); with `predict`, also the next
 /// layer's router on this layer's input, its best PREDICTED experts after the routes in `ids`.
-fn router_ops(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, predict: bool) -> Result<()> {
+fn router_ops(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, predict: bool, publish: bool) -> Result<()> {
     let k = hp.experts_used;
     let gating = match hp.gating { Gating::Softmax => 0, Gating::Sigmoid => 1, Gating::SqrtSoftplus => 2 };
     // (the router and its routes in one launch where it can)
     let router = shard.dense(&name(layer, "ffn_gate_inp"))?;
     let bias = shard.dense(&format!("blk.{layer}.exp_probs_b.bias"))?;
     let scratch = shard.scratch;
-    shard.gpu.linear_route(&router.buffer, router.kind, router.dims[1] as u64, router.dims[0] as u64, work.x.base(), n as u64,
-                           work.router.base(), Some(bias.buffer.base()), k as u64, gating, hp.route_normalize, hp.route_scale,
-                           work.ids.base(), work.weights.base(), &scratch)?;
+    if publish {
+        // (the routes also to the device's route mailbox: Engine::take_routes)
+        shard.gpu.linear_route_published(&router.buffer, router.kind, router.dims[1] as u64, router.dims[0] as u64, work.x.base(),
+                                         n as u64, work.router.base(), Some(bias.buffer.base()), k as u64, gating, hp.route_normalize,
+                                         hp.route_scale, work.ids.base(), work.weights.base(), &scratch)?;
+    } else {
+        shard.gpu.linear_route(&router.buffer, router.kind, router.dims[1] as u64, router.dims[0] as u64, work.x.base(), n as u64,
+                               work.router.base(), Some(bias.buffer.base()), k as u64, gating, hp.route_normalize, hp.route_scale,
+                               work.ids.base(), work.weights.base(), &scratch)?;
+    }
     if predict {
         let next_bias = shard.dense(&format!("blk.{}.exp_probs_b.bias", layer + 1))?;
         shard.linear(&name(layer + 1, "ffn_gate_inp"), work.x.base(), 1, work.router.at(hp.experts))?;
