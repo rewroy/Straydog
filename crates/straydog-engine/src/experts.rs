@@ -484,8 +484,21 @@ impl std::ops::Add for Counts {
     }
 }
 
+/// An upload whose gate and up are queued and whose down is not yet: the bytes after `at`.
+struct Tail {
+    slot: usize,
+    host: usize,
+    stream: Stream,
+    at: u64,
+}
+
 /// One device's expert slots, and its share of the host tier.
 pub struct DeviceExperts {
+    /// While a request queues its misses: their downs wait in `tails` until every gate and up is
+    /// queued (DS41_HEADS_FIRST=0: each expert whole in turn).
+    deferring: bool,
+    heads_first: bool,
+    tails: Vec<Tail>,
     layout: Arc<Layout>,
     reader: Arc<Reader>,
     classes: Vec<Class>,
@@ -606,6 +619,9 @@ impl DeviceExperts {
         }
         let (done_tx, done_rx) = channel();
         Ok(DeviceExperts {
+            deferring: false,
+            heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
+            tails: Vec::new(),
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), rest: Vec::new(),
@@ -753,15 +769,23 @@ impl DeviceExperts {
                     self.requested.push(key);
                 }
             }
-            for &expert in experts {
-                let key = (layer as u32, expert as u32);
-                if !self.map.contains_key(&key) {
-                    let slot = self.fill(gpu, key, true)?;
-                    self.hold(slot);
-                    self.requested.push(key);
+            // The misses' gates and ups go up first, then their downs: a pass waits for every
+            // miss's gate and up before its downs, and one expert's down would hold the next's back.
+            self.deferring = true;
+            let filled = (|| {
+                for &expert in experts {
+                    let key = (layer as u32, expert as u32);
+                    if !self.map.contains_key(&key) {
+                        let slot = self.fill(gpu, key, true)?;
+                        self.hold(slot);
+                        self.requested.push(key);
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })();
+            self.deferring = false;
+            let tails = self.upload_tails(gpu);
+            filled.and(tails)
         })();
         self.counts.store_seconds += started.elapsed().as_secs_f64();
         result
@@ -787,18 +811,27 @@ impl DeviceExperts {
                 slots[index] = slot;
             }
         }
-        for (index, &expert) in experts.iter().enumerate() {
-            if slots[index] == usize::MAX {
-                // (a repeated expert finds the slot its first occurrence filled)
-                let key = (layer as u32, expert as u32);
-                let slot = match self.map.get(&key) {
-                    Some(&slot) => slot,
-                    None => self.fill(gpu, key, true)?,
-                };
-                self.hold(slot);
-                slots[index] = slot;
+        // (an acquire of the gates and ups first takes its misses' downs after all of them, as a
+        // request does)
+        self.deferring = first;
+        let filled = (|| {
+            for (index, &expert) in experts.iter().enumerate() {
+                if slots[index] == usize::MAX {
+                    // (a repeated expert finds the slot its first occurrence filled)
+                    let key = (layer as u32, expert as u32);
+                    let slot = match self.map.get(&key) {
+                        Some(&slot) => slot,
+                        None => self.fill(gpu, key, true)?,
+                    };
+                    self.hold(slot);
+                    slots[index] = slot;
+                }
             }
-        }
+            Ok(())
+        })();
+        self.deferring = false;
+        let tails = self.upload_tails(gpu);
+        filled.and(tails)?;
         // This layer's prefetches it did not take: reads not yet started are skipped, so the
         // drive's time goes to what passes need. Those that landed keep their recency: demoting
         // them to the eviction end sent ~25% more experts back through the host tier, since a
@@ -1075,7 +1108,12 @@ impl DeviceExperts {
         let filled = match self.host_map.get(&key).copied() {
             Some(host) if !matches!(self.host[host].content, Content::Reading(_)) => {
                 self.counts.host_hits += 1;
-                self.upload(gpu, slot, host, stream).inspect_err(|_| self.discard(host, Some(slot)))
+                let uploaded = if self.heads_first && self.deferring {
+                    self.upload_head(gpu, slot, host, stream).map(|tail| self.tails.push(tail))
+                } else {
+                    self.upload(gpu, slot, host, stream)
+                };
+                uploaded.inspect_err(|_| self.discard(host, Some(slot)))
             }
             Some(host) => {
                 self.slots[slot].waiting = Some(host);
@@ -1102,6 +1140,12 @@ impl DeviceExperts {
 
     /// Upload host slot `host` into VRAM slot `slot` on `stream`; the host tier gives the expert up.
     fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<()> {
+        let tail = self.upload_head(gpu, slot, host, stream)?;
+        self.upload_tail(gpu, tail)
+    }
+
+    /// The first part of [`upload`](Self::upload): the gate and up, then the slot's `ready_first`.
+    fn upload_head(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<Tail> {
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
         if self.slots[slot].taken_back {
             return Err("an upload into a lent expert slot its lender has back".into());
@@ -1115,41 +1159,76 @@ impl DeviceExperts {
         }
         let base = self.host_pointer(host);
         let target = self.slot_buffer(slot);
-        // a mark once the first two roles (gate and up) are in
-        let mut first = None;
+        let mut at = 0;
         match self.host[host].content {
             Content::Read => {
-                let mut at = 0;
-                for (role, span) in self.layout.read_plan(layer as usize, expert as usize)?.into_iter().enumerate() {
-                    // SAFETY: the host slot holds this expert as read, and gives it up below (only a
-                    // resident store keeps columns: no CPU reads its host slots).
+                for span in self.layout.read_plan(layer as usize, expert as usize)?.into_iter().take(2) {
+                    // SAFETY: the host slot holds this expert as read, and gives it up in the tail
+                    // (only a resident store keeps columns: no CPU reads its host slots).
                     let bytes = unsafe { span.keep_columns(base) };
-                    // SAFETY: the host slot holds this expert until the mark below completes (busy).
+                    // SAFETY: the host slot holds this expert until the tail's mark completes (busy).
                     unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), bytes)? };
                     at += bytes;
-                    if role == 1 {
-                        first = Some(gpu.mark(stream)?);
-                    }
                 }
             }
             Content::Packed(written) => {
                 gpu.wait_mark(stream, written)?;
-                let roles: Vec<u64> = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).collect();
-                let (head, bytes) = (roles.iter().take(2).sum::<u64>(), roles.iter().sum::<u64>());
+                at = self.layout.roles(layer as usize)?.iter().take(2).map(|role| role.bytes).sum::<u64>();
                 // SAFETY: as above.
-                unsafe { gpu.transfer(stream, &target, 0, base, head)? };
-                first = Some(gpu.mark(stream)?);
-                if bytes > head {
+                unsafe { gpu.transfer(stream, &target, 0, base, at)? };
+            }
+            Content::Reading(_) => return Err("an upload of an expert still being read".into()),
+        }
+        self.slots[slot].ready_first = Some((stream, gpu.mark(stream)?));
+        // Out of the host tier's LRU until the tail: no read or write-back takes the slot meanwhile.
+        let entry = &self.host[host];
+        self.classes[entry.class].host_lru.remove(&(entry.used, host));
+        Ok(Tail { slot, host, stream, at })
+    }
+
+    /// The rest of [`upload`](Self::upload): the down, then the slot's `ready`; the host tier
+    /// gives the expert up.
+    fn upload_tail(&mut self, gpu: &mut Backend, tail: Tail) -> Result<()> {
+        let Tail { slot, host, stream, mut at } = tail;
+        let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
+        let base = self.host_pointer(host);
+        let target = self.slot_buffer(slot);
+        match self.host[host].content {
+            Content::Read => {
+                for span in self.layout.read_plan(layer as usize, expert as usize)?.into_iter().skip(2) {
+                    // SAFETY: as in upload_head.
+                    let bytes = unsafe { span.keep_columns(base) };
+                    // SAFETY: the host slot holds this expert until the mark below completes (busy).
+                    unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), bytes)? };
+                    at += bytes;
+                }
+            }
+            Content::Packed(_) => {
+                let bytes = self.layout.roles(layer as usize)?.iter().map(|role| role.bytes).sum::<u64>();
+                if bytes > at {
                     // SAFETY: as above.
-                    unsafe { gpu.transfer(stream, &target, head, base.add(head as usize), bytes - head)? };
+                    unsafe { gpu.transfer(stream, &target, at, base.add(at as usize), bytes - at)? };
                 }
             }
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
         let mark = gpu.mark(stream)?;
-        self.slots[slot].ready_first = Some((stream, first.unwrap_or(mark)));
         self.uploaded(slot, host, stream, mark);
         Ok(())
+    }
+
+    /// Upload the downs [`request`](Self::request) left for after every gate and up; each one
+    /// that fails empties its slot, and the first failure returns once all are queued.
+    fn upload_tails(&mut self, gpu: &mut Backend) -> Result<()> {
+        let mut first_error = None;
+        for tail in std::mem::take(&mut self.tails) {
+            let (slot, host) = (tail.slot, tail.host);
+            if let Err(error) = self.upload_tail(gpu, tail) {
+                self.discard(host, Some(slot));
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// VRAM slot `slot` holds host slot `host`'s expert once `stream` passes `mark` (its gate and

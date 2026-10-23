@@ -521,6 +521,31 @@ fn a_fill_taken_at_its_gate_and_up_is_whole_after_the_rest() {
     std::fs::remove_file(&path).unwrap();
 }
 
+/// A request queues every miss's gate and up before any of their downs (so a pass waiting for
+/// the gates and ups does not wait behind another expert's down); the slots still hold every
+/// byte once the rest is awaited, from the host tier as from the drive.
+#[test]
+fn a_request_uploads_the_gates_and_ups_before_the_downs() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let mut random = Random(0x5eed_1234);
+    for step in 0..60 {
+        let mut experts: Vec<usize> = (0..2 + random.below(5)).map(|_| random.below(EXPERTS)).collect();
+        experts.sort_unstable();
+        experts.dedup();
+        store.request(&mut gpu, 0, &experts).unwrap();
+        let slots = store.acquire_gate_up(&mut gpu, 0, &experts).unwrap();
+        store.await_rest(&mut gpu).unwrap();
+        check_slots(&mut gpu, &roles, &experts, &slots, &format!("step {step}"));
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    assert!(store.counts().host_hits > 0, "{:?}", store.counts());
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// A pass's fill of experts whose roles take several read chunks uploads each chunk as it lands:
 /// [`DeviceExperts::acquire_gate_up`] gives the slots once their gate and up are in (read back
 /// right then), [`await_rest`] once their downs are too. A chunk that fails fails the pass that
