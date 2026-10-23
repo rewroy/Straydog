@@ -1765,6 +1765,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                   work.x.base(), 0, None, hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(),
                                   0, Some(split))?;
                 check_slots(shard, layer, wave, slots, expert_bytes, true)?;
+            }
+            // Queue every down before slot release can prepare write-backs on the host.
+            for shard in &mut self.shards {
                 shard.experts.release(&mut shard.gpu)?;
             }
         }
@@ -1851,6 +1854,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               hp.layers[layer].clamp_routed, true, work.product.base(), work.parts[1].base(), 0, Some(split))?;
             check_slots(shard, layer, hits, held, expert_bytes, true)?;
             check_slots(shard, layer, misses, filled, expert_bytes, true)?;
+        }
+        // Queue every down before slot release can prepare write-backs on the host.
+        for shard in &mut self.shards {
             shard.experts.release(&mut shard.gpu)?;
         }
         self.mark("routed experts")
