@@ -1129,11 +1129,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 }
             }
             let mut failed = false;
-            let mut rows = vec![0f32; outputs * part_rows + 1];
+            // One read outstanding per device (at most 1 MiB). Queue every device's copy
+            // before waiting for any, so the second device's logits move while the first
+            // wait runs. A longer read keeps the stream-synchronizing path.
+            let read = outputs * part_rows + usize::from(link);
+            let bytes = (read * std::mem::size_of::<f32>()) as u64;
+            let parallel = bytes > 0 && bytes <= 1 << 20;
+            if parallel {
+                for shard in &mut self.shards {
+                    let head = shard.work.head;
+                    shard.gpu.read_start(&head, 0, bytes)?;
+                }
+            }
+            let mut rows = vec![0f32; read];
             for (part, shard) in self.shards.iter_mut().enumerate() {
                 let head = shard.work.head;
-                let read = outputs * part_rows + usize::from(link);
-                shard.gpu.read_buffer(&head, 0, &mut rows[..read])?;
+                if parallel {
+                    shard.gpu.read_finish(&mut rows)?;
+                } else {
+                    shard.gpu.read_buffer(&head, 0, &mut rows)?;
+                }
                 for row in 0..outputs {
                     let at = row * hp.vocabulary + part * part_rows;
                     logits[at..at + part_rows].copy_from_slice(&rows[row * part_rows..(row + 1) * part_rows]);
