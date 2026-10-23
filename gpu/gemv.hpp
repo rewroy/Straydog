@@ -416,15 +416,39 @@ __device__ __forceinline__ float4 iq_flip(float4 a, unsigned signs) {
     a.w = __int_as_float(__float_as_int(a.w) ^ int((signs & 8u) << 28));
     return a;
 }
-// Eight values: grid words g0/g1 against activations [8l, 8l+8) with eight sign bits.
-template<int V>
+// Eight values: grid words g0/g1 against activations [8l, 8l+8) with eight sign bits. SIGNED puts
+// each sign on the grid value rather than the activation: a product's sign is the two signs'
+// exclusive or either way and its magnitude the same, so fmaf(-g, x, a) is fmaf(g, -x, a). A grid
+// value is never negative, so its sign bit is just set, from the signs shifted to put bit k at bit 31
+// (the bits below it masked off): two instructions a value instead of the flip's three. IQ2_XXS
+// keeps the flip: its experts' gate and up, unrolled by two, came out 5% slower signed on gfx1201
+// (their loads overlapped worse), where IQ2_S's took 9% less time and the IQ downs 3 to 8%.
+template<int V, bool SIGNED = true>
 __device__ __forceinline__ void iq_dot8(uint32_t g0, uint32_t g1, unsigned signs, const float* x, uint32_t stride,
                                         size_t offset, float (&sum)[V]) {
-    #pragma unroll
-    for (int v = 0; v < V; ++v) {
-        const float* values = x + v * stride + offset;
-        sum[v] = gemv_dot4(g0, iq_flip(gemv_load4(values), signs), sum[v]);
-        sum[v] = gemv_dot4(g1, iq_flip(gemv_load4(values + 4), signs >> 4), sum[v]);
+    if constexpr (SIGNED) {
+        const uint32_t high = uint32_t(signs) << 24;
+        float g[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t value = __float_as_uint(gemv_byte(k < 4 ? g0 : g1, k % 4)), sign = high << (7 - k);
+            g[k] = __uint_as_float((sign & 0x80000000u) | (value & 0x7fffffffu));
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float* values = x + v * stride + offset;
+            const float4 a = gemv_load4(values), b = gemv_load4(values + 4);
+            sum[v] = fmaf(g[0], a.x, sum[v]); sum[v] = fmaf(g[1], a.y, sum[v]); sum[v] = fmaf(g[2], a.z, sum[v]);
+            sum[v] = fmaf(g[3], a.w, sum[v]); sum[v] = fmaf(g[4], b.x, sum[v]); sum[v] = fmaf(g[5], b.y, sum[v]);
+            sum[v] = fmaf(g[6], b.z, sum[v]); sum[v] = fmaf(g[7], b.w, sum[v]);
+        }
+    } else {
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float* values = x + v * stride + offset;
+            sum[v] = gemv_dot4(g0, iq_flip(gemv_load4(values), signs), sum[v]);
+            sum[v] = gemv_dot4(g1, iq_flip(gemv_load4(values + 4), signs >> 4), sum[v]);
+        }
     }
 }
 __device__ __forceinline__ uint32_t iq_pair(const uint16_t* h, size_t index) { return uint32_t(h[index]) | uint32_t(h[index + 1]) << 16; }
@@ -441,7 +465,7 @@ template<> struct GemvFormat<16> {   // IQ2_XXS
         #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint2 g = reinterpret_cast<const uint2*>(iq_grid2xxs)[(grid >> (8 * l)) & 255];
-            iq_dot8<V>(g.x, g.y, iq_signs((aux >> (7 * l)) & 127), x, stride, unit * 32 + 8 * l, sum);
+            iq_dot8<V, false>(g.x, g.y, iq_signs((aux >> (7 * l)) & 127), x, stride, unit * 32 + 8 * l, sum);
         }
         const float db = gemv_half(h[0]) * (0.5f + float(aux >> 28)) * 0.25f;
         #pragma unroll
