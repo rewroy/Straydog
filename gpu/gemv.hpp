@@ -998,13 +998,15 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
         }
     }
 #endif
-    #define SD_UNIFORM(format) case format: gemv_fixed_kind<format, V><<<blocks, 256, 0, d.stream>>>(list, input, output); break;
+    const unsigned threads = blocks < 2u * d.compute_units ? 64 : 256;
+    blocks *= 256 / threads; // same logical waves, rows, lanes and reduction tree
+    #define SD_UNIFORM(format) case format: gemv_fixed_kind<format, V><<<blocks, threads, 0, d.stream>>>(list, input, output); break;
     if (uniform) {
         switch (list.items[0].matrix.kind) {
             SD_FAST_FORMATS(SD_UNIFORM)
-            default: gemv_fixed<V><<<blocks, 256, 0, d.stream>>>(list, input, output);
+            default: gemv_fixed<V><<<blocks, threads, 0, d.stream>>>(list, input, output);
         }
-    } else gemv_fixed<V><<<blocks, 256, 0, d.stream>>>(list, input, output);
+    } else gemv_fixed<V><<<blocks, threads, 0, d.stream>>>(list, input, output);
     #undef SD_UNIFORM
 }
 // One vector through one matrix into `output`, this device's part of `tail`'s linked sum, in one
