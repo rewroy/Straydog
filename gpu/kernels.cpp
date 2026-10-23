@@ -394,6 +394,7 @@ struct Device {
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
     bool rdna4 = false;
+    unsigned compute_units = 0;   // the device's CUs (SMs on CUDA)
     // A grouped FP16 expert GEMM for prefill exists: RDNA4 WMMA (HIP) or tensor cores (CUDA sm_70+).
     bool expert_prefill = false;
     // Decode work is captured and replayed as graphs: RDNA4 (HIP) and every CUDA device.
@@ -1786,9 +1787,15 @@ void* sd_create(int ordinal, uint64_t budget) {
             check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid1s), grids[5], grid_bytes[5]));
             iq_uploaded = true;
         }
+        {
+            hipDeviceProp_t units{}; check(hipGetDeviceProperties(&units, ordinal));
+            value->compute_units = unsigned(units.multiProcessorCount);
+        }
         #if defined(__HIPCC__)
         hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop,ordinal));
         value->rdna4=std::strncmp(prop.gcnArchName,"gfx120",6)==0;
+        // (in WGP mode, HIP's default on RDNA, multiProcessorCount counts workgroup processors: two CUs each)
+        if (value->rdna4) value->compute_units *= 2;
         value->expert_prefill=value->rdna4;
         value->graph_capture=value->rdna4;
         if (value->rdna4) {

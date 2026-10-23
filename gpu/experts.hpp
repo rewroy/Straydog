@@ -553,29 +553,34 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
     plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
     plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
+    // A launch of fewer than two 256-thread blocks a CU (a decode row's shared expert, the downs) takes
+    // 64-thread blocks: the same waves over every CU. A wave's rows, lanes and sums are the same either way.
+    const auto threads = [&](size_t waves) { return tokens * ((waves + 7) / 8) < 2 * size_t(d.compute_units) ? 64u : 256u; };
+    const auto blocks_of = [](size_t waves, unsigned threads) { return unsigned((waves + threads / 32 - 1) / (threads / 32)); };
+    const unsigned first_threads = threads(size_t(plan.top_k) * plan.waves[0]), second_threads = threads(plan.waves[1]);
     if (tail && !tail->out && stages == 1) {
-        const dim3 blocks(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
+        const dim3 blocks(blocks_of(size_t(plan.top_k) * plan.waves[0], first_threads), unsigned(tokens));
         #define SD_SLOT_GATE_SENT(format) case format: \
-            slot_gate_up_sent<format><<<blocks, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail, send_at, \
-                                                                    raise); break;
+            slot_gate_up_sent<format><<<blocks, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail, \
+                                                                              send_at, raise); break;
         switch (gate_kind) {
             SD_FAST_FORMATS(SD_SLOT_GATE_SENT)
-            default: slot_gate_up_sent<-1><<<blocks, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail,
-                                                                         send_at, raise);
+            default: slot_gate_up_sent<-1><<<blocks, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product,
+                                                                                   *tail, send_at, raise);
         }
         #undef SD_SLOT_GATE_SENT
         check(hipGetLastError());
         return true;
     }
     if (tail && (down_kind < 0 || !(stages & 2) || (tail->out && (stages != 3 || tokens != 1)))) return false;
-    const dim3 first(unsigned((size_t(plan.top_k) * plan.waves[0] + 7) / 8), unsigned(tokens));
-    const dim3 second(unsigned((plan.waves[1] + 7) / 8), unsigned(tokens));
+    const dim3 first(blocks_of(size_t(plan.top_k) * plan.waves[0], first_threads), unsigned(tokens));
+    const dim3 second(blocks_of(plan.waves[1], second_threads), unsigned(tokens));
     #define SD_SLOT_GATE(format) case format: \
-        slot_gate_up<format><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product); break;
+        slot_gate_up<format><<<first, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product); break;
     if (stages & 1) {
         switch (gate_kind) {
             SD_FAST_FORMATS(SD_SLOT_GATE)
-            default: slot_gate_up<-1><<<first, 256, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);
+            default: slot_gate_up<-1><<<first, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);
         }
         check(hipGetLastError());
     }
@@ -583,7 +588,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     if (!(stages & 2)) return true;
     if (tail) {
         #define SD_SLOT_LINKED(format) case format: \
-            slot_down_linked<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride, *tail); break;
+            slot_down_linked<format><<<second, second_threads, 0, d.stream>>>(plan, bases, product, out, out_stride, *tail); break;
         switch (down_kind) {
             SD_FAST_FORMATS(SD_SLOT_LINKED)
         }
@@ -592,10 +597,10 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
         return true;
     }
     #define SD_SLOT_DOWN(format) case format: \
-        slot_down<format><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride); break;
+        slot_down<format><<<second, second_threads, 0, d.stream>>>(plan, bases, product, out, out_stride); break;
     switch (down_kind) {
         SD_FAST_FORMATS(SD_SLOT_DOWN)
-        default: slot_down<-1><<<second, 256, 0, d.stream>>>(plan, bases, product, out, out_stride);
+        default: slot_down<-1><<<second, second_threads, 0, d.stream>>>(plan, bases, product, out, out_stride);
     }
     #undef SD_SLOT_DOWN
     check(hipGetLastError());
