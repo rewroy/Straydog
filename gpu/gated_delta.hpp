@@ -136,6 +136,8 @@ __global__ void delta_post_one(float* state, const float* packed, const float* g
 // *_in and written to state/history at the end; snapshot, when set, receives them
 // first. projections: per token qkv (10240) | gate (6144) | beta (48) | alpha (48).
 constexpr unsigned gdn_threads = 256;
+// Q/K convolution columns are shared by heads h, h+16 and h+32. history_in
+// must not alias history: an owner block can finish before another block reads.
 __global__ void __launch_bounds__(gdn_threads)
 gdn_tokens(const float* state_in, const float* history_in, float* state, float* history,
            const float* coefficients, const float* bias, const float* decay, const float* norm,
@@ -235,6 +237,17 @@ gdn_tokens(const float* state_in, const float* history_in, float* state, float* 
                 for (int i = 0; i < 4; ++i) history[i * 10240 + columns[c]] = window[c][i];
 }
 
+// Keep every head's old convolution window immutable until all blocks have read
+// it. Reuse the input arena after the 6144-value projected output, so graphs keep
+// fixed pointers and no allocation or floating-point operation is added.
+const float* gdn_history_snapshot(Device& d, const float* history) {
+    constexpr size_t offset = 4 * 48 * 128 + 6144, count = 4 * 10240;
+    if (offset + count > d.input_capacity) throw std::runtime_error("DeltaNet history scratch exceeds capacity");
+    float* snapshot = d.input + offset;
+    check(hipMemcpyAsync(snapshot, history, count * sizeof(float), hipMemcpyDeviceToDevice, d.stream));
+    return snapshot;
+}
+
 // residual (one device-resident token): the output projection adds into the
 // decoder hidden state instead of writing `output`.
 void gated_delta(Device& d, void* const* pointers, const int* kinds, void* conv, void* recurrent,
@@ -282,7 +295,8 @@ void gated_delta(Device& d, void* const* pointers, const int* kinds, void* conv,
     }
     if (steps==1) {
         // The same kernel verifies speculative tokens, so both paths agree bitwise.
-        gdn_tokens<<<48,gdn_threads,0,d.stream>>>(static_cast<float*>(recurrent),static_cast<float*>(conv),
+        const float* history_in = gdn_history_snapshot(d, static_cast<float*>(conv));
+        gdn_tokens<<<48,gdn_threads,0,d.stream>>>(static_cast<float*>(recurrent),history_in,
             static_cast<float*>(recurrent),static_cast<float*>(conv),static_cast<const float*>(pointers[5]),
             static_cast<const float*>(pointers[6]),static_cast<const float*>(pointers[7]),static_cast<const float*>(pointers[8]),
             qkv,16480,1,nullptr,d.input+4*48*128);

@@ -42,7 +42,8 @@ void verify_buffers(Device& d, DecoderLayer& plan) {
 void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, float* post) {
     void* const* p = plan.pointers.data() + 4;
     auto* conv = static_cast<float*>(plan.states[0]); auto* recurrent = static_cast<float*>(plan.states[1]);
-    gdn_tokens<<<48,gdn_threads,0,d.stream>>>(replay ? plan.snapshot + 4 * 10240 : recurrent, replay ? plan.snapshot : conv,
+    const float* history_in = replay ? plan.snapshot : gdn_history_snapshot(d, conv);
+    gdn_tokens<<<48,gdn_threads,0,d.stream>>>(replay ? plan.snapshot + 4 * 10240 : recurrent, history_in,
         recurrent, conv, static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
         static_cast<const float*>(p[8]), plan.projections, verify_projection, steps, replay ? nullptr : plan.snapshot, post);
 }
