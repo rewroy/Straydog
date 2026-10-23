@@ -1431,6 +1431,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "rayon",
  "regex",
  "serde_json",
  "sha2",
