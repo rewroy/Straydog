@@ -815,34 +815,55 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     const float* row_q = q + row * heads * dim;
     constexpr int QV = attention_heads * S / 256, KV = attention_keys * S / 256;
     float qv[QV], kv[KV];
-    // q rotated as it is staged, as op_rope_kernel rotates it
+    // One thread takes four consecutive columns. A 16-byte load, then four scalar stores into the
+    // S+1 LDS. Rope stays the scalar double path, and so does a row that is not 16-byte aligned.
     auto load = [&](size_t d0) {
-        #pragma unroll
-        for (int i = 0; i < QV; ++i) {
-            const unsigned at = t + i * 256;
-            const size_t h = head0 + at / S, col = d0 + at % S;
-            float v = 0.0f;
-            if (h < heads && col < rotated) v = row_q[h * dim + col];
-            else if (h < heads) {
-                const size_t pair = (col - rotated) / 2;
-                const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
-                const double c = turns[pair][0], s = turns[pair][1];
-                v = (col - rotated) % 2 == 0 ? float(a * c - b * s) : float(a * s + b * c);
+        const unsigned q_head = t / 16, q_col = (t % 16) * 4;
+        const size_t h = head0 + q_head, col = d0 + q_col;
+        const float* q_row = h < heads ? row_q + h * dim + col : nullptr;
+        if (q_row && col + 3 < rotated && (reinterpret_cast<uintptr_t>(q_row) & 15) == 0) {
+            const float4 g = *reinterpret_cast<const float4*>(q_row);
+            qv[0] = g.x; qv[1] = g.y; qv[2] = g.z; qv[3] = g.w;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < QV; ++j) {
+                const size_t c = col + j;
+                float v = 0.0f;
+                if (h < heads && c < rotated) v = row_q[h * dim + c];
+                else if (h < heads) {
+                    const size_t pair = (c - rotated) / 2;
+                    const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
+                    const double cs = turns[pair][0], sn = turns[pair][1];
+                    v = (c - rotated) % 2 == 0 ? float(a * cs - b * sn) : float(a * sn + b * cs);
+                }
+                qv[j] = v;
             }
-            qv[i] = v;
         }
         #pragma unroll
-        for (int i = 0; i < KV; ++i) {
-            const unsigned at = t + i * 256;
-            const float* key = keys[at / S];
-            kv[i] = key ? key[d0 + at % S] : 0.0f;
+        for (int i = 0; i < KV / 4; ++i) {
+            const unsigned group = t + unsigned(i) * 256;
+            const float* key = keys[group / 16];
+            const float* addr = key ? key + d0 + (group % 16) * 4 : nullptr;
+            if (addr && (reinterpret_cast<uintptr_t>(addr) & 15) == 0) {
+                const float4 g = *reinterpret_cast<const float4*>(addr);
+                kv[i * 4] = g.x; kv[i * 4 + 1] = g.y; kv[i * 4 + 2] = g.z; kv[i * 4 + 3] = g.w;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) kv[i * 4 + j] = addr ? addr[j] : 0.0f;
+            }
         }
     };
     auto store = [&](int buffer) {
+        const unsigned q_head = t / 16, q_col = (t % 16) * 4;
         #pragma unroll
-        for (int i = 0; i < QV; ++i) qs[buffer][(t + i * 256) / S][(t + i * 256) % S] = qv[i];
+        for (int j = 0; j < QV; ++j) qs[buffer][q_head][q_col + j] = qv[j];
         #pragma unroll
-        for (int i = 0; i < KV; ++i) ks[buffer][(t + i * 256) / S][(t + i * 256) % S] = kv[i];
+        for (int i = 0; i < KV / 4; ++i) {
+            const unsigned group = t + unsigned(i) * 256;
+            const unsigned key_index = group / 16, key_col = (group % 16) * 4;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) ks[buffer][key_index][key_col + j] = kv[i * 4 + j];
+        }
     };
     load(0);
     store(0);
