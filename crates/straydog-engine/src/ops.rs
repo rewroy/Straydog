@@ -869,6 +869,22 @@ impl Backend {
         })
     }
 
+    /// [`index_select`](Self::index_select) of one row whose weights it first forms: `weights` = the
+    /// `proj` = (weights, kind, cols) matrix (`heads` rows) . `x`, as [`linear`](Self::linear) forms
+    /// them, in the same launch where it can.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_select_proj(&mut self, proj: (&Buffer, u32, u64), x: P, q: P, keys: P, weights: M, visible: P, groups: u64, heads: u64,
+                             dim: u64, scale: f32, rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M) -> Result<()> {
+        let ((proj_weights, kind, cols), (rope_dims, positions, frequencies)) = (proj, rope);
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_index_select_proj(self.handle(), proj_weights.pointer.cast_const(), kind as i32, cols, x.cast(), q.cast(), keys.cast(),
+                                         weights.cast(), visible.cast(), groups, heads, dim, scale, rope_dims,
+                                         positions.pointer.cast_const().cast(), frequencies.pointer.cast_const().cast(), scores.cast(), k,
+                                         out.cast())
+        })
+    }
+
     pub fn top_k(&mut self, scores: P, rows: u64, groups: u64, k: u64, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_top_k(self.handle(), scores.cast(), rows, groups, k, out.cast()) })

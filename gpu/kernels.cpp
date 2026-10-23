@@ -3004,6 +3004,19 @@ int sd_op_index_scores(void* handle, const float* q, const float* keys, const fl
     SD_OP_END
 }
 
+extern "C++" {
+// sd_op_index_select's counters: a row's score blocks done (the first index_row_capacity, each zeroed by its
+// row's last block), then sd_op_index_select_proj's four (op_index_select_proj_kernel).
+constexpr size_t index_row_capacity = 65536;
+static unsigned* index_counters(Device& value) {
+    if (!value.index_rows) {
+        value.index_rows = static_cast<unsigned*>(allocate(value, (index_row_capacity + 4) * 4));
+        check(hipMemsetAsync(value.index_rows, 0, (index_row_capacity + 4) * 4, value.stream));
+    }
+    return value.index_rows;
+}
+} // extern "C++"
+
 int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible,
                        uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims,
                        const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out) {
@@ -3019,14 +3032,52 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
     if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
     op_span(value, scores, checked_floats({rows, groups}), "index scores");
     op_span(value, out, checked_floats({rows, k}), "top-k indices");
-    constexpr size_t row_capacity = 65536;
-    if (!value.index_rows) {
-        value.index_rows = static_cast<unsigned*>(allocate(value, row_capacity * 4));
-        check(hipMemsetAsync(value.index_rows, 0, row_capacity * 4, value.stream));
-    }
     op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-        value.index_rows);
+        index_counters(value));
+    SD_OP_END
+}
+
+int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kind, uint64_t proj_cols, const float* x,
+                            const float* q, const float* keys, float* weights, const int32_t* visible, uint64_t groups,
+                            uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions,
+                            const float* frequencies, float* scores, uint64_t k, int32_t* out) {
+    SD_OP_BEGIN
+    if (!proj_weights || !proj_cols || proj_cols > 8192 || !groups || groups > (uint64_t(1) << 31) || !heads || heads > 64 || !dim ||
+        !k || k > (uint64_t(1) << 31) || rope_dims % 2 || rope_dims > dim || rope_dims > 128)
+        throw std::runtime_error("invalid Straydog index shape");
+    const size_t row_bytes = matrix_row_bytes(proj_kind, size_t(proj_cols));
+    op_span(value, proj_weights, checked_product({heads, row_bytes}), "a weight matrix");
+    op_span(value, x, checked_floats({proj_cols}), "a linear input");
+    op_span(value, q, checked_floats({heads, dim}), "index queries");
+    op_span(value, keys, checked_floats({groups, dim}), "index keys");
+    op_span(value, weights, checked_floats({heads}), "index weights");
+    op_span(value, visible, 4, "visible counts");
+    op_span(value, positions, 4, "query positions");
+    if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
+    op_span(value, scores, checked_floats({groups}), "index scores");
+    op_span(value, out, checked_floats({k}), "top-k indices");
+    // The projection as sd_op_linear runs it for one vector (gemv: its lanes, widened to op_lanes), in the
+    // scores' launch where that is gemv_fixed_kind<30, 1> (BF16 rows too few for the shared-input launch).
+    const Matrix matrix{static_cast<const uint8_t*>(proj_weights), row_bytes, size_t(heads), size_t(proj_cols), 0, 0, 0, proj_kind};
+    unsigned lanes = gemv_lanes(matrix, x);
+    size_t alignment = 0;
+    if (lanes == 2 && op_lanes > 2 && matrix.cols / gemv_unit(matrix.kind, alignment) >= 32) lanes = std::min(32u, op_lanes);
+    const size_t waves = lanes ? gemv_waves(matrix, lanes) : 0;
+    if (proj_kind == 30 && lanes && waves * (32 / lanes) < 2048) {
+        FixedGemv list{};
+        list.items[0] = {matrix, 0, lanes};
+        list.count = 1;
+        const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((groups + 31) / 32);
+        op_index_select_proj_kernel<30><<<proj_blocks + chunks, 256, 0, value.stream>>>(list, x, proj_blocks, q, keys, weights, visible,
+            size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
+            index_counters(value) + index_row_capacity);
+        check(hipGetLastError());
+        return 0;
+    }
+    gemv(value, &matrix, 1, x, weights, 1, 0, 0, {}, op_lanes);
+    op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
+        size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value));
     SD_OP_END
 }
 

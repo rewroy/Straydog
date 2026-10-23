@@ -1202,16 +1202,40 @@ __global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size
     top_k_row([s](size_t g) { return s[g]; }, groups, k, out + size_t(blockIdx.x) * k, shared);
 }
 
-// op_index_scores_kernel whose q has each head's last 2 * pairs values rotated as they load (op_rope_kernel's
-// angles and arithmetic: the rotation it would have stored), then, with counters, each row's last block to
-// finish takes the row's top k (op_top_k_kernel's), reading the scores the other blocks stored from the
-// device-wide cache. counters: a row's blocks done (its last block zeroes it).
-__global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, const float* keys, const float* weights,
-                                                              const int32_t* visible, size_t groups, size_t heads, size_t dim,
-                                                              float scale, size_t pairs, const int32_t* positions,
-                                                              const float* frequencies, float* scores, size_t k, int32_t* out,
-                                                              unsigned* counters) {
-    const size_t row = blockIdx.y, g0 = size_t(blockIdx.x) * 32;
+// A count other blocks of the launch move (device-wide), and the fences around it.
+__device__ inline unsigned index_count(const unsigned* at) {
+#if defined(__HIPCC__)
+    return __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    return *static_cast<const volatile unsigned*>(at);
+#endif
+}
+__device__ inline void index_release() {
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+    __threadfence();
+#endif
+}
+__device__ inline void index_acquire() {
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+    __threadfence();
+#endif
+}
+// A block of op_index_scores_kernel (groups [32 chunk, 32 chunk + 32) of row `row`, of `chunks` blocks a
+// row) whose q has each head's last 2 * pairs values rotated as they load (op_rope_kernel's angles and
+// arithmetic: the rotation it would have stored), then, with counters, the row's last block to finish
+// takes the row's top k (op_top_k_kernel's), reading the scores the other blocks stored from the
+// device-wide cache. counters: a row's blocks done (its last block zeroes it). With weights_done, the
+// weights are another block's of the launch: read once that many blocks counted themselves done there.
+__device__ __forceinline__ void index_select_block(const float* q, const float* keys, const float* weights, const int32_t* visible,
+                                                   size_t groups, size_t heads, size_t dim, float scale, size_t pairs,
+                                                   const int32_t* positions, const float* frequencies, float* scores, size_t k,
+                                                   int32_t* out, unsigned* counters, size_t chunk, size_t row, size_t chunks,
+                                                   const unsigned* weights_done, unsigned weight_blocks) {
+    const size_t g0 = chunk * 32;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
     const size_t limit = std::min<size_t>(groups, size_t(max(visible[row], 0)));
     __shared__ float qs[64][33], ks[32][33], terms[64][33];
@@ -1250,10 +1274,25 @@ __global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, co
             for (int i = 0; i < 8; ++i) acc[i] = fmaf(qs[wave + 8 * i][c], key, acc[i]);
         }
     }
+    if (weights_done) {
+        if (!t)
+            while (index_count(weights_done) < weight_blocks) {
+#if defined(__HIPCC__)
+                __builtin_amdgcn_s_sleep(1);
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif
+            }
+        __syncthreads();
+        index_acquire();
+    }
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const size_t h = wave + 8 * i;
-        if (h < heads) terms[h][lane] = fmaxf(acc[i], 0.0f) * weights[row * heads + h];
+        if (h < heads) {
+            const float* at = weights + row * heads + h;
+            terms[h][lane] = fmaxf(acc[i], 0.0f) * (weights_done ? hc_step_load(const_cast<float*>(at)) : *at);
+        }
     }
     __syncthreads();
     const size_t g = g0 + lane;
@@ -1265,22 +1304,56 @@ __global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, co
     if (!counters) return;
     // the block's scores out before it counts itself done; the row's last block sees them all
     __shared__ bool last;
-#if defined(__HIPCC__)
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-#else
-    __threadfence();
-#endif
+    index_release();
     __syncthreads();
-    if (!t) last = atomicAdd(counters + row, 1u) == gridDim.x - 1;
+    if (!t) last = atomicAdd(counters + row, 1u) == chunks - 1;
     __syncthreads();
     if (!last) return;
-#if defined(__HIPCC__)
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-#else
-    __threadfence();
-#endif
+    index_acquire();
     if (!t) counters[row] = 0;
     __shared__ uint32_t shared[256];
     float* row_scores = scores + row * groups;
     top_k_row([row_scores](size_t index) { return hc_step_load(row_scores + index); }, groups, k, out + row * k, shared);
+}
+__global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, const float* keys, const float* weights,
+                                                              const int32_t* visible, size_t groups, size_t heads, size_t dim,
+                                                              float scale, size_t pairs, const int32_t* positions,
+                                                              const float* frequencies, float* scores, size_t k, int32_t* out,
+                                                              unsigned* counters) {
+    index_select_block(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
+                       blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0);
+}
+// op_index_select_kernel of one row with the indexer's projection of x into its weights in the same launch
+// (proj: gemv_fixed_kind<kind, 1>'s plan and waves). A block takes a ticket as it starts: the first
+// proj_blocks tickets run the projection's blocks, the rest the score blocks, which read the weights once every
+// projection block has counted itself done. Those took the earlier tickets and already run, so that wait
+// always ends. counters: [0] tickets, [1] projection blocks done, [2] blocks done (the last block zeroes the
+// three), [3] the row's score blocks done (its last block zeroes it).
+template<int kind>
+__global__ void __launch_bounds__(256) op_index_select_proj_kernel(
+        FixedGemv proj, const float* x, unsigned proj_blocks, const float* q, const float* keys, float* weights,
+        const int32_t* visible, size_t groups, size_t heads, size_t dim, float scale, size_t pairs, const int32_t* positions,
+        const float* frequencies, float* scores, size_t k, int32_t* out, unsigned* counters) {
+    __shared__ unsigned ticket;
+    if (!threadIdx.x) ticket = atomicAdd(counters, 1u);
+    __syncthreads();
+    const unsigned mine = ticket, chunks = unsigned((groups + 31) / 32), blocks = proj_blocks + chunks;
+    if (mine < proj_blocks) {
+        const size_t wave = size_t(mine) * (blockDim.x / 32) + threadIdx.x / 32;
+        const GemvItem& item = proj.items[0];
+        gemv_rows<kind, 1>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, x, proj.input_stride, weights,
+                           proj.output_stride, proj.residual);
+        index_release();
+        __syncthreads();
+        if (!threadIdx.x) atomicAdd(counters + 1, 1u);
+    } else {
+        index_select_block(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
+                           counters + 3, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks);
+    }
+    __syncthreads();
+    if (!threadIdx.x && atomicAdd(counters + 2, 1u) == blocks - 1) {
+        counters[0] = 0;
+        counters[1] = 0;
+        counters[2] = 0;
+    }
 }

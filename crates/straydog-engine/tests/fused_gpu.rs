@@ -10,6 +10,8 @@
 //! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
 //!   thousand groups, one row and four) against sd_op_rope, sd_op_index_scores and sd_op_top_k: the
 //!   same scores and indices, run twice (its row counters start over);
+//! - sd_op_index_select_proj (one row, the indexer's projection of x in the same launch, BF16 and
+//!   Q8_0 rows) against sd_op_linear and sd_op_index_select: the same weights, scores and indices;
 //! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
 //!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
 //!   64 rotated dimensions): the same bits.
@@ -332,5 +334,50 @@ fn an_index_select_matches_rope_scores_and_top_k() {
             assert_eq!(read(&mut gpu, &out_1, rows * k), read(&mut gpu, &out_2, rows * k), "{rows} rows, run {run}: indices");
         }
         assert_eq!(read(&mut gpu, &q_2, rows * heads * dim), q.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), "q unchanged");
+    }
+}
+
+#[test]
+fn an_index_select_with_its_projection_matches_the_two_ops() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x510e_527f_ade6_82d1);
+    let (heads, dim, rope_dims, k, width, groups) = (32usize, 128usize, 64usize, 512usize, 5120usize, 2500usize);
+    let frequencies: Vec<f32> = (0..rope_dims / 2).map(|i| 1.6e5f32.powf(-(2.0 * i as f32) / rope_dims as f32)).collect();
+    let frequencies = upload(&mut gpu, &frequencies);
+    let x = upload(&mut gpu, &random.floats(width, 2.0));
+    let q = upload(&mut gpu, &random.floats(heads * dim, 2.0));
+    let keys = upload(&mut gpu, &random.floats(groups * dim, 1.0));
+    let (positions, visible) = (gpu.buffer(4).unwrap(), gpu.buffer(4).unwrap());
+    gpu.write_buffer(&positions, 0, &[31_337i32]).unwrap();
+    gpu.write_buffer(&visible, 0, &[(groups - 5) as i32]).unwrap();
+    let scale = 1.0 / ((dim as f32).sqrt() * (heads as f32).sqrt());
+    let scratch = gpu.buffer(64 << 20).unwrap();
+    // BF16 rows (the fused launch), and Q8_0 rows (a GEMV, then the scores)
+    let bf16: Vec<u8> = random.floats(heads * width, 0.05).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+    let mut q8 = Vec::with_capacity(heads * width / 32 * 34);
+    for _ in 0..heads * width / 32 {
+        let bits = ((random.next() & 1) << 15) | ((8 + random.next() % 5) << 10) | (random.next() & 0x3ff);
+        q8.extend_from_slice(&(bits as u16).to_le_bytes());
+        for _ in 0..32 {
+            q8.push(random.next() as u8);
+        }
+    }
+    for (kind, bytes) in [(30u32, bf16), (8, q8)] {
+        let matrix = gpu.upload_bytes(&bytes).unwrap();
+        let fresh = |gpu: &mut Backend| (gpu.buffer((heads * 4) as u64).unwrap(), gpu.buffer((groups * 4) as u64).unwrap(),
+                                         gpu.buffer((k * 4) as u64).unwrap());
+        let (weights_1, scores_1, out_1) = fresh(&mut gpu);
+        gpu.linear(&matrix, kind, heads as u64, width as u64, 0, x.base(), 0, 1, weights_1.base(), 0, &scratch).unwrap();
+        gpu.index_select(q.base(), keys.base(), weights_1.base(), visible.base(), 1, groups as u64, heads as u64, dim as u64, scale,
+                         (rope_dims as u64, &positions, &frequencies), scores_1.base(), k as u64, out_1.base()).unwrap();
+        for run in 0..2 {
+            let (weights_2, scores_2, out_2) = fresh(&mut gpu);
+            gpu.index_select_proj((&matrix, kind, width as u64), x.base(), q.base(), keys.base(), weights_2.base(), visible.base(),
+                                  groups as u64, heads as u64, dim as u64, scale, (rope_dims as u64, &positions, &frequencies),
+                                  scores_2.base(), k as u64, out_2.base()).unwrap();
+            assert_eq!(read(&mut gpu, &weights_1, heads), read(&mut gpu, &weights_2, heads), "kind {kind}, run {run}: weights");
+            assert_eq!(read(&mut gpu, &scores_1, groups), read(&mut gpu, &scores_2, groups), "kind {kind}, run {run}: scores");
+            assert_eq!(read(&mut gpu, &out_1, k), read(&mut gpu, &out_2, k), "kind {kind}, run {run}: indices");
+        }
     }
 }

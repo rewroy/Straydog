@@ -825,6 +825,29 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_index_select_proj(
+        handle: *mut ::std::os::raw::c_void,
+        proj_weights: *const ::std::os::raw::c_void,
+        proj_kind: ::std::os::raw::c_int,
+        proj_cols: u64,
+        x: *const f32,
+        q: *const f32,
+        keys: *const f32,
+        weights: *mut f32,
+        visible: *const i32,
+        groups: u64,
+        heads: u64,
+        dim: u64,
+        scale: f32,
+        rope_dims: u64,
+        positions: *const i32,
+        frequencies: *const f32,
+        scores: *mut f32,
+        k: u64,
+        out: *mut i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_conv_silu(
         handle: *mut ::std::os::raw::c_void,
         x: *mut f32,
