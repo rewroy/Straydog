@@ -395,6 +395,9 @@ pub struct Engine<'a, T: Tensors> {
     /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
     profile_sync: bool,
+    /// Work::view calls the last decode token did not make because a graph replayed
+    /// (DS41_COUNT_VIEWS; off, so it stays 0, unless that is set).
+    views: ViewCounter,
 }
 
 /// A resident tensor (or a layer's shared expert: gate, up and down) for a device's upload thread.
@@ -735,6 +738,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             link_dirty: false,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
+            views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
         };
         engine.upload_dense()?;
         Ok(engine)
@@ -1053,6 +1057,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (hc, w) = (hp.hc, hp.width);
         let range = self.settings.layers.clone();
         self.outputs = outputs;
+        self.views.reset_token();
         // (a pass of several rows sums with a kernel: its parts' values, stored one by one into the
         // other's inbox as they form, cost more than the sum's launch saves)
         self.link_pass = self.linked && n == 1;
@@ -1250,6 +1255,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.iter().filter_map(|shard| shard.checks.as_ref()).map(|checks| checks.mismatches).sum()
     }
 
+    /// [`Work::view`] calls the last pass did not make because a recorded graph replayed
+    /// (DS41_COUNT_VIEWS). A decode token's graph of the attention skips two and its graph of the
+    /// router skips one, per device; the count stays 0 when it is off.
+    pub fn views_avoided(&self) -> u64 {
+        self.views.skipped()
+    }
+
     /// Whether a pass of `n` rows has the first device's router publish its routes (see `mailbox`):
     /// a fused router's, of a few rows, with no prediction behind them.
     fn publishes(&self, layer: usize, n: usize, predict: bool) -> bool {
@@ -1385,18 +1397,27 @@ impl<'a, T: Tensors> Engine<'a, T> {
             };
             // the rows of the batch that attend, from this row
             let attending = first + attention.full_from;
-            for index in 0..self.shards.len() {
-                let (work, target) = (self.shards[index].work.view(first), self.target(&self.shards[index].work.view(attending), 0));
-                let shard = &mut self.shards[index];
+            // A cached graph replays before any view is built (two per device: the batch and the
+            // rows that attend). A miss builds them inside the recording. The other path is unchanged.
+            let mut avoided = 0u64;
+            let devices = self.shards.len();
+            for index in 0..devices {
                 if record && fixed {
-                    recorded(shard, key(0), |shard| {
+                    if recorded(&mut self.shards[index], key(0), |shard| {
+                        let work = shard.work.view(first);
+                        let attend = shard.work.view(attending);
+                        let target = if devices == 1 { attend.out.base() } else { attend.parts[0].base() };
                         hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
                         attention_ops(shard, &work, &hp, &attention, target, link)
-                    })?;
+                    })? {
+                        avoided += 2;
+                    }
                 } else {
-                    hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
+                    let work = self.shards[index].work.view(first);
+                    hc_attention(&mut self.shards[index], &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
                 }
             }
+            self.views.replay(avoided);
             if !(record && fixed) {
                 self.mark("hyper-connections")?;
                 for index in 0..self.shards.len() {
@@ -1422,19 +1443,25 @@ impl<'a, T: Tensors> Engine<'a, T> {
             if publish {
                 self.shards[0].gpu.route_mailbox_clear()?;
             }
+            // One view per device, built only when this graph is not already stored.
+            let mut avoided = 0u64;
             for (index, shard) in self.shards.iter_mut().enumerate() {
                 // the next layer's experts are predicted on the first device alone, which publishes the routes
                 let (predict, publish) = (predict && index == 0, publish && index == 0);
-                let work = shard.work.view(attending);
                 if record {
-                    recorded(shard, key(1) | u64::from(predict) << 2 | u64::from(publish) << 3, |shard| {
+                    if recorded(shard, key(1) | u64::from(predict) << 2 | u64::from(publish) << 3, |shard| {
+                        let work = shard.work.view(attending);
                         hc_ffn(shard, &work, &hp, layer, attended, link)?;
                         router_ops(shard, &work, &hp, layer, attended, predict, publish)
-                    })?;
+                    })? {
+                        avoided += 1;
+                    }
                 } else {
+                    let work = shard.work.view(attending);
                     hc_ffn(shard, &work, &hp, layer, attended, link)?;
                 }
             }
+            self.views.replay(avoided);
             if !record {
                 self.mark("hyper-connections")?;
                 for (index, shard) in self.shards.iter_mut().enumerate() {
@@ -1918,16 +1945,46 @@ struct AttentionPlan {
     saves: bool,
 }
 
-/// Queue `ops` on a device from the graph recorded under `key`, recording it the first time.
-fn recorded(shard: &mut Shard, key: u64, ops: impl FnOnce(&mut Shard) -> Result<()>) -> Result<()> {
+/// Work::view calls skipped while a decode token's graphs replay (DS41_COUNT_VIEWS; otherwise unused).
+struct ViewCounter {
+    enabled: bool,
+    skipped: u64,
+}
+
+impl ViewCounter {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, skipped: 0 }
+    }
+
+    fn reset_token(&mut self) {
+        if self.enabled {
+            self.skipped = 0;
+        }
+    }
+
+    fn replay(&mut self, built: u64) {
+        if self.enabled {
+            self.skipped += built;
+        }
+    }
+
+    fn skipped(&self) -> u64 {
+        self.skipped
+    }
+}
+
+/// Queue `ops` from the graph stored under `key`, recording it the first time.
+/// True when that graph replayed, so `ops` (which builds the views) did not run.
+/// The replay is one lookup. Only the first recording looks the key up again, to launch it.
+fn recorded(shard: &mut Shard, key: u64, ops: impl FnOnce(&mut Shard) -> Result<()>) -> Result<bool> {
     if shard.gpu.graph_run(key)? {
-        return Ok(());
+        return Ok(true);
     }
     shard.gpu.graph_begin()?;
     let result = ops(shard);
     shard.gpu.graph_end(key, result.is_ok())?;
     result?;
-    if shard.gpu.graph_run(key)? { Ok(()) } else { Err("a recorded graph went missing".into()) }
+    if shard.gpu.graph_run(key)? { Ok(false) } else { Err("a recorded graph went missing".into()) }
 }
 
 /// The hyper-connection weights of a sublayer and its input norm.
@@ -2261,6 +2318,21 @@ impl Work {
 #[cfg(test)]
 mod tests {
     use super::divided;
+
+    #[test]
+    fn a_view_count_stays_off_until_a_replay_is_counted() {
+        let mut off = super::ViewCounter::new(false);
+        off.replay(2);
+        off.replay(1);
+        assert_eq!(off.skipped(), 0);
+        let mut on = super::ViewCounter::new(true);
+        on.reset_token();
+        on.replay(2);
+        on.replay(1);
+        assert_eq!(on.skipped(), 3, "a device's attention graph skips two views and its router graph one");
+        on.reset_token();
+        assert_eq!(on.skipped(), 0);
+    }
 
     #[test]
     fn a_pass_packs_its_four_position_vectors_into_one_image() {
