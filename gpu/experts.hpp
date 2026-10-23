@@ -334,6 +334,55 @@ __device__ __forceinline__ uint64_t slot_base(const SlotExperts& plan, const uin
 __host__ __device__ constexpr bool slot_heavy(int kind) {
     return kind == 10 || kind == 11 || kind == 12 || kind == 13 || kind == 14 || kind == 23;
 }
+// One IQ2_XXS unit's scale and codebook index. The bytes are the same ones GemvFormat<16> reads.
+struct Iq2xxsTerms {
+    uint32_t grid, aux;
+    float scale;
+};
+__device__ __forceinline__ Iq2xxsTerms iq2xxs_terms(const uint8_t* row, size_t unit) {
+    const uint16_t* h = reinterpret_cast<const uint16_t*>(row + (unit / 8) * 66);
+    const unsigned ib = unsigned(unit % 8);
+    const uint32_t grid = iq_pair(h, 1 + 4 * ib), aux = iq_pair(h, 3 + 4 * ib);
+    const float scale = gemv_half(h[0]) * (0.5f + float(aux >> 28)) * 0.25f;
+    return {grid, aux, scale};
+}
+// Paired gate/up only: the unit's eight activation vectors and both rows' grid rows are loaded
+// before either row's FMAs. The flips, the four-group sum and the scale stay in GemvFormat<16>'s
+// order. Down still calls GemvFormat::dots.
+__device__ __forceinline__ void slot_iq2xxs_grids(const uint8_t* first, const uint8_t* second, size_t unit, const float* x,
+                                                  float& a, float& b) {
+    const Iq2xxsTerms t0 = iq2xxs_terms(first, unit);
+    Iq2xxsTerms t1{};
+    if (second) t1 = iq2xxs_terms(second, unit);
+    const float* base = x + unit * 32;
+    float4 act[8];
+    uint2 g0[4], g1[4];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) act[i] = gemv_load4(base + 4 * i);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) g0[l] = reinterpret_cast<const uint2*>(iq_grid2xxs)[(t0.grid >> (8 * l)) & 255];
+    if (second) {
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) g1[l] = reinterpret_cast<const uint2*>(iq_grid2xxs)[(t1.grid >> (8 * l)) & 255];
+    }
+#if defined(__HIPCC__)
+    // Keep the loads above the FMAs. This is not a wait.
+    asm volatile("" ::: "memory");
+#endif
+    auto consume = [](const Iq2xxsTerms& terms, const uint2 (&grid)[4], const float4 (&act)[8], float& acc) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const unsigned signs = iq_signs((terms.aux >> (7 * l)) & 127);
+            sum = gemv_dot4(grid[l].x, iq_flip(act[2 * l], signs), sum);
+            sum = gemv_dot4(grid[l].y, iq_flip(act[2 * l + 1], signs >> 4), sum);
+        }
+        const float dot = terms.scale * sum;
+        acc += dot;
+    };
+    consume(t0, g0, act, a);
+    if (second) consume(t1, g1, act, b);
+}
 // This lane's shares of two rows' dots with x: `kind`'s units over `lanes` lanes, or (kind < 0) the
 // reference element decoder of `format` over the wave. (PAIRED: gate and up, two rows a lane)
 template<int kind, bool PAIRED = false>
@@ -351,11 +400,15 @@ __device__ __forceinline__ void slot_dots(const uint8_t* first, const uint8_t* s
     } else if constexpr (kind >= 0) {
         const size_t units = cols / GemvFormat<kind>::elements;
         const auto step = [&](size_t unit) {
-            float da[1], db[1];
-            GemvFormat<kind>::template dots<1>(first, unit, x, 0, da);
-            if (second) GemvFormat<kind>::template dots<1>(second, unit, x, 0, db);
-            a += da[0];
-            if (second) b += db[0];
+            if constexpr (PAIRED && kind == 16) {
+                slot_iq2xxs_grids(first, second, unit, x, a, b);
+            } else {
+                float da[1], db[1];
+                GemvFormat<kind>::template dots<1>(first, unit, x, 0, da);
+                if (second) GemvFormat<kind>::template dots<1>(second, unit, x, 0, db);
+                a += da[0];
+                if (second) b += db[0];
+            }
         };
         if constexpr (PAIRED && kind != 16) {
             // Gate and up a unit at a time: unrolled, their registers kept fewer waves resident (DeepSeek-V4.1's
