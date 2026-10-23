@@ -7,6 +7,9 @@
 //! - sd_op_norm_linears_rope (DeepSeek-V4.1's decode q_a norm and q_b on one of two GPUs, with
 //!   the kv row's norm and rope into a ring row beside them) against sd_op_rms_norm, sd_op_linears
 //!   and sd_op_norm_rope: the same bits;
+//! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
+//!   thousand groups, one row and four) against sd_op_rope, sd_op_index_scores and sd_op_top_k: the
+//!   same scores and indices, run twice (its row counters start over);
 //! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
 //!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
 //!   64 rotated dimensions): the same bits.
@@ -291,4 +294,43 @@ fn shapes_that_overflow_are_refused() {
     assert!(gpu.attention_prepare(buffer.base(), buffer.base(), buffer.base(), 1, 1, 1, 64, &floats, &floats, 1e-6, 0, &floats, &floats,
                                   buffer.base(), buffer.base(), buffer.base(), buffer.base(), huge).is_err());
     assert!(gpu.swiglu_linear(&buffer, 8, huge, 256, buffer.base(), buffer.base(), None, buffer.base(), buffer.base()).is_err());
+}
+
+#[test]
+fn an_index_select_matches_rope_scores_and_top_k() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0xa54f_f53a_5f1d_36f1);
+    let (heads, dim, rope_dims, k) = (32usize, 128usize, 64usize, 512usize);
+    let frequencies: Vec<f32> = (0..rope_dims / 2).map(|i| 1.6e5f32.powf(-(2.0 * i as f32) / rope_dims as f32)).collect();
+    let frequencies = upload(&mut gpu, &frequencies);
+    for (rows, groups) in [(1usize, 3000usize), (4, 2000), (1, 300)] {
+        let q = random.floats(rows * heads * dim, 2.0);
+        let keys = upload(&mut gpu, &random.floats(groups * dim, 1.0));
+        let weights = upload(&mut gpu, &random.floats(rows * heads, 1.0));
+        let visible: Vec<i32> = (0..rows).map(|row| (groups - 3 * row) as i32).collect();
+        let (positions, visible) = (gpu.buffer((rows * 4) as u64).unwrap(), {
+            let buffer = gpu.buffer((rows * 4) as u64).unwrap();
+            gpu.write_buffer(&buffer, 0, &visible).unwrap();
+            buffer
+        });
+        let at: Vec<i32> = (0..rows).map(|row| 20_000 + 7 * row as i32).collect();
+        gpu.write_buffer(&positions, 0, &at).unwrap();
+        let scale = 1.0 / ((dim as f32).sqrt() * (heads as f32).sqrt());
+        // apart
+        let (q_1, scores_1, out_1) = (upload(&mut gpu, &q), gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
+        gpu.rope(q_1.base(), rows as u64, heads as u64, dim as u64, rope_dims as u64, &positions, &frequencies, false).unwrap();
+        gpu.index_scores(q_1.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64,
+                         scale, scores_1.base()).unwrap();
+        gpu.top_k(scores_1.base(), rows as u64, groups as u64, k as u64, out_1.base()).unwrap();
+        // one launch, twice
+        let q_2 = upload(&mut gpu, &q);
+        for run in 0..2 {
+            let (scores_2, out_2) = (gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
+            gpu.index_select(q_2.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64,
+                             scale, (rope_dims as u64, &positions, &frequencies), scores_2.base(), k as u64, out_2.base()).unwrap();
+            assert_eq!(read(&mut gpu, &scores_1, rows * groups), read(&mut gpu, &scores_2, rows * groups), "{rows} rows, run {run}: scores");
+            assert_eq!(read(&mut gpu, &out_1, rows * k), read(&mut gpu, &out_2, rows * k), "{rows} rows, run {run}: indices");
+        }
+        assert_eq!(read(&mut gpu, &q_2, rows * heads * dim), q.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), "q unchanged");
+    }
 }

@@ -1109,17 +1109,16 @@ __device__ uint32_t top_k_offset(uint32_t value, uint32_t* shared) {
     }
     return shared[threadIdx.x] - value;
 }
-__global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size_t groups, size_t k, int32_t* out) {
-    const size_t row = blockIdx.x;
-    const float* s = scores + row * groups;
-    __shared__ uint32_t shared[256];
+// A row's top k over its `groups` scores (score(g) loads score g) by the block, into out (k slots).
+template<class Score>
+__device__ void top_k_row(Score score, size_t groups, size_t k, int32_t* out, uint32_t* shared) {
     const size_t per = (groups + blockDim.x - 1) / blockDim.x, begin = std::min(groups, threadIdx.x * per);
     const size_t end = std::min(groups, begin + per);
     const uint32_t floor = top_k_key(-INFINITY);
     auto count = [&](uint32_t at_least) {
         uint32_t n = 0;
         for (size_t g = begin; g < end; ++g) {
-            const uint32_t key = top_k_key(s[g]);
+            const uint32_t key = top_k_key(score(g));
             n += key > floor && key >= at_least;
         }
         return top_k_sum(n, shared);
@@ -1135,14 +1134,14 @@ __global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size
     // keys above the threshold are kept; of those equal to it, the lowest indices fill the rest
     uint32_t above = 0, ties = 0;
     for (size_t g = begin; g < end; ++g) {
-        const uint32_t key = top_k_key(s[g]);
+        const uint32_t key = top_k_key(score(g));
         above += key > floor && key > threshold;
         ties += key > floor && key == threshold;
     }
     const uint32_t need = uint32_t(k) - std::min<uint32_t>(uint32_t(k), top_k_sum(above, shared));
     uint32_t tie = top_k_offset(ties, shared), kept = 0;
     for (size_t g = begin; g < end; ++g) {
-        const uint32_t key = top_k_key(s[g]);
+        const uint32_t key = top_k_key(score(g));
         const bool equal = key > floor && key == threshold;
         kept += (key > floor && key > threshold) || (equal && tie < need);
         tie += equal;
@@ -1150,11 +1149,99 @@ __global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size
     uint32_t slot = top_k_offset(kept, shared);
     tie = top_k_offset(ties, shared);
     for (size_t g = begin; g < end; ++g) {
-        const uint32_t key = top_k_key(s[g]);
+        const uint32_t key = top_k_key(score(g));
         const bool equal = key > floor && key == threshold;
-        if ((key > floor && key > threshold) || (equal && tie < need)) out[row * k + slot++] = int32_t(g);
+        if ((key > floor && key > threshold) || (equal && tie < need)) out[slot++] = int32_t(g);
         tie += equal;
     }
     const uint32_t filled = top_k_sum(kept, shared);
-    for (size_t i = filled + threadIdx.x; i < k; i += blockDim.x) out[row * k + i] = -1;
+    for (size_t i = filled + threadIdx.x; i < k; i += blockDim.x) out[i] = -1;
+}
+__global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size_t groups, size_t k, int32_t* out) {
+    const float* s = scores + size_t(blockIdx.x) * groups;
+    __shared__ uint32_t shared[256];
+    top_k_row([s](size_t g) { return s[g]; }, groups, k, out + size_t(blockIdx.x) * k, shared);
+}
+
+// op_index_scores_kernel whose q has each head's last 2 * pairs values rotated as they load (op_rope_kernel's
+// angles and arithmetic: the rotation it would have stored), then, with counters, each row's last block to
+// finish takes the row's top k (op_top_k_kernel's), reading the scores the other blocks stored from the
+// device-wide cache. counters: a row's blocks done (its last block zeroes it).
+__global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, const float* keys, const float* weights,
+                                                              const int32_t* visible, size_t groups, size_t heads, size_t dim,
+                                                              float scale, size_t pairs, const int32_t* positions,
+                                                              const float* frequencies, float* scores, size_t k, int32_t* out,
+                                                              unsigned* counters) {
+    const size_t row = blockIdx.y, g0 = size_t(blockIdx.x) * 32;
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
+    const size_t limit = std::min<size_t>(groups, size_t(max(visible[row], 0)));
+    __shared__ float qs[64][33], ks[32][33], terms[64][33];
+    __shared__ double turns[64][2];
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+        double sine, cosine;
+        sincos(double(positions[row]) * double(frequencies[pair]), &sine, &cosine);
+        turns[pair][0] = cosine; turns[pair][1] = sine;
+    }
+    const size_t rotated = dim - 2 * pairs;
+    float acc[8] = {};
+    const float* row_q = q + row * heads * dim;
+    for (size_t d0 = 0; d0 < dim; d0 += 32) {
+        __syncthreads();
+        for (unsigned i = t; i < 64 * 32; i += blockDim.x) {
+            const size_t h = i / 32, col = d0 + i % 32;
+            float v = 0.0f;
+            if (h < heads && col < rotated) v = row_q[h * dim + col];
+            else if (h < heads && col < dim) {
+                const size_t pair = (col - rotated) / 2;
+                const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
+                const double c = turns[pair][0], s = turns[pair][1];
+                v = (col - rotated) % 2 == 0 ? float(a * c - b * s) : float(a * s + b * c);
+            }
+            qs[i / 32][i % 32] = v;
+        }
+        for (unsigned i = t; i < 32 * 32; i += blockDim.x) {
+            const size_t g = g0 + i / 32, col = d0 + i % 32;
+            ks[i / 32][i % 32] = g < limit && col < dim ? keys[g * dim + col] : 0.0f;
+        }
+        __syncthreads();
+        const int width = int(std::min<size_t>(32, dim - d0));
+        for (int c = 0; c < width; ++c) {
+            const float key = ks[lane][c];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] = fmaf(qs[wave + 8 * i][c], key, acc[i]);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const size_t h = wave + 8 * i;
+        if (h < heads) terms[h][lane] = fmaxf(acc[i], 0.0f) * weights[row * heads + h];
+    }
+    __syncthreads();
+    const size_t g = g0 + lane;
+    if (!wave && g < groups) {
+        float total = 0.0f;
+        for (size_t h = 0; h < heads; ++h) total += terms[h][lane];
+        scores[row * groups + g] = g < limit ? total * scale : -INFINITY;
+    }
+    if (!counters) return;
+    // the block's scores out before it counts itself done; the row's last block sees them all
+    __shared__ bool last;
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+    __threadfence();
+#endif
+    __syncthreads();
+    if (!t) last = atomicAdd(counters + row, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+    __threadfence();
+#endif
+    if (!t) counters[row] = 0;
+    __shared__ uint32_t shared[256];
+    float* row_scores = scores + row * groups;
+    top_k_row([row_scores](size_t index) { return hc_step_load(row_scores + index); }, groups, k, out + row * k, shared);
 }

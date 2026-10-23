@@ -216,6 +216,9 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
 int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
 int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);
+/* sd_op_rope of q (rope_dims, positions, frequencies; q itself unchanged), sd_op_index_scores and
+   sd_op_top_k of the scores in one launch: the same scores and indices. */
+int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out);
 
 /* Token mixers (any shape; gpu/token_mixing.hpp). conv_silu: x (steps x channels) becomes SiLU of
    each channel's causal convolution with its taps (channels x kernel, kernel <= 8) over history

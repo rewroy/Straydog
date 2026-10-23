@@ -1972,14 +1972,13 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         if c.index_source == layer && plan.groups > 0 && n > 0 {
             let keys = shard.sources[&c.kv_source].keys;
             shard.linear(&name(layer, "indexer.attn_q_b"), normed_q.base(), n, work.index_q.base())?;
-            shard.gpu.rope(work.index_q.base(), n as u64, hp.index_heads as u64, hp.index_dim as u64, rope, &q_work.positions, &freqs,
-                           false)?;
             shard.linear(&name(layer, "indexer.proj"), q_work.x.base(), n, work.index_w.base())?;
+            // index_q rotated as the scores read it, and each row's top groups, in one launch
             let scale = 1.0 / ((hp.index_dim as f32).sqrt() * (hp.index_heads as f32).sqrt());
-            shard.gpu.index_scores(work.index_q.base(), keys.base(), work.index_w.base(), q_work.visible[c.ratio].base(), n as u64,
-                                   plan.groups as u64, hp.index_heads as u64, hp.index_dim as u64, scale, work.scores.base())?;
             let chosen = q_work.chosen[&layer];
-            shard.gpu.top_k(work.scores.base(), n as u64, plan.groups as u64, hp.index_top_k as u64, chosen.base())?;
+            shard.gpu.index_select(work.index_q.base(), keys.base(), work.index_w.base(), q_work.visible[c.ratio].base(), n as u64,
+                                   plan.groups as u64, hp.index_heads as u64, hp.index_dim as u64, scale, (rope, &q_work.positions, &freqs),
+                                   work.scores.base(), hp.index_top_k as u64, chosen.base())?;
         }
         if plan.groups > 0 {
             compressed = Some((shard.sources[&c.kv_source].rows, plan.groups, q_work.chosen[&c.index_source]));

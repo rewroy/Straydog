@@ -457,6 +457,8 @@ struct Device {
     uint8_t* route_mailbox = nullptr;
     // sd_op_sparse_attention's tile counters (zero between launches: each tile's last share resets its own)
     unsigned* attention_tiles = nullptr;
+    // sd_op_index_select's row counters (zero between launches: each row's last block resets its own)
+    unsigned* index_rows = nullptr;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
     // Or, when the last call passed its few routes by value, those (reused alike).
     uint64_t inline_routes[32] = {};
@@ -2896,6 +2898,32 @@ int sd_op_index_scores(void* handle, const float* q, const float* keys, const fl
     if (heads > 64) throw std::runtime_error("invalid Straydog index shape");
     op_index_scores_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, scores);
+    SD_OP_END
+}
+
+int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible,
+                       uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims,
+                       const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out) {
+    SD_OP_BEGIN
+    if (!rows || rows > 65535 || !groups || groups > (uint64_t(1) << 31) || !heads || heads > 64 || !dim || !k ||
+        k > (uint64_t(1) << 31) || rope_dims % 2 || rope_dims > dim || rope_dims > 128)
+        throw std::runtime_error("invalid Straydog index shape");
+    op_span(value, q, checked_floats({rows, heads, dim}), "index queries");
+    op_span(value, keys, checked_floats({groups, dim}), "index keys");
+    op_span(value, weights, checked_floats({rows, heads}), "index weights");
+    op_span(value, visible, checked_floats({rows}), "visible counts");
+    op_span(value, positions, checked_floats({rows}), "query positions");
+    if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
+    op_span(value, scores, checked_floats({rows, groups}), "index scores");
+    op_span(value, out, checked_floats({rows, k}), "top-k indices");
+    constexpr size_t row_capacity = 65536;
+    if (!value.index_rows) {
+        value.index_rows = static_cast<unsigned*>(allocate(value, row_capacity * 4));
+        check(hipMemsetAsync(value.index_rows, 0, row_capacity * 4, value.stream));
+    }
+    op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
+        size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
+        value.index_rows);
     SD_OP_END
 }
 

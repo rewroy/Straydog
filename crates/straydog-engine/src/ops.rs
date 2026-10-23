@@ -839,6 +839,21 @@ impl Backend {
         })
     }
 
+    /// [`rope`](Self::rope) of q (`rope` = (dims, positions, frequencies); q itself unchanged),
+    /// [`index_scores`](Self::index_scores) and [`top_k`](Self::top_k) of its scores in one launch:
+    /// the same scores and indices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_select(&mut self, q: P, keys: P, weights: P, visible: P, rows: u64, groups: u64, heads: u64, dim: u64, scale: f32,
+                        rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M) -> Result<()> {
+        let (rope_dims, positions, frequencies) = rope;
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_index_select(self.handle(), q.cast(), keys.cast(), weights.cast(), visible.cast(), rows, groups, heads, dim, scale,
+                                    rope_dims, positions.pointer.cast_const().cast(), frequencies.pointer.cast_const().cast(),
+                                    scores.cast(), k, out.cast())
+        })
+    }
+
     pub fn top_k(&mut self, scores: P, rows: u64, groups: u64, k: u64, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_top_k(self.handle(), scores.cast(), rows, groups, k, out.cast()) })
