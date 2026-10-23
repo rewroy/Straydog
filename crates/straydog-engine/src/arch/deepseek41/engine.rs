@@ -179,6 +179,9 @@ struct Work {
     /// With several devices: this device's parts of the attention's and the experts' outputs (of
     /// the experts', its columns; the others stay zero).
     parts: [Buffer; 2],
+    /// positions, ring rows and visible[1..=2]: four segments of a pass's own rows, one allocation.
+    /// A longer pass's arena keeps the four apart and uploads them one by one.
+    schedule: Buffer,
     positions: Buffer,
     ring_rows: Buffer,
     visible: [Buffer; 3],
@@ -419,6 +422,18 @@ fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
     formats::matrix_bytes(kind, 1, cols).ok_or_else(|| format!("unsupported tensor type {kind}"))
 }
 
+/// Host image of one upload into `schedule`: `stride` i32s each of positions, ring rows,
+/// visible[1] and visible[2]. A pass's rows sit at the start of each segment.
+fn pack_schedule(stride: usize, positions: &[i32], ring_rows: &[i32], visible1: &[i32], visible2: &[i32]) -> Vec<i32> {
+    let n = positions.len();
+    let mut packed = vec![0i32; stride * 4];
+    packed[..n].copy_from_slice(positions);
+    packed[stride..stride + n].copy_from_slice(ring_rows);
+    packed[stride * 2..stride * 2 + n].copy_from_slice(visible1);
+    packed[stride * 3..stride * 3 + n].copy_from_slice(visible2);
+    packed
+}
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}.weight")
 }
@@ -481,6 +496,14 @@ impl Shard {
         let split = if parts > 1 { own } else { 0 };
         // a wave's activations: at most the pass's routes and a wave's
         let routes = (own * k).min(r).max(own);
+        // Four i32 vectors of a pass's own rows, contiguous so one upload fills them.
+        let schedule_rows = own.max(1);
+        let schedule = floats(&mut gpu, schedule_rows * 4)?;
+        let segment = (schedule_rows * 4) as u64;
+        let positions = schedule.slice(0, segment);
+        let ring_rows = schedule.slice(segment, segment);
+        let visible_1 = schedule.slice(segment * 2, segment);
+        let visible_2 = schedule.slice(segment * 3, segment);
         let work = Work {
             stream: floats(&mut gpu, own * hc * w)?,
             stream2: floats(&mut gpu, own * hc * w)?,
@@ -494,9 +517,10 @@ impl Shard {
             x: floats(&mut gpu, own * w)?,
             out: floats(&mut gpu, own * w)?,
             parts: [floats(&mut gpu, split * w)?, floats(&mut gpu, split * w)?],
-            positions: floats(&mut gpu, own)?,
-            ring_rows: floats(&mut gpu, own)?,
-            visible: [floats(&mut gpu, own)?, floats(&mut gpu, own)?, floats(&mut gpu, own)?],
+            schedule,
+            positions,
+            ring_rows,
+            visible: [floats(&mut gpu, own)?, visible_1, visible_2],
             chosen,
             ids: floats(&mut gpu, own * k + PREDICTED)?,
             weights: floats(&mut gpu, own * k)?,
@@ -1067,10 +1091,23 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         for shard in &mut self.shards {
             let work = &shard.work;
-            shard.gpu.write_buffer(&work.positions, 0, &positions)?;
-            shard.gpu.write_buffer(&work.ring_rows, 0, &ring_rows)?;
-            for ratio in [1usize, 2] {
-                shard.gpu.write_buffer(&work.visible[ratio], 0, &visible[ratio])?;
+            let stride = (work.positions.bytes / 4) as usize;
+            // Own-row buffers are four contiguous segments. A longer pass's arena aligns
+            // each buffer, so those stay four uploads.
+            let one = stride > 0 && positions.len() <= stride && work.ring_rows.bytes == work.positions.bytes
+                && work.visible[1].bytes == work.positions.bytes && work.visible[2].bytes == work.positions.bytes
+                && work.positions.bytes.checked_mul(4) == Some(work.schedule.bytes)
+                && work.ring_rows.base() == work.positions.at(stride)
+                && work.visible[1].base() == work.positions.at(stride * 2)
+                && work.visible[2].base() == work.positions.at(stride * 3);
+            if one {
+                let image = pack_schedule(stride, &positions, &ring_rows, &visible[1], &visible[2]);
+                shard.gpu.write_buffer(&work.schedule, 0, &image)?;
+            } else {
+                shard.gpu.write_buffer(&work.positions, 0, &positions)?;
+                shard.gpu.write_buffer(&work.ring_rows, 0, &ring_rows)?;
+                shard.gpu.write_buffer(&work.visible[1], 0, &visible[1])?;
+                shard.gpu.write_buffer(&work.visible[2], 0, &visible[2])?;
             }
             if !stream.is_empty() {
                 shard.gpu.write_buffer(&work.stream, 0, &stream)?;
@@ -2224,6 +2261,12 @@ impl Work {
 #[cfg(test)]
 mod tests {
     use super::divided;
+
+    #[test]
+    fn a_pass_packs_its_four_position_vectors_into_one_image() {
+        let packed = super::pack_schedule(4, &[10, 11], &[2, 3], &[7, 8], &[1, 1]);
+        assert_eq!(packed, vec![10, 11, 0, 0, 2, 3, 0, 0, 7, 8, 0, 0, 1, 1, 0, 0]);
+    }
 
     #[test]
     fn only_the_attention_and_the_shared_experts_and_the_head_are_divided() {
