@@ -170,11 +170,23 @@ struct ReadJob {
     len: u64,
     target: HostPointer,
     verifier: Option<(Verifier, usize)>,
-    done: Sender<(usize, Landed)>,
+    done: Sender<(usize, Chunk, Landed)>,
     slot: usize,
+    chunk: Chunk,
     /// Set when the read's expert is no longer wanted (a prefetch the pass did not need): a
     /// chunk not yet started is skipped.
     cancelled: Arc<AtomicBool>,
+}
+
+/// A chunk's role bytes, for a fill that uploads each chunk as it lands (see
+/// [`DeviceExperts::read`]): `bytes` bytes at `host` in the host slot go to `vram` in the VRAM
+/// slot; `head` for a chunk of the first two roles (gate and up).
+#[derive(Debug, Clone, Copy)]
+struct Chunk {
+    host: u64,
+    vram: u64,
+    bytes: u64,
+    head: bool,
 }
 
 /// How a chunk's read ended.
@@ -220,7 +232,7 @@ impl Reader {
                         Err(_) => Landed::Failed(format!("the read at {} panicked", job.offset)),
                     }
                 };
-                let _ = job.done.send((job.slot, landed));
+                let _ = job.done.send((job.slot, job.chunk, landed));
             })
         }).collect();
         Reader { queue, workers }
@@ -352,6 +364,12 @@ struct HostSlot {
     skipped: bool,
     /// The VRAM slot that uploads this slot's expert once its reads land.
     waiter: Option<usize>,
+    /// Its waiter uploads each chunk as it lands (an urgent fill's read), rather than the whole
+    /// expert once every chunk is in; `head` chunks (gate and up) still to come, and whether a
+    /// chunk's copy was queued.
+    streamed: bool,
+    head: u32,
+    copied: bool,
     class: usize,
     /// Its arena in the class, and its offset there.
     arena: usize,
@@ -477,8 +495,8 @@ pub struct DeviceExperts {
     map: HashMap<Key, usize>,
     host: Vec<HostSlot>,
     host_map: HashMap<Key, usize>,
-    done_tx: Sender<(usize, Landed)>,
-    done_rx: Receiver<(usize, Landed)>,
+    done_tx: Sender<(usize, Chunk, Landed)>,
+    done_rx: Receiver<(usize, Chunk, Landed)>,
     clock: u64,
     /// Slots acquired since the last release, kept from eviction until then.
     in_use: Vec<usize>,
@@ -690,10 +708,18 @@ impl DeviceExperts {
     }
 
     /// The compute stream waits for the rest of the fills [`acquire_gate_up`](Self::acquire_gate_up)
-    /// took (their downs).
+    /// took (their downs), the host first for the reads of those still landing.
     pub fn await_rest(&mut self, gpu: &mut Backend) -> Result<()> {
         let rest = std::mem::take(&mut self.rest);
-        self.wait_uploads(gpu, &rest, false)
+        let started = std::time::Instant::now();
+        let result = (|| {
+            while rest.iter().any(|&slot| self.slots[slot].waiting.is_some()) {
+                self.pump(gpu, true)?;
+            }
+            self.wait_uploads(gpu, &rest, false)
+        })();
+        self.counts.store_seconds += started.elapsed().as_secs_f64();
+        result
     }
 
     fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
@@ -791,7 +817,7 @@ impl DeviceExperts {
         // layer cancelled may be taken before its read lands: the read then drops the expert, and
         // it is read again here (an urgent read, never cancelled, so this ends).
         loop {
-            while slots.iter().any(|&slot| self.slots[slot].waiting.is_some()) {
+            while slots.iter().any(|&slot| self.landing(slot, first)) {
                 self.pump(gpu, true)?;
             }
             let mut again = false;
@@ -813,7 +839,7 @@ impl DeviceExperts {
         }
         self.wait_uploads(gpu, &slots, first)?;
         if first {
-            self.rest.extend(slots.iter().copied().filter(|&slot| self.slots[slot].ready.is_some()));
+            self.rest.extend(slots.iter().copied().filter(|&slot| self.slots[slot].ready.is_some() || self.slots[slot].waiting.is_some()));
         }
         if slots.iter().any(|&slot| self.slots[slot].taken_back) {
             return Err("an acquire found an expert in a lent slot its lender has back".into());
@@ -821,12 +847,26 @@ impl DeviceExperts {
         Ok(slots.iter().map(|&slot| self.slot_buffer(slot)).collect())
     }
 
-    /// The compute stream waits for these slots' uploads (with `first`, for their gate and up). Each
-    /// upload stream runs in order: its newest mark among them covers its others.
+    /// Whether VRAM slot `slot`'s fill still waits for reads: with `first`, for its gate's and up's
+    /// (a streamed fill whose chunks of them are all in no longer does).
+    fn landing(&self, slot: usize, first: bool) -> bool {
+        self.slots[slot].waiting.is_some_and(|host| {
+            let entry = &self.host[host];
+            !(first && entry.streamed && entry.head == 0 && entry.failed.is_none())
+        })
+    }
+
+    /// The compute stream waits for these slots' uploads (with `first`, for their gate and up: a
+    /// streamed fill's down may still be landing). Each upload stream runs in order: its newest
+    /// mark among them covers its others.
     fn wait_uploads(&mut self, gpu: &mut Backend, slots: &[usize], first: bool) -> Result<()> {
         for stream in [Stream::Upload, Stream::LaterUpload] {
             // (an upload known complete has no mark left to wait for)
-            let mark_of = |slot: &VramSlot| if first { slot.ready.and(slot.ready_first) } else { slot.ready };
+            let mark_of = |slot: &VramSlot| match first {
+                true if slot.waiting.is_some() => slot.ready_first,
+                true => slot.ready.and(slot.ready_first),
+                false => slot.ready,
+            };
             let newest = slots.iter().filter_map(|&slot| mark_of(&self.slots[slot]).filter(|ready| ready.0 == stream)).map(|ready| ready.1).max();
             let Some(mark) = newest else { continue };
             if gpu.mark_done(mark, false)? {
@@ -932,8 +972,14 @@ impl DeviceExperts {
                 return Err("a lent expert slot is taken back while a pass holds it".into());
             }
             if let Some(host) = self.slots[slot].waiting.take() {
-                // the read lands in the host tier, for no slot
+                // the read lands in the host tier, for no slot (after the chunks a streamed fill
+                // already copied into it)
                 self.host[host].waiter = None;
+                if std::mem::take(&mut self.host[host].streamed) && self.host[host].copied {
+                    let copies = gpu.mark(Stream::Upload)?;
+                    self.host[host].busy = Some(copies);
+                    waits.push(copies);
+                }
                 self.empty_slot(slot);
             } else {
                 self.evict(gpu, slot)?;
@@ -1038,7 +1084,11 @@ impl DeviceExperts {
             }
             None => {
                 self.counts.drive_reads += 1;
-                self.read(gpu, key, urgent).map(|host| {
+                // A pass's fill uploads each chunk as it lands (prefetches, and a layer whose slots
+                // keep some columns, upload once every chunk is in).
+                let streamed = urgent && !self.layout.columns.keys().any(|&(layer, _)| layer == key.0 as usize);
+                let started = if streamed { self.start_stream(slot) } else { Ok(()) };
+                started.and_then(|()| self.read(gpu, key, urgent, streamed)).map(|host| {
                     self.slots[slot].waiting = Some(host);
                     self.host[host].waiter = Some(slot);
                 })
@@ -1097,8 +1147,15 @@ impl DeviceExperts {
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
         let mark = gpu.mark(stream)?;
-        self.slots[slot].ready = Some((stream, mark));
         self.slots[slot].ready_first = Some((stream, first.unwrap_or(mark)));
+        self.uploaded(slot, host, stream, mark);
+        Ok(())
+    }
+
+    /// VRAM slot `slot` holds host slot `host`'s expert once `stream` passes `mark` (its gate and
+    /// up at its `ready_first`); the host tier gives the expert up.
+    fn uploaded(&mut self, slot: usize, host: usize, stream: Stream, mark: Mark) {
+        self.slots[slot].ready = Some((stream, mark));
         self.vram_changes += 1;
         self.slots[slot].waiting = None;
         let entry = &mut self.host[host];
@@ -1110,12 +1167,56 @@ impl DeviceExperts {
             class.host_lru.remove(&(entry.used, host));
             class.host_free.push_back(host);
         }
+    }
+
+    /// A streamed fill of VRAM slot `slot`: no upload of it is known yet.
+    fn start_stream(&mut self, slot: usize) -> Result<()> {
+        let entry = &mut self.slots[slot];
+        if entry.taken_back {
+            return Err("an upload into a lent expert slot its lender has back".into());
+        }
+        entry.ready = None;
+        entry.ready_first = None;
+        Ok(())
+    }
+
+    /// A landed chunk of a streamed fill's read: its role bytes go to the waiting VRAM slot on the
+    /// upload stream (the first after the slot's previous expert: its last compute use, a download
+    /// from it), and once the gate's and up's chunks are all in, the slot's `ready_first`.
+    /// Nothing after a chunk of the read failed (the fill is then dropped: see [`pump`](Self::pump)).
+    fn stream_chunk(&mut self, gpu: &mut Backend, host: usize, chunk: Chunk) -> Result<()> {
+        let entry = &self.host[host];
+        let Some(slot) = entry.waiter.filter(|_| entry.streamed && entry.failed.is_none() && !entry.skipped) else { return Ok(()) };
+        if self.slots[slot].taken_back {
+            return Err("an upload into a lent expert slot its lender has back".into());
+        }
+        if !self.host[host].copied {
+            self.host[host].copied = true;
+            for guard in std::mem::take(&mut self.slots[slot].guards).into_iter().flatten() {
+                gpu.wait_mark(Stream::Upload, guard)?;
+            }
+        }
+        if chunk.bytes > 0 {
+            let base = self.host_pointer(host);
+            let target = self.slot_buffer(slot);
+            // SAFETY: the chunk's bytes lie inside the host slot, read and checked; the host slot
+            // keeps them until the fill's last mark completes (busy).
+            unsafe { gpu.transfer(Stream::Upload, &target, chunk.vram, base.add(chunk.host as usize), chunk.bytes)? };
+        }
+        if chunk.head {
+            self.host[host].head -= 1;
+            if self.host[host].head == 0 {
+                self.slots[slot].ready_first = Some((Stream::Upload, gpu.mark(Stream::Upload)?));
+            }
+        }
         Ok(())
     }
 
     /// Start reading `key` from the drive into a host slot (a staging slot when the host tier
-    /// holds nothing).
-    fn read(&mut self, gpu: &mut Backend, key: Key, urgent: bool) -> Result<usize> {
+    /// holds nothing). With `streamed`, the VRAM slot the caller then makes its waiter uploads
+    /// each chunk's role bytes as the chunk lands (roles back to back: a layer without kept
+    /// columns), so that only the last chunk's copy follows the last read.
+    fn read(&mut self, gpu: &mut Backend, key: Key, urgent: bool, streamed: bool) -> Result<usize> {
         let class = self.class_of[key.0 as usize].ok_or("a read for a layer without routed experts")?;
         let host = self.free_host(gpu, class)?;
         let plan = self.layout.read_plan(key.0 as usize, key.1 as usize)?;
@@ -1123,26 +1224,35 @@ impl DeviceExperts {
         let base = self.host_pointer(host);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut jobs = Vec::new();
-        for span in plan {
+        let (mut vram, mut head) = (0u64, 0u32);
+        for (role, span) in plan.into_iter().enumerate() {
             let handle = self.layout.files[span.file].0.clone();
             let mut done = 0;
             while done < span.len {
                 let piece = CHUNK.min(span.len - done);
+                // the role's bytes in this piece of the span, and where they go in the VRAM slot
+                let (from, to) = ((span.at + done).max(span.data), (span.at + done + piece).min(span.data + span.bytes));
+                let chunk = Chunk { host: from, vram: vram + from.saturating_sub(span.data), bytes: to.saturating_sub(from), head: role < 2 };
+                head += u32::from(chunk.head);
                 jobs.push(ReadJob {
                     file: handle.clone(), offset: span.offset + done, len: piece,
                     // SAFETY: inside the host slot (its class's host_bytes covers every role's whole blocks).
                     target: HostPointer(unsafe { base.add((span.at + done) as usize) }),
                     verifier: self.layout.verifier.clone().map(|verify| (verify, span.file)),
-                    done: self.done_tx.clone(), slot: host, cancelled: cancel.clone(),
+                    done: self.done_tx.clone(), slot: host, chunk, cancelled: cancel.clone(),
                 });
                 done += piece;
             }
+            vram += span.bytes;
         }
         let entry = &mut self.host[host];
         entry.key = Some(key);
         entry.content = Content::Reading(jobs.len() as u32);
         entry.cancel = cancel;
         entry.skipped = false;
+        entry.streamed = streamed;
+        entry.head = head;
+        entry.copied = false;
         self.reading += 1;
         self.host_map.insert(key, host);
         self.reader.submit(jobs, urgent);
@@ -1170,8 +1280,9 @@ impl DeviceExperts {
         }
         landed.extend(self.done_rx.try_iter());
         let mut first_error = None;
-        for (host, result) in landed {
+        for (host, chunk, result) in landed {
             let entry = &mut self.host[host];
+            let read = matches!(result, Landed::Read);
             match result {
                 Landed::Read => {}
                 Landed::Skipped => entry.skipped = true,
@@ -1180,12 +1291,35 @@ impl DeviceExperts {
                 }
             }
             let Content::Reading(left) = entry.content else { continue };
+            if read {
+                if let Err(error) = self.stream_chunk(gpu, host, chunk) {
+                    self.host[host].failed.get_or_insert(error);
+                }
+            }
+            let entry = &mut self.host[host];
             entry.content = if left > 1 { Content::Reading(left - 1) } else { Content::Read };
             if left > 1 {
                 continue;
             }
             self.reading -= 1;
             let waiting = entry.waiter;
+            let streamed = std::mem::take(&mut entry.streamed);
+            if streamed && entry.copied && (entry.skipped || entry.failed.is_some()) {
+                if let Some(slot) = waiting {
+                    // Chunks already copied into the slot (after its guards), and ops queued once its
+                    // gate and up were in: the slot's next fill and the host slot's next read wait
+                    // for them.
+                    match (gpu.mark(Stream::Upload), gpu.mark(Stream::Compute)) {
+                        (Ok(copies), Ok(uses)) => {
+                            self.slots[slot].guards = [Some(uses), Some(copies)];
+                            self.host[host].busy = Some(copies);
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+            }
             if std::mem::take(&mut self.host[host].skipped) {
                 // A cancelled prefetch: its slots are free again, nothing failed.
                 self.host[host].failed = None;
@@ -1203,6 +1337,21 @@ impl DeviceExperts {
                 continue;
             }
             match waiting {
+                Some(slot) if streamed => {
+                    // every chunk is in: the fill completes with the last one's copy
+                    match gpu.mark(Stream::Upload) {
+                        Ok(mark) => {
+                            if self.slots[slot].ready_first.is_none() {
+                                self.slots[slot].ready_first = Some((Stream::Upload, mark));
+                            }
+                            self.uploaded(slot, host, Stream::Upload, mark);
+                        }
+                        Err(error) => {
+                            self.discard(host, Some(slot));
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
                 Some(slot) => {
                     let stream = if self.slots[slot].speculative { Stream::LaterUpload } else { Stream::Upload };
                     if let Err(error) = self.upload(gpu, slot, host, stream) {
@@ -1398,7 +1547,7 @@ impl DeviceExperts {
         entry.hosts += 1;
         self.host.push(HostSlot {
             key: None, content: Content::Read, busy: None, used: 0, failed: None, cancel: Arc::new(AtomicBool::new(false)),
-            skipped: false, waiter: None, class, arena, at,
+            skipped: false, waiter: None, streamed: false, head: 0, copied: false, class, arena, at,
         });
         self.host.len() - 1
     }
@@ -1455,7 +1604,7 @@ impl DeviceExperts {
             if self.classes[class].host_capacity == 0 || self.map.contains_key(&key) || self.host_map.contains_key(&key) {
                 continue;
             }
-            self.read(gpu, key, false)?;
+            self.read(gpu, key, false, false)?;
         }
         for &(layer, expert) in vram {
             if self.class_of.get(layer).copied().flatten().is_some() {
@@ -1570,7 +1719,7 @@ impl DeviceExperts {
         if !urgent {
             self.counts.prefetched += 1;
         }
-        self.read(gpu, key, urgent).map(drop)
+        self.read(gpu, key, urgent, false).map(drop)
     }
 
     /// Wait for a drive read to land (and take every landed one). A read no pass holds a slot for

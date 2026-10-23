@@ -520,3 +520,85 @@ fn a_fill_taken_at_its_gate_and_up_is_whole_after_the_rest() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// A pass's fill of experts whose roles take several read chunks uploads each chunk as it lands:
+/// [`DeviceExperts::acquire_gate_up`] gives the slots once their gate and up are in (read back
+/// right then), [`await_rest`] once their downs are too. A chunk that fails fails the pass that
+/// waits for it, the down's in await_rest and the gate's or up's in the acquire, and the expert
+/// is read again whole on its next use.
+#[test]
+fn a_streamed_fill_lands_chunk_by_chunk() {
+    let layers = sized_roles([600_001, 600_001, 400_003], STRIDES);
+    let roles = layers[0].clone().unwrap();
+    let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
+    let path = std::env::temp_dir().join(format!("straydog-experts-{}-streamed", std::process::id()));
+    std::fs::write(&path, (0..end + 333).map(byte).collect::<Vec<u8>>()).unwrap();
+    // The block a failing read covers (none: u64::MAX), and how many more reads of it fail.
+    let bad = Arc::new(AtomicU64::new(u64::MAX));
+    let failures = Arc::new(AtomicU64::new(0));
+    let (block, left) = (bad.clone(), failures.clone());
+    // A failing chunk takes 100 ms: the expert's other chunks land long before it.
+    let verifier: Verifier = Arc::new(move |_, offset, data: &[u8]| {
+        for (index, &value) in data.iter().enumerate() {
+            let at = offset + index as u64;
+            if at < end + 333 && value != byte(at) {
+                return Err(format!("byte {at} read wrong"));
+            }
+        }
+        let covers = (offset..offset + data.len() as u64).contains(&block.load(Ordering::Relaxed));
+        if covers && left.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            left.fetch_sub(1, Ordering::Relaxed);
+            return Err("a block does not verify".to_string());
+        }
+        Ok(())
+    });
+    let layout = Arc::new(Layout::new(&[File::open(&path).unwrap()], layers.clone(), Some(verifier)).unwrap());
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, 1 << 24).unwrap();
+    let head = (roles[0].bytes + roles[1].bytes) as usize;
+    let check_heads = |gpu: &mut Backend, experts: &[usize], slots: &[straydog_engine::ops::Buffer], what: &str| {
+        for (&expert, slot) in experts.iter().zip(slots) {
+            let want = expected(&roles, expert);
+            let mut got = vec![0u8; head];
+            gpu.read_buffer(slot, 0, &mut got).unwrap();
+            assert!(got == want[..head], "{what}: expert {expert}'s gate and up differ from the file");
+        }
+    };
+    let mut random = Random(0x2468_ace0);
+    for step in 0..30 {
+        let mut experts: Vec<usize> = (0..1 + random.below(5)).map(|_| random.below(EXPERTS)).collect();
+        experts.sort_unstable();
+        experts.dedup();
+        let slots = store.acquire_gate_up(&mut gpu, 0, &experts).unwrap();
+        check_heads(&mut gpu, &experts, &slots, &format!("step {step}"));
+        store.await_rest(&mut gpu).unwrap();
+        check_slots(&mut gpu, &roles, &experts, &slots, &format!("step {step}"));
+        store.release(&mut gpu).unwrap();
+    }
+    // A failing chunk of a down, then of a gate (each in the middle of its rows, of an expert no
+    // slot holds now).
+    let gone = |store: &DeviceExperts| (0..EXPERTS).find(|&expert| !store.in_vram(0, expert) && !store.in_host(0, expert)).unwrap();
+    for (role, what) in [(2, "a down's chunk"), (0, "a gate's chunk")] {
+        let expert = gone(&store);
+        bad.store((roles[role].base + expert as u64 * roles[role].stride + roles[role].stride / 2) & !4095, Ordering::Relaxed);
+        failures.store(1, Ordering::Relaxed);
+        if role == 2 {
+            let slots = store.acquire_gate_up(&mut gpu, 0, &[expert]).unwrap();
+            check_heads(&mut gpu, &[expert], &slots, what);
+            assert!(store.await_rest(&mut gpu).unwrap_err().contains("does not verify"), "{what}");
+        } else {
+            assert!(store.acquire_gate_up(&mut gpu, 0, &[expert]).unwrap_err().contains("does not verify"), "{what}");
+        }
+        store.release(&mut gpu).unwrap();
+        assert!(!store.in_vram(0, expert) && !store.in_host(0, expert), "{what}: the expert stays in neither tier");
+        let slots = store.acquire_gate_up(&mut gpu, 0, &[expert]).unwrap();
+        store.await_rest(&mut gpu).unwrap();
+        check_slots(&mut gpu, &roles, &[expert], &slots, &format!("after {what}"));
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    assert!(store.counts().drive_bytes > 0);
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
