@@ -398,6 +398,9 @@ pub struct Engine<'a, T: Tensors> {
     /// Work::view calls the last decode token did not make because a graph replayed
     /// (DS41_COUNT_VIEWS; off, so it stays 0, unless that is set).
     views: ViewCounter,
+    /// Position whose one-token schedule was queued after the previous logits' copy, before that
+    /// copy was waited for. The next one-token pass there skips the upload.
+    primed: Option<usize>,
 }
 
 /// A resident tensor (or a layer's shared expert: gate, up and down) for a device's upload thread.
@@ -423,6 +426,47 @@ fn frequencies(dims: usize, rope: &Rope) -> Vec<f32> {
 
 fn row_bytes(kind: u32, cols: usize) -> Result<usize> {
     formats::matrix_bytes(kind, 1, cols).ok_or_else(|| format!("unsupported tensor type {kind}"))
+}
+
+/// Positions, ring rows, visible[1] and visible[2] of a pass of `n` tokens from `start`.
+fn pass_schedule(start: usize, n: usize, ring: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let mut positions = Vec::with_capacity(n);
+    let mut ring_rows = Vec::with_capacity(n);
+    let mut visible1 = Vec::with_capacity(n);
+    let mut visible2 = Vec::with_capacity(n);
+    for p in start..start + n {
+        positions.push(p as i32);
+        ring_rows.push((p % ring) as i32);
+        visible1.push((p + 1) as i32);
+        #[allow(clippy::manual_div_ceil)] // visible groups of ratio 2
+        visible2.push(((p + 1) / 2) as i32);
+    }
+    (positions, ring_rows, visible1, visible2)
+}
+
+/// Own-row buffers are four contiguous segments of one schedule. A longer pass's arena is not.
+fn schedule_is_packed(work: &Work, rows: usize) -> bool {
+    let stride = (work.positions.bytes / 4) as usize;
+    stride > 0 && rows <= stride && work.ring_rows.bytes == work.positions.bytes
+        && work.visible[1].bytes == work.positions.bytes && work.visible[2].bytes == work.positions.bytes
+        && work.positions.bytes.checked_mul(4) == Some(work.schedule.bytes)
+        && work.ring_rows.base() == work.positions.at(stride)
+        && work.visible[1].base() == work.positions.at(stride * 2)
+        && work.visible[2].base() == work.positions.at(stride * 3)
+}
+
+fn upload_rows(shard: &mut Shard, positions: &[i32], ring_rows: &[i32], visible1: &[i32], visible2: &[i32]) -> Result<()> {
+    let work = &shard.work;
+    if schedule_is_packed(work, positions.len()) {
+        let stride = (work.positions.bytes / 4) as usize;
+        let image = pack_schedule(stride, positions, ring_rows, visible1, visible2);
+        shard.gpu.write_buffer(&work.schedule, 0, &image)
+    } else {
+        shard.gpu.write_buffer(&work.positions, 0, positions)?;
+        shard.gpu.write_buffer(&work.ring_rows, 0, ring_rows)?;
+        shard.gpu.write_buffer(&work.visible[1], 0, visible1)?;
+        shard.gpu.write_buffer(&work.visible[2], 0, visible2)
+    }
 }
 
 /// Host image of one upload into `schedule`: `stride` i32s each of positions, ring rows,
@@ -739,6 +783,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
+            primed: None,
         };
         engine.upload_dense()?;
         Ok(engine)
@@ -938,6 +983,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position = 0;
         self.history.clear();
         self.rewind = None;
+        self.primed = None;
         for source in self.sources.values_mut() {
             source.groups = 0;
             source.tail = 0;
@@ -1076,9 +1122,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             sources: self.sources.iter().map(|(&layer, source)| (layer, (source.groups, source.tail))).collect(),
         });
         self.rewind = None;
-        let positions: Vec<i32> = (start..start + n).map(|p| p as i32).collect();
-        let ring_rows: Vec<i32> = (start..start + n).map(|p| (p % self.ring) as i32).collect();
-        let visible: Vec<Vec<i32>> = (0..3).map(|ratio| (start..start + n).map(|p| ((p + 1) / ratio.max(1)) as i32).collect()).collect();
+        let (positions, ring_rows, visible1, visible2) = pass_schedule(start, n, self.ring);
+        // The previous pass queued this one-token schedule behind its logit copy.
+        let skip = n == 1 && self.primed.take() == Some(start);
         // embeddings repeated into the hc copies
         let mut stream = Vec::new();
         if range.start == 0 {
@@ -1095,27 +1141,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         for shard in &mut self.shards {
-            let work = &shard.work;
-            let stride = (work.positions.bytes / 4) as usize;
-            // Own-row buffers are four contiguous segments. A longer pass's arena aligns
-            // each buffer, so those stay four uploads.
-            let one = stride > 0 && positions.len() <= stride && work.ring_rows.bytes == work.positions.bytes
-                && work.visible[1].bytes == work.positions.bytes && work.visible[2].bytes == work.positions.bytes
-                && work.positions.bytes.checked_mul(4) == Some(work.schedule.bytes)
-                && work.ring_rows.base() == work.positions.at(stride)
-                && work.visible[1].base() == work.positions.at(stride * 2)
-                && work.visible[2].base() == work.positions.at(stride * 3);
-            if one {
-                let image = pack_schedule(stride, &positions, &ring_rows, &visible[1], &visible[2]);
-                shard.gpu.write_buffer(&work.schedule, 0, &image)?;
-            } else {
-                shard.gpu.write_buffer(&work.positions, 0, &positions)?;
-                shard.gpu.write_buffer(&work.ring_rows, 0, &ring_rows)?;
-                shard.gpu.write_buffer(&work.visible[1], 0, &visible[1])?;
-                shard.gpu.write_buffer(&work.visible[2], 0, &visible[2])?;
+            if !(skip && schedule_is_packed(&shard.work, positions.len())) {
+                upload_rows(shard, &positions, &ring_rows, &visible1, &visible2)?;
             }
             if !stream.is_empty() {
-                shard.gpu.write_buffer(&work.stream, 0, &stream)?;
+                shard.gpu.write_buffer(&shard.work.stream, 0, &stream)?;
             }
         }
         if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
@@ -1182,6 +1212,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let head = shard.work.head;
                     shard.gpu.read_start(&head, 0, bytes)?;
                 }
+                // The next one-token schedule depends only on the position. Queue it on this stream
+                // before the copy is waited for. The embedding still waits for the token.
+                self.prime_next_row(start + n)?;
             }
             let mut rows = vec![0f32; read];
             for (part, shard) in self.shards.iter_mut().enumerate() {
@@ -1255,6 +1288,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.iter().filter_map(|shard| shard.checks.as_ref()).map(|checks| checks.mismatches).sum()
     }
 
+    /// Queue the next one-token schedule behind the logit copy, when those buffers are the packed
+    /// own-row schedule and another token fits. A longer pass uploads its own rows later.
+    fn prime_next_row(&mut self, next: usize) -> Result<()> {
+        if next >= self.settings.context || self.shards.iter().any(|shard| !schedule_is_packed(&shard.work, 1)) {
+            return Ok(());
+        }
+        let (positions, ring_rows, visible1, visible2) = pass_schedule(next, 1, self.ring);
+        for shard in &mut self.shards {
+            upload_rows(shard, &positions, &ring_rows, &visible1, &visible2)?;
+        }
+        self.primed = Some(next);
+        Ok(())
+    }
+
     /// [`Work::view`] calls the last pass did not make because a recorded graph replayed
     /// (DS41_COUNT_VIEWS). A decode token's graph of the attention skips two and its graph of the
     /// router skips one, per device; the count stays 0 when it is off.
@@ -1292,6 +1339,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let point = self.rewind.take().ok_or("no pass of a few tokens to take back")?;
         let dim = self.hp.head_dim;
         self.position = point.start + keep;
+        self.primed = None;
         self.history.truncate(self.history.len() - (point.rows - keep));
         for (layer, (groups, tail)) in point.sources {
             let source = self.sources.get_mut(&layer).ok_or("a kv source went missing")?;
@@ -2332,6 +2380,14 @@ mod tests {
         assert_eq!(on.skipped(), 3, "a device's attention graph skips two views and its router graph one");
         on.reset_token();
         assert_eq!(on.skipped(), 0);
+    }
+
+    #[test]
+    fn the_next_token_s_schedule_is_the_row_after_this_pass() {
+        let (positions, ring_rows, visible1, visible2) = super::pass_schedule(5, 2, 8);
+        assert_eq!((&positions[..], &ring_rows[..], &visible1[..], &visible2[..]), (&[5, 6][..], &[5, 6][..], &[6, 7][..], &[3, 3][..]));
+        let (positions, ring_rows, visible1, visible2) = super::pass_schedule(7, 1, 8);
+        assert_eq!((positions, ring_rows, visible1, visible2), (vec![7], vec![7], vec![8], vec![4]));
     }
 
     #[test]
