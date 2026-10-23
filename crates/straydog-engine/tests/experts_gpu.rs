@@ -353,13 +353,35 @@ fn a_cancelled_prefetch_taken_before_it_lands() {
     std::fs::remove_file(&path).unwrap();
 }
 
+/// Page-locks a host buffer until dropped, so a panic still unregisters it.
+struct Pinned {
+    pointer: *mut u8,
+}
+
+impl Pinned {
+    fn new(buffer: &mut straydog_engine::storage::Buffer) -> Pinned {
+        let pointer = buffer.as_mut_slice().as_mut_ptr();
+        // SAFETY: `buffer` outlives the guard, and the guard unpins before `buffer` is dropped.
+        unsafe { straydog_engine::transfer::pin_host(pointer, buffer.capacity()).unwrap() };
+        Pinned { pointer }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: pinned in `new`. Copies into the range have been waited for by the time it drops,
+        // or the test is unwinding and the device is about to go with it.
+        unsafe { straydog_engine::transfer::unpin_host(self.pointer).unwrap() };
+    }
+}
+
 /// A pipelined decode step's use of the store: experts the table does not show found on the host
 /// (either layout) or read there from the drive, VRAM experts copied out, experts moved between the
 /// tiers (promote, demote); every byte the host or a slot holds is the file's.
 #[test]
 fn experts_moved_for_a_decode_table() {
     use straydog_engine::experts::HostSource;
-    use straydog_engine::transfer::{self, Stream};
+    use straydog_engine::transfer::Stream;
     let layers = roles();
     let end = layers.iter().flatten().flatten().map(|role| role.base + role.stride * EXPERTS as u64).max().unwrap();
     let path = std::env::temp_dir().join(format!("straydog-experts-{}-decode", std::process::id()));
@@ -370,8 +392,7 @@ fn experts_moved_for_a_decode_table() {
     let mut store = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(4)), 16, host_budget).unwrap();
     let slot_bytes = store.slot_size(0).unwrap() as usize;
     let mut copy = straydog_engine::storage::Buffer::new(slot_bytes);
-    // SAFETY: unpinned below, after the last copy into it was waited for.
-    unsafe { transfer::pin_host(copy.as_mut_slice().as_mut_ptr(), copy.capacity()).unwrap() };
+    let _pinned = Pinned::new(&mut copy);
     let mut random = Random(0x5eed_1234);
     let (mut from_host, mut from_drive, mut from_vram, mut promoted, mut demoted) = (0, 0, 0, 0, 0);
     for step in 0..400 {
@@ -426,8 +447,6 @@ fn experts_moved_for_a_decode_table() {
         }
     }
     store.settle(&mut gpu).unwrap();
-    // SAFETY: pinned above; every copy into it was waited for.
-    unsafe { transfer::unpin_host(copy.as_mut_slice().as_mut_ptr()).unwrap() };
     drop(store);
     std::fs::remove_file(&path).unwrap();
     assert!(from_host > 0 && from_drive > 0 && from_vram > 0 && promoted > 0 && demoted > 0,
