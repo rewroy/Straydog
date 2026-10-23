@@ -351,6 +351,10 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
     Matrix matrices[gemv_fixed_items];
     float* output = nullptr;
     fused_matrices(value, items, size_t(count), input, matrices, output);
+    // (every item reads `input`, so the widest one bounds it)
+    size_t cols = 0;
+    for (size_t i = 0; i < count; ++i) cols = matrices[i].cols > cols ? matrices[i].cols : cols;
+    op_span(value, input, checked_floats({cols}), "a linear input");
     FixedGemv list;
     size_t waves = 0;
     bool uniform = gemv_prologue_plan(matrices, size_t(count), input, op_lanes, list, waves);
