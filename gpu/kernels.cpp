@@ -2242,6 +2242,8 @@ void* sd_buffer(void* handle, uint64_t bytes) {
         catch (...) { cleanup(hipFree(pointer)); throw; }
         value.used += size_t(bytes) + allocation_tail;
         check(hipMemsetAsync(pointer, 0, size_t(bytes) + allocation_tail, value.stream));
+        // Uploads use another stream. Return only after the zeros land, or a late memset wipes them.
+        check(hipStreamSynchronize(value.stream));
         return pointer;
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
 }
