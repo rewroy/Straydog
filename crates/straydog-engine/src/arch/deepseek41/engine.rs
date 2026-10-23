@@ -2093,7 +2093,28 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         input: input as P, output,
     };
     let (q_a, kv) = (shard.dense(&name(layer, "attn_q_a"))?, shard.dense(&name(layer, "attn_kv"))?);
-    if kv_rows == n {
+    let ring = shard.rings[&layer];
+    // q (this device's heads) stays unrotated: the attention rotates it as it reads it. A decode
+    // row's q_a norm (into qn, for q_b and the indexer) and its kv row's norm and rope run in the
+    // last block of q_a's and kv's launch.
+    // q is not rotated here. The KV norm uses this layer's frequencies and, when its rows are the
+    // queries, their positions: it writes the rope table, so attention adds no launch. A KV prefix
+    // that does not attend keeps attention's own launch.
+    let same_rows = plan.kv_from == plan.full_from && rope > 0 && n > 0 && kv_rows > 0;
+    shard.gpu.attention_turns_arm(if same_rows { kv_rows as u64 } else { 0 })?;
+    let fused = n == 1 && kv_rows == 1;
+    let normed_q = if fused { work.qn } else { work.qr };
+    if fused {
+        let (q_a_norm, kv_norm) = (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
+        let side = ops::NormRope {
+            input: work.kv.base() as P, weight: &kv_norm.buffer, width: dim as u64, eps: hp.norm_eps,
+            rope: Some((rope, &kv_work.positions, &freqs)), out_rows: Some(kv_work.ring_rows.base() as P), out: ring.base(),
+            out_count: plan.ring_rows,
+        };
+        shard.gpu.linears_norm_rope(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())],
+                                    work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64, hp.norm_eps, work.qn.base(), &side)?;
+        shard.linear(&name(layer, "attn_q_b"), work.qn.base(), 1, work.q.base())?;
+    } else if kv_rows == n {
         if n > 0 {
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())], n as u64, 0,
                               0, &scratch)?;
@@ -2104,28 +2125,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base())], n as u64, 0, 0, &scratch)?;
         }
     }
-    let ring = shard.rings[&layer];
-    // q (this device's heads) stays unrotated: the attention rotates it as it reads it. A decode
-    // row's q_a norm runs in q_b's launch (its first block keeping the normed row, for the
-    // indexer), with the kv row's norm and rope in a block of its own beside them.
-    // q is not rotated here. The KV norm uses this layer's frequencies and, when its rows are the
-    // queries, their positions: it writes the rope table, so attention adds no launch. A KV prefix
-    // that does not attend keeps attention's own launch.
-    let same_rows = plan.kv_from == plan.full_from && rope > 0 && n > 0 && kv_rows > 0;
-    shard.gpu.attention_turns_arm(if same_rows { kv_rows as u64 } else { 0 })?;
-    let fused = n == 1 && kv_rows == 1;
-    let normed_q = if fused { work.qn } else { work.qr };
-    if fused {
-        let (q_a_norm, q_b, kv_norm) =
-            (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_q_b"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
-        let side = ops::NormRope {
-            input: work.kv.base() as P, weight: &kv_norm.buffer, width: dim as u64, eps: hp.norm_eps,
-            rope: Some((rope, &kv_work.positions, &freqs)), out_rows: Some(kv_work.ring_rows.base() as P), out: ring.base(),
-            out_count: plan.ring_rows,
-        };
-        shard.gpu.norm_linears_rope(work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64, hp.norm_eps, work.qn.base(),
-                                    &[whole(&q_b, work.qn.base(), work.q.base())], &side)?;
-    } else {
+    if !fused {
         if n > 0 {
             shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
             shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;

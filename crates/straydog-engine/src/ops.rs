@@ -282,6 +282,31 @@ impl Backend {
         })
     }
 
+    /// One vector through `items` (every one reading the same input), then the RMS norm of `x` (one of
+    /// their outputs) into `normed` and `side` as [`norm_rope`](Self::norm_rope) makes it: the results
+    /// of the three ops, in one launch where the GEMV takes it (its last block forms the norm and the
+    /// side row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linears_norm_rope(&mut self, items: &[Linear], x: P, weight: &Buffer, width: u64, eps: f32, normed: M, side: &NormRope)
+                             -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        let (rope_dims, positions, frequencies) =
+            side.rope.map_or((0, std::ptr::null(), std::ptr::null()), |(dims, p, f)| (dims, p.pointer.cast_const().cast(), f.pointer.cast_const().cast()));
+        let side = ffi::sd_norm_rope {
+            input: side.input.cast(), weight: side.weight.pointer.cast_const().cast(), width: side.width, eps: side.eps, rope_dims,
+            positions, frequencies, out_rows: side.out_rows.map_or(std::ptr::null(), |rows| rows.cast()), out: side.out.cast(),
+            out_count: side.out_count,
+        };
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linears_norm_rope(self.handle(), items.as_ptr(), items.len() as u64, x.cast(), weight.pointer.cast(), width, eps,
+                                         normed.cast(), &side)
+        })
+    }
+
     /// One vector: `out` = W . SwiGLU(gate, up) (`cols` values each; `hidden` takes the SwiGLU
     /// when it is formed apart), each row times sigmoid(`*scale`) when given: the results of
     /// [`swiglu`](Self::swiglu), [`linear`](Self::linear) and [`scale_rows`](Self::scale_rows).

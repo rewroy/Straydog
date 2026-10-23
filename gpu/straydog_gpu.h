@@ -124,6 +124,10 @@ typedef struct sd_norm_rope {
 } sd_norm_rope;
 /* sd_op_norm_linears, and side's norm and rope in the same launch (a block of its own). */
 int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_linear* items, uint64_t count, const sd_norm_rope* side);
+/* One vector through `items` (sd_op_linears, every item reading the same input), then the RMS norm
+   of x (one of their outputs) into normed and side's row as sd_op_norm_rope forms it: the results of
+   the three ops, in one launch where it can. */
+int sd_op_linears_norm_rope(void* handle, const sd_linear* items, uint64_t count, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_norm_rope* side);
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
 /* sd_op_swiglu_linear, and meanwhile (one launch where the GEMV takes it) the routes of one row of
    256 router logits as sd_op_route picks them with softmax gating, normalized, no bias, scale 1:

@@ -38,10 +38,8 @@ __device__ __forceinline__ float tree256_first_wave(const float* p, unsigned lan
 }
 
 // One block (256 threads) per row: x / sqrt(mean(x^2) + eps) * weight.
-__global__ void op_rms_norm_kernel(const float* input, const float* weight, size_t width, float eps, float* output) {
-    const float* row = input + size_t(blockIdx.x) * width;
-    float* out = output + size_t(blockIdx.x) * width;
-    __shared__ float sums[256];
+// One row's rms_norm by a block of 256 threads; `sums` is 256 floats of the block's shared memory.
+__device__ inline void op_rms_norm_row(const float* row, const float* weight, size_t width, float eps, float* out, float* sums) {
     __shared__ float total;
     float sum = 0.0f;
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) sum += row[col] * row[col];
@@ -54,6 +52,10 @@ __global__ void op_rms_norm_kernel(const float* input, const float* weight, size
     __syncthreads();
     const float scale = rsqrtf(total / float(width) + eps);
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) out[col] = row[col] * scale * weight[col];
+}
+__global__ void op_rms_norm_kernel(const float* input, const float* weight, size_t width, float eps, float* output) {
+    __shared__ float sums[256];
+    op_rms_norm_row(input + size_t(blockIdx.x) * width, weight, width, eps, output + size_t(blockIdx.x) * width, sums);
 }
 
 // A block's row `index`: rms_norm (op_rms_norm_kernel's arithmetic), then the last 2 * pairs values
