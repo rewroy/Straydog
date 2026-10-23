@@ -108,6 +108,22 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
    SwiGLU(gate, up) (cols floats each; hidden takes the SwiGLU where it is formed apart), each row
    times sigmoid(*scale) when scale is given. The results are those of the separate ops. */
 int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_linear* items, uint64_t count);
+/* One row's norm and rope, as sd_op_norm_rope makes them for rows 1 (input, weight, width, eps,
+   rope_dims with a position and its frequencies, out_rows: its row of out, else row 0). */
+typedef struct sd_norm_rope {
+    const float* input;
+    const float* weight;
+    uint64_t width;
+    float eps;
+    uint64_t rope_dims;
+    const int32_t* positions;
+    const float* frequencies;
+    const int32_t* out_rows;
+    float* out;
+    uint64_t out_count;
+} sd_norm_rope;
+/* sd_op_norm_linears, and side's norm and rope in the same launch (a block of its own). */
+int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_linear* items, uint64_t count, const sd_norm_rope* side);
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
 /* sd_op_swiglu_linear, and meanwhile (one launch where the GEMV takes it) the routes of one row of
    256 router logits as sd_op_route picks them with softmax gating, normalized, no bias, scale 1:

@@ -63,6 +63,20 @@ pub struct Linear {
     pub output: M,
 }
 
+/// One row for [`Backend::norm_linears_rope`] to norm and rotate beside its linears: the arguments
+/// [`Backend::norm_rope`] takes for it (`rows` 1).
+#[derive(Debug, Clone, Copy)]
+pub struct NormRope<'a> {
+    pub input: P,
+    pub weight: &'a Buffer,
+    pub width: u64,
+    pub eps: f32,
+    pub rope: Option<(u64, &'a Buffer, &'a Buffer)>,
+    pub out_rows: Option<P>,
+    pub out: M,
+    pub out_count: u64,
+}
+
 /// Tensor parallel: on every device, `outs[i]` = the sum of every device's `parts[j]` (`count`
 /// values each), added in device order, each device's stream waiting for the others' parts. A part
 /// stays unchanged until every sum has run.
@@ -241,6 +255,30 @@ impl Backend {
         check(unsafe {
             ffi::sd_op_norm_linears(self.handle(), x.cast(), weight.pointer.cast(), width, eps, normed.cast(), items.as_ptr(),
                                     items.len() as u64)
+        })
+    }
+
+    /// [`norm_linears`](Self::norm_linears), and `side`'s row normed and rotated as
+    /// [`norm_rope`](Self::norm_rope) makes it, in the same launch where it can (a block of its own):
+    /// the results of the separate ops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn norm_linears_rope(&mut self, x: P, weight: &Buffer, width: u64, eps: f32, normed: M, items: &[Linear], side: &NormRope)
+                             -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        let (rope_dims, positions, frequencies) =
+            side.rope.map_or((0, std::ptr::null(), std::ptr::null()), |(dims, p, f)| (dims, p.pointer.cast_const().cast(), f.pointer.cast_const().cast()));
+        let side = ffi::sd_norm_rope {
+            input: side.input.cast(), weight: side.weight.pointer.cast_const().cast(), width: side.width, eps: side.eps, rope_dims,
+            positions, frequencies, out_rows: side.out_rows.map_or(std::ptr::null(), |rows| rows.cast()), out: side.out.cast(),
+            out_count: side.out_count,
+        };
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_norm_linears_rope(self.handle(), x.cast(), weight.pointer.cast(), width, eps, normed.cast(), items.as_ptr(),
+                                         items.len() as u64, &side)
         })
     }
 

@@ -353,6 +353,33 @@ unsafe extern "C" {
         count: u64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_norm_rope {
+    pub input: *const f32,
+    pub weight: *const f32,
+    pub width: u64,
+    pub eps: f32,
+    pub rope_dims: u64,
+    pub positions: *const i32,
+    pub frequencies: *const f32,
+    pub out_rows: *const i32,
+    pub out: *mut f32,
+    pub out_count: u64,
+}
+unsafe extern "C" {
+    pub fn sd_op_norm_linears_rope(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        weight: *const f32,
+        width: u64,
+        eps: f32,
+        normed: *mut f32,
+        items: *const sd_linear,
+        count: u64,
+        side: *const sd_norm_rope,
+    ) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
     pub fn sd_op_swiglu_linear(
         handle: *mut ::std::os::raw::c_void,

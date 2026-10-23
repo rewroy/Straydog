@@ -9,6 +9,19 @@
 
 namespace {
 
+// One row's norm and rope (op_norm_rope_row) for a block of its own beside a GEMV's.
+struct NormRopeJob {
+    const float* input;
+    const float* weight;
+    uint32_t width;
+    float eps;
+    uint32_t pairs;
+    const int32_t* positions;
+    const float* frequencies;
+    const int32_t* rows;
+    float* output;         // null: no job
+};
+
 struct GemvPrologue {
     int mode;              // 0: x as it is; 1: silu(x) * y; 2: the RMS norm of x times y (the weight)
     const float* x;
@@ -22,7 +35,18 @@ struct GemvPrologue {
     uint32_t route_k;
     int32_t* route_ids;
     float* route_weights;
+    // With side.output (one more block, the last; not with route_logits): that block forms the
+    // side job's row meanwhile.
+    NormRopeJob side;
 };
+
+// The prologue GEMV's last block, when it runs the side job: true once it has (the block is done).
+__device__ inline bool gemv_side_job(const GemvPrologue& pro, float* sums) {
+    if (!pro.side.output || blockIdx.x != gridDim.x - 1) return false;
+    const NormRopeJob& job = pro.side;
+    op_norm_rope_row(job.input, job.weight, job.width, job.eps, job.pairs, job.positions, job.frequencies, job.rows, job.output, 0, sums);
+    return true;
+}
 
 template<int kind>
 __global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* output) {
@@ -34,6 +58,7 @@ __global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* outp
         if (tid < 32) op_route_softmax256_wave(pro.route_logits, pro.route_k, 1, pro.route_ids, pro.route_weights, tid);
         return;
     }
+    if (gemv_side_job(pro, sums)) return;
     if (pro.mode == 2) {
         float sum = 0.0f;
         for (size_t col = tid; col < pro.width; col += blockDim.x) sum += pro.x[col] * pro.x[col];
@@ -76,6 +101,7 @@ __global__ void gemv_prologue_kind2(FixedGemv list, GemvPrologue pro, float* out
     __shared__ float sums[256];
     __shared__ float total;
     const unsigned tid = threadIdx.x;
+    if (gemv_side_job(pro, sums)) return;
     if (pro.mode == 2) {
         float sum = 0.0f;
         for (size_t col = tid; col < pro.width; col += blockDim.x) sum += pro.x[col] * pro.x[col];
@@ -138,7 +164,8 @@ bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input
 // Launch the prologue GEMV over `list` (its rows' kind must have a fast unit); false when the
 // kind has none here.
 bool gemv_prologue_launch(Device& d, const FixedGemv& list, size_t waves, const GemvPrologue& pro, float* output) {
-    const unsigned blocks = unsigned((waves + 7) / 8) + (pro.route_logits ? 1 : 0);
+    if (pro.route_logits && pro.side.output) return false;
+    const unsigned blocks = unsigned((waves + 7) / 8) + (pro.route_logits || pro.side.output ? 1 : 0);
     const size_t shared = size_t(pro.width) * 4;
     int other = list.items[0].matrix.kind;
     for (unsigned i = 1; i < list.count; ++i) if (list.items[i].matrix.kind != other) { other = list.items[i].matrix.kind; break; }
@@ -196,9 +223,31 @@ void fused_matrices(Device& value, const sd_linear* items, size_t count, const f
 
 } // namespace
 
-int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed,
-                       const sd_linear* items, uint64_t count) {
-    SD_OP_BEGIN
+namespace {
+// The side job of sd_op_norm_linears_rope, checked as sd_op_norm_rope checks one row.
+NormRopeJob norm_rope_job(Device& value, const sd_norm_rope& side) {
+    if (!side.width || side.width > (uint64_t(1) << 24) || side.rope_dims % 2 || side.rope_dims > side.width ||
+        (!side.out_rows && side.out_count < 1))
+        throw std::runtime_error("invalid Straydog norm shape");
+    op_span(value, side.input, checked_floats({side.width}), "a norm input");
+    op_span(value, side.weight, checked_floats({side.width}), "a norm weight");
+    if (side.rope_dims) {
+        op_span(value, side.positions, 4, "rope positions");
+        op_span(value, side.frequencies, checked_floats({side.rope_dims / 2}), "rope frequencies");
+    }
+    op_span(value, side.out, checked_floats({side.out_count, side.width}), "a norm output");
+    if (side.out_rows) {
+        op_span(value, side.out_rows, 4, "output rows");
+        if (side.out == side.input) throw std::runtime_error("a scattered norm cannot run in place");
+    }
+    return NormRopeJob{side.input, side.weight, uint32_t(side.width), side.eps, uint32_t(side.rope_dims / 2), side.positions,
+                       side.frequencies, side.out_rows, side.out};
+}
+
+// sd_op_norm_linears, with a side job (else output null) in the same launch where it can (else
+// after the linears).
+void norm_linears(Device& value, const float* x, const float* weight, uint64_t width, float eps, float* normed,
+                  const sd_linear* items, uint64_t count, const NormRopeJob& side) {
     if (!width || width > 8192 || !items || !count || count > gemv_fixed_items) throw std::runtime_error("invalid Straydog norm linears");
     op_span(value, x, size_t(width) * 4, "a norm input");
     op_span(value, weight, size_t(width) * 4, "a norm weight");
@@ -210,10 +259,11 @@ int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64
         if (matrices[i].cols != width) throw std::runtime_error("a norm linear's columns differ from the norm's width");
     FixedGemv list;
     size_t waves = 0;
-    if (gemv_prologue_plan(matrices, size_t(count), normed, op_lanes, list, waves) &&
-        gemv_prologue_launch(value, list, waves, GemvPrologue{2, x, weight, uint32_t(width), eps, normed}, output)) {
+    GemvPrologue pro{2, x, weight, uint32_t(width), eps, normed};
+    pro.side = side;
+    if (gemv_prologue_plan(matrices, size_t(count), normed, op_lanes, list, waves) && gemv_prologue_launch(value, list, waves, pro, output)) {
         check(hipGetLastError());
-        return 0;
+        return;
     }
     op_rms_norm_kernel<<<1, 256, 0, value.stream>>>(x, weight, size_t(width), eps, normed);
     // a launch per kind, as sd_op_linears groups them
@@ -234,6 +284,25 @@ int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64
         for (size_t j = 0; j < size; ++j) group[j].output_offset = size_t(output + group[j].output_offset - group_output);
         gemv(value, group, size, normed, group_output, 1, 0, 0, {}, op_lanes);
     }
+    if (side.output)
+        op_norm_rope_kernel<<<1, 256, 0, value.stream>>>(side.input, side.weight, side.width, side.eps, side.pairs, side.positions,
+                                                          side.frequencies, side.rows, side.output);
+    check(hipGetLastError());
+}
+} // namespace
+
+int sd_op_norm_linears(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed,
+                       const sd_linear* items, uint64_t count) {
+    SD_OP_BEGIN
+    norm_linears(value, x, weight, width, eps, normed, items, count, NormRopeJob{});
+    SD_OP_END
+}
+
+int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, uint64_t width, float eps, float* normed,
+                            const sd_linear* items, uint64_t count, const sd_norm_rope* side) {
+    SD_OP_BEGIN
+    if (!side) throw std::runtime_error("invalid Straydog norm shape");
+    norm_linears(value, x, weight, width, eps, normed, items, count, norm_rope_job(value, *side));
     SD_OP_END
 }
 

@@ -190,6 +190,8 @@ struct Work {
     weights: Buffer,
     // of a batch
     qr: Buffer,
+    /// A decode row's normed q_a (its norm fused into q_b's launch: see attention_ops).
+    qn: Buffer,
     q: Buffer,
     kv: Buffer,
     attended: Buffer,
@@ -495,6 +497,7 @@ impl Shard {
             ids: floats(&mut gpu, own * k + PREDICTED)?,
             weights: floats(&mut gpu, own * k)?,
             qr: floats(&mut gpu, b * hp.q_rank)?,
+            qn: floats(&mut gpu, hp.q_rank)?,
             q: floats(&mut gpu, b * hp.heads * hp.head_dim)?,
             kv: floats(&mut gpu, b * hp.head_dim)?,
             attended: floats(&mut gpu, b * hp.heads * hp.head_dim)?,
@@ -1935,15 +1938,31 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         }
     }
     let ring = shard.rings[&layer];
-    if n > 0 {
-        shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
-        // q (this device's heads) stays unrotated: the attention rotates it as it reads it
-        shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
-    }
-    if kv_rows > 0 {
-        let kv_norm = shard.dense(&name(layer, "attn_kv_a_norm"))?;
-        shard.gpu.norm_rope(work.kv.base(), &kv_norm.buffer, kv_rows as u64, dim as u64, hp.norm_eps,
-                            Some((rope, &kv_work.positions, &freqs)), Some(kv_work.ring_rows.base()), ring.base(), plan.ring_rows)?;
+    // q (this device's heads) stays unrotated: the attention rotates it as it reads it. A decode
+    // row's q_a norm runs in q_b's launch (its first block keeping the normed row, for the
+    // indexer), with the kv row's norm and rope in a block of its own beside them.
+    let fused = n == 1 && kv_rows == 1;
+    let normed_q = if fused { work.qn } else { work.qr };
+    if fused {
+        let (q_a_norm, q_b, kv_norm) =
+            (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_q_b"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
+        let side = ops::NormRope {
+            input: work.kv.base() as P, weight: &kv_norm.buffer, width: dim as u64, eps: hp.norm_eps,
+            rope: Some((rope, &kv_work.positions, &freqs)), out_rows: Some(kv_work.ring_rows.base() as P), out: ring.base(),
+            out_count: plan.ring_rows,
+        };
+        shard.gpu.norm_linears_rope(work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64, hp.norm_eps, work.qn.base(),
+                                    &[whole(&q_b, work.qn.base(), work.q.base())], &side)?;
+    } else {
+        if n > 0 {
+            shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
+            shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
+        }
+        if kv_rows > 0 {
+            let kv_norm = shard.dense(&name(layer, "attn_kv_a_norm"))?;
+            shard.gpu.norm_rope(work.kv.base(), &kv_norm.buffer, kv_rows as u64, dim as u64, hp.norm_eps,
+                                Some((rope, &kv_work.positions, &freqs)), Some(kv_work.ring_rows.base()), ring.base(), plan.ring_rows)?;
+        }
     }
     let mut compressed = None;
     if let Some(c) = plan.compressed {
@@ -1952,7 +1971,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         }
         if c.index_source == layer && plan.groups > 0 && n > 0 {
             let keys = shard.sources[&c.kv_source].keys;
-            shard.linear(&name(layer, "indexer.attn_q_b"), work.qr.base(), n, work.index_q.base())?;
+            shard.linear(&name(layer, "indexer.attn_q_b"), normed_q.base(), n, work.index_q.base())?;
             shard.gpu.rope(work.index_q.base(), n as u64, hp.index_heads as u64, hp.index_dim as u64, rope, &q_work.positions, &freqs,
                            false)?;
             shard.linear(&name(layer, "indexer.proj"), q_work.x.base(), n, work.index_w.base())?;

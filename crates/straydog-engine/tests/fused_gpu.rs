@@ -4,6 +4,9 @@
 //!   states and outputs within F32 rounding;
 //! - sd_op_norm_linears over Q8_0 and F32 rows in one launch against sd_op_rms_norm and a
 //!   sd_op_linears launch per format: the same bits;
+//! - sd_op_norm_linears_rope (DeepSeek-V4.1's decode q_a norm and q_b on one of two GPUs, with
+//!   the kv row's norm and rope into a ring row beside them) against sd_op_rms_norm, sd_op_linears
+//!   and sd_op_norm_rope: the same bits;
 //! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
 //!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
 //!   64 rotated dimensions): the same bits.
@@ -15,7 +18,7 @@
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 use straydog_engine::gpu::Backend;
-use straydog_engine::ops::{Buffer, Linear};
+use straydog_engine::ops::{Buffer, Linear, NormRope};
 
 struct Random(u64);
 impl Random {
@@ -138,6 +141,58 @@ fn norm_linears_of_two_formats_match_a_launch_per_format() {
     for (index, &(kind, rows)) in shapes.iter().enumerate() {
         assert_eq!(read(&mut gpu, &outs_1[index], rows), read(&mut gpu, &outs_2[index], rows), "kind {kind}, {rows} rows");
     }
+}
+
+#[test]
+fn norm_linears_with_a_rope_row_match_the_separate_ops() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0xbb67_ae85_84ca_a73b);
+    let (width, rows, dim, rope_dims, ring_rows, position, ring_row) = (1024usize, 4096usize, 512usize, 64usize, 8usize, 70_001i32, 5i32);
+    let x = upload(&mut gpu, &random.floats(width, 3.0));
+    let weight = upload(&mut gpu, &random.floats(width, 1.0));
+    let mut bytes = Vec::with_capacity(rows * width / 32 * 34);
+    for _ in 0..rows * width / 32 {
+        let bits = ((random.next() & 1) << 15) | ((8 + random.next() % 5) << 10) | (random.next() & 0x3ff);
+        bytes.extend_from_slice(&(bits as u16).to_le_bytes());
+        for _ in 0..32 {
+            bytes.push(random.next() as u8);
+        }
+    }
+    let matrix = gpu.upload_bytes(&bytes).unwrap();
+    let kv = upload(&mut gpu, &random.floats(dim, 3.0));
+    let kv_weight = upload(&mut gpu, &random.floats(dim, 1.0));
+    let frequencies: Vec<f32> = (0..rope_dims / 2).map(|i| 1e4f32.powf(-(2.0 * i as f32) / rope_dims as f32)).collect();
+    let frequencies = upload(&mut gpu, &frequencies);
+    let positions = gpu.buffer(4).unwrap();
+    gpu.write_buffer(&positions, 0, &[position]).unwrap();
+    let ring_index = gpu.buffer(4).unwrap();
+    gpu.write_buffer(&ring_index, 0, &[ring_row]).unwrap();
+    let ring = random.floats(ring_rows * dim, 1.0);
+    let scratch = gpu.buffer(64 << 20).unwrap();
+    let linear = |normed: &Buffer, out: &Buffer| Linear {
+        weights: matrix, kind: 8, rows: rows as u64, cols: width as u64, first_row: 0, input: normed.base(), output: out.base(),
+    };
+    // the separate ops
+    let (normed_1, out_1, ring_1) = (gpu.buffer((width * 4) as u64).unwrap(), gpu.buffer((rows * 4) as u64).unwrap(), upload(&mut gpu, &ring));
+    gpu.rms_norm(x.base(), &weight, 1, width as u64, 1e-6, normed_1.base()).unwrap();
+    gpu.linears(&[linear(&normed_1, &out_1)], 1, 0, 0, &scratch).unwrap();
+    gpu.norm_rope(kv.base(), &kv_weight, 1, dim as u64, 1e-6, Some((rope_dims as u64, &positions, &frequencies)), Some(ring_index.base()),
+                  ring_1.base(), ring_rows as u64).unwrap();
+    // one launch
+    let (normed_2, out_2, ring_2) = (gpu.buffer((width * 4) as u64).unwrap(), gpu.buffer((rows * 4) as u64).unwrap(), upload(&mut gpu, &ring));
+    let side = NormRope {
+        input: kv.base(), weight: &kv_weight, width: dim as u64, eps: 1e-6, rope: Some((rope_dims as u64, &positions, &frequencies)),
+        out_rows: Some(ring_index.base()), out: ring_2.base(), out_count: ring_rows as u64,
+    };
+    gpu.norm_linears_rope(x.base(), &weight, width as u64, 1e-6, normed_2.base(), &[linear(&normed_2, &out_2)], &side).unwrap();
+    assert_eq!(read(&mut gpu, &normed_1, width), read(&mut gpu, &normed_2, width), "the norm");
+    assert_eq!(read(&mut gpu, &out_1, rows), read(&mut gpu, &out_2, rows), "the linear");
+    assert_eq!(read(&mut gpu, &ring_1, ring_rows * dim), read(&mut gpu, &ring_2, ring_rows * dim), "the ring");
+    // a side row outside its ring, or a rope wider than its row, is refused
+    let wide = NormRope { rope: Some((2 * dim as u64 + 2, &positions, &frequencies)), ..side };
+    assert!(gpu.norm_linears_rope(x.base(), &weight, width as u64, 1e-6, normed_2.base(), &[linear(&normed_2, &out_2)], &wide).is_err());
+    let outside = NormRope { out_count: u64::MAX, ..side };
+    assert!(gpu.norm_linears_rope(x.base(), &weight, width as u64, 1e-6, normed_2.base(), &[linear(&normed_2, &out_2)], &outside).is_err());
 }
 
 #[test]

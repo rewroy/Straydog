@@ -56,13 +56,14 @@ __global__ void op_rms_norm_kernel(const float* input, const float* weight, size
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) out[col] = row[col] * scale * weight[col];
 }
 
-// One block per row: rms_norm (op_rms_norm_kernel's arithmetic), then the last 2 * pairs values
-// rotated as op_rope_kernel rotates them, stored at row rows[row] of out (row itself without rows).
-__global__ void op_norm_rope_kernel(const float* input, const float* weight, size_t width, float eps, size_t pairs,
-                                    const int32_t* positions, const float* frequencies, const int32_t* rows, float* output) {
-    const float* row = input + size_t(blockIdx.x) * width;
-    float* out = output + size_t(rows ? rows[blockIdx.x] : blockIdx.x) * width;
-    __shared__ float sums[256];
+// A block's row `index`: rms_norm (op_rms_norm_kernel's arithmetic), then the last 2 * pairs values
+// rotated as op_rope_kernel rotates them, stored at row rows[index] of out (index itself without
+// rows); `sums` is 256 floats of the block's shared memory. A block of 256 threads.
+__device__ inline void op_norm_rope_row(const float* input, const float* weight, size_t width, float eps, size_t pairs,
+                                        const int32_t* positions, const float* frequencies, const int32_t* rows, float* output,
+                                        size_t index, float* sums) {
+    const float* row = input + index * width;
+    float* out = output + size_t(rows ? rows[index] : index) * width;
     float sum = 0.0f;
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) sum += row[col] * row[col];
     sums[threadIdx.x] = sum;
@@ -76,13 +77,20 @@ __global__ void op_norm_rope_kernel(const float* input, const float* weight, siz
     for (size_t col = threadIdx.x; col < plain; col += blockDim.x) out[col] = row[col] * scale * weight[col];
     for (size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
         const size_t col = plain + 2 * pair;
-        const double angle = double(positions[blockIdx.x]) * double(frequencies[pair]);
+        const double angle = double(positions[index]) * double(frequencies[pair]);
         double s, c;
         sincos(angle, &s, &c);
         const double a = row[col] * scale * weight[col], b = row[col + 1] * scale * weight[col + 1];
         out[col] = float(a * c - b * s);
         out[col + 1] = float(a * s + b * c);
     }
+}
+
+// One block per row: op_norm_rope_row.
+__global__ void op_norm_rope_kernel(const float* input, const float* weight, size_t width, float eps, size_t pairs,
+                                    const int32_t* positions, const float* frequencies, const int32_t* rows, float* output) {
+    __shared__ float sums[256];
+    op_norm_rope_row(input, weight, width, eps, pairs, positions, frequencies, rows, output, blockIdx.x, sums);
 }
 
 // Rotate the last 2 * pairs values of each vector (adjacent pairs) by position * frequency; the
