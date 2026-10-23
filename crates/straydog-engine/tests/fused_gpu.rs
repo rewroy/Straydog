@@ -7,6 +7,8 @@
 //! - sd_op_norm_linears_rope (DeepSeek-V4.1's decode q_a norm and q_b on one of two GPUs, with
 //!   the kv row's norm and rope into a ring row beside them) against sd_op_rms_norm, sd_op_linears
 //!   and sd_op_norm_rope: the same bits;
+//! - sd_op_top_k against a reference of its rule (ties keep the lower index, -inf never kept, -1 for
+//!   empty slots) on scores with many ties, 511 to 131072 groups, top 512: the same indices;
 //! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
 //!   thousand groups, one row and four) against sd_op_rope, sd_op_index_scores and sd_op_top_k: the
 //!   same scores and indices, run twice (its row counters start over);
@@ -296,6 +298,69 @@ fn shapes_that_overflow_are_refused() {
     assert!(gpu.attention_prepare(buffer.base(), buffer.base(), buffer.base(), 1, 1, 1, 64, &floats, &floats, 1e-6, 0, &floats, &floats,
                                   buffer.base(), buffer.base(), buffer.base(), buffer.base(), huge).is_err());
     assert!(gpu.swiglu_linear(&buffer, 8, huge, 256, buffer.base(), buffer.base(), None, buffer.base(), buffer.base()).is_err());
+}
+
+/// top_k_row's order-preserving key (-0 ties +0).
+fn top_k_key(value: f32) -> u32 {
+    let bits = if value == 0.0 { 0.0f32.to_bits() } else { value.to_bits() };
+    if bits & 0x8000_0000 != 0 { !bits } else { bits | 0x8000_0000 }
+}
+
+/// The k highest scores' indices in ascending index order (ties keep the lower index; -inf is never
+/// kept), -1 for empty slots: what sd_op_top_k must give.
+fn top_k_reference(scores: &[f32], k: usize) -> Vec<u32> {
+    let floor = top_k_key(f32::NEG_INFINITY);
+    let keys: Vec<u32> = scores.iter().map(|&score| top_k_key(score)).collect();
+    let live: Vec<usize> = (0..scores.len()).filter(|&g| keys[g] > floor).collect();
+    let mut out: Vec<i32> = if live.len() <= k {
+        live.iter().map(|&g| g as i32).collect()
+    } else {
+        let mut sorted: Vec<u32> = live.iter().map(|&g| keys[g]).collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let threshold = sorted[k - 1];
+        let mut need = k - live.iter().filter(|&&g| keys[g] > threshold).count();
+        let mut kept = Vec::with_capacity(k);
+        for &g in &live {
+            if keys[g] > threshold {
+                kept.push(g as i32);
+            } else if keys[g] == threshold && need > 0 {
+                kept.push(g as i32);
+                need -= 1;
+            }
+        }
+        kept
+    };
+    out.resize(k, -1);
+    out.into_iter().map(|index| index as u32).collect()
+}
+
+#[test]
+fn top_k_matches_its_reference_with_many_ties() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x2f6b_91d3_c0a5_4e77);
+    let k = 512usize;
+    for groups in [511usize, 512, 513, 600, 4096, 30000, 65536, 131072] {
+        let rows = 2usize;
+        // quarter steps in [-2, 2] (many ties), -0 beside +0, some -inf (never kept) and a few +inf;
+        // with 600 groups most are -inf, fewer than k finite
+        let scores: Vec<f32> = (0..rows * groups).map(|i| {
+            let draw = random.next();
+            if groups == 600 && !draw.is_multiple_of(8) { return f32::NEG_INFINITY; }
+            match draw % 97 {
+                0..=6 => f32::NEG_INFINITY,
+                7 => f32::INFINITY,
+                8 => -0.0,
+                _ => ((draw >> 8) % 17) as f32 * 0.25 - 2.0 + if i % 1000 == 999 { 0.125 } else { 0.0 },
+            }
+        }).collect();
+        let (input, out) = (upload(&mut gpu, &scores), gpu.buffer((rows * k * 4) as u64).unwrap());
+        gpu.top_k(input.base(), rows as u64, groups as u64, k as u64, out.base()).unwrap();
+        let got = read(&mut gpu, &out, rows * k);
+        for row in 0..rows {
+            assert_eq!(got[row * k..(row + 1) * k], top_k_reference(&scores[row * groups..(row + 1) * groups], k)[..],
+                       "{groups} groups, row {row}");
+        }
+    }
 }
 
 #[test]

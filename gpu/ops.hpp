@@ -1145,9 +1145,8 @@ __global__ void __launch_bounds__(256) op_index_scores_kernel(const float* q, co
 }
 
 // One block per row: the k highest scores' indices in ascending index order, -1 for empty slots
-// (fewer finite scores than k). Ties keep the lower index. The k-th highest score is found bit by
-// bit over order-preserving keys (32 block-wide counts), then each thread takes its stretch of
-// the row in order.
+// (fewer finite scores than k). Ties keep the lower index. The k-th highest score is found over
+// order-preserving keys (top_k_row), then each thread takes its stretch of the row in order.
 __device__ __forceinline__ uint32_t top_k_key(float value) {
     const uint32_t bits = __float_as_uint(value == 0.0f ? 0.0f : value);   // -0 ties +0, as the floats compare
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
@@ -1176,26 +1175,46 @@ __device__ uint32_t top_k_offset(uint32_t value, uint32_t* shared) {
     return shared[threadIdx.x] - value;
 }
 // A row's top k over its `groups` scores (score(g) loads score g) by the block, into out (k slots).
+// The k-th highest key is found a byte at a time, most significant first: a 256-bin histogram (in
+// shared memory) of the keys that match the bytes found so far picks the next byte, and the rank
+// left within it (four passes over the row where 32 bit-by-bit counts took 32). Then each thread
+// takes its stretch of the row in order: keys above the threshold, and of those equal to it the
+// lowest indices, as many as k leaves.
 template<class Score>
 __device__ void top_k_row(Score score, size_t groups, size_t k, int32_t* out, uint32_t* shared) {
     const size_t per = (groups + blockDim.x - 1) / blockDim.x, begin = std::min(groups, threadIdx.x * per);
     const size_t end = std::min(groups, begin + per);
     const uint32_t floor = top_k_key(-INFINITY);
-    auto count = [&](uint32_t at_least) {
-        uint32_t n = 0;
+    __shared__ uint32_t bins[256];
+    __shared__ uint32_t chosen, left, total;
+    // the k-th highest key, or the floor when fewer than k are finite (then every finite one is kept)
+    uint32_t threshold = floor + 1, prefix = 0, rank = uint32_t(k);
+    for (int byte = 3; byte >= 0; --byte) {
+        __syncthreads();
+        for (unsigned bin = threadIdx.x; bin < 256; bin += blockDim.x) bins[bin] = 0;
+        __syncthreads();
+        const int shift = 8 * byte;
         for (size_t g = begin; g < end; ++g) {
             const uint32_t key = top_k_key(score(g));
-            n += key > floor && key >= at_least;
+            if (key > floor && (byte == 3 || (key >> (shift + 8)) == (prefix >> (shift + 8)))) atomicAdd(&bins[(key >> shift) & 255u], 1u);
         }
-        return top_k_sum(n, shared);
-    };
-    // the k-th highest key, or the floor when fewer than k are finite (then every finite one is kept)
-    uint32_t threshold = floor + 1;
-    if (count(threshold) > k) {
-        uint32_t prefix = 0;
-        for (int bit = 31; bit >= 0; --bit)
-            if (count(prefix | (1u << bit)) >= k) prefix |= 1u << bit;
-        threshold = prefix;
+        __syncthreads();
+        if (!threadIdx.x) {
+            uint32_t above = 0, bin = 255, all = 0;
+            for (unsigned b = 0; b < 256; ++b) all += bins[b];
+            for (;; --bin) {
+                if (above + bins[bin] >= rank || !bin) break;
+                above += bins[bin];
+            }
+            chosen = bin;
+            left = rank - above;
+            total = all;
+        }
+        __syncthreads();
+        if (byte == 3 && total <= k) break;
+        prefix |= chosen << shift;
+        rank = left;
+        if (!byte) threshold = prefix;
     }
     // keys above the threshold are kept; of those equal to it, the lowest indices fill the rest
     uint32_t above = 0, ties = 0;
@@ -1205,15 +1224,9 @@ __device__ void top_k_row(Score score, size_t groups, size_t k, int32_t* out, ui
         ties += key > floor && key == threshold;
     }
     const uint32_t need = uint32_t(k) - std::min<uint32_t>(uint32_t(k), top_k_sum(above, shared));
-    uint32_t tie = top_k_offset(ties, shared), kept = 0;
-    for (size_t g = begin; g < end; ++g) {
-        const uint32_t key = top_k_key(score(g));
-        const bool equal = key > floor && key == threshold;
-        kept += (key > floor && key > threshold) || (equal && tie < need);
-        tie += equal;
-    }
+    uint32_t tie = top_k_offset(ties, shared);
+    const uint32_t kept = above + (need > tie ? std::min(ties, need - tie) : 0u);
     uint32_t slot = top_k_offset(kept, shared);
-    tie = top_k_offset(ties, shared);
     for (size_t g = begin; g < end; ++g) {
         const uint32_t key = top_k_key(score(g));
         const bool equal = key > floor && key == threshold;
