@@ -583,8 +583,17 @@ __device__ int nonlinear(unsigned code) {
 // IQ1/IQ2/IQ3 lattice grids, one byte per value: the gguf reference tables, uploaded to
 // every device at creation (sd_iq_tables). A grid row is 8 (IQ1, IQ2) or 4 (IQ3) values;
 // IQ1 rows store value + 1 (-1, 0, 1 as 0, 1, 2).
-__constant__ SD_ALIGN(16) uint8_t iq_grid2xxs[256 * 8], iq_grid2xs[512 * 8], iq_grid2s[1024 * 8];
-__constant__ SD_ALIGN(16) uint8_t iq_grid3xxs[256 * 4], iq_grid3s[512 * 4], iq_grid1s[2048 * 8];
+#if defined(__HIPCC__)
+#define SD_IQ_GRID_STORAGE __constant__
+#else
+// Warp lanes select unrelated codebook entries. CUDA constant loads serialize
+// those addresses; device storage lets the read-only global/L1 path serve them.
+// The symbols are still populated once by the existing cudaMemcpyToSymbol path.
+#define SD_IQ_GRID_STORAGE __device__
+#endif
+SD_IQ_GRID_STORAGE SD_ALIGN(16) uint8_t iq_grid2xxs[256 * 8], iq_grid2xs[512 * 8], iq_grid2s[1024 * 8];
+SD_IQ_GRID_STORAGE SD_ALIGN(16) uint8_t iq_grid3xxs[256 * 4], iq_grid3s[512 * 4], iq_grid1s[2048 * 8];
+#undef SD_IQ_GRID_STORAGE
 extern "C" const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 std::atomic<bool> iq_uploaded{false};
 __host__ __device__ inline bool iq_kind(int kind) {
