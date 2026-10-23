@@ -732,6 +732,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_attention_turns_reserve(
+        handle: *mut ::std::os::raw::c_void,
+        rows: u64,
+        rope_dims: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_attention_turns_arm(
+        handle: *mut ::std::os::raw::c_void,
+        rows: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_sparse_attention(
         handle: *mut ::std::os::raw::c_void,
         q: *const f32,

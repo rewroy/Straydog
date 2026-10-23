@@ -61,7 +61,7 @@ __global__ void op_rms_norm_kernel(const float* input, const float* weight, size
 // rows); `sums` is 256 floats of the block's shared memory. A block of 256 threads.
 __device__ inline void op_norm_rope_row(const float* input, const float* weight, size_t width, float eps, size_t pairs,
                                         const int32_t* positions, const float* frequencies, const int32_t* rows, float* output,
-                                        size_t index, float* sums) {
+                                        size_t index, float* sums, double2* forward, double2* inverse) {
     const float* row = input + index * width;
     float* out = output + size_t(rows ? rows[index] : index) * width;
     float sum = 0.0f;
@@ -83,14 +83,21 @@ __device__ inline void op_norm_rope_row(const float* input, const float* weight,
         const double a = row[col] * scale * weight[col], b = row[col + 1] * scale * weight[col + 1];
         out[col] = float(a * c - b * s);
         out[col + 1] = float(a * s + b * c);
+        // The attention table, when this row's position is the query's. Inverse is a second sincos.
+        if (forward) {
+            forward[index * pairs + pair] = make_double2(c, s);
+            sincos(angle * -1.0, &s, &c);
+            inverse[index * pairs + pair] = make_double2(c, s);
+        }
     }
 }
 
 // One block per row: op_norm_rope_row.
 __global__ void op_norm_rope_kernel(const float* input, const float* weight, size_t width, float eps, size_t pairs,
-                                    const int32_t* positions, const float* frequencies, const int32_t* rows, float* output) {
+                                    const int32_t* positions, const float* frequencies, const int32_t* rows, float* output,
+                                    double2* forward, double2* inverse) {
     __shared__ float sums[256];
-    op_norm_rope_row(input, weight, width, eps, pairs, positions, frequencies, rows, output, blockIdx.x, sums);
+    op_norm_rope_row(input, weight, width, eps, pairs, positions, frequencies, rows, output, blockIdx.x, sums, forward, inverse);
 }
 
 // Rotate the last 2 * pairs values of each vector (adjacent pairs) by position * frequency; the
@@ -789,9 +796,21 @@ __device__ __forceinline__ const float* attention_key(size_t index, size_t raw_c
     const int32_t at = selected[index - raw_count];
     return at < 0 ? nullptr : compressed + size_t(at) * dim;
 }
+// One row's rope, once: forward, then the inverse from the same angle times -1 (not a negated sine).
+__global__ void op_attention_turns_kernel(const int32_t* positions, const float* frequencies, size_t pairs, double2* forward,
+                                          double2* inverse) {
+    const int64_t p = positions[blockIdx.x];
+    for (size_t pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+        double s, c;
+        sincos(double(p) * double(frequencies[pair]), &s, &c);
+        forward[size_t(blockIdx.x) * pairs + pair] = make_double2(c, s);
+        sincos(double(p) * double(frequencies[pair]) * -1.0, &s, &c);
+        inverse[size_t(blockIdx.x) * pairs + pair] = make_double2(c, s);
+    }
+}
 __global__ void __launch_bounds__(256) op_attention_scores_kernel(
         const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
-        const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const float* frequencies,
+        const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const double2* forward,
         size_t stride, float* scores, float2* partial) {
     const size_t row = blockIdx.y, head0 = size_t(blockIdx.z) * attention_heads, chunks = gridDim.x;
     const int64_t p = positions[row];
@@ -801,11 +820,10 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     constexpr int S = 64;
     __shared__ float qs[2][attention_heads][S + 1], ks[2][attention_keys][S + 1];
     __shared__ const float* keys[attention_keys];
-    __shared__ double turns[64][2];   // the row's rotation per rope pair (op_rope_kernel's angles)
+    __shared__ double turns[64][2];   // the row's rotation per rope pair, filled once for the token
     for (size_t pair = t; pair < pairs; pair += blockDim.x) {
-        double s, c;
-        sincos(double(p) * double(frequencies[pair]), &s, &c);
-        turns[pair][0] = c; turns[pair][1] = s;
+        const double2 g = forward[row * pairs + pair];
+        turns[pair][0] = g.x; turns[pair][1] = g.y;
     }
     if (t < attention_keys)
         keys[t] = attention_key(size_t(blockIdx.x) * attention_keys + t, raw_count, first, raw, raw_rows, compressed,
@@ -896,12 +914,13 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
         if (lane == 0 && head < heads) partial[(row * heads + head) * chunks + blockIdx.x] = make_float2(top, sum);
     }
 }
-// The inverse rotation of an output's values col .. col + 3, as op_rope_kernel's inverse.
-__device__ __forceinline__ void attention_unrotate(float (&o)[4], int64_t p, size_t col, size_t rotated, const float* frequencies) {
+// The inverse rotation of an output's values col .. col + 3, from the token's inverse table.
+__device__ __forceinline__ void attention_unrotate(float (&o)[4], size_t row, size_t col, size_t rotated, size_t pairs,
+                                                   const double2* inverse) {
     for (int i = 0; i < 4; i += 2)
         if (col + i >= rotated) {
-            double s, c;
-            sincos(double(p) * double(frequencies[(col + i - rotated) / 2]) * -1.0, &s, &c);
+            const double2 g = inverse[row * pairs + (col + i - rotated) / 2];
+            const double c = g.x, s = g.y;
             const double a = o[i], b = o[i + 1];
             o[i] = float(a * c - b * s);
             o[i + 1] = float(a * s + b * c);
@@ -913,7 +932,7 @@ __device__ __forceinline__ void attention_unrotate(float (&o)[4], int64_t p, siz
 __global__ void __launch_bounds__(128) op_attention_output_kernel(
         const float* scores, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
         size_t window, const float* compressed, const int32_t* selected, size_t selections, const float* sinks, size_t heads,
-        size_t dim, size_t pairs, const float* frequencies, size_t stride, size_t shares, size_t share_keys, float* sums,
+        size_t dim, size_t pairs, const double2* inverse, size_t stride, size_t shares, size_t share_keys, float* sums,
         float* head_denominators, float* out, unsigned* tiles) {
     const size_t row = blockIdx.z / shares, share = blockIdx.z % shares;
     const size_t head0 = size_t(blockIdx.y) * attention_out_heads, d0 = size_t(blockIdx.x) * 64;
@@ -1009,20 +1028,19 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
         }
         const float denominator = denominators[local];
         float o[4] = {total[0] / denominator, total[1] / denominator, total[2] / denominator, total[3] / denominator};
-        attention_unrotate(o, p, col, dim - 2 * pairs, frequencies);
+        attention_unrotate(o, row, col, dim - 2 * pairs, pairs, inverse);
         *reinterpret_cast<float4*>(out + (row * heads + head) * dim + col) = make_float4(o[0], o[1], o[2], o[3]);
         return;
     }
     if (!valid) return;
     const float denominator = denominators[local];
     float o[4] = {acc.x / denominator, acc.y / denominator, acc.z / denominator, acc.w / denominator};
-    attention_unrotate(o, p, col, dim - 2 * pairs, frequencies);
+    attention_unrotate(o, row, col, dim - 2 * pairs, pairs, inverse);
     *reinterpret_cast<float4*>(out + (row * heads + head) * dim + col) = make_float4(o[0], o[1], o[2], o[3]);
 }
 // The shares' sums added in order, over the head's denominator, rotated back: a thread per four values.
-__global__ void op_attention_combine_kernel(const float* sums, const float* head_denominators, const int32_t* positions,
-                                            size_t rows, size_t shares, size_t heads, size_t dim, size_t pairs,
-                                            const float* frequencies, float* out) {
+__global__ void op_attention_combine_kernel(const float* sums, const float* head_denominators, size_t rows, size_t shares,
+                                            size_t heads, size_t dim, size_t pairs, const double2* inverse, float* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x, quads = rows * heads * dim / 4;
     if (index >= quads) return;
     const size_t row = index / (heads * dim / 4), head = index / (dim / 4) % heads, col = index % (dim / 4) * 4;
@@ -1033,7 +1051,7 @@ __global__ void op_attention_combine_kernel(const float* sums, const float* head
     }
     const float denominator = head_denominators[row * heads + head];
     float o[4] = {acc.x / denominator, acc.y / denominator, acc.z / denominator, acc.w / denominator};
-    attention_unrotate(o, positions[row], col, dim - 2 * pairs, frequencies);
+    attention_unrotate(o, row, col, dim - 2 * pairs, pairs, inverse);
     *reinterpret_cast<float4*>(out + (row * heads + head) * dim + col) = make_float4(o[0], o[1], o[2], o[3]);
 }
 

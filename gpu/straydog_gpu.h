@@ -204,6 +204,14 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
 /* Every device's later work waits until each other device's last sd_op_sum_devices has read its
    part (that sum reads it in place): before a device writes a summed part's buffer again. */
 int sd_devices_settle(void* const* handles, uint64_t devices);
+/* Attention rope for one pass: rows of rope_dims/2 pairs, forward then inverse. Allocate once,
+   outside a captured graph (a graph keeps the pointer). A larger request replaces it only while
+   no graph is stored. rope_dims 0 reserves nothing. */
+int sd_attention_turns_reserve(void* handle, uint64_t rows, uint64_t rope_dims);
+/* The next sd_op_norm_rope or sd_op_norm_linears_rope of exactly `rows` (0 clears) writes that
+   table: sincos(position * frequency), then sincos of that angle times -1. The next
+   sd_op_sparse_attention of those rows skips its own rope launch. */
+int sd_attention_turns_arm(void* handle, uint64_t rows);
 /* Latent attention: each query attends to the window rows of `raw` ending at its position
    (position p in row p % raw_rows, so `raw` may be a ring) and
    the compressed rows `selected` lists (-1 none), with a sink per head. Compression pools ratio

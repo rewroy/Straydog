@@ -444,6 +444,10 @@ impl Shard {
         let mut gpu = Backend::new(device, budget)?;
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
+        // One table for every attention of this pass, before any graph records a pointer into it.
+        if hp.rope_dims > 0 {
+            gpu.attention_turns_reserve(b as u64, hp.rope_dims as u64)?;
+        }
         let (r, k, ff) = (settings.rows.max(b), hp.experts_used, hp.expert_ff);
         // the buffers of every row for this device's own rows (a longer pass's in the arena)
         let own = OWN_ROWS.min(r);
@@ -1941,6 +1945,11 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     // q (this device's heads) stays unrotated: the attention rotates it as it reads it. A decode
     // row's q_a norm runs in q_b's launch (its first block keeping the normed row, for the
     // indexer), with the kv row's norm and rope in a block of its own beside them.
+    // q is not rotated here. The KV norm uses this layer's frequencies and, when its rows are the
+    // queries, their positions: it writes the rope table, so attention adds no launch. A KV prefix
+    // that does not attend keeps attention's own launch.
+    let same_rows = plan.kv_from == plan.full_from && rope > 0 && n > 0 && kv_rows > 0;
+    shard.gpu.attention_turns_arm(if same_rows { kv_rows as u64 } else { 0 })?;
     let fused = n == 1 && kv_rows == 1;
     let normed_q = if fused { work.qn } else { work.qr };
     if fused {

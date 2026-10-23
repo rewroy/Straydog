@@ -459,6 +459,16 @@ struct Device {
     unsigned* attention_tiles = nullptr;
     // sd_op_index_select's row counters (zero between launches: each row's last block resets its own)
     unsigned* index_rows = nullptr;
+    // Forward then inverse rope for one pass, reserved once outside capture (sd_attention_turns_reserve).
+    // A captured graph keeps the pointer, so it is not grown while a graph is stored.
+    double2* attention_turns = nullptr;
+    size_t attention_turns_bytes = 0;
+    size_t attention_turns_rows = 0;
+    size_t attention_turns_pairs = 0;
+    size_t attention_turns_armed = 0;   // the next norm_rope of this many rows publishes the table
+    bool attention_turns_ready = false;
+    size_t attention_turns_ready_rows = 0;
+    size_t attention_turns_ready_pairs = 0;
     size_t slot_routes_count = 0;   // the routes uploaded there last (sd_op_experts may reuse them)
     // Or, when the last call passed its few routes by value, those (reused alike).
     uint64_t inline_routes[32] = {};
@@ -1120,6 +1130,66 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "verify_span.hpp"
 #include "ops.hpp"
 #include "transfer.hpp"
+
+// The attention rope table: forward[row, pair], then the inverse at the same stride, one allocation
+// for the pass. Publishing consumes an arm from sd_attention_turns_arm.
+struct AttentionTurnsView {
+    double2* forward = nullptr;
+    double2* inverse = nullptr;
+    bool publish = false;
+};
+
+void attention_turns_free(Device& value) {
+    if (!value.attention_turns) return;
+    auto found = value.allocations.find(value.attention_turns);
+    if (found == value.allocations.end()) throw std::runtime_error("the attention rope table is not an allocation");
+    if (value.stream) check(hipStreamSynchronize(value.stream));
+    check(hipFree(value.attention_turns));
+    value.used -= found->second + allocation_tail;
+    value.allocations.erase(found);
+    value.attention_turns = nullptr;
+    value.attention_turns_bytes = 0;
+    value.attention_turns_rows = 0;
+    value.attention_turns_pairs = 0;
+    value.attention_turns_armed = 0;
+    value.attention_turns_ready = false;
+}
+
+void attention_turns_reserve(Device& value, size_t rows, size_t pairs) {
+    if (!rows || !pairs) return;
+    if (pairs > 64) throw std::runtime_error("invalid Straydog attention rope");
+    if (value.attention_turns && value.attention_turns_pairs == pairs && value.attention_turns_rows >= rows) return;
+    if (value.op_recording) throw std::runtime_error("an attention rope table cannot be allocated while a graph is recorded");
+    if (value.attention_turns && !value.graphs.empty())
+        throw std::runtime_error("an attention rope table cannot grow after a graph was recorded");
+    if (value.attention_turns) attention_turns_free(value);
+    const size_t bytes = rows * pairs * sizeof(double2) * 2;
+    value.attention_turns = static_cast<double2*>(allocate(value, bytes));
+    value.attention_turns_bytes = bytes;
+    value.attention_turns_rows = rows;
+    value.attention_turns_pairs = pairs;
+    value.attention_turns_armed = 0;
+    value.attention_turns_ready = false;
+}
+
+AttentionTurnsView attention_turns_for_rope(Device& value, size_t rows, size_t pairs) {
+    if (!value.attention_turns_armed) return {};
+    const size_t armed = value.attention_turns_armed;
+    value.attention_turns_armed = 0;
+    if (armed != rows || !pairs || pairs != value.attention_turns_pairs || !value.attention_turns || value.attention_turns_rows < rows)
+        return {};
+    AttentionTurnsView view;
+    view.forward = value.attention_turns;
+    view.inverse = view.forward + value.attention_turns_rows * value.attention_turns_pairs;
+    view.publish = true;
+    return view;
+}
+
+void attention_turns_mark_ready(Device& value, size_t rows, size_t pairs) {
+    value.attention_turns_ready = true;
+    value.attention_turns_ready_rows = rows;
+    value.attention_turns_ready_pairs = pairs;
+}
 } // namespace
 
 // A function that throws keeps C++ linkage: outside this block, or in extern "C++" within it.
@@ -2509,9 +2579,11 @@ int sd_op_norm_rope(void* handle, const float* input, const float* weight, uint6
             op_span(value, out_rows, size_t(rows) * 4, "output rows");
             if (out == input) throw std::runtime_error("a scattered norm cannot run in place");
         }
+        const AttentionTurnsView turns = attention_turns_for_rope(value, size_t(rows), size_t(rope_dims / 2));
         op_norm_rope_kernel<<<unsigned(rows), 256, 0, value.stream>>>(input, weight, size_t(width), eps, size_t(rope_dims / 2),
-                                                                     positions, frequencies, out_rows, out);
+                                                                     positions, frequencies, out_rows, out, turns.forward, turns.inverse);
         check(hipGetLastError());
+        if (turns.publish) attention_turns_mark_ready(value, size_t(rows), size_t(rope_dims / 2));
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -2811,6 +2883,23 @@ int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_
     SD_OP_END
 }
 
+int sd_attention_turns_reserve(void* handle, uint64_t rows, uint64_t rope_dims) {
+    try {
+        if (rope_dims > 128 || rope_dims % 2) throw std::runtime_error("invalid Straydog attention rope");
+        attention_turns_reserve(device(handle), size_t(rows), size_t(rope_dims / 2));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_attention_turns_arm(void* handle, uint64_t rows) {
+    try {
+        auto& value = device(handle);
+        value.attention_turns_armed = size_t(rows);
+        value.attention_turns_ready = false;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions,
                            uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected,
                            uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim,
@@ -2842,10 +2931,25 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         op_span(value, scratch, need, "attention scratch");
         float* scores = scratch;
         auto* partial = reinterpret_cast<float2*>(reinterpret_cast<uint8_t*>(scratch) + score_bytes);
+        const size_t pairs = size_t(rope_dims / 2);
+        double2* forward = nullptr;
+        double2* inverse = nullptr;
+        if (pairs) {
+            attention_turns_reserve(value, size_t(rows), pairs);
+            forward = value.attention_turns;
+            inverse = forward + value.attention_turns_rows * pairs;
+            const bool filled = value.attention_turns_ready && value.attention_turns_ready_rows == size_t(rows) &&
+                                value.attention_turns_ready_pairs == pairs;
+            value.attention_turns_ready = false;
+            if (!filled)
+                op_attention_turns_kernel<<<unsigned(rows), 64, 0, value.stream>>>(positions, frequencies, pairs, forward, inverse);
+        } else {
+            value.attention_turns_ready = false;
+        }
         op_attention_scores_kernel<<<dim3(unsigned(chunks), unsigned(rows), unsigned((heads + attention_heads - 1) / attention_heads)),
                                      256, 0, value.stream>>>(
             q, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads),
-            size_t(dim), scale, size_t(rope_dims / 2), frequencies, stride, scores, partial);
+            size_t(dim), scale, pairs, forward, stride, scores, partial);
         check(hipGetLastError());
         float* sums = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(scratch) + need);
         float* denominators = sums + size_t(rows * heads) * shares * dim;
@@ -2862,13 +2966,12 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         unsigned* counters = shares > 1 && tiles <= tile_capacity ? value.attention_tiles : nullptr;
         op_attention_output_kernel<<<grid, 128, share_keys * sizeof(float*), value.stream>>>(
             scores, partial, chunks, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections),
-            sinks, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies, stride, shares, share_keys, sums, denominators,
+            sinks, size_t(heads), size_t(dim), pairs, inverse, stride, shares, share_keys, sums, denominators,
             out, counters);
         if (shares > 1 && !counters) {
             check(hipGetLastError());
             op_attention_combine_kernel<<<op_blocks(size_t(rows * heads * dim / 4)), 256, 0, value.stream>>>(
-                sums, denominators, positions, size_t(rows), shares, size_t(heads), size_t(dim), size_t(rope_dims / 2), frequencies,
-                out);
+                sums, denominators, size_t(rows), shares, size_t(heads), size_t(dim), pairs, inverse, out);
         }
     } else {
         if (shared > 60 * 1024 || rope_dims) throw std::runtime_error("invalid Straydog attention shape");

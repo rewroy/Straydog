@@ -803,6 +803,21 @@ impl Backend {
         })
     }
 
+    /// The attention rope table for one pass (`rows` by `rope_dims`), allocated once and kept.
+    /// Call it before a captured graph. `rope_dims` 0 reserves nothing.
+    pub fn attention_turns_reserve(&mut self, rows: u64, rope_dims: u64) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_attention_turns_reserve(self.handle(), rows, rope_dims) })
+    }
+
+    /// The next [`norm_rope`](Self::norm_rope) or [`norm_linears_rope`](Self::norm_linears_rope) of
+    /// exactly `rows` (0 clears) writes that table. The next [`sparse_attention`](Self::sparse_attention)
+    /// of those rows then does not launch its own rope kernel.
+    pub fn attention_turns_arm(&mut self, rows: u64) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_attention_turns_arm(self.handle(), rows) })
+    }
+
     /// Tiled over `scratch` when it holds the scores (see the C header), else one block per head.
     /// `rope` = (dims, frequencies): q's last dims are rotated on the way in, the output's back
     /// (tiled only).

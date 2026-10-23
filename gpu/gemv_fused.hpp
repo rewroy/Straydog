@@ -20,6 +20,9 @@ struct NormRopeJob {
     const float* frequencies;
     const int32_t* rows;
     float* output;         // null: no job
+    double2* forward;      // with inverse: this row's attention rope, else null
+    double2* inverse;
+    bool publish;
 };
 
 struct GemvPrologue {
@@ -44,7 +47,8 @@ struct GemvPrologue {
 __device__ inline bool gemv_side_job(const GemvPrologue& pro, float* sums) {
     if (!pro.side.output || blockIdx.x != gridDim.x - 1) return false;
     const NormRopeJob& job = pro.side;
-    op_norm_rope_row(job.input, job.weight, job.width, job.eps, job.pairs, job.positions, job.frequencies, job.rows, job.output, 0, sums);
+    op_norm_rope_row(job.input, job.weight, job.width, job.eps, job.pairs, job.positions, job.frequencies, job.rows, job.output, 0,
+                     sums, job.forward, job.inverse);
     return true;
 }
 
@@ -240,8 +244,10 @@ NormRopeJob norm_rope_job(Device& value, const sd_norm_rope& side) {
         op_span(value, side.out_rows, 4, "output rows");
         if (side.out == side.input) throw std::runtime_error("a scattered norm cannot run in place");
     }
+    AttentionTurnsView turns;
+    if (side.rope_dims) turns = attention_turns_for_rope(value, 1, size_t(side.rope_dims / 2));
     return NormRopeJob{side.input, side.weight, uint32_t(side.width), side.eps, uint32_t(side.rope_dims / 2), side.positions,
-                       side.frequencies, side.out_rows, side.out};
+                       side.frequencies, side.out_rows, side.out, turns.forward, turns.inverse, turns.publish};
 }
 
 // sd_op_norm_linears, with a side job (else output null) in the same launch where it can (else
@@ -263,6 +269,7 @@ void norm_linears(Device& value, const float* x, const float* weight, uint64_t w
     pro.side = side;
     if (gemv_prologue_plan(matrices, size_t(count), normed, op_lanes, list, waves) && gemv_prologue_launch(value, list, waves, pro, output)) {
         check(hipGetLastError());
+        if (side.publish) attention_turns_mark_ready(value, 1, side.pairs);
         return;
     }
     op_rms_norm_kernel<<<1, 256, 0, value.stream>>>(x, weight, size_t(width), eps, normed);
@@ -286,7 +293,8 @@ void norm_linears(Device& value, const float* x, const float* weight, uint64_t w
     }
     if (side.output)
         op_norm_rope_kernel<<<1, 256, 0, value.stream>>>(side.input, side.weight, side.width, side.eps, side.pairs, side.positions,
-                                                          side.frequencies, side.rows, side.output);
+                                                          side.frequencies, side.rows, side.output, side.forward, side.inverse);
+    if (side.publish) attention_turns_mark_ready(value, 1, side.pairs);
     check(hipGetLastError());
 }
 } // namespace
