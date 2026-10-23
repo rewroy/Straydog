@@ -626,13 +626,38 @@ struct RouteTail {
     int32_t* published;
     unsigned* flag;
 };
+// Issue both units' loads before their dots; keep each dot and the single sum in order.
+__device__ void gemv_routed_f32_rows(const Matrix& m, size_t first_row, unsigned lanes, const float* input,
+                                     float* output, uint32_t output_stride, const GemvResidual& residual) {
+    const unsigned lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = first_row + lane / lanes, units = m.cols / 4;
+    float sum = 0.0f;
+    if (row < m.rows) {
+        const float4* weights = reinterpret_cast<const float4*>(m.data + row * m.row_bytes);
+        const float* x = input + m.input_offset;
+        for (size_t unit = sub; unit < units; unit += 2 * lanes) {
+            const float4 w0 = weights[unit], a0 = gemv_load4(x + unit * 4);
+            const bool next = unit + lanes < units;
+            float4 w1, a1;
+            if (next) { w1 = weights[unit + lanes]; a1 = gemv_load4(x + (unit + lanes) * 4); }
+            sum += fmaf(w0.x, a0.x, fmaf(w0.y, a0.y, fmaf(w0.z, a0.z, w0.w * a0.w)));
+            if (next) sum += fmaf(w1.x, a1.x, fmaf(w1.y, a1.y, fmaf(w1.z, a1.z, w1.w * a1.w)));
+        }
+    }
+    float total = sum;
+    for (unsigned offset = lanes / 2; offset; offset /= 2) total += __shfl_xor(total, offset, 32);
+    if (sub == 0 && row < m.rows) gemv_store(m, row, 0, total, output, output_stride, residual);
+}
 template<int kind, int V>
 __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* output, RouteTail tail) {
     extern __shared__ float scores[];
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     const GemvItem& item = list.items[0];
-    gemv_rows<kind, V>(item.matrix, wave * (32 / item.lanes), item.lanes, input, list.input_stride, output, list.output_stride,
-                       list.residual);
+    if constexpr (kind == 0 && V == 1)
+        gemv_routed_f32_rows(item.matrix, wave * (32 / item.lanes), item.lanes, input, output, list.output_stride, list.residual);
+    else
+        gemv_rows<kind, V>(item.matrix, wave * (32 / item.lanes), item.lanes, input, list.input_stride, output, list.output_stride,
+                           list.residual);
     // Every block's logits are out before it counts itself done.
     __shared__ bool last;
     __threadfence();

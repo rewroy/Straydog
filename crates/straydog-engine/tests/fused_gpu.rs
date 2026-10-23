@@ -381,3 +381,38 @@ fn an_index_select_with_its_projection_matches_the_two_ops() {
         }
     }
 }
+
+#[test]
+fn f32_router_prefetch_keeps_odd_units_and_routes_bit_exact() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x510e_527f_ade6_82d1);
+    let scratch = gpu.buffer(1 << 20).unwrap();
+    // One-unit tails around both a wave and a pair, plus the actual DS router shape.
+    for cols in [4usize, 124, 128, 132, 252, 256, 260, 5120] {
+        for experts in [1usize, 33, 384] {
+            let k = experts.min(6);
+            let matrix = upload(&mut gpu, &random.floats(experts * cols, 0.02));
+            let input = upload(&mut gpu, &random.floats(cols, 3.0));
+            let bias = upload(&mut gpu, &random.floats(experts, 0.1));
+            let baseline = gpu.buffer((experts * 4) as u64).unwrap();
+            let fused = gpu.buffer((experts * 4) as u64).unwrap();
+            let ids_a = gpu.buffer((k * 4) as u64).unwrap();
+            let ids_b = gpu.buffer((k * 4) as u64).unwrap();
+            let weights_a = gpu.buffer((k * 4) as u64).unwrap();
+            let weights_b = gpu.buffer((k * 4) as u64).unwrap();
+            gpu.linear(&matrix, 0, experts as u64, cols as u64, 0, input.base(), 0, 1, baseline.base(), 0, &scratch).unwrap();
+            for gating in 0..3 {
+                gpu.route(baseline.base(), Some(bias.base()), 1, experts as u64, k as u64, gating, true, 1.3,
+                          ids_a.base(), weights_a.base()).unwrap();
+                // Run twice to check that the launch's completion counter resets.
+                for _ in 0..2 {
+                    gpu.linear_route(&matrix, 0, experts as u64, cols as u64, input.base(), 1, fused.base(), Some(bias.base()),
+                                     k as u64, gating, true, 1.3, ids_b.base(), weights_b.base(), &scratch).unwrap();
+                    assert_eq!(read(&mut gpu, &baseline, experts), read(&mut gpu, &fused, experts), "logits {cols}/{experts}");
+                    assert_eq!(read(&mut gpu, &ids_a, k), read(&mut gpu, &ids_b, k), "ids {cols}/{experts}/{gating}");
+                    assert_eq!(read(&mut gpu, &weights_a, k), read(&mut gpu, &weights_b, k), "weights {cols}/{experts}/{gating}");
+                }
+            }
+        }
+    }
+}
