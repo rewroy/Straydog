@@ -3017,8 +3017,8 @@ extern "C++" {
 constexpr size_t index_row_capacity = 65536;
 static unsigned* index_counters(Device& value) {
     if (!value.index_rows) {
-        value.index_rows = static_cast<unsigned*>(allocate(value, (index_row_capacity + 4) * 4));
-        check(hipMemsetAsync(value.index_rows, 0, (index_row_capacity + 4) * 4, value.stream));
+        value.index_rows = static_cast<unsigned*>(allocate(value, (index_row_capacity + 5) * 4));
+        check(hipMemsetAsync(value.index_rows, 0, (index_row_capacity + 5) * 4, value.stream));
     }
     return value.index_rows;
 }

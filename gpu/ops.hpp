@@ -1274,13 +1274,27 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
                                                    size_t groups, size_t heads, size_t dim, float scale, size_t pairs,
                                                    const int32_t* positions, const float* frequencies, float* scores, size_t k,
                                                    int32_t* out, unsigned* counters, size_t chunk, size_t row, size_t chunks,
-                                                   const unsigned* weights_done, unsigned weight_blocks) {
+                                                   const unsigned* weights_done, unsigned weight_blocks,
+                                                   float* rotated_q = nullptr, const unsigned* rotated_done = nullptr) {
     const size_t g0 = chunk * 32;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
     const size_t limit = std::min<size_t>(groups, size_t(max(visible[row], 0)));
     __shared__ float qs[64][33], ks[32][33], terms[64][33];
     __shared__ double turns[64][2];
-    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+    if (rotated_q) {
+        // q as another block of the launch rotated it (index_rotate_q), once it says so
+        if (!t)
+            while (index_count(rotated_done) < 1u) {
+#if defined(__HIPCC__)
+                __builtin_amdgcn_s_sleep(1);
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif
+            }
+        __syncthreads();
+        index_acquire();
+    }
+    for (size_t pair = t; !rotated_q && pair < pairs; pair += blockDim.x) {
         double sine, cosine;
         sincos(double(positions[row]) * double(frequencies[pair]), &sine, &cosine);
         turns[pair][0] = cosine; turns[pair][1] = sine;
@@ -1293,7 +1307,8 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
         for (unsigned i = t; i < 64 * 32; i += blockDim.x) {
             const size_t h = i / 32, col = d0 + i % 32;
             float v = 0.0f;
-            if (h < heads && col < rotated) v = row_q[h * dim + col];
+            if (rotated_q) v = h < heads && col < dim ? hc_step_load(rotated_q + h * dim + col) : 0.0f;
+            else if (h < heads && col < rotated) v = row_q[h * dim + col];
             else if (h < heads && col < dim) {
                 const size_t pair = (col - rotated) / 2;
                 const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
@@ -1368,7 +1383,37 @@ __global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, co
 // proj_blocks tickets run the projection's blocks, the rest the score blocks, which read the weights once every
 // projection block has counted itself done. Those took the earlier tickets and already run, so that wait
 // always ends. counters: [0] tickets, [1] projection blocks done, [2] blocks done (the last block zeroes the
-// three), [3] the row's score blocks done (its last block zeroes it).
+// three and [4]), [3] the row's score blocks done (its last block zeroes it), [4] q rotated.
+// The first ticket's block also rotates q once (index_select_block's arithmetic) into index_rotated_q, which
+// the score blocks read: each of them rotated it on its own before.
+constexpr size_t index_rotated_floats = 64 * 256;
+__device__ float index_rotated_q[index_rotated_floats];
+__device__ __forceinline__ void index_rotate_q(const float* q, size_t heads, size_t dim, size_t pairs, const int32_t* positions,
+                                               const float* frequencies, unsigned* done) {
+    __shared__ double turns[64][2];
+    const unsigned t = threadIdx.x;
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+        double sine, cosine;
+        sincos(double(positions[0]) * double(frequencies[pair]), &sine, &cosine);
+        turns[pair][0] = cosine; turns[pair][1] = sine;
+    }
+    __syncthreads();
+    const size_t rotated = dim - 2 * pairs;
+    for (size_t i = t; i < heads * dim; i += blockDim.x) {
+        const size_t h = i / dim, col = i % dim;
+        float v = q[i];
+        if (col >= rotated) {
+            const size_t pair = (col - rotated) / 2;
+            const double a = q[h * dim + rotated + 2 * pair], b = q[h * dim + rotated + 2 * pair + 1];
+            const double c = turns[pair][0], s = turns[pair][1];
+            v = (col - rotated) % 2 == 0 ? float(a * c - b * s) : float(a * s + b * c);
+        }
+        index_rotated_q[i] = v;
+    }
+    index_release();
+    __syncthreads();
+    if (!t) atomicAdd(done, 1u);
+}
 template<int kind>
 __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         FixedGemv proj, const float* x, unsigned proj_blocks, const float* q, const float* keys, float* weights,
@@ -1378,7 +1423,9 @@ __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
     if (!threadIdx.x) ticket = atomicAdd(counters, 1u);
     __syncthreads();
     const unsigned mine = ticket, chunks = unsigned((groups + 31) / 32), blocks = proj_blocks + chunks;
+    const bool once = heads * dim <= index_rotated_floats;
     if (mine < proj_blocks) {
+        if (!mine && once) index_rotate_q(q, heads, dim, pairs, positions, frequencies, counters + 4);
         const size_t wave = size_t(mine) * (blockDim.x / 32) + threadIdx.x / 32;
         const GemvItem& item = proj.items[0];
         gemv_rows<kind, 1>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, x, proj.input_stride, weights,
@@ -1388,12 +1435,14 @@ __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         if (!threadIdx.x) atomicAdd(counters + 1, 1u);
     } else {
         index_select_block(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
-                           counters + 3, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks);
+                           counters + 3, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
+                           once ? index_rotated_q : nullptr, counters + 4);
     }
     __syncthreads();
     if (!threadIdx.x && atomicAdd(counters + 2, 1u) == blocks - 1) {
         counters[0] = 0;
         counters[1] = 0;
         counters[2] = 0;
+        counters[4] = 0;
     }
 }
