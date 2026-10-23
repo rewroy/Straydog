@@ -426,6 +426,8 @@ pub struct Counts {
     pub hits: u64,
     pub host_hits: u64,
     pub drive_reads: u64,
+    /// Bytes queued for drive reads (whole blocks), a pass's and a prefetch's alike.
+    pub drive_bytes: u64,
     pub writebacks: u64,
     pub prefetched: u64,
     /// Prefetched experts their layer then did not use.
@@ -451,6 +453,7 @@ impl std::ops::Add for Counts {
             hits: self.hits + other.hits,
             host_hits: self.host_hits + other.host_hits,
             drive_reads: self.drive_reads + other.drive_reads,
+            drive_bytes: self.drive_bytes + other.drive_bytes,
             writebacks: self.writebacks + other.writebacks,
             prefetched: self.prefetched + other.prefetched,
             prefetch_unused: self.prefetch_unused + other.prefetch_unused,
@@ -1116,6 +1119,7 @@ impl DeviceExperts {
         let class = self.class_of[key.0 as usize].ok_or("a read for a layer without routed experts")?;
         let host = self.free_host(gpu, class)?;
         let plan = self.layout.read_plan(key.0 as usize, key.1 as usize)?;
+        self.counts.drive_bytes += plan.iter().map(|span| span.len).sum::<u64>();
         let base = self.host_pointer(host);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut jobs = Vec::new();

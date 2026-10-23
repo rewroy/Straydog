@@ -191,6 +191,7 @@ fn main() -> Result<(), String> {
             stores.hits += after.hits - before.hits;
             stores.host_hits += after.host_hits - before.host_hits;
             stores.drive_reads += after.drive_reads - before.drive_reads;
+            stores.drive_bytes += after.drive_bytes - before.drive_bytes;
             (decode_tokens, decode_passes, decode_seconds) =
                 (decode_tokens + decode_steps, decode_passes + passes, decode_seconds + seconds);
             hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
@@ -213,8 +214,9 @@ fn main() -> Result<(), String> {
         println!("{} | run hash {run_hash:016x} | {decode_tokens} tokens in {decode_passes} passes, {decode_seconds:.2} s",
                  summary(&label, &all));
         let per_pass = |count: u64| count as f64 / decode_passes.max(1) as f64;
-        println!("  a decode pass: {:.2} ms, {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads", 1e3 * decode_seconds / decode_passes.max(1) as f64,
-                 per_pass(stores.hits), per_pass(stores.host_hits), per_pass(stores.drive_reads));
+        println!("  a decode pass: {:.2} ms, {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads ({:.1} MiB)",
+                 1e3 * decode_seconds / decode_passes.max(1) as f64, per_pass(stores.hits), per_pass(stores.host_hits),
+                 per_pass(stores.drive_reads), per_pass(stores.drive_bytes) / f64::from(1 << 20));
         if !phases.is_empty() {
             let line: Vec<String> = phases.iter().map(|(phase, spent)| format!("{phase} {:.2}", 1e3 * spent / decode_passes.max(1) as f64)).collect();
             println!("  phases, ms a pass: {}", line.join(", "));
