@@ -13,6 +13,7 @@
 //! reads positions [position - history, position), so those must have been injected
 //! (Drafter::inject) first.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 
 use super::engine::{columns, Beside};
@@ -45,6 +46,10 @@ const SINKHORN: u64 = 20;
 const CLAMP: f32 = 10.0;
 const SCALE: f32 = 1.5;
 const FEATURES: usize = 3 * WIDTH;
+/// The drafter's graph keys on a device: this, the part of a draft (a stage's attention, routes and
+/// experts, then the head and the Markov head) << 8, the block's slots (apart from the target's,
+/// layer << 8 and below).
+const GRAPHS: u64 = 0xd5 << 56;
 
 /// One device's part of a stage.
 struct Stage {
@@ -138,9 +143,13 @@ pub struct Drafter {
     tokens: Buffer,
     confidences: Buffer,
     count: Buffer,
+    /// The block's anchor token (i32), for the Markov head's graph.
+    anchor: Buffer,
     vocabulary: usize,
     /// Per ring row, the position injected there (-1: none).
     held: Vec<i64>,
+    /// The graph keys whose parts have run once (the next time records them).
+    ran: HashSet<u64>,
     /// The target's token embedding rows, decoded on the host.
     embed_kind: u32,
 }
@@ -187,6 +196,20 @@ fn expert_slots(gpu: &mut Backend, [gate, up, down]: &[Tensor<'_>; 3], count: us
         gpu.write_buffer(&buffer, expert as u64 * bytes, &slot(expert)?)?;
     }
     Ok((buffer, Slot { bytes, offsets: [0, gate_bytes, gate_bytes + up_bytes] }))
+}
+
+/// `ops` on `gpu`: from the graph under `key` when there is one, recorded into it when `key` is given
+/// and its part ran before (`ran`: the first run sets up what a recording may not), else as they are.
+fn replay(gpu: &mut Backend, key: Option<u64>, ran: bool, ops: impl FnOnce(&mut Backend) -> Result<()>) -> Result<()> {
+    let Some(key) = key.filter(|_| ran) else { return ops(gpu) };
+    if gpu.graph_run(key)? {
+        return Ok(());
+    }
+    gpu.graph_begin()?;
+    let result = ops(gpu);
+    gpu.graph_end(key, result.is_ok())?;
+    result?;
+    if gpu.graph_run(key)? { Ok(()) } else { Err("a recorded DSpark graph went missing".into()) }
 }
 
 impl Part {
@@ -313,8 +336,9 @@ impl Part {
         self.linear(gpu, &s.kv, 8, HEAD_DIM, WIDTH, self.x.base(), self.kv.base(), block)?;
         gpu.rms_norm(self.kv.base(), &s.kv_norm, rows, HEAD_DIM as u64, NORM_EPS, self.kv.base())?;
         gpu.rope(self.kv.base(), rows, 1, HEAD_DIM as u64, ROPE as u64, &positions, &self.frequencies, false)?;
-        gpu.dspark_attention(self.q.base(), &s.ring, self.kv.base(), &s.sinks, self.heads as u64, rows, block.position as u32, None,
-                             block.history as u64, self.attended.base(), &self.scratch)?;
+        // (the anchor's position read from the block's positions, as a replayed graph needs it)
+        gpu.dspark_attention(self.q.base(), &s.ring, self.kv.base(), &s.sinks, self.heads as u64, rows, block.position as u32,
+                             Some(self.positions.base().cast_const()), block.history as u64, self.attended.base(), &self.scratch)?;
         gpu.rope(self.attended.base(), rows, self.heads as u64, HEAD_DIM as u64, ROPE as u64, &positions, &self.frequencies, true)?;
         let group_width = HEADS / GROUPS * HEAD_DIM;
         let projections: Vec<Linear> = (0..self.groups).map(|g| Linear {
@@ -325,10 +349,9 @@ impl Part {
         self.linear(gpu, &s.out_b, 8, WIDTH, self.groups * OUT_RANK, self.low.base(), self.target(0), block)
     }
 
-    /// A stage's FFN after the attention's sum: the stream expanded, the FFN's coefficients (set
-    /// `ffn`), collapsed by the attention's pre-mix, this device's rows of the routed and shared
-    /// experts into its part of the experts' sum.
-    fn ffn(&self, gpu: &mut Backend, stage: usize, ffn: usize, block: &Block) -> Result<()> {
+    /// A stage's FFN up to its routes, after the attention's sum: the stream expanded, the FFN's
+    /// coefficients (set `ffn`), collapsed by the attention's pre-mix, normed, routed.
+    fn route(&self, gpu: &mut Backend, stage: usize, ffn: usize, block: &Block) -> Result<()> {
         let (s, rows, (w, hc)) = (&self.stages[stage], block.rows, (WIDTH as u64, HC as u64));
         let [stream, expanded] = self.stream;
         let [pre_a, post_a, comb_a] = self.coefficients[0];
@@ -341,7 +364,13 @@ impl Part {
         gpu.rms_norm(self.collapsed.base(), &s.ffn_norm, rows, w, NORM_EPS, self.x.base())?;
         self.linear(gpu, &s.router, 0, EXPERTS, WIDTH, self.x.base(), self.logits_router.base(), block)?;
         gpu.route(self.logits_router.base(), Some(s.bias.base().cast_const()), rows, EXPERTS as u64, USED as u64, 2, true, SCALE,
-                  self.ids.base(), self.weights.base())?;
+                  self.ids.base(), self.weights.base())
+    }
+
+    /// A stage's experts after its routes: this device's rows of the routed (through the stage's
+    /// table) and shared experts into its part of the experts' sum.
+    fn experts(&self, gpu: &mut Backend, stage: usize, block: &Block) -> Result<()> {
+        let (s, rows, w) = (&self.stages[stage], block.rows, WIDTH as u64);
         let (experts, shared) = (self.experts, self.shared_expert);
         gpu.experts_table(&s.table, EXPERTS as u64, self.ids.base(), experts.bytes, experts.offsets, [39; 3], w, self.ffn as u64, rows,
                           USED as u64, self.x.base(), Some(self.weights.base().cast_const()), CLAMP, false, self.product.base(),
@@ -393,8 +422,10 @@ impl Drafter {
             tokens: floats(gpu, MAX_SLOTS)?,
             confidences: floats(gpu, MAX_SLOTS)?,
             count: floats(gpu, 1)?,
+            anchor: floats(gpu, 1)?,
             vocabulary,
             held: vec![-1; RING],
+            ran: HashSet::new(),
             embed_kind: target.tensor("token_embd.weight")?.kind,
         })
     }
@@ -429,6 +460,11 @@ impl Drafter {
                 *held = -1;
             }
         }
+    }
+
+    /// Whether the part under `key` has run before (and so records a graph now), noting that it has.
+    fn ran(&mut self, key: Option<u64>) -> bool {
+        key.is_some_and(|key| !self.ran.insert(key))
     }
 
     /// Every device's sum `which` of the devices' parts.
@@ -475,35 +511,54 @@ impl Drafter {
             device.gpu.write_buffer(&part.stream[0], 0, &stream)?;
             device.gpu.write_buffer(&part.positions, 0, &positions)?;
         }
+        // A block after a full history repeats its shape: each part between the devices' sums (and a
+        // stage's routes apart from its experts) replays from a graph (recorded the second time it
+        // runs), reading the anchor's position and token from the devices.
+        let full = history == RING;
+        let key = |segment: u64| full.then_some(GRAPHS | segment << 8 | slots as u64);
         // (the attention's pre-mix: copy 0 for the first stage, the previous stage's FFN pre after)
         let mut previous: Option<usize> = None;
         for stage in 0..self.parts[0].stages.len() {
             let ffn = 1 + stage % 2;
+            let (attention, routes, experts) = (key(3 * stage as u64), key(3 * stage as u64 + 1), key(3 * stage as u64 + 2));
+            let ran = self.ran(attention);
             for (part, device) in self.parts.iter().zip(devices.iter_mut()) {
-                let pre = previous.map_or(part.first, |set| part.coefficients[set][0]);
-                part.attention(device.gpu, stage, pre, &block)?;
+                replay(device.gpu, attention, ran, |gpu| {
+                    if let Some(set) = previous {
+                        part.expand(gpu, set, &block)?;
+                    }
+                    let pre = previous.map_or(part.first, |set| part.coefficients[set][0]);
+                    part.attention(gpu, stage, pre, &block)
+                })?;
             }
             self.sum(devices, 0, &block)?;
+            // (the routes and the experts apart: a seam where experts that are not resident would be
+            // fetched)
+            let ran = self.ran(routes);
             for (part, device) in self.parts.iter().zip(devices.iter_mut()) {
-                part.ffn(device.gpu, stage, ffn, &block)?;
+                replay(device.gpu, routes, ran, |gpu| part.route(gpu, stage, ffn, &block))?;
+            }
+            let ran = self.ran(experts);
+            for (part, device) in self.parts.iter().zip(devices.iter_mut()) {
+                replay(device.gpu, experts, ran, |gpu| part.experts(gpu, stage, &block))?;
             }
             self.sum(devices, 1, &block)?;
-            for (part, device) in self.parts.iter().zip(devices.iter_mut()) {
-                part.expand(device.gpu, ffn, &block)?;
-            }
             previous = Some(ffn);
         }
         // the last FFN's pre-mix collapses the block (the confidence head reads it un-normed); each
         // device's rows of the logits, gathered on the first
         let last = previous.ok_or("DSpark has no stages")?;
         let (vocabulary, rows) = (self.vocabulary, block.rows);
+        let (head, ran) = (key(9), self.ran(key(9)));
         for (index, (part, device)) in self.parts.iter().zip(devices.iter_mut()).enumerate() {
-            let gpu = &mut *device.gpu;
-            gpu.hc_collapse(part.stream[0].base(), part.coefficients[last][0].base(), rows, HC as u64, WIDTH as u64, part.collapsed.base())?;
-            gpu.rms_norm(part.collapsed.base(), &part.output_norm, rows, WIDTH as u64, NORM_EPS, part.x.base())?;
-            let (output, stride) = if index == 0 { (self.logits.at(device.head_first), vocabulary) } else { (part.head_out.base(), 0) };
-            gpu.linear(&device.head, device.head_kind, device.head_rows as u64, WIDTH as u64, 0, part.x.base(), 0, rows, output, stride as u64,
-                       &part.scratch)?;
+            let (weights, kind, head_rows, head_first) = (device.head, device.head_kind, device.head_rows, device.head_first);
+            let (output, stride) = if index == 0 { (self.logits.at(head_first), vocabulary) } else { (part.head_out.base(), 0) };
+            replay(device.gpu, head, ran, |gpu| {
+                part.expand(gpu, last, &block)?;
+                gpu.hc_collapse(part.stream[0].base(), part.coefficients[last][0].base(), rows, HC as u64, WIDTH as u64, part.collapsed.base())?;
+                gpu.rms_norm(part.collapsed.base(), &part.output_norm, rows, WIDTH as u64, NORM_EPS, part.x.base())?;
+                gpu.linear(&weights, kind, head_rows as u64, WIDTH as u64, 0, part.x.base(), 0, rows, output, stride as u64, &part.scratch)
+            })?;
         }
         let (first, rest) = devices.split_at_mut(1);
         for (part, device) in self.parts[1..].iter().zip(rest.iter_mut()) {
@@ -513,9 +568,13 @@ impl Drafter {
             }
         }
         let gpu = &mut *first[0].gpu;
-        gpu.dspark_head(self.logits.base(), self.parts[0].collapsed.base(), &self.markov[0], &self.markov[1], &self.confidence, rows,
-                        vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, None, 0.0, 0, self.corrected.base(), self.tokens.base(),
-                        self.confidences.base(), self.count.base(), &self.parts[0].scratch)?;
+        gpu.write_buffer(&self.anchor, 0, &[anchor as i32])?;
+        let (markov, ran) = (key(10), self.ran(key(10)));
+        replay(gpu, markov, ran, |gpu| {
+            gpu.dspark_head(self.logits.base(), self.parts[0].collapsed.base(), &self.markov[0], &self.markov[1], &self.confidence, rows,
+                            vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, Some(self.anchor.base().cast_const()), 0.0, 0,
+                            self.corrected.base(), self.tokens.base(), self.confidences.base(), self.count.base(), &self.parts[0].scratch)
+        })?;
         let (mut tokens, mut confidences, mut count) = (vec![0i32; slots], vec![0f32; slots], [0u32; 1]);
         gpu.read_buffer(&self.tokens, 0, &mut tokens)?;
         gpu.read_buffer(&self.confidences, 0, &mut confidences)?;

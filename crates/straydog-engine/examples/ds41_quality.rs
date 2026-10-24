@@ -138,8 +138,9 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
     let (mut all_hash, mut all_seconds, mut all_tokens, mut all_passes) = (0xcbf2_9ce4_8422_2325u64, 0.0, 0, 0);
     // rounds, rounds drafted, verified widths 0..=3, verified drafts accepted, seconds drafting
     let (mut all_rounds, mut all_drafted, mut all_widths, mut all_accepted, mut all_drafting) = (0, 0, [0usize; 4], 0, 0.0);
-    // passes by rows (seconds, count), 1-row passes after a verify pass, seconds injecting
-    let (mut by_rows, mut after_verify, mut injecting) = ([(0.0, 0usize); 4], (0.0, 0usize), 0.0);
+    // passes by rows (seconds, count), 1-row passes after a verify pass, seconds injecting, drafts
+    // after a full history (seconds, count: they replay graphs)
+    let (mut by_rows, mut after_verify, mut injecting, mut full) = ([(0.0, 0usize); 4], (0.0, 0usize), 0.0, (0.0, 0usize));
     let mut decode = straydog_engine::experts::Counts::default();
     for (index, prompt) in prompts.iter().enumerate() {
         engines.iter_mut().for_each(|engine| engine.reset());
@@ -169,6 +170,9 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
                     let draft = drafter.draft(&mut engines[0].beside()?, files, next, position, VERIFY_MS.len() - 1)?;
                     let ms = 1e3 * timed.elapsed().as_secs_f64();
                     policy.drafted(ms);
+                    if position >= straydog_engine::arch::deepseek41::drafter::RING {
+                        full = (full.0 + ms / 1e3, full.1 + 1);
+                    }
                     let width = match settings.width {
                         Some(width) => width,
                         None => policy.width(&draft.confidences, room - 1),
@@ -238,8 +242,9 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
              mean(after_verify), 1e3 * injecting / all_passes.max(1) as f64);
     if drafter.is_some() {
         println!("  dspark rounds {all_rounds}, drafted {all_drafted} ({:.0}%), widths {all_widths:?}, {all_accepted} drafts accepted, \
-                  {:.2} tokens a round, {:.2} ms a draft", 100.0 * all_drafted as f64 / all_rounds.max(1) as f64,
-                 all_tokens as f64 / all_rounds.max(1) as f64, 1e3 * all_drafting / all_drafted.max(1) as f64);
+                  {:.2} tokens a round, {:.2} ms a draft ({} after a full history at {:.2} ms)",
+                 100.0 * all_drafted as f64 / all_rounds.max(1) as f64, all_tokens as f64 / all_rounds.max(1) as f64,
+                 1e3 * all_drafting / all_drafted.max(1) as f64, full.1, mean(full));
     }
     Ok(())
 }
