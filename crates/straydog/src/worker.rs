@@ -414,6 +414,14 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     Failure { message: format!("{site}: {}", message.into()), fatal: true }
 }
 
+/// Telemetry must not turn a completed generation into a failed request.
+pub(crate) fn gpu_info_or_null(info: Result<Value, String>, site: &str) -> Value {
+    info.unwrap_or_else(|message| {
+        eprintln!("WARN Straydog GPU info unavailable at {site}: {message}");
+        Value::Null
+    })
+}
+
 // Tokenization and detokenization use host state owned by this request. Neither can
 // invalidate the device; generate still resets the model before accepting another request.
 impl From<TextError> for Failure {
@@ -556,7 +564,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         "id": id, "event": "done", "finish_reason": finish_reason,
         "usage": {"prompt_tokens": ids.len(), "completion_tokens": generated, "total_tokens": ids.len() + generated,
                   "cached_tokens": cached},
-        "gpu": engine.model.info().map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.info")))?,
+        "gpu": gpu_info_or_null(engine.model.info(), concat!(file!(), ":", line!(), " model.info")),
         "timings": timings,
     }))
 }
@@ -578,6 +586,9 @@ mod tests {
             let prompt = body.as_str().unwrap();
             if prompt == "device-fault" {
                 return Err(engine_failed("an illegal memory access was encountered", concat!(file!(), ":", line!(), " device fault")));
+            }
+            if prompt == "gpu-info-error" {
+                return Ok(json!({"id": id, "event": "done", "gpu": gpu_info_or_null(Err("injected info error".into()), "test")}));
             }
             let tokens = text.encode(prompt).map_err(Failure::from)?;
             Ok(json!({"id": id, "event": "done", "tokens": tokens}))
@@ -629,5 +640,18 @@ mod tests {
         assert_eq!(failed["fatal"], true);
         assert!(failed["message"].as_str().unwrap().contains("device fault: an illegal memory access"));
         assert_eq!(engine.lock().unwrap().resets, 1);
+    }
+
+    #[test]
+    fn gpu_info_failure_preserves_done_and_the_next_request() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: false });
+        let text = tokenizer();
+        let done = request(&engine, &text, "gpu-info-error", "no-info");
+        assert_eq!(done["event"], "done");
+        assert!(done.get("gpu").unwrap().is_null());
+        assert_eq!(request(&engine, &text, "ok", "next")["event"], "done");
+        assert_eq!(engine.lock().unwrap().resets, 0);
+        let info = json!({"free_bytes": 0});
+        assert_eq!(gpu_info_or_null(Ok(info.clone()), "test"), info);
     }
 }

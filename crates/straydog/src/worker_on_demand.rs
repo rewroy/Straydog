@@ -17,7 +17,7 @@ use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 
-use crate::worker::{engine_failed, refused, serve, Failure, Output, Plan, Served, WorkerArgs};
+use crate::worker::{engine_failed, gpu_info_or_null, refused, serve, Failure, Output, Plan, Served, WorkerArgs};
 
 /// The model and its template, on the thread that made them: the engines hold device state that
 /// stays on one thread.
@@ -328,7 +328,7 @@ impl<E: Engines> Loaded<E> {
             "id": id, "event": "done", "finish_reason": finish_reason,
             "usage": {"prompt_tokens": ids.len(), "completion_tokens": generated, "total_tokens": ids.len() + generated,
                       "cached_tokens": cached},
-            "gpu": self.model.info().map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.info")))?,
+            "gpu": gpu_info_or_null(self.model.info(), concat!(file!(), ":", line!(), " model.info")),
             "timings": timings,
         }))
     }
