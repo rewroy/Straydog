@@ -1045,8 +1045,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// runs): per layer, its window ring's rows of the last `window` positions (oldest first), and
     /// per kv source layer its compressed rows, index keys and the rows waiting in its tail.
     pub fn state(&mut self) -> Result<Vec<(String, Vec<f32>)>> {
+        self.state_on(0)
+    }
+
+    /// [`Engine::state`] as device `device` of the engine's holds it (every device holds the same).
+    pub fn state_on(&mut self, device: usize) -> Result<Vec<(String, Vec<f32>)>> {
         let (window, dim, index_dim, ring) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring);
-        let shard = &mut self.shards[0];
+        let shard = self.shards.get_mut(device).ok_or("no such device in the engine")?;
         let mut state = Vec::new();
         for (&layer, buffer) in &shard.rings {
             let mut rows = vec![0f32; ring * dim];

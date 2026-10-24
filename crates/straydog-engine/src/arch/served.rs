@@ -203,6 +203,9 @@ pub struct Session<E: Engines> {
     pub state_bytes: u64,
     pub load_seconds: Vec<(String, f64)>,
     pub last_metrics: Map<String, Value>,
+    /// Tests only: when set, each request's prompt logits (those its first token is chosen from).
+    #[doc(hidden)]
+    pub prompt_logits: Option<Vec<f32>>,
     /// An earlier run's experts still to warm up with: (VRAM, host tier), least recently used
     /// first, taken from the front.
     warming: (Pending, Pending),
@@ -337,7 +340,7 @@ impl<E: Engines> Session<E> {
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
             checkpoints: Vec::new(), card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
-            last_metrics: Map::new(), warming: Default::default(),
+            last_metrics: Map::new(), prompt_logits: None, warming: Default::default(),
         }
     }
 
@@ -435,6 +438,9 @@ impl<E: Engines> Session<E> {
         let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
             return Ok(());
         };
+        if let Some(kept) = self.prompt_logits.as_mut() {
+            kept.clone_from(&logits);
+        }
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
         let cpu = self.engines.cpu_routes();
@@ -516,6 +522,9 @@ impl<E: Engines> Session<E> {
     /// Save the held state as the last turn's checkpoint: one of the same tokens just becomes the
     /// last; else a free slot takes it, the oldest checkpoint giving its up when all are taken.
     fn save_turn(&mut self) -> Result<(), String> {
+        // (checkpoints the engines gave up are gone: one of the same tokens is taken again)
+        let engines = &self.engines;
+        self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
             let same = self.checkpoints.remove(index);
             self.checkpoints.push(same);

@@ -47,6 +47,8 @@ pub struct Engines {
     saved: Vec<Option<Vec<Snapshot>>>,
     /// The slots holding one, oldest first.
     order: Vec<usize>,
+    /// Host bytes they may take ([`CHECKPOINT_BYTES`]).
+    budget: u64,
 }
 
 impl served::Engines for Engines {
@@ -132,7 +134,7 @@ impl served::Engines for Engines {
         let required: u64 = self.engines.iter().map(Engine::snapshot_bytes).sum();
         let held: Vec<(usize, u64)> = self.order.iter()
             .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
-        let Some(given_up) = evictions(&held, required, CHECKPOINT_BYTES) else { return Ok(()) };
+        let Some(given_up) = evictions(&held, required, self.budget) else { return Ok(()) };
         for oldest in given_up {
             self.saved[oldest] = None;
             self.order.retain(|&held| held != oldest);
@@ -170,12 +172,21 @@ fn evictions(held: &[(usize, u64)], required: u64, cap: u64) -> Option<Vec<usize
 }
 
 impl Engines {
-    /// Diagnostics: every engine's sequence state ([`Engine::state`]), engine after engine.
+    /// Tests only: let the checkpoints take at most `bytes` (a budget too low for one).
+    #[doc(hidden)]
+    pub fn limit_checkpoints(&mut self, bytes: u64) {
+        self.budget = bytes;
+    }
+
+    /// Diagnostics: every engine's sequence state ([`Engine::state_on`]) on each of its devices,
+    /// engine after engine.
     #[doc(hidden)]
     pub fn state(&mut self) -> Result<Vec<(String, Vec<f32>)>, String> {
         let mut state = Vec::new();
         for (index, engine) in self.engines.iter_mut().enumerate() {
-            state.extend(engine.state()?.into_iter().map(|(name, values)| (format!("engine {index} {name}"), values)));
+            for device in 0..engine.gpus().count() {
+                state.extend(engine.state_on(device)?.into_iter().map(|(name, values)| (format!("engine {index} device {device} {name}"), values)));
+            }
         }
         Ok(state)
     }
@@ -338,7 +349,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let verify_rows = if drafts { engines.iter().map(Engine::verify_rows).min().unwrap_or(1) } else { 1 };
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
-                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new() },
+                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), budget: CHECKPOINT_BYTES },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
         end: vec![end], turn_start, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),

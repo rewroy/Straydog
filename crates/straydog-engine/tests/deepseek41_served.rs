@@ -10,7 +10,7 @@ mod common;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
-use straydog_engine::arch::deepseek41::serve::{place, Model};
+use straydog_engine::arch::deepseek41::serve::{place, Model, CHECKPOINT_BYTES};
 use straydog_engine::arch::served::Settings;
 use straydog_engine::group::SplitMode;
 use straydog_engine::chat::ChatTemplate;
@@ -18,25 +18,28 @@ use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 
-/// What a request left: its greedy tokens, where it resumed, and the digests of the sequence
-/// state then (every engine's window rings, compressed rows, index keys and tails).
+/// What a request left: its greedy tokens, where it resumed, its prompt logits' digest, and the
+/// digests of the sequence state then (every engine's window rings, compressed rows, index keys
+/// and tails, on each of its devices).
 #[derive(Debug, PartialEq)]
 struct Outcome {
     tokens: Vec<u32>,
     cached: Option<u64>,
+    logits: String,
     state: Vec<String>,
+}
+
+fn digest(values: &[f32]) -> String {
+    let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    format!("{:x}", Sha256::digest(&bytes))
 }
 
 fn go(model: &mut Model, prompt: &[u32], max_new: usize) -> Outcome {
     let mut tokens = Vec::new();
     model.generate(prompt, max_new, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, &mut |token| tokens.push(token)).unwrap();
-    let state = model.engines.state().unwrap().into_iter()
-        .map(|(name, values)| {
-            let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-            format!("{name} {:x}", Sha256::digest(&bytes))
-        })
-        .collect();
-    Outcome { tokens, cached: model.last_metrics["cached_tokens"].as_u64(), state }
+    let state = model.engines.state().unwrap().into_iter().map(|(name, values)| format!("{name} {}", digest(&values))).collect();
+    let logits = digest(model.prompt_logits.as_deref().unwrap());
+    Outcome { tokens, cached: model.last_metrics["cached_tokens"].as_u64(), logits, state }
 }
 
 /// A chat's turns (thinking on, the replies sent back without their reasoning), then another
@@ -53,6 +56,7 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
         row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: false,
     };
     let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+    model.prompt_logits = Some(Vec::new());
     let text = Text::from_gguf(model.header()).unwrap();
     let template = ChatTemplate::new(model.header().metadata["tokenizer.chat_template"].text().unwrap()).unwrap();
     // Chats with thinking on, sent back as clients send them: each reply's content alone, without
@@ -91,10 +95,24 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     let (direct, back) = (&runs[0], &runs[1]);
     assert!(back.cached.is_some_and(|cached| cached as usize > first.len()), "the third turn from the second's checkpoint");
     assert_eq!(back.cached, direct.cached, "resumed at");
+    assert_eq!(back.logits, direct.logits, "prompt logits");
     assert_eq!(back.tokens, direct.tokens, "tokens");
     let differing: Vec<_> = back.state.iter().zip(&direct.state).filter(|(a, b)| a != b).collect();
     for (a, b) in differing.iter().take(12) {
         eprintln!("{a} (direct {})", b.rsplit(' ').next().unwrap());
     }
     assert!(differing.is_empty() && back.state.len() == direct.state.len(), "state ({} parts differ)", differing.len());
+
+    // A turn whose checkpoint the budget did not let be taken, regenerated once there is room,
+    // takes it then: the turn after it resumes from there.
+    let fourth = render(&format!("[{system}, {}, {}, {}]", turns.join(", "), reply("In checkpoints."), user("Where are they kept?")));
+    let fifth = render(&format!("[{system}, {}, {}, {}, {}, {}]", turns.join(", "), reply("In checkpoints."), user("Where are they kept?"),
+                                reply("In host memory."), user("How many?")));
+    model.engines.limit_checkpoints(0);
+    go(&mut model, &fourth, 8);
+    model.engines.limit_checkpoints(CHECKPOINT_BYTES);
+    let again = go(&mut model, &fourth, 8);
+    assert!(again.cached.is_some_and(|cached| (cached as usize) < third.len()), "regenerated from the third turn's checkpoint");
+    let after = go(&mut model, &fifth, 8);
+    assert!(after.cached.is_some_and(|cached| cached as usize > third.len()), "the fifth turn from the regenerated fourth's checkpoint");
 }
