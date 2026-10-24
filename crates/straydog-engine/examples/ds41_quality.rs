@@ -7,7 +7,7 @@
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
-//!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all]
+//!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -16,6 +16,13 @@
 //! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
 //! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
 //! Each TOKENS file is the probe's prompt-N.tokens; its logits are read from prompt-N.logits beside it.
+//! --dspark DIR loads DSpark (the GGUF in DIR) beside the first device, feeds it the target's
+//! features of every position, and before each decode step drafts a block of each --draft-slots
+//! size (default 3,4; 0 drafts nothing) after that step's token, teacher forced (one engine,
+//! --verify 0): per prompt and size, the mean count of a block's tokens that match the
+//! reference's continuation as a prefix, and how often that prefix reaches each slot (slot 0
+//! alone, slots 0-1, ...); --show-drafts prints every block. The logits hashed are the target's,
+//! so the hashes must not change.
 
 #[path = "common/files.rs"]
 mod files;
@@ -23,6 +30,8 @@ mod files;
 use std::path::Path;
 
 use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
+use straydog_engine::arch::deepseek41::drafter::Drafter;
+use straydog_engine::arch::deepseek41::dspark::Dspark;
 use straydog_engine::arch::deepseek41::Hparams;
 
 /// Log-softmax in F64.
@@ -80,6 +89,11 @@ fn summary(label: &str, steps: &[Step]) -> String {
             steps.len(), kls.last().copied().unwrap_or(0.0), 100.0 * top1, ours.exp(), reference.exp())
 }
 
+/// DSpark's drafts of one size: how often their prefix matching the reference reaches each slot.
+fn reach(rounds: usize, per_slot: &[usize]) -> String {
+    per_slot.iter().map(|&reached| format!("{:.3}", reached as f64 / rounds.max(1) as f64)).collect::<Vec<_>>().join(", ")
+}
+
 fn main() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut option = |flag: &str, default: usize| args.iter().position(|arg| arg == flag).map_or(default, |at| {
@@ -107,6 +121,18 @@ fn main() -> Result<(), String> {
         value
     });
     let accept_all = args.iter().position(|arg| arg == "--accept-all").map(|at| args.remove(at)).is_some();
+    let dspark_dir = args.iter().position(|arg| arg == "--dspark").map(|at| {
+        let value = args[at + 1].clone();
+        args.drain(at..at + 2);
+        value
+    });
+    let draft_slots: Vec<usize> = args.iter().position(|arg| arg == "--draft-slots").map_or(vec![3, 4], |at| {
+        let value = args[at + 1].split(',').map(|slots| slots.parse().unwrap()).collect();
+        args.drain(at..at + 2);
+        value
+    });
+    let draft_slots: Vec<usize> = draft_slots.into_iter().filter(|&slots| slots > 0 && dspark_dir.is_some()).collect();
+    let show_drafts = args.iter().position(|arg| arg == "--show-drafts").map(|at| args.remove(at)).is_some();
     let show = args.iter().position(|arg| arg == "--show").map(|at| {
         let value: f64 = args[at + 1].parse().unwrap();
         args.drain(at..at + 2);
@@ -114,7 +140,8 @@ fn main() -> Result<(), String> {
     });
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
-                    [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all]".into());
+                    [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -140,9 +167,37 @@ fn main() -> Result<(), String> {
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
+    let dspark_files = dspark_dir.as_ref().map(|dir| files::Files::open(Path::new(dir))).transpose()?;
+    let mut drafter = match &dspark_files {
+        Some(draft) => {
+            if engines.len() != 1 || widths.iter().any(|&verify| verify != 0) {
+                return Err("--dspark drafts on one engine (no --split) with --verify 0".into());
+            }
+            Dspark::from_headers(&draft.header, &files.header)?;
+            engines[0].enable_tap()?;
+            let (gpu, _) = engines[0].tap().ok_or("no tap")?;
+            let loading = std::time::Instant::now();
+            let drafter = Drafter::load(gpu, draft, &files, vocabulary)?;
+            println!("dspark: loaded in {:.1} s", loading.elapsed().as_secs_f64());
+            Some(drafter)
+        }
+        None => None,
+    };
+    // the drafter's history: the tapped rows of the last pass (its last n of its positions)
+    let inject = |engines: &mut Vec<Engine<'_, files::Files>>, drafter: &mut Option<Drafter>, n: usize| -> Result<(), String> {
+        let Some(drafter) = drafter else { return Ok(()) };
+        let end = engines[0].position();
+        let kept = n.min(straydog_engine::arch::deepseek41::engine::TAP_ROWS);
+        let positions: Vec<i32> = (end - kept..end).map(|at| at as i32).collect();
+        let (gpu, tap) = engines[0].tap().ok_or("no tap")?;
+        drafter.inject(gpu, tap.base(), &positions)
+    };
     for (run, &verify) in widths.iter().enumerate() {
         let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
         let mut run_hash = 0xcbf2_9ce4_8422_2325u64;
+        // per block size, over the prompts: rounds, tokens matched as a prefix, rounds whose prefix
+        // reaches each slot, seconds drafting
+        let mut drafted_all: Vec<(usize, usize, Vec<usize>, f64)> = draft_slots.iter().map(|&slots| (0, 0, vec![0; slots], 0.0)).collect();
         // DS41_PROFILE: the decode passes' phases, and the store's counters over them
         let (mut phases, mut stores) = (std::collections::BTreeMap::<&str, f64>::new(), straydog_engine::experts::Counts::default());
         for (index, tokens_file) in tokens_files.split(',').enumerate() {
@@ -159,10 +214,17 @@ fn main() -> Result<(), String> {
             // end-of-generation one.
             let decode_rows = rows.len().saturating_sub(kept);
             engines.iter_mut().for_each(|engine| engine.reset());
+            if let Some(drafter) = &mut drafter {
+                drafter.forget_from(0);
+            }
             let mut logits = Vec::new();
             for piece in prompt.chunks(chunk) {
                 logits = forward_split(&mut engines, piece)?;
+                inject(&mut engines, &mut drafter, piece.len())?;
             }
+            // per block size: rounds, tokens matched as a prefix, rounds whose prefix reaches each slot,
+            // seconds drafting
+            let mut drafted: Vec<(usize, usize, Vec<usize>, f64)> = draft_slots.iter().map(|&slots| (0, 0, vec![0; slots], 0.0)).collect();
             let mut prompt_hash = 0xcbf2_9ce4_8422_2325u64;
             hash(&mut prompt_hash, &logits);
             let mut saved: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
@@ -177,7 +239,29 @@ fn main() -> Result<(), String> {
             while step < decode_steps {
                 let width = verify.clamp(1, decode_steps - step);
                 let rows = if verify == 0 {
-                    forward_split(&mut engines, &generated[step..step + 1])?
+                    // the drafts after this step's token (the anchor, the target's choice), before it is fed
+                    if let Some(drafter) = &mut drafter {
+                        let (anchor, position, truth) = (generated[step], engines[0].position(), &generated[step + 1..]);
+                        for (&slots, (rounds, matched, per_slot, spent)) in draft_slots.iter().zip(&mut drafted) {
+                            if truth.len() < slots {
+                                continue;
+                            }
+                            let (gpu, _) = engines[0].tap().ok_or("no tap")?;
+                            let drafting = std::time::Instant::now();
+                            let proposal = drafter.draft(gpu, &files, anchor, position, slots)?;
+                            *spent += drafting.elapsed().as_secs_f64();
+                            let prefix = proposal.iter().zip(truth).take_while(|(a, b)| a == b).count();
+                            *rounds += 1;
+                            *matched += prefix;
+                            per_slot[..prefix].iter_mut().for_each(|reached| *reached += 1);
+                            if show_drafts {
+                                println!("  draft prompt {index} position {position} anchor {anchor} B={slots}: {proposal:?}, {prefix} matched");
+                            }
+                        }
+                    }
+                    let rows = forward_split(&mut engines, &generated[step..step + 1])?;
+                    inject(&mut engines, &mut drafter, 1)?;
+                    rows
                 } else {
                     verify_split(&mut engines, &generated[step..step + width])?
                 };
@@ -216,6 +300,14 @@ fn main() -> Result<(), String> {
             hash(&mut run_hash, &[f32::from_bits(prompt_hash as u32), f32::from_bits((prompt_hash >> 32) as u32)]);
             println!("{} | logits hash {prompt_hash:016x} | {decode_steps} tokens in {passes} passes, {seconds:.2} s",
                      summary(&format!("prompt {index}"), &steps));
+            for ((&slots, (rounds, matched, per_slot, spent)), total) in draft_slots.iter().zip(&drafted).zip(&mut drafted_all) {
+                println!("  dspark prompt {index} B={slots}: {rounds} rounds, mean accepted {:.3}, prefix reaches slot [{}]",
+                         *matched as f64 / (*rounds).max(1) as f64, reach(*rounds, per_slot));
+                total.0 += rounds;
+                total.1 += matched;
+                total.2.iter_mut().zip(per_slot).for_each(|(sum, reached)| *sum += reached);
+                total.3 += spent;
+            }
             if let Some(dir) = std::env::var_os("DS41_QUALITY_SAVE") {
                 let name = if widths.len() > 1 { format!("prompt-{index}-run{run}.logits") } else { format!("prompt-{index}.logits") };
                 std::fs::write(Path::new(&dir).join(name), &saved).map_err(|exc| exc.to_string())?;
@@ -232,6 +324,10 @@ fn main() -> Result<(), String> {
         let label = if widths.len() > 1 { format!("all, verify {verify}") } else { "all".to_string() };
         println!("{} | run hash {run_hash:016x} | {decode_tokens} tokens in {decode_passes} passes, {decode_seconds:.2} s",
                  summary(&label, &all));
+        for (&slots, (rounds, matched, per_slot, spent)) in draft_slots.iter().zip(&drafted_all) {
+            println!("  dspark all B={slots}: {rounds} rounds, mean accepted {:.3}, prefix reaches slot [{}], {:.2} ms a draft",
+                     *matched as f64 / (*rounds).max(1) as f64, reach(*rounds, per_slot), 1e3 * spent / (*rounds).max(1) as f64);
+        }
         let per_pass = |count: u64| count as f64 / decode_passes.max(1) as f64;
         println!("  a decode pass: {:.2} ms, {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads ({:.1} MiB), {:.1} write-backs; \
                   waits {:.2} ms for reads, {:.2} ms for slots, store {:.2} ms",
