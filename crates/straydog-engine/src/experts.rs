@@ -2036,7 +2036,7 @@ impl DeviceExperts {
 
     /// Of a warm-up's lists (least recently used first), what this store's slots hold (see
     /// [`fit_warm`]).
-    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Contents {
         let room: Vec<(usize, usize)> = self.classes.iter().map(|class| (class.count, class.host_capacity)).collect();
         fit_warm(&self.class_of, &room, vram, host)
     }
@@ -2055,7 +2055,7 @@ impl DeviceExperts {
 /// recent than its own entries), then the most recent host entries its slots take. Each list
 /// keeps its order (VRAM's left over after the host tier's own).
 pub fn fit_warm(class_of: &[Option<usize>], room: &[(usize, usize)], vram: &[(usize, usize)], host: &[(usize, usize)])
-                -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+                -> Contents {
     let mut room = room.to_vec();
     let class = |&(layer, _): &(usize, usize)| class_of.get(layer).copied().flatten();
     let (mut kept_vram, mut spilled, mut kept_host) = (Vec::new(), Vec::new(), Vec::new());

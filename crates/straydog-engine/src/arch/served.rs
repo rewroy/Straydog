@@ -49,7 +49,7 @@ pub trait Engines {
     fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize), String>;
     /// Of a warm-up's lists (least recently used first), what the stores' slots hold, each
     /// expert's layer to whichever store holds that layer now: the most recent of each.
-    fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> Contents {
         (vram, host)
     }
     /// Take the landed reads, without waiting; the reads still in flight.

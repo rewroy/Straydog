@@ -103,7 +103,7 @@ impl served::Engines for Engines {
         Ok((reading, placed, hosted))
     }
 
-    fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> crate::experts::Contents {
         // each engine its layers' (the stores' layers as placed now, whatever they were)
         let (mut kept_vram, mut kept_host) = (std::collections::HashSet::new(), std::collections::HashSet::new());
         for engine in &self.engines {

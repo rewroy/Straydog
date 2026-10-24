@@ -1069,7 +1069,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// Of a warm-up's lists, this engine's experts that its stores' slots hold (every device's
     /// store has the same slots).
-    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> crate::experts::Contents {
         let (layers, count) = (self.settings.layers.clone(), self.hp.experts);
         let mine = |layer: usize, expert: usize| layers.contains(&layer) && expert < count;
         let ((vram, _), (host, _)) = (select(vram, mine), select(host, mine));
