@@ -234,6 +234,14 @@ struct Work {
     act: Buffer,
     act_sum: Buffer,
     y: Buffer,
+    /// For the grouped WMMA kernels (an FP16 pass on RDNA4, see `Engine::experts_grouped`): the
+    /// input rows in FP16, a wave's FP16 products (the device's share of the expert width) and,
+    /// with several devices, their summed activations in FP16; and each launch's group and tile
+    /// lists.
+    xh: Buffer,
+    ph: Buffer,
+    ah: Buffer,
+    tables: Buffer,
     /// Values a row of the buffers of every row: hc, width, routes, selections.
     widths: (usize, usize, usize, usize),
 }
@@ -290,6 +298,9 @@ struct Shard {
 pub const OWN_ROWS: usize = 64;
 /// The least rows a product takes GEMM for (the devices' default).
 const GEMM_MIN_BATCH: u64 = 8;
+/// A wave's group and tile lists for the grouped WMMA kernels (32 experts' groups and their 64-row
+/// tiles of up to a pass's routes take ~11 KB).
+const SLOT_TABLE_BYTES: u64 = 64 << 10;
 
 /// What sizes a device's buffers of every row: hc, width, routes a row, the experts' width,
 /// selections a row, the index source layers (in order), whether the device has parts of sums,
@@ -317,8 +328,9 @@ impl RowShape {
         let mut floats = vec![rows * hc * w, rows * hc * w, rows * hc, rows * hc, rows * hc * hc, rows * hc, rows * hc, rows * hc,
                               rows * hc * hc, rows * w, rows * w, split * w, split * w, rows, rows, rows, rows, rows];
         floats.extend(self.chosen.iter().map(|_| rows * self.top_k));
+        // (y: a wave's routes' outputs; xh, ph and ah: halves, two to a float)
         floats.extend([rows * k + PREDICTED, rows * k, rows * k, (rows * k).max(PREDICTED), rows * w, rows * ff, rows * ff,
-                       routes * ff, if self.split { routes } else { 0 } * ff, rows * w]);
+                       routes * ff, if self.split { routes } else { 0 } * ff, routes * w, rows * w / 2, routes * ff / 2, routes * ff / 2]);
         floats
     }
 
@@ -428,6 +440,9 @@ pub struct Engine<'a, T: Tensors> {
     /// Decode's fills start their gate and up once those are in, their downs landing meanwhile
     /// (DS41_GATE_UP_FIRST=0: once all of them is in).
     gate_up_first: bool,
+    /// An FP16 pass's waves of experts take the grouped WMMA kernels where the device has them
+    /// (DS41_SLOT_WMMA=0: an expanded GEMM per expert).
+    slot_wmma: bool,
     /// A pass of a few rows has the first device's router publish its routes to page-locked host
     /// memory, for the host to take without a readback (DS41_ROUTE_READBACK: read them back).
     mailbox: bool,
@@ -691,7 +706,11 @@ impl Shard {
             up: floats(&mut gpu, own * ff)?,
             act: floats(&mut gpu, routes * ff)?,
             act_sum: floats(&mut gpu, if parts > 1 { routes } else { 0 } * ff)?,
-            y: floats(&mut gpu, own * w)?,
+            y: floats(&mut gpu, routes * w)?,
+            xh: floats(&mut gpu, own * w / 2)?,
+            ph: floats(&mut gpu, routes * ff / 2)?,
+            ah: floats(&mut gpu, routes * ff / 2)?,
+            tables: gpu.buffer(SLOT_TABLE_BYTES)?,
             widths: (hc, w, k, hp.index_top_k),
         };
         gpu.write_buffer(&work.identity, 0, &identity)?;
@@ -882,6 +901,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             predicted: Vec::new(),
             hits_first: std::env::var("DS41_HITS_FIRST").map_or(true, |value| value != "0"),
             gate_up_first: std::env::var("DS41_GATE_UP_FIRST").map_or(true, |value| value != "0"),
+            slot_wmma: std::env::var("DS41_SLOT_WMMA").map_or(true, |value| value != "0"),
             mailbox: std::env::var_os("DS41_ROUTE_READBACK").is_none(),
             linked,
             link_pass: false,
@@ -2184,6 +2204,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // starts its reads behind this layer's last wave, through the next layer's attention.
         let next_rows = if self.settings.layers.contains(&(layer + 1)) { n - self.rows_of(layer + 1, n).2 } else { 0 };
         let ahead: Vec<usize> = if next_rows * k >= AHEAD * hp.experts { (0..limit.min(hp.experts)).collect() } else { Vec::new() };
+        // An FP16 pass on RDNA4 runs a wave's experts in one grouped launch a stage, decoding their
+        // slots' quantized weights straight into WMMA fragments. Each expert's weights expanded
+        // into VRAM for a GEMM of its own held a GPU ~4.6 s of a 10.7K-token prompt.
+        let wmma = half_gemm && self.slot_wmma && {
+            let shard = &self.shards[0];
+            let ((_, fs), (_, hs)) = (shard.rows.ffn, shard.rows.hidden);
+            shard.gpu.slot_moe_supported(kinds, w as u64, fs as u64, ff as u64, hs as u64)?
+        };
+        if wmma {
+            for shard in &mut self.shards {
+                let work = shard.work.view(first);
+                shard.gpu.half_values(work.x.base(), (rows * w) as u64, work.xh.base())?;
+            }
+        }
+        // (a wave's experts as the grouped kernels take them: slots, grouped rows from the wave's
+        // first, route counts)
+        let slot_wave = |slots: &[Buffer], wave: &[moe::Span]| -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+            (slots.iter().map(|slot| slot.base() as u64).collect(), wave.iter().map(|span| (span.first - wave[0].first) as u32).collect(),
+             wave.iter().map(|span| span.routes as u32).collect())
+        };
         for (index, wave) in waves.iter().enumerate() {
             // A wave's gate and up write the activations again: each device first waits until the
             // others' last sum (the shared expert's, or the wave before's) has read its activations,
@@ -2218,6 +2258,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let routes = wave.iter().map(|span| span.routes).sum::<usize>();
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
+                if wmma {
+                    // the wave's FP16 products (this device's columns), spread over the expert width
+                    // for the sum across devices
+                    let ((f0, fs), (_, hs)) = (shard.rows.ffn, shard.rows.hidden);
+                    let (bases, firsts, counts) = slot_wave(slots, wave);
+                    let grouped = ops::SlotWave { bases: &bases, firsts: &firsts, counts: &counts, gate_bytes, kinds, width: w as u64,
+                                                  ffn_share: fs as u64, ffn: ff as u64, hidden_share: hs as u64, tables: &work.tables };
+                    shard.gpu.slot_moe_gate_up(&grouped, work.route_rows.at(base), rows as u64, work.xh.base(), clamp_routed,
+                                               work.route_weights.at(base), work.ph.base())?;
+                    if split {
+                        shard.gpu.slot_moe_spread(work.ph.base(), routes as u64, fs as u64, ff as u64, f0 as u64, work.act.base())?;
+                    }
+                    continue;
+                }
                 let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 for (span, slot) in wave.iter().zip(slots) {
                     moe::gate_up(&mut shard.gpu, slot, &shape, &scratch, work.x.base(), rows, work.route_rows.at(span.first),
@@ -2227,11 +2281,33 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.sum_activations(routes)?;
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
-                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
-                for (span, slot) in wave.iter().zip(slots) {
-                    moe::down(&mut shard.gpu, slot, &shape, &scratch, input.at((span.first - base) * ff), span.routes,
-                              work.route_rows.at(span.first), target.base(), rows)?;
+                if wmma {
+                    // the summed activations in FP16 (one device: its products are the whole width),
+                    // down into this device's columns of the wave's rows, added to their rows' output
+                    let ((_, fs), (h0, hs)) = (shard.rows.ffn, shard.rows.hidden);
+                    let (bases, firsts, counts) = slot_wave(slots, wave);
+                    let grouped = ops::SlotWave { bases: &bases, firsts: &firsts, counts: &counts, gate_bytes, kinds, width: w as u64,
+                                                  ffn_share: fs as u64, ffn: ff as u64, hidden_share: hs as u64, tables: &work.tables };
+                    let product = if split {
+                        shard.gpu.half_values(input.base(), (routes * ff) as u64, work.ah.base())?;
+                        work.ah.base()
+                    } else {
+                        work.ph.base()
+                    };
+                    shard.gpu.slot_moe_down(&grouped, product, work.y.at(h0), w as u64)?;
+                    // (an expert's routes at a time: a row routes to several experts of a wave, and a
+                    // scatter's adds to one row race; an expert's routes are of distinct rows)
+                    for span in wave.iter() {
+                        shard.gpu.scatter_add(work.y.at((span.first - base) * w), work.route_rows.at(span.first), span.routes as u64, w as u64,
+                                              target.base(), rows as u64)?;
+                    }
+                } else {
+                    let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
+                    for (span, slot) in wave.iter().zip(slots) {
+                        moe::down(&mut shard.gpu, slot, &shape, &scratch, input.at((span.first - base) * ff), span.routes,
+                                  work.route_rows.at(span.first), target.base(), rows)?;
+                    }
                 }
                 check_slots(shard, layer, &experts(wave), slots, 2 * gate_bytes + down_bytes, true)?;
                 shard.experts.release(&mut shard.gpu)?;
@@ -2577,7 +2653,9 @@ pub fn pass_row_bytes(hp: &Hparams, parts: usize, layers: std::ops::Range<usize>
     let split = usize::from(parts > 1);
     // the stream twice, its coefficients, x, out, an expert's input and output rows, the parts,
     // positions and visible counts, selections, routes, gate, up and the activations (and their sum)
-    let values = 2 * hc * w + 6 * hc + 2 * hc * hc + 4 * w + 2 * split * w + 5 + indexes * hp.index_top_k + 4 * k + (3 + split) * ff;
+    // (and the grouped WMMA kernels' FP16 input row, products and summed activations: w / 2 + ff)
+    let values = 2 * hc * w + 6 * hc + 2 * hc * hc + 4 * w + 2 * split * w + 5 + indexes * hp.index_top_k + 4 * k + (3 + split) * ff
+        + w / 2 + ff;
     (values * 4) as u64
 }
 
@@ -2622,7 +2700,7 @@ impl Work {
             comb_f: next(), x: next(), out: next(), parts: [next(), next()], positions: next(), ring_rows: next(),
             visible: [next(), next(), next()], chosen: self.chosen.keys().map(|&layer| (layer, next())).collect(), ids: next(),
             weights: next(), route_rows: next(), route_weights: next(), xe: next(), gate: next(), up: next(), act: next(),
-            act_sum: next(), y: next(), ..self.clone()
+            act_sum: next(), y: next(), xh: next(), ph: next(), ah: next(), ..self.clone()
         })
     }
 

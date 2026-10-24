@@ -181,6 +181,21 @@ int sd_op_zero(void* handle, void* pointer, uint64_t bytes);
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
 int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
+// A wave of experts in slots through the RDNA4 grouped WMMA kernels (see kernels.cpp): whether the
+// device and these kinds and shapes take them (1), gate/up into FP16 grouped products (clamped
+// SwiGLU times the routes' weights), down from FP16 grouped products into F32 rows out_stride apart.
+int sd_slot_moe_supported(void* handle, const int* kinds, uint64_t width, uint64_t ffn_share, uint64_t ffn, uint64_t hidden_share);
+int sd_op_slot_moe_gate_up(void* handle, const uint64_t* bases, const uint32_t* firsts, const uint32_t* counts, uint64_t experts,
+                           uint64_t gate_bytes, const int* kinds, uint64_t width, uint64_t ffn_share, uint64_t ffn,
+                           uint64_t hidden_share, const int32_t* rows, uint64_t steps, const void* input, float clamp,
+                           const float* weights, void* product, void* tables, uint64_t table_bytes);
+int sd_op_slot_moe_down(void* handle, const uint64_t* bases, const uint32_t* firsts, const uint32_t* counts, uint64_t experts,
+                        uint64_t gate_bytes, const int* kinds, uint64_t width, uint64_t ffn_share, uint64_t ffn, uint64_t hidden_share,
+                        const void* product, float* outputs, uint64_t out_stride, void* tables, uint64_t table_bytes);
+// `values` (a multiple of four) rounded to FP16; FP16 products spread into F32 rows of `full`
+// at column `first`, the other columns zero.
+int sd_op_half_values(void* handle, const float* input, uint64_t values, void* output);
+int sd_op_slot_moe_spread(void* handle, const void* product, uint64_t rows, uint64_t share, uint64_t full, uint64_t first, float* act);
 /* Experts in slots: route r (rows * top_k of them, token-major) runs the expert at bases[r], a slot
    of slot_bytes holding its gate and up (ffn x hidden) and down (hidden x ffn) matrices at byte
    offsets[0..2] (a zero base: a route another device runs); product[r] = SwiGLU of the route

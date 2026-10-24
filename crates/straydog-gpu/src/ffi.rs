@@ -693,6 +693,78 @@ unsafe extern "C" {
         out_rows: u64,
     ) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn sd_slot_moe_supported(
+        handle: *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        width: u64,
+        ffn_share: u64,
+        ffn: u64,
+        hidden_share: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_slot_moe_gate_up(
+        handle: *mut ::std::os::raw::c_void,
+        bases: *const u64,
+        firsts: *const u32,
+        counts: *const u32,
+        experts: u64,
+        gate_bytes: u64,
+        kinds: *const ::std::os::raw::c_int,
+        width: u64,
+        ffn_share: u64,
+        ffn: u64,
+        hidden_share: u64,
+        rows: *const i32,
+        steps: u64,
+        input: *const ::std::os::raw::c_void,
+        clamp: f32,
+        weights: *const f32,
+        product: *mut ::std::os::raw::c_void,
+        tables: *mut ::std::os::raw::c_void,
+        table_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_slot_moe_down(
+        handle: *mut ::std::os::raw::c_void,
+        bases: *const u64,
+        firsts: *const u32,
+        counts: *const u32,
+        experts: u64,
+        gate_bytes: u64,
+        kinds: *const ::std::os::raw::c_int,
+        width: u64,
+        ffn_share: u64,
+        ffn: u64,
+        hidden_share: u64,
+        product: *const ::std::os::raw::c_void,
+        outputs: *mut f32,
+        out_stride: u64,
+        tables: *mut ::std::os::raw::c_void,
+        table_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_half_values(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        values: u64,
+        output: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_slot_moe_spread(
+        handle: *mut ::std::os::raw::c_void,
+        product: *const ::std::os::raw::c_void,
+        rows: u64,
+        share: u64,
+        full: u64,
+        first: u64,
+        act: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct sd_expert_split {

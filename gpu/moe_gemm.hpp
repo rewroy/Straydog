@@ -505,12 +505,15 @@ constexpr int moe_wave_n = 2;
 // Unfused (tests): the F32 gate and up sums go to `raw`, per route its gate then its up row.
 // Nonzero H, F, K fix the shape's hidden, ffn and top_k at compile time (the K loop's trip count
 // and the route-to-token division constant); zero takes them from `shape`.
+// A positive `clamp` caps gate above and up on both sides first, and `route_weights` (one per
+// grouped row) scale the product, as DeepSeek's SwiGLU does (op_swiglu_kernel).
 template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0>
 __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, const MoeTile* tiles,
                                                         const int32_t* positions, size_t steps, MoeShape shape,
                                                         const _Float16* input, _Float16* product,
                                                         const unsigned* tile_count, unsigned shared, bool tail,
-                                                        float* raw = nullptr) {
+                                                        float* raw = nullptr, float clamp = 0.0f,
+                                                        const float* route_weights = nullptr) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     using Unit = MoeUnit<kind>;
     constexpr int L = moe_lds_k, N = moe_wave_n, P = moe_block_k / 16, per_unit = Unit::span / moe_block_k;
@@ -618,8 +621,10 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
                 if (row < count) {
                     const float partner = theirs[(m * 16 + half * 8 + i) * up_stride + (wave % 4) * 16 + lane % 16];
                     const float value = wave < 4 ? sum[m][n][i] : sum[2 + m][n][i];
-                    const float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
-                    product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up);
+                    float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
+                    if (clamp > 0.0f) { g = fminf(g, clamp); up = fminf(fmaxf(up, -clamp), clamp); }
+                    const float scale = route_weights ? route_weights[first + row] : 1.0f;
+                    product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up * scale);
                 }
             }
         if (n + 1 < N) __syncthreads();
@@ -627,11 +632,13 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
 #endif
 }
 
-// One block: 64 grouped product rows x 128 * moe_wave_n output columns; results scatter to routes.
+// One block: 64 grouped product rows x 128 * moe_wave_n output columns; results scatter to routes
+// (without `positions`, each to its grouped row), rows `out_stride` values apart (zero: hidden).
 template<int kind, int H = 0, int F = 0>
 __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, const MoeTile* tiles,
                                                      const int32_t* positions, MoeShape shape, const _Float16* product,
-                                                     float* outputs, const unsigned* tile_count, unsigned shared, bool tail) {
+                                                     float* outputs, const unsigned* tile_count, unsigned shared, bool tail,
+                                                     size_t out_stride = 0) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     using Unit = MoeUnit<kind>;
     constexpr int L = moe_lds_k, N = moe_wave_n, P = moe_block_k / 16, per_unit = Unit::span / moe_block_k;
@@ -704,7 +711,8 @@ __global__ void __launch_bounds__(256) moe_down_wmma(const MoeGroup* groups, con
         for (int i = 0; i < 8; ++i) {
             const size_t r = tile.first + m * 16 + half * 8 + i;
             if (r >= count) continue;
-            float* target = outputs + size_t(positions[first + r]) * hidden + n0;
+            const size_t out_row = positions ? size_t(positions[first + r]) : first + r;
+            float* target = outputs + out_row * (out_stride ? out_stride : hidden) + n0;
             #pragma unroll
             for (int n = 0; n < N; ++n) target[16 * n] = sum[m][n][i];
         }

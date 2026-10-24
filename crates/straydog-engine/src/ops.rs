@@ -2,7 +2,7 @@
 //! and an architecture composes them into its layers. Every op is queued on the device's
 //! stream; only reading a buffer waits for it.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 
 use straydog_gpu::ffi;
 
@@ -44,6 +44,24 @@ impl Buffer {
         assert!(offset + bytes <= self.bytes, "a buffer slice past its end");
         Buffer { pointer: self.pointer.wrapping_byte_add(offset as usize), bytes }
     }
+}
+
+/// A wave of experts in their slots, for the grouped WMMA kernels (`Backend::slot_moe_gate_up` and
+/// `slot_moe_down`): expert i's slot at `bases[i]` holds gate and up (`ffn_share` rows of `width`
+/// each, `gate_bytes` apart, of `kinds[0]` and `kinds[1]`) then down (`hidden_share` rows of `ffn`,
+/// of `kinds[2]`); its routes are the grouped rows `firsts[i]`.. (`counts[i]` of them). `tables`
+/// takes each launch's group and tile lists.
+pub struct SlotWave<'a> {
+    pub bases: &'a [u64],
+    pub firsts: &'a [u32],
+    pub counts: &'a [u32],
+    pub gate_bytes: u64,
+    pub kinds: [u32; 3],
+    pub width: u64,
+    pub ffn_share: u64,
+    pub ffn: u64,
+    pub hidden_share: u64,
+    pub tables: &'a Buffer,
 }
 
 /// A device's rows of each expert for [`Backend::experts`]: gate and up rows [ffn_first,
@@ -529,6 +547,59 @@ impl Backend {
     pub fn scatter_add(&mut self, x: P, rows: P, count: u64, width: u64, out: M, out_rows: u64) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_scatter_add(self.handle(), x.cast(), rows.cast(), count, width, out.cast(), out_rows) })
+    }
+
+    /// Whether a wave of experts of these kinds and shares takes the grouped WMMA kernels here
+    /// (RDNA4, whole tiles and units): see [`SlotWave`].
+    pub fn slot_moe_supported(&self, kinds: [u32; 3], width: u64, ffn_share: u64, ffn: u64, hidden_share: u64) -> Result<bool> {
+        let kinds = kinds.map(|kind| kind as c_int);
+        // SAFETY: a live handle; kinds holds three values.
+        let supported = unsafe { ffi::sd_slot_moe_supported(self.handle(), kinds.as_ptr(), width, ffn_share, ffn, hidden_share) };
+        if supported < 0 {
+            return check(supported).map(|()| false);
+        }
+        Ok(supported == 1)
+    }
+
+    /// A wave's gate and up over the routes' rows (`rows`: each grouped route's row of `input`,
+    /// `steps` FP16 rows of the width): clamped SwiGLU times the routes' `weights` into `product`
+    /// (FP16 grouped rows of the device's ffn share).
+    #[allow(clippy::too_many_arguments)]
+    pub fn slot_moe_gate_up(&mut self, wave: &SlotWave<'_>, rows: P, steps: u64, input: P, clamp: f32, weights: P, product: M) -> Result<()> {
+        let kinds = wave.kinds.map(|kind| kind as c_int);
+        // SAFETY: a live handle; the slices hold `experts` values each; the library checks the
+        // buffers' ranges and the slots are the store's.
+        check(unsafe {
+            ffi::sd_op_slot_moe_gate_up(self.handle(), wave.bases.as_ptr(), wave.firsts.as_ptr(), wave.counts.as_ptr(),
+                                        wave.bases.len() as u64, wave.gate_bytes, kinds.as_ptr(), wave.width, wave.ffn_share, wave.ffn,
+                                        wave.hidden_share, rows.cast(), steps, input.cast(), clamp, weights.cast(), product.cast(),
+                                        wave.tables.pointer, wave.tables.bytes)
+        })
+    }
+
+    /// A wave's down over its FP16 grouped products (rows of the whole ffn) into `outputs` (F32
+    /// grouped rows `out_stride` values apart, the device's hidden share).
+    pub fn slot_moe_down(&mut self, wave: &SlotWave<'_>, product: P, outputs: M, out_stride: u64) -> Result<()> {
+        let kinds = wave.kinds.map(|kind| kind as c_int);
+        // SAFETY: as in slot_moe_gate_up.
+        check(unsafe {
+            ffi::sd_op_slot_moe_down(self.handle(), wave.bases.as_ptr(), wave.firsts.as_ptr(), wave.counts.as_ptr(),
+                                     wave.bases.len() as u64, wave.gate_bytes, kinds.as_ptr(), wave.width, wave.ffn_share, wave.ffn,
+                                     wave.hidden_share, product.cast(), outputs.cast(), out_stride, wave.tables.pointer, wave.tables.bytes)
+        })
+    }
+
+    /// `values` (a multiple of four) of `input` rounded to FP16 into `output`.
+    pub fn half_values(&mut self, input: P, values: u64, output: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_half_values(self.handle(), input.cast(), values, output.cast()) })
+    }
+
+    /// FP16 `product` rows of `share` into F32 `act` rows of `full` at column `first`, the other
+    /// columns zero.
+    pub fn slot_moe_spread(&mut self, product: P, rows: u64, share: u64, full: u64, first: u64, act: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_slot_moe_spread(self.handle(), product.cast(), rows, share, full, first, act.cast()) })
     }
 
     /// `x` (steps x channels) becomes SiLU of each channel's causal convolution with its `taps`
