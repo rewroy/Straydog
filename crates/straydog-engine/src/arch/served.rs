@@ -46,9 +46,20 @@ pub trait Engines {
         0
     }
     /// Save the sequence state (its position too) to checkpoint `slot`, or restore it from there.
-    /// A restore keeps the K/V below the checkpoint's position, which must be its sequence's.
+    /// A restore keeps the K/V below the checkpoint's position, which must be its sequence's,
+    /// unless the checkpoints are whole ([`Engines::whole_checkpoints`]).
     fn checkpoint(&mut self, _slot: usize, _save: bool) -> Result<(), String> {
         Err("these engines keep no checkpoints".into())
+    }
+    /// Whether a checkpoint holds the whole sequence state, positional too: restored after any
+    /// other sequence (a conversation come back to after another), not only below a common prefix.
+    fn whole_checkpoints(&self) -> bool {
+        false
+    }
+    /// Whether checkpoint `slot` still holds its state (whole checkpoints may give theirs up to
+    /// a budget).
+    fn holds(&self, _slot: usize) -> bool {
+        true
     }
     /// The most tokens [`Engines::verify`] takes in a pass (1: the engines verify no drafts).
     fn verify_rows(&self) -> usize {
@@ -179,8 +190,8 @@ pub struct Session<E: Engines> {
     history: Vec<u32>,
     /// Tokens that end a reply (unsent).
     end: Vec<u32>,
-    /// The token a reply's generation prompt begins with (`<|im_start|>`): the state before it is
-    /// checkpointed when the engines keep checkpoints.
+    /// The token a reply's generation prompt begins with (`<|im_start|>`, `<｜Assistant｜>`): the
+    /// state before it is checkpointed when the engines keep checkpoints.
     turn_start: Option<u32>,
     /// Saved states, oldest first: the last ("turn") where the last prompt's reply began, the
     /// earlier ones ("prior") where earlier prompts' did.
@@ -334,6 +345,14 @@ impl<E: Engines> Session<E> {
         self.vocabulary
     }
 
+    /// Tests only: forget the held sequence and every checkpoint (the engines' copies are then
+    /// unused), as a fresh start does, to run the same requests again from nothing.
+    #[doc(hidden)]
+    pub fn forget(&mut self) {
+        self.reset();
+        self.checkpoints.clear();
+    }
+
     /// The model's metadata, authenticated.
     pub fn header(&self) -> &straydog_gguf::ModelHeader {
         &self.files.header
@@ -457,7 +476,8 @@ impl<E: Engines> Session<E> {
     /// The prompt tokens already held, after restoring the state they need: the held sequence when
     /// the prompt extends it ("live"), else the longest checkpoint the prompt extends that the
     /// held sequence matches as far ("turn", the last, or "prior"; its K/V rows are then the held
-    /// ones), else none (the engines start over). At least one prompt token is left to run.
+    /// ones) or, whole, whatever is held, else none (the engines start over). At least one prompt
+    /// token is left to run.
     fn resume(&mut self, tokens: &[u32]) -> Result<(usize, &'static str), String> {
         let limit = tokens.len() - 1;
         let held = &self.history;
@@ -466,8 +486,10 @@ impl<E: Engines> Session<E> {
         }
         let span = held.len().min(limit);
         let common = (0..span).find(|&index| held[index] != tokens[index]).unwrap_or(span);
+        let whole = self.engines.whole_checkpoints();
         let best = self.checkpoints.iter().enumerate()
-            .filter(|(_, checkpoint)| checkpoint.tokens.len() <= common && tokens.starts_with(&checkpoint.tokens))
+            .filter(|(_, checkpoint)| (whole || checkpoint.tokens.len() <= common) && checkpoint.tokens.len() <= limit
+                    && tokens.starts_with(&checkpoint.tokens) && self.engines.holds(checkpoint.slot))
             .max_by_key(|(_, checkpoint)| checkpoint.tokens.len());
         let Some((index, checkpoint)) = best else {
             self.reset();

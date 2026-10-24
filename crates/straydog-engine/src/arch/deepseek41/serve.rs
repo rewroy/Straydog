@@ -3,15 +3,17 @@
 //! the layers split where no layer reads another part's compressed rows (one engine per GPU);
 //! each GPU's VRAM left after its dense weights and state given to expert slots and the host
 //! memory planned for the experts' host tier, then prompts continued from the sequence the engines
-//! hold, sampling and the request's metrics. The engines are driven only through their public
-//! passes.
+//! hold or from a checkpoint (the whole sequence state, in host memory, where a reply's generation
+//! prompt began: a conversation switched away from comes back from there), sampling and the
+//! request's metrics. The engines are driven only through their public passes.
 
 use std::path::Path;
 use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, ATTENTION_ROWS, OWN_ROWS};
+use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS,
+                    OWN_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Placed, Session, Settings};
 use crate::bundle;
@@ -26,6 +28,14 @@ use served::{RESERVE, SCRATCH};
 /// DeepSeek-V4.1 served: its placed engines in a session.
 pub type Model = Session<Engines>;
 
+/// Checkpoints kept, each the whole sequence state where a reply's generation prompt began (a
+/// conversation switched away from comes back from there).
+pub const CHECKPOINTS: usize = 4;
+/// Host memory the checkpoints take at most, together and at any moment (a 20K-token
+/// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
+/// over it (past ~160K tokens) is not taken.
+pub const CHECKPOINT_BYTES: u64 = 1 << 30;
+
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
     engines: Vec<Engine<'static, Pinned>>,
@@ -33,6 +43,10 @@ pub struct Engines {
     devices_per_expert: usize,
     /// The most tokens a verify pass takes (DS41_DRAFTS=0: 1, no drafts).
     verify_rows: usize,
+    /// Per checkpoint slot: each engine's snapshot, if held.
+    saved: Vec<Option<Vec<Snapshot>>>,
+    /// The slots holding one, oldest first.
+    order: Vec<usize>,
 }
 
 impl served::Engines for Engines {
@@ -97,6 +111,73 @@ impl served::Engines for Engines {
 
     fn rewind(&mut self, keep: usize) -> Result<(), String> {
         self.engines.iter_mut().try_for_each(|engine| engine.rewind(keep))
+    }
+
+    fn checkpoints(&self) -> usize {
+        CHECKPOINTS
+    }
+
+    /// A snapshot of every engine's state into host memory, or every engine's back from it.
+    fn checkpoint(&mut self, slot: usize, save: bool) -> Result<(), String> {
+        if slot >= CHECKPOINTS {
+            return Err("no such Straydog checkpoint".into());
+        }
+        if !save {
+            let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
+            return self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot));
+        }
+        self.saved[slot] = None;
+        self.order.retain(|&held| held != slot);
+        // Room first, the copy after: the budget bounds the host memory at its peak too.
+        let required: u64 = self.engines.iter().map(Engine::snapshot_bytes).sum();
+        let held: Vec<(usize, u64)> = self.order.iter()
+            .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
+        let Some(given_up) = evictions(&held, required, CHECKPOINT_BYTES) else { return Ok(()) };
+        for oldest in given_up {
+            self.saved[oldest] = None;
+            self.order.retain(|&held| held != oldest);
+        }
+        self.saved[slot] = Some(self.engines.iter_mut().map(Engine::snapshot).collect::<Result<Vec<_>, _>>()?);
+        self.order.push(slot);
+        Ok(())
+    }
+
+    fn whole_checkpoints(&self) -> bool {
+        true
+    }
+
+    fn holds(&self, slot: usize) -> bool {
+        self.saved.get(slot).is_some_and(Option::is_some)
+    }
+}
+
+/// The checkpoints (slots with their bytes, oldest first) that give theirs up so one of `required`
+/// bytes fits within `cap` with the rest; None when it alone does not (it is not kept).
+fn evictions(held: &[(usize, u64)], required: u64, cap: u64) -> Option<Vec<usize>> {
+    if required > cap {
+        return None;
+    }
+    let mut total = required + held.iter().map(|(_, bytes)| bytes).sum::<u64>();
+    let mut given_up = Vec::new();
+    for &(slot, bytes) in held {
+        if total <= cap {
+            break;
+        }
+        total -= bytes;
+        given_up.push(slot);
+    }
+    Some(given_up)
+}
+
+impl Engines {
+    /// Diagnostics: every engine's sequence state ([`Engine::state`]), engine after engine.
+    #[doc(hidden)]
+    pub fn state(&mut self) -> Result<Vec<(String, Vec<f32>)>, String> {
+        let mut state = Vec::new();
+        for (index, engine) in self.engines.iter_mut().enumerate() {
+            state.extend(engine.state()?.into_iter().map(|(name, values)| (format!("engine {index} {name}"), values)));
+        }
+        Ok(state)
     }
 }
 
@@ -191,7 +272,11 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         slots.push(held.min(range.len() * hp.experts) / devices.len() * devices.len());
     }
     let in_vram: u64 = groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).sum();
-    let host = served::host_tier(settings, total_experts.saturating_sub(in_vram));
+    // (planned, the tier leaves the checkpoints their host memory)
+    let host = match settings.host_expert_bytes {
+        Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
+        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts.saturating_sub(in_vram)),
+    };
     let whole_bytes = files.whole_bytes(|_| true);
     let files: &'static Pinned = Box::leak(Box::new(files));
     let placed = Instant::now();
@@ -245,12 +330,41 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "expert_bytes": total_experts,
         "prefill_batch_size": settings.batch,
     });
+    // (where a reply's generation prompt begins: its state is checkpointed there)
+    let turn_start = files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
+        .and_then(|tokens| tokens.iter().position(|token| token.text() == Some("<｜Assistant｜>")))
+        .map(|id| id as u32);
     let drafts = std::env::var_os("DS41_DRAFTS").is_none_or(|value| value != "0");
     let verify_rows = if drafts { engines.iter().map(Engine::verify_rows).min().unwrap_or(1) } else { 1 };
     Ok(Session::new(Placed {
-        engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows },
+        engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
+                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new() },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
-        end: vec![end], turn_start: None, card, placement, state_bytes,
+        end: vec![end], turn_start, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::engine::snapshot_bytes;
+    use super::*;
+
+    /// A checkpoint near a 262144-token context (DeepSeek-V4.1's 40 layers, sources 2, 8, 14 at
+    /// ratio 2 and 20 at ratio 1) is over the budget: not taken, and none given up for it. Under
+    /// the budget the oldest give theirs up until it fits, no more.
+    #[test]
+    fn a_checkpoint_over_the_budget_is_not_taken() {
+        let position = 262_000;
+        let groups = [position / 2, position / 2, position / 2, position];
+        let huge = snapshot_bytes(position, 128, 40, 512, 128, &groups, position);
+        assert!(huge > CHECKPOINT_BYTES && huge < 2 * CHECKPOINT_BYTES, "{huge}");
+        let held = [(0, 300 << 20), (1, 300 << 20), (2, 300 << 20)];
+        assert_eq!(evictions(&held, huge, CHECKPOINT_BYTES), None);
+        let small = snapshot_bytes(4096, 128, 40, 512, 128, &[2048, 2048, 2048, 4096], 4096);
+        assert!(small < 64 << 20, "{small}");
+        assert_eq!(evictions(&held, small, CHECKPOINT_BYTES), Some(vec![]));
+        assert_eq!(evictions(&held, 400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
+        assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
+    }
 }

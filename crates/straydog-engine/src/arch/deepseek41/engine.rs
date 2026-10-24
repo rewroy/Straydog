@@ -351,6 +351,49 @@ fn check_slots(shard: &mut Shard, layer: usize, experts: &[usize], slots: &[Buff
     Ok(())
 }
 
+/// The sequence state a later pass continues, in host memory ([`Engine::snapshot`]): the window
+/// rings' rows of the last `window` positions (oldest first), each kv source's compressed rows,
+/// index keys and tail rows, and the counters.
+pub struct Snapshot {
+    position: usize,
+    history: Vec<u32>,
+    /// (layer, groups, tail) of each kv source
+    sources: Vec<(usize, usize, usize)>,
+    windows: Vec<(usize, Vec<f32>)>,
+    /// (layer, [compressed rows, index keys, tail kv, tail gate])
+    rows: Vec<(usize, [Vec<f32>; 4])>,
+}
+
+impl Snapshot {
+    /// Host bytes it holds.
+    pub fn bytes(&self) -> u64 {
+        let floats: usize = self.windows.iter().map(|(_, rows)| rows.len()).sum::<usize>()
+            + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::len)).sum::<usize>();
+        (floats * 4 + self.history.len() * 4) as u64
+    }
+}
+
+/// Host bytes a [`Snapshot`] holds, known before it is taken: `layers` window rings' rows of the
+/// last `window` of `position` positions, each kv source's compressed rows and index keys (its
+/// `groups`) and its two tail rows, of `dim` and `index_dim` floats, and `history` tokens.
+pub fn snapshot_bytes(position: usize, window: usize, layers: usize, dim: usize, index_dim: usize, groups: &[usize], history: usize) -> u64 {
+    let floats = layers * position.min(window) * dim + groups.iter().map(|&groups| groups * (dim + index_dim) + 2 * dim).sum::<usize>();
+    ((floats + history) * 4) as u64
+}
+
+/// Positions `first..end` in a ring of `ring` rows: (ring row, rows, rows before it), at most two.
+fn ring_runs(first: usize, end: usize, ring: usize) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut position = first;
+    while position < end {
+        let at = position % ring;
+        let run = (ring - at).min(end - position);
+        runs.push((at, run, position - first));
+        position += run;
+    }
+    runs
+}
+
 pub struct Engine<'a, T: Tensors> {
     /// Shared, so a pass takes the parameters without copying the Engram tables' metadata.
     hp: std::rc::Rc<Hparams>,
@@ -1029,6 +1072,73 @@ impl<'a, T: Tensors> Engine<'a, T> {
                           (format!("layer {layer} tail"), tail)]);
         }
         Ok(state)
+    }
+
+    /// Host bytes [`Engine::snapshot`] would take now.
+    pub fn snapshot_bytes(&self) -> u64 {
+        let groups: Vec<usize> = self.sources.values().map(|source| source.groups).collect();
+        snapshot_bytes(self.position, self.hp.window, self.shards[0].rings.len(), self.hp.head_dim, self.hp.index_dim, &groups,
+                       self.history.len())
+    }
+
+    /// The sequence state a later pass continues, copied to host memory: every device holds the
+    /// same (see the module documentation), so from the first. [`Engine::restore`] starts that
+    /// sequence over from it, whatever ran in between.
+    pub fn snapshot(&mut self) -> Result<Snapshot> {
+        let (window, dim, index_dim, ring, position) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring, self.position);
+        let shard = &mut self.shards[0];
+        let first = position.saturating_sub(window);
+        let mut windows = Vec::with_capacity(shard.rings.len());
+        for (&layer, buffer) in &shard.rings {
+            let mut rows = vec![0f32; (position - first) * dim];
+            for (at, run, done) in ring_runs(first, position, ring) {
+                shard.gpu.read_buffer(buffer, at * dim, &mut rows[done * dim..(done + run) * dim])?;
+            }
+            windows.push((layer, rows));
+        }
+        let mut rows = Vec::with_capacity(shard.sources.len());
+        for (&layer, buffers) in &shard.sources {
+            let groups = self.sources[&layer].groups;
+            let mut kept = [vec![0f32; groups * dim], vec![0f32; groups * index_dim], vec![0f32; dim], vec![0f32; dim]];
+            for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(&mut kept) {
+                if !values.is_empty() {
+                    shard.gpu.read_buffer(buffer, 0, values)?;
+                }
+            }
+            rows.push((layer, kept));
+        }
+        let sources = self.sources.iter().map(|(&layer, source)| (layer, source.groups, source.tail)).collect();
+        Ok(Snapshot { position, history: self.history.clone(), sources, windows, rows })
+    }
+
+    /// Put a [`Engine::snapshot`] back on every device: the sequence as it was then.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let (dim, ring, position) = (self.hp.head_dim, self.ring, snapshot.position);
+        for shard in &mut self.shards {
+            for (layer, rows) in &snapshot.windows {
+                let buffer = shard.rings.get(layer).ok_or("a snapshot of another engine's layers")?;
+                for (at, run, done) in ring_runs(position - rows.len() / dim, position, ring) {
+                    shard.gpu.write_buffer(buffer, (at * dim * 4) as u64, &rows[done * dim..(done + run) * dim])?;
+                }
+            }
+            for (layer, kept) in &snapshot.rows {
+                let buffers = shard.sources.get(layer).ok_or("a snapshot of another engine's layers")?;
+                for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(kept) {
+                    if !values.is_empty() {
+                        shard.gpu.write_buffer(buffer, 0, values)?;
+                    }
+                }
+            }
+        }
+        for &(layer, groups, tail) in &snapshot.sources {
+            let source = self.sources.get_mut(&layer).ok_or("a snapshot of another engine's layers")?;
+            (source.groups, source.tail) = (groups, tail);
+        }
+        self.position = position;
+        self.history.clone_from(&snapshot.history);
+        self.rewind = None;
+        self.primed = None;
+        Ok(())
     }
 
     /// The expert stores' counters, summed over the devices.
