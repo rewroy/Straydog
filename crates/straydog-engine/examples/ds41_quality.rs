@@ -185,6 +185,7 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
             let timed = std::time::Instant::now();
             let rows = if drafts.is_empty() { forward_split(engines, &fed)? } else { verify_split(engines, &fed)? };
             let spent = timed.elapsed().as_secs_f64();
+            policy.passed(fed.len(), 1e3 * spent);
             let sums = &mut by_rows[fed.len() - 1];
             *sums = (sums.0 + spent, sums.1 + 1);
             if fed.len() == 1 && verified {

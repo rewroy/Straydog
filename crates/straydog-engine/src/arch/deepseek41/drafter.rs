@@ -530,7 +530,8 @@ impl Drafter {
 /// pass's cost by its rows and the draft's. After [`PAUSE_AFTER`] rounds in a row that verify
 /// none it stops drafting for [`PAUSE_ROUNDS`] rounds (the draft's cost is paid either way).
 pub struct Policy {
-    /// A target pass's milliseconds by its rows (1, 2, ...).
+    /// A target pass's milliseconds by its rows (1, 2, ...): a first guess, then running means of
+    /// [`Policy::passed`]'s (the drafter's own memory makes every pass dearer than without it).
     verify_ms: Vec<f64>,
     /// A draft's milliseconds (a running mean of [`Policy::drafted`]'s).
     draft_ms: f64,
@@ -579,6 +580,13 @@ impl Policy {
     /// A draft took `ms`.
     pub fn drafted(&mut self, ms: f64) {
         self.draft_ms = 0.8 * self.draft_ms + 0.2 * ms;
+    }
+
+    /// A target pass of `rows` rows took `ms`.
+    pub fn passed(&mut self, rows: usize, ms: f64) {
+        if let Some(mean) = rows.checked_sub(1).and_then(|at| self.verify_ms.get_mut(at)) {
+            *mean = 0.9 * *mean + 0.1 * ms;
+        }
     }
 
     /// A new context: no pause.
