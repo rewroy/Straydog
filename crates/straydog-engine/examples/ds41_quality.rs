@@ -175,9 +175,8 @@ fn main() -> Result<(), String> {
             }
             Dspark::from_headers(&draft.header, &files.header)?;
             engines[0].enable_tap()?;
-            let (gpu, _) = engines[0].tap().ok_or("no tap")?;
             let loading = std::time::Instant::now();
-            let drafter = Drafter::load(gpu, draft, &files, vocabulary)?;
+            let drafter = Drafter::load(&mut engines[0].beside()?, draft, &files, vocabulary)?;
             println!("dspark: loaded in {:.1} s", loading.elapsed().as_secs_f64());
             Some(drafter)
         }
@@ -189,8 +188,7 @@ fn main() -> Result<(), String> {
         let end = engines[0].position();
         let kept = n.min(straydog_engine::arch::deepseek41::engine::TAP_ROWS);
         let positions: Vec<i32> = (end - kept..end).map(|at| at as i32).collect();
-        let (gpu, tap) = engines[0].tap().ok_or("no tap")?;
-        drafter.inject(gpu, tap.base(), &positions)
+        drafter.inject(&mut engines[0].beside()?, &positions)
     };
     for (run, &verify) in widths.iter().enumerate() {
         let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
@@ -246,16 +244,18 @@ fn main() -> Result<(), String> {
                             if truth.len() < slots {
                                 continue;
                             }
-                            let (gpu, _) = engines[0].tap().ok_or("no tap")?;
                             let drafting = std::time::Instant::now();
-                            let proposal = drafter.draft(gpu, &files, anchor, position, slots)?;
+                            let draft = drafter.draft(&mut engines[0].beside()?, &files, anchor, position, slots)?;
+                            let proposal = &draft.tokens;
                             *spent += drafting.elapsed().as_secs_f64();
                             let prefix = proposal.iter().zip(truth).take_while(|(a, b)| a == b).count();
                             *rounds += 1;
                             *matched += prefix;
                             per_slot[..prefix].iter_mut().for_each(|reached| *reached += 1);
                             if show_drafts {
-                                println!("  draft prompt {index} position {position} anchor {anchor} B={slots}: {proposal:?}, {prefix} matched");
+                                let confidences: Vec<String> = draft.confidences.iter().map(|c| format!("{c:.4}")).collect();
+                                println!("  draft prompt {index} position {position} anchor {anchor} B={slots}: {proposal:?}, {prefix} matched, \
+                                          confidences [{}]", confidences.join(", "));
                             }
                         }
                     }

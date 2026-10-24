@@ -380,7 +380,7 @@ struct Shard {
     checks: Option<SlotChecks>,
     /// The routers' image biases (every layer's, one after another), uploaded with the first image.
     image_bias: Option<Buffer>,
-    /// With a DSpark drafter (the first device only): the target features of a pass's last
+    /// With a DSpark drafter (on every device): the target features of a pass's last
     /// [`TAP_ROWS`] rows, rows of [`TAP_LAYERS`] x width (see [`tap_features`]).
     tap: Option<Buffer>,
 }
@@ -395,6 +395,18 @@ pub const TAP_LAYERS: [usize; 3] = [37, 38, 39];
 /// The rows of a pass whose features are kept: DSpark's window of history (and the rows every
 /// tapped layer computes after a prefill's pruning, [`Engine::rows_of`]).
 pub const TAP_ROWS: usize = 128;
+
+/// A drafter's view of one of an engine's devices ([`Engine::beside`]): the device; its tap, the
+/// last pass's last min(n, [`TAP_ROWS`]) rows of [`TAP_LAYERS`] x width, in order; and its rows of
+/// the head (output.weight), `head_rows` rows from `head_first`.
+pub struct Beside<'e> {
+    pub gpu: &'e mut Backend,
+    pub tap: Buffer,
+    pub head: Buffer,
+    pub head_kind: u32,
+    pub head_first: usize,
+    pub head_rows: usize,
+}
 
 /// Rows of a pass on a device's own buffers of every row: decode, verify, a short prompt. A
 /// longer pass takes the arena lent to the expert store back as far as its rows reach (T8).
@@ -711,7 +723,7 @@ fn name(layer: usize, tensor: &str) -> String {
 }
 
 /// Columns [first, first + count) of every row of a `rows` x `cols` matrix, whole blocks only.
-fn columns(kind: u32, rows: usize, cols: usize, data: &[u8], first: usize, count: usize) -> Result<Vec<u8>> {
+pub(super) fn columns(kind: u32, rows: usize, cols: usize, data: &[u8], first: usize, count: usize) -> Result<Vec<u8>> {
     let whole = row_bytes(kind, cols)?;
     let (skip, take) = (formats::matrix_bytes(kind, 1, first), formats::matrix_bytes(kind, 1, count));
     let (Some(skip), Some(take)) = (skip, take) else {
@@ -1655,22 +1667,30 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.run(tokens, n)
     }
 
-    /// Keep DSpark's target features (on the first device) from now on: each pass's last
-    /// [`TAP_ROWS`] rows of [`TAP_LAYERS`]' inputs, read with [`Engine::tap`]. Call before the first
-    /// pass (a recorded decode graph holds whether it taps).
+    /// Keep DSpark's target features on every device from now on (the hyper-connections are alike
+    /// on all): each pass's last [`TAP_ROWS`] rows of [`TAP_LAYERS`]' inputs, read through
+    /// [`Engine::beside`]. Call before the first pass (a recorded decode graph holds whether it taps).
     pub fn enable_tap(&mut self) -> Result<()> {
-        let shard = &mut self.shards[0];
-        if shard.tap.is_none() {
-            shard.tap = Some(shard.gpu.buffer((TAP_ROWS * TAP_LAYERS.len() * self.hp.width * 4) as u64)?);
+        let bytes = (TAP_ROWS * TAP_LAYERS.len() * self.hp.width * 4) as u64;
+        for shard in &mut self.shards {
+            if shard.tap.is_none() {
+                shard.tap = Some(shard.gpu.buffer(bytes)?);
+            }
         }
         Ok(())
     }
 
-    /// The tap: the device that holds it (the first) and the buffer, rows of [`TAP_LAYERS`] x width
-    /// for the last pass's last min(n, [`TAP_ROWS`]) rows, in order.
-    pub fn tap(&mut self) -> Option<(&mut Backend, Buffer)> {
-        let shard = &mut self.shards[0];
-        shard.tap.map(|tap| (&mut shard.gpu, tap))
+    /// What a drafter beside this engine uses on each device, in device order (after
+    /// [`Engine::enable_tap`]): the device, its tap and its rows of the head.
+    pub fn beside(&mut self) -> Result<Vec<Beside<'_>>> {
+        let mut devices = Vec::with_capacity(self.shards.len());
+        for (part, shard) in self.shards.iter_mut().enumerate() {
+            let tap = shard.tap.ok_or("no DeepSeek-V4.1 feature tap (Engine::enable_tap)")?;
+            let head = shard.dense("output.weight")?;
+            let rows = head.dims[1];
+            devices.push(Beside { gpu: &mut shard.gpu, tap, head: head.buffer, head_kind: head.kind, head_first: part * rows, head_rows: rows });
+        }
+        Ok(devices)
     }
 
     /// Most tokens a verify pass takes: at most [`VERIFY_ROWS`], in a batch, and as many as the
@@ -3024,7 +3044,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     shard.linear(&name(layer, "attn_output_b"), work.low.base(), n, target)
 }
 
-/// With a feature tap (the drafter's device), a tapped layer's input after its hyper-connections
+/// With a feature tap (a drafter beside the engine), a tapped layer's input after its hyper-connections
 /// (Engram applied, before attention) into the tap: the mean of each row's hc copies, for the
 /// pass's last [`TAP_ROWS`] rows (`n` rows; this batch's `rows` from row `first`). Only the tap
 /// is written: the layer's results are those without it.
