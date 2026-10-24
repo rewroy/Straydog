@@ -514,6 +514,9 @@ impl<E: Engines> Session<E> {
         let decode_seconds = decoding.elapsed().as_secs_f64();
         let emitted = decoded.emitted;
         let steps = emitted.saturating_sub(1);
+        // (with DS41_PROFILE: the decode's phases, in milliseconds a token)
+        let decode_profile: Map<String, Value> = self.engines.take_profile().into_iter()
+            .map(|(phase, seconds)| (phase.to_string(), json!(1e3 * seconds / steps.max(1) as f64))).collect();
         let (hits2, host2, drive2) = self.engines.counts();
         let cpu2 = self.engines.cpu_routes();
         let per = |value: u64| if steps > 0 { json!(value as f64 / steps as f64) } else { Value::Null };
@@ -532,6 +535,7 @@ impl<E: Engines> Session<E> {
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
+            "decode_profile": decode_profile,
         })
         .as_object()
         .unwrap()

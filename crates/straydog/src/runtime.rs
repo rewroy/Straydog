@@ -308,7 +308,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -337,6 +337,22 @@ pub fn request_summary(event: &Value) -> String {
                 let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, seconds)| (phase, seconds.as_f64().unwrap_or(0.0))).collect();
                 phases.sort_by(|a, b| b.1.total_cmp(&a.1));
                 format!("; prefill phases: {}", phases.iter().map(|(phase, seconds)| format!("{phase} {seconds:.3} s")).collect::<Vec<_>>().join(", "))
+            }
+            _ => String::new(),
+        },
+        // (an engine that streams experts says where a decoded token's came from)
+        match &timings["experts_per_token"] {
+            experts if experts["vram"].is_number() => format!("; decode expert reads a token: VRAM {}, host {}, drive {}",
+                                                              number(&experts["vram"], 1), number(&experts["host"], 2),
+                                                              number(&experts["drive"], 2)),
+            _ => String::new(),
+        },
+        // (with DS41_PROFILE: the decode's phases, longest first)
+        match &timings["decode_profile"] {
+            Value::Object(phases) if !phases.is_empty() => {
+                let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, ms)| (phase, ms.as_f64().unwrap_or(0.0))).collect();
+                phases.sort_by(|a, b| b.1.total_cmp(&a.1));
+                format!("; decode phases (ms a token): {}", phases.iter().map(|(phase, ms)| format!("{phase} {ms:.3}")).collect::<Vec<_>>().join(", "))
             }
             _ => String::new(),
         },
