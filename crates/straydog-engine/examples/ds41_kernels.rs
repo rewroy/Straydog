@@ -18,6 +18,7 @@ fn block(kind: u32) -> (usize, usize) {
     match kind {
         8 => (34, 32),
         10 => (84, 256),
+        13 => (176, 256),
         16 => (66, 256),
         17 => (74, 256),
         18 => (98, 256),
@@ -48,6 +49,10 @@ impl Random {
         if kind != 10 {
             for chunk in out.chunks_exact_mut(bytes) {
                 chunk[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+                // (Q5_K: dmin too)
+                if kind == 13 {
+                    chunk[2..4].copy_from_slice(&0x2c00u16.to_le_bytes());
+                }
             }
         }
         out
@@ -73,14 +78,15 @@ fn main() -> Result<(), String> {
     let out = gpu.buffer((WIDTH * 4) as u64)?;
     let (ffn_rows, hidden_rows) = (FFN / PARTS, WIDTH / PARTS);
     let split = |stages: i32| ExpertSplit { ffn_first: 0, ffn_rows: ffn_rows as u64, hidden_first: 0, hidden_rows: hidden_rows as u64, stages, send: 0, more: 0, send_at: 0 };
-    // (gate and up, down): layer 0, 1-9, 10-19, 20-24, 25-34, 35-39; the shared expert
-    for (label, gate, down) in [("IQ1_S / Q2_K", 19u32, 10u32), ("IQ1_S / IQ2_XS", 19, 17), ("IQ2_XXS / IQ2_S", 16, 22),
-                                ("IQ2_XXS / IQ3_XXS", 16, 18), ("IQ2_S / IQ3_XXS", 22, 18), ("IQ2_S / IQ2_S", 22, 22),
-                                ("Q8_0 shared", 8, 8)] {
+    // (gate and up, down, routes) of the GSQ-RCO IQ2_XS bundle: its routed experts' commonest pairs
+    // (16, 7, 6 and 4 of 40 layers) and the shared expert (Q5_K, one route, every layer)
+    for (label, gate, down, routes) in [("IQ2_XXS / IQ2_XXS", 16u32, 16u32, ROUTES), ("IQ2_XXS / IQ2_S", 16, 22, ROUTES),
+                                        ("IQ2_XXS / IQ2_XS", 16, 17, ROUTES), ("IQ2_XS / IQ2_XS", 17, 17, ROUTES),
+                                        ("Q5_K shared", 13, 13, 1)] {
         let gate_bytes = ffn_rows * row_bytes(gate, WIDTH);
         let down_bytes = hidden_rows * row_bytes(down, FFN);
         let slot = (2 * gate_bytes + down_bytes).next_multiple_of(256);
-        let experts = ((384usize << 20) / slot).max(ROUTES);
+        let experts = ((384usize << 20) / slot).max(routes);
         let mut bytes = Vec::with_capacity(experts * slot);
         for _ in 0..experts {
             let start = bytes.len();
@@ -93,17 +99,19 @@ fn main() -> Result<(), String> {
         let offsets = [0, gate_bytes as u64, 2 * gate_bytes as u64];
         let started = std::time::Instant::now();
         for iteration in 0..iterations {
-            let bases: Vec<u64> = (0..ROUTES).map(|route| bank.base() as u64 + (((iteration * ROUTES + route) * 7) % experts * slot) as u64).collect();
-            gpu.experts(Some(&bases), slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1, ROUTES as u64, x.base(), 0,
+            let bases: Vec<u64> = (0..routes).map(|route| bank.base() as u64 + (((iteration * routes + route) * 7) % experts * slot) as u64).collect();
+            gpu.experts(Some(&bases), slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1, routes as u64, x.base(), 0,
                         Some(weights.base()), 10.0, false, product.base(), out.base(), 0, Some(split(1)))?;
-            gpu.experts(None, slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1, ROUTES as u64, x.base(), 0, None,
-                        10.0, false, product.base(), out.base(), 0, Some(split(2)))?;
+            // (one route: a uniform base, passed again; more: the first stage's routes reused)
+            gpu.experts(if routes == 1 { Some(&bases) } else { None }, slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1,
+                        routes as u64, x.base(), 0, None, 10.0, false, product.base(), out.base(), 0, Some(split(2)))?;
         }
         let mut sink = [0f32; 1];
         gpu.read_buffer(&out, 0, &mut sink)?;
         let each = started.elapsed().as_secs_f64() / iterations as f64 * 1e6;
-        println!("{label:20} gate+up {:.2} MB, down {:.2} MB a step (six routes): {each:.1} us a step (wall, both stages)",
-                 (ROUTES * 2 * gate_bytes) as f64 / 1e6, (ROUTES * down_bytes) as f64 / 1e6);
+        let megabytes = (routes * (2 * gate_bytes + down_bytes)) as f64 / 1e6;
+        println!("{label:20} gate+up {:.2} MB, down {:.2} MB a step ({routes} routes): {each:.1} us a step (wall, both stages), {:.0} GB/s",
+                 (routes * 2 * gate_bytes) as f64 / 1e6, (routes * down_bytes) as f64 / 1e6, megabytes / each * 1e3);
         gpu.release_buffer(bank)?;
     }
     // hc_step at decode: one row, four streams, the coefficients' weights from a bank
