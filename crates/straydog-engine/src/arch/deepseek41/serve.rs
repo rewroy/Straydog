@@ -229,6 +229,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         result.map(|()| engines)
     })?;
     let place_seconds = placed.elapsed().as_secs_f64();
+    // (place's steps, each engine's: the wait before a server starts)
+    let startup: Vec<(String, f64)> = engines.iter().flat_map(|engine| engine.startup.iter().cloned()).collect();
     let card = served::card(&files.header)?;
     let end = files.header.metadata.get("tokenizer.ggml.eos_token_id").and_then(|value| value.integer())
         .and_then(|id| u32::try_from(id).ok()).ok_or("GGUF tokenizer.ggml.eos_token_id is missing")?;
@@ -249,6 +251,6 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
         end: vec![end], turn_start: None, card, placement, state_bytes,
-        load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
+        load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
 }

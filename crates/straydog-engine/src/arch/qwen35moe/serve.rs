@@ -343,6 +343,6 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch, end, turn_start,
         card,
         placement, state_bytes,
-        load_seconds: vec![("open", open_seconds), ("place", place_seconds)],
+        load_seconds: vec![("open".to_string(), open_seconds), ("place".to_string(), place_seconds)],
     }))
 }

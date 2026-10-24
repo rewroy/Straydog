@@ -256,6 +256,8 @@ pub const VERIFY_ROWS: usize = SLOT_ROWS;
 /// One device's share of the engine: its weights (its parts of the split ones), its copy of the
 /// sequence state and work buffers, and its expert store.
 struct Shard {
+    /// Seconds this device took to start: the GPU's runtime, its buffers, its expert store.
+    startup: [f64; 3],
     /// This device's rows of the experts.
     rows: Rows,
     gpu: Backend,
@@ -401,6 +403,9 @@ pub struct Engine<'a, T: Tensors> {
     /// Position whose one-token schedule was queued after the previous logits' copy, before that
     /// copy was waited for. The next one-token pass there skips the upload.
     primed: Option<usize>,
+    /// Seconds each step of its start took (each device's, the dense weights'), for the load steps
+    /// a server reports.
+    pub startup: Vec<(String, f64)>,
 }
 
 /// A resident tensor (or a layer's shared expert: gate, up and down) for a device's upload thread.
@@ -516,7 +521,9 @@ impl Shard {
     fn new(hp: &Hparams, settings: &Settings, device: usize, budget: u64, layout: Arc<Layout>, rows: Rows, parts: usize)
            -> Result<Shard> {
         let range = settings.layers.clone();
+        let started = std::time::Instant::now();
         let mut gpu = Backend::new(device, budget)?;
+        let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
         // One table for every attention of this pass, before any graph records a pointer into it.
@@ -624,8 +631,11 @@ impl Shard {
         gpu.write_buffer(&plain_buffer, 0, &plain)?;
         let compressed_buffer = floats(&mut gpu, compressed.len())?;
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
+        let building = std::time::Instant::now();
+        let buffers = (building - started).as_secs_f64() - initialized;
         let mut experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots * parts,
                                              settings.host_expert_bytes)?;
+        let store = building.elapsed().as_secs_f64();
         let shape = RowShape {
             hc, w, k, ff, top_k: hp.index_top_k, chosen: work.chosen.keys().copied().collect(), split: parts > 1, capacity: r,
         };
@@ -638,6 +648,7 @@ impl Shard {
             None => None,
         };
         Ok(Shard {
+            startup: [initialized, buffers, store],
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
@@ -742,6 +753,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // back to back).
         let files = tensors.files()?;
         let mut shards = Vec::with_capacity(parts);
+        let mut startup = Vec::new();
         for (part, &device) in devices.iter().enumerate() {
             let rows = Rows::of(part, parts, hp.expert_ff, hp.width);
             let mut roles = vec![None; hp.layers.len()];
@@ -757,8 +769,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 }
                 roles[layer] = Some(layer_roles);
             }
+            let laying = std::time::Instant::now();
             let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
-            shards.push(Shard::new(&hp, &settings, device, budget, layout, rows, parts)?);
+            let laid = laying.elapsed().as_secs_f64();
+            let shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
+            let [init, buffers, store] = shard.startup;
+            // (the wait before a server starts, by step: T161)
+            startup.extend([(format!("GPU {device} expert layout"), laid), (format!("GPU {device} init"), init),
+                            (format!("GPU {device} buffers"), buffers), (format!("GPU {device} expert store"), store)]);
+            shards.push(shard);
         }
         let mut sources = BTreeMap::new();
         for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
@@ -799,8 +818,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
             primed: None,
+            startup,
         };
-        engine.upload_dense()?;
+        let (reading, uploading) = engine.upload_dense()?;
+        engine.startup.extend([("dense read".to_string(), reading), ("dense upload after".to_string(), uploading)]);
         Ok(engine)
     }
 
@@ -809,7 +830,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// documentation and [`divided`]), the rest whole; each shared expert's part as a slot. This
     /// thread takes the tensors from the source (which may check them as it hands them over), a
     /// thread per device uploads its parts of those taken before.
-    fn upload_dense(&mut self) -> Result<()> {
+    /// Returns its seconds taking the tensors from the source (their authentication) and waiting
+    /// for the uploads after.
+    fn upload_dense(&mut self) -> Result<(f64, f64)> {
         let hp = self.hp.clone();
         let range = self.settings.layers.clone();
         let parts = self.shards.len();
@@ -856,8 +879,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // A device's thread that failed takes no more; its error is the one reported.
             let send = |resident: &dyn Fn() -> Resident<'a>| senders.iter().all(|sender| sender.send(resident()).is_ok());
             let mut taken = Ok(());
+            // (the time the source takes to hand the dense tensors over: their authentication)
+            let mut reading = 0.0;
             for name in names {
+                let read = std::time::Instant::now();
                 let Ok(tensor) = tensors.tensor(&name) else { continue };
+                reading += read.elapsed().as_secs_f64();
                 // (engram_wkv is what others call engram_kv)
                 let placed = name.replace(".engram_wkv.", ".engram_kv.");
                 if !send(&|| Resident::Tensor(placed.clone(), copy(&tensor))) {
@@ -870,7 +897,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 }
             }
             for layer in range {
+                let read = std::time::Instant::now();
                 let roles = ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].map(|role| tensors.tensor(&name(layer, role)));
+                reading += read.elapsed().as_secs_f64();
                 let [gate, up, down] = match roles {
                     [Ok(gate), Ok(up), Ok(down)] => [gate, up, down],
                     [gate, up, down] => {
@@ -883,10 +912,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 }
             }
             drop(senders);
+            let waiting = std::time::Instant::now();
             for thread in threads {
                 thread.join().unwrap_or_else(|_| Err("a device's upload thread panicked".into()))?;
             }
-            taken
+            taken.map(|()| (reading, waiting.elapsed().as_secs_f64()))
         })
     }
 

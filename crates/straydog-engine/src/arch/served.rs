@@ -190,7 +190,7 @@ pub struct Session<E: Engines> {
     /// How the model was placed (the ready frame shows it).
     pub placement: Value,
     pub state_bytes: u64,
-    pub load_seconds: Vec<(&'static str, f64)>,
+    pub load_seconds: Vec<(String, f64)>,
     pub last_metrics: Map<String, Value>,
     /// An earlier run's experts still to warm up with: (VRAM, host tier), least recently used
     /// first, taken from the front.
@@ -211,7 +211,7 @@ pub struct Placed<E: Engines> {
     pub card: Sampling,
     pub placement: Value,
     pub state_bytes: u64,
-    pub load_seconds: Vec<(&'static str, f64)>,
+    pub load_seconds: Vec<(String, f64)>,
 }
 
 /// The sampling a GGUF's `general.sampling.*` gives (the model card's), else neutral.
