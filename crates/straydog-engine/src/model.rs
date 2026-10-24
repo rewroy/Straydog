@@ -852,6 +852,16 @@ impl Model {
                 }
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
             }
+            if self.speculative > 0 {
+                // The MTP layer's pair of the row before, its token now known (the longer
+                // prompts' paths write theirs from there too): inside a pipelined prompt, from
+                // the row its last batch kept on the MTP layer's device.
+                if self.deferred {
+                    self.mtp_prompt_kept(tokens, previous)?;
+                } else {
+                    self.mtp_prompt(tokens, &hidden, previous)?;
+                }
+            }
             hidden
         };
         self.history.extend_from_slice(tokens);
@@ -1211,7 +1221,7 @@ impl Model {
         let mut mtp_position = self.history.len() as u64 - 1;
         while produced < max_new {
             if cancelled() {
-                return Ok(());
+                break;
             }
             let pass_started = Instant::now();
             let limit = self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
@@ -1246,13 +1256,22 @@ impl Model {
                 self.update_rate();
                 emit(*value);
             }
-            if emitted.len() < accepted + 1 {
-                return Ok(());
-            }
+            // The kept rows' pairs, for the next pass to catch up on (but an end token's row:
+            // the next prompt pairs it, from the row before its own).
+            let ended = emitted.len() < accepted + 1;
             token = following;
-            mtp_hidden = hidden[..(accepted + 1) * WIDTH].to_vec();
+            mtp_hidden = hidden[..emitted.len().min(kept) * WIDTH].to_vec();
             mtp_tokens = emitted;
             mtp_position = position;
+            if ended {
+                break;
+            }
+        }
+        // The pairs no pass caught up on, now: else the MTP layer's rows from the last pass up
+        // to the sequence's last would keep what was there before (another sequence's, or a
+        // draft's), which every later draft attends to. (The draft does nothing more at 0.)
+        if !mtp_tokens.is_empty() {
+            self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0)?;
         }
         Ok(())
     }
