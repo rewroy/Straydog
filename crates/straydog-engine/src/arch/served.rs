@@ -108,6 +108,13 @@ pub trait Engines {
     fn verify_rows(&self) -> usize {
         1
     }
+    /// Propose tokens after `anchor` (chosen but not fed yet), without advancing target state.
+    /// None uses prompt lookup; Some(empty) declines this round without that fallback.
+    /// Candidates are capped at `max` and the request's remaining output. After verification,
+    /// [`Engines::rewind`] must also restore any drafter state to the retained prefix.
+    fn draft(&mut self, _anchor: u32, _max: usize) -> Result<Option<Vec<u32>>, String> {
+        Ok(None)
+    }
     /// One pass over `tokens` (at most [`Engines::verify_rows`]) continuing the held sequence: the
     /// logits after each, `tokens.len()` rows of the vocabulary. Each row is what feeding the
     /// tokens one at a time gives.
@@ -315,11 +322,13 @@ struct Decoded {
     passes: usize,
     drafted: usize,
     accepted: usize,
+    engine_drafted: usize,
+    engine_accepted: usize,
 }
 
 /// Sample from `logits` (after the held sequence, `history`) and continue it: up to `max_new`
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
-/// each token is fed with the drafts the sequence proposes after it (drafts::Ngrams), in one pass;
+/// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
 /// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
 /// emitted after it and kept, the rest rewound. A `constraint` chooses every token itself (no
 /// drafts).
@@ -347,13 +356,24 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         if done.emitted == max_new {
             break;
         }
-        let drafts = if rows > 1 {
+        let (drafts, engine_draft) = if rows > 1 {
             ngrams.push(next);
-            let (proposal, matched) = ngrams.propose(rows - 1);
-            let width = policy.width(matched).min(proposal.len()).min(max_new - done.emitted);
-            proposal[..width].to_vec()
+            match engines.draft(next, rows - 1)? {
+                Some(mut proposal) => {
+                    proposal.truncate((rows - 1).min(max_new - done.emitted));
+                    if proposal.iter().any(|&token| token as usize >= vocabulary) {
+                        return Err("Straydog engine drafted a token out of range".into());
+                    }
+                    (proposal, true)
+                }
+                None => {
+                    let (proposal, matched) = ngrams.propose(rows - 1);
+                    let width = policy.width(matched).min(proposal.len()).min(max_new - done.emitted);
+                    (proposal[..width].to_vec(), false)
+                }
+            }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         if drafts.is_empty() {
             let logits = engines.forward(&[next])?;
@@ -368,8 +388,9 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             return Err("Straydog engines verified the wrong number of logits".into());
         }
         (done.passes, done.fed, done.drafted) = (done.passes + 1, done.fed + fed.len(), done.drafted + drafts.len());
+        if engine_draft { done.engine_drafted += drafts.len(); }
         let (accepted, token) = sampling::accept(&drafts, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
-        policy.record(drafts.len(), accepted);
+        if !engine_draft { policy.record(drafts.len(), accepted); }
         // The accepted drafts go out in order: an end token among them ends the reply unsent, the
         // last token allowed ends it sent; either is left out of the state, as without drafts.
         let (mut kept, mut stop) = (accepted, false);
@@ -387,6 +408,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         }
         engines.rewind(1 + kept)?;
         done.accepted += kept;
+        if engine_draft { done.engine_accepted += kept; }
         history.push(next);
         history.extend_from_slice(&drafts[..kept]);
         ngrams.extend(&drafts[..kept]);
@@ -610,6 +632,7 @@ impl<E: Engines> Session<E> {
             "prefill_store": prefill_store,
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
+            "engine_draft_tokens": decoded.engine_drafted, "accepted_engine_drafts": decoded.engine_accepted,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
             "decode_profile": decode_profile,
@@ -779,11 +802,16 @@ mod tests {
     /// A toy model over a small vocabulary: after a sequence it favors the token that followed the
     /// last token's previous occurrence (else a fixed successor), with smaller logits for the rest
     /// that depend on the whole sequence. It verifies up to `rows` tokens a pass.
+    #[derive(Default)]
     struct Toy {
         vocabulary: usize,
         rows: usize,
         held: Vec<u32>,
         verified_from: Option<usize>,
+        proposals: std::collections::VecDeque<Result<Option<Vec<u32>>, String>>,
+        draft_calls: Vec<(u32, usize)>,
+        verified: Vec<Vec<u32>>,
+        rewinds: Vec<usize>,
     }
 
     impl Toy {
@@ -833,8 +861,13 @@ mod tests {
         fn verify_rows(&self) -> usize {
             self.rows
         }
+        fn draft(&mut self, anchor: u32, max: usize) -> Result<Option<Vec<u32>>, String> {
+            self.draft_calls.push((anchor, max));
+            self.proposals.pop_front().unwrap_or(Ok(None))
+        }
         fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
             assert!(tokens.len() <= self.rows);
+            self.verified.push(tokens.to_vec());
             self.verified_from = Some(self.held.len());
             let mut rows = Vec::new();
             for &token in tokens {
@@ -844,6 +877,7 @@ mod tests {
             Ok(rows)
         }
         fn rewind(&mut self, keep: usize) -> Result<(), String> {
+            self.rewinds.push(keep);
             let from = self.verified_from.take().ok_or("no verify to rewind")?;
             self.held.truncate(from + keep);
             Ok(())
@@ -851,7 +885,7 @@ mod tests {
     }
 
     fn run(rows: usize, prompt: &[u32], end: &[u32], max_new: usize, sampling: &Sampling, seed: u64) -> (Vec<u32>, Decoded) {
-        let mut toy = Toy { vocabulary: 8, rows, held: Vec::new(), verified_from: None };
+        let mut toy = Toy { vocabulary: 8, rows, ..Toy::default() };
         let mut history = prompt.to_vec();
         let logits = toy.forward(prompt).unwrap();
         let mut out = Vec::new();
@@ -875,7 +909,7 @@ mod tests {
         let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]));
         for seed in 1..20 {
             let mut constraint = Constraint::new(Arc::clone(&tokens), &[0], false, vec![Alternative::json(Schema::any_object())]);
-            let mut toy = Toy { vocabulary: 8, rows: 3, held: Vec::new(), verified_from: None };
+            let mut toy = Toy { vocabulary: 8, rows: 3, ..Toy::default() };
             let mut history = PROMPT.to_vec();
             let logits = toy.forward(&PROMPT).unwrap();
             let mut out = Vec::new();
@@ -887,6 +921,95 @@ mod tests {
             let mut json = JsonMatcher::new(Arc::new(Schema::any_object()));
             assert!(json.feed_all(text.as_bytes()), "seed {seed}: {text}");
             assert!(done.emitted == 120 || json.complete(), "seed {seed}: {text}");
+        }
+    }
+
+    fn scripted(rows: usize, prompt: &[u32], end: &[u32], max_new: usize,
+                proposals: Vec<Result<Option<Vec<u32>>, String>>) -> (Toy, Vec<u32>, Decoded) {
+        let mut toy = Toy { vocabulary: 8, rows, proposals: proposals.into(), ..Toy::default() };
+        let mut history = prompt.to_vec();
+        let logits = toy.forward(prompt).unwrap();
+        let mut out = Vec::new();
+        let done = decode(&mut toy, &mut history, logits, 8, end, max_new, &Sampling::GREEDY, 1,
+            &|| false, &mut |token| out.push(token)).unwrap();
+        assert_eq!(toy.held, history);
+        assert_eq!(history.len(), prompt.len() + done.emitted - usize::from(done.emitted == max_new));
+        (toy, out, done)
+    }
+
+    #[test]
+    fn engine_drafts_use_existing_acceptance_rewind_and_both_width_limits() {
+        let (plain, _) = run(1, &[1], &[], 8, &Sampling::GREEDY, 1);
+        assert_eq!(plain, [4, 5, 0, 1, 4, 5, 0, 1]);
+        let wrong = (plain[2] + 1) % 8;
+        let proposals = vec![
+            Ok(Some(vec![plain[1], wrong, 7, u32::MAX])), // Too wide: cap at rows-1.
+            Ok(Some(plain[3..6].to_vec())),
+            Ok(Some(vec![plain[7], 99, 99])), // Only one output remains.
+        ];
+        let (toy, out, done) = scripted(4, &[1], &[], 8, proposals);
+        assert_eq!(out, plain);
+        assert_eq!(toy.draft_calls, [(plain[0], 3), (plain[2], 3), (plain[6], 3)]);
+        assert_eq!(toy.verified, [vec![plain[0], plain[1], wrong, 7], plain[2..6].to_vec(), plain[6..8].to_vec()]);
+        assert_eq!(toy.rewinds, [2, 4, 1]); // Rejection, all accepted, final emitted token stays unfed.
+        assert_eq!(done, Decoded { emitted: 8, fed: 10, passes: 3, drafted: 7, accepted: 4,
+            engine_drafted: 7, engine_accepted: 4 });
+    }
+
+    #[test]
+    fn none_keeps_prompt_lookup_and_empty_explicitly_declines_it() {
+        let (plain, plain_done) = run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        let (_, lookup_done) = run(4, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        assert!(lookup_done.drafted > 0 && lookup_done.accepted > 0);
+        let (fallback, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(None)]);
+        assert_eq!(out, plain);
+        assert_eq!(done, lookup_done);
+        assert!(!fallback.verified.is_empty() && !fallback.draft_calls.is_empty());
+        assert_eq!((done.engine_drafted, done.engine_accepted), (0, 0));
+        let (empty, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(Some(Vec::new())); 80]);
+        assert_eq!(out, plain);
+        assert_eq!(done, plain_done);
+        assert_eq!(empty.draft_calls.len(), 79);
+        assert!(empty.verified.is_empty() && empty.rewinds.is_empty());
+    }
+
+    #[test]
+    fn an_engine_can_return_to_prompt_lookup_on_the_next_round() {
+        let (plain, _) = run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        let (toy, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(Some(vec![plain[1]])), Ok(None)]);
+        assert_eq!(out, plain);
+        assert_eq!(toy.verified[0], plain[..2]);
+        assert_eq!((done.engine_drafted, done.engine_accepted), (1, 1));
+        assert!(done.drafted > done.engine_drafted && done.accepted > done.engine_accepted);
+    }
+
+    #[test]
+    fn engine_drafts_stop_at_an_end_token_and_are_not_asked_without_verify_rows() {
+        let (toy, out, done) = scripted(4, &[1], &[0], 8, vec![Ok(Some(vec![5, 0, 1]))]);
+        assert_eq!(out, [4, 5]);
+        assert_eq!(toy.rewinds, [2]);
+        assert_eq!((done.engine_drafted, done.engine_accepted), (3, 1));
+        let (plain, plain_done) = run(1, &PROMPT, &[], 20, &Sampling::GREEDY, 1);
+        let (toy, out, done) = scripted(1, &PROMPT, &[], 20, vec![Err("must not ask".into())]);
+        assert_eq!(out, plain);
+        assert_eq!(done, plain_done);
+        assert!(toy.draft_calls.is_empty() && toy.verified.is_empty());
+        assert_eq!(toy.proposals.len(), 1);
+    }
+
+    #[test]
+    fn engine_draft_failure_or_invalid_token_does_not_enter_verification() {
+        for (proposal, expected) in [(Err("draft failed".into()), "draft failed"),
+            (Ok(Some(vec![8])), "Straydog engine drafted a token out of range")] {
+            let mut toy = Toy { vocabulary: 8, rows: 4, proposals: [proposal].into(), ..Toy::default() };
+            let mut history = vec![1];
+            let logits = toy.forward(&history).unwrap();
+            let error = decode(&mut toy, &mut history, logits, 8, &[], 2, &Sampling::GREEDY, 1,
+                &|| false, &mut |_| {}).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(toy.held, [1]);
+            assert_eq!(history, [1]);
+            assert!(toy.verified.is_empty() && toy.rewinds.is_empty());
         }
     }
 
