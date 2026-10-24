@@ -114,7 +114,7 @@ Where it rounds, and how to turn it off:
 | --- | --- | --- |
 | Qwen products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm fp32` |
 | Long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
-| DeepSeek shared/routed FFN products (prefill batches of at least 32 rows; more than 4 rows per expert) | FP16 operands, F32 sums and output | `--gemm fp32` |
+| DeepSeek products over prompt passes of at least 32 rows (FFN, attention, index, router and Engram projections; more than 4 rows per expert) | FP16 operands, F32 sums and output | `--gemm fp32` |
 | Decode and speculative verification | F32 | |
 | MTP drafter | its experts quantized to Q2_0 when it is built: this changes only how many drafts are accepted, never the output | run without `-md` |
 | Experts beyond VRAM (partial residency) | the CPU computes them in F32 and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
@@ -126,12 +126,12 @@ anew, and F32 products take the same kernels in every process (rocBLAS's own lib
 RDNA4, hipBLASLt's choice of F32 kernels changed from one process to another).
 With the FP16 long-prompt attention, KL against `--gemm fp32` averaged 3.4e-3 over 12
 prompts of 8K-40K (3.9e-3 before it; top-1 12/12), while reordering one sum alone moves it
-by 3.0e-3. DeepSeek-V4.1 rounds only the inputs and weights of shared/routed FFN
-products with more than four rows to FP16 in prefill batches of at least 32 rows;
-smaller batches stay F32 after the half path regressed short-prompt TTFT in the served
-benchmark. Sums and output remain F32. Norms,
-router/index projections, attention, HC, residuals and K/V remain F32. `--gemm fp32`
-also keeps those FFN products in F32. With the IQ2_XS model, the FP16 FFN path agrees
+by 3.0e-3. DeepSeek-V4.1 rounds the inputs and weights of a prompt pass's products to
+FP16 when the pass has at least 32 rows: the shared/routed FFN (more than four rows per
+expert), and the attention, index, router and Engram projections. In F32 the attention's
+projections alone held each device ~6 of a 10.7K-token prompt's 36 s. Smaller passes
+(decode, speculative verification, short prompts) stay F32, as do sums and outputs,
+norms, attention scores, HC, residuals and K/V. `--gemm fp32` keeps every product in F32. With the IQ2_XS model, the FP16 FFN path agrees
 with F32 on 772/774 next-token choices in six short probes for each of TP1 and TP2;
 a native 4083-token prompt plus 16 teacher-forced steps agrees on all 17 choices, with
 mean KL 5.3e-4 (TP1) and 3.2e-4 (TP2). Same-mode decode and speculative verification

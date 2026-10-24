@@ -69,7 +69,7 @@ fn take_back(devices: &[usize]) {
     // (slots enough for a verify pass of four's experts at once, as a served placement has)
     let settings = Settings {
         context: 1024, rows: 64, batch: 64, expert_slots: 1900, host_expert_bytes: (4 << 30) / devices.len() as u64,
-        scratch_bytes: 512 << 20, half_ffn: false, layers: 0..hp.layers.len(),
+        scratch_bytes: 512 << 20, half_gemm: false, layers: 0..hp.layers.len(),
     };
     let mut engine = Engine::new(hp.clone(), &files, devices, 31 << 30, settings).unwrap();
     assert_eq!(engine.verify_rows(), VERIFY_ROWS);

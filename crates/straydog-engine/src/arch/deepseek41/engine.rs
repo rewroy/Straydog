@@ -70,8 +70,10 @@ pub struct Settings {
     /// Bytes of host tier (page-locked memory) for experts VRAM evicts, per device.
     pub host_expert_bytes: u64,
     pub scratch_bytes: u64,
-    /// FP16 shared/routed FFN GEMMs in batches of at least 32 rows; up to four expert rows stay GEMV.
-    pub half_ffn: bool,
+    /// FP16 operands (F32 sums and output) for the products of a pass of at least 32 rows: the
+    /// shared/routed FFN GEMMs, and through the devices' GEMM policy every other projection over
+    /// its rows (attention, index, router, Engram). Fewer rows stay F32; up to four rows GEMV.
+    pub half_gemm: bool,
     /// The layers this engine runs: the first embeds the tokens, the last has the head, and an
     /// engine between takes the stream the one before hands over (see [`forward_split`]).
     pub layers: std::ops::Range<usize>,
@@ -286,6 +288,8 @@ struct Shard {
 /// Rows of a pass on a device's own buffers of every row: decode, verify, a short prompt. A
 /// longer pass takes the arena lent to the expert store back as far as its rows reach (T8).
 pub const OWN_ROWS: usize = 64;
+/// The least rows a product takes GEMM for (the devices' default).
+const GEMM_MIN_BATCH: u64 = 8;
 
 /// What sizes a device's buffers of every row: hc, width, routes a row, the experts' width,
 /// selections a row, the index source layers (in order), whether the device has parts of sums,
@@ -436,6 +440,8 @@ pub struct Engine<'a, T: Tensors> {
     link_pass: bool,
     /// A pass using the part links did not complete: the next starts their counts over.
     link_dirty: bool,
+    /// The devices' GEMM policy as last set: FP16 operands (see [`Settings::half_gemm`]).
+    half_policy: Option<bool>,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
     /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
@@ -575,7 +581,7 @@ impl Shard {
         // Synthetic zero matrices touch no model, expert store or sequence state. Release
         // them before the long-lived buffers/cache are allocated (no residency change).
         let mut gemm_warm = [0.0; 2];
-        if settings.half_ffn && settings.rows >= 32 {
+        if settings.half_gemm && settings.rows >= 32 {
             let warming = std::time::Instant::now();
             let weights = gpu.buffer(256 * 256 * 4)?;
             let input = gpu.buffer(32 * 256 * 4)?;
@@ -880,6 +886,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             linked,
             link_pass: false,
             link_dirty: false,
+            half_policy: None,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
@@ -1335,6 +1342,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
         self.select_work(n)?;
+        // A prompt pass's projections take FP16 operands as its FFN's do: in F32, its attention's
+        // alone held each device ~6 of a 10.7K-token prompt's 36 s (F32 GEMMs and their weights
+        // expanded to F32, every 256 rows).
+        let half = self.settings.half_gemm && n >= 32;
+        if self.half_policy != Some(half) {
+            for shard in &self.shards {
+                shard.gpu.configure_gemm(GEMM_MIN_BATCH, half)?;
+            }
+            self.half_policy = Some(half);
+        }
         let hp = self.hp.clone();
         let (hc, w) = (hp.hc, hp.width);
         let range = self.settings.layers.clone();
@@ -2114,7 +2131,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (rows, split) = (n - first, self.shards.len() > 1);
         // Small prompts keep F32 after the half path regressed served cold TTFT.
         // Each routed GEMV still keeps its <=4 rule inside the linear op.
-        let half_ffn = self.settings.half_ffn && rows >= 32;
+        let half_gemm = self.settings.half_gemm && rows >= 32;
         let capacity = self.settings.rows.max(self.settings.batch);
         // The routes (alike on every device), grouped by expert, in waves of at most the stores'
         // limit of experts and as many routes as a pass has rows.
@@ -2147,9 +2164,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let role = |r: usize, end: u64| shared.buffer.slice(shared.offsets[r], end - shared.offsets[r]);
             let (gate, up) = (role(0, shared.offsets[1]), role(1, shared.offsets[2]));
             shard.gpu.linear_gemm(&gate, shared.kinds[0], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.gate.at(f0), ff as u64,
-                             &scratch, half_ffn)?;
+                             &scratch, half_gemm)?;
             shard.gpu.linear_gemm(&up, shared.kinds[1], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.up.at(f0), ff as u64,
-                             &scratch, half_ffn)?;
+                             &scratch, half_gemm)?;
             shard.gpu.swiglu(work.gate.base(), work.up.base(), rows as u64, ff as u64, clamp_shared, None, work.act.base())?;
         }
         self.sum_activations(rows)?;
@@ -2159,7 +2176,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let down = shared.buffer.slice(shared.offsets[2], shared.buffer.bytes - shared.offsets[2]);
             let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
             shard.gpu.linear_gemm(&down, shared.kinds[2], hs as u64, ff as u64, 0, input.base(), 0, rows as u64, target.at(h0), w as u64,
-                             &scratch, half_ffn)?;
+                             &scratch, half_gemm)?;
         }
         self.mark("shared expert")?;
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
@@ -2201,7 +2218,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let routes = wave.iter().map(|span| span.routes).sum::<usize>();
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
-                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm: half_ffn, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
+                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 for (span, slot) in wave.iter().zip(slots) {
                     moe::gate_up(&mut shard.gpu, slot, &shape, &scratch, work.x.base(), rows, work.route_rows.at(span.first),
                                  work.route_weights.at(span.first), span.routes, clamp_routed, work.act.at((span.first - base) * ff))?;
@@ -2210,7 +2227,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.sum_activations(routes)?;
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
-                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm: half_ffn, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
+                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
                 for (span, slot) in wave.iter().zip(slots) {
                     moe::down(&mut shard.gpu, slot, &shape, &scratch, input.at((span.first - base) * ff), span.routes,

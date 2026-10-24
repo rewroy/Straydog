@@ -340,7 +340,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     // engine's devices (each keeps its rows).
     let group_experts: Vec<u64> = groups.iter().map(|(_, range)| expert_bytes[range.clone()].iter().sum()).collect();
     let loading = std::sync::atomic::AtomicBool::new(true);
-    eprintln!("Straydog DeepSeek FFN GEMM: {}; prefill batches below 32 and remaining ops F32, up to four expert rows unchanged GEMV",
+    eprintln!("Straydog DeepSeek prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV",
               if settings.half_gemm { "FP16 inputs/weights, F32 sums/output" } else { "FP32" });
     let engines = std::thread::scope(|scope| {
         // The dense weights verify as the engines take them: their bytes are the progress.
@@ -364,7 +364,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                     expert_slots: slots / devices.len(),
                     host_expert_bytes: share,
                     scratch_bytes: SCRATCH,
-                    half_ffn: settings.half_gemm,
+                    half_gemm: settings.half_gemm,
                     layers: range.clone(),
                 };
                 engines.push(Engine::new(hp.clone(), files, devices, budget(devices), engine_settings)?);

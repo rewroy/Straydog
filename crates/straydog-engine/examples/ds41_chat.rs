@@ -82,7 +82,7 @@ fn main() -> Result<(), String> {
     let mut engines = Vec::new();
     for (index, part) in parts.into_iter().enumerate() {
         let settings = Settings { context, rows: chunk.max(batch), batch, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / devices,
-                                  scratch_bytes: 512 << 20, half_ffn: false, layers: part };
+                                  scratch_bytes: 512 << 20, half_gemm: false, layers: part };
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
