@@ -543,9 +543,16 @@ pub const PAUSE_AFTER: usize = 4;
 pub const PAUSE_ROUNDS: usize = 16;
 
 /// Per slot, the rate at which a draft's token matches the target's greedy one, given that every
-/// token before it did, at DSpark's confidence 0, 0.1, ... 1 (linear between): from teacher-forced
-/// runs (ds41_quality --dspark --show-drafts on the probe prompts).
-const CALIBRATION: [[f64; 11]; MAX_SLOTS] = [[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]; MAX_SLOTS];
+/// token before it did, at DSpark's confidence 0, 0.1, ... 1 (linear between): a monotone fit of
+/// 750 teacher-forced blocks of three on the six probe prompts (ds41_quality --dspark
+/// --show-drafts; a fit on three prompts gives the others' rate within 3%). The fourth slot
+/// takes the third's.
+const CALIBRATION: [[f64; 11]; MAX_SLOTS] = [
+    [0.0, 0.0, 0.001, 0.25, 0.344, 0.533, 0.562, 0.672, 0.755, 0.951, 1.0],
+    [0.0, 0.0, 0.072, 0.227, 0.394, 0.51, 0.605, 0.758, 0.808, 0.967, 1.0],
+    [0.0, 0.0, 0.06, 0.303, 0.414, 0.54, 0.708, 0.8, 0.856, 1.0, 1.0],
+    [0.0, 0.0, 0.06, 0.303, 0.414, 0.54, 0.708, 0.8, 0.856, 1.0, 1.0],
+];
 
 fn calibrated(slot: usize, confidence: f32) -> f64 {
     let at = (confidence.clamp(0.0, 1.0) as f64) * 10.0;
