@@ -29,6 +29,10 @@ pub trait Engines {
     fn cpu_routes(&self) -> u64 {
         0
     }
+    /// The bytes the expert stores read from the drive so far (every device's share).
+    fn drive_bytes(&self) -> u64 {
+        0
+    }
     /// The experts the stores hold, least recently used first: in VRAM, and only in the host tier.
     fn contents(&self) -> Contents;
     /// Start warming the stores up with these experts; the reads in flight.
@@ -423,7 +427,11 @@ impl<E: Engines> Session<E> {
         sampling.check()?;
         self.files.check_unchanged()?;
         let (reused, resumed_from) = self.resume(tokens)?;
+        let resume_seconds = started.elapsed().as_secs_f64();
         let total = tokens.len();
+        // (where the prefill's experts came from: the wait before the first token, broken down)
+        let (hits0, host0, drive0) = self.engines.counts();
+        let drive_bytes0 = self.engines.drive_bytes();
         // The state where this reply's generation prompt begins is saved on the way: the next
         // turn's prompt keeps what precedes it even where the template renders this reply
         // otherwise than it was generated (a past turn's thinking dropped).
@@ -443,6 +451,7 @@ impl<E: Engines> Session<E> {
         }
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
+        let prefill_drive_bytes = self.engines.drive_bytes() - drive_bytes0;
         let cpu = self.engines.cpu_routes();
         let mut ttft = None;
         let decoding = Instant::now();
@@ -468,6 +477,11 @@ impl<E: Engines> Session<E> {
             "cached_tokens": reused, "resumed_from": resumed_from,
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
+            "resume_seconds": resume_seconds,
+            // (store events of every device's share, a prefetched expert counted again when used;
+            // the drive bytes are what the wait for the first token read)
+            "prefill_experts": {"vram": hits - hits0, "host": host - host0, "drive": drive - drive0},
+            "prefill_drive_bytes": prefill_drive_bytes,
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },

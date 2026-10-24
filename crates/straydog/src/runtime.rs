@@ -307,7 +307,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s",
+        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -315,6 +315,13 @@ pub fn request_summary(event: &Value) -> String {
         number(&timings["ttft_seconds"], 2),
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
+        // (an engine that streams experts says where the prefill's came from: what the first token waited on)
+        match &timings["prefill_experts"] {
+            experts if experts.is_object() => format!("; prefill expert reads: VRAM {}, host {}, drive {} ({:.0} MB)",
+                                                      count(&experts["vram"]), count(&experts["host"]), count(&experts["drive"]),
+                                                      timings["prefill_drive_bytes"].as_f64().unwrap_or(0.0) / 1e6),
+            _ => String::new(),
+        },
     )
 }
 

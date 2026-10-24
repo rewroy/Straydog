@@ -65,6 +65,10 @@ impl served::Engines for Engines {
             .fold((0, 0, 0), |sum, counts| (sum.0 + counts.hits, sum.1 + counts.host_hits, sum.2 + counts.drive_reads))
     }
 
+    fn drive_bytes(&self) -> u64 {
+        self.engines.iter().map(|engine| engine.cache_counts().drive_bytes).sum()
+    }
+
     fn contents(&self) -> Contents {
         let (mut vram, mut host) = (Vec::new(), Vec::new());
         for engine in &self.engines {
