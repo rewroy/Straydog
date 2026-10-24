@@ -2,11 +2,11 @@
 namespace {
 __global__ void dspark_features(const float* hidden, const uint16_t* w1, const int32_t* tokens,
                                 size_t slot, size_t vocabulary, size_t rank, size_t width,
-                                uint32_t anchor, float* features) {
+                                uint32_t anchor, const int32_t* anchor_at, float* features) {
     const size_t col = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col < width) features[col] = hidden[slot * width + col];
     else if (col < width + rank) {
-        const int32_t previous = slot ? tokens[slot - 1] : int32_t(anchor);
+        const int32_t previous = slot ? tokens[slot - 1] : anchor_at ? anchor_at[0] : int32_t(anchor);
         // Non-finite logits can give argmax -1. Never use it as a table index.
         features[col] = previous >= 0 && size_t(previous) < vocabulary
             ? __uint_as_float(uint32_t(w1[size_t(previous) * rank + col - width]) << 16) : 0.0f;
@@ -29,8 +29,8 @@ __global__ void dspark_finish(const int32_t* tokens, float* confidences, size_t 
 
 int sd_op_dspark_head(void* handle, const float* body, const float* hidden, const void* w1, const void* w2,
                       const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank, uint64_t width,
-                      uint32_t anchor, float threshold, uint64_t minimum, float* logits, int32_t* tokens,
-                      float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes) {
+                      uint32_t anchor, const int32_t* anchor_at, float threshold, uint64_t minimum, float* logits,
+                      int32_t* tokens, float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes) {
     SD_OP_BEGIN
     if (!slots || slots > 5 || !vocabulary || vocabulary > INT32_MAX || !rank || !width ||
         anchor >= vocabulary || !std::isfinite(threshold) || threshold < 0 || threshold > 1)
@@ -52,10 +52,11 @@ int sd_op_dspark_head(void* handle, const float* body, const float* hidden, cons
     op_span(value, confidences, checked_floats({slots}), "DSpark confidence output");
     op_span(value, count, 4, "DSpark prefix length");
     op_span(value, scratch, needed, "DSpark scratch");
+    if (anchor_at) op_span(value, anchor_at, 4, "DSpark anchor token");
     auto* partial = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(scratch) + partial_offset);
     for (size_t slot = 0; slot < slots; ++slot) {
         dspark_features<<<feature_blocks, 256, 0, value.stream>>>(hidden, static_cast<const uint16_t*>(w1), tokens,
-            slot, size_t(vocabulary), size_t(rank), size_t(width), anchor, scratch);
+            slot, size_t(vocabulary), size_t(rank), size_t(width), anchor, anchor_at, scratch);
         op_linear(value, static_cast<const uint8_t*>(w2), 30, size_t(vocabulary), size_t(rank), 0,
                   scratch + width, 0, 1, logits + slot * vocabulary, 0, nullptr, 0);
         tm_add_kernel<<<logit_blocks, 256, 0, value.stream>>>(body + slot * vocabulary, size_t(vocabulary), logits + slot * vocabulary);
