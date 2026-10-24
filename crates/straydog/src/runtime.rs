@@ -308,7 +308,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -321,6 +321,14 @@ pub fn request_summary(event: &Value) -> String {
             experts if experts.is_object() => format!("; prefill expert reads: VRAM {}, host {}, drive {} ({:.0} MB)",
                                                       count(&experts["vram"]), count(&experts["host"]), count(&experts["drive"]),
                                                       timings["prefill_drive_bytes"].as_f64().unwrap_or(0.0) / 1e6),
+            _ => String::new(),
+        },
+        // (the experts' other costs in the prefill)
+        match &timings["prefill_store"] {
+            store if store.is_object() => format!("; prefill store: {} write-backs, {} of {} prefetched unused, waits {:.3} s for reads, {:.3} s for slots, {:.3} s pinning",
+                                                  count(&store["writebacks"]), count(&store["prefetch_unused"]), count(&store["prefetched"]),
+                                                  store["wait_seconds"].as_f64().unwrap_or(0.0), store["slot_wait_seconds"].as_f64().unwrap_or(0.0),
+                                                  store["pin_seconds"].as_f64().unwrap_or(0.0)),
             _ => String::new(),
         },
         // (with DS41_PROFILE: the prefill's phases, longest first)

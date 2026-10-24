@@ -33,6 +33,10 @@ pub trait Engines {
     fn drive_bytes(&self) -> u64 {
         0
     }
+    /// The expert stores' counters so far (every device's), when the engines stream experts.
+    fn store_counts(&self) -> Option<crate::experts::Counts> {
+        None
+    }
     /// Seconds per phase of the passes since the last call, when the engines profile them
     /// (DS41_PROFILE), else nothing; the count restarts.
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
@@ -451,6 +455,7 @@ impl<E: Engines> Session<E> {
         // (a profile counts from here: the time since the last request is not this prefill's)
         drop(self.engines.take_profile());
         let drive_bytes0 = self.engines.drive_bytes();
+        let store0 = self.engines.store_counts();
         // The state where this reply's generation prompt begins is saved on the way: the next
         // turn's prompt keeps what precedes it even where the template renders this reply
         // otherwise than it was generated (a past turn's thinking dropped).
@@ -471,6 +476,19 @@ impl<E: Engines> Session<E> {
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
         let prefill_drive_bytes = self.engines.drive_bytes() - drive_bytes0;
+        // (what else the prefill's experts cost: write-backs to the host tier, prefetches it did not
+        // use, and the seconds the stores waited for reads, for free slots and for pinning)
+        let prefill_store = match (store0, self.engines.store_counts()) {
+            (Some(before), Some(after)) => json!({
+                "writebacks": after.writebacks - before.writebacks,
+                "prefetched": after.prefetched - before.prefetched,
+                "prefetch_unused": after.prefetch_unused - before.prefetch_unused,
+                "wait_seconds": after.wait_seconds - before.wait_seconds,
+                "slot_wait_seconds": after.slot_wait_seconds - before.slot_wait_seconds,
+                "pin_seconds": after.pin_seconds - before.pin_seconds,
+            }),
+            _ => Value::Null,
+        };
         let prefill_profile: Map<String, Value> = self.engines.take_profile().into_iter()
             .map(|(phase, seconds)| (phase.to_string(), json!(seconds))).collect();
         let cpu = self.engines.cpu_routes();
@@ -504,6 +522,7 @@ impl<E: Engines> Session<E> {
             "prefill_experts": {"vram": hits - hits0, "host": host - host0, "drive": drive - drive0},
             "prefill_drive_bytes": prefill_drive_bytes,
             "prefill_profile": prefill_profile,
+            "prefill_store": prefill_store,
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },

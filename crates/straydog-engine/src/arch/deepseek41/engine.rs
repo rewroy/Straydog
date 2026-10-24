@@ -2122,6 +2122,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let work = shard.work.clone();
             shard.gpu.write_buffer(&work.route_rows, 0, &grouped.rows)?;
             shard.gpu.write_buffer(&work.route_weights, 0, &grouped.weights)?;
+            // (the layer's misses stream through, leaving the VRAM's experts to decoding)
+            shard.experts.set_streaming(true);
             if let Some(wave) = waves.first() {
                 shard.experts.request_bulk(&mut shard.gpu, layer, &experts(wave))?;
             }
@@ -2163,14 +2165,25 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 ops::devices_settle(&devices)?;
             }
             let mut acquired = Vec::with_capacity(self.shards.len());
+            // (under DS41_PROFILE: the host's share of the fills, apart from the devices' wait)
+            let (mut acquiring, mut prefetching) = (0f64, 0f64);
             for shard in &mut self.shards {
+                let started = std::time::Instant::now();
                 acquired.push(shard.experts.acquire(&mut shard.gpu, layer, &experts(wave))?);
                 check_slots(shard, layer, &experts(wave), acquired.last().unwrap(), 2 * gate_bytes + down_bytes, false)?;
+                let issued = std::time::Instant::now();
                 if let Some(next) = waves.get(index + 1) {
                     shard.experts.prefetch_bulk(&mut shard.gpu, layer, &experts(next), true)?;
                 } else if !ahead.is_empty() {
                     shard.experts.prefetch_bulk(&mut shard.gpu, layer + 1, &ahead, true)?;
                 }
+                acquiring += (issued - started).as_secs_f64();
+                prefetching += issued.elapsed().as_secs_f64();
+            }
+            if let Some((_, phases)) = self.profile.as_mut() {
+                *phases.entry("fills: acquire on the host").or_default() += acquiring;
+                *phases.entry("fills: prefetch on the host").or_default() += prefetching;
+                *phases.entry("fills: waves (count)").or_default() += 1.0;
             }
             self.mark("expert fills")?;
             let base = wave[0].first;
@@ -2195,6 +2208,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 check_slots(shard, layer, &experts(wave), slots, 2 * gate_bytes + down_bytes, true)?;
                 shard.experts.release(&mut shard.gpu)?;
             }
+        }
+        for shard in &mut self.shards {
+            shard.experts.set_streaming(false);
         }
         self.mark("routed experts")
     }

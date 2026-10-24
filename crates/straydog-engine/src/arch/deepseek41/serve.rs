@@ -69,6 +69,10 @@ impl served::Engines for Engines {
         self.engines.iter().map(|engine| engine.cache_counts().drive_bytes).sum()
     }
 
+    fn store_counts(&self) -> Option<crate::experts::Counts> {
+        self.engines.iter().map(Engine::cache_counts).reduce(|sum, counts| sum + counts)
+    }
+
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
         // (each engine is a layer group; their phases add up over the pass)
         let mut phases: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();

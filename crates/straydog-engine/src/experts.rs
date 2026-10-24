@@ -596,6 +596,9 @@ struct VramSlot {
     speculative: bool,
     /// Acquired or requested since the last release: not evicted before it.
     held: bool,
+    /// Filled while a prefill streams its experts through ([`DeviceExperts::set_streaming`]): the
+    /// host tier keeps its copy, and the release empties the slot without a write-back.
+    streamed: bool,
     class: usize,
     /// A slot in a region lent to the store ([`DeviceExperts::lend`]): its bytes there (else its
     /// class's).
@@ -701,6 +704,8 @@ pub struct DeviceExperts {
     /// While a request queues its misses: their downs wait in `tails` until every gate and up is
     /// queued (DS41_HEADS_FIRST=0: each expert whole in turn).
     deferring: bool,
+    /// A prefill streams its experts through (see [`set_streaming`](Self::set_streaming)).
+    streaming: bool,
     heads_first: bool,
     tails: Vec<Tail>,
     layout: Arc<Layout>,
@@ -822,7 +827,7 @@ impl DeviceExperts {
             let pinner = Pinner::new(arenas, per_arena * host_bytes as usize);
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, streamed: false, class: index,
                 place: None,
                 taken_back: false,
             }));
@@ -835,6 +840,7 @@ impl DeviceExperts {
         let (done_tx, done_rx) = channel();
         Ok(DeviceExperts {
             deferring: false,
+            streaming: false,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
             tails: Vec::new(),
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
@@ -971,6 +977,21 @@ impl DeviceExperts {
         })();
         self.counts.store_seconds += started.elapsed().as_secs_f64();
         result
+    }
+
+    /// While on, a fill leaves the host tier its copy and the release empties the slot again
+    /// without writing it back: a prefill, which takes nearly every expert of each layer once,
+    /// streams them through the slots its releases free instead of turning the VRAM's experts
+    /// (what decoding keeps hitting) over, and moves each only one way over the bus. An upload
+    /// and a write-back at once share the host's ~50 GB/s: each GPU's uploads fell from ~25 to
+    /// ~12 GB/s. Off again, the experts still filled stay as any others.
+    pub fn set_streaming(&mut self, on: bool) {
+        self.streaming = on;
+        if !on {
+            for slot in &mut self.slots {
+                slot.streamed = false;
+            }
+        }
     }
 
     fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
@@ -1202,11 +1223,20 @@ impl DeviceExperts {
             return Ok(());
         }
         let mark = gpu.mark(Stream::Compute)?;
-        for slot in std::mem::take(&mut self.in_use) {
+        let released = std::mem::take(&mut self.in_use);
+        for &slot in &released {
             self.slots[slot].guards[0] = Some(mark);
             self.slots[slot].held = false;
         }
         self.requested.clear();
+        // A streamed expert's slot comes free for the prefill's next wave; the host tier holds
+        // it, so the eviction writes nothing back (unless the host tier gave it up meanwhile).
+        for slot in released {
+            if self.slots[slot].streamed {
+                self.slots[slot].streamed = false;
+                self.evict(gpu, slot)?;
+            }
+        }
         self.keep_free(gpu, mark)
     }
 
@@ -1232,7 +1262,7 @@ impl DeviceExperts {
             let slot = self.slots.len();
             self.slots.push(VramSlot {
                 key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false,
-                class, place: Some(region.slice(start, bytes)), taken_back: false,
+                streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
             self.lent.push(LentSlot { slot, offset: start, out: false });
@@ -1355,6 +1385,7 @@ impl DeviceExperts {
         self.vram_changes += 1;
         self.map.insert(key, slot);
         self.slots[slot].key = Some(key);
+        self.slots[slot].streamed = self.streaming;
         self.classes[class].lru.insert((self.slots[slot].used, slot));
         self.touch(slot);
         let stream = if urgent { Stream::Upload } else { Stream::LaterUpload };
@@ -1490,6 +1521,16 @@ impl DeviceExperts {
         self.slots[slot].ready = Some((stream, mark));
         self.vram_changes += 1;
         self.slots[slot].waiting = None;
+        if self.slots[slot].streamed && self.host[host].key.is_some() {
+            // (streamed: the host tier keeps the expert, back in its LRU as just used)
+            self.clock += 1;
+            let entry = &mut self.host[host];
+            entry.busy = Some(mark);
+            entry.waiter = None;
+            entry.used = self.clock;
+            self.classes[entry.class].host_lru.insert((entry.used, host));
+            return;
+        }
         let entry = &mut self.host[host];
         entry.busy = Some(mark);
         entry.waiter = None;
