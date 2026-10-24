@@ -224,7 +224,15 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
     let pieces: Vec<(u64, u64)> = (start..whole_end).step_by(PIECE as usize).map(|at| (at, (at + PIECE).min(whole_end))).collect();
     let failure = Mutex::new(None);
     let check = |(from, to): (u64, u64)| {
-        if let Err(error) = verifier.verify(from, &map[from as usize..to as usize]) {
+        let data = &map[from as usize..to as usize];
+        // Issue the cold piece's reads before hashing its 4 KiB blocks. Sequential demand
+        // faults otherwise serialize I/O with hashing. Stay inside this worker's 16 MiB
+        // piece (at most 128 MiB across the batch), and skip advice on resident pieces.
+        // Advice is not authentication: every block below still checks its Merkle proof.
+        if crate::storage::resident(data) < 1.0 {
+            crate::storage::read_ahead(data.chunks(2 << 20));
+        }
+        if let Err(error) = verifier.verify(from, data) {
             failure.lock().unwrap().get_or_insert(error);
         }
     };
@@ -334,6 +342,8 @@ pub fn with_mapped_checks<R>(ranges: &[MappedRange<'_>], run: impl FnOnce(&Mappe
         fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
     }
     let threads = std::thread::available_parallelism().map_or(1, |count| count.get()).min(8).min(jobs.len());
+    eprintln!("Straydog dense authentication: {} tensors, {} workers, {} MiB maximum read-ahead",
+              ranges.len(), threads, threads * (PIECE as usize >> 20));
     Ok(std::thread::scope(|scope| {
         let _cancel = Cancel(&cancelled);
         for _ in 0..threads {
