@@ -655,10 +655,11 @@ impl Policy {
         self.draft_ms = 0.8 * self.draft_ms + 0.2 * ms;
     }
 
-    /// A target pass of `rows` rows took `ms`.
+    /// A target pass of `rows` rows took `ms` (counted at most twice the mean so far: one pass that
+    /// waited on the drive must not make a width look too dear ever to be tried again).
     pub fn passed(&mut self, rows: usize, ms: f64) {
         if let Some(mean) = rows.checked_sub(1).and_then(|at| self.verify_ms.get_mut(at)) {
-            *mean = 0.9 * *mean + 0.1 * ms;
+            *mean = 0.9 * *mean + 0.1 * ms.min(2.0 * *mean);
         }
     }
 
