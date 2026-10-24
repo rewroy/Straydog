@@ -512,6 +512,28 @@ unsafe extern "C" {
         out_count: u64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_dspark_inject_stage {
+    pub kv: *const ::std::os::raw::c_void,
+    pub norm: *const f32,
+    pub ring: *mut f32,
+}
+unsafe extern "C" {
+    pub fn sd_op_dspark_inject(
+        handle: *mut ::std::os::raw::c_void,
+        features: *const f32,
+        positions: *const i32,
+        rows: u64,
+        fc: *const ::std::os::raw::c_void,
+        encoder_norm: *const f32,
+        stages: *const sd_dspark_inject_stage,
+        frequencies: *const f32,
+        encoded: *mut f32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
     pub fn sd_op_rope(
         handle: *mut ::std::os::raw::c_void,
