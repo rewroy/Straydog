@@ -95,6 +95,13 @@ pub struct NormRope<'a> {
     pub out_count: u64,
 }
 
+/// One of DSpark's three independent target-feature KV projections and K-only rings.
+pub struct DsparkInjectStage<'a> {
+    pub kv: &'a Buffer,
+    pub norm: &'a Buffer,
+    pub ring: &'a Buffer,
+}
+
 /// Tensor parallel: on every device, `outs[i]` = the sum of every device's `parts[j]` (`count`
 /// values each), added in device order, each device's stream waiting for the others' parts. A part
 /// stays unchanged until every sum has run.
@@ -180,6 +187,24 @@ impl Backend {
         let at = (offset * std::mem::size_of::<T>()) as u64;
         // SAFETY: a live handle; the library checks the range; `out` holds `bytes`.
         check(unsafe { ffi::sd_buffer_read(self.handle(), buffer.pointer, at, out.as_mut_ptr().cast(), bytes) })
+    }
+
+    /// Inject target features `[rows,15360]` through Q8 encoder / RMS and three Q8 KV / RMS /
+    /// tail-64 RoPE stages into their `[128,512]` rings. Original positions select ring rows;
+    /// the last input wins on collisions. Frequencies are 32 F32 values for theta 10000.
+    /// Returns encoder-normalized `[rows,5120]` features in `encoded`. All ranges are disjoint.
+    /// Scratch: `4096*rows` bytes, plus at least `align256(30720*rows)+61440` when rows > 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_inject(&mut self, features: P, positions: &Buffer, rows: u64, fc: &Buffer,
+                         encoder_norm: &Buffer, stages: &[DsparkInjectStage<'_>; 3], frequencies: &Buffer,
+                         encoded: M, scratch: &Buffer) -> Result<()> {
+        let stages = stages.each_ref().map(|s| ffi::sd_dspark_inject_stage {
+            kv: s.kv.pointer.cast_const(), norm: s.norm.pointer.cast(), ring: s.ring.pointer.cast(),
+        });
+        // SAFETY: live handle and three host descriptors; native code checks every device range.
+        check(unsafe { ffi::sd_op_dspark_inject(self.handle(), features.cast(), positions.pointer.cast(), rows,
+            fc.pointer.cast_const(), encoder_norm.pointer.cast(), stages.as_ptr(), frequencies.pointer.cast(),
+            encoded.cast(), scratch.pointer.cast(), scratch.bytes) })
     }
 
     /// Start reading `bytes` of the buffer, `offset_bytes` in, behind the work queued so far; the

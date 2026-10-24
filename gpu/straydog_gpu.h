@@ -162,6 +162,22 @@ int sd_op_rms_norm(void* handle, const float* input, const float* weight, uint64
 /* rms_norm, then sd_op_rope's rotation of the last rope_dims values (0: none), stored at row
    out_rows[row] of out (out_count rows), or at row `row` without out_rows. */
 int sd_op_norm_rope(void* handle, const float* input, const float* weight, uint64_t rows, uint64_t width, float eps, uint64_t rope_dims, const int32_t* positions, const float* frequencies, const int32_t* out_rows, float* out, uint64_t out_count);
+typedef struct sd_dspark_inject_stage {
+    const void* kv;      /* Q8_0 [512,5120]. */
+    const float* norm;   /* F32 [512]. */
+    float* ring;         /* F32 [128,512], untouched rows stay unchanged. */
+} sd_dspark_inject_stage;
+/* DSpark target feature injection: features [rows,15360] -> Q8_0 fc [5120,15360]
+   -> encoder RMS -> three independent KV projections / RMS / last-64 RoPE -> K rings.
+   Frequencies: 32 F32 values, theta=10000. Positions are original token positions;
+   ring index is position modulo 128. If rows collide, the last input row wins.
+   encoded [rows,5120] also returns the encoder-normalized features. All ranges disjoint.
+   Scratch holds 4096*rows bytes plus linear workspace; when rows>4 the latter needs
+   at least align256(30720*rows)+61440 bytes (both F32 and half GEMM modes).
+   Three host stage descriptors; their buffers stay on the device. No host readback. */
+int sd_op_dspark_inject(void* handle, const float* features, const int32_t* positions, uint64_t rows,
+                        const void* fc, const float* encoder_norm, const sd_dspark_inject_stage* stages,
+                        const float* frequencies, float* encoded, float* scratch, uint64_t scratch_bytes);
 int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t width, uint64_t rope_dims, const int32_t* positions, const float* frequencies, int inverse);
 /* Hyper-connections: coefficients (pre and post per copy, a Sinkhorn-balanced combination) from
    mixes = W_hc . stream; a stream collapsed by pre; a sublayer output expanded back with the
