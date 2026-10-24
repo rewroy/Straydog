@@ -609,6 +609,19 @@ size_t hc_step_row_values(size_t hc, size_t width) {
 }
 
 // out[t][d] = sum_j pre[t][j] stream[t][j][d]
+// A DSpark target feature: each row's hc copies summed in order, ((x0 + x1) + x2) + x3, over hc, from
+// row `skip` on, row r (of `rows`) into out + (r - skip) * stride + offset.
+__global__ void op_hc_mean_kernel(const float* stream, size_t rows, size_t hc, size_t width, size_t skip, float* out, size_t stride,
+                                  size_t offset) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= rows * width) return;
+    const size_t row = index / width, col = index % width;
+    if (row < skip) return;
+    const float* at = stream + row * hc * width + col;
+    float sum = at[0];
+    for (size_t copy = 1; copy < hc; ++copy) sum += at[copy * width];
+    out[(row - skip) * stride + offset + col] = sum / float(hc);
+}
 __global__ void op_hc_collapse_kernel(const float* stream, const float* pre, size_t rows, size_t hc, size_t width, float* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * width) return;

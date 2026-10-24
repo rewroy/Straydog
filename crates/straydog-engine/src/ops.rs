@@ -484,6 +484,14 @@ impl Backend {
         })
     }
 
+    /// DSpark's target feature of a layer: each row's `hc` copies of `stream` summed in order,
+    /// ((x0 + x1) + x2) + x3, over hc; rows from `skip` on, row r into `out` + (r - skip) * `stride` + `offset` floats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_mean(&mut self, stream: P, rows: u64, hc: u64, width: u64, skip: u64, out: M, stride: u64, offset: u64) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_hc_mean(self.handle(), stream.cast(), rows, hc, width, skip, out.cast(), stride, offset) })
+    }
+
     pub fn hc_collapse(&mut self, stream: P, pre: P, rows: u64, hc: u64, width: u64, out: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_hc_collapse(self.handle(), stream.cast(), pre.cast(), rows, hc, width, out.cast()) })

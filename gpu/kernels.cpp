@@ -2719,6 +2719,17 @@ int sd_op_hc_collapse(void* handle, const float* stream, const float* pre, uint6
     SD_OP_END
 }
 
+int sd_op_hc_mean(void* handle, const float* stream, uint64_t rows, uint64_t hc, uint64_t width, uint64_t skip, float* out,
+                  uint64_t stride, uint64_t offset) {
+    SD_OP_BEGIN
+    if (!rows || !hc || !width || skip >= rows || offset + width > stride) throw std::runtime_error("invalid Straydog hc mean");
+    op_span(value, stream, size_t(rows * hc * width) * 4, "a stream");
+    op_span(value, out, size_t(((rows - skip - 1) * stride + offset + width)) * 4, "hc means");
+    op_hc_mean_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(stream, size_t(rows), size_t(hc), size_t(width),
+                                                                                  size_t(skip), out, size_t(stride), size_t(offset));
+    SD_OP_END
+}
+
 int sd_op_hc_expand(void* handle, const float* x, const float* residual, const float* post, const float* comb, uint64_t rows,
                     uint64_t hc, uint64_t width, float* out) {
     SD_OP_BEGIN

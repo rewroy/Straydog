@@ -184,6 +184,9 @@ int sd_op_rope(void* handle, float* x, uint64_t rows, uint64_t vectors, uint64_t
    residual: out[j] = post[j] x + sum_i comb[i][j] residual[i]. */
 int sd_op_hc_coefficients(void* handle, const float* mixes, const float* stream, uint64_t rows, uint64_t hc, uint64_t width, const float* base, const float* scale, uint64_t iterations, float eps, float norm_eps, float* pre, float* post, float* comb);
 int sd_op_hc_collapse(void* handle, const float* stream, const float* pre, uint64_t rows, uint64_t hc, uint64_t width, float* out);
+/* DSpark's target feature of a layer: each row's hc copies summed in order over hc, rows from `skip` on, row r into
+   out + (r - skip) * stride + offset. */
+int sd_op_hc_mean(void* handle, const float* stream, uint64_t rows, uint64_t hc, uint64_t width, uint64_t skip, float* out, uint64_t stride, uint64_t offset);
 int sd_op_hc_expand(void* handle, const float* x, const float* residual, const float* post, const float* comb, uint64_t rows, uint64_t hc, uint64_t width, float* out);
 /* A sublayer boundary in one launch: x (optional) expanded with residual, post_in and comb_in into
    stream (else stream is read); the coefficients from fn (optional, with base and scale) into
