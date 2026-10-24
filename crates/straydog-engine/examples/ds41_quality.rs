@@ -8,7 +8,7 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
-//!     [--generate N [--runs R]]
+//!     [--generate N [--runs R] [--width W]]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -29,7 +29,9 @@
 //! ahead and verifies as many of the draft's tokens as the width policy picks
 //! (drafter::Policy, by DSpark's confidences and [`VERIFY_MS`]), keeps the matching ones and the
 //! target's next, and takes the rest back: the tokens must be those without the drafter. --runs R
-//! goes over the prompts R times (the first warms the expert stores).
+//! goes over the prompts R times (the first warms the expert stores). --width W verifies W of each
+//! draft whatever the policy picks; --draft-slots 0 takes the features but never drafts. Each pass
+//! is timed by its rows, and the stores' counters taken over the decode alone.
 
 #[path = "common/files.rs"]
 mod files;
@@ -110,12 +112,25 @@ fn inject(engines: &mut [Engine<'_, files::Files>], drafter: &mut Option<Drafter
     drafter.inject(&mut engines[0].beside()?, &positions)
 }
 
+/// --generate's settings: tokens a prompt, prefill chunk, vocabulary, whether to print every round,
+/// whether the drafter drafts (else it only takes the features) and a width that overrides the
+/// policy's.
+struct Generate {
+    count: usize,
+    chunk: usize,
+    vocabulary: usize,
+    show: bool,
+    drafts: bool,
+    width: Option<usize>,
+}
+
 /// --generate: each prompt continued greedily by `count` tokens, timed; with a drafter, DSpark
-/// drafts each round (but in a pause) and the policy picks how many of its tokens a verify pass
-/// checks.
-#[allow(clippy::too_many_arguments)]
+/// drafts each round (but in a pause) and the policy (or the width given) picks how many of its
+/// tokens a verify pass checks. Timed apart: each pass by its rows (a 1-row pass also by whether a
+/// verify pass came before it), the drafts and the injections; the stores' counters over the decode.
 fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, drafter: &mut Option<Drafter>, prompts: &[Vec<u32>],
-            count: usize, chunk: usize, vocabulary: usize, show: bool) -> Result<(), String> {
+            settings: &Generate) -> Result<(), String> {
+    let (count, vocabulary) = (settings.count, settings.vocabulary);
     let mut policy = Policy::new(&VERIFY_MS, 5.0);
     let counted = |engines: &[Engine<'_, files::Files>]| {
         engines.iter().map(Engine::cache_counts).fold(straydog_engine::experts::Counts::default(), |a, b| a + b)
@@ -123,7 +138,9 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
     let (mut all_hash, mut all_seconds, mut all_tokens, mut all_passes) = (0xcbf2_9ce4_8422_2325u64, 0.0, 0, 0);
     // rounds, rounds drafted, verified widths 0..=3, verified drafts accepted, seconds drafting
     let (mut all_rounds, mut all_drafted, mut all_widths, mut all_accepted, mut all_drafting) = (0, 0, [0usize; 4], 0, 0.0);
-    let before = counted(engines);
+    // passes by rows (seconds, count), 1-row passes after a verify pass, seconds injecting
+    let (mut by_rows, mut after_verify, mut injecting) = ([(0.0, 0usize); 4], (0.0, 0usize), 0.0);
+    let mut decode = straydog_engine::experts::Counts::default();
     for (index, prompt) in prompts.iter().enumerate() {
         engines.iter_mut().for_each(|engine| engine.reset());
         if let Some(drafter) = drafter.as_mut() {
@@ -131,12 +148,14 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
         }
         policy.reset();
         let mut logits = Vec::new();
-        for piece in prompt.chunks(chunk) {
+        for piece in prompt.chunks(settings.chunk) {
             logits = forward_split(engines, piece)?;
             inject(engines, drafter, piece.len())?;
         }
         let mut emitted = vec![argmax(&logits) as u32];
         let (mut passes, mut rounds, mut drafted, mut widths, mut accepted_all, mut drafting) = (0, 0, 0, [0usize; 4], 0, 0.0);
+        let mut verified = false;
+        let before = counted(engines);
         let started = std::time::Instant::now();
         while emitted.len() < count {
             let next = emitted[emitted.len() - 1];
@@ -144,21 +163,34 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
             let room = count - emitted.len();
             let mut drafts = Vec::new();
             if let Some(drafter) = drafter.as_mut() {
-                if room > 1 && policy.drafting() {
+                // (a width given drafts every round: no pause)
+                if settings.drafts && room > 1 && (settings.width.is_some() || policy.drafting()) {
                     let timed = std::time::Instant::now();
                     let draft = drafter.draft(&mut engines[0].beside()?, files, next, position, VERIFY_MS.len() - 1)?;
                     let ms = 1e3 * timed.elapsed().as_secs_f64();
                     policy.drafted(ms);
-                    let width = policy.width(&draft.confidences, room - 1);
-                    drafts = draft.tokens[..width.min(draft.tokens.len())].to_vec();
+                    let width = match settings.width {
+                        Some(width) => width,
+                        None => policy.width(&draft.confidences, room - 1),
+                    };
+                    let width = width.min(room - 1).min(draft.tokens.len());
+                    drafts = draft.tokens[..width].to_vec();
                     (drafted, drafting) = (drafted + 1, drafting + ms / 1e3);
-                    if show {
+                    if settings.show {
                         println!("  round at {position}: draft {:?} confidences {:?}, verifying {}", draft.tokens, draft.confidences, drafts.len());
                     }
                 }
             }
             let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
+            let timed = std::time::Instant::now();
             let rows = if drafts.is_empty() { forward_split(engines, &fed)? } else { verify_split(engines, &fed)? };
+            let spent = timed.elapsed().as_secs_f64();
+            let sums = &mut by_rows[fed.len() - 1];
+            *sums = (sums.0 + spent, sums.1 + 1);
+            if fed.len() == 1 && verified {
+                after_verify = (after_verify.0 + spent, after_verify.1 + 1);
+            }
+            verified = fed.len() > 1;
             let row = |at: usize| argmax(&rows[at * vocabulary..(at + 1) * vocabulary]) as u32;
             let accepted = (0..drafts.len()).take_while(|&at| row(at) == drafts[at]).count();
             if accepted + 1 < fed.len() {
@@ -166,11 +198,17 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
             }
             emitted.extend_from_slice(&drafts[..accepted]);
             emitted.push(row(accepted));
+            let timed = std::time::Instant::now();
             inject(engines, drafter, accepted + 1)?;
+            injecting += timed.elapsed().as_secs_f64();
             (passes, rounds, accepted_all) = (passes + 1, rounds + 1, accepted_all + accepted);
             widths[drafts.len()] += 1;
         }
         let seconds = started.elapsed().as_secs_f64();
+        let after = counted(engines);
+        decode.hits += after.hits - before.hits;
+        decode.host_hits += after.host_hits - before.host_hits;
+        decode.drive_reads += after.drive_reads - before.drive_reads;
         let mut hash_state = 0xcbf2_9ce4_8422_2325u64;
         hash(&mut hash_state, &emitted.iter().map(|&token| f32::from_bits(token)).collect::<Vec<_>>());
         hash(&mut all_hash, &[f32::from_bits(hash_state as u32), f32::from_bits((hash_state >> 32) as u32)]);
@@ -187,12 +225,16 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
                                                                  all_drafting + drafting);
         all_widths.iter_mut().zip(widths).for_each(|(sum, width)| *sum += width);
     }
-    let after = counted(engines);
-    let per_pass = |count: u64| count as f64 / all_passes.max(1) as f64;
+    let per_token = |count: u64| count as f64 / all_tokens.max(1) as f64;
     println!("generate all: tokens hash {all_hash:016x}, {all_tokens} tokens in {all_passes} passes, {:.2} ms a token, {:.2} ms a pass",
              1e3 * all_seconds / all_tokens.max(1) as f64, 1e3 * all_seconds / all_passes.max(1) as f64);
-    println!("  a pass: {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads", per_pass(after.hits - before.hits),
-             per_pass(after.host_hits - before.host_hits), per_pass(after.drive_reads - before.drive_reads));
+    println!("  a decoded token: {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads", per_token(decode.hits), per_token(decode.host_hits),
+             per_token(decode.drive_reads));
+    let mean = |(seconds, passes): (f64, usize)| 1e3 * seconds / passes.max(1) as f64;
+    let rows: Vec<String> = by_rows.iter().enumerate().filter(|(_, sums)| sums.1 > 0)
+        .map(|(at, &sums)| format!("{} rows {} at {:.2} ms", at + 1, sums.1, mean(sums))).collect();
+    println!("  passes: {}; a 1-row pass after a verify pass {} at {:.2} ms; injecting {:.2} ms a pass", rows.join(", "), after_verify.1,
+             mean(after_verify), 1e3 * injecting / all_passes.max(1) as f64);
     if drafter.is_some() {
         println!("  dspark rounds {all_rounds}, drafted {all_drafted} ({:.0}%), widths {all_widths:?}, {all_accepted} drafts accepted, \
                   {:.2} tokens a round, {:.2} ms a draft", 100.0 * all_drafted as f64 / all_rounds.max(1) as f64,
@@ -227,7 +269,7 @@ fn main() -> Result<(), String> {
         None => false,
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
-    let (generate_count, runs) = (option("--generate", 0), option("--runs", 1));
+    let (generate_count, runs, forced_width) = (option("--generate", 0), option("--runs", 1), option("--width", usize::MAX));
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
@@ -254,7 +296,7 @@ fn main() -> Result<(), String> {
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
-                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R]]".into());
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -302,8 +344,10 @@ fn main() -> Result<(), String> {
             let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
             prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
         }
+        let settings = Generate { count: generate_count, chunk, vocabulary, show: show_drafts, drafts: !draft_slots.is_empty(),
+                                  width: (forced_width < VERIFY_MS.len()).then_some(forced_width) };
         for _ in 0..runs {
-            generate(&mut engines, &files, &mut drafter, &prompts, generate_count, chunk, vocabulary, show_drafts)?;
+            generate(&mut engines, &files, &mut drafter, &prompts, &settings)?;
         }
         return Ok(());
     }
