@@ -3287,6 +3287,23 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
     if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
     op_span(value, scores, checked_floats({rows, groups}), "index scores");
     op_span(value, out, checked_floats({rows, k}), "top-k indices");
+#if defined(__HIPCC__)
+    // An FP16 prompt pass on RDNA4: the scores through WMMA (ds_index_scores_wmma), every index head
+    // of a row and 128 groups a block, then each row's top groups. Decode keeps the kernel below.
+    if (value.rdna4 && value.half_gemm && rows >= 32 && dim == 128 && (heads == 32 || heads == 64)) {
+        const dim3 grid{unsigned((groups + ds_index_groups - 1) / ds_index_groups), unsigned(rows)};
+        if (heads == 32)
+            ds_index_scores_wmma<2, 128><<<grid, 128, 0, value.stream>>>(q, keys, weights, visible, size_t(groups), size_t(heads), scale,
+                                                                      size_t(rope_dims / 2), positions, frequencies, scores);
+        else
+            ds_index_scores_wmma<4, 128><<<grid, 128, 0, value.stream>>>(q, keys, weights, visible, size_t(groups), size_t(heads), scale,
+                                                                      size_t(rope_dims / 2), positions, frequencies, scores);
+        check(hipGetLastError());
+        op_top_k_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), size_t(k), out);
+        check(hipGetLastError());
+        return 0;
+    }
+#endif
     op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
         index_counters(value));

@@ -256,4 +256,97 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
         }
 #endif
 }
+
+// The indexer's scores over a prompt pass's rows: grid (groups / 128, rows), 128 threads, every index
+// head (HM tiles of 16) and the whole of the keys' DIM columns in LDS at once; wave w takes groups
+// 32w .. of the block's 128. A group's score is scale * sum over heads of relu(q . key) * the
+// row's head weight (op_index_select_kernel's), or -inf past the row's visible groups; the top
+// groups are then op_top_k_kernel's.
+constexpr int ds_index_groups = 128;
+template<int HM, int DIM>
+__global__ void __launch_bounds__(128) ds_index_scores_wmma(const float* q, const float* keys, const float* weights, const int32_t* visible,
+                                                            size_t groups, size_t heads, float scale, size_t pairs, const int32_t* positions,
+                                                            const float* frequencies, float* scores) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr int H = HM * 16, L = DIM + 8;
+    const size_t row = blockIdx.y, g0 = size_t(blockIdx.x) * ds_index_groups;
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, half = lane / 16;
+    const size_t limit = std::min<size_t>(groups, size_t(max(visible[row], 0)));
+    __shared__ __attribute__((aligned(16))) _Float16 qs[H][L];
+    __shared__ __attribute__((aligned(16))) _Float16 ks[ds_index_groups][L];
+    __shared__ double turns[64][2];
+    __shared__ float head_weights[H];
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+        double sine, cosine;
+        sincos(double(positions[row]) * double(frequencies[pair]), &sine, &cosine);
+        turns[pair][0] = cosine;
+        turns[pair][1] = sine;
+    }
+    if (t < H) head_weights[t] = t < heads ? weights[row * heads + t] : 0.0f;
+    __syncthreads();
+    const size_t rotated = DIM - 2 * pairs;
+    const float* row_q = q + row * heads * DIM;
+    // q: every head's DIM columns, eight a thread at a time (the rotated ones turned by the row's angle)
+    for (unsigned at = t; at < unsigned(H) * (DIM / 8); at += blockDim.x) {
+        const unsigned h = at / (DIM / 8), c0 = (at % (DIM / 8)) * 8;
+        moe_half8 v = {};
+        if (h < heads) {
+            if (c0 + 8 <= rotated) {
+                v = ds_half8(reinterpret_cast<const float4*>(row_q + h * DIM + c0)[0], reinterpret_cast<const float4*>(row_q + h * DIM + c0)[1]);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const size_t c = c0 + j;
+                    float x;
+                    if (c < rotated) x = row_q[h * DIM + c];
+                    else {
+                        const size_t pair = (c - rotated) / 2;
+                        const double a = row_q[h * DIM + rotated + 2 * pair], b = row_q[h * DIM + rotated + 2 * pair + 1];
+                        const double cs = turns[pair][0], sn = turns[pair][1];
+                        x = (c - rotated) % 2 == 0 ? float(a * cs - b * sn) : float(a * sn + b * cs);
+                    }
+                    v[j] = _Float16(x);
+                }
+            }
+        }
+        *reinterpret_cast<moe_half8*>(&qs[h][c0]) = v;
+    }
+    // the block's keys: DIM columns each, eight a thread at a time (none past the visible groups: zeros)
+    for (unsigned at = t; at < unsigned(ds_index_groups) * (DIM / 8); at += blockDim.x) {
+        const unsigned k = at / (DIM / 8), c0 = (at % (DIM / 8)) * 8;
+        const size_t g = g0 + k;
+        const moe_half8 v = g < limit ? ds_half8(reinterpret_cast<const float4*>(keys + g * DIM + c0)[0],
+                                                 reinterpret_cast<const float4*>(keys + g * DIM + c0)[1])
+                                      : moe_half8{};
+        *reinterpret_cast<moe_half8*>(&ks[k][c0]) = v;
+    }
+    __syncthreads();
+    moe_float8 acc[HM][2] = {};
+    #pragma unroll
+    for (int kk = 0; kk < DIM; kk += 16) {
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            const moe_half8 b = *reinterpret_cast<const moe_half8*>(&ks[wave * 32 + n * 16 + lane % 16][kk + 8 * half]);
+            #pragma unroll
+            for (int m = 0; m < HM; ++m) {
+                const moe_half8 a = *reinterpret_cast<const moe_half8*>(&qs[m * 16 + lane % 16][kk + 8 * half]);
+                acc[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc[m][n]);
+            }
+        }
+    }
+    // acc[m][n][i]: head m * 16 + half * 8 + i, group 32 * wave + 16 * n + lane % 16. The lane sums its
+    // heads; the other half of the wave holds the group's other heads.
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int m = 0; m < HM; ++m)
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) total += fmaxf(acc[m][n][i], 0.0f) * head_weights[m * 16 + half * 8 + i];
+        total += __shfl_xor(total, 16, 32);
+        const size_t g = g0 + wave * 32 + n * 16 + lane % 16;
+        if (half == 0 && g < groups) scores[row * groups + g] = g < limit ? total * scale : -INFINITY;
+    }
+#endif
+}
 #endif
