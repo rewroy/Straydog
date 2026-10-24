@@ -175,6 +175,8 @@ struct ReadJob {
     done: Sender<(usize, Chunk, Landed)>,
     slot: usize,
     chunk: Chunk,
+    /// Decode/verify demand only: bulk prefill demand can also be urgent.
+    latency: bool,
     /// Set when the read's expert is no longer wanted (a prefetch the pass did not need): a
     /// chunk not yet started is skipped.
     cancelled: Arc<AtomicBool>,
@@ -202,7 +204,11 @@ struct ReadQueue {
     jobs: VecDeque<ReadJob>,
     heads: VecDeque<ReadJob>,
     tails: VecDeque<ReadJob>,
+    latency_heads: VecDeque<ReadJob>,
+    latency_tails: VecDeque<ReadJob>,
+    latency_streak: usize,
     stopped: bool,
+    /// Only limited bulk reads; latency demands never increment or decrement this.
     reading: usize,
     limit: usize,
     head_priority: bool,
@@ -210,6 +216,19 @@ struct ReadQueue {
 }
 
 impl ReadQueue {
+    fn pop_latency(&mut self) -> Option<ReadJob> {
+        if !self.latency_heads.is_empty() && (self.latency_tails.is_empty() || self.latency_streak < self.limit) {
+            self.latency_streak += 1;
+            return self.latency_heads.pop_front();
+        }
+        if let Some(job) = self.latency_tails.pop_front() {
+            self.latency_streak = 0;
+            return Some(job);
+        }
+        self.latency_streak = 0;
+        None
+    }
+
     fn pop(&mut self) -> Option<ReadJob> {
         // Bound head priority too: a sustained head stream must still finish earlier downs.
         if !self.heads.is_empty() && (self.tails.is_empty() || self.consecutive_heads < self.limit) {
@@ -227,7 +246,7 @@ impl ReadQueue {
 
 type Queue = Arc<(Mutex<ReadQueue>, Condvar)>;
 
-/// A data-read permit. Error, cancellation and panic also return it; verification holds none.
+/// A bulk data-read permit. Exempt demand has None; error, cancellation and panic return Some.
 struct ReadPermit(Queue);
 impl Drop for ReadPermit {
     fn drop(&mut self) {
@@ -249,9 +268,9 @@ impl Reader {
         Self::bounded(threads, threads.max(1), false)
     }
 
-    /// One process-wide DS expert pool, shared by devices and layer groups: thirty-two workers
-    /// share sixteen data-read admissions, returned before verification. No worker consumes a queued
-    /// background job before admission, so newly urgent work retains its priority.
+    /// One process-wide DS pool: thirty-two workers share sixteen bulk data-read admissions,
+    /// returned before verification. Decode/verify demand has priority and bypasses that bound;
+    /// bulk prefill demand remains bounded even though it also has urgent queue priority.
     pub fn shared() -> Arc<Reader> {
         static SHARED: OnceLock<Arc<Reader>> = OnceLock::new();
         SHARED.get_or_init(|| Arc::new(Self::bounded(32, 16, true))).clone()
@@ -259,7 +278,8 @@ impl Reader {
 
     fn bounded(threads: usize, limit: usize, head_priority: bool) -> Reader {
         let queue: Queue = Arc::new((Mutex::new(ReadQueue {
-            jobs: VecDeque::new(), heads: VecDeque::new(), tails: VecDeque::new(), stopped: false,
+            jobs: VecDeque::new(), heads: VecDeque::new(), tails: VecDeque::new(),
+            latency_heads: VecDeque::new(), latency_tails: VecDeque::new(), latency_streak: 0, stopped: false,
             reading: 0, limit: limit.max(1).min(threads.max(1)), head_priority, consecutive_heads: 0,
         }), Condvar::new()));
         let workers = (0..threads.max(1)).map(|_| {
@@ -268,13 +288,17 @@ impl Reader {
                 let (job, permit) = {
                     let mut state = queue.0.lock().unwrap();
                     loop {
+                        if let Some(job) = state.pop_latency() {
+                            break (job, None);
+                        }
                         if state.reading < state.limit {
                             if let Some(job) = state.pop() {
                                 state.reading += 1;
-                                break (job, ReadPermit(queue.clone()));
+                                break (job, Some(ReadPermit(queue.clone())));
                             }
                         }
-                        if state.stopped && state.jobs.is_empty() && state.heads.is_empty() && state.tails.is_empty() { return; }
+                        if state.stopped && state.jobs.is_empty() && state.heads.is_empty() && state.tails.is_empty()
+                            && state.latency_heads.is_empty() && state.latency_tails.is_empty() { return; }
                         state = queue.1.wait(state).unwrap();
                     }
                 };
@@ -301,7 +325,13 @@ impl Reader {
         let mut state = self.queue.0.lock().unwrap();
         if urgent && state.head_priority {
             for job in jobs {
-                if job.chunk.head { state.heads.push_back(job); } else { state.tails.push_back(job); }
+                if job.latency {
+                    if job.chunk.head { state.latency_heads.push_back(job); } else { state.latency_tails.push_back(job); }
+                } else if job.chunk.head {
+                    state.heads.push_back(job);
+                } else {
+                    state.tails.push_back(job);
+                }
             }
         } else if urgent {
             for job in jobs.into_iter().rev() { state.jobs.push_front(job); }
@@ -321,7 +351,7 @@ impl Drop for Reader {
     }
 }
 
-fn run_read(job: &ReadJob, permit: ReadPermit) -> std::result::Result<(), String> {
+fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
     read_fully(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
@@ -1390,7 +1420,8 @@ impl DeviceExperts {
                     // SAFETY: inside the host slot (its class's host_bytes covers every role's whole blocks).
                     target: HostPointer(unsafe { base.add((span.at + done) as usize) }),
                     verifier: self.layout.verifier.clone().map(|verify| (verify, span.file)),
-                    done: self.done_tx.clone(), slot: host, chunk, cancelled: cancel.clone(),
+                    done: self.done_tx.clone(), slot: host, chunk,
+                    latency: urgent && chunk_bytes == CHUNK, cancelled: cancel.clone(),
                 });
                 done += piece;
             }
@@ -1999,7 +2030,7 @@ mod reader_tests {
            head: bool, verifier: Option<Verifier>) -> ReadJob {
         ReadJob { file: file.clone(), offset: 0, len: target.len() as u64, target: HostPointer(target.as_mut_ptr()),
             verifier: verifier.map(|verify| (verify, 0)), done: done.clone(), slot,
-            chunk: Chunk { host: 0, vram: 0, bytes: target.len() as u64, head }, cancelled: Arc::new(AtomicBool::new(false)) }
+            chunk: Chunk { host: 0, vram: 0, bytes: target.len() as u64, head }, latency: false, cancelled: Arc::new(AtomicBool::new(false)) }
     }
 
     struct Unblock(Arc<(Mutex<bool>, Condvar)>);
@@ -2058,6 +2089,27 @@ mod reader_tests {
         assert!(premature.is_err(), "a data read bypassed the admission bound");
         let slots: Vec<_> = order.into_iter().map(|r| r.unwrap().0).collect();
         assert_eq!(slots, [2, 1, 3, 0], "urgent head first, tail progress, then background");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn latency_bypasses_full_bulk_admission_without_returning_a_permit() {
+        let (path, file) = file();
+        let mut target = vec![0u8; ALIGN];
+        let reader = Reader::bounded(1, 1, true);
+        reader.queue.0.lock().unwrap().reading = 1;
+        let held_bulk = ReadPermit(reader.queue.clone());
+        let (done, results) = channel();
+        let mut demand = job(&file, &mut target, &done, 0, true, None);
+        demand.latency = true;
+        reader.submit(vec![demand], true);
+        let completed = results.recv_timeout(Duration::from_secs(3));
+        let reading_after_demand = reader.queue.0.lock().unwrap().reading;
+        drop(held_bulk);
+        drop(reader);
+        assert!(matches!(completed, Ok((_, _, Landed::Read))), "latency demand waited for a bulk permit");
+        assert_eq!(reading_after_demand, 1, "an exempt job returned a bulk permit it never acquired");
         drop(file);
         std::fs::remove_file(path).unwrap();
     }
