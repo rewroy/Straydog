@@ -666,6 +666,9 @@ impl Model {
                 for positions in parked.saved.iter_mut().rev() {
                     self.group.restore_positions(positions)?;
                 }
+                for positions in std::mem::take(&mut parked.saved) {
+                    self.group.release_positions(positions)?;
+                }
                 self.group.checkpoint(parked.slot, false)?;
                 self.history = parked.tokens;
                 self.final_hidden = parked.final_hidden;
@@ -674,7 +677,15 @@ impl Model {
             }
         }
         if live < self.history.len() && self.parkable(live) {
-            let slot = self.parked.take().map_or(PARK_SLOTS[0], |parked| parked.slot);
+            let slot = match self.parked.take() {
+                Some(parked) => {
+                    for positions in parked.saved {
+                        self.group.release_positions(positions)?;
+                    }
+                    parked.slot
+                }
+                None => PARK_SLOTS[0],
+            };
             self.parked = Some(self.park(live, slot)?);
             return Ok(Some("saved"));
         }

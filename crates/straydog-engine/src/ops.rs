@@ -111,6 +111,16 @@ impl Backend {
         Ok(Buffer { pointer, bytes })
     }
 
+    /// A device buffer whose contents are undefined until written.
+    pub fn buffer_unset(&mut self, bytes: u64) -> Result<Buffer> {
+        // SAFETY: a live handle.
+        let pointer = unsafe { ffi::sd_allocate(self.handle(), bytes) };
+        if pointer.is_null() {
+            return Err(straydog_gpu::last_error().to_string());
+        }
+        Ok(Buffer { pointer, bytes })
+    }
+
     /// A device copy of `data` (weights).
     pub fn upload_bytes(&mut self, data: &[u8]) -> Result<Buffer> {
         // SAFETY: a live handle; `data` outlives the call, which copies it.

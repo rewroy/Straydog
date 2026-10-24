@@ -151,7 +151,8 @@ pub struct Entry {
 }
 
 /// Floats of a sequence state copied out: `height` runs of `width` floats, `pitch` floats apart
-/// in the state, from float `offset`; `first` the first position they hold.
+/// in the state, from float `offset`; `first` the first position they hold. They lie in `device`
+/// when it is given (a VRAM copy, freed by [`Backend::release_positions`]), else in `data`.
 pub struct StatePart {
     key: String,
     offset: u64,
@@ -160,7 +161,11 @@ pub struct StatePart {
     height: u64,
     first: u64,
     data: Vec<f32>,
+    device: Option<crate::ops::Buffer>,
 }
+
+/// VRAM a device keeps free when parked positions go to VRAM instead of host memory.
+const PARK_MARGIN: u64 = 512 << 20;
 
 /// One device, its stream and an explicit VRAM budget.
 pub struct Backend {
@@ -1013,23 +1018,44 @@ impl Backend {
                 // Four planes (each head's keys, then each head's values), a position's 256 values a row.
                 let context = entry.rows / 4;
                 parts.push(StatePart { key: key.clone(), offset: from * 256, pitch: context * 256, width: (to - from) * 256,
-                                       height: 4, first: from, data: Vec::new() });
+                                       height: 4, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - 512) / 128;
                 let (first, last) = (from / 4, to.div_ceil(4));
                 parts.push(StatePart { key: key.clone(), offset: first, pitch: pool, width: last - first, height: 128, first: from,
-                                       data: Vec::new() });
+                                       data: Vec::new(), device: None });
                 if history {
                     parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: 512, width: 512, height: 1, first: from,
-                                           data: Vec::new() });
+                                           data: Vec::new(), device: None });
                 }
             }
         }
-        for part in &mut parts {
-            part.data = vec![0f32; (part.width * part.height) as usize];
-            self.state_copy(part, true)?;
+        // In VRAM when the budget has room: a copy on the device. The host copy of a 20K-token
+        // Qwen3.8 conversation (~0.5 GB a device, into pageable memory, device after device) held
+        // the next prompt's first token back by ~0.12 s.
+        let floats: u64 = parts.iter().map(|part| part.width * part.height).sum();
+        let (used, budget) = self.memory()?;
+        let in_vram = used + floats * 4 + PARK_MARGIN <= budget;
+        let copied = (|| {
+            for part in &mut parts {
+                let count = part.width * part.height;
+                if in_vram {
+                    part.device = Some(self.buffer_unset(count * 4)?);
+                } else {
+                    part.data = vec![0f32; count as usize];
+                }
+                self.state_copy(part, true)?;
+            }
+            Ok(())
+        })();
+        match copied {
+            Ok(()) => Ok(parts),
+            Err(error) => {
+                // (the error is the copy's: a failed release behind it is not reported)
+                let _ = self.release_positions(parts);
+                Err(error)
+            }
         }
-        Ok(parts)
     }
 
     /// Put parts [`save_positions`](Self::save_positions) copied out back where they were.
@@ -1037,15 +1063,24 @@ impl Backend {
         parts.iter_mut().try_for_each(|part| self.state_copy(part, false))
     }
 
+    /// Free the VRAM of parts [`save_positions`](Self::save_positions) copied out (host parts
+    /// free themselves).
+    pub fn release_positions(&mut self, parts: Vec<StatePart>) -> Result<()> {
+        parts.into_iter().filter_map(|part| part.device).try_for_each(|buffer| self.release_buffer(buffer))
+    }
+
     fn state_copy(&mut self, part: &mut StatePart, save: bool) -> Result<()> {
         let entry = self.states.get(&part.key).ok_or("no such Straydog state")?;
-        if part.data.len() as u64 != part.width * part.height {
-            return Err("a Straydog state part of the wrong size".into());
-        }
-        // SAFETY: an allocation of this device and a host buffer of width × height floats (the
-        // native side checks the runs against the allocation).
+        let count = part.width * part.height;
+        let copy: *mut f32 = match &part.device {
+            Some(buffer) if buffer.bytes == count * 4 => buffer.base().cast(),
+            None if part.data.len() as u64 == count => part.data.as_mut_ptr(),
+            _ => return Err("a Straydog state part of the wrong size".into()),
+        };
+        // SAFETY: an allocation of this device and a device or host buffer of width × height
+        // floats (the native side checks the runs against the allocation).
         check(unsafe {
-            ffi::sd_state_copy(self.handle, entry.pointer, part.offset, part.pitch, part.width, part.height, part.data.as_mut_ptr(),
+            ffi::sd_state_copy(self.handle, entry.pointer, part.offset, part.pitch, part.width, part.height, copy,
                                part.first, c_int::from(save))
         }).map(drop)
     }

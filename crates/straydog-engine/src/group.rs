@@ -570,12 +570,29 @@ impl Group {
 
     /// Every device's positional state over positions `from..to` (see [`Backend::save_positions`]).
     pub fn save_positions(&mut self, from: u64, to: u64, history: bool) -> Result<Positions> {
-        let parts = self.backends.iter_mut().map(|backend| backend.save_positions(from, to, history)).collect::<Result<_>>()?;
+        let mut parts = Vec::with_capacity(self.backends.len());
+        for index in 0..self.backends.len() {
+            match self.backends[index].save_positions(from, to, history) {
+                Ok(part) => parts.push(part),
+                Err(error) => {
+                    // The devices before it free what they kept in VRAM.
+                    for (backend, saved) in self.backends.iter_mut().zip(parts) {
+                        let _ = backend.release_positions(saved);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         Ok(Positions { from, parts })
     }
 
     pub fn restore_positions(&mut self, positions: &mut Positions) -> Result<()> {
         self.backends.iter_mut().zip(&mut positions.parts).try_for_each(|(backend, parts)| backend.restore_positions(parts))
+    }
+
+    /// Free what [`save_positions`](Self::save_positions) kept in VRAM, once nothing restores it.
+    pub fn release_positions(&mut self, positions: Positions) -> Result<()> {
+        self.backends.iter_mut().zip(positions.parts).try_for_each(|(backend, parts)| backend.release_positions(parts))
     }
 
     /// Allocated bytes and budgets summed over the devices.
