@@ -379,6 +379,29 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_dspark_head(
+        handle: *mut ::std::os::raw::c_void,
+        body: *const f32,
+        hidden: *const f32,
+        w1: *const ::std::os::raw::c_void,
+        w2: *const ::std::os::raw::c_void,
+        conf: *const f32,
+        slots: u64,
+        vocabulary: u64,
+        rank: u64,
+        width: u64,
+        anchor: u32,
+        threshold: f32,
+        minimum: u64,
+        logits: *mut f32,
+        tokens: *mut i32,
+        confidences: *mut f32,
+        count: *mut u32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_norm_linears(
         handle: *mut ::std::os::raw::c_void,
         x: *const f32,

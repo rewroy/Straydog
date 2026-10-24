@@ -233,6 +233,23 @@ impl Backend {
         })
     }
 
+    /// DSpark's greedy Markov chain. Inputs/outputs/scratch must be disjoint; scratch holds
+    /// `align16(4*(width+rank))+512` bytes. Only the first `count` tokens/confidences are used.
+    /// Reference defaults are `threshold=0.0`, `minimum=0` (llama.cpp be83657 common.h:330-333).
+    /// No host readback: the first invocation may be captured in a graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_head(&mut self, body: P, hidden: P, w1: &Buffer, w2: &Buffer, conf: &Buffer,
+                       slots: u64, vocabulary: u64, rank: u64, width: u64, anchor: u32,
+                       threshold: f32, minimum: u64, logits: M, tokens: M, confidences: M,
+                       count: M, scratch: &Buffer) -> Result<()> {
+        // SAFETY: a live handle; the native op checks shapes and all device allocation ranges.
+        check(unsafe {
+            ffi::sd_op_dspark_head(self.handle(), body.cast(), hidden.cast(), w1.pointer.cast_const(), w2.pointer.cast_const(),
+                conf.pointer.cast(), slots, vocabulary, rank, width, anchor, threshold, minimum, logits.cast(), tokens.cast(),
+                confidences.cast(), count.cast(), scratch.pointer.cast(), scratch.bytes)
+        })
+    }
+
     /// Record the ops queued from here to [`Backend::graph_end`] into a graph instead of running
     /// them (only ops with no host data: see the C header).
     pub fn graph_begin(&mut self) -> Result<()> {
