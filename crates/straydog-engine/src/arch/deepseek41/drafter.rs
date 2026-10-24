@@ -313,7 +313,7 @@ impl Part {
         self.linear(gpu, &s.kv, 8, HEAD_DIM, WIDTH, self.x.base(), self.kv.base(), block)?;
         gpu.rms_norm(self.kv.base(), &s.kv_norm, rows, HEAD_DIM as u64, NORM_EPS, self.kv.base())?;
         gpu.rope(self.kv.base(), rows, 1, HEAD_DIM as u64, ROPE as u64, &positions, &self.frequencies, false)?;
-        gpu.dspark_attention(self.q.base(), &s.ring, self.kv.base(), &s.sinks, self.heads as u64, rows, block.position as u32,
+        gpu.dspark_attention(self.q.base(), &s.ring, self.kv.base(), &s.sinks, self.heads as u64, rows, block.position as u32, None,
                              block.history as u64, self.attended.base(), &self.scratch)?;
         gpu.rope(self.attended.base(), rows, self.heads as u64, HEAD_DIM as u64, ROPE as u64, &positions, &self.frequencies, true)?;
         let group_width = HEADS / GROUPS * HEAD_DIM;
@@ -514,7 +514,7 @@ impl Drafter {
         }
         let gpu = &mut *first[0].gpu;
         gpu.dspark_head(self.logits.base(), self.parts[0].collapsed.base(), &self.markov[0], &self.markov[1], &self.confidence, rows,
-                        vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, 0.0, 0, self.corrected.base(), self.tokens.base(),
+                        vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, None, 0.0, 0, self.corrected.base(), self.tokens.base(),
                         self.confidences.base(), self.count.base(), &self.parts[0].scratch)?;
         let (mut tokens, mut confidences, mut count) = (vec![0i32; slots], vec![0f32; slots], [0u32; 1]);
         gpu.read_buffer(&self.tokens, 0, &mut tokens)?;

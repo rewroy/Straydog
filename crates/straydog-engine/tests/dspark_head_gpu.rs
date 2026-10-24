@@ -73,8 +73,13 @@ struct Device {
 }
 impl Device {
     fn run(&self, gpu: &mut Backend, case: &Case, slots: u64, threshold: f32, minimum: u64) -> Result<(), String> {
+        self.run_at(gpu, case, slots, threshold, minimum, None)
+    }
+    /// With the anchor token from a device i32.
+    fn run_at(&self, gpu: &mut Backend, case: &Case, slots: u64, threshold: f32, minimum: u64, anchor: Option<&Buffer>)
+              -> Result<(), String> {
         gpu.dspark_head(self.body.base(), self.hidden.base(), &self.w1, &self.w2, &self.conf,
-            slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, threshold, minimum,
+            slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, anchor.map(|at| at.base().cast_const()), threshold, minimum,
             self.logits.base(), self.tokens.base(), self.confidences.base(), self.count.base(), &self.scratch)
     }
     fn check(&self, gpu: &mut Backend, case: &Case, expected: &Expected, slots: usize, count: u32) {
@@ -124,6 +129,19 @@ fn production_shape_b1_to_b5_matches_cpu_and_prefix_limits() {
     device.check(&mut gpu, &case, &changed, 5, 5);
     case.body = original_body;
     gpu.write_buffer(&device.body, 0, &case.body).unwrap();
+    // The anchor token from a device i32: a recorded graph follows it as it changes.
+    let anchor = upload(&mut gpu, &[case.anchor as i32]);
+    gpu.graph_begin().unwrap();
+    device.run_at(&mut gpu, &case, 5, 0.0, 0, Some(&anchor)).unwrap();
+    gpu.graph_end(138, true).unwrap();
+    assert!(gpu.graph_run(138).unwrap());
+    device.check(&mut gpu, &case, &expected, 5, 5);
+    let moved = Case { anchor: 4242, ..case };
+    gpu.write_buffer(&anchor, 0, &[moved.anchor as i32]).unwrap();
+    let moved_expected = moved.oracle();
+    assert!(gpu.graph_run(138).unwrap());
+    device.check(&mut gpu, &moved, &moved_expected, 5, 5);
+    let case = Case { anchor: 128799, ..moved };
     for slots in 1..=5 {
         device.run(&mut gpu, &case, slots, 0.0, 0).unwrap();
         device.check(&mut gpu, &case, &expected, slots as usize, slots as u32);
