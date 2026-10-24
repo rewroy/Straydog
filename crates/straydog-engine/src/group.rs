@@ -340,6 +340,12 @@ impl Group {
         self.backends[mtp].mtp_keep(steps, previous, host)
     }
 
+    /// Row `index` of the rows the MTP layer's device keeps (see [`Backend::mtp_keep`]).
+    pub fn mtp_kept_row(&mut self, index: u64) -> Result<Vec<f32>> {
+        let mtp = self.owner(48);
+        self.backends[mtp].mtp_kept_row(index)
+    }
+
     pub fn mtp_embed(&mut self, embeddings: &[f32]) -> Result<()> {
         let mtp = self.owner(48);
         self.backends[mtp].mtp_embed(embeddings)

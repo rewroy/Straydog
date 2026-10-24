@@ -76,6 +76,9 @@ struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
+    /// With the MTP layer, the indexers' rolling history then: resuming here, the MTP layer's
+    /// pair before completes its pooled block from the three inputs before it.
+    history: Option<Positions>,
 }
 
 /// A sequence a prompt departed from, kept to come back to: its recurrent state in a slot and
@@ -621,7 +624,9 @@ impl Model {
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
         if kind == "turn" {
             if let Some(turn) = self.checkpoints.shift_remove("turn") {
-                self.checkpoints.shift_remove("prior");
+                if let Some(prior) = self.checkpoints.shift_remove("prior") {
+                    self.release_checkpoint(prior)?;
+                }
                 self.checkpoints.insert("prior", turn);
             }
         }
@@ -629,12 +634,31 @@ impl Model {
             self.checkpoints.iter().filter(|(name, _)| **name != kind).map(|(_, checkpoint)| checkpoint.slot).collect();
         let slot = (0..CHECKPOINTS.len()).find(|slot| !used.contains(slot)).unwrap();
         self.group.checkpoint(slot, true)?;
-        self.checkpoints.insert(kind, Checkpoint {
-            slot,
-            tokens: self.history.clone(),
-            final_hidden: self.final_hidden.clone(),
-        });
+        // (inside a pipelined prompt, the row its last batch kept: a prompt resuming here pairs
+        // its first token with it)
+        let final_hidden = match self.final_hidden.clone() {
+            None => self.kept_hidden()?,
+            hidden => hidden,
+        };
+        let history = if self.speculative > 0 { Some(self.group.save_history(self.history.len() as u64)?) } else { None };
+        if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens: self.history.clone(), final_hidden, history }) {
+            self.release_checkpoint(replaced)?;
+        }
         Ok(())
+    }
+
+    /// Free what a checkpoint holds besides its slot.
+    fn release_checkpoint(&mut self, checkpoint: Checkpoint) -> Result<()> {
+        checkpoint.history.map_or(Ok(()), |history| self.group.release_positions(history))
+    }
+
+    /// Inside a pipelined prompt with the MTP layer: its last batch's last row, which only the
+    /// MTP layer's device kept (None outside one or before its first batch).
+    fn kept_hidden(&mut self) -> Result<Option<Vec<f32>>> {
+        if self.speculative == 0 || !self.deferred || self.mtp_kept == 0 {
+            return Ok(None);
+        }
+        self.group.mtp_kept_row(self.mtp_kept).map(Some)
     }
 
     /// Park the live sequence whole: its positions from `from` (with the indexers' history) and
@@ -836,9 +860,12 @@ impl Model {
             self.reset()?;
             return Ok((0, "none"));
         };
-        let checkpoint = &self.checkpoints[kind];
+        let checkpoint = self.checkpoints.get_mut(kind).unwrap();
         let (slot, saved, hidden) = (checkpoint.slot, checkpoint.tokens.clone(), checkpoint.final_hidden.clone());
         self.group.checkpoint(slot, false)?;
+        if let Some(history) = checkpoint.history.as_mut() {
+            self.group.restore_positions(history)?;
+        }
         self.final_hidden = hidden;
         self.history = saved;
         Ok((self.history.len(), kind))
@@ -930,7 +957,19 @@ impl Model {
         let embeddings = self.token_embeddings(tokens)?;
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
-        let hidden = if tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL {
+        // Inside a pipelined prompt the last batch's rows stayed on the GPUs: a batch on the
+        // verified or the one-token path pairs its first token with that batch's last row, read
+        // back from where the MTP layer's device kept it (the next batch pairs from this one's).
+        let verified = tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL;
+        let previous = match previous {
+            None if verified || tokens.len() == 1 => {
+                let kept = self.kept_hidden()?;
+                self.mtp_kept = 0;
+                kept
+            }
+            previous => previous,
+        };
+        let hidden = if verified {
             let start = self.history.len();
             let rows = self.prefill_verified(tokens)?;
             // forward records the tokens below, after the MTP layer has read the prompt.
@@ -974,13 +1013,8 @@ impl Model {
             }
             if self.speculative > 0 {
                 // The MTP layer's pair of the row before, its token now known (the longer
-                // prompts' paths write theirs from there too): inside a pipelined prompt, from
-                // the row its last batch kept on the MTP layer's device.
-                if self.deferred {
-                    self.mtp_prompt_kept(tokens, previous)?;
-                } else {
-                    self.mtp_prompt(tokens, &hidden, previous)?;
-                }
+                // prompts' paths write theirs from there too).
+                self.mtp_prompt(tokens, &hidden, previous)?;
             }
             hidden
         };

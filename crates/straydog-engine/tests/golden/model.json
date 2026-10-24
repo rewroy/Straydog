@@ -15162,7 +15162,7 @@
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
-      "drafted_tokens": 21,
+      "drafted_tokens": 19,
       "accepted_tokens": 19
      },
      "logits": [
@@ -45656,7 +45656,7 @@
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
-      "drafted_tokens": 21,
+      "drafted_tokens": 19,
       "accepted_tokens": 19
      },
      "logits": [
@@ -76150,7 +76150,7 @@
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
-      "drafted_tokens": 21,
+      "drafted_tokens": 19,
       "accepted_tokens": 19
      },
      "logits": [

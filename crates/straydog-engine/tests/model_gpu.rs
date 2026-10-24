@@ -246,6 +246,7 @@ fn turn(prompt: &[u32], reply: &[u32], content: &[u32]) -> Vec<u32> {
 struct Prompts {
     root: Vec<u32>, short: Vec<u32>, live: Vec<u32>, tools: Vec<u32>, tools_more: Vec<u32>, step: Vec<u32>,
     step_last: Vec<u32>, other: Vec<u32>, other_next: Vec<u32>, other_last: Vec<u32>, other_final: Vec<u32>, past: Vec<u32>,
+    below: Vec<u32>,
 }
 
 /// Parking a conversation copies only what later prompts overwrite (T164's first policy), and a
@@ -253,8 +254,9 @@ struct Prompts {
 /// interleaved, conversations parked and restored, twice: parking each departing conversation
 /// whole at once (the reference for every bit) and bounded; every request leaves the same
 /// tokens, logits, final hidden state, resume position, drafts and sequence state (the MTP
-/// layer's too) in both. Each conversation's requests also run back to back, never parked, and
-/// the interleaved ones leave the same tokens, logits, hidden and target state as there. Among
+/// layer's too) in both. Each conversation's requests also run back to back (none coming back
+/// once left), and the interleaved ones leave all of it the same as there too, whatever ran
+/// before them. Among
 /// them: a short prompt that copies a few positions and borrows the rest of a 4.9K conversation
 /// (1); its continuation past what was copied (2); a prompt that resumes from a checkpoint below
 /// where it departs (R < live) and prompt lengths at different residues of four (3); drafts at
@@ -292,6 +294,10 @@ fn bounded_parking(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quan
         let other_final = turn(&other_last, &other_last_out.tokens, &root[700..720]);
         apart.insert("other-last", other_last_out);
         apart.insert("other-final", go(&mut model, &other_final, 16, None));
+        // (from the other conversation's root checkpoint, thousands of positions below its end)
+        let mut below = other[..2500].to_vec();
+        below.extend_from_slice(&short);
+        apart.insert("below", go(&mut model, &below, 3, None));
         let tools_out = go(&mut model, &tools, 40, None);
         // (its reply decoded further, from the one token after it)
         let tools_more = [&tools[..], &tools_out.tokens[..]].concat();
@@ -309,7 +315,8 @@ fn bounded_parking(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quan
         apart.insert("root", root_out);
         drop(model);
 
-        let prompts = Prompts { root, short, live, tools, tools_more, step, step_last, other, other_next, other_last, other_final, past };
+        let prompts =
+            Prompts { root, short, live, tools, tools_more, step, step_last, other, other_next, other_last, other_final, past, below };
         let mut model = open(model_root, drafter, quantization, &expected["placement"]);
         model.park_whole();
         let whole = interleaved(&mut model, name, &prompts, true);
@@ -319,36 +326,31 @@ fn bounded_parking(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quan
         drop(model);
 
         for ((label, outcome), (_, wanted)) in bounded.iter().zip(&whole) {
-            compare(name, label, outcome, wanted, true);
-            // (the MTP layer's rows also depend on what ran before a request, T176, even rows of
-            // a prompt it recomputes whole: the tools prompt's row 5191 of 5202 by the
-            // conversation before it; back to back, that conversation is another)
+            compare(name, label, outcome, wanted);
             if let Some(apart) = apart.get(label) {
-                compare(name, label, outcome, apart, *label == "root");
+                compare(name, label, outcome, apart);
             }
         }
         eprintln!("{name}: every request as with whole copies, bit for bit");
     }
 }
 
-/// `outcome` as `wanted`: resume position, tokens, logits, final hidden state and the target's
-/// state, with `exact` the MTP layer's state and drafts too.
-fn compare(name: &str, label: &str, outcome: &Outcome, wanted: &Outcome, exact: bool) {
+/// `outcome` as `wanted`: resume position, tokens, logits, final hidden state, drafts and state.
+fn compare(name: &str, label: &str, outcome: &Outcome, wanted: &Outcome) {
     assert_eq!(outcome.metrics["cached_tokens"], wanted.metrics["cached_tokens"], "{name} {label}: resumed at");
     assert_eq!(outcome.tokens, wanted.tokens, "{name} {label}: tokens");
     assert_eq!(outcome.logits, wanted.logits, "{name} {label}: logits");
     assert_eq!(outcome.hidden, wanted.hidden, "{name} {label}: final hidden");
-    let differing: Vec<_> =
-        outcome.state.iter().zip(&wanted.state).filter(|(a, b)| a != b && (exact || !a.contains(":blk.48."))).collect();
+    let differing: Vec<_> = outcome.state.iter().zip(&wanted.state).filter(|(a, b)| a != b).collect();
     for (actual, expected) in &differing {
         eprintln!("{name} {label}: {actual} (reference {})", expected.rsplit(' ').next().unwrap());
     }
     let drafts = ["speculative_passes", "drafted_tokens", "accepted_tokens"].map(|key| (outcome.metrics.get(key), wanted.metrics.get(key)));
-    if exact && drafts.iter().any(|(a, b)| a != b) {
+    if drafts.iter().any(|(a, b)| a != b) {
         eprintln!("{name} {label}: drafts {drafts:?} (this run, the reference)");
     }
     assert!(differing.is_empty() && outcome.state.len() == wanted.state.len(), "{name} {label}: state ({} parts differ)", differing.len());
-    assert!(!exact || drafts.iter().all(|(a, b)| a == b), "{name} {label}: the MTP layer's drafts");
+    assert!(drafts.iter().all(|(a, b)| a == b), "{name} {label}: the MTP layer's drafts");
 }
 
 /// The interleaved requests and what each left, the parking's own checks along them (those of
@@ -389,10 +391,9 @@ fn interleaved(model: &mut Model, name: &str, p: &Prompts, whole: bool) -> Vec<(
     assert_eq!(cancelled.metrics["parked"], "saved", "{name}: parked before the cancelled prompt");
     record(&mut outcomes, "other", go(model, &p.other, 24, None));
     // (3) resuming from the other conversation's root checkpoint (2052) below where it departs
-    // (2500), max_new 3: the copy starts under the checkpoint
-    let mut below = p.other[..2500].to_vec();
-    below.extend_from_slice(&p.short);
-    let below_out = record(&mut outcomes, "below", go(model, &below, 3, None));
+    // (2500), max_new 3: the copy starts under the checkpoint (and the MTP layer's pair before
+    // completes a pooled block from the history the checkpoint kept, not the ring's later inputs)
+    let below_out = record(&mut outcomes, "below", go(model, &p.below, 3, None));
     assert_eq!((below_out.metrics["parked"].as_str(), below_out.metrics["cached_tokens"].as_u64()), (Some("saved"), Some(2052)),
                "{name}: from the root checkpoint");
     let (covered, _) = model.parked_coverage().unwrap();

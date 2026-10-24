@@ -663,6 +663,19 @@ impl Backend {
         check(unsafe { ffi::sd_mtp_keep(self.handle, 47, steps, rows.pointer, previous, host) }).map(drop)
     }
 
+    /// Kept row `index` (the last batch's last is `steps`), read back to the host.
+    pub fn mtp_kept_row(&mut self, index: u64) -> Result<Vec<f32>> {
+        let rows = self.state_entry("@mtp:rows")?;
+        if index >= rows.rows {
+            return Err("invalid Straydog MTP row".into());
+        }
+        let width = WIDTH as u64;
+        let mut part = StatePart { key: "@mtp:rows".into(), offset: index * width, pitch: width, width, height: 1, first: 0,
+                                   data: vec![0f32; WIDTH], device: None };
+        self.state_copy(&mut part, true)?;
+        Ok(part.data)
+    }
+
     /// The embeddings the kept rows pair with, staged without waiting for the device.
     pub fn mtp_embed(&mut self, embeddings: &[f32]) -> Result<()> {
         let target = self.state_entry("@mtp:embeddings")?;
@@ -1092,9 +1105,10 @@ impl Backend {
     /// - the MTP layer's (layer 48's) row `to - 1`: its rows are pairs, a position's hidden
     ///   state with the token after it, and that token is not in the sequence yet. The next
     ///   prompt writes its pairs from the row before it (`first = start - 1` in model.rs
-    ///   mtp_prompt :1178, mtp_prompt_resident :1127, mtp_prompt_kept :1153; a one-token
-    ///   prompt through them too, :975-984), and a decode's first draft catches up from there
-    ///   (mtp_position, model.rs:1371), before attending.
+    ///   mtp_prompt :1196, mtp_prompt_resident :1145, mtp_prompt_kept :1171; a one-token
+    ///   prompt through them too, :998-1002; inside a pipelined prompt from the row kept on
+    ///   the MTP layer's device, kept_hidden), and a decode's first draft catches up from there
+    ///   (mtp_position, model.rs:1389), before attending.
     /// - the rolling history's inputs below the last block boundary (another block's, perhaps
     ///   another sequence's): pooling reads it only for positions from the boundary of the
     ///   block being completed up to where the batch starts (qsa_pool, gpu/sparse_attention.hpp
