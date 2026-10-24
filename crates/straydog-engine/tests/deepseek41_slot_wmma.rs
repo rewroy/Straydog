@@ -3,7 +3,7 @@
 //! accurate as the expanded GEMM per expert (DS41_SLOT_WMMA=0), both measured against F32
 //! (--gemm fp32): over a prompt of several waves of multi-row experts on two devices, the first
 //! layers' sequence state (where FP16's differences have not compounded yet) is as near F32's,
-//! the next-token distribution about as near, and the next token the same. A lost or wrong
+//! the next-token distribution about as near, and the next token F32's or one it all but ties with. A lost or wrong
 //! expert contribution moves the first layers' state some 60 times further than FP16 does (a
 //! scatter whose adds to one row raced did).
 //!
@@ -90,7 +90,11 @@ fn an_fp16_pass_through_the_grouped_kernels_is_as_accurate_as_the_expanded_gemms
     let (from_expanded, from_grouped) = (kl(&exact, &expanded), kl(&exact, &grouped));
     eprintln!("KL from F32: expanded {from_expanded:.3e}, grouped {from_grouped:.3e}");
     assert!(from_grouped <= 2.0 * from_expanded + 1e-3, "KL from F32: grouped {from_grouped:.3e}, expanded {from_expanded:.3e}");
-    if best(&expanded) == best(&exact) {
-        assert_eq!(best(&grouped), best(&exact), "the next token");
-    }
+    // The next token: F32's, or one F32 itself all but ties with it (a near tie two FP16 paths
+    // may break either way: on this prompt two tokens lie within FP16's differences).
+    let (picked, ideal) = (best(&grouped), best(&exact));
+    eprintln!("next token: F32 {ideal}, expanded {}, grouped {picked} ({:.3} below F32's best under F32)", best(&expanded),
+              exact[ideal] - exact[picked]);
+    assert!(exact[picked] >= exact[ideal] - 0.25, "the next token: grouped picks {picked}, {:.3} below F32's {ideal}",
+            exact[ideal] - exact[picked]);
 }

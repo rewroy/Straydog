@@ -1131,6 +1131,7 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "decoder_span.hpp"
 #include "verify_span.hpp"
 #include "ops.hpp"
+#include "ds_attention_wmma.hpp"
 #include "transfer.hpp"
 
 // The attention rope table: forward[row, pair], then the inverse at the same stride, one allocation
@@ -3141,6 +3142,46 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
     const size_t share_bytes = size_t(rows * heads) * (shares * dim + 1) * 4;
     if (shares > 1 && scratch_bytes < need + share_bytes) shares = 1;
     const size_t share_keys = (stride + shares * attention_keys - 1) / (shares * attention_keys) * attention_keys;
+#if defined(__HIPCC__)
+    // An FP16 prompt pass on RDNA4: both products through WMMA, every head of a row in one block
+    // (ds_attention_wmma.hpp). Decode and short passes keep the F32 kernels below.
+    const size_t wmma_chunks = (stride + ds_attention_chunk - 1) / ds_attention_chunk;
+    const size_t wmma_need = score_bytes + size_t(rows * heads) * wmma_chunks * 8;
+    if (value.rdna4 && value.half_gemm && rows >= 32 && dim % 64 == 0 && (heads == 32 || heads == 64) && scratch &&
+        scratch_bytes >= wmma_need && stride * sizeof(float*) <= 32 * 1024) {
+        op_span(value, scratch, wmma_need, "attention scratch");
+        float* scores = scratch;
+        auto* partial = reinterpret_cast<float2*>(reinterpret_cast<uint8_t*>(scratch) + score_bytes);
+        const size_t pairs = size_t(rope_dims / 2);
+        double2* forward = nullptr;
+        double2* inverse = nullptr;
+        if (pairs) {
+            attention_turns_reserve(value, size_t(rows), pairs);
+            forward = value.attention_turns;
+            inverse = forward + value.attention_turns_rows * pairs;
+            const bool filled = value.attention_turns_ready && value.attention_turns_ready_rows == size_t(rows) &&
+                                value.attention_turns_ready_pairs == pairs;
+            value.attention_turns_ready = false;
+            if (!filled)
+                op_attention_turns_kernel<<<unsigned(rows), 64, 0, value.stream>>>(positions, frequencies, pairs, forward, inverse);
+        } else {
+            value.attention_turns_ready = false;
+        }
+        const dim3 score_grid{unsigned(wmma_chunks), unsigned(rows)}, out_grid{unsigned(dim / 64), unsigned(rows)};
+        const size_t keys_bytes = size_t(stride) * sizeof(float*);
+        #define SD_DS_ATTENTION(HM) \
+            ds_attention_scores_wmma<HM><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
+                compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial); \
+            check(hipGetLastError()); \
+            ds_attention_output_wmma<HM><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, size_t(raw_rows), \
+                positions, size_t(window), compressed, selected, size_t(selections), sinks, size_t(heads), size_t(dim), pairs, inverse, \
+                stride, out);
+        if (heads == 32) { SD_DS_ATTENTION(2) } else { SD_DS_ATTENTION(4) }
+        #undef SD_DS_ATTENTION
+        check(hipGetLastError());
+        return 0;
+    }
+#endif
     if (dim % 64 == 0 && scratch && scratch_bytes >= need && share_keys * sizeof(float*) <= 32 * 1024 && rows * shares <= 65535) {
         op_span(value, scratch, need, "attention scratch");
         float* scores = scratch;
