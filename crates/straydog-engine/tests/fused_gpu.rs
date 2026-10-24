@@ -416,3 +416,57 @@ fn f32_router_prefetch_keeps_odd_units_and_routes_bit_exact() {
         }
     }
 }
+
+#[test]
+fn linears_norm_tail_graph_matches_separate_ops() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let (rank, dim, rope, context) = (1280usize, 512usize, 64usize, 16usize);
+    for (kind, cols) in [(0u32, 128usize), (8, 5120)] {
+        let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
+            if kind == 0 { upload(&mut gpu, &random.floats(rows * cols, 0.02)) }
+            else {
+                let mut bytes = Vec::new();
+                for _ in 0..rows * cols / 32 {
+                    bytes.extend_from_slice(&0x2000u16.to_le_bytes());
+                    for _ in 0..32 { bytes.push(random.next() as u8); }
+                }
+                gpu.upload_bytes(&bytes).unwrap()
+            }
+        }).collect();
+        let input = upload(&mut gpu, &vec![0.0; cols]);
+        let qweight = upload(&mut gpu, &random.floats(rank, 1.0));
+        let kvweight = upload(&mut gpu, &random.floats(dim, 1.0));
+        let frequencies = upload(&mut gpu, &(0..rope / 2).map(|i| 1e4f32.powf(-(2.0 * i as f32) / rope as f32)).collect::<Vec<_>>());
+        let positions = gpu.buffer(4).unwrap();
+        let out_rows = gpu.buffer(4).unwrap();
+        gpu.write_buffer(&positions, 0, &[70_001i32]).unwrap();
+        gpu.write_buffer(&out_rows, 0, &[5i32]).unwrap();
+        let outputs = |gpu: &mut Backend| [gpu.buffer((rank * 4) as u64).unwrap(), gpu.buffer((dim * 4) as u64).unwrap(),
+            gpu.buffer((rank * 4) as u64).unwrap(), upload(gpu, &vec![0.0; context * dim])];
+        let a = outputs(&mut gpu); let b = outputs(&mut gpu);
+        let scratch = gpu.buffer(16 << 20).unwrap();
+        let items = |out: &[Buffer; 4]| [rank, dim].into_iter().enumerate().map(|(i, rows)| Linear {
+            weights: matrices[i], kind, rows: rows as u64, cols: cols as u64, first_row: 0, input: input.base(), output: out[i].base()
+        }).collect::<Vec<_>>();
+        let side = NormRope { input: b[1].base(), weight: &kvweight, width: dim as u64, eps: 1e-6,
+            rope: Some((rope as u64, &positions, &frequencies)), out_rows: Some(out_rows.base()), out: b[3].base(), out_count: context as u64 };
+        // The first invocation is captured: no prior launch initializes its counter.
+        gpu.graph_begin().unwrap();
+        gpu.linears_norm_rope(&items(&b), b[0].base(), &qweight, rank as u64, 1e-6, b[2].base(), &side).unwrap();
+        gpu.graph_end(121, true).unwrap();
+        for replay in 0..4 {
+            gpu.write_buffer(&input, 0, &random.floats(cols, 2.0)).unwrap();
+            gpu.write_buffer(&positions, 0, &[70_001i32 + replay]).unwrap();
+            gpu.write_buffer(&out_rows, 0, &[5i32 + replay]).unwrap();
+            gpu.linears(&items(&a), 1, 0, 0, &scratch).unwrap();
+            gpu.rms_norm(a[0].base(), &qweight, 1, rank as u64, 1e-6, a[2].base()).unwrap();
+            gpu.norm_rope(a[1].base(), &kvweight, 1, dim as u64, 1e-6, Some((rope as u64, &positions, &frequencies)),
+                Some(out_rows.base()), a[3].base(), context as u64).unwrap();
+            assert!(gpu.graph_run(121).unwrap());
+            for (i, count) in [rank, dim, rank, context * dim].into_iter().enumerate() {
+                assert_eq!(read(&mut gpu, &a[i], count), read(&mut gpu, &b[i], count), "kind {kind}, replay {replay}, output {i}");
+            }
+        }
+    }
+}
