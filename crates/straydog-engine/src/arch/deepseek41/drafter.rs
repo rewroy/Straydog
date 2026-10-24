@@ -114,7 +114,8 @@ struct Part {
     /// Pre coefficients that collapse a stream to its copy 0 (rows of [1, 0, 0, 0]).
     first: Buffer,
     logits_router: Buffer,
-    ids: Buffer,
+    /// Each stage's routes (kept apart, read back by [`Drafter::routes`]).
+    ids: [Buffer; 3],
     weights: Buffer,
     product: Buffer,
     /// This device's rows of the block's logits (the first device's go into the logits).
@@ -290,7 +291,7 @@ impl Part {
             coefficients: [coefficients(gpu)?, coefficients(gpu)?, coefficients(gpu)?],
             first: floats(gpu, s * HC)?,
             logits_router: floats(gpu, s * EXPERTS)?,
-            ids: floats(gpu, s * USED)?,
+            ids: [floats(gpu, s * USED)?, floats(gpu, s * USED)?, floats(gpu, s * USED)?],
             weights: floats(gpu, s * USED)?,
             product: floats(gpu, s * USED * ffn)?,
             head_out: floats(gpu, s * head_rows)?,
@@ -364,7 +365,7 @@ impl Part {
         gpu.rms_norm(self.collapsed.base(), &s.ffn_norm, rows, w, NORM_EPS, self.x.base())?;
         self.linear(gpu, &s.router, 0, EXPERTS, WIDTH, self.x.base(), self.logits_router.base(), block)?;
         gpu.route(self.logits_router.base(), Some(s.bias.base().cast_const()), rows, EXPERTS as u64, USED as u64, 2, true, SCALE,
-                  self.ids.base(), self.weights.base())
+                  self.ids[stage].base(), self.weights.base())
     }
 
     /// A stage's experts after its routes: this device's rows of the routed (through the stage's
@@ -372,7 +373,7 @@ impl Part {
     fn experts(&self, gpu: &mut Backend, stage: usize, block: &Block) -> Result<()> {
         let (s, rows, w) = (&self.stages[stage], block.rows, WIDTH as u64);
         let (experts, shared) = (self.experts, self.shared_expert);
-        gpu.experts_table(&s.table, EXPERTS as u64, self.ids.base(), experts.bytes, experts.offsets, [39; 3], w, self.ffn as u64, rows,
+        gpu.experts_table(&s.table, EXPERTS as u64, self.ids[stage].base(), experts.bytes, experts.offsets, [39; 3], w, self.ffn as u64, rows,
                           USED as u64, self.x.base(), Some(self.weights.base().cast_const()), CLAMP, false, self.product.base(),
                           self.target(1))?;
         let bases = vec![s.shared.base() as u64; rows as usize];
@@ -451,6 +452,19 @@ impl Drafter {
             self.held[position as usize % RING] = position as i64;
         }
         Ok(())
+    }
+
+    /// The last draft's routes, for each stage its `slots` rows of experts (read back: not in a
+    /// draft's timing).
+    pub fn routes(&mut self, devices: &mut [Beside<'_>], slots: usize) -> Result<Vec<Vec<i32>>> {
+        let (part, gpu) = (&self.parts[0], &mut *devices[0].gpu);
+        let mut all = Vec::with_capacity(part.stages.len());
+        for ids in &part.ids[..part.stages.len()] {
+            let mut routes = vec![0i32; slots.min(MAX_SLOTS) * USED];
+            gpu.read_buffer(ids, 0, &mut routes)?;
+            all.push(routes);
+        }
+        Ok(all)
     }
 
     /// Forget every injected position from `position` on (a rewind of the target to `position`).
