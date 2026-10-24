@@ -9,5 +9,5 @@
 mod gguf;
 mod snapshot;
 
-pub use gguf::{inspect, Metadata, ModelHeader, TensorInfo};
+pub use gguf::{inspect, Metadata, ModelHeader, TensorInfo, SIDECAR_ARCHITECTURES};
 pub use snapshot::inspect_header;

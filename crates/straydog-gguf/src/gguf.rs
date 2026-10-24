@@ -65,6 +65,10 @@ impl Metadata {
     }
 }
 
+/// The architectures of the files beside a model's shards that are accepted though their names fall
+/// outside the usual characters: DeepSeek-V4.1's separate Engram tables.
+pub const SIDECAR_ARCHITECTURES: [&str; 1] = ["deepseek41-engram"];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelHeader {
     /// `general.architecture`; which ones are supported is the engine's decision.
@@ -182,10 +186,12 @@ fn unsigned(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::Result<Opti
 
 // GGML block geometry is required to check byte ranges, including mixed dense
 // tensors in low-bit models. This does not implement any dequantization kernel.
-// Q2_0 (type 42) is the GSQ-RCO extension: 64 elements in 18 bytes.
+// Q2_0 (type 42) is the GSQ-RCO extension: 64 elements in 18 bytes. I32 (26) and I64 (27)
+// hold integer tables (DeepSeek-V4.1's Engram hash parameters), read as integers.
 fn geometry(kind: u32) -> io::Result<(u64, u64)> {
     match kind {
-        0 => Ok((1, 4)),
+        0 | 26 => Ok((1, 4)),
+        27 => Ok((1, 8)),
         1 | 30 => Ok((1, 2)),
         2 | 20 => Ok((32, 18)),
         3 => Ok((32, 20)),
@@ -271,9 +277,10 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
     }
     let architecture = match metadata.get("general.architecture") {
         Some(Metadata::Text(value))
-            if !value.is_empty()
+            if (!value.is_empty()
                 && value.len() <= 64
-                && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') =>
+                && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+                || SIDECAR_ARCHITECTURES.contains(&value.as_str()) =>
         {
             value.clone()
         }

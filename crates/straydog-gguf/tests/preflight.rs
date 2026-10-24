@@ -236,6 +236,24 @@ fn reports_any_architecture_but_rejects_malformed_names_and_mistyped_capacity() 
     );
 }
 
+/// Integer tables (I32, I64) take 4 and 8 bytes a value; the one registered sidecar architecture
+/// with a hyphen is accepted, no other.
+#[test]
+fn integer_tables_and_the_engram_sidecar() {
+    let tensors = vec![
+        Tensor { name: "engram_token_map.weight", dims: vec![5], kind: 26, offset: 0 },
+        Tensor { name: "engram_primes.weight", dims: vec![3, 2], kind: 27, offset: 32 },
+    ];
+    let header = inspect(&mut Cursor::new(fixture(metadata(), tensors, 96))).unwrap();
+    assert_eq!(header.tensors.iter().map(|tensor| tensor.bytes).collect::<Vec<_>>(), [20, 48]);
+    let sidecar = fixture(vec![text("general.architecture", "deepseek41-engram")], vec![dense("blk.1.engram_embd.weight", 0)], 16);
+    let header = inspect(&mut Cursor::new(sidecar)).unwrap();
+    assert_eq!((header.architecture.as_str(), header.shard_index, header.shard_count), ("deepseek41-engram", 0, 1));
+    for name in ["deepseek41-other", "qwen4-exp"] {
+        rejects(fixture(vec![text("general.architecture", name)], vec![dense("x", 0)], 16), "architecture name");
+    }
+}
+
 #[test]
 fn rejects_unknown_types_partial_rows_and_shape_overflow() {
     for (dims, kind, expected) in [
