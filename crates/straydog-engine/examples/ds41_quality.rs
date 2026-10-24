@@ -8,7 +8,7 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
-//!     [--generate N [--runs R] [--width W]]
+//!     [--generate N [--runs R] [--width W]] [--dump-routes FILE]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -31,11 +31,13 @@
 //! target's next, and takes the rest back: the tokens must be those without the drafter. --runs R
 //! goes over the prompts R times (the first warms the expert stores). --width W verifies W of each
 //! draft whatever the policy picks; --draft-slots 0 takes the features but never drafts. Each pass
-//! is timed by its rows, and the stores' counters taken over the decode alone.
+//! is timed by its rows, and the stores' counters taken over the decode alone. --dump-routes FILE
+//! writes every draft's routes, a line a stage (read back after the draft, outside its timing).
 
 #[path = "common/files.rs"]
 mod files;
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
@@ -122,6 +124,19 @@ struct Generate {
     show: bool,
     drafts: bool,
     width: Option<usize>,
+    /// Which time over the prompts this is (--runs).
+    run: usize,
+}
+
+/// --dump-routes: a draft's routes, a line a stage: the run, prompt, round, position, slots, stage,
+/// then each slot's experts (by commas, slots by semicolons).
+fn dump_routes(text: &mut String, run: usize, prompt: usize, round: usize, position: usize, slots: usize, routes: &[Vec<i32>]) {
+    for (stage, ids) in routes.iter().enumerate() {
+        let groups: Vec<String> = ids.chunks(ids.len() / slots.max(1)).map(|slot| {
+            slot.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+        }).collect();
+        let _ = writeln!(text, "{run}\t{prompt}\t{round}\t{position}\t{slots}\t{stage}\t{}", groups.join(";"));
+    }
 }
 
 /// --generate: each prompt continued greedily by `count` tokens, timed; with a drafter, DSpark
@@ -129,7 +144,7 @@ struct Generate {
 /// tokens a verify pass checks. Timed apart: each pass by its rows (a 1-row pass also by whether a
 /// verify pass came before it), the drafts and the injections; the stores' counters over the decode.
 fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, drafter: &mut Option<Drafter>, prompts: &[Vec<u32>],
-            settings: &Generate) -> Result<(), String> {
+            settings: &Generate, dump: &mut Option<String>) -> Result<(), String> {
     let (count, vocabulary) = (settings.count, settings.vocabulary);
     let mut policy = Policy::new(&VERIFY_MS, 5.0);
     let counted = |engines: &[Engine<'_, files::Files>]| {
@@ -179,6 +194,10 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
                     };
                     let width = width.min(room - 1).min(draft.tokens.len());
                     drafts = draft.tokens[..width].to_vec();
+                    if let Some(text) = dump.as_mut() {
+                        let slots = VERIFY_MS.len() - 1;
+                        dump_routes(text, settings.run, index, rounds, position, slots, &drafter.routes(&mut engines[0].beside()?, slots)?);
+                    }
                     (drafted, drafting) = (drafted + 1, drafting + ms / 1e3);
                     if settings.show {
                         println!("  round at {position}: draft {:?} confidences {:?}, verifying {}", draft.tokens, draft.confidences, drafts.len());
@@ -276,6 +295,12 @@ fn main() -> Result<(), String> {
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
     let (generate_count, runs, forced_width) = (option("--generate", 0), option("--runs", 1), option("--width", usize::MAX));
+    let dump_path = args.iter().position(|arg| arg == "--dump-routes").map(|at| {
+        let value = args[at + 1].clone();
+        args.drain(at..at + 2);
+        value
+    });
+    let mut dump = dump_path.as_ref().map(|_| "# run\tprompt\tround\tposition\tslots\tstage\troutes\n".to_string());
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
@@ -302,7 +327,7 @@ fn main() -> Result<(), String> {
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
-                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]]".into());
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]] [--dump-routes FILE]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -350,10 +375,14 @@ fn main() -> Result<(), String> {
             let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
             prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
         }
-        let settings = Generate { count: generate_count, chunk, vocabulary, show: show_drafts, drafts: !draft_slots.is_empty(),
-                                  width: (forced_width < VERIFY_MS.len()).then_some(forced_width) };
-        for _ in 0..runs {
-            generate(&mut engines, &files, &mut drafter, &prompts, &settings)?;
+        let mut settings = Generate { count: generate_count, chunk, vocabulary, show: show_drafts, drafts: !draft_slots.is_empty(),
+                                      width: (forced_width < VERIFY_MS.len()).then_some(forced_width), run: 0 };
+        for run in 0..runs {
+            settings.run = run;
+            generate(&mut engines, &files, &mut drafter, &prompts, &settings, &mut dump)?;
+        }
+        if let (Some(path), Some(text)) = (&dump_path, &dump) {
+            std::fs::write(path, text).map_err(|exc| format!("{path}: {exc}"))?;
         }
         return Ok(());
     }
@@ -416,6 +445,9 @@ fn main() -> Result<(), String> {
                             let proposal = &draft.tokens;
                             *spent += drafting.elapsed().as_secs_f64();
                             let prefix = proposal.iter().zip(truth).take_while(|(a, b)| a == b).count();
+                            if let Some(text) = dump.as_mut() {
+                                dump_routes(text, run, index, step, position, slots, &drafter.routes(&mut engines[0].beside()?, slots)?);
+                            }
                             *rounds += 1;
                             *matched += prefix;
                             per_slot[..prefix].iter_mut().for_each(|reached| *reached += 1);
@@ -506,6 +538,9 @@ fn main() -> Result<(), String> {
             let line: Vec<String> = phases.iter().map(|(phase, spent)| format!("{phase} {:.2}", 1e3 * spent / decode_passes.max(1) as f64)).collect();
             println!("  phases, ms a pass: {}", line.join(", "));
         }
+    }
+    if let (Some(path), Some(text)) = (&dump_path, &dump) {
+        std::fs::write(path, text).map_err(|exc| format!("{path}: {exc}"))?;
     }
     if std::env::var_os("DS41_CHECK_SLOTS").is_some() {
         println!("slot checks: {} mismatches", engines.iter().map(Engine::slot_mismatches).sum::<u64>());
