@@ -306,6 +306,34 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_linear_gemm(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        first_row: u64,
+        input: *const f32,
+        input_stride: u64,
+        steps: u64,
+        output: *mut f32,
+        output_stride: u64,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+        half_precision: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_gemm_check_start(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_gemm_check_read(
+        handle: *mut ::std::os::raw::c_void,
+        counters: *mut u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_graph_begin(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

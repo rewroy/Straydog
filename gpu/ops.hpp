@@ -125,6 +125,40 @@ __global__ void op_half_rows(const float* input, size_t stride, size_t cols, siz
     if (index < steps * cols) out[index] = __float2half(input[(index / cols) * stride + index % cols]);
 }
 
+// Quality-only observers of the actual cast operands; never launched unless explicitly enabled.
+__global__ void op_half_input_checks(const float* input, size_t stride, size_t cols, size_t steps,
+                                     const __half* half, uint64_t* counters) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count = steps * cols;
+    __shared__ unsigned maximum[256];
+    unsigned bits = 0;
+    if (index < count) {
+        const float before = input[(index / cols) * stride + index % cols];
+        const float after = __half2float(half[index]);
+        if (!isfinite(before)) atomicAdd(reinterpret_cast<unsigned long long*>(counters), 1ull);
+        if (!isfinite(after)) atomicAdd(reinterpret_cast<unsigned long long*>(counters + 1), 1ull);
+        if (isfinite(before) && isinf(after)) atomicAdd(reinterpret_cast<unsigned long long*>(counters + 2), 1ull);
+        if (isfinite(before) && before != 0 && after == 0) atomicAdd(reinterpret_cast<unsigned long long*>(counters + 3), 1ull);
+        if (isfinite(before)) bits = __float_as_uint(fabsf(before));
+    }
+    maximum[threadIdx.x] = bits;
+    __syncthreads();
+    for (unsigned offset = 128; offset; offset /= 2) {
+        if (threadIdx.x < offset) maximum[threadIdx.x] = max(maximum[threadIdx.x], maximum[threadIdx.x + offset]);
+        __syncthreads();
+    }
+    if (!threadIdx.x) atomicMax(reinterpret_cast<unsigned long long*>(counters + 7),
+                               static_cast<unsigned long long>(maximum[0]));
+    if (!index) atomicAdd(reinterpret_cast<unsigned long long*>(counters + 5), static_cast<unsigned long long>(count));
+}
+
+__global__ void op_half_weight_checks(const __half* weights, size_t count, uint64_t* counters) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count && !isfinite(__half2float(weights[index])))
+        atomicAdd(reinterpret_cast<unsigned long long*>(counters + 4), 1ull);
+    if (!index) atomicAdd(reinterpret_cast<unsigned long long*>(counters + 6), static_cast<unsigned long long>(count));
+}
+
 // out[t][r] = W[first + r] . in[t] for `rows` rows, inputs and outputs `input_stride` and
 // `output_stride` values apart: GEMV for up to gemv_max_vectors inputs, else the rows expanded
 // to F32 in `scratch` (in pieces that fit) and an F32 GEMM -- or, on a device set to FP16 GEMMs
@@ -134,7 +168,7 @@ __global__ void op_half_rows(const float* input, size_t stride, size_t cols, siz
 constexpr unsigned op_lanes = 8;
 void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t cols, size_t first,
                const float* input, size_t input_stride, size_t steps, float* output, size_t output_stride,
-               float* scratch, size_t scratch_bytes) {
+               float* scratch, size_t scratch_bytes, int precision = -1) {
     const size_t row_bytes = matrix_row_bytes(kind, cols);
     const Matrix matrix{weights + first * row_bytes, row_bytes, rows, cols, 0, 0, 0, kind};
     if (steps <= size_t(gemv_max_vectors)) {
@@ -143,11 +177,16 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
         return;
     }
     if (!d.blas) throw std::runtime_error("Straydog op: GEMM needs a BLAS handle");
-    if (d.half_gemm) {
+    // -1 retains the device policy; explicit 0/1 selects one op without changing the device
+    // or its graph cache. Small-row GEMV above is identical for every policy.
+    if (precision < 0 ? d.half_gemm : precision != 0) {
         const size_t input_bytes = (steps * cols * 2 + 255) & ~size_t(255);
         if (scratch_bytes <= input_bytes) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
         auto* half_input = reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(scratch) + scratch_bytes - input_bytes);
         op_half_rows<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(input, input_stride, cols, steps, half_input);
+        if (d.gemm_checks)
+            op_half_input_checks<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(
+                input, input_stride, cols, steps, half_input, d.gemm_checks);
         const size_t piece = std::min(rows, (scratch_bytes - input_bytes) / (cols * 2));
         if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
         const float alpha = 1, beta = 0;
@@ -155,6 +194,9 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
             const size_t count = std::min(piece, rows - done);
             const Matrix part{matrix.data + done * row_bytes, row_bytes, count, cols, 0, 0, 0, kind};
             expand(part, scratch, d.stream, true);
+            if (d.gemm_checks)
+                op_half_weight_checks<<<unsigned((count * cols + 255) / 256), 256, 0, d.stream>>>(
+                    reinterpret_cast<const __half*>(scratch), count * cols, d.gemm_checks);
             blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha, scratch, HIP_R_16F,
                                      int(cols), half_input, HIP_R_16F, int(cols), &beta, output + done, HIP_R_32F, int(output_stride),
                                      HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));

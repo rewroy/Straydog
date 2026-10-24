@@ -393,6 +393,7 @@ struct Device {
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
+    uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
     unsigned compute_units = 0;   // the device's CUs (SMs on CUDA)
     // A grouped FP16 expert GEMM for prefill exists: RDNA4 WMMA (HIP) or tensor cores (CUDA sm_70+).
@@ -2319,6 +2320,27 @@ int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t col
 
 // ---- Ops over device buffers (ops.hpp) ----
 
+int sd_gemm_check_start(void* handle) {
+    try {
+        auto& value = device(handle);
+        if (value.gemm_checks || value.op_recording || !value.graphs.empty())
+            throw std::runtime_error("GEMM checks must start once before graphs");
+        value.gemm_checks = static_cast<uint64_t*>(allocate(value, 8 * sizeof(uint64_t)));
+        check(hipMemsetAsync(value.gemm_checks, 0, 8 * sizeof(uint64_t), value.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_gemm_check_read(void* handle, uint64_t* counters, uint64_t count) {
+    try {
+        auto& value = device(handle);
+        if (!value.gemm_checks || !counters || count != 8)
+            throw std::runtime_error("GEMM checks need an enabled device and eight output counters");
+        download(value, counters, value.gemm_checks, 8 * sizeof(uint64_t));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 void* sd_buffer(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);
@@ -2432,9 +2454,9 @@ int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, 
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
-int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
-                 const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
-                 float* scratch, uint64_t scratch_bytes) {
+static int op_linear_checked(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                             const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
+                             float* scratch, uint64_t scratch_bytes, int precision) {
     try {
         auto& value = device(handle);
         input_stride = input_stride ? input_stride : cols;
@@ -2447,10 +2469,28 @@ int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uin
         op_span(value, output, size_t((steps - 1) * output_stride + rows) * 4, "a linear output");
         if (steps > uint64_t(gemv_max_vectors)) op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
         op_linear(value, static_cast<const uint8_t*>(weights), kind, size_t(rows), size_t(cols), size_t(first_row), input,
-                  size_t(input_stride), size_t(steps), output, size_t(output_stride), scratch, size_t(scratch_bytes));
+                  size_t(input_stride), size_t(steps), output, size_t(output_stride), scratch, size_t(scratch_bytes), precision);
         check(hipGetLastError());
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                 const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
+                 float* scratch, uint64_t scratch_bytes) {
+    return op_linear_checked(handle, weights, kind, rows, cols, first_row, input, input_stride, steps, output, output_stride,
+                             scratch, scratch_bytes, -1);
+}
+
+int sd_op_linear_gemm(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                      const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
+                      float* scratch, uint64_t scratch_bytes, int half_precision) {
+    if (half_precision != 0 && half_precision != 1) {
+        last_error = "Straydog linear GEMM precision must be 0 (F32) or 1 (FP16)";
+        return -1;
+    }
+    return op_linear_checked(handle, weights, kind, rows, cols, first_row, input, input_stride, steps, output, output_stride,
+                             scratch, scratch_bytes, half_precision);
 }
 
 // ---- Graphs of ops (kept in Device::graphs under "op" and the caller's key) ----

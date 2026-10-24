@@ -83,6 +83,8 @@ pub struct Shape {
 /// written), its output (`width`, the device's columns).
 pub struct Scratch<'a> {
     pub gemm: &'a Buffer,
+    /// Only the expert's large-row linears; every non-GEMM op remains F32.
+    pub half_gemm: bool,
     pub input: &'a Buffer,
     pub gate: &'a Buffer,
     pub up: &'a Buffer,
@@ -97,10 +99,10 @@ pub fn gate_up(gpu: &mut Backend, slot: &Buffer, shape: &Shape, scratch: &Scratc
                count: usize, clamp: f32, act: M) -> Result<()> {
     let (width, ffn, (first, share)) = (shape.width as u64, shape.ffn as u64, shape.ffn_rows);
     gpu.gather(x, x_rows as u64, rows, count as u64, width, scratch.input.base())?;
-    gpu.linear(&slot.slice(0, shape.gate_bytes), shape.kinds[0], share as u64, width, 0, scratch.input.base(), 0, count as u64,
-               scratch.gate.at(first), ffn, scratch.gemm)?;
-    gpu.linear(&slot.slice(shape.gate_bytes, shape.gate_bytes), shape.kinds[1], share as u64, width, 0, scratch.input.base(), 0,
-               count as u64, scratch.up.at(first), ffn, scratch.gemm)?;
+    gpu.linear_gemm(&slot.slice(0, shape.gate_bytes), shape.kinds[0], share as u64, width, 0, scratch.input.base(), 0, count as u64,
+                    scratch.gate.at(first), ffn, scratch.gemm, scratch.half_gemm)?;
+    gpu.linear_gemm(&slot.slice(shape.gate_bytes, shape.gate_bytes), shape.kinds[1], share as u64, width, 0, scratch.input.base(), 0,
+                    count as u64, scratch.up.at(first), ffn, scratch.gemm, scratch.half_gemm)?;
     gpu.swiglu(scratch.gate.base(), scratch.up.base(), count as u64, ffn, clamp, Some(weights), act)
 }
 
@@ -111,8 +113,8 @@ pub fn gate_up(gpu: &mut Backend, slot: &Buffer, shape: &Shape, scratch: &Scratc
 pub fn down(gpu: &mut Backend, slot: &Buffer, shape: &Shape, scratch: &Scratch<'_>, act: P, count: usize, rows: P, out: M,
             out_rows: usize) -> Result<()> {
     let (width, (first, share)) = (shape.width as u64, shape.hidden_rows);
-    gpu.linear(&slot.slice(2 * shape.gate_bytes, shape.down_bytes), shape.kinds[2], share as u64, shape.ffn as u64, 0, act, 0,
-               count as u64, scratch.output.at(first), width, scratch.gemm)?;
+    gpu.linear_gemm(&slot.slice(2 * shape.gate_bytes, shape.down_bytes), shape.kinds[2], share as u64, shape.ffn as u64, 0, act, 0,
+                    count as u64, scratch.output.at(first), width, scratch.gemm, scratch.half_gemm)?;
     gpu.scatter_add(scratch.output.base(), rows, count as u64, width, out, out_rows as u64)
 }
 

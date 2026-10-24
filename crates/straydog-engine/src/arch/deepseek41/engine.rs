@@ -70,6 +70,8 @@ pub struct Settings {
     /// Bytes of host tier (page-locked memory) for experts VRAM evicts, per device.
     pub host_expert_bytes: u64,
     pub scratch_bytes: u64,
+    /// FP16 inputs/weights with F32 sums only for shared/routed FFN GEMMs (more than four rows).
+    pub half_ffn: bool,
     /// The layers this engine runs: the first embeds the tokens, the last has the head, and an
     /// engine between takes the stream the one before hands over (see [`forward_split`]).
     pub layers: std::ops::Range<usize>,
@@ -564,6 +566,9 @@ impl Shard {
         let range = settings.layers.clone();
         let started = std::time::Instant::now();
         let mut gpu = Backend::new(device, budget)?;
+        if std::env::var("DS41_FP16_CHECKS").is_ok_and(|value| value == "1") {
+            gpu.enable_gemm_checks()?;
+        }
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
@@ -2097,10 +2102,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let (f0, fs) = shard.rows.ffn;
             let role = |r: usize, end: u64| shared.buffer.slice(shared.offsets[r], end - shared.offsets[r]);
             let (gate, up) = (role(0, shared.offsets[1]), role(1, shared.offsets[2]));
-            shard.gpu.linear(&gate, shared.kinds[0], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.gate.at(f0), ff as u64,
-                             &scratch)?;
-            shard.gpu.linear(&up, shared.kinds[1], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.up.at(f0), ff as u64,
-                             &scratch)?;
+            shard.gpu.linear_gemm(&gate, shared.kinds[0], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.gate.at(f0), ff as u64,
+                             &scratch, self.settings.half_ffn)?;
+            shard.gpu.linear_gemm(&up, shared.kinds[1], fs as u64, w as u64, 0, work.x.base(), 0, rows as u64, work.up.at(f0), ff as u64,
+                             &scratch, self.settings.half_ffn)?;
             shard.gpu.swiglu(work.gate.base(), work.up.base(), rows as u64, ff as u64, clamp_shared, None, work.act.base())?;
         }
         self.sum_activations(rows)?;
@@ -2109,8 +2114,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let (h0, hs) = shard.rows.hidden;
             let down = shared.buffer.slice(shared.offsets[2], shared.buffer.bytes - shared.offsets[2]);
             let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
-            shard.gpu.linear(&down, shared.kinds[2], hs as u64, ff as u64, 0, input.base(), 0, rows as u64, target.at(h0), w as u64,
-                             &scratch)?;
+            shard.gpu.linear_gemm(&down, shared.kinds[2], hs as u64, ff as u64, 0, input.base(), 0, rows as u64, target.at(h0), w as u64,
+                             &scratch, self.settings.half_ffn)?;
         }
         self.mark("shared expert")?;
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
@@ -2141,7 +2146,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let routes = wave.iter().map(|span| span.routes).sum::<usize>();
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
-                let scratch = moe::Scratch { gemm: &shard.scratch, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
+                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm: self.settings.half_ffn, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 for (span, slot) in wave.iter().zip(slots) {
                     moe::gate_up(&mut shard.gpu, slot, &shape, &scratch, work.x.base(), rows, work.route_rows.at(span.first),
                                  work.route_weights.at(span.first), span.routes, clamp_routed, work.act.at((span.first - base) * ff))?;
@@ -2150,7 +2155,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.sum_activations(routes)?;
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
-                let scratch = moe::Scratch { gemm: &shard.scratch, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
+                let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm: self.settings.half_ffn, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
                 let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
                 for (span, slot) in wave.iter().zip(slots) {
                     moe::down(&mut shard.gpu, slot, &shape, &scratch, input.at((span.first - base) * ff), span.routes,

@@ -189,6 +189,18 @@ impl Backend {
         })
     }
 
+    /// One linear with an explicit GEMM policy: FP16 inputs/weights with F32 sums/output when
+    /// half is true, otherwise F32. Up to four inputs use unchanged GEMV. Device defaults stay fixed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_gemm(&mut self, weights: &Buffer, kind: u32, rows: u64, cols: u64, first: u64, input: P, input_stride: u64,
+                       steps: u64, output: M, output_stride: u64, scratch: &Buffer, half: bool) -> Result<()> {
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linear_gemm(self.handle(), weights.pointer, kind as i32, rows, cols, first, input.cast(), input_stride, steps,
+                                   output.cast(), output_stride, scratch.pointer.cast(), scratch.bytes, i32::from(half))
+        })
+    }
+
     /// Record the ops queued from here to [`Backend::graph_end`] into a graph instead of running
     /// them (only ops with no host data: see the C header).
     pub fn graph_begin(&mut self) -> Result<()> {

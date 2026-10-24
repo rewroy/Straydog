@@ -270,6 +270,21 @@ impl Backend {
         Ok((used, budget))
     }
 
+    /// Enable quality-only observers of FP16 casts once, before graphs are recorded.
+    pub fn enable_gemm_checks(&self) -> Result<()> {
+        // SAFETY: a live device; native allocation is tracked until this backend drops.
+        check(unsafe { ffi::sd_gemm_check_start(self.handle) }).map(drop)
+    }
+
+    /// Read cast diagnostics: nonfinite F32/half inputs, overflow, underflow, nonfinite half
+    /// weights, input/weight element counts, and maximum finite input magnitude as F32 bits.
+    pub fn gemm_checks(&self) -> Result<[u64; 8]> {
+        let mut counts = [0u64; 8];
+        // SAFETY: a live enabled device and exactly eight output counters.
+        check(unsafe { ffi::sd_gemm_check_read(self.handle, counts.as_mut_ptr(), counts.len() as u64) })?;
+        Ok(counts)
+    }
+
     pub fn configure_gemm(&self, minimum_batch: u64, half: bool) -> Result<()> {
         if !(2..=257).contains(&minimum_batch) {
             return Err("invalid Straydog GEMM configuration".into());

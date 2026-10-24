@@ -85,6 +85,15 @@ int sd_buffer_read_finish(void* handle, void* output, uint64_t bytes);
    on the source; the target's later work waits for it, and so does the source's. */
 int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, uint64_t bytes);
 int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row, const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
+/* The same shape and GEMV for up to four rows; larger products explicitly use F32(0) or
+   FP16 inputs/weights with F32 accumulation/output(1), without changing the device policy. */
+int sd_op_linear_gemm(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row, const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes, int half_precision);
+/* Optional quality-only observers; start once before any graphs. Read synchronizes the stream.
+   Eight counters: nonfinite F32 inputs, nonfinite half inputs, finite-input overflow, input
+   underflow-to-zero, nonfinite half weights, input count, weight count, max finite input abs bits.
+   Disabled devices launch no observer kernels. */
+int sd_gemm_check_start(void* handle);
+int sd_gemm_check_read(void* handle, uint64_t* counters, uint64_t count);
 /* Graphs of ops: between sd_graph_begin and sd_graph_end (keep: store it under key, replacing
    any; else drop it) the ops queued on the device's stream are recorded rather than run; only
    ops with no host data (no buffer writes, no expert routes) may be recorded. sd_graph_run

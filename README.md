@@ -6,7 +6,7 @@ executable per GPU backend.
 - **No hidden shortcuts in the numbers.** Weights run in the format their GGUF ships,
   decoded exactly; activations and the K/V cache are never quantized; every expert a
   token routes to is computed. The one rounding on by default, FP16 operands in prompt
-  batches' products, is named below and `--gemm f32` turns it off. Speculative decoding
+  batches' products, is named below and `--gemm fp32` turns it off. Speculative decoding
   never changes an answer. See [Numerics](#numerics).
 - **Isolated.** The engine runs in a worker without network access (bubblewrap on
   Linux, its own AppContainer on Windows). Every model and drafter file is pinned by
@@ -112,8 +112,9 @@ Where it rounds, and how to turn it off:
 
 | Where | Default | Exact |
 | --- | --- | --- |
-| Products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm f32` |
-| Long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm f32` |
+| Qwen products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm fp32` |
+| Long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
+| DeepSeek shared/routed FFN products (more than 4 rows) | FP16 operands, F32 sums and output | `--gemm fp32` |
 | Decode and speculative verification | F32 | |
 | MTP drafter | its experts quantized to Q2_0 when it is built: this changes only how many drafts are accepted, never the output | run without `-md` |
 | Experts beyond VRAM (partial residency) | the CPU computes them in F32 and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
@@ -123,14 +124,18 @@ vector and final hidden state bit for bit in each placement; a deliberate numeri
 is first compared with an F32-GEMM run, by KL divergence and top-1 agreement, then pinned
 anew, and F32 products take the same kernels in every process (rocBLAS's own library: on
 RDNA4, hipBLASLt's choice of F32 kernels changed from one process to another).
-With the FP16 long-prompt attention, KL against `--gemm f32` averaged 3.4e-3 over 12
+With the FP16 long-prompt attention, KL against `--gemm fp32` averaged 3.4e-3 over 12
 prompts of 8K-40K (3.9e-3 before it; top-1 12/12), while reordering one sum alone moves it
-by 3.0e-3. DeepSeek-V4.1
-computes in F32 throughout and keeps its K/V in F32 (the model was trained for FP4/FP8
-caches); against llama.cpp, which rounds activations to 8 bits, its next-token
-distributions differ by KL 2-6e-3 on average with 97-100% top-1 agreement, and a CPU F32
-reference agrees with it where the two disagree (`examples/ds41_quality`,
-`examples/ds41_reference`).
+by 3.0e-3. DeepSeek-V4.1 rounds only the inputs and weights of shared/routed FFN
+products with more than four rows to FP16; their sums and output remain F32. Norms,
+router/index projections, attention, HC, residuals and K/V remain F32. `--gemm fp32`
+also keeps those FFN products in F32. With the IQ2_XS model, the FP16 FFN path agrees
+with F32 on 772/774 next-token choices in six short probes for each of TP1 and TP2;
+a native 4083-token prompt plus 16 teacher-forced steps agrees on all 17 choices, with
+mean KL 5.3e-4 (TP1) and 3.2e-4 (TP2). Same-mode decode and speculative verification
+remain bitwise identical. `examples/ds41_quality --gemm fp32|fp16` and
+`examples/ds41_reference` provide the numerical checks; the quality example defaults
+to F32.
 
 ## Dashboard
 

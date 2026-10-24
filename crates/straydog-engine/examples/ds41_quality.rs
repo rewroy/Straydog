@@ -7,7 +7,7 @@
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
-//!     [--steps N] [--show KL] [--context N] [--verify N[,N...]] [--accept-all]
+//!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -48,6 +48,7 @@ struct Step {
 }
 
 fn compare(ours: &[f32], reference: &[f32], next: Option<usize>) -> Step {
+    assert!(ours.iter().chain(reference).all(|v| v.is_finite()), "nonfinite quality logits");
     let (p, q) = (log_softmax(reference), log_softmax(ours));
     let kl = p.iter().zip(&q).map(|(&lp, &lq)| lp.exp() * (lp - lq)).sum::<f64>().max(0.0);
     let nll = next.map_or((0.0, 0.0), |token| (-q[token], -p[token]));
@@ -91,6 +92,15 @@ fn main() -> Result<(), String> {
     // rows the attention runs at a time within a pass of up to --chunk tokens
     let batch = option("--batch", 256);
     let context = option("--context", 8192);
+    let half_ffn = match args.iter().position(|arg| arg == "--gemm") {
+        Some(at) => {
+            let mode = args.get(at + 1).ok_or("--gemm needs fp32 or fp16")?.clone();
+            args.drain(at..at + 2);
+            match mode.as_str() { "fp32" => false, "fp16" => true, _ => return Err("--gemm needs fp32 or fp16".into()) }
+        }
+        None => false,
+    };
+    eprintln!("DS FFN GEMM: {}; other ops F32, span<=4 unchanged GEMV", if half_ffn { "FP16 inputs, F32 sums/output" } else { "FP32" });
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
@@ -126,7 +136,7 @@ fn main() -> Result<(), String> {
     let mut engines = Vec::new();
     for (index, part) in parts.into_iter().enumerate() {
         let settings = Settings { context, rows: chunk.max(batch), batch, expert_slots: slots, host_expert_bytes: ((host_gb as u64) << 30) / devices,
-                                  scratch_bytes: 512 << 20, layers: part };
+                                  scratch_bytes: 512 << 20, half_ffn, layers: part };
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
@@ -229,6 +239,15 @@ fn main() -> Result<(), String> {
     }
     if std::env::var_os("DS41_CHECK_SLOTS").is_some() {
         println!("slot checks: {} mismatches", engines.iter().map(Engine::slot_mismatches).sum::<u64>());
+    }
+    if std::env::var("DS41_FP16_CHECKS").is_ok_and(|value| value == "1") {
+        for (index, gpu) in engines.iter().flat_map(|engine| engine.gpus()).enumerate() {
+            let counts = gpu.gemm_checks()?;
+            println!("FP16 cast checks GPU{index}: {counts:?}, max_abs={}", f32::from_bits(counts[7] as u32));
+            if counts[0] != 0 || counts[1] != 0 || counts[2] != 0 || counts[4] != 0 {
+                return Err(format!("nonfinite/overflow FP16 operand on GPU{index}: {counts:?}"));
+            }
+        }
     }
     let counts = engines.iter().map(|engine| engine.cache_counts()).fold(straydog_engine::experts::Counts::default(), |a, b| a + b);
     println!("experts: {} VRAM hits, {} host-tier fills, {} drive reads, {} write-backs", counts.hits, counts.host_hits,
