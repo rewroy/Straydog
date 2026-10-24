@@ -928,6 +928,12 @@ impl Driver {
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
+                    // (the failing client gets the event; the server log keeps why, escaped and cut short,
+                    // and nothing of it reaches the failure other clients are told)
+                    if kind == "error" {
+                        let message: String = event["message"].as_str().unwrap_or("no message").chars().take(500).collect();
+                        tracing::warn!("Straydog request failed: {message:?}");
+                    }
                     if forwarding {
                         // Wait for room in the client's channel while still taking control
                         // messages: a client that reads slowly must not hold up an interrupt, a
