@@ -51,12 +51,17 @@ const PARK_MINIMUM: usize = 1024;
 const ROOT_MINIMUM: usize = 2048;
 const VOCABULARY: usize = 248320;
 
-/// Host bytes of one sequence's state before the GPU takes its attention and recurrence:
-/// QSA K/V and pooled indexer keys, DeltaNet state and convolution, PLE history and the
-/// partial indexer pooling buffers.
-pub fn context_state_bytes(context: u64) -> u64 {
-    let state = 12 * (context * 2 * 2 * 256 + (context / 4 + 1) * 128) * 4;
-    state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4 + 12 * 4 * 128 * 4
+/// Host bytes of one sequence's state before the GPU takes its attention and recurrence: each
+/// attention layer's (the MTP layer's too, `drafting`) QSA K/V, pooled indexer keys and the
+/// indexer's rolling history (eight inputs), DeltaNet state and convolution, PLE history.
+pub fn context_state_bytes(context: u64, drafting: bool) -> u64 {
+    let state = attention_layers(drafting) * (context * 2 * 2 * 256 + (context / 4 + 1) * 128 + 8 * 128) * 4;
+    state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4
+}
+
+/// The layers with QSA attention: twelve, and the MTP layer when drafting.
+fn attention_layers(drafting: bool) -> u64 {
+    12 + u64::from(drafting)
 }
 
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
@@ -271,9 +276,9 @@ impl Model {
             return Err("Straydog prefill exceeds this GPU workspace capacity".into());
         }
         let context64 = context as u64;
-        let mut state_bytes = context_state_bytes(context64);
+        let mut state_bytes = context_state_bytes(context64, drafting);
         let attention_capable = group.batch_capacity() == 256;
-        let kv_bytes = 12 * context64 * 1024 * 4;
+        let kv_bytes = attention_layers(drafting) * context64 * 1024 * 4;
         let fits = attention_capable && kv_bytes <= group.memory()?.1 / 4;
         let host_capable = attention_capable && group.host_state_supported()?;
         let recurrent_bytes = 36 * 48 * 128 * 128 * 4;

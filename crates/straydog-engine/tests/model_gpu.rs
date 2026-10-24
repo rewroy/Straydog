@@ -43,7 +43,8 @@ fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &
     }
     let settings = Settings {
         context: placement["context"].as_u64().unwrap() as usize,
-        state_budget_bytes: 13 << 30,
+        // (--state-ram's default at 262144 tokens with the drafter)
+        state_budget_bytes: 14 << 30,
         prefill_batch_size: 4096,
         speculative,
         cpu_threads: 0,

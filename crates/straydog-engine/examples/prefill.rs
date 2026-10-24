@@ -58,7 +58,7 @@ fn main() -> Result<(), String> {
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
-    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 13 << 30, prefill_batch_size: batch.unwrap_or(4096),
+    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(4096),
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;

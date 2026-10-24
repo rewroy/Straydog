@@ -409,7 +409,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
     // GPU budget), rounded up to half a GiB.
-    let needed = (context_state_bytes(u64::from(ctx_size)) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
+    let needed = (context_state_bytes(u64::from(ctx_size), draft_max > 0) as f64 / (1u64 << 30) as f64 * 2.0).ceil() / 2.0;
     let state_ram = options.state_ram.unwrap_or(needed.max(1.0));
     if !(0.01..=256.0).contains(&state_ram) {
         return Err("--state-ram must be between 0.01 and 256 GiB".into());

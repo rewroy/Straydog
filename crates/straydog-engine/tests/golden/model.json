@@ -18,7 +18,7 @@
    "host_kv": false,
    "prefill_batch_size": 4096,
    "speculative": 3,
-   "state_bytes": 56670208,
+   "state_bytes": 60893696,
    "requests": [
     {
      "name": "root",
@@ -30504,7 +30504,7 @@
    "host_kv": false,
    "prefill_batch_size": 4096,
    "speculative": 3,
-   "state_bytes": 56670208,
+   "state_bytes": 60893696,
    "requests": [
     {
      "name": "root",
@@ -60998,7 +60998,7 @@
    "host_kv": true,
    "prefill_batch_size": 2048,
    "speculative": 3,
-   "state_bytes": 13293893632,
+   "state_bytes": 14401219072,
    "requests": [
     {
      "name": "root",
@@ -91492,7 +91492,7 @@
    "host_kv": false,
    "prefill_batch_size": 4096,
    "speculative": 0,
-   "state_bytes": 56670208,
+   "state_bytes": 56694784,
    "requests": [
     {
      "name": "root",
@@ -122083,7 +122083,7 @@
    "host_kv": false,
    "prefill_batch_size": 4096,
    "speculative": 0,
-   "state_bytes": 56670208,
+   "state_bytes": 56694784,
    "requests": [
     {
      "name": "root",
