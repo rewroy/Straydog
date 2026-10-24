@@ -8,7 +8,7 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
-//!     [--generate N]
+//!     [--generate N [--runs R]]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -28,7 +28,8 @@
 //! times it: per prompt the tokens' hash and milliseconds a token. With --dspark each round drafts
 //! ahead and verifies as many of the draft's tokens as the width policy picks
 //! (drafter::Policy, by DSpark's confidences and [`VERIFY_MS`]), keeps the matching ones and the
-//! target's next, and takes the rest back: the tokens must be those without the drafter.
+//! target's next, and takes the rest back: the tokens must be those without the drafter. --runs R
+//! goes over the prompts R times (the first warms the expert stores).
 
 #[path = "common/files.rs"]
 mod files;
@@ -226,7 +227,7 @@ fn main() -> Result<(), String> {
         None => false,
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
-    let generate_count = option("--generate", 0);
+    let (generate_count, runs) = (option("--generate", 0), option("--runs", 1));
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
@@ -253,7 +254,7 @@ fn main() -> Result<(), String> {
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
-                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N]".into());
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R]]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -301,7 +302,10 @@ fn main() -> Result<(), String> {
             let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
             prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
         }
-        return generate(&mut engines, &files, &mut drafter, &prompts, generate_count, chunk, vocabulary, show_drafts);
+        for _ in 0..runs {
+            generate(&mut engines, &files, &mut drafter, &prompts, generate_count, chunk, vocabulary, show_drafts)?;
+        }
+        return Ok(());
     }
     for (run, &verify) in widths.iter().enumerate() {
         let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
