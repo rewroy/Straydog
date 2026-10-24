@@ -170,17 +170,17 @@ impl Backend {
         Ok(Buffer { pointer, bytes: data.len() as u64 })
     }
 
-    /// DSpark noncausal attention: all queries `[slots,64,512]` see the same history
-    /// `[anchor-history,anchor)` from the `[128,512]` ring and every block KV row `[slots,512]`.
-    /// Queries and keys already have RoPE applied. Sinks `[64]` enter only the denominator.
-    /// Slots 1..5, history <=128 and <=anchor. Scratch: `4*slots*(slots+1)` bytes.
+    /// DSpark noncausal attention: all queries `[slots,heads,512]` (a device's heads, at most 64)
+    /// see the same history `[anchor-history,anchor)` from the `[128,512]` ring and every block KV
+    /// row `[slots,512]`. Queries and keys already have RoPE applied. Sinks `[heads]` enter only the
+    /// denominator. Slots 1..5, history <=128 and <=anchor. Scratch: `4*slots*(slots+1)` bytes.
     /// All ranges are disjoint; the first invocation can be captured in a graph.
     #[allow(clippy::too_many_arguments)]
-    pub fn dspark_attention(&mut self, q: P, ring: &Buffer, block: P, sinks: &Buffer, slots: u64,
+    pub fn dspark_attention(&mut self, q: P, ring: &Buffer, block: P, sinks: &Buffer, heads: u64, slots: u64,
                             anchor: u32, history: u64, out: M, scratch: &Buffer) -> Result<()> {
         // SAFETY: live handle; native code checks shapes and every device allocation range.
         check(unsafe { ffi::sd_op_dspark_attention(self.handle(), q.cast(), ring.pointer.cast(), block.cast(),
-            sinks.pointer.cast(), slots, anchor, history, out.cast(), scratch.pointer.cast(), scratch.bytes) })
+            sinks.pointer.cast(), heads, slots, anchor, history, out.cast(), scratch.pointer.cast(), scratch.bytes) })
     }
 
     pub fn release_buffer(&mut self, buffer: Buffer) -> Result<()> {
