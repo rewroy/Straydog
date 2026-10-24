@@ -1011,6 +1011,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.first().map_or((0, 0), |shard| shard.experts.capacity())
     }
 
+    /// All shards' scheduled/minimum staging/currently pinned host expert bytes.
+    pub fn expert_host_memory(&self) -> (u64, u64, u64) {
+        self.shards.iter().map(|shard| shard.experts.host_memory())
+            .fold((0, 0, 0), |sum, value| (sum.0 + value.0, sum.1 + value.1, sum.2 + value.2))
+    }
+
     /// The experts the devices hold, least recently used first: in VRAM, and only in the host
     /// tier (the first device's; each holds its rows of the same experts).
     pub fn expert_contents(&self) -> crate::experts::Contents {

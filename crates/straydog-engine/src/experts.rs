@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -385,6 +385,8 @@ struct Pinner {
     arenas: Receiver<std::result::Result<storage::Buffer, String>>,
     thread: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    planned_bytes: u64,
+    pinned_bytes: Arc<AtomicU64>,
 }
 
 impl Pinner {
@@ -392,6 +394,8 @@ impl Pinner {
         let (tx, arenas) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let pinned_bytes = Arc::new(AtomicU64::new(0));
+        let pinned = pinned_bytes.clone();
         let thread = std::thread::spawn(move || {
             for _ in 0..count {
                 if stopped.load(Ordering::Relaxed) {
@@ -403,20 +407,66 @@ impl Pinner {
                     let _ = tx.send(Err(error));
                     return;
                 }
+                pinned.fetch_add(arena.capacity() as u64, Ordering::Relaxed);
                 if let Err(unsent) = tx.send(Ok(arena)) {
                     if let Ok(mut arena) = unsent.0 {
                         // SAFETY: pinned above, never used by a device.
                         let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
+                        pinned.fetch_sub(arena.capacity() as u64, Ordering::Relaxed);
                     }
                     return;
                 }
             }
         });
-        Pinner { arenas, thread: Some(thread), stop }
+        Pinner { arenas, thread: Some(thread), stop, planned_bytes: count as u64 * bytes as u64, pinned_bytes }
     }
 }
 
 type Key = (u32, u32);
+
+/// Whole equal-sized arenas only: no final arena rounded beyond the class budget.
+/// A zero tier keeps only its bounded staging reserve, charged outside the tier.
+fn host_plan(budget: u64, host_bytes: u64, reserve: usize) -> (usize, usize, usize) {
+    let slots = if budget == 0 { reserve } else { (budget / host_bytes) as usize };
+    let per_arena = ((ARENA as u64 / host_bytes) as usize).clamp(1, slots.max(1));
+    let arenas = slots / per_arena;
+    (if budget == 0 { 0 } else { arenas * per_arena }, per_arena, arenas)
+}
+
+#[cfg(test)]
+mod host_budget_tests {
+    use super::{host_plan, ARENA};
+
+    #[test]
+    fn whole_arenas_never_exceed_the_class_budget() {
+        for bytes in [4096, 7 << 20, 10 << 20, 17 << 20] {
+            for budget in [bytes, bytes * 3, ARENA as u64, ARENA as u64 + bytes * 3, 91 << 30] {
+                let (capacity, per_arena, arenas) = host_plan(budget, bytes, 8);
+                assert!(capacity > 0);
+                assert_eq!(capacity, per_arena * arenas);
+                assert!(capacity as u64 * bytes <= budget);
+            }
+        }
+    }
+
+    #[test]
+    fn final_partial_arena_is_not_rounded_up() {
+        let bytes = 10 << 20;
+        let budget = ARENA as u64 + 3 * bytes;
+        let (capacity, per_arena, arenas) = host_plan(budget, bytes, 8);
+        assert_eq!(arenas, 1);
+        assert_eq!(capacity, per_arena);
+        assert!((arenas + 1) as u64 * per_arena as u64 * bytes > budget);
+    }
+
+    #[test]
+    fn zero_tier_has_only_the_bounded_staging_reserve() {
+        let bytes = 10 << 20;
+        let (capacity, per_arena, arenas) = host_plan(0, bytes, 8);
+        assert_eq!(capacity, 0);
+        assert_eq!(per_arena * arenas, 8);
+    }
+}
 
 /// The most VRAM slots a size class keeps free (its reserve).
 const MAX_RESERVE: usize = 32;
@@ -676,6 +726,12 @@ impl DeviceExperts {
         let mut distinct: Vec<(u64, u64)> = sizes.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
+        // Every class needs at least one staging slot. Charge those to a nonzero
+        // budget first, then divide the remainder; tiny classes cannot overspend it.
+        let staging: u64 = distinct.iter().map(|&(_, host)| host).sum();
+        if host_budget > 0 && host_budget < staging {
+            return Err(format!("expert host budget {host_budget} bytes is below the {staging} bytes needed for staging"));
+        }
         let class_of: Vec<Option<usize>> = sizes.iter()
             .map(|size| size.map(|size| distinct.iter().position(|&other| other == size).unwrap())).collect();
         let layers = class_of.iter().flatten().count() as u64;
@@ -684,11 +740,12 @@ impl DeviceExperts {
         for (index, &(vram_bytes, host_bytes)) in distinct.iter().enumerate() {
             let share = class_of.iter().filter(|class| **class == Some(index)).count() as u64;
             let count = count(share, layers, vram_bytes);
-            let host_capacity = ((host_budget * share / layers) / host_bytes) as usize;
             let reserve = (count / 64).clamp(4, MAX_RESERVE);
-            // Small tiers (and staging alone) take one arena of just their size.
-            let per_arena = ((ARENA as u64 / host_bytes) as usize).clamp(1, host_capacity.max(reserve));
-            let pinner = Pinner::new(host_capacity.max(reserve).div_ceil(per_arena), per_arena * host_bytes as usize);
+            let class_budget = if host_budget == 0 { 0 } else {
+                host_bytes + ((host_budget - staging) as u128 * share as u128 / layers as u128) as u64
+            };
+            let (host_capacity, per_arena, arenas) = host_plan(class_budget, host_bytes, reserve);
+            let pinner = Pinner::new(arenas, per_arena * host_bytes as usize);
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
                 key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, class: index,
@@ -792,6 +849,15 @@ impl DeviceExperts {
     /// VRAM and host slots.
     pub fn capacity(&self) -> (usize, usize) {
         (self.slots.len(), self.classes.iter().map(|class| class.host_capacity).sum())
+    }
+
+    /// Scheduled pin limit, its minimum staging footprint, and successfully pinned
+    /// bytes at this instant (including arenas still waiting in the pinner's queue).
+    pub fn host_memory(&self) -> (u64, u64, u64) {
+        self.classes.iter().filter_map(|class| class.pinner.as_ref().map(|pinner| {
+            (pinner.planned_bytes, if class.host_capacity == 0 { pinner.planned_bytes } else { class.host_bytes },
+             pinner.pinned_bytes.load(Ordering::Relaxed))
+        })).fold((0, 0, 0), |sum, value| (sum.0 + value.0, sum.1 + value.1, sum.2 + value.2))
     }
 
     /// Make these experts of `layer` resident here; the compute stream waits for their copies.
@@ -1643,59 +1709,67 @@ impl DeviceExperts {
 
     /// A host slot of `class` to fill: an emptied one whose upload finished, a new one while the
     /// budget allows, else the least recently used expert's (after any copy still using it).
-    /// With no host tier, staging slots grow as reads need.
+    /// Once the bounded arenas are all taken, wait for a slot instead of pinning more.
     fn free_host(&mut self, gpu: &mut Backend, class: usize) -> Result<usize> {
-        // Emptied slots' uploads finish in order: the oldest is the one to check.
-        if let Some(&host) = self.classes[class].host_free.front() {
-            let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
-            let mut reusable = true;
-            for mark in copies.into_iter().flatten() {
-                reusable &= gpu.mark_done(mark, false)?;
+        loop {
+            // Emptied slots' uploads finish in order: the oldest is the one to check.
+            if let Some(&host) = self.classes[class].host_free.front() {
+                let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
+                let mut reusable = true;
+                for mark in copies.into_iter().flatten() {
+                    reusable &= gpu.mark_done(mark, false)?;
+                }
+                if reusable {
+                    self.classes[class].host_free.pop_front();
+                    self.host[host].busy = None;
+                    return Ok(host);
+                }
             }
-            if reusable {
-                self.classes[class].host_free.pop_front();
-                self.host[host].busy = None;
-                return Ok(host);
+            // A new slot while pinned room lasts (or a pinned arena is ready).
+            let room = self.classes[class].hosts < self.classes[class].arenas.len() * self.classes[class].per_arena;
+            if room || self.take_arena(class, false)? {
+                return Ok(self.new_host_slot(class));
             }
-        }
-        // A new slot while pinned room lasts (or a pinned arena is ready).
-        let room = self.classes[class].hosts < self.classes[class].arenas.len() * self.classes[class].per_arena;
-        if room || self.take_arena(class, false)? {
-            return Ok(self.new_host_slot(class));
-        }
-        // The least recently used expert's slot (its copies long done), before an emptied slot
-        // whose upload is still running.
-        let candidate = self.classes[class].host_lru.iter().map(|&(_, host)| host).next()
-            .or_else(|| self.classes[class].host_free.front().copied());
-        let Some(host) = candidate else {
-            // Every slot is being read into: wait for the next arena, or (all handed over) pin
-            // one more for staging.
-            self.take_arena(class, true)?;
-            return Ok(self.new_host_slot(class));
-        };
-        let started = std::time::Instant::now();
-        if let Some(mark) = self.host[host].busy.take() {
-            gpu.mark_done(mark, true)?;
-        }
-        if let Content::Packed(mark) = self.host[host].content {
-            gpu.mark_done(mark, true)?;
-        }
-        self.counts.slot_wait_seconds += started.elapsed().as_secs_f64();
-        let entry = &mut self.host[host];
-        match entry.key.take() {
-            Some(key) => {
-                self.host_map.remove(&key);
-                self.classes[class].host_lru.remove(&(entry.used, host));
+            // The least recently used expert's slot (its copies long done), before an emptied slot
+            // whose upload is still running.
+            let candidate = self.classes[class].host_lru.iter().map(|&(_, host)| host).next()
+                .or_else(|| self.classes[class].host_free.front().copied());
+            let Some(host) = candidate else {
+                if self.take_arena(class, true)? {
+                    return Ok(self.new_host_slot(class));
+                }
+                // Deferred downs may be the only owner of a staging slot. Flush them
+                // before waiting, so a one-slot budget can make forward progress too.
+                if !self.tails.is_empty() {
+                    self.upload_tails(gpu)?;
+                } else {
+                    self.pump(gpu, true)?;
+                }
+                continue;
+            };
+            let started = std::time::Instant::now();
+            if let Some(mark) = self.host[host].busy.take() {
+                gpu.mark_done(mark, true)?;
             }
-            None => {
-                self.classes[class].host_free.pop_front();
+            if let Content::Packed(mark) = self.host[host].content {
+                gpu.mark_done(mark, true)?;
             }
+            self.counts.slot_wait_seconds += started.elapsed().as_secs_f64();
+            let entry = &mut self.host[host];
+            match entry.key.take() {
+                Some(key) => {
+                    self.host_map.remove(&key);
+                    self.classes[class].host_lru.remove(&(entry.used, host));
+                }
+                None => {
+                    self.classes[class].host_free.pop_front();
+                }
+            }
+            return Ok(host);
         }
-        Ok(host)
     }
 
-    /// Take `class`'s next pinned arena: if ready (or, with `wait`, once it is; when its pinner
-    /// has handed all over, a new one pinned here). Whether one was taken.
+    /// Take the next budgeted arena, waiting if asked. Exhaustion never allocates more.
     fn take_arena(&mut self, class: usize, wait: bool) -> Result<bool> {
         let started = std::time::Instant::now();
         let entry = &mut self.classes[class];
@@ -1710,12 +1784,6 @@ impl DeviceExperts {
         };
         let arena = match arena {
             Some(arena) => arena?,
-            None if wait => {
-                let mut arena = storage::Buffer::new(entry.per_arena * entry.host_bytes as usize);
-                // SAFETY: the arena lives in its class until drop, which unpins it first.
-                unsafe { transfer::pin_host(arena.as_mut_slice().as_mut_ptr(), arena.capacity())? };
-                arena
-            }
             None => return Ok(false),
         };
         entry.arenas.push(arena);

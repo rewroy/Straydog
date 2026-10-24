@@ -307,13 +307,16 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let mut engines = Vec::new();
         let result = (|| {
             for ((devices, range), (&slots, &experts)) in groups.iter().zip(slots.iter().zip(&group_experts)) {
-                let share = host as f64 * experts as f64 / total_experts.max(1) as f64;
+                let share = (host as u128 * experts as u128 / total_experts.max(1) as u128 / devices.len() as u128) as u64;
+                if host > 0 && share == 0 {
+                    return Err("expert host budget is too small for every layer group".to_string());
+                }
                 let engine_settings = EngineSettings {
                     context: settings.context,
                     rows: settings.batch,
                     batch: settings.batch.min(ATTENTION_ROWS),
                     expert_slots: slots / devices.len(),
-                    host_expert_bytes: (share / devices.len() as f64) as u64,
+                    host_expert_bytes: share,
                     scratch_bytes: SCRATCH,
                     layers: range.clone(),
                 };
@@ -325,6 +328,14 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         result.map(|()| engines)
     })?;
     let place_seconds = placed.elapsed().as_secs_f64();
+    let (planned, staging, pinned) = engines.iter().map(Engine::expert_host_memory)
+        .fold((0, 0, 0), |sum, value| (sum.0 + value.0, sum.1 + value.1, sum.2 + value.2));
+    if host > 0 && planned > host {
+        return Err(format!("expert host pin plan {planned} exceeds budget {host}"));
+    }
+    let gib = (1u64 << 30) as f64;
+    eprintln!("host tier: budget {:.3} GiB; planned limit {:.3} GiB (minimum staging {:.3} GiB included); pinned at placement {:.3} GiB",
+              host as f64 / gib, planned as f64 / gib, staging as f64 / gib, pinned as f64 / gib);
     // (place's steps, each engine's: the wait before a server starts)
     let startup: Vec<(String, f64)> = engines.iter().flat_map(|engine| engine.startup.iter().cloned()).collect();
     let card = served::card(&files.header)?;
