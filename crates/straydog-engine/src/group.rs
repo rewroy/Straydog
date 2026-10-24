@@ -620,7 +620,15 @@ impl Group {
 
     /// Free what [`save_positions`](Self::save_positions) kept in VRAM, once nothing restores it.
     pub fn release_positions(&mut self, positions: Positions) -> Result<()> {
-        self.backends.iter_mut().zip(positions.parts).try_for_each(|(backend, parts)| backend.release_positions(parts))
+        // Every device's, a failed one too (the first error returned).
+        let mut result = Ok(());
+        for (backend, parts) in self.backends.iter_mut().zip(positions.parts) {
+            let released = backend.release_positions(parts);
+            if result.is_ok() {
+                result = released;
+            }
+        }
+        result
     }
 
     /// Allocated bytes and budgets summed over the devices.

@@ -1151,7 +1151,15 @@ impl Backend {
     /// Free the VRAM of parts [`save_positions`](Self::save_positions) copied out (host parts
     /// free themselves).
     pub fn release_positions(&mut self, parts: Vec<StatePart>) -> Result<()> {
-        parts.into_iter().filter_map(|part| part.device).try_for_each(|buffer| self.release_buffer(buffer))
+        // Every part, a failed one too (the first error returned).
+        let mut result = Ok(());
+        for buffer in parts.into_iter().filter_map(|part| part.device) {
+            let released = self.release_buffer(buffer);
+            if result.is_ok() {
+                result = released;
+            }
+        }
+        result
     }
 
     fn state_copy(&mut self, part: &mut StatePart, save: bool) -> Result<()> {
