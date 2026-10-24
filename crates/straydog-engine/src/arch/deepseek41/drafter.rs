@@ -524,3 +524,83 @@ impl Drafter {
         Ok(Draft { tokens: tokens[..kept].iter().map(|&token| token as u32).collect(), confidences: confidences[..kept].to_vec() })
     }
 }
+
+/// How many of a draft's tokens a round verifies: the most expected tokens per millisecond, by
+/// DSpark's confidences calibrated against teacher-forced match rates ([`CALIBRATION`]), a target
+/// pass's cost by its rows and the draft's. After [`PAUSE_AFTER`] rounds in a row that verify
+/// none it stops drafting for [`PAUSE_ROUNDS`] rounds (the draft's cost is paid either way).
+pub struct Policy {
+    /// A target pass's milliseconds by its rows (1, 2, ...).
+    verify_ms: Vec<f64>,
+    /// A draft's milliseconds (a running mean of [`Policy::drafted`]'s).
+    draft_ms: f64,
+    zeros: usize,
+    paused: usize,
+}
+
+/// Rounds in a row that verify no draft before a pause, and the rounds a pause skips.
+pub const PAUSE_AFTER: usize = 4;
+pub const PAUSE_ROUNDS: usize = 16;
+
+/// Per slot, the rate at which a draft's token matches the target's greedy one, given that every
+/// token before it did, at DSpark's confidence 0, 0.1, ... 1 (linear between): from teacher-forced
+/// runs (ds41_quality --dspark --show-drafts on the probe prompts).
+const CALIBRATION: [[f64; 11]; MAX_SLOTS] = [[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]; MAX_SLOTS];
+
+fn calibrated(slot: usize, confidence: f32) -> f64 {
+    let at = (confidence.clamp(0.0, 1.0) as f64) * 10.0;
+    let (low, high) = (at.floor() as usize, at.ceil() as usize);
+    let table = &CALIBRATION[slot.min(MAX_SLOTS - 1)];
+    table[low] + (table[high] - table[low]) * (at - low as f64)
+}
+
+impl Policy {
+    /// With a target pass's milliseconds by its rows and a first guess at a draft's.
+    pub fn new(verify_ms: &[f64], draft_ms: f64) -> Policy {
+        Policy { verify_ms: verify_ms.to_vec(), draft_ms, zeros: 0, paused: 0 }
+    }
+
+    /// Whether this round drafts (not during a pause).
+    pub fn drafting(&mut self) -> bool {
+        if self.paused > 0 {
+            self.paused -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// A draft took `ms`.
+    pub fn drafted(&mut self, ms: f64) {
+        self.draft_ms = 0.8 * self.draft_ms + 0.2 * ms;
+    }
+
+    /// A new context: no pause.
+    pub fn reset(&mut self) {
+        (self.zeros, self.paused) = (0, 0);
+    }
+
+    /// The draft's tokens to verify (0 to `most`, at most a pass's rows less one): the width with
+    /// the most expected tokens (the matched prefix and the target's next) per millisecond.
+    pub fn width(&mut self, confidences: &[f32], most: usize) -> usize {
+        let (mut reach, mut expected) = (1.0, 1.0);
+        let mut best = (0, expected / (self.verify_ms[0] + self.draft_ms));
+        let most = most.min(self.verify_ms.len() - 1);
+        for (slot, &confidence) in confidences.iter().enumerate().take(most) {
+            reach *= calibrated(slot, confidence);
+            expected += reach;
+            let rate = expected / (self.verify_ms[slot + 1] + self.draft_ms);
+            if rate > best.1 {
+                best = (slot + 1, rate);
+            }
+        }
+        if best.0 == 0 {
+            self.zeros += 1;
+            if self.zeros >= PAUSE_AFTER {
+                (self.zeros, self.paused) = (0, PAUSE_ROUNDS);
+            }
+        } else {
+            self.zeros = 0;
+        }
+        best.0
+    }
+}

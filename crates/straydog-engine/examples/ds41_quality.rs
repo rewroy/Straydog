@@ -8,6 +8,7 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
+//!     [--generate N]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -23,6 +24,11 @@
 //! reference's continuation as a prefix, and how often that prefix reaches each slot (slot 0
 //! alone, slots 0-1, ...); --show-drafts prints every block. The logits hashed are the target's,
 //! so the hashes must not change.
+//! --generate N instead continues each prompt greedily by N tokens of its own (no reference) and
+//! times it: per prompt the tokens' hash and milliseconds a token. With --dspark each round drafts
+//! ahead and verifies as many of the draft's tokens as the width policy picks
+//! (drafter::Policy, by DSpark's confidences and [`VERIFY_MS`]), keeps the matching ones and the
+//! target's next, and takes the rest back: the tokens must be those without the drafter.
 
 #[path = "common/files.rs"]
 mod files;
@@ -30,7 +36,8 @@ mod files;
 use std::path::Path;
 
 use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
-use straydog_engine::arch::deepseek41::drafter::Drafter;
+use straydog_engine::arch::deepseek41::drafter::{Drafter, Policy};
+use straydog_engine::arch::deepseek41::engine::TAP_ROWS;
 use straydog_engine::arch::deepseek41::dspark::Dspark;
 use straydog_engine::arch::deepseek41::Hparams;
 
@@ -89,6 +96,110 @@ fn summary(label: &str, steps: &[Step]) -> String {
             steps.len(), kls.last().copied().unwrap_or(0.0), 100.0 * top1, ours.exp(), reference.exp())
 }
 
+/// A DeepSeek-V4.1 pass's milliseconds on two GPUs by its rows, 1 to 4 (T133), for the width policy.
+const VERIFY_MS: [f64; 4] = [25.4, 41.4, 57.0, 69.5];
+
+/// The drafter's history: the last pass's last `n` rows' target features (positions up to the
+/// engine's), from each device's tap.
+fn inject(engines: &mut [Engine<'_, files::Files>], drafter: &mut Option<Drafter>, n: usize) -> Result<(), String> {
+    let Some(drafter) = drafter else { return Ok(()) };
+    let end = engines[0].position();
+    let kept = n.min(TAP_ROWS);
+    let positions: Vec<i32> = (end - kept..end).map(|at| at as i32).collect();
+    drafter.inject(&mut engines[0].beside()?, &positions)
+}
+
+/// --generate: each prompt continued greedily by `count` tokens, timed; with a drafter, DSpark
+/// drafts each round (but in a pause) and the policy picks how many of its tokens a verify pass
+/// checks.
+#[allow(clippy::too_many_arguments)]
+fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, drafter: &mut Option<Drafter>, prompts: &[Vec<u32>],
+            count: usize, chunk: usize, vocabulary: usize, show: bool) -> Result<(), String> {
+    let mut policy = Policy::new(&VERIFY_MS, 5.0);
+    let counted = |engines: &[Engine<'_, files::Files>]| {
+        engines.iter().map(Engine::cache_counts).fold(straydog_engine::experts::Counts::default(), |a, b| a + b)
+    };
+    let (mut all_hash, mut all_seconds, mut all_tokens, mut all_passes) = (0xcbf2_9ce4_8422_2325u64, 0.0, 0, 0);
+    // rounds, rounds drafted, verified widths 0..=3, verified drafts accepted, seconds drafting
+    let (mut all_rounds, mut all_drafted, mut all_widths, mut all_accepted, mut all_drafting) = (0, 0, [0usize; 4], 0, 0.0);
+    let before = counted(engines);
+    for (index, prompt) in prompts.iter().enumerate() {
+        engines.iter_mut().for_each(|engine| engine.reset());
+        if let Some(drafter) = drafter.as_mut() {
+            drafter.forget_from(0);
+        }
+        policy.reset();
+        let mut logits = Vec::new();
+        for piece in prompt.chunks(chunk) {
+            logits = forward_split(engines, piece)?;
+            inject(engines, drafter, piece.len())?;
+        }
+        let mut emitted = vec![argmax(&logits) as u32];
+        let (mut passes, mut rounds, mut drafted, mut widths, mut accepted_all, mut drafting) = (0, 0, 0, [0usize; 4], 0, 0.0);
+        let started = std::time::Instant::now();
+        while emitted.len() < count {
+            let next = emitted[emitted.len() - 1];
+            let position = engines[0].position();
+            let room = count - emitted.len();
+            let mut drafts = Vec::new();
+            if let Some(drafter) = drafter.as_mut() {
+                if room > 1 && policy.drafting() {
+                    let timed = std::time::Instant::now();
+                    let draft = drafter.draft(&mut engines[0].beside()?, files, next, position, VERIFY_MS.len() - 1)?;
+                    let ms = 1e3 * timed.elapsed().as_secs_f64();
+                    policy.drafted(ms);
+                    let width = policy.width(&draft.confidences, room - 1);
+                    drafts = draft.tokens[..width.min(draft.tokens.len())].to_vec();
+                    (drafted, drafting) = (drafted + 1, drafting + ms / 1e3);
+                    if show {
+                        println!("  round at {position}: draft {:?} confidences {:?}, verifying {}", draft.tokens, draft.confidences, drafts.len());
+                    }
+                }
+            }
+            let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
+            let rows = if drafts.is_empty() { forward_split(engines, &fed)? } else { verify_split(engines, &fed)? };
+            let row = |at: usize| argmax(&rows[at * vocabulary..(at + 1) * vocabulary]) as u32;
+            let accepted = (0..drafts.len()).take_while(|&at| row(at) == drafts[at]).count();
+            if accepted + 1 < fed.len() {
+                engines.iter_mut().try_for_each(|engine| engine.rewind(accepted + 1))?;
+            }
+            emitted.extend_from_slice(&drafts[..accepted]);
+            emitted.push(row(accepted));
+            inject(engines, drafter, accepted + 1)?;
+            (passes, rounds, accepted_all) = (passes + 1, rounds + 1, accepted_all + accepted);
+            widths[drafts.len()] += 1;
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        let mut hash_state = 0xcbf2_9ce4_8422_2325u64;
+        hash(&mut hash_state, &emitted.iter().map(|&token| f32::from_bits(token)).collect::<Vec<_>>());
+        hash(&mut all_hash, &[f32::from_bits(hash_state as u32), f32::from_bits((hash_state >> 32) as u32)]);
+        // the first token comes with the prompt; the rest from the rounds
+        let made = emitted.len() - 1;
+        println!("generate prompt {index}: {} tokens, tokens hash {hash_state:016x}, {made} in {passes} passes, {:.2} ms a token",
+                 emitted.len(), 1e3 * seconds / made.max(1) as f64);
+        if drafter.is_some() {
+            println!("  rounds {rounds}, drafted {drafted} ({:.0}%), widths {widths:?}, {accepted_all} drafts accepted, {:.2} ms a draft",
+                     100.0 * drafted as f64 / rounds.max(1) as f64, 1e3 * drafting / drafted.max(1) as f64);
+        }
+        (all_seconds, all_tokens, all_passes) = (all_seconds + seconds, all_tokens + made, all_passes + passes);
+        (all_rounds, all_drafted, all_accepted, all_drafting) = (all_rounds + rounds, all_drafted + drafted, all_accepted + accepted_all,
+                                                                 all_drafting + drafting);
+        all_widths.iter_mut().zip(widths).for_each(|(sum, width)| *sum += width);
+    }
+    let after = counted(engines);
+    let per_pass = |count: u64| count as f64 / all_passes.max(1) as f64;
+    println!("generate all: tokens hash {all_hash:016x}, {all_tokens} tokens in {all_passes} passes, {:.2} ms a token, {:.2} ms a pass",
+             1e3 * all_seconds / all_tokens.max(1) as f64, 1e3 * all_seconds / all_passes.max(1) as f64);
+    println!("  a pass: {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads", per_pass(after.hits - before.hits),
+             per_pass(after.host_hits - before.host_hits), per_pass(after.drive_reads - before.drive_reads));
+    if drafter.is_some() {
+        println!("  dspark rounds {all_rounds}, drafted {all_drafted} ({:.0}%), widths {all_widths:?}, {all_accepted} drafts accepted, \
+                  {:.2} tokens a round, {:.2} ms a draft", 100.0 * all_drafted as f64 / all_rounds.max(1) as f64,
+                 all_tokens as f64 / all_rounds.max(1) as f64, 1e3 * all_drafting / all_drafted.max(1) as f64);
+    }
+    Ok(())
+}
+
 /// DSpark's drafts of one size: how often their prefix matching the reference reaches each slot.
 fn reach(rounds: usize, per_slot: &[usize]) -> String {
     per_slot.iter().map(|&reached| format!("{:.3}", reached as f64 / rounds.max(1) as f64)).collect::<Vec<_>>().join(", ")
@@ -115,6 +226,7 @@ fn main() -> Result<(), String> {
         None => false,
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
+    let generate_count = option("--generate", 0);
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
@@ -141,7 +253,7 @@ fn main() -> Result<(), String> {
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
-                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]".into());
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -182,14 +294,15 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
-    // the drafter's history: the tapped rows of the last pass (its last n of its positions)
-    let inject = |engines: &mut Vec<Engine<'_, files::Files>>, drafter: &mut Option<Drafter>, n: usize| -> Result<(), String> {
-        let Some(drafter) = drafter else { return Ok(()) };
-        let end = engines[0].position();
-        let kept = n.min(straydog_engine::arch::deepseek41::engine::TAP_ROWS);
-        let positions: Vec<i32> = (end - kept..end).map(|at| at as i32).collect();
-        drafter.inject(&mut engines[0].beside()?, &positions)
-    };
+    if generate_count > 0 {
+        let mut prompts = Vec::new();
+        for tokens_file in tokens_files.split(',') {
+            let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
+            let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+            prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
+        }
+        return generate(&mut engines, &files, &mut drafter, &prompts, generate_count, chunk, vocabulary, show_drafts);
+    }
     for (run, &verify) in widths.iter().enumerate() {
         let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
         let mut run_hash = 0xcbf2_9ce4_8422_2325u64;
