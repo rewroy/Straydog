@@ -669,20 +669,36 @@ impl Driver {
         }
     }
 
-    /// The file an engine placed as `ready` says keeps its warm-up state: one per model and
-    /// placement (a state is a list of the experts a store held, only meaningful for the same).
-    fn warm_path(&self, ready: &Value) -> Option<PathBuf> {
+    /// The file that keeps the model's warm-up state: one per model (its shards), whatever the
+    /// placement. A state lists experts by layer and number, which any placement of the model
+    /// takes: each into the store now holding its layer, as many as its slots hold.
+    fn warm_path(&self) -> Option<PathBuf> {
         use sha2::Digest;
         let directory = self.warm_directory.as_ref()?;
         let quant = &self.expected.1;
         let mut key = sha2::Sha256::new();
-        key.update(b"straydog warm-up state 1\n");
+        key.update(b"straydog warm-up state 2\n");
         for shard in straydog_engine::bundle::shards(quant).ok()? {
             key.update(shard.sha256.as_bytes());
         }
-        key.update(serde_json::to_vec(&ready["placement"]).ok()?);
         let key: String = key.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
         Some(directory.join(format!("{quant}-{key}.json")))
+    }
+
+    /// The model's warm-up state, else the latest an earlier version kept per placement (its
+    /// file named for the quantization too): only a list of experts to read, so any of the
+    /// model's will do.
+    fn warm_source(&self) -> Option<PathBuf> {
+        let path = self.warm_path()?;
+        if path.is_file() {
+            return Some(path);
+        }
+        let prefix = format!("{}-", self.expected.1);
+        std::fs::read_dir(path.parent()?).ok()?.flatten()
+            .filter(|entry| entry.file_name().to_str().is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json")))
+            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .max()
+            .map(|(_, path)| path)
     }
 
     fn ready_frame(&self) -> Option<Value> {
@@ -692,10 +708,10 @@ impl Driver {
         }
     }
 
-    /// Hand the worker the state an earlier run saved for this model and placement: it warms up
-    /// with it in the background, never ahead of a request.
+    /// Hand the worker the state an earlier run saved for this model: it warms up with it in the
+    /// background, never ahead of a request.
     async fn restore_warm_state(&self, process: &mut Process) {
-        let Some(path) = self.ready_frame().and_then(|ready| self.warm_path(&ready)) else { return };
+        let Some(path) = self.ready_frame().and_then(|_| self.warm_source()) else { return };
         let state = std::fs::File::open(&path).ok().and_then(|file| {
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut std::io::Read::take(file, WARM_BYTES + 1), &mut bytes).ok()?;
@@ -711,9 +727,9 @@ impl Driver {
     }
 
     /// Ask the worker for its warm-up state and keep it in the data directory (written whole,
-    /// then renamed), for the next start with this model and placement.
+    /// then renamed), for the next start with this model.
     async fn save_warm_state(&self, process: &mut Process) {
-        let Some(path) = self.ready_frame().and_then(|ready| self.warm_path(&ready)) else { return };
+        let Some(path) = self.ready_frame().and_then(|_| self.warm_path()) else { return };
         let request = frame(vec![("id", pyjson::Value::Str("warm-state".into())),
                                  ("command", pyjson::Value::Str("warm_state".into()))]);
         let reply = async {

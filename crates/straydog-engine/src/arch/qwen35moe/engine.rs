@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::part::Part;
 use super::{Hparams, Mixer};
 use crate::arch::Tensors;
-use crate::experts::{Columns, Contents, Counts, DeviceExperts, Layout, Reader, Role};
+use crate::experts::{select, taken_up_to, Columns, Contents, Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, CpuExperts, Result};
 use crate::ops::{Buffer, Linear};
@@ -455,17 +455,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// Warm the expert store up with an earlier run's contents of this engine's layers (of its part's
     /// experts). Resident experts are all in place already: nothing is read, so no read can take a
     /// resident expert's slot (whose address the expert table holds).
-    pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+    pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize)> {
         if self.resident.is_some() {
-            return Ok(0);
+            return Ok((0, vram.len(), host.len()));
         }
         let layers = self.settings.layers.clone();
         let experts = self.settings.part.experts(&self.hp);
-        let mine = |keys: &[(usize, usize)]| -> Vec<(usize, usize)> {
-            keys.iter().copied().filter(|&(layer, expert)| layers.contains(&layer) && experts.contains(&expert)).collect()
-        };
-        let (vram, host) = (mine(vram), mine(host));
-        self.experts.warm(&mut self.gpu, &vram, &host)
+        let mine = |layer: usize, expert: usize| layers.contains(&layer) && experts.contains(&expert);
+        let ((my_vram, vram_at), (my_host, host_at)) = (select(vram, mine), select(host, mine));
+        let (reading, placed, hosted) = self.experts.warm(&mut self.gpu, &my_vram, &my_host)?;
+        Ok((reading, taken_up_to(placed, &vram_at, vram.len()), taken_up_to(hosted, &host_at, host.len())))
     }
 
     /// Take the expert reads that have landed, without waiting; those still in flight.

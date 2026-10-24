@@ -79,12 +79,26 @@ impl served::Engines for Engines {
         (vram, host)
     }
 
-    fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize, String> {
-        let mut reading = 0;
+    fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize), String> {
+        let (mut reading, mut placed, mut hosted) = (0, vram.len(), host.len());
         for engine in &mut self.engines {
-            reading += engine.warm_experts(vram, host)?;
+            let (read, engine_placed, engine_hosted) = engine.warm_experts(vram, host)?;
+            (reading, placed, hosted) = (reading + read, placed.min(engine_placed), hosted.min(engine_hosted));
         }
-        Ok(reading)
+        Ok((reading, placed, hosted))
+    }
+
+    fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        // each engine its layers' (the stores' layers as placed now, whatever they were)
+        let (mut kept_vram, mut kept_host) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for engine in &self.engines {
+            let (vram, host) = engine.fit_warm(&vram, &host);
+            kept_vram.extend(vram);
+            kept_host.extend(host);
+        }
+        let host_out: Vec<(usize, usize)> = host.iter().chain(vram.iter().filter(|&key| !kept_vram.contains(key)))
+            .filter(|&key| kept_host.contains(key)).copied().collect();
+        (vram.into_iter().filter(|key| kept_vram.contains(key)).collect(), host_out)
     }
 
     fn poll(&mut self) -> Result<usize, String> {

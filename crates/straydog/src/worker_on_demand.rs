@@ -40,10 +40,11 @@ enum Job {
     Warm(Value),
 }
 
-/// Warm-up experts started per step while the model is idle, and the reads (one per device of
-/// an expert) at most on their way: few, so that a request waits for little.
-const WARM_STEP: usize = 8;
-const WARM_IN_FLIGHT: usize = 8;
+/// Warm-up experts started per step while the model is idle (a step every millisecond), and
+/// the reads (one per device of an expert) at most on their way: enough to keep the drive's
+/// sixteen bulk reads busy (~300 MB queued); a request's reads go ahead of them.
+const WARM_STEP: usize = 64;
+const WARM_IN_FLIGHT: usize = 64;
 
 /// The request loop's side: each request runs on the model's thread.
 struct Handle(mpsc::Sender<Job>);
@@ -117,7 +118,7 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
             let mut warming: Option<Instant> = None;
             loop {
                 let job = match warming {
-                    Some(_) => match queue.recv_timeout(std::time::Duration::from_millis(2)) {
+                    Some(_) => match queue.recv_timeout(std::time::Duration::from_millis(1)) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
@@ -152,8 +153,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         let _ = reply.send(served.model.warm_state());
                     }
                     Job::Warm(state) => match served.model.warm(&state) {
-                        Ok(count) => {
-                            eprintln!("Straydog warming up with {count} experts");
+                        Ok((vram, host)) => {
+                            eprintln!("Straydog warming up with {vram} experts for VRAM, {host} for the host tier");
                             warming = Some(Instant::now());
                         }
                         Err(error) => eprintln!("Straydog cannot warm up: {error}"),

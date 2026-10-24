@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use super::{Gating, Hparams, Rope};
 use crate::arch::{Tensor, Tensors};
-use crate::experts::{Counts, DeviceExperts, Layout, Reader, Role};
+use crate::experts::{select, taken_up_to, Counts, DeviceExperts, Layout, Reader, Role};
 use crate::formats;
 use crate::gpu::{Backend, Result};
 use crate::moe;
@@ -1055,17 +1055,25 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// Warm the expert stores up with an earlier run's contents of this engine's layers (see
     /// `DeviceExperts::warm`), each device its rows; the reads still in flight.
-    pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
-        let layers = self.settings.layers.clone();
-        let mine = |keys: &[(usize, usize)]| -> Vec<(usize, usize)> {
-            keys.iter().copied().filter(|&(layer, expert)| layers.contains(&layer) && expert < self.hp.experts).collect()
-        };
-        let (vram, host) = (mine(vram), mine(host));
-        let mut reading = 0;
+    pub fn warm_experts(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize)> {
+        let (layers, count) = (self.settings.layers.clone(), self.hp.experts);
+        let mine = |layer: usize, expert: usize| layers.contains(&layer) && expert < count;
+        let ((my_vram, vram_at), (my_host, host_at)) = (select(vram, mine), select(host, mine));
+        let (mut reading, mut placed, mut hosted) = (0, my_vram.len(), my_host.len());
         for shard in &mut self.shards {
-            reading += shard.experts.warm_bulk(&mut shard.gpu, &vram, &host)?;
+            let (read, shard_placed, shard_hosted) = shard.experts.warm_bulk(&mut shard.gpu, &my_vram, &my_host)?;
+            (reading, placed, hosted) = (reading + read, placed.min(shard_placed), hosted.min(shard_hosted));
         }
-        Ok(reading)
+        Ok((reading, taken_up_to(placed, &vram_at, vram.len()), taken_up_to(hosted, &host_at, host.len())))
+    }
+
+    /// Of a warm-up's lists, this engine's experts that its stores' slots hold (every device's
+    /// store has the same slots).
+    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let (layers, count) = (self.settings.layers.clone(), self.hp.experts);
+        let mine = |layer: usize, expert: usize| layers.contains(&layer) && expert < count;
+        let ((vram, _), (host, _)) = (select(vram, mine), select(host, mine));
+        self.shards.first().map_or((Vec::new(), Vec::new()), |shard| shard.experts.fit_warm(&vram, &host))
     }
 
     /// Take the expert reads that have landed, without waiting; those still in flight.

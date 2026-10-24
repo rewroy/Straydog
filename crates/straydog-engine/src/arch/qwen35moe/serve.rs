@@ -82,12 +82,13 @@ impl served::Engines for Engines {
         (vram, host)
     }
 
-    fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize, String> {
-        let mut reading = 0;
+    fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize), String> {
+        let (mut reading, mut placed, mut hosted) = (0, vram.len(), host.len());
         for engine in &mut self.engines {
-            reading += engine.warm_experts(vram, host)?;
+            let (read, engine_placed, engine_hosted) = engine.warm_experts(vram, host)?;
+            (reading, placed, hosted) = (reading + read, placed.min(engine_placed), hosted.min(engine_hosted));
         }
-        Ok(reading)
+        Ok((reading, placed, hosted))
     }
 
     fn poll(&mut self) -> Result<usize, String> {

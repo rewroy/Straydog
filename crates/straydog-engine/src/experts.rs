@@ -1929,33 +1929,75 @@ impl DeviceExperts {
     /// Warm up with experts an earlier run held ([`contents`](Self::contents)), least recently
     /// used first: `host` read into the host tier (when there is one), `vram` brought into VRAM
     /// slots as prefetches (a pass's fills go first, and a pass skips its layer's reads not yet
-    /// started). The reads queue behind every pass's. Experts of layers this store does not hold
-    /// are skipped. Returns the reads still in flight.
-    pub fn warm(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+    /// started). The reads queue behind every pass's. A warm-up never evicts: an expert goes
+    /// only into a free VRAM slot (else the host tier) and a host slot to be had without evicting
+    /// what the host tier alone holds; with none, it stops there, to go on when there is room. Experts of layers
+    /// this store does not hold are skipped. Returns the reads still in flight, and how far into
+    /// `vram` and `host` it went.
+    pub fn warm(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize)> {
         self.warm_with(gpu, vram, host, CHUNK)
     }
 
     /// Warm-up from disk in bulk; demand reads retain priority.
-    pub fn warm_bulk(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+    pub fn warm_bulk(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)])
+                     -> Result<(usize, usize, usize)> {
         self.warm_with(gpu, vram, host, BULK_CHUNK)
     }
 
-    fn warm_with(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)], chunk: u64) -> Result<usize> {
+    fn warm_with(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)], chunk: u64)
+                 -> Result<(usize, usize, usize)> {
         self.settled = false;
+        let mut hosted = 0;
         for &(layer, expert) in host {
-            let Some(class) = self.class_of.get(layer).copied().flatten() else { continue };
-            let key = (layer as u32, expert as u32);
-            if self.classes[class].host_capacity == 0 || self.map.contains_key(&key) || self.host_map.contains_key(&key) {
-                continue;
+            if let Some(class) = self.class_of.get(layer).copied().flatten() {
+                let key = (layer as u32, expert as u32);
+                if self.classes[class].host_capacity > 0 && !self.map.contains_key(&key) && !self.host_map.contains_key(&key) {
+                    if !self.host_room(class)? {
+                        break;
+                    }
+                    self.read(gpu, key, false, false, chunk)?;
+                }
             }
-            self.read(gpu, key, false, false, chunk)?;
+            hosted += 1;
         }
+        let mut placed = 0;
         for &(layer, expert) in vram {
-            if self.class_of.get(layer).copied().flatten().is_some() {
-                self.prefetch_with(gpu, layer, &[expert], true, chunk)?;
+            if let Some(class) = self.class_of.get(layer).copied().flatten() {
+                let key = (layer as u32, expert as u32);
+                if !self.map.contains_key(&key) {
+                    if !self.host_room(class)? {
+                        break;
+                    }
+                    if !self.classes[class].free.is_empty() {
+                        self.prefetch_with(gpu, layer, &[expert], true, chunk)?;
+                    } else if self.classes[class].host_capacity > 0 && !self.host_map.contains_key(&key) {
+                        // (VRAM full of what requests brought in: the host tier, then)
+                        self.read(gpu, key, false, false, chunk)?;
+                    }
+                }
             }
+            placed += 1;
         }
-        self.poll(gpu)
+        Ok((self.poll(gpu)?, placed, hosted))
+    }
+
+    /// Whether a host slot of `class` is to be had without evicting an expert the host tier
+    /// alone holds: an emptied one, pinned room (or a pinned arena ready), or the least recently
+    /// used one's expert held in VRAM too (see [`free_host`](Self::free_host)).
+    fn host_room(&mut self, class: usize) -> Result<bool> {
+        let entry = &self.classes[class];
+        if !entry.host_free.is_empty() || entry.hosts < entry.arenas.len() * entry.per_arena || self.take_arena(class, false)? {
+            return Ok(true);
+        }
+        let oldest = self.classes[class].host_lru.iter().next().map(|&(_, host)| host);
+        Ok(oldest.is_some_and(|host| self.host[host].key.is_some_and(|key| self.map.contains_key(&key))))
+    }
+
+    /// Of a warm-up's lists (least recently used first), what this store's slots hold (see
+    /// [`fit_warm`]).
+    pub fn fit_warm(&self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let room: Vec<(usize, usize)> = self.classes.iter().map(|class| (class.count, class.host_capacity)).collect();
+        fit_warm(&self.class_of, &room, vram, host)
     }
 
     /// Take the reads that have landed (uploading those a fill waits for), without waiting;
@@ -1964,6 +2006,51 @@ impl DeviceExperts {
         self.pump(gpu, false)?;
         Ok(self.reading)
     }
+}
+
+/// Of a warm-up's lists (least recently used first), what fits a store whose classes take
+/// `room` (VRAM slots, host slots) each, a layer's class by `class_of`: per class the most recent
+/// VRAM entries its slots take, those they cannot take next in line for the host tier (more
+/// recent than its own entries), then the most recent host entries its slots take. Each list
+/// keeps its order (VRAM's left over after the host tier's own).
+pub fn fit_warm(class_of: &[Option<usize>], room: &[(usize, usize)], vram: &[(usize, usize)], host: &[(usize, usize)])
+                -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut room = room.to_vec();
+    let class = |&(layer, _): &(usize, usize)| class_of.get(layer).copied().flatten();
+    let (mut kept_vram, mut spilled, mut kept_host) = (Vec::new(), Vec::new(), Vec::new());
+    for key in vram.iter().rev() {
+        let Some(class) = class(key) else { continue };
+        if room[class].0 > 0 {
+            room[class].0 -= 1;
+            kept_vram.push(*key);
+        } else {
+            spilled.push(*key);
+        }
+    }
+    let mut spilled_kept = Vec::new();
+    for (key, spill) in spilled.iter().map(|key| (key, true)).chain(host.iter().rev().map(|key| (key, false))) {
+        let Some(class) = class(key) else { continue };
+        if room[class].1 > 0 {
+            room[class].1 -= 1;
+            if spill { spilled_kept.push(*key) } else { kept_host.push(*key) }
+        }
+    }
+    kept_vram.reverse();
+    kept_host.reverse();
+    spilled_kept.reverse();
+    kept_host.extend(spilled_kept);
+    (kept_vram, kept_host)
+}
+
+/// The entries of `keys` that `keep` takes, with their places in `keys`.
+pub fn select(keys: &[(usize, usize)], keep: impl Fn(usize, usize) -> bool) -> (Vec<(usize, usize)>, Vec<usize>) {
+    keys.iter().enumerate().filter(|(_, &(layer, expert))| keep(layer, expert)).map(|(at, &key)| (key, at)).unzip()
+}
+
+/// How far into `len` keys a warm-up went when it took the first `taken` of those it selected,
+/// at places `at` ([`select`]): up to the first it did not take.
+pub fn taken_up_to(taken: usize, at: &[usize], len: usize) -> usize {
+    at.get(taken).copied().unwrap_or(len)
 }
 
 /// Where a decode step's route finds an expert the device does not run (see
@@ -2291,5 +2378,42 @@ mod reader_tests {
         assert!(matches!(completed[3], Landed::Read));
         drop(file);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+
+    /// A saved state fits stores of other capacities: per class the most recent VRAM entries
+    /// its slots take, the rest of VRAM's ahead of the host list's own for the host slots, the
+    /// most recent of those; layers no store holds dropped; each list in its order.
+    #[test]
+    fn a_warm_up_fits_the_slots_as_placed_now() {
+        // layers 0 and 1 in class 0, layer 2 in class 1, layer 3 without routed experts
+        let class_of = [Some(0), Some(0), Some(1), None];
+        let vram = [(0, 1), (2, 1), (0, 2), (1, 3), (3, 9), (2, 2)];
+        let host = [(0, 7), (2, 7), (1, 8), (2, 8)];
+        // class 0: one VRAM slot, two host slots; class 1: two VRAM slots, one host slot
+        let (fit_vram, fit_host) = fit_warm(&class_of, &[(1, 2), (2, 1)], &vram, &host);
+        assert_eq!(fit_vram, [(2, 1), (1, 3), (2, 2)]);
+        // class 0's two host slots: the VRAM entries it had no slot for, newest first ((0, 2),
+        // (0, 1)); class 1's one: its newest host entry (2, 8)
+        assert_eq!(fit_host, [(2, 8), (0, 1), (0, 2)]);
+        // larger stores take everything
+        let (all_vram, all_host) = fit_warm(&class_of, &[(9, 9), (9, 9)], &vram, &host);
+        assert_eq!(all_vram, [(0, 1), (2, 1), (0, 2), (1, 3), (2, 2)]);
+        assert_eq!(all_host, host);
+    }
+
+    /// A warm-up's progress in an engine's own entries maps back to the lists it was given.
+    #[test]
+    fn a_warm_up_step_goes_up_to_the_first_entry_not_taken() {
+        let keys = [(0, 1), (5, 1), (0, 2), (5, 2), (0, 3)];
+        let (mine, at) = select(&keys, |layer, _| layer == 0);
+        assert_eq!((mine, at.clone()), (vec![(0, 1), (0, 2), (0, 3)], vec![0, 2, 4]));
+        assert_eq!(taken_up_to(0, &at, keys.len()), 0);
+        assert_eq!(taken_up_to(1, &at, keys.len()), 2);
+        assert_eq!(taken_up_to(3, &at, keys.len()), 5);
     }
 }
