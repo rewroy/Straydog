@@ -799,9 +799,13 @@ impl DeviceExperts {
         // Every class needs at least one staging slot. Charge those to a nonzero
         // budget first, then divide the remainder; tiny classes cannot overspend it.
         let staging: u64 = distinct.iter().map(|&(_, host)| host).sum();
-        if host_budget > 0 && host_budget < staging {
-            return Err(format!("expert host budget {host_budget} bytes is below the {staging} bytes needed for staging"));
-        }
+        // A tier too small for one slot of each size class is no tier: staging alone, as with none.
+        let host_budget = if host_budget > 0 && host_budget < staging {
+            eprintln!("WARN Straydog expert host budget {host_budget} bytes is below the {staging} bytes of one slot per size class: no host tier");
+            0
+        } else {
+            host_budget
+        };
         let class_of: Vec<Option<usize>> = sizes.iter()
             .map(|size| size.map(|size| distinct.iter().position(|&other| other == size).unwrap())).collect();
         let layers = class_of.iter().flatten().count() as u64;
