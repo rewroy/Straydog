@@ -283,6 +283,15 @@ int sd_attention_turns_arm(void* handle, uint64_t rows);
    rope_dims (else 0) rotates q's last values by positions * frequencies as sd_op_rope does, and
    the output back. */
 int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions, uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected, uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const float* frequencies, float* scratch, uint64_t scratch_bytes, float* out);
+/* DSpark noncausal block attention: q/out [slots,64,512], K=V ring [128,512],
+   block KV [slots,512], sinks [64]. Q and all keys already have RoPE applied.
+   Every query sees history positions [anchor-history,anchor) and ALL block keys.
+   slots 1..5, history 0..128, anchor>=history and <=INT32_MAX. Scale 1/sqrt(512);
+   the sink contributes to the softmax denominator only. Scratch: 4*slots*(slots+1)
+   bytes for generated positions/selections. All ranges disjoint; graph-capturable. */
+int sd_op_dspark_attention(void* handle, const float* q, const float* ring, const float* block,
+                           const float* sinks, uint64_t slots, uint32_t anchor, uint64_t history,
+                           float* out, int32_t* scratch, uint64_t scratch_bytes);
 int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
 int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);
