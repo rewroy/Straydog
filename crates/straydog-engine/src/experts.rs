@@ -654,6 +654,11 @@ pub struct Counts {
     /// Bytes queued for drive reads (whole blocks), a pass's and a prefetch's alike.
     pub drive_bytes: u64,
     pub writebacks: u64,
+    /// Experts the host tier gave up for room (read from the drive again on their next use), and
+    /// of those, the ones given up while the tier was still below its budget (its arenas not yet
+    /// pinned).
+    pub host_drops: u64,
+    pub host_drops_short: u64,
     pub prefetched: u64,
     /// Prefetched experts their layer then did not use.
     pub prefetch_unused: u64,
@@ -680,6 +685,8 @@ impl std::ops::Add for Counts {
             drive_reads: self.drive_reads + other.drive_reads,
             drive_bytes: self.drive_bytes + other.drive_bytes,
             writebacks: self.writebacks + other.writebacks,
+            host_drops: self.host_drops + other.host_drops,
+            host_drops_short: self.host_drops_short + other.host_drops_short,
             prefetched: self.prefetched + other.prefetched,
             prefetch_unused: self.prefetch_unused + other.prefetch_unused,
             failed_unwaited: self.failed_unwaited + other.failed_unwaited,
@@ -1923,11 +1930,14 @@ impl DeviceExperts {
                 gpu.mark_done(mark, true)?;
             }
             self.counts.slot_wait_seconds += started.elapsed().as_secs_f64();
+            let short = self.classes[class].hosts < self.classes[class].host_capacity;
             let entry = &mut self.host[host];
             match entry.key.take() {
                 Some(key) => {
                     self.host_map.remove(&key);
                     self.classes[class].host_lru.remove(&(entry.used, host));
+                    self.counts.host_drops += 1;
+                    self.counts.host_drops_short += u64::from(short);
                 }
                 None => {
                     self.classes[class].host_free.pop_front();

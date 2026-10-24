@@ -486,6 +486,8 @@ impl<E: Engines> Session<E> {
         let prefill_store = match (store0, self.engines.store_counts()) {
             (Some(before), Some(after)) => json!({
                 "writebacks": after.writebacks - before.writebacks,
+                "host_drops": after.host_drops - before.host_drops,
+                "host_drops_short": after.host_drops_short - before.host_drops_short,
                 "prefetched": after.prefetched - before.prefetched,
                 "prefetch_unused": after.prefetch_unused - before.prefetch_unused,
                 "wait_seconds": after.wait_seconds - before.wait_seconds,
