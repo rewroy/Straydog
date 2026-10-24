@@ -8,7 +8,7 @@
 //!
 //! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
-//!     [--generate N [--runs R] [--width W]] [--dump-routes FILE]
+//!     [--generate N [--runs R] [--width W]] [--dump-routes FILE] [--draft-bench K]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
@@ -33,6 +33,8 @@
 //! draft whatever the policy picks; --draft-slots 0 takes the features but never drafts. Each pass
 //! is timed by its rows, and the stores' counters taken over the decode alone. --dump-routes FILE
 //! writes every draft's routes, a line a stage (read back after the draft, outside its timing).
+//! --draft-bench K prefills the first prompt (128 tokens or more), pauses a second, then drafts K
+//! times at its end alone and prints their times (for a kernel trace of the drafts).
 
 #[path = "common/files.rs"]
 mod files;
@@ -295,6 +297,7 @@ fn main() -> Result<(), String> {
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
     let (generate_count, runs, forced_width) = (option("--generate", 0), option("--runs", 1), option("--width", usize::MAX));
+    let draft_bench = option("--draft-bench", 0);
     let dump_path = args.iter().position(|arg| arg == "--dump-routes").map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -327,7 +330,7 @@ fn main() -> Result<(), String> {
     let [dir, tokens_files] = &args[..] else {
         return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
-                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]] [--dump-routes FILE]".into());
+                    [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]] [--dump-routes FILE] [--draft-bench K]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -368,13 +371,38 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
-    if generate_count > 0 {
-        let mut prompts = Vec::new();
-        for tokens_file in tokens_files.split(',') {
-            let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
-            let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
-            prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    for tokens_file in tokens_files.split(',') {
+        let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
+        let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+        prompts.push(ints[3..3 + ints[0] as usize].iter().map(|&id| id as u32).collect());
+    }
+    if draft_bench > 0 {
+        // the first prompt prefilled, a second's pause (a gap in a trace), then the drafts alone
+        let mut logits = Vec::new();
+        for piece in prompts[0].chunks(chunk) {
+            logits = forward_split(&mut engines, piece)?;
+            inject(&mut engines, &mut drafter, piece.len())?;
         }
+        let (next, position) = (argmax(&logits) as u32, engines[0].position());
+        let drafter = drafter.as_mut().ok_or("--draft-bench drafts with --dspark")?;
+        if position < straydog_engine::arch::deepseek41::drafter::RING {
+            return Err("--draft-bench drafts after a full history: a prompt of 128 tokens or more".into());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut times = Vec::with_capacity(draft_bench);
+        for _ in 0..draft_bench {
+            let timed = std::time::Instant::now();
+            drafter.draft(&mut engines[0].beside()?, &files, next, position, VERIFY_MS.len() - 1)?;
+            times.push(1e3 * timed.elapsed().as_secs_f64());
+        }
+        let first = times[..2.min(times.len())].to_vec();
+        times.sort_by(f64::total_cmp);
+        println!("draft bench: {draft_bench} drafts of {} at position {position}: median {:.3} ms, min {:.3} ms, the first two {first:.3?} ms",
+                 VERIFY_MS.len() - 1, times[times.len() / 2], times[0]);
+        return Ok(());
+    }
+    if generate_count > 0 {
         let mut settings = Generate { count: generate_count, chunk, vocabulary, show: show_drafts, drafts: !draft_slots.is_empty(),
                                       width: (forced_width < VERIFY_MS.len()).then_some(forced_width), run: 0 };
         for run in 0..runs {
