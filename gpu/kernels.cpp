@@ -2978,14 +2978,6 @@ static unsigned slot_moe_tables(Device& d, const uint64_t* bases, const uint32_t
     return unsigned(tile_list.size());
 }
 
-// `act` (rows of `full`): this device's columns first..first+share from `product` (FP16 rows of
-// share), the others zero.
-__global__ void slot_moe_spread(const _Float16* product, size_t rows, size_t share, size_t full, size_t first, float* act) {
-    const size_t index = size_t(blockIdx.x) * 256 + threadIdx.x;
-    if (index >= rows * full) return;
-    const size_t row = index / full, column = index % full;
-    act[index] = column >= first && column < first + share ? float(product[row * share + column - first]) : 0.0f;
-}
 #endif
 
 int sd_slot_moe_supported(void* handle, const int* kinds, uint64_t width, uint64_t ffn_share, uint64_t ffn, uint64_t hidden_share) {
@@ -3079,21 +3071,6 @@ int sd_op_half_values(void* handle, const float* input, uint64_t values, void* o
 #else
     (void)value; (void)input; (void)values; (void)output;
     throw std::runtime_error("FP16 rounding is RDNA4's here");
-#endif
-    SD_OP_END
-}
-
-int sd_op_slot_moe_spread(void* handle, const void* product, uint64_t rows, uint64_t share, uint64_t full, uint64_t first, float* act) {
-    SD_OP_BEGIN
-#if defined(__HIPCC__)
-    if (!product || !act || !rows || !share || first + share > full) throw std::runtime_error("invalid Straydog slot expert spread");
-    op_span(value, product, size_t(rows * share) * 2, "slot expert products");
-    op_span(value, act, size_t(rows * full) * 4, "slot expert activations");
-    slot_moe_spread<<<op_blocks(size_t(rows * full)), 256, 0, value.stream>>>(static_cast<const _Float16*>(product), size_t(rows),
-                                                                              size_t(share), size_t(full), size_t(first), act);
-#else
-    (void)value; (void)product; (void)rows; (void)share; (void)full; (void)first; (void)act;
-    throw std::runtime_error("the grouped expert GEMM is RDNA4's");
 #endif
     SD_OP_END
 }
@@ -3441,6 +3418,71 @@ int sd_devices_settle(void* const* handles, uint64_t devices) {
             on_device(d->ordinal, [&]() {
                 for (Device* other : list)
                     if (other != d && other->parts_read) check(hipStreamWaitEvent(d->stream, other->parts_read, 0));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// Every device's `out` (rows of `full` FP16 values) = each device's `part` (rows of its `share` columns,
+// FP16) at that device's columns `firsts[d]`.., the other devices' read over the peer link at system
+// scope as sd_op_sum_devices reads them; their bits copied, nothing summed (the columns are disjoint).
+struct DeviceHalves { const uint32_t* parts[sum_devices_max]; uint64_t firsts[sum_devices_max]; };
+__global__ void gather_columns_kernel(DeviceHalves list, unsigned devices, size_t rows, size_t share, size_t full, uint32_t* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x, pairs = full / 2;
+    if (index >= rows * pairs) return;
+    const size_t row = index / pairs, column = (index % pairs) * 2;
+    for (unsigned d = 0; d < devices; ++d) {
+        if (column < list.firsts[d] || column >= list.firsts[d] + share) continue;
+        const uint32_t* at = list.parts[d] + (row * share + column - list.firsts[d]) / 2;
+#if defined(__HIPCC__)
+        out[index] = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        out[index] = *static_cast<const volatile uint32_t*>(at);
+#endif
+        return;
+    }
+    out[index] = 0;
+}
+
+int sd_op_gather_columns(void* const* handles, void* const* outs, const void* const* parts, const uint64_t* firsts, uint64_t devices,
+                         uint64_t rows, uint64_t share, uint64_t full) {
+    try {
+        if (!handles || !outs || !parts || !firsts || devices < 1 || devices > sum_devices_max || !rows || !share || share % 2 ||
+            full % 2 || share > full)
+            throw std::runtime_error("invalid Straydog column gather");
+        std::vector<Device*> list;
+        DeviceHalves all{};
+        for (size_t i = 0; i < devices; ++i) {
+            Device& d = device(handles[i]);
+            for (Device* other : list) if (other == &d) throw std::runtime_error("a device twice in a Straydog column gather");
+            if (firsts[i] % 2 || firsts[i] + share > full) throw std::runtime_error("invalid Straydog column gather");
+            for (size_t j = 0; j < i; ++j)
+                if (firsts[i] < firsts[j] + share && firsts[j] < firsts[i] + share)
+                    throw std::runtime_error("a Straydog column gather's shares overlap");
+            op_span(d, parts[i], size_t(rows * share) * 2, "a device's columns");
+            op_span(d, outs[i], size_t(rows * full) * 2, "a device's gathered rows");
+            for (size_t j = 0; j < devices; ++j)
+                if (outs[i] == parts[j]) throw std::runtime_error("a column gather cannot overwrite a part");
+            list.push_back(&d);
+            all.parts[i] = static_cast<const uint32_t*>(parts[i]);
+            all.firsts[i] = firsts[i];
+        }
+        // (the devices have peer access already: a sum of theirs set it up, as every pass of several
+        // devices sums its attention's parts before its experts')
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
+                check(hipEventRecord(d->parts_ready, d->stream));
+            });
+        for (size_t i = 0; i < devices; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                for (size_t j = 0; j < devices; ++j)
+                    if (j != i) check(hipStreamWaitEvent(list[i]->stream, list[j]->parts_ready, 0));
+                gather_columns_kernel<<<unsigned((rows * full / 2 + 255) / 256), 256, 0, list[i]->stream>>>(
+                    all, unsigned(devices), size_t(rows), size_t(share), size_t(full), static_cast<uint32_t*>(outs[i]));
+                check(hipGetLastError());
+                if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
+                check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

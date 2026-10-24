@@ -192,10 +192,12 @@ int sd_op_slot_moe_gate_up(void* handle, const uint64_t* bases, const uint32_t* 
 int sd_op_slot_moe_down(void* handle, const uint64_t* bases, const uint32_t* firsts, const uint32_t* counts, uint64_t experts,
                         uint64_t gate_bytes, const int* kinds, uint64_t width, uint64_t ffn_share, uint64_t ffn, uint64_t hidden_share,
                         const void* product, float* outputs, uint64_t out_stride, void* tables, uint64_t table_bytes);
-// `values` (a multiple of four) rounded to FP16; FP16 products spread into F32 rows of `full`
-// at column `first`, the other columns zero.
+// `values` (a multiple of four) rounded to FP16.
 int sd_op_half_values(void* handle, const float* input, uint64_t values, void* output);
-int sd_op_slot_moe_spread(void* handle, const void* product, uint64_t rows, uint64_t share, uint64_t full, uint64_t first, float* act);
+// Every device's `out` (rows of `full` FP16 values) = each device's `part` (rows of its `share` columns)
+// at its columns `firsts[d]`, the peers' read over the peer link; ordered as sd_op_sum_devices.
+int sd_op_gather_columns(void* const* handles, void* const* outs, const void* const* parts, const uint64_t* firsts, uint64_t devices,
+                         uint64_t rows, uint64_t share, uint64_t full);
 /* Experts in slots: route r (rows * top_k of them, token-major) runs the expert at bases[r], a slot
    of slot_bytes holding its gate and up (ffn x hidden) and down (hidden x ffn) matrices at byte
    offsets[0..2] (a zero base: a route another device runs); product[r] = SwiGLU of the route

@@ -747,22 +747,23 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_gather_columns(
+        handles: *const *mut ::std::os::raw::c_void,
+        outs: *const *mut ::std::os::raw::c_void,
+        parts: *const *const ::std::os::raw::c_void,
+        firsts: *const u64,
+        devices: u64,
+        rows: u64,
+        share: u64,
+        full: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_half_values(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,
         values: u64,
         output: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn sd_op_slot_moe_spread(
-        handle: *mut ::std::os::raw::c_void,
-        product: *const ::std::os::raw::c_void,
-        rows: u64,
-        share: u64,
-        full: u64,
-        first: u64,
-        act: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]

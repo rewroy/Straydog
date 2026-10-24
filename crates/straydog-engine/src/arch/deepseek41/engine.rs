@@ -2259,17 +2259,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
                 if wmma {
-                    // the wave's FP16 products (this device's columns), spread over the expert width
-                    // for the sum across devices
-                    let ((f0, fs), (_, hs)) = (shard.rows.ffn, shard.rows.hidden);
+                    // the wave's FP16 products (this device's columns)
+                    let ((_, fs), (_, hs)) = (shard.rows.ffn, shard.rows.hidden);
                     let (bases, firsts, counts) = slot_wave(slots, wave);
                     let grouped = ops::SlotWave { bases: &bases, firsts: &firsts, counts: &counts, gate_bytes, kinds, width: w as u64,
                                                   ffn_share: fs as u64, ffn: ff as u64, hidden_share: hs as u64, tables: &work.tables };
                     shard.gpu.slot_moe_gate_up(&grouped, work.route_rows.at(base), rows as u64, work.xh.base(), clamp_routed,
                                                work.route_weights.at(base), work.ph.base())?;
-                    if split {
-                        shard.gpu.slot_moe_spread(work.ph.base(), routes as u64, fs as u64, ff as u64, f0 as u64, work.act.base())?;
-                    }
                     continue;
                 }
                 let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
@@ -2278,23 +2274,30 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                  work.route_weights.at(span.first), span.routes, clamp_routed, work.act.at((span.first - base) * ff))?;
                 }
             }
-            self.sum_activations(routes)?;
+            if wmma && split {
+                // every device's columns of the wave's FP16 products, gathered from each into every
+                // one: the activations whole, as down takes them. (The F32 sum across devices of each
+                // one's columns and zeros moved four times the bytes over PCIe: ~1.1 s of a 10.7K-token
+                // prompt's 1.5 s of sums on each GPU.)
+                let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+                let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.ah.base()).collect();
+                let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.ph.base() as P).collect();
+                let firsts: Vec<u64> = self.shards.iter().map(|shard| shard.rows.ffn.0 as u64).collect();
+                ops::gather_columns(&devices, &outs, &parts, &firsts, routes as u64, self.shards[0].rows.ffn.1 as u64, ff as u64)?;
+            } else if !wmma {
+                self.sum_activations(routes)?;
+            }
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let (work, shape) = (shard.work.view(first), shard.expert_shape(&hp, gate_bytes, down_bytes, kinds));
                 let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
                 if wmma {
-                    // the summed activations in FP16 (one device: its products are the whole width),
+                    // the whole width's FP16 activations (one device: its products are the whole width),
                     // down into this device's columns of the wave's rows, added to their rows' output
                     let ((_, fs), (h0, hs)) = (shard.rows.ffn, shard.rows.hidden);
                     let (bases, firsts, counts) = slot_wave(slots, wave);
                     let grouped = ops::SlotWave { bases: &bases, firsts: &firsts, counts: &counts, gate_bytes, kinds, width: w as u64,
                                                   ffn_share: fs as u64, ffn: ff as u64, hidden_share: hs as u64, tables: &work.tables };
-                    let product = if split {
-                        shard.gpu.half_values(input.base(), (routes * ff) as u64, work.ah.base())?;
-                        work.ah.base()
-                    } else {
-                        work.ph.base()
-                    };
+                    let product = if split { work.ah.base() } else { work.ph.base() };
                     shard.gpu.slot_moe_down(&grouped, product, work.y.at(h0), w as u64)?;
                     // (an expert's routes at a time: a row routes to several experts of a wave, and a
                     // scatter's adds to one row race; an expert's routes are of distinct rows)

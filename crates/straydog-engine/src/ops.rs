@@ -109,6 +109,20 @@ pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) ->
     check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
+/// Every device's `outs` (`rows` of `full` FP16 values) = each device's `parts` (rows of its `share`
+/// FP16 columns) at its columns `firsts`: the devices' disjoint columns of one product, gathered
+/// (the peers' read over the peer link, ordered as [`sum_devices`] orders its reads).
+pub fn gather_columns(devices: &[&Backend], outs: &[M], parts: &[P], firsts: &[u64], rows: u64, share: u64, full: u64) -> Result<()> {
+    if outs.len() != devices.len() || parts.len() != devices.len() || firsts.len() != devices.len() {
+        return Err("a column gather takes one out, one part and one first column per device".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe {
+        ffi::sd_op_gather_columns(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), firsts.as_ptr(), handles.len() as u64, rows, share, full)
+    })
+}
+
 /// Every device's later work waits until each other device's last [`sum_devices`] has read its
 /// part (that sum reads the parts where they lie): before a device writes a summed part's buffer
 /// again, as a pass's next wave of experts writes its activations.
@@ -595,12 +609,6 @@ impl Backend {
         check(unsafe { ffi::sd_op_half_values(self.handle(), input.cast(), values, output.cast()) })
     }
 
-    /// FP16 `product` rows of `share` into F32 `act` rows of `full` at column `first`, the other
-    /// columns zero.
-    pub fn slot_moe_spread(&mut self, product: P, rows: u64, share: u64, full: u64, first: u64, act: M) -> Result<()> {
-        // SAFETY: as above.
-        check(unsafe { ffi::sd_op_slot_moe_spread(self.handle(), product.cast(), rows, share, full, first, act.cast()) })
-    }
 
     /// `x` (steps x channels) becomes SiLU of each channel's causal convolution with its `taps`
     /// (channels x kernel) over `history` (kernel - 1 rows, oldest first, left holding the last inputs).
