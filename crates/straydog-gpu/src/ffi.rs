@@ -956,6 +956,7 @@ unsafe extern "C" {
         ring: *const f32,
         block: *const f32,
         sinks: *const f32,
+        heads: u64,
         slots: u64,
         anchor: u32,
         history: u64,

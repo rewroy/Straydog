@@ -314,7 +314,7 @@ impl Drafter {
             linear(gpu, &stage.kv, 8, HEAD_DIM, WIDTH, self.x.base(), self.kv.base())?;
             gpu.rms_norm(self.kv.base(), &stage.kv_norm, rows, HEAD_DIM as u64, NORM_EPS, self.kv.base())?;
             gpu.rope(self.kv.base(), rows, 1, HEAD_DIM as u64, ROPE as u64, &block_positions, &self.frequencies, false)?;
-            gpu.dspark_attention(self.q.base(), &stage.ring, self.kv.base(), &stage.sinks, rows, position as u32, history as u64,
+            gpu.dspark_attention(self.q.base(), &stage.ring, self.kv.base(), &stage.sinks, HEADS as u64, rows, position as u32, history as u64,
                                  self.attended.base(), &scratch)?;
             gpu.rope(self.attended.base(), rows, HEADS as u64, HEAD_DIM as u64, ROPE as u64, &block_positions, &self.frequencies, true)?;
             let group_width = HEADS / GROUPS * HEAD_DIM;
