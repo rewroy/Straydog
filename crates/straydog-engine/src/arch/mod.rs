@@ -14,9 +14,32 @@ pub struct Tensor<'a> {
     pub data: &'a [u8],
 }
 
+/// Tensor access during a bounded authentication batch. The bytes still belong to the source,
+/// not the batch: upload threads may borrow them until the source's lifetime ends.
+pub trait TensorBatch<'a> {
+    fn tensor(&self, name: &str) -> Result<Tensor<'a>, String>;
+}
+
+struct DirectBatch<'a, T: ?Sized>(&'a T);
+
+impl<'a, T: Tensors + ?Sized> TensorBatch<'a> for DirectBatch<'a, T> {
+    fn tensor(&self, name: &str) -> Result<Tensor<'a>, String> {
+        self.0.tensor(name)
+    }
+}
+
 /// Where an engine reads its weights: the authenticated files, or a development reader.
 pub trait Tensors {
     fn tensor(&self, name: &str) -> Result<Tensor<'_>, String>;
+
+    /// Authenticate upcoming whole tensors concurrently while `run` consumes them in order.
+    /// Development readers keep their usual access. The scoped callback lets a pinned source
+    /// join every worker before returning, including on an upload error or unwinding.
+    fn with_authentication<'a, R>(&'a self, _names: &[String], run: impl FnOnce(&dyn TensorBatch<'a>) -> Result<R, String>)
+        -> Result<R, String>
+    where Self: Sized {
+        run(&DirectBatch(self))
+    }
 
     /// Start reading these byte ranges of tensors (slices of their `data`) in the background,
     /// so a later access finds them in memory; the default reads nothing ahead.

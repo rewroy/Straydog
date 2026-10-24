@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use memmap2::Mmap;
 use straydog_gguf::{ModelHeader, TensorInfo};
 
-use crate::arch::{Tensor, Tensors};
+use crate::arch::{Tensor, TensorBatch, Tensors};
 use crate::bundle::{self, OnDemand};
 use crate::rows::{ReadPool, RowTable};
 use crate::verity::{Verifier, BLOCK};
@@ -230,8 +230,9 @@ impl Tensors for Pinned {
         let (file, info) = self.tensors.get(name).ok_or_else(|| format!("tensor {name} is missing"))?;
         if taken_whole(name) && !self.checked.lock().unwrap().contains(name) {
             self.check(*file, info.offset, info.bytes)?;
-            self.checked.lock().unwrap().insert(name.to_string());
-            self.verified.fetch_add(info.bytes, Ordering::Relaxed);
+            if self.checked.lock().unwrap().insert(name.to_string()) {
+                self.verified.fetch_add(info.bytes, Ordering::Relaxed);
+            }
         }
         let start = info.offset as usize;
         Ok(Tensor {
@@ -239,6 +240,64 @@ impl Tensors for Pinned {
             dims: info.dimensions.iter().map(|&d| d as usize).collect(),
             data: &self.maps[*file][start..start + info.bytes as usize],
         })
+    }
+
+    fn with_authentication<'a, R>(&'a self, names: &[String], run: impl FnOnce(&dyn TensorBatch<'a>) -> Result<R, String>)
+        -> Result<R, String>
+    {
+        let mut indices = HashMap::new();
+        let mut ranges = Vec::new();
+        let mut ordered = Vec::new();
+        for name in names {
+            let Some((file, info)) = self.tensors.get(name) else { continue };
+            if !taken_whole(name) || self.checked.lock().unwrap().contains(name) || indices.contains_key(name.as_str()) {
+                continue;
+            }
+            indices.insert(name.as_str(), ranges.len());
+            ordered.push(name.as_str());
+            ranges.push(crate::verity::MappedRange { map: &self.maps[*file], verifier: &self.verifiers[*file],
+                                                     offset: info.offset, length: info.bytes });
+        }
+        struct Batch<'a, 'b> {
+            pinned: &'a Pinned,
+            indices: &'b HashMap<&'b str, usize>,
+            checks: &'b crate::verity::MappedChecks,
+            observed_failure: Mutex<Option<String>>,
+        }
+        impl<'a> TensorBatch<'a> for Batch<'a, '_> {
+            fn tensor(&self, name: &str) -> Result<Tensor<'a>, String> {
+                if let Some(&index) = self.indices.get(name) {
+                    self.checks.wait(index).map_err(|error| {
+                        let error = format!("{name}: Straydog model bytes do not verify: {error}");
+                        self.observed_failure.lock().unwrap().get_or_insert(error.clone());
+                        error
+                    })?;
+                    if self.pinned.checked.lock().unwrap().insert(name.to_string()) {
+                        self.pinned.verified.fetch_add(self.pinned.tensors[name].1.bytes, Ordering::Relaxed);
+                    }
+                }
+                self.pinned.tensor(name)
+            }
+        }
+        crate::verity::with_mapped_checks(&ranges, |checks| {
+            let batch = Batch { pinned: self, indices: &indices, checks, observed_failure: Mutex::new(None) };
+            let result = run(&batch);
+            if result.is_err() {
+                // The existing uploader can skip an optional tensor's lookup error and then
+                // fail because that weight is absent. Keep the actual authentication failure
+                // (and its name), rather than replacing it with that downstream upload error.
+                if let Some(error) = batch.observed_failure.into_inner().unwrap() {
+                    return Err(error);
+                }
+                return result;
+            }
+            // Optional absent names remain optional. A present but corrupt tensor must not be
+            // silently skipped by a consumer's optional lookup. Report in planned order.
+            for (index, name) in ordered.iter().enumerate() {
+                checks.wait(index).map_err(|error| format!("{name}: Straydog model bytes do not verify: {error}"))?;
+            }
+            result
+        })?
     }
 
     fn prefetch(&self, ranges: &[&[u8]]) {
@@ -458,6 +517,90 @@ mod tests {
         // A changed header (the first block) fails the opening itself.
         tamper(&bundle, 0, 10);
         assert!(open(&bundle).err().unwrap().contains("does not verify"));
+    }
+
+    #[test]
+    fn pooled_tensors_match_direct_access_and_count_only_once() {
+        let bundle = bundle("pool-intact");
+        let direct = open(&bundle).unwrap();
+        let pooled = open(&bundle).unwrap();
+        let names: Vec<String> = ["token_embd.weight", "blk.0.attn_norm.weight", "token_embd.weight", "optional.absent",
+                                  "per_layer_token_embd.weight", "blk.0.ffn_gate_exps.weight"].map(str::to_string).into();
+        for _ in 0..2 {
+            pooled.with_authentication(&names, |batch| {
+                for name in &names {
+                    match (direct.tensor(name), batch.tensor(name)) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!((a.kind, a.dims, a.data), (b.kind, b.dims, b.data));
+                        }
+                        (Err(a), Err(b)) => assert_eq!(a, b),
+                        _ => panic!("different acceptance for {name}"),
+                    }
+                }
+                Ok(())
+            }).unwrap();
+            assert_eq!(pooled.verified_bytes(), 32_000);
+            assert_eq!(pooled.verified_bytes(), direct.verified_bytes());
+        }
+        pooled.with_authentication(&[], |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn pooled_corruption_is_rejected_by_tensor_without_publishing_success() {
+        let bundle = bundle("pool-tamper");
+        let direct = open(&bundle).unwrap();
+        let pooled = open(&bundle).unwrap();
+        let norm = "blk.0.attn_norm.weight";
+        let (file, offset) = direct.location(norm).unwrap();
+        // One changed byte is outside the 16MiB preflight header, and neither reader has
+        // authenticated this tensor. In-place writing also works with Windows mappings open.
+        tamper(&bundle, file, offset + 7777);
+        let direct_error = direct.tensor(norm).err().unwrap();
+        let names = vec!["token_embd.weight".to_string(), norm.to_string()];
+        for _ in 0..2 {
+            let error = pooled.with_authentication(&names, |batch| {
+                assert!(batch.tensor("token_embd.weight").is_ok());
+                let error = batch.tensor(norm).err().unwrap();
+                assert_eq!(error, format!("{norm}: {direct_error}"));
+                Err::<(), _>(error)
+            }).unwrap_err();
+            assert!(error.starts_with(norm));
+            assert!(!pooled.checked.lock().unwrap().contains(norm));
+            assert_eq!(pooled.verified_bytes(), 12_000);
+        }
+        // Even a consumer that ignores the error cannot turn a corrupt batch into success.
+        assert!(pooled.with_authentication(&names, |_| Ok(())).unwrap_err().starts_with(norm));
+        let error = pooled.with_authentication(&names, |batch| {
+            assert!(batch.tensor(norm).is_err());
+            Err::<(), _>("later uploader is missing that weight".into())
+        }).unwrap_err();
+        assert_eq!(error, format!("{norm}: {direct_error}"));
+        // Two corrupt tensors report the first planned name, not whichever worker finishes
+        // first. No failed tensor increments progress or becomes trusted on the next attempt.
+        tamper(&bundle, 0, direct.location("token_embd.weight").unwrap().1 + 17);
+        let fresh = open(&bundle);
+        // A header-region change is refused by preflight itself; use the existing unchecked
+        // direct reader to exercise ordered pool failures without reopening that header.
+        assert!(fresh.is_err());
+        let reversed = vec![norm.to_string(), "token_embd.weight".to_string()];
+        assert!(direct.with_authentication(&reversed, |_| Ok(())).unwrap_err().starts_with(norm));
+        assert!(direct.with_authentication(&names, |_| Ok(())).unwrap_err().starts_with("token_embd.weight"));
+        assert_eq!(direct.verified_bytes(), 0);
+    }
+
+    #[test]
+    fn pooled_consumer_failure_does_not_leave_background_work_or_failed_state() {
+        let bundle = bundle("pool-cancel");
+        let pooled = open(&bundle).unwrap();
+        let names = vec!["token_embd.weight".to_string(), "blk.0.attn_norm.weight".to_string()];
+        let result = pooled.with_authentication(&names, |_| Err::<(), _>("upload failed".into()));
+        assert_eq!(result.unwrap_err(), "upload failed");
+        assert_eq!(pooled.verified_bytes(), 0);
+        pooled.with_authentication(&names, |batch| {
+            for name in &names { batch.tensor(name)?; }
+            Ok(())
+        }).unwrap();
+        assert_eq!(pooled.verified_bytes(), 32_000);
     }
 
     #[test]

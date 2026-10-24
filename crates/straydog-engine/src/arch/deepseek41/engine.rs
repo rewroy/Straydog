@@ -860,7 +860,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         let tensors = self.tensors;
         let copy = |tensor: &Tensor<'a>| Tensor { kind: tensor.kind, dims: tensor.dims.clone(), data: tensor.data };
-        std::thread::scope(|scope| {
+        let mut authentication = names.clone();
+        for layer in range.clone() {
+            authentication.extend(["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"].map(|role| name(layer, role)));
+        }
+        // Include planning/worker setup in dense read, rather than hiding work before its timer.
+        let preparing = std::time::Instant::now();
+        tensors.with_authentication(&authentication, |tensors| std::thread::scope(|scope| {
+            let prepared = preparing.elapsed().as_secs_f64();
             let (mut senders, mut threads) = (Vec::new(), Vec::new());
             for (part, shard) in self.shards.iter_mut().enumerate() {
                 let (sender, receiver) = channel::<Resident<'a>>();
@@ -880,7 +887,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let send = |resident: &dyn Fn() -> Resident<'a>| senders.iter().all(|sender| sender.send(resident()).is_ok());
             let mut taken = Ok(());
             // (the time the source takes to hand the dense tensors over: their authentication)
-            let mut reading = 0.0;
+            let mut reading = prepared;
             for name in names {
                 let read = std::time::Instant::now();
                 let Ok(tensor) = tensors.tensor(&name) else { continue };
@@ -917,7 +924,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 thread.join().unwrap_or_else(|_| Err("a device's upload thread panicked".into()))?;
             }
             taken.map(|()| (reading, waiting.elapsed().as_secs_f64()))
-        })
+        }))
     }
 
     /// Attribute the time since the last mark to `phase` (profiling only: waits for the GPUs, but

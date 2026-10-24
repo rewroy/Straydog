@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -255,6 +255,105 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
     }
 }
 
+/// A whole tensor to check during a scoped batch. The mapping is borrowed, never copied into
+/// the work queue; the same immutability assumptions as `verify_mapped` apply.
+pub struct MappedRange<'a> {
+    pub map: &'a [u8],
+    pub verifier: &'a Verifier,
+    pub offset: u64,
+    pub length: u64,
+}
+
+struct CheckState {
+    remaining: usize,
+    // Keep the earliest failing piece, independently of worker completion order.
+    failure: Option<(u64, String)>,
+}
+
+/// Completion of each input range. A successful wait means ALL blocks of that range verified;
+/// a later range's failure cannot replace the result of an earlier consumer access.
+pub struct MappedChecks {
+    states: Vec<(Mutex<CheckState>, Condvar)>,
+}
+
+impl MappedChecks {
+    pub fn wait(&self, index: usize) -> Result<(), String> {
+        let (state, ready) = &self.states[index];
+        let state = ready.wait_while(state.lock().unwrap(), |state| state.remaining != 0).unwrap();
+        match &state.failure {
+            Some((_, error)) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn complete(&self, index: usize, offset: u64, result: Result<(), String>) {
+        let (state, ready) = &self.states[index];
+        let mut state = state.lock().unwrap();
+        if let Err(error) = result {
+            if state.failure.as_ref().is_none_or(|(first, _)| offset < *first) {
+                state.failure = Some((offset, error));
+            }
+        }
+        state.remaining -= 1;
+        if state.remaining == 0 {
+            ready.notify_all();
+        }
+    }
+}
+
+/// One persistent group of bounded workers for pieces from ALL input tensors. Work descriptors
+/// contain only indices/ranges: at most `min(available_parallelism, 8)` pieces fault/hash at once,
+/// with no model-sized payload allocation or nested per-tensor thread groups.
+///
+/// `run` waits for tensors in its original order and can overlap their uploads with later checks.
+/// It must not return success after ignoring a failed wait; callers check planned results in
+/// input order after `run` succeeds. Dropping the cancellation guard also handles unwinding:
+/// scoped threads finish their current piece and join before any borrowed mapping can disappear.
+pub fn with_mapped_checks<R>(ranges: &[MappedRange<'_>], run: impl FnOnce(&MappedChecks) -> R) -> Result<R, String> {
+    const PIECE: u64 = 16 << 20;
+    let mut jobs = Vec::new();
+    let mut states = Vec::with_capacity(ranges.len());
+    for (index, range) in ranges.iter().enumerate() {
+        let size = range.map.len() as u64;
+        if range.offset.checked_add(range.length).is_none_or(|end| end > size) {
+            return Err("a verified range past the file's end".into());
+        }
+        let first = range.offset / BLOCK as u64 * BLOCK as u64;
+        let end = (range.offset + range.length).next_multiple_of(BLOCK as u64).min(size);
+        let before = jobs.len();
+        for offset in (first..end).step_by(PIECE as usize) {
+            jobs.push((index, offset, (end - offset).min(PIECE)));
+        }
+        states.push((Mutex::new(CheckState { remaining: jobs.len() - before, failure: None }), Condvar::new()));
+    }
+    let checks = MappedChecks { states };
+    let next = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    struct Cancel<'a>(&'a AtomicBool);
+    impl Drop for Cancel<'_> {
+        fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get()).min(8).min(jobs.len());
+    Ok(std::thread::scope(|scope| {
+        let _cancel = Cancel(&cancelled);
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while !cancelled.load(Ordering::Relaxed) {
+                    let Some(&(index, offset, length)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
+                    let range = &ranges[index];
+                    // A worker panic must complete this item with an error, rather than leave
+                    // a consumer asleep forever waiting for a piece that can never finish.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        verify_mapped(range.map, range.verifier, offset, length, 1)
+                    })).unwrap_or_else(|_| Err("authentication worker panicked".into()));
+                    checks.complete(index, offset, result);
+                }
+            });
+        }
+        run(&checks)
+    }))
+}
+
 pub struct Verifier {
     geometry: Geometry,
     tree: File,
@@ -407,5 +506,58 @@ impl Verifier {
         }
         cache.blocks.insert(tree_block, (block.clone(), true));
         Ok(block)
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn pooled_mapped_ranges_match_serial_checks_and_join_on_early_exit() {
+        let size = (33 << 20) + 137;
+        let mut data: Vec<u8> = (0..size).map(|at| (at * 37 % 251) as u8).collect();
+        let file = std::env::temp_dir().join(format!("straydog-auth-pool-{}.data", std::process::id()));
+        let tree = file.with_extension("tree");
+        std::fs::write(&file, &data).unwrap();
+        let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+        let verifier = Verifier::open(&tree, size as u64, &digest, 4 * BLOCK).unwrap();
+        // Small tensors, several pieces of one tensor, unaligned/shared blocks, partial EOF,
+        // and zero-length ranges. All use the identical block checker and pinned root.
+        let spans = [(0, 1 << 20), (100_000, 30 << 20), (size as u64 - 100, 100),
+                     (0, size as u64), (4095, 2), (size as u64, 0)];
+        let pooled = |data: &[u8]| {
+            let ranges: Vec<_> = spans.iter().map(|&(offset, length)| MappedRange { map: data, verifier: &verifier, offset, length }).collect();
+            with_mapped_checks(&ranges, |checks| {
+                spans.iter().enumerate().map(|(index, &(offset, length))| {
+                    let expected = verify_mapped(data, &verifier, offset, length, 1);
+                    assert_eq!(checks.wait(index), expected, "range {index}");
+                    expected
+                }).collect::<Vec<_>>()
+            }).unwrap()
+        };
+        assert!(pooled(&data).iter().all(Result::is_ok));
+        for at in [17 << 20, size - 3] {
+            data[at] ^= 1;
+            let results = pooled(&data);
+            assert!(results[0].is_ok());
+            assert!(results[3].is_err());
+            data[at] ^= 1;
+        }
+        let range = MappedRange { map: &data, verifier: &verifier, offset: 0, length: size as u64 };
+        let early: Result<(), &str> = with_mapped_checks(&[range], |_| Err("upload failed")).unwrap();
+        assert_eq!(early, Err("upload failed"));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let range = MappedRange { map: &data, verifier: &verifier, offset: 0, length: size as u64 };
+            with_mapped_checks(&[range], |_| panic!("consumer failed"))
+        }));
+        assert!(unwound.is_err());
+        assert!(pooled(&data).iter().all(Result::is_ok));
+        assert!(with_mapped_checks(&[], |_| true).unwrap());
+        let invalid = MappedRange { map: &data, verifier: &verifier, offset: size as u64, length: 1 };
+        assert!(with_mapped_checks(&[invalid], |_| ()).is_err());
+        drop(verifier);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_file(tree).unwrap();
     }
 }
