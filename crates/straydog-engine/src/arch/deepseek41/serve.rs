@@ -35,6 +35,9 @@ pub const CHECKPOINTS: usize = 4;
 /// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
 /// over it (past ~160K tokens) is not taken.
 pub const CHECKPOINT_BYTES: u64 = 1 << 30;
+/// Write-backs a device queues a step of making room between requests ([`Engines::make_room`]):
+/// ~20 MB, about what its downloads move in the worker's 1 ms between steps.
+const ROOM_STEP: usize = 4;
 
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
@@ -134,6 +137,14 @@ impl served::Engines for Engines {
 
     fn settle(&mut self) -> Result<(), String> {
         self.engines.iter_mut().try_for_each(Engine::settle)
+    }
+
+    fn make_room(&mut self) -> Result<bool, String> {
+        let mut done = true;
+        for engine in &mut self.engines {
+            done &= engine.make_room(ROOM_STEP)?;
+        }
+        Ok(done)
     }
 
     fn verify_rows(&self) -> usize {

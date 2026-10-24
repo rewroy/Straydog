@@ -1195,6 +1195,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.iter().map(|shard| shard.experts.counts()).fold(Counts::default(), |sum, counts| sum + counts)
     }
 
+    /// Between requests: room in each device's store for the next prefill's first waves (see
+    /// [`DeviceExperts::make_room`]), at most `budget` write-backs a device. Whether there is.
+    pub fn make_room(&mut self, budget: usize) -> Result<bool> {
+        let mut done = true;
+        for shard in &mut self.shards {
+            let slots = 2 * shard.experts.wave_limit().min(WAVE);
+            done &= shard.experts.make_room(&mut shard.gpu, slots, budget)?;
+        }
+        Ok(done)
+    }
+
     /// Wait for the expert stores' reads and copies (before dropping the engine).
     pub fn settle(&mut self) -> Result<()> {
         for shard in &mut self.shards {
@@ -2123,7 +2134,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             shard.gpu.write_buffer(&work.route_rows, 0, &grouped.rows)?;
             shard.gpu.write_buffer(&work.route_weights, 0, &grouped.weights)?;
             // (the layer's misses stream through, leaving the VRAM's experts to decoding)
-            shard.experts.set_streaming(true);
+            shard.experts.set_streaming(&mut shard.gpu, true)?;
             if let Some(wave) = waves.first() {
                 shard.experts.request_bulk(&mut shard.gpu, layer, &experts(wave))?;
             }
@@ -2210,7 +2221,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         for shard in &mut self.shards {
-            shard.experts.set_streaming(false);
+            shard.experts.set_streaming(&mut shard.gpu, false)?;
         }
         self.mark("routed experts")
     }

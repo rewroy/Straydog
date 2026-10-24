@@ -673,3 +673,59 @@ fn bulk_reads_and_decode_reads_preserve_expert_bytes() {
     drop(store);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn a_prefill_streams_through_and_room_is_made_between_requests() {
+    let layers = roles();
+    let (path, mut gpu, mut store, _reads) = open(&layers, 16, 24);
+    let check = |gpu: &mut Backend, store: &mut DeviceExperts, layer: usize, experts: &[usize], what: &str| {
+        let slots = store.acquire(gpu, layer, experts).unwrap();
+        check_slots(gpu, layers[layer].as_ref().unwrap(), experts, &slots, what);
+        store.release(gpu).unwrap();
+    };
+    // Decoding fills every slot (one class: both layers' experts take the same bytes).
+    for expert in 0..16 {
+        check(&mut gpu, &mut store, if expert % 2 == 0 { 0 } else { 2 }, &[20 + expert], "decode");
+    }
+    // A prefill's layer 0 in waves of 6, the next prefetched beside each, then a guess at layer 2's
+    // first wave (experts 0-5), of which its wave takes 1, 3 and 5.
+    store.set_streaming(&mut gpu, true).unwrap();
+    let waves: [&[usize]; 3] = [&[0, 1, 2, 3, 4, 5], &[6, 7, 8, 9, 10, 11], &[12, 13]];
+    for (index, wave) in waves.iter().enumerate() {
+        let slots = store.acquire(&mut gpu, 0, wave).unwrap();
+        check_slots(&mut gpu, layers[0].as_ref().unwrap(), wave, &slots, "layer 0 wave");
+        match waves.get(index + 1) {
+            Some(next) => store.prefetch_bulk(&mut gpu, 0, next, true).unwrap(),
+            None => store.prefetch_bulk(&mut gpu, 2, &[0, 1, 2, 3, 4, 5], true).unwrap(),
+        }
+        store.release(&mut gpu).unwrap();
+    }
+    // (the guesses land through layer 2's attention)
+    store.wait_reads(&mut gpu).unwrap();
+    store.set_streaming(&mut gpu, false).unwrap();
+    // (the guesses at layer 2 stay for it; layer 0's streamed experts left)
+    assert!(store.vram_keys().iter().all(|&(layer, expert)| layer == 2 || expert >= 20), "{:?}", store.vram_keys());
+    store.set_streaming(&mut gpu, true).unwrap();
+    check(&mut gpu, &mut store, 2, &[1, 3, 5, 30], "layer 2 wave");
+    store.set_streaming(&mut gpu, false).unwrap();
+    // Neither the guesses its wave took nor those it did not stay: only decoding's experts do.
+    assert!(store.vram_keys().iter().all(|&(layer, expert)| expert >= 20 && (layer, expert) != (2, 30)), "{:?}", store.vram_keys());
+    let free = store.free_slots(0);
+    assert!(free >= 12, "{free} slots free after the prefill");
+    // Decoding takes the free slots again; between requests the room comes back, a step at a time.
+    for expert in 0..10 {
+        check(&mut gpu, &mut store, 0, &[expert], "decode after");
+    }
+    assert!(!store.make_room(&mut gpu, 8, 1).unwrap());
+    while !store.make_room(&mut gpu, 8, 2).unwrap() {}
+    let free = store.free_slots(0);
+    assert!(free >= 12, "{free} slots free after making room");
+    // What went back to the host tier comes up whole.
+    for expert in 0..10 {
+        check(&mut gpu, &mut store, 0, &[expert], "after making room");
+    }
+    check(&mut gpu, &mut store, 2, &[21, 23, 25, 27, 29, 31, 33, 35], "decode's experts");
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}

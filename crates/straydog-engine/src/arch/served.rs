@@ -59,6 +59,11 @@ pub trait Engines {
     fn gpus(&self) -> Vec<&Backend>;
     /// Wait for the stores' reads and copies (before the process ends).
     fn settle(&mut self) -> Result<(), String>;
+    /// Between requests: a few of the stores' write-backs that make room for the next prefill's
+    /// experts; whether the room is made.
+    fn make_room(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
     /// Copies of the sequence state the engines keep ([`Engines::checkpoint`]); none: a session
     /// continues only a sequence the prompt extends.
     fn checkpoints(&self) -> usize {
@@ -650,6 +655,12 @@ impl<E: Engines> Session<E> {
     /// Wait for the expert stores' reads and copies (before the process ends).
     pub fn settle(&mut self) -> Result<(), String> {
         self.engines.settle()
+    }
+
+    /// Between requests: a step of making the stores' room for the next prefill (without
+    /// waiting); whether that is done.
+    pub fn make_room(&mut self) -> Result<bool, String> {
+        self.engines.make_room()
     }
 }
 

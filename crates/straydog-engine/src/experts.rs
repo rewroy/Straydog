@@ -984,14 +984,51 @@ impl DeviceExperts {
     /// streams them through the slots its releases free instead of turning the VRAM's experts
     /// (what decoding keeps hitting) over, and moves each only one way over the bus. An upload
     /// and a write-back at once share the host's ~50 GB/s: each GPU's uploads fell from ~25 to
-    /// ~12 GB/s. Off again, the experts still filled stay as any others.
-    pub fn set_streaming(&mut self, on: bool) {
+    /// ~12 GB/s. Off again (a layer's routed experts done), a guess for the next layer not yet
+    /// taken stays streamed, for that layer's release to free; a streamed expert no wave took
+    /// (a guess its layer did not route to) is emptied, the host tier holding it; the rest stay
+    /// as any others. Kept as residents, the next layer's guesses (up to a wave a layer) each
+    /// took a free slot for good, and later fills wrote back as many residents: ~1500 of a
+    /// 300-token prefill's 2100 write-backs.
+    pub fn set_streaming(&mut self, gpu: &mut Backend, on: bool) -> Result<()> {
         self.streaming = on;
-        if !on {
-            for slot in &mut self.slots {
-                slot.streamed = false;
+        if on {
+            return Ok(());
+        }
+        for slot in 0..self.slots.len() {
+            let entry = &mut self.slots[slot];
+            if !entry.streamed || entry.speculative {
+                continue;
+            }
+            entry.streamed = false;
+            if !entry.held && entry.waiting.is_none() {
+                self.evict(gpu, slot)?;
             }
         }
+        Ok(())
+    }
+
+    /// Between requests: write back the least recently used experts, at most `budget`, until each
+    /// class has `slots` free beyond its reserve. A prefill takes two waves' slots of each class at
+    /// once (a wave, and the next one's prefetch); the last prefill's releases freed them, but
+    /// decoding has filled them since, so a prefill's first waves of each class wrote ~600
+    /// residents back while their uploads waited (a write-back beside an upload halves it).
+    /// Whether every class has its room.
+    pub fn make_room(&mut self, gpu: &mut Backend, slots: usize, budget: usize) -> Result<bool> {
+        let mut budget = budget;
+        for class in 0..self.classes.len() {
+            let want = (slots + self.classes[class].reserve).min(self.classes[class].count);
+            while self.classes[class].free.len() < want {
+                if budget == 0 {
+                    return Ok(false);
+                }
+                let Ok(victim) = self.victim(class) else { break };
+                self.settled = false;
+                self.evict(gpu, victim)?;
+                budget -= 1;
+            }
+        }
+        Ok(true)
     }
 
     fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
@@ -1810,6 +1847,11 @@ impl DeviceExperts {
         let Some(key) = self.empty_slot(slot) else { return Ok(()) };
         let class = self.slots[slot].class;
         if self.classes[class].host_capacity == 0 || self.host_map.contains_key(&key) {
+            // Nothing to write back, but the slot's upload may still run (a guess's, on its own
+            // stream): its next fill waits for it. (A download from the slot waited for it too.)
+            if let Some((_, ready)) = self.slots[slot].ready.take() {
+                self.slots[slot].guards[1].get_or_insert(ready);
+            }
             return Ok(());
         }
         let host = self.free_host(gpu, class)?;

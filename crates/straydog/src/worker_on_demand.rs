@@ -114,36 +114,52 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                     return;
                 }
             };
-            // Between requests, an earlier run's experts come back a few reads at a time.
+            // Between requests, an earlier run's experts come back a few reads at a time; then
+            // (and after each request) the stores make room for the next prefill a few
+            // write-backs at a time.
             let mut warming: Option<Instant> = None;
+            let mut rooming = false;
             loop {
-                let job = match warming {
-                    Some(_) => match queue.recv_timeout(std::time::Duration::from_millis(1)) {
+                let job = if warming.is_some() || rooming {
+                    match queue.recv_timeout(std::time::Duration::from_millis(1)) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
-                                Ok(false) => {}
-                                Ok(true) => {
-                                    eprintln!("Straydog warmed up in {:.1} s", warming.unwrap().elapsed().as_secs_f64());
-                                    warming = None;
+                            if let Some(since) = warming {
+                                match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
+                                    Ok(false) => {}
+                                    Ok(true) => {
+                                        eprintln!("Straydog warmed up in {:.1} s", since.elapsed().as_secs_f64());
+                                        warming = None;
+                                        rooming = true;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("Straydog stopped warming up: {error}");
+                                        warming = None;
+                                    }
                                 }
-                                Err(error) => {
-                                    eprintln!("Straydog stopped warming up: {error}");
-                                    warming = None;
+                            } else {
+                                match served.model.make_room() {
+                                    Ok(done) => rooming = !done,
+                                    Err(error) => {
+                                        eprintln!("Straydog stopped making room for the next prefill: {error}");
+                                        rooming = false;
+                                    }
                                 }
                             }
                             continue;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    },
-                    None => match queue.recv() {
+                    }
+                } else {
+                    match queue.recv() {
                         Ok(job) => job,
                         Err(_) => break,
-                    },
+                    }
                 };
                 match job {
                     Job::Run { body, id, output, cancel, started, text, reply } => {
                         let _ = reply.send(served.run(&text, &output, &id, &body, &cancel, started));
+                        rooming = true;
                     }
                     Job::Reset(reply) => {
                         served.model.reset();
