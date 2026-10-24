@@ -54,4 +54,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# Tests read floats back from the server's JSON (the dashboard's sample times, which a test then
+# sends as its cursor): without float_roundtrip about 1 in 8 parse one ulp off, and a sample the
+# test already has comes back as newer. Tests only: the server's own parsing is unchanged.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 tower = { version = "0.5", features = ["util"] }
