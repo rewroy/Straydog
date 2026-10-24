@@ -96,8 +96,10 @@ fn a_parked_conversation_comes_back() {
         let digests: Vec<String> = serde_json::from_value(request("live")["logits"].clone()).unwrap();
         assert_eq!(tokens, pinned, "{name}: tokens");
         assert_eq!(logits, digests, "{name}: logits");
+        assert_eq!(digest(model.final_hidden().unwrap()), request("live")["final_hidden"].as_str().unwrap(), "{name}: final hidden");
         eprintln!("{name}: parked in {saved:.3} s, restored in {:.3} s", model.last_metrics["park_seconds"].as_f64().unwrap());
     }
+    bounded_parking(&model_root, &drafter, quantization, &golden);
 }
 
 #[test]
@@ -192,4 +194,248 @@ fn generations_equal_the_reference() {
             .collect();
         std::fs::write(&path, text).unwrap();
     }
+}
+
+/// What a request left: its greedy tokens, its logits' digests, the final hidden state's digest,
+/// the digest of the sequence state then valid (K/V and pooled rows below its end, the indexers'
+/// history, the recurrent state) and its metrics.
+struct Outcome {
+    tokens: Vec<u32>,
+    logits: Vec<String>,
+    hidden: String,
+    state: Vec<String>,
+    metrics: serde_json::Map<String, Json>,
+}
+
+/// `prompt` with greedy decoding of `max_new`, cancelled at the `cancel`th check if given.
+fn go(model: &mut Model, prompt: &[u32], max_new: usize, cancel: Option<usize>) -> Outcome {
+    model.logits_digests = Some(Vec::new());
+    let checks = std::cell::Cell::new(0usize);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        cancel.is_some_and(|at| checks.get() >= at)
+    };
+    let mut tokens = Vec::new();
+    model.generate(prompt, max_new, &straydog_engine::sampling::Sampling::GREEDY, 0, &cancelled, &mut |_, _| {}, true, true,
+                   &mut |token| tokens.push(token)).unwrap();
+    Outcome { tokens, logits: model.logits_digests.take().unwrap(), hidden: model.final_hidden().map(digest).unwrap_or_default(),
+              state: model.state_digest().unwrap(), metrics: model.last_metrics.clone() }
+}
+
+/// The length of the prefix `a` and `b` share.
+fn shared(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The chat template's next turn: the conversation so far (`prompt` and its reply `reply`), a
+/// user message of `content`, and the assistant's header.
+fn turn(prompt: &[u32], reply: &[u32], content: &[u32]) -> Vec<u32> {
+    let (start, end, user, assistant, newline) = (248045, 248046, 846, 74455, 198);
+    let mut next = prompt.to_vec();
+    if !reply.is_empty() {
+        next.extend_from_slice(reply);
+        next.extend([end, newline]);
+    }
+    next.extend([start, user, newline]);
+    next.extend_from_slice(content);
+    next.extend([end, newline, start, assistant, newline, 248068, 271, 248069, 271]);
+    next
+}
+
+/// The conversations' prompts (the later turns built on the reference's replies).
+struct Prompts {
+    root: Vec<u32>, short: Vec<u32>, live: Vec<u32>, tools: Vec<u32>, tools_more: Vec<u32>, step: Vec<u32>,
+    step_last: Vec<u32>, other: Vec<u32>, other_next: Vec<u32>, other_last: Vec<u32>, other_final: Vec<u32>, past: Vec<u32>,
+}
+
+/// Parking a conversation copies only what later prompts overwrite (T164's first policy), and a
+/// restored conversation goes on exactly as if nothing had come between. The requests run
+/// interleaved, conversations parked and restored, twice: parking each departing conversation
+/// whole at once (the reference for every bit) and bounded; every request leaves the same
+/// tokens, logits, final hidden state, resume position, drafts and sequence state (the MTP
+/// layer's too) in both. Each conversation's requests also run back to back, never parked, and
+/// the interleaved ones leave the same tokens, logits, hidden and target state as there. Among
+/// them: a short prompt that copies a few positions and borrows the rest of a 4.9K conversation
+/// (1); its continuation past what was copied (2); a prompt that resumes from a checkpoint below
+/// where it departs (R < live) and prompt lengths at different residues of four (3); drafts at
+/// max_new 1, 2 and 3 and prompts on the stashed and the kept MTP paths, one a token past a
+/// prefill batch (4); a prompt cancelled during its prefill (5); two long conversations trading
+/// places, both slots, and a budget too low for a swap or a copy (6); with the K/V in VRAM and
+/// in host memory behind its stage (7). Run by a_parked_conversation_comes_back, which holds the
+/// GPUs.
+fn bounded_parking(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &str, golden: &Json) {
+    for name in ["two-gpu-experts-mtp", "two-gpu-host-kv-mtp"] {
+        let expected = &golden["placements"][name];
+        let prompt = |label: &str| -> Vec<u32> {
+            let request = expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == label).unwrap();
+            serde_json::from_value(request["prompt"].clone()).unwrap()
+        };
+        let (root, tools, short) = (prompt("root"), prompt("tools"), prompt("short"));
+        // A second conversation whose system prompt ends at 2051 (its root checkpoint at 2052).
+        let mut other = root[..2051].to_vec();
+        other.extend([248046, 198]);
+        let other = turn(&other, &[], &root[100..3100]);
+
+        // Each conversation's requests back to back.
+        let mut model = open(model_root, drafter, quantization, &expected["placement"]);
+        let mut apart = std::collections::HashMap::new();
+        let root_out = go(&mut model, &root, 24, None);
+        let live = turn(&root, &root_out.tokens, &root[4000..4030]);
+        apart.insert("live", go(&mut model, &live, 24, None));
+        let other_out = go(&mut model, &other, 24, None);
+        let other_next = turn(&other, &other_out.tokens, &root[200..260]);
+        let other_next_out = go(&mut model, &other_next, 16, None);
+        let other_last = turn(&other_next, &other_next_out.tokens, &root[300..320]);
+        apart.insert("other", other_out);
+        apart.insert("other-next", other_next_out);
+        let other_last_out = go(&mut model, &other_last, 16, None);
+        let other_final = turn(&other_last, &other_last_out.tokens, &root[700..720]);
+        apart.insert("other-last", other_last_out);
+        apart.insert("other-final", go(&mut model, &other_final, 16, None));
+        let tools_out = go(&mut model, &tools, 40, None);
+        // (its reply decoded further, from the one token after it)
+        let tools_more = [&tools[..], &tools_out.tokens[..]].concat();
+        apart.insert("tools-more", go(&mut model, &tools_more, 8, None));
+        let step = turn(&tools, &tools_out.tokens, &root[400..430]);
+        let step_out = go(&mut model, &step, 24, None);
+        let step_last = turn(&step, &step_out.tokens, &root[500..520]);
+        apart.insert("tools", tools_out);
+        apart.insert("step", step_out);
+        apart.insert("step-last", go(&mut model, &step_last, 16, None));
+        // A prompt one token past a prefill batch (4096): its last token runs alone after the
+        // pipelined batch, its MTP pair from the row that batch kept (no checkpoint between).
+        let past: Vec<u32> = root.iter().copied().filter(|token| ![248045, 248046].contains(token)).take(4097).collect();
+        apart.insert("pipeline-end", go(&mut model, &past, 4, None));
+        apart.insert("root", root_out);
+        drop(model);
+
+        let prompts = Prompts { root, short, live, tools, tools_more, step, step_last, other, other_next, other_last, other_final, past };
+        let mut model = open(model_root, drafter, quantization, &expected["placement"]);
+        model.park_whole();
+        let whole = interleaved(&mut model, name, &prompts, true);
+        drop(model);
+        let mut model = open(model_root, drafter, quantization, &expected["placement"]);
+        let bounded = interleaved(&mut model, name, &prompts, false);
+        drop(model);
+
+        for ((label, outcome), (_, wanted)) in bounded.iter().zip(&whole) {
+            compare(name, label, outcome, wanted, true);
+            // (the MTP layer's rows also depend on what ran before a request, T176, even rows of
+            // a prompt it recomputes whole: the tools prompt's row 5191 of 5202 by the
+            // conversation before it; back to back, that conversation is another)
+            if let Some(apart) = apart.get(label) {
+                compare(name, label, outcome, apart, *label == "root");
+            }
+        }
+        eprintln!("{name}: every request as with whole copies, bit for bit");
+    }
+}
+
+/// `outcome` as `wanted`: resume position, tokens, logits, final hidden state and the target's
+/// state, with `exact` the MTP layer's state and drafts too.
+fn compare(name: &str, label: &str, outcome: &Outcome, wanted: &Outcome, exact: bool) {
+    assert_eq!(outcome.metrics["cached_tokens"], wanted.metrics["cached_tokens"], "{name} {label}: resumed at");
+    assert_eq!(outcome.tokens, wanted.tokens, "{name} {label}: tokens");
+    assert_eq!(outcome.logits, wanted.logits, "{name} {label}: logits");
+    assert_eq!(outcome.hidden, wanted.hidden, "{name} {label}: final hidden");
+    let differing: Vec<_> =
+        outcome.state.iter().zip(&wanted.state).filter(|(a, b)| a != b && (exact || !a.contains(":blk.48."))).collect();
+    for (actual, expected) in &differing {
+        eprintln!("{name} {label}: {actual} (reference {})", expected.rsplit(' ').next().unwrap());
+    }
+    let drafts = ["speculative_passes", "drafted_tokens", "accepted_tokens"].map(|key| (outcome.metrics.get(key), wanted.metrics.get(key)));
+    if exact && drafts.iter().any(|(a, b)| a != b) {
+        eprintln!("{name} {label}: drafts {drafts:?} (this run, the reference)");
+    }
+    assert!(differing.is_empty() && outcome.state.len() == wanted.state.len(), "{name} {label}: state ({} parts differ)", differing.len());
+    assert!(!exact || drafts.iter().all(|(a, b)| a == b), "{name} {label}: the MTP layer's drafts");
+}
+
+/// The interleaved requests and what each left, the parking's own checks along them (those of
+/// bounded copies unless `whole`).
+fn interleaved(model: &mut Model, name: &str, p: &Prompts, whole: bool) -> Vec<(&'static str, Outcome)> {
+    let mut outcomes = Vec::new();
+    fn record<'a>(outcomes: &'a mut Vec<(&'static str, Outcome)>, label: &'static str, outcome: Outcome) -> &'a Outcome {
+        outcomes.push((label, outcome));
+        &outcomes.last().unwrap().1
+    }
+    let root = &p.root;
+    record(&mut outcomes, "root", go(model, root, 24, None));
+    // (1) a short prompt: the conversation parked, a few positions copied, the rest borrowed
+    let short_out = go(model, &p.short, 1, None);
+    assert_eq!(short_out.metrics["parked"], "saved", "{name}: parked");
+    let (covered, end) = model.parked_coverage().unwrap();
+    let (low, high) = covered.unwrap();
+    if !whole {
+        assert!(low == 0 && high < 64 && end > 4900, "{name}: only the short prompt's positions copied ({low}..{high} of {end})");
+        assert_eq!(short_out.metrics["park_borrowed_positions"], (end - high) as u64, "{name}: borrowed");
+    }
+    // (2) its continuation, past what was copied (max_new 2): the coverage grows first
+    let short_next = turn(&p.short, &short_out.tokens, &root[600..640]);
+    let next_out = go(model, &short_next, 2, None);
+    let (grown, _) = model.parked_coverage().unwrap();
+    if !whole {
+        assert!(grown.unwrap().1 > high && next_out.metrics["park_copied_positions"].as_u64().unwrap() > 0, "{name}: grown");
+    }
+    let outcome = record(&mut outcomes, "short", short_out);
+    let short_cached = outcome.metrics["cached_tokens"].clone();
+    let short_tokens = outcome.tokens.clone();
+    let next = record(&mut outcomes, "short-next", next_out);
+    let next_digests = (next.tokens.clone(), next.logits.clone(), next.hidden.clone(), next.state.clone());
+    let restored = record(&mut outcomes, "live", go(model, &p.live, 24, None));
+    assert_eq!(restored.metrics["parked"], "restored", "{name}: back");
+    // (5) a long prompt cancelled during its prefill (the root conversation parked again)
+    let cancelled = record(&mut outcomes, "cancelled", go(model, &p.tools, 40, Some(3)));
+    assert_eq!(cancelled.metrics["parked"], "saved", "{name}: parked before the cancelled prompt");
+    record(&mut outcomes, "other", go(model, &p.other, 24, None));
+    // (3) resuming from the other conversation's root checkpoint (2052) below where it departs
+    // (2500), max_new 3: the copy starts under the checkpoint
+    let mut below = p.other[..2500].to_vec();
+    below.extend_from_slice(&p.short);
+    let below_out = record(&mut outcomes, "below", go(model, &below, 3, None));
+    assert_eq!((below_out.metrics["parked"].as_str(), below_out.metrics["cached_tokens"].as_u64()), (Some("saved"), Some(2052)),
+               "{name}: from the root checkpoint");
+    let (covered, _) = model.parked_coverage().unwrap();
+    if !whole {
+        assert_eq!(covered.unwrap().0, 2048, "{name}: copied from the MTP pair under the checkpoint");
+    }
+    record(&mut outcomes, "other-next", go(model, &p.other_next, 16, None));
+    // (6) two long conversations trading places: the other parked as the tools one starts, each
+    // back in turn, the live one parked whole in the other slot
+    record(&mut outcomes, "tools", go(model, &p.tools, 40, None));
+    record(&mut outcomes, "tools-more", go(model, &p.tools_more, 8, None));
+    record(&mut outcomes, "step", go(model, &p.step, 24, None));
+    let last = record(&mut outcomes, "other-last", go(model, &p.other_last, 16, None));
+    assert_eq!(last.metrics["parked"], "restored", "{name}: the other back");
+    let (covered, end) = model.parked_coverage().unwrap();
+    assert_eq!(covered.unwrap().1, end, "{name}: the tools conversation parked whole");
+    let back = record(&mut outcomes, "step-last", go(model, &p.step_last, 16, None));
+    assert_eq!(back.metrics["parked"], "restored", "{name}: the tools conversation back");
+    // (6, low headroom) the other conversation back once more with room for the live one's own
+    // part only, not down to the lowest copy: the live one is not parked
+    let (covered, _) = model.parked_coverage().unwrap();
+    let (low, common) = (covered.unwrap().0, shared(&model.history, &p.other_final));
+    assert!(low < common && model.history.len() - common >= 1024, "{name}: a copy below the shared {common} ({low})");
+    model.limit_parking(model.history.len() - common);
+    let last = record(&mut outcomes, "other-final", go(model, &p.other_final, 16, None));
+    assert_eq!(last.metrics["parked"], "restored", "{name}: the other back");
+    assert!(model.parked_coverage().is_none(), "{name}: the live one parked from {common}");
+    // (6, low headroom) a prompt whose copies would outgrow the budget: the parked conversation
+    // is dropped (bounded), and the prompt runs as it did
+    model.limit_parking(1 << 20);
+    let again = record(&mut outcomes, "short-again", go(model, &p.short, 1, None));
+    assert_eq!((again.metrics["parked"].as_str(), &again.metrics["cached_tokens"], &again.tokens),
+               (Some("saved"), &short_cached, &short_tokens), "{name}: parked again");
+    let (covered, _) = model.parked_coverage().unwrap();
+    let (low, high) = covered.unwrap();
+    model.limit_parking(high - low);
+    let dropped = record(&mut outcomes, "short-next-again", go(model, &short_next, 2, None));
+    assert_eq!((&dropped.tokens, &dropped.logits, &dropped.hidden, &dropped.state),
+               (&next_digests.0, &next_digests.1, &next_digests.2, &next_digests.3), "{name}: the prompt unchanged");
+    if !whole {
+        assert!(model.parked_coverage().is_none(), "{name}: dropped");
+    }
+    // (4) the prompt one past a batch: its MTP pair at 4095 written whatever row 4095 held before
+    record(&mut outcomes, "pipeline-end", go(model, &p.past, 4, None));
+    outcomes
 }

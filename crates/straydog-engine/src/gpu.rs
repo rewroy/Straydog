@@ -1030,6 +1030,30 @@ impl Backend {
                 }
             }
         }
+        self.copy_out(parts)
+    }
+
+    /// The indexers' rolling pooling history alone (their last four inputs), copied out as
+    /// [`save_positions`](Self::save_positions) copies a range's with `history` and restored the
+    /// same way: a parked sequence's, taken when it departs, before a later prompt's prefill
+    /// changes it.
+    pub fn save_history(&mut self) -> Result<Vec<StatePart>> {
+        let mut parts = Vec::new();
+        for (key, entry) in &self.states {
+            if key.starts_with("@indexer:") {
+                let pool = (entry.rows * entry.cols - 512) / 128;
+                parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: 512, width: 512, height: 1, first: 0,
+                                       data: Vec::new(), device: None });
+            }
+        }
+        self.copy_out(parts)
+    }
+
+    /// Copy `parts` out of their states: into VRAM when the budget has room, else host memory.
+    fn copy_out(&mut self, mut parts: Vec<StatePart>) -> Result<Vec<StatePart>> {
+        if parts.is_empty() {
+            return Ok(parts);
+        }
         // In VRAM when the budget has room: a copy on the device. The host copy of a 20K-token
         // Qwen3.8 conversation (~0.5 GB a device, into pageable memory, device after device) held
         // the next prompt's first token back by ~0.12 s.
@@ -1056,6 +1080,67 @@ impl Backend {
                 Err(error)
             }
         }
+    }
+
+    /// Diagnostics: digests of the sequence state that is valid below position `to`, one line a
+    /// part ("<state> <part> <sha256>"): each attention layer's K/V rows below it (of its four
+    /// planes) in runs of 256 positions and its last 8 rows one by one, each indexer's complete
+    /// pooled blocks below it (runs, then its last 4 blocks) and the inputs of its rolling
+    /// history from the last block boundary, and each recurrent state. Never the rows above, the
+    /// scratch states or the parked copies, nor two kinds of bytes a sequence leaves that
+    /// nothing reads before rewriting them:
+    /// - the MTP layer's (layer 48's) row `to - 1`: its rows are pairs, a position's hidden
+    ///   state with the token after it, and that token is not in the sequence yet. The next
+    ///   prompt writes its pairs from the row before it (`first = start - 1` in model.rs
+    ///   mtp_prompt :1178, mtp_prompt_resident :1127, mtp_prompt_kept :1153; a one-token
+    ///   prompt through them too, :975-984), and a decode's first draft catches up from there
+    ///   (mtp_position, model.rs:1371), before attending.
+    /// - the rolling history's inputs below the last block boundary (another block's, perhaps
+    ///   another sequence's): pooling reads it only for positions from the boundary of the
+    ///   block being completed up to where the batch starts (qsa_pool, gpu/sparse_attention.hpp
+    ///   :53-60; qsa_pool_one, gpu/qsa_decode.hpp:3-9, the block's earlier inputs).
+    pub fn state_digest(&mut self, to: u64) -> Result<Vec<String>> {
+        use sha2::Digest;
+        // (K/V rows and pooled blocks in runs of this many positions, to tell where they differ)
+        const RUN: u64 = 256;
+        let mut parts = Vec::new();
+        for (key, entry) in &self.states {
+            let floats = entry.rows * entry.cols;
+            let to = if key.ends_with(":blk.48.") { to.saturating_sub(1) } else { to };
+            let part = |offset, pitch, width, height| StatePart { key: key.clone(), offset, pitch, width, height, first: 0,
+                                                               data: Vec::new(), device: None };
+            if key.starts_with("@qsa:") {
+                for low in (0..to).step_by(RUN as usize) {
+                    let high = (low + RUN).min(to);
+                    parts.push((format!("{key} rows {low}..{high}"), part(low * 256, entry.rows / 4 * 256, (high - low) * 256, 4)));
+                }
+                // (and the last few one by one: where a sequence's writes end)
+                for row in to.saturating_sub(8)..to {
+                    parts.push((format!("{key} row {row}"), part(row * 256, entry.rows / 4 * 256, 256, 4)));
+                }
+            } else if key.starts_with("@indexer:") {
+                let pool = (floats - 512) / 128;
+                for low in (0..to / 4).step_by((RUN / 4) as usize) {
+                    let high = (low + RUN / 4).min(to / 4);
+                    parts.push((format!("{key} blocks {low}..{high}"), part(low, pool, high - low, 128)));
+                }
+                for block in (to / 4).saturating_sub(4)..to / 4 {
+                    parts.push((format!("{key} block {block}"), part(block, pool, 1, 128)));
+                }
+                for position in to / 4 * 4..to {
+                    parts.push((format!("{key} history {position}"), part(128 * pool + position % 4 * 128, 128, 128, 1)));
+                }
+            } else if RECURRENT.iter().any(|prefix| key.starts_with(prefix)) {
+                parts.push((key.clone(), part(0, floats, floats, 1)));
+            }
+        }
+        let mut digests = Vec::with_capacity(parts.len());
+        for (label, mut part) in parts {
+            part.data = vec![0f32; (part.width * part.height) as usize];
+            self.state_copy(&mut part, true)?;
+            digests.push(format!("{label} {:x}", sha2::Sha256::digest(bytemuck_bytes(&part.data))));
+        }
+        Ok(digests)
     }
 
     /// Put parts [`save_positions`](Self::save_positions) copied out back where they were.
@@ -1295,4 +1380,10 @@ impl Drop for CpuExperts {
         // SAFETY: created by sd_cpu_experts_create, destroyed once after the devices using it.
         unsafe { ffi::sd_cpu_experts_destroy(self.handle) }
     }
+}
+
+/// The bytes of F32 values as they lie in memory (little-endian on every supported host).
+fn bytemuck_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: an f32 slice reinterpreted as its bytes, same length in bytes and alignment 1.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }

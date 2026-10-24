@@ -586,6 +586,34 @@ impl Group {
         Ok(Positions { from, parts })
     }
 
+    /// Every device's indexer history alone (see [`Backend::save_history`]), as positions from
+    /// `from` (the parked sequence's lowest).
+    pub fn save_history(&mut self, from: u64) -> Result<Positions> {
+        let mut parts = Vec::with_capacity(self.backends.len());
+        for index in 0..self.backends.len() {
+            match self.backends[index].save_history() {
+                Ok(part) => parts.push(part),
+                Err(error) => {
+                    for (backend, saved) in self.backends.iter_mut().zip(parts) {
+                        let _ = backend.release_positions(saved);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Positions { from, parts })
+    }
+
+    /// Diagnostics: a digest of every device's sequence state valid below `to` (see
+    /// [`Backend::state_digest`]).
+    pub fn state_digest(&mut self, to: u64) -> Result<Vec<String>> {
+        let mut digests = Vec::new();
+        for (index, backend) in self.backends.iter_mut().enumerate() {
+            digests.extend(backend.state_digest(to)?.into_iter().map(|digest| format!("GPU {index} {digest}")));
+        }
+        Ok(digests)
+    }
+
     pub fn restore_positions(&mut self, positions: &mut Positions) -> Result<()> {
         self.backends.iter_mut().zip(&mut positions.parts).try_for_each(|(backend, parts)| backend.restore_positions(parts))
     }

@@ -78,20 +78,26 @@ struct Checkpoint {
     final_hidden: Option<Vec<f32>>,
 }
 
-/// A sequence a prompt departed from, kept in host memory to come back to: its positional state
-/// from where the live sequence then left it (later prompts that departed below that added the
-/// positions under it, in `saved` after the first), and its recurrent state in a slot. Below the
-/// lowest saved position, the live sequence holds the same tokens.
+/// A sequence a prompt departed from, kept to come back to: its recurrent state in a slot and
+/// its indexers' rolling history, taken when it departed, and of its positional state only what
+/// later prompts would overwrite, copied out before they write it (`saved`, covering `covered`).
+/// Below the covered positions the live sequence holds the same tokens; above them, to the
+/// sequence's end, the positional state is still where the parked sequence left it (borrowed:
+/// any write there first extends the coverage, [`Model::protect`]), so a short prompt after a
+/// long conversation copies a few hundred positions, not the conversation.
 struct Parked {
     tokens: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
     slot: usize,
+    history: Option<Positions>,
     saved: Vec<Positions>,
+    covered: Option<(usize, usize)>,
 }
 
 impl Parked {
+    /// Its lowest position copied out (its end while none is).
     fn from(&self) -> usize {
-        self.saved.last().map_or(self.tokens.len(), |positions| positions.from as usize)
+        self.covered.map_or(self.tokens.len(), |(from, _)| from)
     }
 }
 
@@ -224,6 +230,8 @@ pub struct Model {
     parked: Option<Parked>,
     /// Host bytes parked positions may take.
     park_budget: u64,
+    /// Park a departing sequence whole at once ([`Model::park_whole`]).
+    park_whole: bool,
     pub last_metrics: Map<String, Value>,
     /// When set, the SHA-256 of every logits vector the model returns (a determinism check).
     pub logits_digests: Option<Vec<String>>,
@@ -306,6 +314,7 @@ impl Model {
             checkpoints: IndexMap::new(),
             parked: None,
             park_budget: crate::host::host_memory_bytes() / 8,
+            park_whole: false,
             last_metrics: Map::new(),
             logits_digests: None,
             logits_capture: None,
@@ -628,11 +637,102 @@ impl Model {
         Ok(())
     }
 
-    /// Park the live sequence's positions from `from` and its recurrent state (in `slot`).
+    /// Park the live sequence whole: its positions from `from` (with the indexers' history) and
+    /// its recurrent state (in `slot`). For the live sequence a restored one replaces, whose
+    /// positions the restore overwrites at once.
     fn park(&mut self, from: usize, slot: usize) -> Result<Parked> {
         let positions = self.group.save_positions(from as u64, self.history.len() as u64, true)?;
-        self.group.checkpoint(slot, true)?;
-        Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, saved: vec![positions] })
+        if let Err(error) = self.group.checkpoint(slot, true) {
+            let _ = self.group.release_positions(positions);
+            return Err(error);
+        }
+        Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: None,
+                    saved: vec![positions], covered: Some((from, self.history.len())) })
+    }
+
+    /// Park the live sequence as a prompt departs from it: its recurrent state (in `slot`) and its
+    /// indexers' history now, while they are still its own; its positions only as the prompt
+    /// (and later ones) would overwrite them ([`Model::protect`]).
+    fn depart(&mut self, slot: usize) -> Result<Parked> {
+        let history = self.group.save_history(self.history.len() as u64)?;
+        if let Err(error) = self.group.checkpoint(slot, true) {
+            let _ = self.group.release_positions(history);
+            return Err(error);
+        }
+        Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: Some(history),
+                    saved: Vec::new(), covered: None })
+    }
+
+    /// Free what a parked sequence holds (once nothing restores it).
+    fn discard(&mut self, parked: Parked) -> Result<()> {
+        let mut result = Ok(());
+        for positions in parked.saved.into_iter().chain(parked.history) {
+            let released = self.group.release_positions(positions);
+            if result.is_ok() {
+                result = released;
+            }
+        }
+        result
+    }
+
+    /// Put `parked` back as the live sequence's state: its copies lowest first (a pooled block two
+    /// of them hold ends as the higher one has it; above the copies its positions are where it
+    /// left them), then its indexers' history, its recurrent state.
+    fn restore(&mut self, parked: &mut Parked) -> Result<()> {
+        parked.saved.sort_by_key(|positions| positions.from);
+        for positions in parked.saved.iter_mut().chain(parked.history.as_mut()) {
+            self.group.restore_positions(positions)?;
+        }
+        self.group.checkpoint(parked.slot, false)
+    }
+
+    /// Before positions `from..to` are written: the parked sequence's state there copied out,
+    /// what of it its coverage lacks (extended to multiples of four, but at its end), so the
+    /// coverage stays one run. Every writer of positional state asks first: a prompt's whole
+    /// range when it starts (from where it resumes, the MTP layer's pair before that, to its
+    /// last possible output), then each prefill, decode, verification and draft its own.
+    fn protect(&mut self, from: usize, to: usize) -> Result<()> {
+        let Some(parked) = &self.parked else { return Ok(()) };
+        let end = parked.tokens.len();
+        let (from, to) = (from / 4 * 4, to.min(end));
+        if from >= to {
+            return Ok(());
+        }
+        let to = to.next_multiple_of(4).min(end);
+        let pieces = match parked.covered {
+            None => vec![(from, to)],
+            Some((low, high)) => [(from, low), (high, to)].into_iter().filter(|(a, b)| a < b).collect(),
+        };
+        if pieces.is_empty() {
+            return Ok(());
+        }
+        let grown = parked.covered.map_or((from, to), |(low, high)| (low.min(from), high.max(to)));
+        if (grown.1 - grown.0) as u64 * self.group.position_bytes() > self.park_budget {
+            // Its copies would outgrow the budget: the parked sequence is dropped, overwritten.
+            let parked = self.parked.take().unwrap();
+            return self.discard(parked);
+        }
+        let started = Instant::now();
+        let mut saved = Vec::new();
+        for (low, high) in &pieces {
+            match self.group.save_positions(*low as u64, *high as u64, false) {
+                Ok(positions) => saved.push(positions),
+                Err(error) => {
+                    // (the coverage stays as it was: nothing writes past it)
+                    for positions in saved {
+                        let _ = self.group.release_positions(positions);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let parked = self.parked.as_mut().unwrap();
+        parked.covered = Some(grown);
+        parked.saved.extend(saved);
+        let copied: usize = pieces.iter().map(|(low, high)| high - low).sum();
+        self.metric_count("park_copied_positions", copied as u64);
+        self.metric_add("park_seconds", started.elapsed().as_secs_f64());
+        Ok(())
     }
 
     /// Whether parking the live sequence from `from` fits the host budget.
@@ -661,39 +761,53 @@ impl Model {
             if back > live && resumable && common >= parked.from() {
                 let mut parked = self.parked.take().unwrap();
                 let slot = if parked.slot == PARK_SLOTS[0] { PARK_SLOTS[1] } else { PARK_SLOTS[0] };
-                let swapped = if self.parkable(common) { Some(self.park(common, slot)?) } else { None };
-                // Lowest first: a pooled block two of them hold ends as the higher one has it.
-                for positions in parked.saved.iter_mut().rev() {
-                    self.group.restore_positions(positions)?;
+                // The live sequence whole over what the restore overwrites: from the lowest copy too
+                // (the same tokens below `common`, but perhaps not the same bits once rewritten), or
+                // not at all when that does not fit the budget.
+                let from = common.min(parked.from());
+                let swapped = if self.parkable(common) && self.parkable(from) {
+                    match self.park(from, slot) {
+                        Ok(swapped) => Some(swapped),
+                        Err(error) => {
+                            // (nothing overwritten yet: the parked sequence stays parked)
+                            self.parked = Some(parked);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Err(error) = self.restore(&mut parked) {
+                    // Neither sequence whole any more: both copies freed, the live one reset.
+                    let _ = self.discard(parked);
+                    if let Some(swapped) = swapped {
+                        let _ = self.discard(swapped);
+                    }
+                    let _ = self.reset();
+                    return Err(error);
                 }
-                for positions in std::mem::take(&mut parked.saved) {
-                    self.group.release_positions(positions)?;
-                }
-                self.group.checkpoint(parked.slot, false)?;
-                self.history = parked.tokens;
-                self.final_hidden = parked.final_hidden;
+                let (tokens, final_hidden) = (std::mem::take(&mut parked.tokens), parked.final_hidden.take());
+                self.history = tokens;
+                self.final_hidden = final_hidden;
                 self.parked = swapped;
+                self.discard(parked)?;
                 return Ok(Some("restored"));
             }
         }
         if live < self.history.len() && self.parkable(live) {
             let slot = match self.parked.take() {
                 Some(parked) => {
-                    for positions in parked.saved {
-                        self.group.release_positions(positions)?;
-                    }
-                    parked.slot
+                    let slot = parked.slot;
+                    self.discard(parked)?;
+                    slot
                 }
                 None => PARK_SLOTS[0],
             };
-            self.parked = Some(self.park(live, slot)?);
+            self.parked = Some(if self.park_whole { self.park(0, slot)? } else { self.depart(slot)? });
             return Ok(Some("saved"));
         }
-        if let Some(from) = self.parked.as_ref().map(Parked::from).filter(|from| live < *from) {
-            // Positions `live..from` are the same tokens in both: the parked sequence keeps them.
-            let positions = self.group.save_positions(live as u64, from as u64, false)?;
-            self.parked.as_mut().unwrap().saved.push(positions);
-        }
+        // (a parked sequence keeps the positions this prompt overwrites below its copies: the
+        // request protects its range once it knows where it resumes)
         Ok(None)
     }
 
@@ -806,6 +920,12 @@ impl Model {
         if self.history.len() + tokens.len() > self.context || tokens.iter().any(|token| *token as usize >= VOCABULARY) {
             return Err("Straydog token or context is out of range".into());
         }
+        // Every write below lies in these positions: the layers' rows of the tokens, and the MTP
+        // layer's pairs (from the row before them), whichever path they take (a verified short
+        // prefill, a resident or pipelined one with the MTP rows on the host, stashed or kept, a
+        // decode step), all from here.
+        let start = self.history.len();
+        self.protect(start.saturating_sub(usize::from(self.speculative > 0)), start + tokens.len())?;
         self.prefetch_ple(&self.history, tokens)?;
         let embeddings = self.token_embeddings(tokens)?;
         let previous = self.final_hidden.clone();
@@ -891,6 +1011,32 @@ impl Model {
     /// The last processed token's four-stream hidden state.
     pub fn final_hidden(&self) -> Option<&[f32]> {
         self.final_hidden.as_deref()
+    }
+
+    /// Diagnostics: a digest of the live sequence's state that is valid (its positions' K/V and
+    /// complete pooled blocks, the indexers' history, the recurrent state).
+    pub fn state_digest(&mut self) -> Result<Vec<String>> {
+        self.group.state_digest(self.history.len() as u64)
+    }
+
+    /// Tests only: let parked sequences hold at most `positions` positions, to run the paths of a
+    /// budget too low for a swap or for a copy (model_gpu's parking scenarios).
+    #[doc(hidden)]
+    pub fn limit_parking(&mut self, positions: usize) {
+        self.park_budget = positions as u64 * self.group.position_bytes();
+    }
+
+    /// Tests only: park each departing sequence whole at once, every position copied before any
+    /// later prompt runs and all of them restored: the reference that parking only what later
+    /// prompts overwrite must equal bit for bit (model_gpu's parking scenarios).
+    #[doc(hidden)]
+    pub fn park_whole(&mut self) {
+        self.park_whole = true;
+    }
+
+    /// Diagnostics: the parked sequence's positions copied out (`from..to`, if any) and its length.
+    pub fn parked_coverage(&self) -> Option<(Option<(usize, usize)>, usize)> {
+        self.parked.as_ref().map(|parked| (parked.covered, parked.tokens.len()))
     }
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
@@ -1045,6 +1191,8 @@ impl Model {
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
     /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
+        // (the catch-up's pairs, then a row for each draft tried, a failed one too)
+        self.protect(position as usize, position as usize + tokens.len() + limit)?;
         let embedded = self.token_embeddings(tokens)?;
         let rows = self.mtp_prologue(&embedded, hidden)?;
         let output = self.group.verify_span(48, 49, &rows, position)?;
@@ -1138,6 +1286,8 @@ impl Model {
     }
 
     fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        // (every row verified is written, kept or not)
+        self.protect(self.history.len(), self.history.len() + tokens.len())?;
         let position = self.history.len() as u64;
         self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
@@ -1296,13 +1446,21 @@ impl Model {
         let (reused, resumed) = self.resume(tokens)?;
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
-            "parked": parked, "park_seconds": park_seconds,
+            "parked": parked, "park_seconds": park_seconds, "park_copied_positions": 0,
             "decode_forward_tokens": 0, "decode_seconds": 0.0, "decode_tokens_per_second": null,
             "generated_tokens": 0, "ttft_seconds": null,
         })
         .as_object()
         .unwrap()
         .clone();
+        // The parked sequence's positions this request may write, copied out before anything
+        // runs: from where it resumes (the MTP layer's pair before that) to its last possible
+        // output (the rows of a verification later rejected among them).
+        self.protect(reused.saturating_sub(usize::from(self.speculative > 0)), tokens.len() + max_new - 1)?;
+        if let Some(parked) = &self.parked {
+            let borrowed = parked.covered.map_or(0, |(_, high)| parked.tokens.len() - high);
+            self.last_metrics.insert("park_borrowed_positions".into(), json!(borrowed));
+        }
         let prefill_started = Instant::now();
         let plan = self.checkpoint_plan(tokens, reused, turn, checkpoint);
         let pipelined = self.pipelined_prefill(tokens.len() - reused)?;
