@@ -50,7 +50,7 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     }
     if (linear) { allocation(states[0],4*10240*4); allocation(states[1],48*128*128*4); }
     else {
-        allocation(states[0],context*1024*4); allocation(states[1],((context/4+1)*128+512)*4);
+        allocation(states[0],context*1024*4); allocation(states[1],((context/4+1)*128+qsa_history*128)*4);
         allocation(states[2],256*(context/4+1)*4);
     }
     DecoderLayer plan{}; plan.index=layer; plan.context=context; plan.capacity=capacity; plan.moe=moe;

@@ -164,6 +164,11 @@ pub struct StatePart {
     device: Option<crate::ops::Buffer>,
 }
 
+/// Floats of an indexer's rolling history after its pooled blocks: its last eight inputs, a ring
+/// by position (gpu/sparse_attention.hpp, qsa_history), so that a rewind's rows never overwrite
+/// the inputs a block completed after it still pools.
+const INDEX_HISTORY: u64 = 8 * 128;
+
 /// VRAM a device keeps free when parked positions go to VRAM instead of host memory.
 const PARK_MARGIN: u64 = 512 << 20;
 
@@ -420,7 +425,7 @@ impl Backend {
                 }
             } else {
                 plan.push((format!("@qsa:blk.{layer}."), context * 4, 256, host_attention));
-                plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + 512, 1, false));
+                plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + INDEX_HISTORY, 1, false));
             }
         }
         if self.keeps_mtp_rows && self.batch_capacity == 256 && layers.contains(&48) && !layers.contains(&0) {
@@ -1018,7 +1023,7 @@ impl Backend {
 
     /// What a later sequence overwrites from position `from` up to `to`, copied out: each
     /// attention layer's K/V rows (of its four planes), and its indexer's pooled blocks (from the block holding `from`)
-    /// with, if `history`, its last four inputs. [`restore_positions`](Self::restore_positions)
+    /// with, if `history`, its rolling history. [`restore_positions`](Self::restore_positions)
     /// puts them back.
     pub fn save_positions(&mut self, from: u64, to: u64, history: bool) -> Result<Vec<StatePart>> {
         if from >= to {
@@ -1033,12 +1038,12 @@ impl Backend {
                 parts.push(StatePart { key: key.clone(), offset: from * 256, pitch: context * 256, width: (to - from) * 256,
                                        height: 4, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
-                let pool = (floats - 512) / 128;
+                let pool = (floats - INDEX_HISTORY) / 128;
                 let (first, last) = (from / 4, to.div_ceil(4));
                 parts.push(StatePart { key: key.clone(), offset: first, pitch: pool, width: last - first, height: 128, first: from,
                                        data: Vec::new(), device: None });
                 if history {
-                    parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: 512, width: 512, height: 1, first: from,
+                    parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: INDEX_HISTORY, width: INDEX_HISTORY, height: 1, first: from,
                                            data: Vec::new(), device: None });
                 }
             }
@@ -1046,7 +1051,7 @@ impl Backend {
         self.copy_out(parts)
     }
 
-    /// The indexers' rolling pooling history alone (their last four inputs), copied out as
+    /// The indexers' rolling pooling history alone (their last eight inputs), copied out as
     /// [`save_positions`](Self::save_positions) copies a range's with `history` and restored the
     /// same way: a parked sequence's, taken when it departs, before a later prompt's prefill
     /// changes it.
@@ -1054,8 +1059,8 @@ impl Backend {
         let mut parts = Vec::new();
         for (key, entry) in &self.states {
             if key.starts_with("@indexer:") {
-                let pool = (entry.rows * entry.cols - 512) / 128;
-                parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: 512, width: 512, height: 1, first: 0,
+                let pool = (entry.rows * entry.cols - INDEX_HISTORY) / 128;
+                parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: INDEX_HISTORY, width: INDEX_HISTORY, height: 1, first: 0,
                                        data: Vec::new(), device: None });
             }
         }
@@ -1133,7 +1138,7 @@ impl Backend {
                     parts.push((format!("{key} row {row}"), part(row * 256, entry.rows / 4 * 256, 256, 4)));
                 }
             } else if key.starts_with("@indexer:") {
-                let pool = (floats - 512) / 128;
+                let pool = (floats - INDEX_HISTORY) / 128;
                 for low in (0..to / 4).step_by((RUN / 4) as usize) {
                     let high = (low + RUN / 4).min(to / 4);
                     parts.push((format!("{key} blocks {low}..{high}"), part(low, pool, high - low, 128)));
@@ -1142,7 +1147,7 @@ impl Backend {
                     parts.push((format!("{key} block {block}"), part(block, pool, 1, 128)));
                 }
                 for position in to / 4 * 4..to {
-                    parts.push((format!("{key} history {position}"), part(128 * pool + position % 4 * 128, 128, 128, 1)));
+                    parts.push((format!("{key} history {position}"), part(128 * pool + position % 8 * 128, 128, 128, 1)));
                 }
             } else if RECURRENT.iter().any(|prefix| key.starts_with(prefix)) {
                 parts.push((key.clone(), part(0, floats, floats, 1)));

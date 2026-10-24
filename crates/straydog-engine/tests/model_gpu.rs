@@ -102,6 +102,65 @@ fn a_parked_conversation_comes_back() {
     bounded_parking(&model_root, &drafter, quantization, &golden);
 }
 
+/// Speculative decoding leaves the target as one-token decoding does (T173). Past 512 pooled
+/// blocks (2048 positions) a token attends to the 512 blocks its indexer picks by their pooled
+/// keys, so a block pooled from a rejected draft's input changes what later tokens see: a 20K
+/// conversation decoded greedily with the MTP drafts and without them leaves the same tokens,
+/// final hidden state and target state (every layer's K/V, pooled blocks and history and the
+/// recurrent state; the MTP layer runs only with drafts), and the next turn the same logits.
+#[test]
+fn speculation_leaves_the_target_as_decoding() {
+    let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
+                                             common::model_env("STRAYDOG_DRAFTER", "the drafter directory"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
+    let golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let quantization = golden["quantization"].as_str().unwrap();
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let expected = &golden["placements"]["two-gpu-experts-mtp"];
+    let prompt = |label: &str| -> Vec<u32> {
+        let request = expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == label).unwrap();
+        serde_json::from_value(request["prompt"].clone()).unwrap()
+    };
+    // (then a request for a long story of its own: drafts it often rejects)
+    let text = straydog_engine::text::Text::new(&std::fs::read(PathBuf::from(&model_root).join("tokenizer.json")).unwrap()).unwrap();
+    let story = text.encode("Write a long, original short story about a lighthouse keeper who receives a strange radio \
+                             signal during a winter storm. Use vivid detail and dialogue, at least 800 words.").unwrap();
+    let earlier: Vec<u32> = ["root", "tools", "turn", "new-chat"].iter().flat_map(|label| prompt(label)).collect();
+    let conversation = turn(&earlier, &[], &story);
+    let mut runs = Vec::new();
+    for drafting in [true, false] {
+        let mut model = open(&model_root, &drafter, quantization, &expected["placement"]);
+        if !drafting {
+            model.speculative = 0;
+        }
+        let first = go(&mut model, &conversation, 512, None);
+        let next = turn(&conversation, &first.tokens, &prompt("root")[4000..4030]);
+        let second = go(&mut model, &next, 1, None);
+        eprintln!("{} drafts: {} prompt tokens, {} generated, drafts {:?}/{:?}", if drafting { "with" } else { "without" },
+                  conversation.len(), first.tokens.len(), first.metrics.get("drafted_tokens"), first.metrics.get("accepted_tokens"));
+        runs.push((first, second));
+    }
+    let ((with, with_next), (without, without_next)) = (&runs[0], &runs[1]);
+    // (drafts rejected, so verified rows past the kept ones)
+    assert!(with.tokens.len() >= 256 && with.metrics["drafted_tokens"].as_u64() > with.metrics["accepted_tokens"].as_u64(),
+            "a long reply with rejected drafts");
+    let target = |outcome: &Outcome| -> Vec<String> { outcome.state.iter().filter(|line| !line.contains(":blk.48.")).cloned().collect() };
+    let (with_state, without_state) = (target(with), target(without));
+    let differing: Vec<_> = with_state.iter().zip(&without_state).filter(|(a, b)| a != b).collect();
+    for (a, b) in differing.iter().take(24) {
+        eprintln!("with drafts: {a} (without {})", b.rsplit(' ').next().unwrap());
+    }
+    let parted = with.tokens.iter().zip(&without.tokens).position(|(a, b)| a != b);
+    eprintln!("{} state parts differ of {}; tokens part at {parted:?}", differing.len(), with_state.len());
+    assert_eq!(with.tokens, without.tokens, "tokens");
+    assert_eq!(with.hidden, without.hidden, "final hidden");
+    assert!(differing.is_empty() && with_state.len() == without_state.len(), "target state ({} parts differ)", differing.len());
+    assert_eq!((&with_next.tokens, &with_next.logits), (&without_next.tokens, &without_next.logits), "the next turn");
+}
+
 #[test]
 fn generations_equal_the_reference() {
     let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),

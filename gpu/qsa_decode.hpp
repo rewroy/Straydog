@@ -3,10 +3,10 @@
 __global__ void qsa_pool_one(const float* incoming,const float* norm,size_t pool,
                              const uint32_t* position,float* blocks,float* history) {
     const size_t column=threadIdx.x,pos=*position;
-    history[(pos%4)*128+column]=incoming[column];
+    history[(pos%qsa_history)*128+column]=incoming[column];
     if ((pos+1)%4) return;
     float x=0;
-    for (size_t row=0;row<4;++row) x+=history[row*128+column];
+    for (size_t row=0;row<4;++row) x+=history[((pos-3+row)%qsa_history)*128+column];
     x/=4.0f;
     __shared__ float values[128],sums[128]; values[column]=x*norm[column]; sums[column]=x*x;
     __syncthreads();

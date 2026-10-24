@@ -50,6 +50,12 @@ __global__ void qsa_normalize_decode(const float* qgate, const float* key, float
     else qsa_normalize_block(iq,iqnorm,block-26,128,128,pos,iq,128);
 }
 
+// The indexer's rolling history: its last eight inputs, a ring by position. A block pools the
+// inputs of its four positions; one completed after a rewind (a verification's rejected rows, a
+// draft's) still finds its earlier inputs there, which those rows, at most four positions on
+// from the last kept one, cannot have overwritten in a ring of two blocks.
+constexpr size_t qsa_history = 8;
+
 __global__ void qsa_pool(const float* incoming, const float* history, const float* norm,
                          size_t pool, size_t base, float* blocks) {
     const size_t block=base/4+blockIdx.x, column=threadIdx.x;
@@ -57,7 +63,7 @@ __global__ void qsa_pool(const float* incoming, const float* history, const floa
     float x=0;
     for (size_t tap=0;tap<4;++tap) {
         const size_t pos=begin+tap;
-        x+=pos<base ? history[(pos%4)*128+column] : incoming[(pos-base)*128+column];
+        x+=pos<base ? history[(pos%qsa_history)*128+column] : incoming[(pos-base)*128+column];
     }
     x/=4.0f;
     __shared__ float values[128], sums[128]; values[column]=x*norm[column]; sums[column]=x*x;
@@ -77,7 +83,7 @@ __global__ void qsa_save_history(const float* incoming, size_t base, size_t step
     const size_t kept=steps<4 ? steps : 4;
     if (i>=kept*128) return;
     const size_t token=steps-kept+i/128;
-    history[((base+token)%4)*128+i%128]=incoming[token*128+i%128];
+    history[((base+token)%qsa_history)*128+i%128]=incoming[token*128+i%128];
 }
 
 __global__ void qsa_block_scores(const float* queries, const float* blocks, size_t pool,
@@ -359,7 +365,7 @@ void sparse_attention(Device& d, void* const* pointers, const int* kinds, void* 
             throw std::runtime_error("invalid Straydog QSA state allocation");
     };
     check_state(kv_state,context*1024*4);
-    check_state(index_state,(pool*128+512)*4);
+    check_state(index_state,(pool*128+qsa_history*128)*4);
     check_state(scratch,256*pool*4);
     const size_t rows[10]={12288,512,512,512,128,2560,1,1,1,1};
     const size_t cols[10]={2560,2560,2560,2560,2560,6144,256,256,128,128};
