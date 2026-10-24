@@ -937,6 +937,21 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_dspark_attention(
+        handle: *mut ::std::os::raw::c_void,
+        q: *const f32,
+        ring: *const f32,
+        block: *const f32,
+        sinks: *const f32,
+        slots: u64,
+        anchor: u32,
+        history: u64,
+        out: *mut f32,
+        scratch: *mut i32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_compress(
         handle: *mut ::std::os::raw::c_void,
         kv: *const f32,

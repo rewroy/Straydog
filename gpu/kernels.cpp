@@ -3749,3 +3749,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "moe_prefill.hpp"
 #include "host_exchange.hpp"
 #include "vision.hpp"
+#include "dspark_attention.hpp"
