@@ -592,12 +592,12 @@ impl Group {
         Ok(Positions { from, parts })
     }
 
-    /// Every device's indexer history alone (see [`Backend::save_history`]), as positions from
-    /// `from` (the parked sequence's lowest).
-    pub fn save_history(&mut self, from: u64) -> Result<Positions> {
+    /// Every device's indexer history alone (see [`Backend::save_history`]; one `layer`'s with
+    /// it), as positions from `from` (the parked sequence's lowest).
+    pub fn save_history(&mut self, from: u64, layer: Option<&str>) -> Result<Positions> {
         let mut parts = Vec::with_capacity(self.backends.len());
         for index in 0..self.backends.len() {
-            match self.backends[index].save_history() {
+            match self.backends[index].save_history(layer) {
                 Ok(part) => parts.push(part),
                 Err(error) => {
                     for (backend, saved) in self.backends.iter_mut().zip(parts) {

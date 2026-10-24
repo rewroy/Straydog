@@ -169,6 +169,9 @@ pub struct StatePart {
 /// the inputs a block completed after it still pools.
 const INDEX_HISTORY: u64 = 8 * 128;
 
+/// Copies of states this small always go to host memory (see `copy_out`).
+const HOST_COPY_BYTES: u64 = 256 << 10;
+
 /// VRAM a device keeps free when parked positions go to VRAM instead of host memory.
 const PARK_MARGIN: u64 = 512 << 20;
 
@@ -1055,10 +1058,11 @@ impl Backend {
     /// [`save_positions`](Self::save_positions) copies a range's with `history` and restored the
     /// same way: a parked sequence's, taken when it departs, before a later prompt's prefill
     /// changes it.
-    pub fn save_history(&mut self) -> Result<Vec<StatePart>> {
+    /// `layer` ("blk.48.") keeps one layer's alone.
+    pub fn save_history(&mut self, layer: Option<&str>) -> Result<Vec<StatePart>> {
         let mut parts = Vec::new();
         for (key, entry) in &self.states {
-            if key.starts_with("@indexer:") {
+            if key.starts_with("@indexer:") && layer.is_none_or(|layer| key.ends_with(layer)) {
                 let pool = (entry.rows * entry.cols - INDEX_HISTORY) / 128;
                 parts.push(StatePart { key: key.clone(), offset: 128 * pool, pitch: INDEX_HISTORY, width: INDEX_HISTORY, height: 1, first: 0,
                                        data: Vec::new(), device: None });
@@ -1075,9 +1079,11 @@ impl Backend {
         // In VRAM when the budget has room: a copy on the device. The host copy of a 20K-token
         // Qwen3.8 conversation (~0.5 GB a device, into pageable memory, device after device) held
         // the next prompt's first token back by ~0.12 s.
+        // A few kilobytes (rolling histories) go to host memory: a VRAM allocation and its
+        // release cost more than their copy.
         let floats: u64 = parts.iter().map(|part| part.width * part.height).sum();
         let (used, budget) = self.memory()?;
-        let in_vram = used + floats * 4 + PARK_MARGIN <= budget;
+        let in_vram = floats * 4 > HOST_COPY_BYTES && used + floats * 4 + PARK_MARGIN <= budget;
         let copied = (|| {
             for part in &mut parts {
                 let count = part.width * part.height;

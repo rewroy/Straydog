@@ -76,7 +76,7 @@ struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
-    /// With the MTP layer, the indexers' rolling history then: resuming here, the MTP layer's
+    /// With the MTP layer, its indexer's rolling history then: resuming here, the MTP layer's
     /// pair before completes its pooled block from the three inputs before it.
     history: Option<Positions>,
 }
@@ -640,7 +640,8 @@ impl Model {
             None => self.kept_hidden()?,
             hidden => hidden,
         };
-        let history = if self.speculative > 0 { Some(self.group.save_history(self.history.len() as u64)?) } else { None };
+        // (the MTP layer's alone: the target's layers resume at a block boundary and read none)
+        let history = if self.speculative > 0 { Some(self.group.save_history(self.history.len() as u64, Some("blk.48."))?) } else { None };
         if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens: self.history.clone(), final_hidden, history }) {
             self.release_checkpoint(replaced)?;
         }
@@ -678,7 +679,7 @@ impl Model {
     /// indexers' history now, while they are still its own; its positions only as the prompt
     /// (and later ones) would overwrite them ([`Model::protect`]).
     fn depart(&mut self, slot: usize) -> Result<Parked> {
-        let history = self.group.save_history(self.history.len() as u64)?;
+        let history = self.group.save_history(self.history.len() as u64, None)?;
         if let Err(error) = self.group.checkpoint(slot, true) {
             let _ = self.group.release_positions(history);
             return Err(error);
