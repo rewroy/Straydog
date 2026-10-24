@@ -226,10 +226,18 @@ impl<E: Engines> Loaded<E> {
         let thinking = body.get("thinking").is_some_and(Py::truthy);
         let mut variables = vec![("enable_thinking", Py::Bool(thinking))];
         if self.efforts {
-            // The template's own levels (low 50, medium 62, high 75, max 100); it refuses others.
+            // As a budget in 1..100 (low 50, medium 62, high 75, max 100), which every DeepSeek-V4.1
+            // template takes (the GSQ-RCO bundle's knows no "medium"); it refuses others.
             let effort = match body.get("reasoning_effort") {
-                None | Some(Py::Null) => Py::Str("high".into()),
-                Some(effort @ Py::Str(_)) => effort.clone(),
+                None | Some(Py::Null) => Py::Int(75),
+                Some(Py::Str(level)) => match level.as_str() {
+                    "low" => Py::Int(50),
+                    "medium" => Py::Int(62),
+                    "high" => Py::Int(75),
+                    "max" => Py::Int(100),
+                    _ => Py::Str(level.clone()),
+                },
+                Some(effort @ Py::Int(_)) => effort.clone(),
                 Some(_) => return Err(refused("invalid Straydog reasoning effort")),
             };
             variables.push(("reasoning_effort", effort));
