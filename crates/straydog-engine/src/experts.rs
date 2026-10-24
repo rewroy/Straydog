@@ -387,6 +387,8 @@ struct Pinner {
     stop: Arc<AtomicBool>,
     planned_bytes: u64,
     pinned_bytes: Arc<AtomicU64>,
+    exhausted: bool,
+    failure: Option<String>,
 }
 
 impl Pinner {
@@ -404,6 +406,8 @@ impl Pinner {
                 let mut arena = storage::Buffer::new(bytes);
                 // SAFETY: the arena is handed over pinned; whoever holds it unpins it before freeing.
                 if let Err(error) = unsafe { transfer::pin_host(arena.as_mut_slice().as_mut_ptr(), arena.capacity()) } {
+                    let kept = pinned.load(Ordering::Relaxed);
+                    eprintln!("WARN Straydog expert host pin stopped: {error}; keeping {kept} of {} planned bytes", count as u64 * bytes as u64);
                     let _ = tx.send(Err(error));
                     return;
                 }
@@ -418,11 +422,77 @@ impl Pinner {
                 }
             }
         });
-        Pinner { arenas, thread: Some(thread), stop, planned_bytes: count as u64 * bytes as u64, pinned_bytes }
+        Pinner { arenas, thread: Some(thread), stop, planned_bytes: count as u64 * bytes as u64, pinned_bytes,
+                 exhausted: false, failure: None }
+    }
+
+    /// A failed expansion seals the pool at its successful prefix. The channel is
+    /// FIFO, so every earlier successful arena has been handed over before Err.
+    fn take(&mut self, wait: bool) -> Option<storage::Buffer> {
+        if self.exhausted { return None; }
+        let next = if wait { self.arenas.recv().ok() } else {
+            match self.arenas.try_recv() {
+                Ok(arena) => Some(arena),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        match next {
+            Some(Ok(arena)) => Some(arena),
+            ended => {
+                self.exhausted = true;
+                let pinned = self.pinned_bytes.load(Ordering::Relaxed);
+                match ended {
+                    Some(Err(error)) => self.failure = Some(error), // producer already warned once
+                    _ if pinned < self.planned_bytes => {
+                        let error = "host pin thread stopped before filling its plan".to_string();
+                        eprintln!("WARN Straydog expert host pin stopped: {error}; keeping {pinned} of {} planned bytes", self.planned_bytes);
+                        self.failure = Some(error);
+                    }
+                    _ => {}
+                }
+                self.planned_bytes = pinned;
+                None
+            }
+        }
     }
 }
 
 type Key = (u32, u32);
+
+#[cfg(test)]
+mod pin_failure_tests {
+    use super::*;
+
+    fn failed_pool(pinned: u64) -> Pinner {
+        let (sender, arenas) = channel();
+        assert!(sender.send(Err("injected pin failure".into())).is_ok());
+        Pinner { arenas, thread: None, stop: Arc::new(AtomicBool::new(false)), planned_bytes: 16384,
+                 pinned_bytes: Arc::new(AtomicU64::new(pinned)), exhausted: false, failure: None }
+    }
+
+    #[test]
+    fn expansion_failure_preserves_the_pinned_prefix_and_stops_growth() {
+        // Simulate arenas already handed to the class; no native pin is performed.
+        let mut pool = failed_pool(8192);
+        assert!(pool.take(false).is_none());
+        assert!(pool.exhausted);
+        assert_eq!(pool.planned_bytes, 8192);
+        assert_eq!(pool.pinned_bytes.load(Ordering::Relaxed), 8192);
+        assert_eq!(pool.failure.as_deref(), Some("injected pin failure"));
+        assert!(pool.take(false).is_none());
+        assert_eq!(pool.planned_bytes, 8192);
+    }
+
+    #[test]
+    fn first_pin_failure_does_not_invent_usable_staging() {
+        let mut pool = failed_pool(0);
+        assert!(pool.take(false).is_none());
+        assert!(pool.exhausted);
+        assert_eq!(pool.planned_bytes, 0);
+        assert!(pool.failure.is_some());
+    }
+}
 
 /// Whole equal-sized arenas only: no final arena rounded beyond the class budget.
 /// A zero tier keeps only its bounded staging reserve, charged outside the tier.
@@ -858,6 +928,17 @@ impl DeviceExperts {
             (pinner.planned_bytes, if class.host_capacity == 0 { pinner.planned_bytes } else { class.host_bytes },
              pinner.pinned_bytes.load(Ordering::Relaxed))
         })).fold((0, 0, 0), |sum, value| (sum.0 + value.0, sum.1 + value.1, sum.2 + value.2))
+    }
+
+    /// A running DS engine must always have staging, even if later expansions fail.
+    /// Call after dense placement so the first pin overlaps loading, before READY.
+    pub fn prepare_staging(&mut self) -> Result<()> {
+        for class in 0..self.classes.len() {
+            if self.classes[class].arenas.is_empty() {
+                self.take_arena(class, true)?;
+            }
+        }
+        Ok(())
     }
 
     /// Make these experts of `layer` resident here; the compute stream waits for their copies.
@@ -1773,19 +1854,19 @@ impl DeviceExperts {
     fn take_arena(&mut self, class: usize, wait: bool) -> Result<bool> {
         let started = std::time::Instant::now();
         let entry = &mut self.classes[class];
-        let arena = match &entry.pinner {
-            Some(pinner) if wait => pinner.arenas.recv().ok(),
-            Some(pinner) => match pinner.arenas.try_recv() {
-                Ok(arena) => Some(arena),
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-            },
-            None => None,
-        };
-        let arena = match arena {
-            Some(arena) => arena?,
-            None => return Ok(false),
-        };
+        let arena = entry.pinner.as_mut().and_then(|pinner| pinner.take(wait));
+        if let Some(pinner) = &entry.pinner {
+            if pinner.exhausted {
+                if entry.host_capacity > 0 {
+                    entry.host_capacity = entry.host_capacity.min(entry.arenas.len() * entry.per_arena);
+                }
+                if entry.arenas.is_empty() {
+                    return Err(format!("no pinned expert staging is available: {}",
+                        pinner.failure.as_deref().unwrap_or("host pin pool is empty")));
+                }
+            }
+        }
+        let Some(arena) = arena else { return Ok(false) };
         entry.arenas.push(arena);
         self.counts.pin_seconds += started.elapsed().as_secs_f64();
         Ok(true)

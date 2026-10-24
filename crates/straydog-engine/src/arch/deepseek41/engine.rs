@@ -863,6 +863,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         };
         let (reading, uploading) = engine.upload_dense()?;
         engine.startup.extend([("dense read".to_string(), reading), ("dense upload after".to_string(), uploading)]);
+        let staging = std::time::Instant::now();
+        for shard in &mut engine.shards {
+            shard.experts.prepare_staging()?;
+        }
+        engine.startup.push(("host staging ready".to_string(), staging.elapsed().as_secs_f64()));
         Ok(engine)
     }
 
