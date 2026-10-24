@@ -566,6 +566,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_hc_mean(
+        handle: *mut ::std::os::raw::c_void,
+        stream: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        skip: u64,
+        out: *mut f32,
+        stride: u64,
+        offset: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_hc_collapse(
         handle: *mut ::std::os::raw::c_void,
         stream: *const f32,

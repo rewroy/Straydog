@@ -380,12 +380,21 @@ struct Shard {
     checks: Option<SlotChecks>,
     /// The routers' image biases (every layer's, one after another), uploaded with the first image.
     image_bias: Option<Buffer>,
+    /// With a DSpark drafter (the first device only): the target features of a pass's last
+    /// [`TAP_ROWS`] rows, rows of [`TAP_LAYERS`] x width (see [`tap_features`]).
+    tap: Option<Buffer>,
 }
 
 /// VRAM a device keeps a prompt pass's FP16 attention weights in (Backend::keep_expansions), for its
 /// batches after a layer's first (ATTENTION_ROWS): a layer's on two GPUs take ~170 MB. Expanded for
 /// every batch, they held a GPU ~0.23 s of an agent's 1.6K-token turn (2.9 s).
 pub const EXPANSIONS: u64 = 192 << 20;
+
+/// The target layers whose input streams DSpark reads (the mean of their hc copies), in order.
+pub const TAP_LAYERS: [usize; 3] = [37, 38, 39];
+/// The rows of a pass whose features are kept: DSpark's window of history (and the rows every
+/// tapped layer computes after a prefill's pruning, [`Engine::rows_of`]).
+pub const TAP_ROWS: usize = 128;
 
 /// Rows of a pass on a device's own buffers of every row: decode, verify, a short prompt. A
 /// longer pass takes the arena lent to the expert store back as far as its rows reach (T8).
@@ -897,6 +906,7 @@ impl Shard {
         };
         Ok(Shard {
             startup: [initialized, buffers, store, gemm_warm[0], gemm_warm[1]],
+            tap: None,
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
@@ -1645,6 +1655,24 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.run(tokens, n)
     }
 
+    /// Keep DSpark's target features (on the first device) from now on: each pass's last
+    /// [`TAP_ROWS`] rows of [`TAP_LAYERS`]' inputs, read with [`Engine::tap`]. Call before the first
+    /// pass (a recorded decode graph holds whether it taps).
+    pub fn enable_tap(&mut self) -> Result<()> {
+        let shard = &mut self.shards[0];
+        if shard.tap.is_none() {
+            shard.tap = Some(shard.gpu.buffer((TAP_ROWS * TAP_LAYERS.len() * self.hp.width * 4) as u64)?);
+        }
+        Ok(())
+    }
+
+    /// The tap: the device that holds it (the first) and the buffer, rows of [`TAP_LAYERS`] x width
+    /// for the last pass's last min(n, [`TAP_ROWS`]) rows, in order.
+    pub fn tap(&mut self) -> Option<(&mut Backend, Buffer)> {
+        let shard = &mut self.shards[0];
+        shard.tap.map(|tap| (&mut shard.gpu, tap))
+    }
+
     /// Most tokens a verify pass takes: at most [`VERIFY_ROWS`], in a batch, and as many as the
     /// stores hold every route's expert for at once. Several devices acquire a pass's experts in
     /// waves (experts_split), each wave's down summed apart: a verify pass's routes must fit one
@@ -2120,6 +2148,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                         if let Some((at, slot)) = hc_stamp.filter(|_| index == 0) {
                             shard.gpu.debug_stamp(at, slot)?;
                         }
+                        tap_features(shard, &work, &hp, layer, first, rows as usize, n)?;
                         attention_ops(shard, &work, &hp, &attention, target, link)
                     })? {
                         avoided += 2;
@@ -2127,6 +2156,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 } else {
                     let work = self.shards[index].work.view(first);
                     hc_attention(&mut self.shards[index], &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
+                    tap_features(&mut self.shards[index], &work, &hp, layer, first, rows as usize, n)?;
                 }
             }
             self.views.replay(avoided);
@@ -2992,6 +3022,22 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         return shard.linear_send(ATTENTION, &name(layer, "attn_output_b"), work.low.base(), n, target);
     }
     shard.linear(&name(layer, "attn_output_b"), work.low.base(), n, target)
+}
+
+/// With a feature tap (the drafter's device), a tapped layer's input after its hyper-connections
+/// (Engram applied, before attention) into the tap: the mean of each row's hc copies, for the
+/// pass's last [`TAP_ROWS`] rows (`n` rows; this batch's `rows` from row `first`). Only the tap
+/// is written: the layer's results are those without it.
+fn tap_features(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, first: usize, rows: usize, n: usize) -> Result<()> {
+    let (Some(tap), Some(slot)) = (shard.tap, TAP_LAYERS.iter().position(|&tapped| tapped == layer)) else { return Ok(()) };
+    let keep = n.saturating_sub(TAP_ROWS);
+    if first + rows <= keep {
+        return Ok(());
+    }
+    let (w, skip) = (hp.width, keep.saturating_sub(first));
+    let stride = TAP_LAYERS.len() * w;
+    shard.gpu.hc_mean(work.stream.base(), rows as u64, hp.hc as u64, w as u64, skip as u64, tap.at((first + skip - keep) * stride),
+                      stride as u64, (slot * w) as u64)
 }
 
 /// A layer's router on a device (every device routes alike); with `predict`, also the next
