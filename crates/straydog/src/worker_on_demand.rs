@@ -17,7 +17,7 @@ use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 
-use crate::worker::{refused, serve, Failure, Output, Plan, Served, WorkerArgs};
+use crate::worker::{engine_failed, refused, serve, Failure, Output, Plan, Served, WorkerArgs};
 
 /// The model and its template, on the thread that made them: the engines hold device state that
 /// stays on one thread.
@@ -54,7 +54,7 @@ impl Served for Handle {
         let (reply, result) = mpsc::channel();
         let job = Job::Run { body: body.clone(), id: id.to_string(), output: output.clone(), cancel: cancel.clone(), started,
                              text: text.clone(), reply };
-        let gone = || Failure { message: "the Straydog model thread has stopped".into(), fatal: true };
+        let gone = || engine_failed("the Straydog model thread has stopped", concat!(file!(), ":", line!(), " Handle::run"));
         self.0.send(job).map_err(|_| gone())?;
         result.recv().map_err(|_| gone())?
     }
@@ -243,7 +243,7 @@ impl<E: Engines> Loaded<E> {
             variables.push(("reasoning_effort", effort));
         }
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
-        let ids = text.encode(&prompt).map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
+        let ids = text.encode(&prompt).map_err(Failure::from)?;
         let encode_seconds = started.elapsed().as_secs_f64();
         let context = self.model.context;
         let max_new = match body.get("max_tokens") {
@@ -285,7 +285,7 @@ impl<E: Engines> Loaded<E> {
         let mut stream = text.stream();
         let mut generated = 0usize;
         let mut first_text: Option<f64> = None;
-        let mut decode_error: Option<String> = None;
+        let mut decode_error: Option<Failure> = None;
         let cancelled = || cancel.load(Ordering::SeqCst);
         let result = self.model.generate(
             &ids, max_new, &sampling, seed, &cancelled,
@@ -299,16 +299,16 @@ impl<E: Engines> Loaded<E> {
                     }
                     Ok(_) => {}
                     Err(exc) => {
-                        decode_error.get_or_insert(exc.to_string());
+                        decode_error.get_or_insert_with(|| exc.into());
                     }
                 }
             },
         );
-        result.map_err(|message| Failure { message, fatal: true })?;
-        if let Some(message) = decode_error {
-            return Err(Failure { message, fatal: true });
+        result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
+        if let Some(failure) = decode_error {
+            return Err(failure);
         }
-        let rest = stream.finish().map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
+        let rest = stream.finish().map_err(Failure::from)?;
         if !rest.is_empty() {
             output.send(&json!({"id": id, "event": "delta", "content": rest, "tokens": generated}));
         }
@@ -328,7 +328,7 @@ impl<E: Engines> Loaded<E> {
             "id": id, "event": "done", "finish_reason": finish_reason,
             "usage": {"prompt_tokens": ids.len(), "completion_tokens": generated, "total_tokens": ids.len() + generated,
                       "cached_tokens": cached},
-            "gpu": self.model.info().map_err(|message| Failure { message, fatal: true })?,
+            "gpu": self.model.info().map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.info")))?,
             "timings": timings,
         }))
     }

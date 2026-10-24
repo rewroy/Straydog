@@ -17,7 +17,7 @@ use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings};
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
-use straydog_engine::text::Text;
+use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
 
 /// The largest frame either way.
@@ -399,7 +399,8 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
     result
 }
 
-/// One request's failure: a request the engine refuses, or an engine failure (fatal).
+/// One request's failure. Request errors need a successful reset; engine/device
+/// failures stay fatal even where resetting their host state succeeds.
 pub(crate) struct Failure {
     pub message: String,
     pub fatal: bool,
@@ -407,6 +408,18 @@ pub(crate) struct Failure {
 
 pub(crate) fn refused(message: impl Into<String>) -> Failure {
     Failure { message: message.into(), fatal: false }
+}
+
+pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
+    Failure { message: format!("{site}: {}", message.into()), fatal: true }
+}
+
+// Tokenization and detokenization use host state owned by this request. Neither can
+// invalidate the device; generate still resets the model before accepting another request.
+impl From<TextError> for Failure {
+    fn from(error: TextError) -> Self {
+        refused(error.to_string())
+    }
 }
 
 /// Run one chat request; returns its terminal frame (`done` or `error`).
@@ -441,7 +454,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         Some(_) => return Err(refused("invalid Straydog reasoning effort")),
     };
     let prompt = engine.template.render(messages, &tools, thinking, effort).map_err(|exc| refused(exc.0))?;
-    let ids = text.encode(&prompt).map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
+    let ids = text.encode(&prompt).map_err(Failure::from)?;
     let encode_seconds = started.elapsed().as_secs_f64();
     let context = engine.model.context;
     let max_new = match body.get("max_tokens") {
@@ -499,7 +512,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let mut stream = text.stream();
     let mut generated = 0usize;
     let mut first_text: Option<f64> = None;
-    let mut decode_error: Option<String> = None;
+    let mut decode_error: Option<Failure> = None;
     let cancelled = || cancel.load(Ordering::SeqCst);
     let result = engine.model.generate(
         &ids, max_new, &sampling, seed, &cancelled,
@@ -514,16 +527,16 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
                 }
                 Ok(_) => {}
                 Err(exc) => {
-                    decode_error.get_or_insert(exc.to_string());
+                    decode_error.get_or_insert_with(|| exc.into());
                 }
             }
         },
     );
-    result.map_err(|message| Failure { message, fatal: true })?;
-    if let Some(message) = decode_error {
-        return Err(Failure { message, fatal: true });
+    result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
+    if let Some(failure) = decode_error {
+        return Err(failure);
     }
-    let rest = stream.finish().map_err(|exc| Failure { message: exc.to_string(), fatal: true })?;
+    let rest = stream.finish().map_err(Failure::from)?;
     if !rest.is_empty() {
         output.send(&json!({"id": id, "event": "delta", "content": rest, "tokens": generated}));
     }
@@ -543,7 +556,78 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         "id": id, "event": "done", "finish_reason": finish_reason,
         "usage": {"prompt_tokens": ids.len(), "completion_tokens": generated, "total_tokens": ids.len() + generated,
                   "cached_tokens": cached},
-        "gpu": engine.model.info().map_err(|message| Failure { message, fatal: true })?,
+        "gpu": engine.model.info().map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.info")))?,
         "timings": timings,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // No GPU or model: an actual tokenizer error goes through the production request
+    // completion/reset path, followed by another request on the same served instance.
+    struct TokenizerOnly {
+        resets: usize,
+        reset_fails: bool,
+    }
+
+    impl Served for TokenizerOnly {
+        fn run(&mut self, text: &Arc<Text>, _output: &Output, id: &str, body: &pyjson::Value,
+               _cancel: &Arc<AtomicBool>, _started: Instant) -> Result<Value, Failure> {
+            let prompt = body.as_str().unwrap();
+            if prompt == "device-fault" {
+                return Err(engine_failed("an illegal memory access was encountered", concat!(file!(), ":", line!(), " device fault")));
+            }
+            let tokens = text.encode(prompt).map_err(Failure::from)?;
+            Ok(json!({"id": id, "event": "done", "tokens": tokens}))
+        }
+
+        fn reset(&mut self) -> Result<(), String> {
+            self.resets += 1;
+            if self.reset_fails { Err("device reset failed".into()) } else { Ok(()) }
+        }
+    }
+
+    fn tokenizer() -> Arc<Text> {
+        // Unknown text fails because the declared unknown token is absent. Known text
+        // still encodes, so this exercises a failure and then real successful encoding.
+        Arc::new(Text::new(br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"ok":0},"unk_token":"[UNK]"}}"#).unwrap())
+    }
+
+    fn request(engine: &Mutex<TokenizerOnly>, text: &Arc<Text>, prompt: &str, id: &str) -> Value {
+        let output = Output(Arc::new(Mutex::new(std::io::stdout())));
+        generate(engine, text, &output, id, &pyjson::Value::Str(prompt.into()), &Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn tokenizer_failure_resets_and_next_request_succeeds() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: false });
+        let text = tokenizer();
+        let failed = request(&engine, &text, "unknown", "first");
+        assert_eq!(failed["event"], "error");
+        assert_eq!(failed["fatal"], false);
+        assert!(failed["message"].as_str().unwrap().starts_with("Straydog tokenizer:"));
+        assert_eq!(engine.lock().unwrap().resets, 1);
+        let next = request(&engine, &text, "ok", "second");
+        assert_eq!(next["event"], "done");
+        assert_eq!(next["id"], "second");
+        assert_eq!(next["tokens"], json!([0]));
+    }
+
+    #[test]
+    fn reset_failure_makes_a_request_error_fatal() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: true });
+        assert_eq!(request(&engine, &tokenizer(), "unknown", "reset-fails")["fatal"], true);
+        assert_eq!(engine.lock().unwrap().resets, 1);
+    }
+
+    #[test]
+    fn device_failure_stays_fatal_after_a_successful_host_reset() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: false });
+        let failed = request(&engine, &tokenizer(), "device-fault", "device-fails");
+        assert_eq!(failed["fatal"], true);
+        assert!(failed["message"].as_str().unwrap().contains("device fault: an illegal memory access"));
+        assert_eq!(engine.lock().unwrap().resets, 1);
+    }
 }
