@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "model": "DeepSeek-V4.1-Flash",
+  "architecture": "deepseek41",
+  "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+  "revision": "cb02422c900df489cea5833e8a92171224059b3c",
+  "bundles": {
+    "GSQ-RCO-IQ2_XS": {
+      "assets": [
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf",
+          "bytes": 39535776992,
+          "sha256": "4c65307992ab586c527ca1f6f64062aa96a33b23c02b7fed103f45f75e854798",
+          "verity": "d56bc41974efd278901f030a6fd0ee4bb49e72eb278812e41b0d6df9b99dd89f"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf",
+          "bytes": 39494617536,
+          "sha256": "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e",
+          "verity": "231d90fc967c00ab6ed91e55915067aad5512a794161ca7319868d9475ed5c36"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf",
+          "bytes": 39423838496,
+          "sha256": "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240",
+          "verity": "e68f4c8c48e7faba9385823aa3aaa3c5e49e464e574c3d6c5dbf6dcededfad7c"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf",
+          "bytes": 36771591232,
+          "sha256": "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf",
+          "verity": "261c4bedaef6c6b431f134afe27f20143917ce09fa04663ae2201078f515df94"
+        }
+      ],
+      "sidecars": [
+        {
+          "name": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+          "bytes": 110595290816,
+          "sha256": "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a",
+          "verity": "9e7a67f276e45441a0f2426d891da3bb69ac18a914906d13cd33574c9f79df31",
+          "architecture": "deepseek41-engram"
+        }
+      ]
+    }
+  }
+}

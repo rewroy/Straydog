@@ -33,7 +33,9 @@ impl Files {
             for tensor in &header.tensors {
                 tensors.insert(tensor.name.clone(), (index, tensor.clone()));
             }
-            if header.shard_index == 0 {
+            // (a sidecar beside the shards, such as a separate Engram's tables, is a GGUF of its own
+            // and never the model's header)
+            if header.shard_index == 0 && !straydog_gguf::SIDECAR_ARCHITECTURES.contains(&header.architecture.as_str()) {
                 first = Some(header);
             }
             maps.push(map);

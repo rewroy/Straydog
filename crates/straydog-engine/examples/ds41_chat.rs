@@ -62,10 +62,15 @@ fn main() -> Result<(), String> {
                     [--split L] [--tp N] [--host-gb N] [--row-cache MIB] [--context N]".into());
     };
     let mut files = files::Files::open(Path::new(dir))?;
-    if row_cache > 0 && straydog_engine::arch::Tensors::tensor(&files, "per_layer_token_embd.weight").is_ok() {
-        files.cache_rows("per_layer_token_embd.weight", row_cache << 20)?;
+    let hp = Hparams::from_model(&files.header, &files)?;
+    // Engram's tables (one, or one a module) read through row caches sharing the budget
+    let mut tables = hp.engram.as_ref().map_or(Vec::new(), |engram| engram.tables.clone());
+    tables.dedup();
+    for table in &tables {
+        if row_cache > 0 {
+            files.cache_rows(table, (row_cache << 20) / tables.len() as u64)?;
+        }
     }
-    let hp = Hparams::from_header(&files.header)?;
     let vocabulary = hp.vocabulary;
     let started = std::time::Instant::now();
     let layers = hp.layers.len();

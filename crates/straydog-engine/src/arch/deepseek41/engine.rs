@@ -407,6 +407,19 @@ pub struct Engine<'a, T: Tensors> {
 enum Resident<'a> {
     Tensor(String, Tensor<'a>),
     Shared(usize, [Tensor<'a>; 3]),
+    /// A tensor made at loading (name, kind, dims, bytes).
+    Made(String, u32, Vec<usize>, Vec<u8>),
+}
+
+/// Engram's gate weights from its q and k norm weights apart: their product, F32 bytes.
+fn engram_gate(q: &Tensor<'_>, k: &Tensor<'_>) -> Result<Vec<u8>> {
+    if q.dims != k.dims {
+        return Err("DeepSeek-V4.1 engram_q and engram_k differ in shape".into());
+    }
+    let (mut qs, mut ks) = (Vec::new(), Vec::new());
+    formats::decode_into(q.kind, q.data, &mut qs)?;
+    formats::decode_into(k.kind, k.data, &mut ks)?;
+    Ok(qs.iter().zip(&ks).flat_map(|(a, b)| (a * b).to_le_bytes()).collect())
 }
 
 fn frequencies(dims: usize, rope: &Rope) -> Vec<f32> {
@@ -637,7 +650,9 @@ impl Shard {
         if parts == 1 || !divided(&name) {
             return self.upload(name, tensor.kind, tensor.dims.clone(), tensor.data);
         }
-        let (cols, rows) = (tensor.dims[0], tensor.dims.get(1).copied().unwrap_or(1));
+        // (rows: every dimension past the first; GGUFs that give wo_a as [cols, rank, groups] hold
+        // its groups' rows one group after another, as [cols, groups x rank] does)
+        let (cols, rows) = (tensor.dims[0], tensor.dims[1..].iter().product::<usize>().max(1));
         if name.ends_with(".attn_output_b.weight") {
             // its groups' columns: a part of every output
             let count = cols / parts;
@@ -807,10 +822,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
                            "attn_output_a", "attn_output_b", "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn",
                            "hc_ffn_base", "hc_ffn_scale", "ffn_norm", "ffn_gate_inp", "attn_compressor_kv", "attn_compressor_gate",
                            "attn_compressor_norm", "indexer.attn_k", "indexer.k_norm", "indexer.attn_q_b", "indexer.proj",
-                           "engram_kv", "engram_gate"] {
+                           "engram_kv", "engram_wkv", "engram_gate"] {
                 names.push(name(layer, tensor));
             }
             names.push(format!("blk.{layer}.exp_probs_b.bias"));
+        }
+        // GGUFs that keep Engram's two norm weights apart (engram_q, engram_k): the gate the op
+        // takes is their product (the gate others store; a product of BF16s is exact in F32)
+        let mut gates = Vec::new();
+        for layer in range.clone() {
+            if let (Ok(q), Ok(k)) = (self.tensors.tensor(&name(layer, "engram_q")), self.tensors.tensor(&name(layer, "engram_k"))) {
+                gates.push((name(layer, "engram_gate"), engram_gate(&q, &k)?, q.dims.clone()));
+            }
         }
         let tensors = self.tensors;
         let copy = |tensor: &Tensor<'a>| Tensor { kind: tensor.kind, dims: tensor.dims.clone(), data: tensor.data };
@@ -824,6 +847,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                         match resident {
                             Resident::Tensor(name, tensor) => shard.place(part, parts, name, &tensor)?,
                             Resident::Shared(layer, roles) => shard.place_shared(layer, &roles)?,
+                            Resident::Made(name, kind, dims, data) => shard.place(part, parts, name, &Tensor { kind, dims, data: &data })?,
                         }
                     }
                     Ok(())
@@ -834,7 +858,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let mut taken = Ok(());
             for name in names {
                 let Ok(tensor) = tensors.tensor(&name) else { continue };
-                if !send(&|| Resident::Tensor(name.clone(), copy(&tensor))) {
+                // (engram_wkv is what others call engram_kv)
+                let placed = name.replace(".engram_wkv.", ".engram_kv.");
+                if !send(&|| Resident::Tensor(placed.clone(), copy(&tensor))) {
+                    break;
+                }
+            }
+            for (name, gate, dims) in &gates {
+                if !send(&|| Resident::Made(name.clone(), 0, dims.clone(), gate.clone())) {
                     break;
                 }
             }
@@ -1556,21 +1587,25 @@ impl<'a, T: Tensors> Engine<'a, T> {
     fn prefetch_engram(&self, tokens: &[u32]) -> Result<()> {
         let Some(engram) = self.hp.engram.as_ref() else { return Ok(()) };
         let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-        let mut rows = Vec::new();
+        let mut rows = vec![Vec::new(); engram.tables.len()];
         for (i, &token) in tokens.iter().enumerate() {
             let before = history[history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-            for module in 0..engram.multipliers.len() / engram.ngram {
-                engram.rows(module, token, &before, self.position + i, &mut rows);
+            for (module, rows) in rows.iter_mut().enumerate() {
+                engram.rows(module, token, &before, self.position + i, rows);
             }
             history.push(token);
         }
-        self.tensors.prefetch_rows("per_layer_token_embd.weight", &rows)
+        for (table, rows) in engram.tables.iter().zip(&rows) {
+            self.tensors.prefetch_rows(table, rows)?;
+        }
+        Ok(())
     }
 
     /// The rows Engram module `module` gathers for `tokens`, decoded (a token's after another's).
     fn engram_rows(&self, module: usize, tokens: &[u32]) -> Result<Vec<f32>> {
         let engram = self.hp.engram.as_ref().ok_or("no Engram metadata")?;
-        let table = self.tensors.tensor("per_layer_token_embd.weight")?;
+        let name = &engram.tables[module];
+        let table = self.tensors.tensor(name)?;
         let (kind, width) = (table.kind, row_bytes(table.kind, table.dims[0])?);
         let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
         let mut rows = Vec::new();
@@ -1579,7 +1614,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             engram.rows(module, token, before, self.position + i, &mut rows);
             history.push(token);
         }
-        let bytes = self.tensors.rows("per_layer_token_embd.weight", &rows)?;
+        let bytes = self.tensors.rows(name, &rows)?;
         let mut gathered = Vec::with_capacity(tokens.len() * self.hp.engram_columns() * engram.head_dim);
         for row in bytes.chunks_exact(width) {
             formats::decode_into(kind, row, &mut gathered)?;

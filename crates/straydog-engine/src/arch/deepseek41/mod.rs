@@ -5,7 +5,7 @@
 pub mod engine;
 pub mod serve;
 
-use super::Keys;
+use super::{Keys, Tensors};
 use straydog_gguf::ModelHeader;
 
 /// How a layer's attention obtains the compressed rows it reads.
@@ -57,6 +57,9 @@ pub struct Engram {
     /// shifts before the sequence start.
     pub token_map: Vec<i64>,
     pub pad: i64,
+    /// Per module, the table its rows (`offsets` + bucket) are in: one table for every module
+    /// (offsets running on across them) or one of its own each (offsets from 0).
+    pub tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,8 +96,42 @@ pub struct Hparams {
     pub layers: Vec<Layer>,
 }
 
+/// A metadata key under its current name or the name older GGUFs gave it.
+fn key<'k>(keys: &Keys<'_>, current: &'k str, older: &'k str) -> &'k str {
+    if keys.has(current) { current } else { older }
+}
+
+/// An integer table of the model's (I32 or I64, `dims`), exactly: none if the model has no such
+/// tensor.
+fn integers(tensors: Option<&dyn Tensors>, name: &str, dims: &[usize]) -> Result<Option<Vec<i64>>, String> {
+    let Some(tensor) = tensors.and_then(|tensors| tensors.tensor(name).ok()) else { return Ok(None) };
+    if tensor.dims != dims {
+        return Err(format!("deepseek41 {name} is {:?}, not {dims:?}", tensor.dims));
+    }
+    let values: Vec<i64> = match tensor.kind {
+        26 => tensor.data.chunks_exact(4).map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()) as i64).collect(),
+        27 => tensor.data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap())).collect(),
+        kind => return Err(format!("deepseek41 {name} is of type {kind}, not an integer table")),
+    };
+    if values.len() != dims.iter().product::<usize>() {
+        return Err(format!("deepseek41 {name} is short"));
+    }
+    Ok(Some(values))
+}
+
 impl Hparams {
+    /// From the metadata alone: a GGUF that keeps Engram's hash parameters there.
     pub fn from_header(header: &ModelHeader) -> Result<Hparams, String> {
+        Self::from_parts(header, None)
+    }
+
+    /// From the metadata and the tensors: also a GGUF that keeps Engram's hash parameters in
+    /// integer tensors (engram_token_map, _multipliers, _primes, _offsets).
+    pub fn from_model(header: &ModelHeader, tensors: &impl Tensors) -> Result<Hparams, String> {
+        Self::from_parts(header, Some(tensors as &dyn Tensors))
+    }
+
+    fn from_parts(header: &ModelHeader, tensors: Option<&dyn Tensors>) -> Result<Hparams, String> {
         if header.architecture != "deepseek41" {
             return Err(format!("expected a deepseek41 GGUF, found {}", header.architecture));
         }
@@ -106,14 +143,15 @@ impl Hparams {
             .map(|tokens| tokens.len())
             .ok_or("GGUF tokenizer tokens are missing")?;
         let ratios = keys.integers("attention.compress_ratios")?;
-        let kv_sources = keys.integers("attention.kv_source_layers")?;
-        let index_sources = keys.integers("attention.indexer.source_layers")?;
+        let kv_sources = keys.integers(key(&keys, "kv_source_layer_ids", "attention.kv_source_layers"))?;
+        let index_sources = keys.integers(key(&keys, "index_source_layer_ids", "attention.indexer.source_layers"))?;
         if ratios.len() < layers {
             return Err("deepseek41 compress ratios do not cover every layer".into());
         }
         let clamp_routed = keys.per_layer("swiglu_clamp_exp", layers)?;
         let clamp_shared = if keys.has("swiglu_clamp_shexp") { keys.per_layer("swiglu_clamp_shexp", layers)? } else { clamp_routed.clone() };
-        let engram_layers = if keys.has("ple.layers") { keys.integers("ple.layers")? } else { Vec::new() };
+        let engram_key = key(&keys, "engram.layer_ids", "ple.layers");
+        let engram_layers = if keys.has(engram_key) { keys.integers(engram_key)? } else { Vec::new() };
         // Every compressed layer reads the rows and the selection of the latest source at or
         // before it, which must compress at the same ratio.
         let (mut kv_last, mut index_last) = (None, None);
@@ -145,10 +183,11 @@ impl Hparams {
                 clamp_shared: clamp_shared[layer] as f32,
             });
         }
-        let candidates = if keys.has("attention.indexer.candidate_source_layer") {
-            let layer = keys.count("attention.indexer.candidate_source_layer")?;
-            let blocks = keys.count("attention.indexer.candidate_top_k_blocks")?;
-            let block = keys.count("attention.indexer.candidate_block_size")?;
+        let candidate = key(&keys, "attention.candidate_source_layer_id", "attention.indexer.candidate_source_layer");
+        let candidates = if keys.has(candidate) {
+            let layer = keys.count(candidate)?;
+            let blocks = keys.count(key(&keys, "attention.candidate_topk_blocks", "attention.indexer.candidate_top_k_blocks"))?;
+            let block = keys.count(key(&keys, "attention.candidate_block_size", "attention.indexer.candidate_block_size"))?;
             if layer >= layers || plan[layer].compressed.map(|c| c.index_source) != Some(layer) || blocks == 0 || block == 0 {
                 return Err("deepseek41 candidate source is not an index source".into());
             }
@@ -175,21 +214,39 @@ impl Hparams {
         let engram = if engram_layers.is_empty() {
             None
         } else {
-            let ngram = keys.count("ple.ngram_size")?;
-            let heads = keys.count("ple.heads_per_ngram")?;
-            let columns = (ngram - 1) * heads;
+            let ngram = keys.count(key(&keys, "engram_max_ngram_size", "ple.ngram_size"))?;
+            let heads = keys.count(key(&keys, "engram_n_heads", "ple.heads_per_ngram"))?;
+            let columns = ngram.saturating_sub(1) * heads;
             let modules = engram_layers.len();
-            let token_map = keys.integers("engram.token_map")?;
-            let pad_token = keys.count("engram.pad_token_id")?;
+            // the hash parameters: in the metadata, or in integer tensors (a table each, row a module)
+            let words = |metadata: &str, tensor: &str, per_module: usize| -> Result<Vec<u64>, String> {
+                if keys.has(metadata) {
+                    return keys.words(metadata);
+                }
+                let values = integers(tensors, tensor, &[per_module, modules])?
+                    .ok_or_else(|| format!("deepseek41 Engram {metadata} is missing (in the metadata or as {tensor})"))?;
+                // (stored as I64; the multipliers are bits of a u64)
+                Ok(values.into_iter().map(|value| value as u64).collect())
+            };
+            let token_map = if keys.has("engram.token_map") {
+                keys.integers("engram.token_map")?
+            } else {
+                integers(tensors, "engram_token_map.weight", &[vocabulary])?.ok_or("deepseek41 Engram token map is missing")?
+            };
+            let pad_token = keys.count(key(&keys, "engram_pad_token_id", "engram.pad_token_id"))?;
+            // a table of its own for each module (offsets from 0) where the model has them
+            let own: Vec<String> = engram_layers.iter().map(|layer| format!("blk.{layer}.engram_embd.weight")).collect();
+            let separate = tensors.is_some_and(|tensors| own.iter().all(|name| tensors.tensor(name).is_ok()));
             let engram = Engram {
                 ngram,
                 heads,
-                head_dim: keys.count("embedding_length_per_layer_input")?,
-                multipliers: keys.words("ple.layer_multipliers")?,
-                primes: keys.words("ple.head_vocab_sizes")?,
-                offsets: keys.words("ple.head_offsets")?,
+                head_dim: keys.count(key(&keys, "engram_head_dim", "embedding_length_per_layer_input"))?,
+                multipliers: words("ple.layer_multipliers", "engram_multipliers.weight", ngram)?,
+                primes: words("ple.head_vocab_sizes", "engram_primes.weight", columns)?,
+                offsets: words("ple.head_offsets", "engram_offsets.weight", columns)?,
                 pad: *token_map.get(pad_token).ok_or("Engram padding token outside the token map")?,
                 token_map,
+                tables: if separate { own } else { vec!["per_layer_token_embd.weight".to_string(); modules] },
             };
             if ngram < 2 || heads == 0 || engram.multipliers.len() != modules * ngram || engram.primes.len() != modules * columns
                 || engram.offsets.len() != modules * columns || engram.primes.iter().any(|&prime| prime < 2)
@@ -269,5 +326,89 @@ impl Engram {
                 out.push((rolling % primes[column] + offsets[column]) as u32);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::Tensor;
+    use std::collections::BTreeMap;
+    use straydog_gguf::Metadata;
+
+    /// A model's tensors by name: kind, dims, bytes.
+    struct Fake(BTreeMap<&'static str, (u32, Vec<usize>, Vec<u8>)>);
+
+    impl Tensors for Fake {
+        fn tensor(&self, name: &str) -> Result<Tensor<'_>, String> {
+            let (kind, dims, data) = self.0.get(name).ok_or_else(|| format!("tensor {name} is missing"))?;
+            Ok(Tensor { kind: *kind, dims: dims.clone(), data })
+        }
+
+        fn verifier(&self) -> Option<crate::experts::Verifier> {
+            None
+        }
+    }
+
+    /// A three-layer DeepSeek-V4.1 header under the current key names, Engram before layers 0
+    /// and 2 (tri-grams, two heads), five tokens.
+    fn header() -> ModelHeader {
+        let mut metadata = BTreeMap::new();
+        let mut put = |key: &str, value: Metadata| { metadata.insert(format!("deepseek41.{key}"), value); };
+        let numbers = |values: &[u64]| Metadata::Array(values.iter().map(|&value| Metadata::Unsigned(value)).collect());
+        for (key, value) in [("block_count", 3), ("embedding_length", 16), ("attention.head_count", 4), ("attention.key_length", 8),
+                             ("rope.dimension_count", 4), ("attention.q_lora_rank", 8), ("attention.output_group_count", 2),
+                             ("attention.output_lora_rank", 8), ("attention.sliding_window", 8), ("expert_count", 4),
+                             ("expert_used_count", 2), ("expert_feed_forward_length", 8), ("expert_shared_count", 1),
+                             ("expert_gating_func", 4), ("attention.indexer.head_count", 2), ("attention.indexer.key_length", 8),
+                             ("attention.indexer.top_k", 4), ("hyper_connection.count", 2), ("hyper_connection.sinkhorn_iterations", 3),
+                             ("engram_max_ngram_size", 3), ("engram_n_heads", 2), ("engram_head_dim", 4), ("engram_pad_token_id", 1)] {
+            put(key, Metadata::Unsigned(value));
+        }
+        for (key, value) in [("attention.layer_norm_rms_epsilon", 1e-6), ("expert_weights_scale", 1.5), ("hyper_connection.epsilon", 1e-6),
+                             ("rope.freq_base", 10000.0), ("attention.compress_rope_freq_base", 160000.0), ("swiglu_clamp_exp", 10.0)] {
+            put(key, Metadata::Float(value));
+        }
+        put("expert_weights_norm", Metadata::Bool(true));
+        put("attention.compress_ratios", numbers(&[0, 1, 1]));
+        put("kv_source_layer_ids", numbers(&[1]));
+        put("index_source_layer_ids", numbers(&[1]));
+        put("engram.layer_ids", numbers(&[0, 2]));
+        metadata.insert("tokenizer.ggml.tokens".into(), Metadata::Array((0..5).map(|id| Metadata::Text(format!("t{id}"))).collect()));
+        ModelHeader { architecture: "deepseek41".into(), declared_context: None, alignment: 32, data_offset: 0, file_bytes: 0,
+                      shard_index: 0, shard_count: 1, tensors: Vec::new(), integer_arrays: BTreeMap::new(), metadata }
+    }
+
+    fn i64s(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    /// The renamed keys and the Engram's hash parameters from integer tables (exact, a multiplier
+    /// above i64 kept as its bits), each module reading a table of its own.
+    #[test]
+    fn current_keys_and_integer_tables() {
+        let multipliers: Vec<i64> = vec![3, 5, -7, 11, 13, 17];
+        let tensors = Fake(BTreeMap::from([
+            ("engram_token_map.weight", (26, vec![5], [4i32, 3, 2, 1, -1].iter().flat_map(|v| v.to_le_bytes()).collect())),
+            ("engram_multipliers.weight", (27, vec![3, 2], i64s(&multipliers))),
+            ("engram_primes.weight", (27, vec![4, 2], i64s(&[101, 103, 107, 109, 113, 127, 131, 137]))),
+            ("engram_offsets.weight", (27, vec![4, 2], i64s(&[0, 101, 204, 311, 0, 113, 240, 371]))),
+            ("blk.0.engram_embd.weight", (20, vec![32, 420], Vec::new())),
+            ("blk.2.engram_embd.weight", (20, vec![32, 508], Vec::new())),
+        ]));
+        let hp = Hparams::from_model(&header(), &tensors).unwrap();
+        let engram = hp.engram.as_ref().unwrap();
+        assert_eq!((engram.ngram, engram.heads, engram.head_dim, engram.pad), (3, 2, 4, 3));
+        assert_eq!(engram.token_map, [4, 3, 2, 1, -1]);
+        assert_eq!(engram.multipliers[2], (-7i64) as u64);
+        assert_eq!(engram.offsets[4..], [0, 113, 240, 371]);
+        assert_eq!(engram.tables, ["blk.0.engram_embd.weight", "blk.2.engram_embd.weight"]);
+        assert_eq!(hp.layers.iter().map(|layer| layer.engram).collect::<Vec<_>>(), [Some(0), None, Some(1)]);
+        assert_eq!(hp.layers[2].compressed, Some(Compressed { ratio: 1, kv_source: 1, index_source: 1 }));
+        // without the tables in the metadata or the tensors, the Engram cannot be set up
+        assert!(Hparams::from_header(&header()).unwrap_err().contains("Engram"));
+        let mut short = tensors;
+        short.0.insert("engram_primes.weight", (27, vec![4, 1], i64s(&[101, 103, 107, 109])));
+        assert!(Hparams::from_model(&header(), &short).is_err());
     }
 }

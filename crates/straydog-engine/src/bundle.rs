@@ -104,7 +104,8 @@ pub fn verity_digest(sha256: &str) -> Result<Option<String>, String> {
 pub fn verity_pins(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
     if is_on_demand(quantization) {
         let pins = on_demand(quantization)?;
-        return Ok(pins.shards.into_iter().zip(pins.verity).collect());
+        let sidecars = pins.sidecars.into_iter().map(|sidecar| (sidecar.asset, sidecar.verity));
+        return Ok(pins.shards.into_iter().zip(pins.verity).chain(sidecars).collect());
     }
     let mut pins = Vec::new();
     for asset in bundle(quantization)?.shards {
@@ -206,10 +207,10 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
 /// worker checks every block it uses against them. A model whose official repository gives its
 /// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
-pub const ON_DEMAND_MANIFESTS: [&str; 3] =
-    [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"), include_str!("assets_ornith.json")];
+pub const ON_DEMAND_MANIFESTS: [&str; 4] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
+                                            include_str!("assets_ornith.json"), include_str!("assets_deepseek41_gsq.json")];
 /// Every on-demand quantization, with the manifest that pins it.
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 3] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0"];
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 4] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0", "GSQ-RCO-IQ2_XS"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -222,6 +223,25 @@ pub struct OnDemand {
     pub verity: Vec<String>,
     /// Official files beside the shards (tokenizer, chat template, generation config), if any.
     pub resources: Vec<Asset>,
+    /// GGUFs beside the shards that the model reads but that are not its shards (a separate
+    /// Engram's tables), read on demand as the shards are.
+    pub sidecars: Vec<Sidecar>,
+}
+
+/// A GGUF beside a bundle's shards: pinned as they are, with the architecture it declares.
+#[derive(Debug, Clone)]
+pub struct Sidecar {
+    pub asset: Asset,
+    pub verity: String,
+    pub architecture: String,
+}
+
+/// A manifest asset's fs-verity digest.
+fn verity_of(item: &Value) -> Result<String, String> {
+    match item["verity"].as_str() {
+        Some(digest) if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) => Ok(digest.to_string()),
+        _ => Err("manifest asset without a verity digest".to_string()),
+    }
 }
 
 /// The manifest pinning an on-demand quantization.
@@ -241,17 +261,16 @@ pub fn on_demand(quantization: &str) -> Result<OnDemand, String> {
     let manifest = on_demand_manifest(quantization)?;
     let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
     let shards = listed.iter().map(asset).collect::<Result<Vec<_>, _>>()?;
-    let verity = listed
-        .iter()
-        .map(|item| match item["verity"].as_str() {
-            Some(digest) if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) => Ok(digest.to_string()),
-            _ => Err("manifest asset without a verity digest".to_string()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let verity = listed.iter().map(verity_of).collect::<Result<Vec<_>, _>>()?;
     let resources = match manifest["resources"]["assets"].as_array() {
         Some(items) => items.iter().map(asset).collect::<Result<Vec<_>, _>>()?,
         None => Vec::new(),
     };
+    let mut sidecars = Vec::new();
+    for item in manifest["bundles"][quantization]["sidecars"].as_array().into_iter().flatten() {
+        let architecture = item["architecture"].as_str().ok_or("manifest sidecar without an architecture")?;
+        sidecars.push(Sidecar { asset: asset(item)?, verity: verity_of(item)?, architecture: architecture.to_string() });
+    }
     Ok(OnDemand {
         model: manifest["model"].as_str().unwrap().to_string(),
         architecture: manifest["architecture"].as_str().unwrap().to_string(),
@@ -259,6 +278,7 @@ pub fn on_demand(quantization: &str) -> Result<OnDemand, String> {
         shards,
         verity,
         resources,
+        sidecars,
     })
 }
 
@@ -273,9 +293,10 @@ pub fn on_demand_sources(quantization: &str) -> Result<Vec<Source>, String> {
     let repository = text(&manifest["repository"], "a repository")?;
     let revision = text(&manifest["revision"], "a revision")?;
     let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
-    let mut sources = pins.shards
-        .into_iter()
-        .zip(listed)
+    let sidecars = manifest["bundles"][quantization]["sidecars"].as_array().map_or(&[][..], Vec::as_slice);
+    let assets = pins.shards.into_iter().chain(pins.sidecars.into_iter().map(|sidecar| sidecar.asset));
+    let mut sources = assets
+        .zip(listed.iter().chain(sidecars))
         .map(|(asset, item)| {
             Ok(Source { asset, repository: repository.clone(), revision: revision.clone(), path: text(&item["source_path"], "a source path")? })
         })
@@ -357,7 +378,7 @@ mod tests {
             assert_eq!(pins.verity.len(), pins.shards.len(), "{quantization}");
             assert!(!pins.shards.is_empty() && pins.shards.iter().all(|asset| asset.sha256.len() == 64), "{quantization}");
             let sources = on_demand_sources(quantization).unwrap();
-            assert_eq!(sources.len(), pins.shards.len() + pins.resources.len(), "{quantization}");
+            assert_eq!(sources.len(), pins.shards.len() + pins.resources.len() + pins.sidecars.len(), "{quantization}");
             assert!(is_on_demand(quantization) && !QUANTIZATIONS.contains(&quantization));
         }
         assert_eq!((model_of("UD-Q8_K_XL").unwrap().as_str(), architecture_of("UD-Q8_K_XL").unwrap().as_str()),
@@ -367,6 +388,13 @@ mod tests {
         let tokenizer = qwen.iter().find(|source| source.asset.name == "tokenizer.json").unwrap();
         assert_eq!((tokenizer.repository.as_str(), tokenizer.path.as_str()), ("Qwen/Qwen3.6-35B-A3B", "tokenizer.json"));
         assert!(on_demand("UD-IQ2_XXS").unwrap().resources.is_empty());
+        // ISTA's GSQ-RCO DeepSeek-V4.1: four shards and the Engram tables beside them, apart from
+        // Qwen3.8's IQ2_XS
+        let gsq = on_demand("GSQ-RCO-IQ2_XS").unwrap();
+        assert_eq!((gsq.model.as_str(), gsq.architecture.as_str(), gsq.shards.len()), ("DeepSeek-V4.1-Flash", "deepseek41", 4));
+        assert_eq!(gsq.sidecars.iter().map(|sidecar| sidecar.architecture.as_str()).collect::<Vec<_>>(), ["deepseek41-engram"]);
+        assert_eq!(verity_pins("GSQ-RCO-IQ2_XS").unwrap().len(), 5);
+        assert_eq!(model_of("IQ2_XS").unwrap(), MODEL);
         assert!(on_demand("IQ3_S").is_err());
     }
 }

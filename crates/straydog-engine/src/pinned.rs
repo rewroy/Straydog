@@ -37,8 +37,9 @@ fn signature(file: &File) -> Result<Signature, String> {
 }
 
 /// Whether the engine gathers rows of a table rather than taking it whole.
-fn gathered(name: &str) -> bool {
-    name == "per_layer_token_embd.weight"
+pub fn gathered(name: &str) -> bool {
+    // DeepSeek-V4.1's Engram: one table for every module, or one each (blk.N.engram_embd)
+    name == "per_layer_token_embd.weight" || (name.starts_with("blk.") && name.ends_with(".engram_embd.weight"))
 }
 
 /// Whether the engine takes a tensor whole (checked when taken) rather than in pieces read later:
@@ -66,12 +67,15 @@ pub struct Pinned {
 
 impl Pinned {
     /// Open the pinned shards in `root` with their trees from `data_dir`: sizes checked, each tree's
-    /// upper levels checked against the pinned digest, and every header verified, then parsed.
+    /// upper levels checked against the pinned digest, and every header verified, then parsed. The
+    /// bundle's sidecars (GGUFs beside the shards, such as a separate Engram's tables) open the same
+    /// way, each a file of its own of the architecture pinned for it.
     pub fn open(root: &Path, data_dir: &Path, pins: &OnDemand) -> Result<Pinned, String> {
         let (mut files, mut maps, mut signatures, mut verifiers) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut tensors, mut first) = (HashMap::new(), None);
         let count = pins.shards.len();
-        for (index, (asset, digest)) in pins.shards.iter().zip(&pins.verity).enumerate() {
+        let sidecars = pins.sidecars.iter().map(|sidecar| (&sidecar.asset, &sidecar.verity));
+        for (index, (asset, digest)) in pins.shards.iter().zip(&pins.verity).chain(sidecars).enumerate() {
             let file = File::open(root.join(&asset.name)).map_err(|exc| format!("{}: {exc}", asset.name))?;
             let before = signature(&file)?;
             if before.0 != asset.bytes {
@@ -94,11 +98,23 @@ impl Pinned {
             verifier.verify(0, &head).map_err(|exc| format!("Straydog asset {}: {exc}", asset.name))?;
             let header = straydog_gguf::inspect_header(&head[..length], asset.bytes)
                 .map_err(|exc| format!("Straydog GGUF preflight of {}: {exc}", asset.name))?;
-            if header.shard_index != index as u64 || header.shard_count != count as u64 {
-                return Err(format!("Straydog shard identity mismatch: {}", asset.name));
-            }
-            if index == 0 && header.architecture != pins.architecture {
-                return Err(format!("Straydog architecture mismatch: {} is not {}", header.architecture, pins.architecture));
+            if let Some(sidecar) = index.checked_sub(count).map(|at| &pins.sidecars[at]) {
+                // a file of its own, of its architecture, made from the model it is beside
+                if header.shard_index != 0 || header.shard_count != 1 || header.architecture != sidecar.architecture {
+                    return Err(format!("Straydog sidecar identity mismatch: {}", asset.name));
+                }
+                let model: &ModelHeader = first.as_ref().ok_or("an on-demand bundle without shards")?;
+                let source = |header: &ModelHeader| header.metadata.get(&format!("{}.engram.source", pins.architecture)).cloned();
+                if source(&header) != source(model) {
+                    return Err(format!("Straydog sidecar {} was made from another model", asset.name));
+                }
+            } else {
+                if header.shard_index != index as u64 || header.shard_count != count as u64 {
+                    return Err(format!("Straydog shard identity mismatch: {}", asset.name));
+                }
+                if index == 0 && header.architecture != pins.architecture {
+                    return Err(format!("Straydog architecture mismatch: {} is not {}", header.architecture, pins.architecture));
+                }
             }
             for tensor in &header.tensors {
                 if tensor.offset.checked_add(tensor.bytes).is_none_or(|end| end > asset.bytes) {
@@ -358,7 +374,8 @@ mod tests {
             verity.push(digest.iter().map(|byte| format!("{byte:02x}")).collect());
             assets.push(asset);
         }
-        let pins = OnDemand { model: "test".into(), architecture: "deepseek41".into(), quantization: "TEST".into(), shards: assets, verity, resources: Vec::new() };
+        let pins = OnDemand { model: "test".into(), architecture: "deepseek41".into(), quantization: "TEST".into(), shards: assets, verity, resources: Vec::new(),
+                              sidecars: Vec::new() };
         Bundle { root, pins }
     }
 

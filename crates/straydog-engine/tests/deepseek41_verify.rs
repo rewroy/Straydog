@@ -57,7 +57,7 @@ fn take_back(devices: &[usize]) {
     let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
     let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let files = Files::open(Path::new(&model)).unwrap();
-    let hp = Hparams::from_header(&files.header).unwrap();
+    let hp = Hparams::from_model(&files.header, &files).unwrap();
     assert!(hp.layers.iter().any(|plan| plan.engram.is_some()), "no Engram layer");
     assert!(hp.layers.iter().enumerate().any(|(layer, plan)| plan.compressed.is_some_and(|c| c.kv_source == layer && c.ratio == 2)),
             "no ratio-2 kv source");

@@ -125,7 +125,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let mut files = Pinned::open(root, data_dir, &pins)?;
     files.cache_tables(settings.row_cache_bytes)?;
     let open_seconds = started.elapsed().as_secs_f64();
-    let hp = Hparams::from_header(&files.header)?;
+    let hp = Hparams::from_model(&files.header, &files)?;
     let layers = hp.layers.len();
     // Per layer: the routed experts' bytes, and the resident bytes kept whole on every device
     // and divided among an engine's devices; the same for the head.
@@ -133,6 +133,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let (mut head_whole, mut head_parted) = (0u64, 0u64);
     for (name, bytes) in files.tensor_bytes() {
         match layer_of(name) {
+            // (Engram's tables are read a row at a time, never resident)
+            _ if crate::pinned::gathered(name) => {}
             Some(layer) if layer < layers && name.ends_with("_exps.weight") => expert_bytes[layer] += bytes,
             Some(layer) if layer < layers && divided(name) => parted[layer] += bytes,
             Some(layer) if layer < layers => whole[layer] += bytes,

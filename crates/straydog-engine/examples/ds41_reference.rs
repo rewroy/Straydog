@@ -53,12 +53,17 @@ impl Files {
             for tensor in &header.tensors {
                 tensors.insert(tensor.name.clone(), (index, tensor.clone()));
             }
-            if header.shard_index == 0 {
+            // (a sidecar beside the shards, such as a separate Engram's tables, is never the model's header)
+            if header.shard_index == 0 && !straydog_gguf::SIDECAR_ARCHITECTURES.contains(&header.architecture.as_str()) {
                 first = Some(header);
             }
             maps.push(map);
         }
         Ok(Files { maps, tensors, header: first.ok_or("no first shard")? })
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
     }
 
     fn tensor(&self, name: &str) -> Tensor<'_> {
@@ -74,6 +79,23 @@ impl Files {
     fn vector(&self, name: &str) -> Vec<f32> {
         let tensor = self.tensor(name);
         decode(tensor.kind, tensor.data)
+    }
+}
+
+/// For Hparams::from_model (the Engram's integer tables).
+impl straydog_engine::arch::Tensors for Files {
+    fn tensor(&self, name: &str) -> Result<straydog_engine::arch::Tensor<'_>, String> {
+        let (shard, info) = self.tensors.get(name).ok_or_else(|| format!("tensor {name} is missing"))?;
+        let start = info.offset as usize;
+        Ok(straydog_engine::arch::Tensor {
+            kind: info.quant_type,
+            dims: info.dimensions.iter().map(|&dim| dim as usize).collect(),
+            data: &self.maps[*shard][start..start + info.bytes as usize],
+        })
+    }
+
+    fn verifier(&self) -> Option<straydog_engine::experts::Verifier> {
+        None
     }
 }
 
@@ -289,7 +311,7 @@ impl Model<'_> {
     fn engram(&self, layer: usize, module: usize, stream: &mut [f32], ids: &[u32], tokens: usize) {
         let (hc, width) = (self.hp.hc, self.hp.width);
         let engram = self.hp.engram.as_ref().unwrap();
-        let table = self.files.tensor("per_layer_token_embd.weight");
+        let table = self.files.tensor(&engram.tables[module]);
         let row_bytes = table.row_bytes();
         let mut rows = Vec::new();
         let mut gathered = Vec::with_capacity(tokens * self.hp.engram_columns() * engram.head_dim);
@@ -300,8 +322,15 @@ impl Model<'_> {
                 gathered.extend(decode(table.kind, &table.data[row as usize * row_bytes..(row as usize + 1) * row_bytes]));
             }
         }
-        let kv = linear(&self.files.tensor(&Model::name(layer, "engram_kv")), &gathered, tokens);
-        let gate = self.files.vector(&Model::name(layer, "engram_gate"));
+        // (engram_wkv elsewhere; the gate the product of q's and k's norm weights where they are apart)
+        let kv_name = if self.files.has(&Model::name(layer, "engram_kv")) { "engram_kv" } else { "engram_wkv" };
+        let kv = linear(&self.files.tensor(&Model::name(layer, kv_name)), &gathered, tokens);
+        let gate = if self.files.has(&Model::name(layer, "engram_gate")) {
+            self.files.vector(&Model::name(layer, "engram_gate"))
+        } else {
+            let (q, k) = (self.files.vector(&Model::name(layer, "engram_q")), self.files.vector(&Model::name(layer, "engram_k")));
+            q.iter().zip(&k).map(|(a, b)| a * b).collect()
+        };
         let eps = self.hp.norm_eps as f64;
         for t in 0..tokens {
             let row = &kv[t * (hc + 1) * width..(t + 1) * (hc + 1) * width];
@@ -637,7 +666,7 @@ fn main() -> Result<(), String> {
         return Err("usage: ds41_reference SHARD_DIR TOKENS [--dump DIR] [--layers N] [--logits FILE]".into());
     };
     let files = Files::open(Path::new(dir))?;
-    let hp = Hparams::from_header(&files.header)?;
+    let hp = Hparams::from_model(&files.header, &files)?;
     let raw = std::fs::read(tokens_file).map_err(|exc| exc.to_string())?;
     let ints: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
     let (prompt, kept) = (ints[0] as usize, ints[1] as usize);

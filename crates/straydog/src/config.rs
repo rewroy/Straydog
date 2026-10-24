@@ -356,7 +356,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     }
     let quant = match options.quant.or(shard_quant) {
         Some(quant) if bundle::quantizations().any(|known| known == quant) => quant,
-        Some(quant) => return Err(format!("unknown quantization {quant}: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S, UD-IQ2_XXS, UD-Q8_K_XL or Q8_0")),
+        Some(quant) => return Err(format!("unknown quantization {quant}: {}", bundle::quantizations().collect::<Vec<_>>().join(", "))),
         None => detect_quantization(&model)?,
     };
     // The shards' verity trees and the warm-up state: beside the model unless given elsewhere
