@@ -100,7 +100,7 @@ fn main() -> Result<(), String> {
         }
         None => false,
     };
-    eprintln!("DS FFN GEMM: {}; other ops F32, span<=4 unchanged GEMV", if half_ffn { "FP16 inputs, F32 sums/output" } else { "FP32" });
+    eprintln!("DS FFN GEMM: {}; prefill batches below 32 and other ops F32, expert span<=4 unchanged GEMV", if half_ffn { "FP16 inputs, F32 sums/output" } else { "FP32" });
     let widths: Vec<usize> = args.iter().position(|arg| arg == "--verify").map_or(vec![0], |at| {
         let value = args[at + 1].split(',').map(|width| width.parse().unwrap()).collect();
         args.drain(at..at + 2);
