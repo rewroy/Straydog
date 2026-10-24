@@ -69,6 +69,17 @@ impl served::Engines for Engines {
         self.engines.iter().map(|engine| engine.cache_counts().drive_bytes).sum()
     }
 
+    fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
+        // (each engine is a layer group; their phases add up over the pass)
+        let mut phases: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();
+        for engine in &mut self.engines {
+            for (phase, seconds) in engine.take_profile() {
+                *phases.entry(phase).or_default() += seconds;
+            }
+        }
+        phases.into_iter().collect()
+    }
+
     fn contents(&self) -> Contents {
         let (mut vram, mut host) = (Vec::new(), Vec::new());
         for engine in &self.engines {

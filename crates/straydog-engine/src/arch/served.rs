@@ -33,6 +33,11 @@ pub trait Engines {
     fn drive_bytes(&self) -> u64 {
         0
     }
+    /// Seconds per phase of the passes since the last call, when the engines profile them
+    /// (DS41_PROFILE), else nothing; the count restarts.
+    fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
+        Vec::new()
+    }
     /// The experts the stores hold, least recently used first: in VRAM, and only in the host tier.
     fn contents(&self) -> Contents;
     /// Start warming the stores up with these experts, least recently used first: the reads in
@@ -443,6 +448,8 @@ impl<E: Engines> Session<E> {
         let total = tokens.len();
         // (where the prefill's experts came from: the wait before the first token, broken down)
         let (hits0, host0, drive0) = self.engines.counts();
+        // (a profile counts from here: the time since the last request is not this prefill's)
+        drop(self.engines.take_profile());
         let drive_bytes0 = self.engines.drive_bytes();
         // The state where this reply's generation prompt begins is saved on the way: the next
         // turn's prompt keeps what precedes it even where the template renders this reply
@@ -464,6 +471,8 @@ impl<E: Engines> Session<E> {
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
         let prefill_drive_bytes = self.engines.drive_bytes() - drive_bytes0;
+        let prefill_profile: Map<String, Value> = self.engines.take_profile().into_iter()
+            .map(|(phase, seconds)| (phase.to_string(), json!(seconds))).collect();
         let cpu = self.engines.cpu_routes();
         let mut ttft = None;
         let decoding = Instant::now();
@@ -494,6 +503,7 @@ impl<E: Engines> Session<E> {
             // the drive bytes are what the wait for the first token read)
             "prefill_experts": {"vram": hits - hits0, "host": host - host0, "drive": drive - drive0},
             "prefill_drive_bytes": prefill_drive_bytes,
+            "prefill_profile": prefill_profile,
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },

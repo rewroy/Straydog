@@ -230,7 +230,8 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
     #[cfg(windows)]
     let keep: &[&str] = &straydog_isolation::WORKER_VARIABLES;
     #[cfg(not(windows))]
-    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM"];
+    // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports)
+    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE"];
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()
@@ -307,7 +308,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}",
+        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -320,6 +321,15 @@ pub fn request_summary(event: &Value) -> String {
             experts if experts.is_object() => format!("; prefill expert reads: VRAM {}, host {}, drive {} ({:.0} MB)",
                                                       count(&experts["vram"]), count(&experts["host"]), count(&experts["drive"]),
                                                       timings["prefill_drive_bytes"].as_f64().unwrap_or(0.0) / 1e6),
+            _ => String::new(),
+        },
+        // (with DS41_PROFILE: the prefill's phases, longest first)
+        match &timings["prefill_profile"] {
+            Value::Object(phases) if !phases.is_empty() => {
+                let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, seconds)| (phase, seconds.as_f64().unwrap_or(0.0))).collect();
+                phases.sort_by(|a, b| b.1.total_cmp(&a.1));
+                format!("; prefill phases: {}", phases.iter().map(|(phase, seconds)| format!("{phase} {seconds:.3} s")).collect::<Vec<_>>().join(", "))
+            }
             _ => String::new(),
         },
     )
