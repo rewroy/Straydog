@@ -244,8 +244,6 @@ const PREDICTED: usize = 8;
 /// prefetches every expert of the next layer (then each used with near certainty: of 4 x 384 routes
 /// all but 1.8% of the experts).
 const AHEAD: usize = 4;
-/// Reader threads per device: reads in flight, enough for an expert's pieces at once.
-const READERS: usize = 32;
 /// Passes of up to this many rows run the routed experts over their slots (decode); longer ones
 /// expert by expert.
 const SLOT_ROWS: usize = 4;
@@ -633,7 +631,7 @@ impl Shard {
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
         let building = std::time::Instant::now();
         let buffers = (building - started).as_secs_f64() - initialized;
-        let mut experts = DeviceExperts::new(&mut gpu, layout, Arc::new(Reader::new(READERS)), settings.expert_slots * parts,
+        let mut experts = DeviceExperts::new(&mut gpu, layout, Reader::shared(), settings.expert_slots * parts,
                                              settings.host_expert_bytes)?;
         let store = building.elapsed().as_secs_f64();
         let shape = RowShape {
@@ -986,7 +984,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (vram, host) = (mine(vram), mine(host));
         let mut reading = 0;
         for shard in &mut self.shards {
-            reading += shard.experts.warm(&mut shard.gpu, &vram, &host)?;
+            reading += shard.experts.warm_bulk(&mut shard.gpu, &vram, &host)?;
         }
         Ok(reading)
     }
@@ -1963,7 +1961,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             shard.gpu.write_buffer(&work.route_rows, 0, &grouped.rows)?;
             shard.gpu.write_buffer(&work.route_weights, 0, &grouped.weights)?;
             if let Some(wave) = waves.first() {
-                shard.experts.request(&mut shard.gpu, layer, &experts(wave))?;
+                shard.experts.request_bulk(&mut shard.gpu, layer, &experts(wave))?;
             }
         }
         // The shared expert over every row (its down writes this device's columns of the output).
@@ -2007,9 +2005,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 acquired.push(shard.experts.acquire(&mut shard.gpu, layer, &experts(wave))?);
                 check_slots(shard, layer, &experts(wave), acquired.last().unwrap(), 2 * gate_bytes + down_bytes, false)?;
                 if let Some(next) = waves.get(index + 1) {
-                    shard.experts.prefetch(&mut shard.gpu, layer, &experts(next), true)?;
+                    shard.experts.prefetch_bulk(&mut shard.gpu, layer, &experts(next), true)?;
                 } else if !ahead.is_empty() {
-                    shard.experts.prefetch(&mut shard.gpu, layer + 1, &ahead, true)?;
+                    shard.experts.prefetch_bulk(&mut shard.gpu, layer + 1, &ahead, true)?;
                 }
             }
             self.mark("expert fills")?;

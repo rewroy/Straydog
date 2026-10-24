@@ -646,3 +646,30 @@ fn a_streamed_fill_lands_chunk_by_chunk() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// Bulk uses one read per role here, while decode keeps its 256KiB pieces; both return
+/// exactly the same authenticated payload, including every role's streamed head/tail.
+#[test]
+fn bulk_reads_and_decode_reads_preserve_expert_bytes() {
+    let strides = [384 << 10, 384 << 10, 256 << 10];
+    let mut base = 0;
+    let roles: Vec<Role> = strides.into_iter().map(|stride| {
+        let role = Role { file: 0, base, stride, bytes: stride };
+        base += stride * EXPERTS as u64;
+        role
+    }).collect();
+    let (path, mut gpu, mut store, reads) = open(&[Some(roles.clone())], 16, 24);
+    store.request_bulk(&mut gpu, 0, &[0]).unwrap();
+    let bulk = store.acquire(&mut gpu, 0, &[0]).unwrap();
+    check_slots(&mut gpu, &roles, &[0], &bulk, "bulk");
+    assert_eq!(reads.load(Ordering::Relaxed), 3);
+    store.release(&mut gpu).unwrap();
+    store.request(&mut gpu, 0, &[1]).unwrap();
+    let decode = store.acquire(&mut gpu, 0, &[1]).unwrap();
+    check_slots(&mut gpu, &roles, &[1], &decode, "decode");
+    assert_eq!(reads.load(Ordering::Relaxed), 8);
+    store.release(&mut gpu).unwrap();
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}

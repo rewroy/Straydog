@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::gpu::{Backend, Result};
 use crate::ops::Buffer;
@@ -28,6 +28,8 @@ use crate::transfer::{self, Mark, Stream};
 /// One drive read: an expert's ~40 pieces go to as many readers at once, so one miss reads at
 /// near the drive's rate (1 MiB pieces waited ~10% longer for a token's misses).
 const CHUNK: u64 = 256 << 10;
+/// Large-row prefill and explicit bulk warm-up; decode/verify keep `CHUNK`.
+const BULK_CHUNK: u64 = 1 << 20;
 /// Host tier memory is allocated and page-locked in arenas of this size, by a thread of its own
 /// from the start (page-locking costs ~0.4 s per GiB: never in a pass's way).
 const ARENA: usize = 1 << 30;
@@ -196,9 +198,47 @@ enum Landed {
     Failed(String),
 }
 
-type Queue = Arc<(Mutex<(VecDeque<ReadJob>, bool)>, Condvar)>;
+struct ReadQueue {
+    jobs: VecDeque<ReadJob>,
+    heads: VecDeque<ReadJob>,
+    tails: VecDeque<ReadJob>,
+    stopped: bool,
+    reading: usize,
+    limit: usize,
+    head_priority: bool,
+    consecutive_heads: usize,
+}
 
-/// Threads that read expert chunks from the drive into host slots.
+impl ReadQueue {
+    fn pop(&mut self) -> Option<ReadJob> {
+        // Bound head priority too: a sustained head stream must still finish earlier downs.
+        if !self.heads.is_empty() && (self.tails.is_empty() || self.consecutive_heads < self.limit) {
+            self.consecutive_heads += 1;
+            return self.heads.pop_front();
+        }
+        if let Some(job) = self.tails.pop_front() {
+            self.consecutive_heads = 0;
+            return Some(job);
+        }
+        self.consecutive_heads = 0;
+        self.jobs.pop_front()
+    }
+}
+
+type Queue = Arc<(Mutex<ReadQueue>, Condvar)>;
+
+/// A data-read permit. Error, cancellation and panic also return it; verification holds none.
+struct ReadPermit(Queue);
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap();
+        state.reading -= 1;
+        drop(state);
+        self.0.1.notify_one();
+    }
+}
+
+/// Threads reading expert chunks, with optional data-I/O admission separate from hashing.
 pub struct Reader {
     queue: Queue,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -206,28 +246,44 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(threads: usize) -> Reader {
-        let queue: Queue = Arc::default();
+        Self::bounded(threads, threads.max(1), false)
+    }
+
+    /// One process-wide DS expert pool, shared by devices and layer groups: thirty-two workers
+    /// share sixteen data-read admissions, returned before verification. No worker consumes a queued
+    /// background job before admission, so newly urgent work retains its priority.
+    pub fn shared() -> Arc<Reader> {
+        static SHARED: OnceLock<Arc<Reader>> = OnceLock::new();
+        SHARED.get_or_init(|| Arc::new(Self::bounded(32, 16, true))).clone()
+    }
+
+    fn bounded(threads: usize, limit: usize, head_priority: bool) -> Reader {
+        let queue: Queue = Arc::new((Mutex::new(ReadQueue {
+            jobs: VecDeque::new(), heads: VecDeque::new(), tails: VecDeque::new(), stopped: false,
+            reading: 0, limit: limit.max(1).min(threads.max(1)), head_priority, consecutive_heads: 0,
+        }), Condvar::new()));
         let workers = (0..threads.max(1)).map(|_| {
             let queue = queue.clone();
             std::thread::spawn(move || loop {
-                let job = {
+                let (job, permit) = {
                     let mut state = queue.0.lock().unwrap();
                     loop {
-                        if let Some(job) = state.0.pop_front() {
-                            break job;
+                        if state.reading < state.limit {
+                            if let Some(job) = state.pop() {
+                                state.reading += 1;
+                                break (job, ReadPermit(queue.clone()));
+                            }
                         }
-                        if state.1 {
-                            return;
-                        }
+                        if state.stopped && state.jobs.is_empty() && state.heads.is_empty() && state.tails.is_empty() { return; }
                         state = queue.1.wait(state).unwrap();
                     }
                 };
-                // A read that panics (a verifier's bug) fails that read; the thread lives on and the
-                // pass waiting for it gets an error instead of waiting forever.
+                // A verifier panic fails just this read; the permit is already returned.
                 let landed = if job.cancelled.load(Ordering::Relaxed) {
+                    drop(permit);
                     Landed::Skipped
                 } else {
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read(&job))) {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read(&job, permit))) {
                         Ok(result) => result.map_or_else(Landed::Failed, |()| Landed::Read),
                         Err(_) => Landed::Failed(format!("the read at {} panicked", job.offset)),
                     }
@@ -238,18 +294,19 @@ impl Reader {
         Reader { queue, workers }
     }
 
-    /// Queue reads; urgent ones (a pass waits for them) go before those queued for prefetches.
+    /// Pass reads precede prefetches. The shared pool is FIFO across devices' heads, with bounded
+    /// priority over tails; legacy pools retain their existing urgent-front ordering.
     fn submit(&self, jobs: Vec<ReadJob>, urgent: bool) {
-        if jobs.is_empty() {
-            return;
-        }
+        if jobs.is_empty() { return; }
         let mut state = self.queue.0.lock().unwrap();
-        if urgent {
-            for job in jobs.into_iter().rev() {
-                state.0.push_front(job);
+        if urgent && state.head_priority {
+            for job in jobs {
+                if job.chunk.head { state.heads.push_back(job); } else { state.tails.push_back(job); }
             }
+        } else if urgent {
+            for job in jobs.into_iter().rev() { state.jobs.push_front(job); }
         } else {
-            state.0.extend(jobs);
+            state.jobs.extend(jobs);
         }
         drop(state);
         self.queue.1.notify_all();
@@ -258,21 +315,18 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.queue.0.lock().unwrap().1 = true;
+        self.queue.0.lock().unwrap().stopped = true;
         self.queue.1.notify_all();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        for worker in self.workers.drain(..) { let _ = worker.join(); }
     }
 }
 
-fn run_read(job: &ReadJob) -> std::result::Result<(), String> {
+fn run_read(job: &ReadJob, permit: ReadPermit) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
     read_fully(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
-    if let Some((verify, file)) = &job.verifier {
-        verify(*file, job.offset, target)?;
-    }
+    drop(permit); // Hashing and proof checks do not consume one of the sixteen data-read admits.
+    if let Some((verify, file)) = &job.verifier { verify(*file, job.offset, target)?; }
     Ok(())
 }
 
@@ -756,6 +810,15 @@ impl DeviceExperts {
     /// without waiting: when several devices each acquire, every device's reads start before any
     /// waits. The next [`acquire`](Self::acquire) takes them (counted here) and waits.
     pub fn request(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<()> {
+        self.request_with(gpu, layer, experts, CHUNK)
+    }
+
+    /// Large-row prefill demand, including its urgent first wave.
+    pub fn request_bulk(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<()> {
+        self.request_with(gpu, layer, experts, BULK_CHUNK)
+    }
+
+    fn request_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], chunk: u64) -> Result<()> {
         self.settled = false;
         let started = std::time::Instant::now();
         let result = (|| {
@@ -776,7 +839,7 @@ impl DeviceExperts {
                 for &expert in experts {
                     let key = (layer as u32, expert as u32);
                     if !self.map.contains_key(&key) {
-                        let slot = self.fill(gpu, key, true)?;
+                        let slot = self.fill(gpu, key, true, chunk)?;
                         self.hold(slot);
                         self.requested.push(key);
                     }
@@ -821,7 +884,7 @@ impl DeviceExperts {
                     let key = (layer as u32, expert as u32);
                     let slot = match self.map.get(&key) {
                         Some(&slot) => slot,
-                        None => self.fill(gpu, key, true)?,
+                        None => self.fill(gpu, key, true, CHUNK)?,
                     };
                     self.hold(slot);
                     slots[index] = slot;
@@ -859,7 +922,7 @@ impl DeviceExperts {
                 if self.slots[slots[index]].key != Some(key) {
                     let slot = match self.map.get(&key) {
                         Some(&slot) => slot,
-                        None => self.fill(gpu, key, true)?,
+                        None => self.fill(gpu, key, true, CHUNK)?,
                     };
                     self.hold(slot);
                     slots[index] = slot;
@@ -921,6 +984,15 @@ impl DeviceExperts {
     /// (and drive time: the scarcest), never a result. Its uploads queue apart from those a pass
     /// waits for.
     pub fn prefetch(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool) -> Result<()> {
+        self.prefetch_with(gpu, layer, experts, drive, CHUNK)
+    }
+
+    /// A bulk prefill wave or warm-up, not decode/verify prediction.
+    pub fn prefetch_bulk(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool) -> Result<()> {
+        self.prefetch_with(gpu, layer, experts, drive, BULK_CHUNK)
+    }
+
+    fn prefetch_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool, chunk: u64) -> Result<()> {
         self.settled = false;
         let class = self.class_of.get(layer).copied().flatten().ok_or_else(|| format!("layer {layer} has no routed experts"))?;
         for &expert in experts {
@@ -930,7 +1002,7 @@ impl DeviceExperts {
                 if self.classes[class].free.is_empty() && self.victim(class).is_err() {
                     break;
                 }
-                let slot = self.fill(gpu, key, false)?;
+                let slot = self.fill(gpu, key, false, chunk)?;
                 self.slots[slot].speculative = true;
                 self.speculative.entry(layer as u32).or_default().push(slot);
                 self.counts.prefetched += 1;
@@ -1096,7 +1168,7 @@ impl DeviceExperts {
     }
 
     /// A VRAM slot for `key`, its fill queued (uploaded now, or once its drive reads land).
-    fn fill(&mut self, gpu: &mut Backend, key: Key, urgent: bool) -> Result<usize> {
+    fn fill(&mut self, gpu: &mut Backend, key: Key, urgent: bool, chunk: u64) -> Result<usize> {
         let class = self.class_of.get(key.0 as usize).copied().flatten().ok_or_else(|| format!("layer {} has no routed experts", key.0))?;
         let slot = self.free_slot(gpu, class)?;
         self.vram_changes += 1;
@@ -1126,7 +1198,7 @@ impl DeviceExperts {
                 // keep some columns, upload once every chunk is in).
                 let streamed = urgent && !self.layout.columns.keys().any(|&(layer, _)| layer == key.0 as usize);
                 let started = if streamed { self.start_stream(slot) } else { Ok(()) };
-                started.and_then(|()| self.read(gpu, key, urgent, streamed)).map(|host| {
+                started.and_then(|()| self.read(gpu, key, urgent, streamed, chunk)).map(|host| {
                     self.slots[slot].waiting = Some(host);
                     self.host[host].waiter = Some(slot);
                 })
@@ -1295,7 +1367,7 @@ impl DeviceExperts {
     /// holds nothing). With `streamed`, the VRAM slot the caller then makes its waiter uploads
     /// each chunk's role bytes as the chunk lands (roles back to back: a layer without kept
     /// columns), so that only the last chunk's copy follows the last read.
-    fn read(&mut self, gpu: &mut Backend, key: Key, urgent: bool, streamed: bool) -> Result<usize> {
+    fn read(&mut self, gpu: &mut Backend, key: Key, urgent: bool, streamed: bool, chunk_bytes: u64) -> Result<usize> {
         let class = self.class_of[key.0 as usize].ok_or("a read for a layer without routed experts")?;
         let host = self.free_host(gpu, class)?;
         let plan = self.layout.read_plan(key.0 as usize, key.1 as usize)?;
@@ -1308,7 +1380,7 @@ impl DeviceExperts {
             let handle = self.layout.files[span.file].0.clone();
             let mut done = 0;
             while done < span.len {
-                let piece = CHUNK.min(span.len - done);
+                let piece = chunk_bytes.min(span.len - done);
                 // the role's bytes in this piece of the span, and where they go in the VRAM slot
                 let (from, to) = ((span.at + done).max(span.data), (span.at + done + piece).min(span.data + span.bytes));
                 let chunk = Chunk { host: from, vram: vram + from.saturating_sub(span.data), bytes: to.saturating_sub(from), head: role < 2 };
@@ -1676,6 +1748,15 @@ impl DeviceExperts {
     /// started). The reads queue behind every pass's. Experts of layers this store does not hold
     /// are skipped. Returns the reads still in flight.
     pub fn warm(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+        self.warm_with(gpu, vram, host, CHUNK)
+    }
+
+    /// Warm-up from disk in bulk; demand reads retain priority.
+    pub fn warm_bulk(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<usize> {
+        self.warm_with(gpu, vram, host, BULK_CHUNK)
+    }
+
+    fn warm_with(&mut self, gpu: &mut Backend, vram: &[(usize, usize)], host: &[(usize, usize)], chunk: u64) -> Result<usize> {
         self.settled = false;
         for &(layer, expert) in host {
             let Some(class) = self.class_of.get(layer).copied().flatten() else { continue };
@@ -1683,11 +1764,11 @@ impl DeviceExperts {
             if self.classes[class].host_capacity == 0 || self.map.contains_key(&key) || self.host_map.contains_key(&key) {
                 continue;
             }
-            self.read(gpu, key, false, false)?;
+            self.read(gpu, key, false, false, chunk)?;
         }
         for &(layer, expert) in vram {
             if self.class_of.get(layer).copied().flatten().is_some() {
-                self.prefetch(gpu, layer, &[expert], true)?;
+                self.prefetch_with(gpu, layer, &[expert], true, chunk)?;
             }
         }
         self.poll(gpu)
@@ -1798,7 +1879,7 @@ impl DeviceExperts {
         if !urgent {
             self.counts.prefetched += 1;
         }
-        self.read(gpu, key, urgent, false).map(drop)
+        self.read(gpu, key, urgent, false, CHUNK).map(drop)
     }
 
     /// Wait for a drive read to land (and take every landed one). A read no pass holds a slot for
@@ -1832,7 +1913,7 @@ impl DeviceExperts {
             return Ok(None);
         }
         self.settled = false;
-        let slot = self.fill(gpu, (layer as u32, expert as u32), false)?;
+        let slot = self.fill(gpu, (layer as u32, expert as u32), false, CHUNK)?;
         let (_, mark) = self.slots[slot].ready.ok_or("a promoted expert has no upload")?;
         Ok(Some((self.slot_buffer(slot).base() as u64, mark)))
     }
@@ -1897,5 +1978,113 @@ impl Drop for DeviceExperts {
                 let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    fn file() -> (std::path::PathBuf, Arc<File>) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("straydog-reader-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        File::create(&path).unwrap().write_all(&vec![7u8; ALIGN]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        (path, file)
+    }
+
+    fn job(file: &Arc<File>, target: &mut [u8], done: &Sender<(usize, Chunk, Landed)>, slot: usize,
+           head: bool, verifier: Option<Verifier>) -> ReadJob {
+        ReadJob { file: file.clone(), offset: 0, len: target.len() as u64, target: HostPointer(target.as_mut_ptr()),
+            verifier: verifier.map(|verify| (verify, 0)), done: done.clone(), slot,
+            chunk: Chunk { host: 0, vram: 0, bytes: target.len() as u64, head }, cancelled: Arc::new(AtomicBool::new(false)) }
+    }
+
+    struct Unblock(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for Unblock {
+        fn drop(&mut self) { *self.0.0.lock().unwrap() = true; self.0.1.notify_all(); }
+    }
+
+    #[test]
+    fn admission_returns_before_verification() {
+        let (path, file) = file();
+        let mut targets = [vec![0u8; ALIGN], vec![0u8; ALIGN]];
+        let reader = Reader::bounded(2, 1, true);
+        let blocked = Arc::new((Mutex::new(false), Condvar::new()));
+        let unblock = Unblock(blocked.clone());
+        let (entered, entries) = channel();
+        let verifier: Verifier = Arc::new(move |_, _, data| {
+            assert!(data.iter().all(|&byte| byte == 7));
+            entered.send(()).unwrap();
+            let mut open = blocked.0.lock().unwrap();
+            while !*open { open = blocked.1.wait(open).unwrap(); }
+            Ok(())
+        });
+        let (done, results) = channel();
+        let jobs = targets.iter_mut().enumerate().map(|(i, target)| job(&file, target, &done, i, true, Some(verifier.clone()))).collect();
+        reader.submit(jobs, true);
+        // Both workers must reach verification even with just one data-read admission.
+        let first = entries.recv_timeout(Duration::from_secs(3));
+        let second = entries.recv_timeout(Duration::from_secs(3));
+        drop(unblock);
+        let completed: Vec<_> = (0..2).map(|_| results.recv_timeout(Duration::from_secs(3))).collect();
+        drop(reader);
+        assert!(first.is_ok() && second.is_ok(), "verification held the only data-read permit");
+        assert!(completed.iter().all(|r| matches!(r, Ok((_, _, Landed::Read)))));
+        assert!(targets.iter().flatten().all(|&byte| byte == 7));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unadmitted_background_does_not_bypass_urgent_or_starve_tails() {
+        let (path, file) = file();
+        let mut targets = [vec![0u8; ALIGN], vec![0u8; ALIGN], vec![0u8; ALIGN], vec![0u8; ALIGN]];
+        let reader = Reader::bounded(1, 1, true);
+        // Represent a data call already occupying the admission. Workers must not dequeue yet.
+        reader.queue.0.lock().unwrap().reading = 1;
+        let held = ReadPermit(reader.queue.clone());
+        let (done, results) = channel();
+        let [background, tail, head, another_head] = &mut targets;
+        reader.submit(vec![job(&file, background, &done, 0, true, None)], false);
+        reader.submit(vec![job(&file, tail, &done, 1, false, None), job(&file, head, &done, 2, true, None),
+                           job(&file, another_head, &done, 3, true, None)], true);
+        let premature = results.recv_timeout(Duration::from_millis(50));
+        drop(held);
+        let order: Vec<_> = (0..4).map(|_| results.recv_timeout(Duration::from_secs(3))).collect();
+        drop(reader);
+        assert!(premature.is_err(), "a data read bypassed the admission bound");
+        let slots: Vec<_> = order.into_iter().map(|r| r.unwrap().0).collect();
+        assert_eq!(slots, [2, 1, 3, 0], "urgent head first, tail progress, then background");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_cancelled_and_panicked_reads_return_their_admission() {
+        let (path, file) = file();
+        let mut targets = [vec![0u8; ALIGN], vec![0u8; ALIGN], vec![0u8; ALIGN], vec![0u8; ALIGN]];
+        let reader = Reader::bounded(1, 1, true);
+        let (done, results) = channel();
+        let mut jobs = Vec::new();
+        let verifiers: [Option<Verifier>; 4] = [None, Some(Arc::new(|_, _, _| Err("bad proof".into()))),
+            Some(Arc::new(|_, _, _| panic!("expected verifier panic"))), None];
+        for (i, (target, verifier)) in targets.iter_mut().zip(verifiers).enumerate() {
+            let read = job(&file, target, &done, i, true, verifier);
+            if i == 0 { read.cancelled.store(true, Ordering::Relaxed); }
+            jobs.push(read);
+        }
+        reader.submit(jobs, true);
+        let completed: Vec<_> = (0..4).map(|_| results.recv_timeout(Duration::from_secs(3))).collect();
+        drop(reader);
+        let completed: Vec<_> = completed.into_iter().map(|r| r.unwrap().2).collect();
+        assert!(matches!(completed[0], Landed::Skipped));
+        assert!(matches!(&completed[1], Landed::Failed(message) if message.contains("bad proof")));
+        assert!(matches!(&completed[2], Landed::Failed(message) if message.contains("panicked")));
+        assert!(matches!(completed[3], Landed::Read));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }
