@@ -256,8 +256,8 @@ pub const VERIFY_ROWS: usize = SLOT_ROWS;
 /// One device's share of the engine: its weights (its parts of the split ones), its copy of the
 /// sequence state and work buffers, and its expert store.
 struct Shard {
-    /// Seconds this device took to start: the GPU's runtime, its buffers, its expert store.
-    startup: [f64; 3],
+    /// Seconds starting the GPU, its buffers/store and the F32/FP16 GEMM warm-ups.
+    startup: [f64; 5],
     /// This device's rows of the experts.
     rows: Rows,
     gpu: Backend,
@@ -571,6 +571,25 @@ impl Shard {
         }
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
+        // The normal four-token warm takes GEMV; move BLAS's lazy setup ahead of requests. Initialize both policies: batches below 32 still use F32.
+        // Synthetic zero matrices touch no model, expert store or sequence state. Release
+        // them before the long-lived buffers/cache are allocated (no residency change).
+        let mut gemm_warm = [0.0; 2];
+        if settings.half_ffn && settings.rows >= 32 {
+            let warming = std::time::Instant::now();
+            let weights = gpu.buffer(256 * 256 * 4)?;
+            let input = gpu.buffer(32 * 256 * 4)?;
+            let output = gpu.buffer(32 * 256 * 4)?;
+            let mut finished = [0.0f32];
+            for (index, half) in [false, true].into_iter().enumerate() {
+                let started = if index == 0 { warming } else { std::time::Instant::now() };
+                gpu.linear_gemm(&weights, 0, 256, 256, 0, input.base(), 0, 32, output.base(), 0, &scratch, half)?;
+                // This read waits for the stream; startup timing includes completed GPU work.
+                gpu.read_buffer(&output, 0, &mut finished)?;
+                gemm_warm[index] = started.elapsed().as_secs_f64();
+            }
+            for buffer in [weights, input, output] { gpu.release_buffer(buffer)?; }
+        }
         let (b, hc, w) = (settings.batch, hp.hc, hp.width);
         // One table for every attention of this pass, before any graph records a pointer into it.
         if hp.rope_dims > 0 {
@@ -678,7 +697,7 @@ impl Shard {
         let compressed_buffer = floats(&mut gpu, compressed.len())?;
         gpu.write_buffer(&compressed_buffer, 0, &compressed)?;
         let building = std::time::Instant::now();
-        let buffers = (building - started).as_secs_f64() - initialized;
+        let buffers = (building - started).as_secs_f64() - initialized - gemm_warm.iter().sum::<f64>();
         let mut experts = DeviceExperts::new(&mut gpu, layout, Reader::shared(), settings.expert_slots * parts,
                                              settings.host_expert_bytes)?;
         let store = building.elapsed().as_secs_f64();
@@ -694,7 +713,7 @@ impl Shard {
             None => None,
         };
         Ok(Shard {
-            startup: [initialized, buffers, store],
+            startup: [initialized, buffers, store, gemm_warm[0], gemm_warm[1]],
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
@@ -819,10 +838,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
             let laid = laying.elapsed().as_secs_f64();
             let shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
-            let [init, buffers, store] = shard.startup;
+            let [init, buffers, store, f32_warm, f16_warm] = shard.startup;
             // (the wait before a server starts, by step: T161)
             startup.extend([(format!("GPU {device} expert layout"), laid), (format!("GPU {device} init"), init),
-                            (format!("GPU {device} buffers"), buffers), (format!("GPU {device} expert store"), store)]);
+                            (format!("GPU {device} buffers"), buffers), (format!("GPU {device} expert store"), store),
+                            (format!("GPU {device} F32 GEMM warm"), f32_warm), (format!("GPU {device} FP16 GEMM warm"), f16_warm)]);
             shards.push(shard);
         }
         let mut sources = BTreeMap::new();
