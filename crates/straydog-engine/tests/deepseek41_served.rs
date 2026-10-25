@@ -58,7 +58,7 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
     model.prompt_logits = Some(Vec::new());
     let text = Text::from_gguf(model.header()).unwrap();
-    let template = ChatTemplate::new(model.header().metadata["tokenizer.chat_template"].text().unwrap()).unwrap();
+    let template = ChatTemplate::new(straydog_engine::arch::deepseek41::CHAT_TEMPLATE).unwrap();
     // Chats with thinking on, sent back as clients send them: each reply's content alone, without
     // its reasoning, so a turn never extends the held sequence (its reply's thinking) and resumes
     // from the checkpoint where that reply's generation prompt began.

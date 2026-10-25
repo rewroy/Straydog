@@ -195,7 +195,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     report("prepare", 0, 0);
     let header = model.header();
     let architecture = header.architecture.clone();
-    // The official tokenizer and chat template when the bundle pins them, else the GGUF's.
+    // The official tokenizer and chat template when the bundle pins them, else the GGUF's (but
+    // DeepSeek-V4.1's own: not every GGUF carries the reference's).
     let resources = bundle::on_demand(&args.quant)?.resources;
     let resource = |name: &str| resources.iter().find(|asset| asset.name == name)
         .map(|asset| straydog_engine::pinned::resource(&args.model, asset)).transpose();
@@ -205,6 +206,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     }.map_err(|exc| exc.to_string())?;
     let source = match resource("chat_template.jinja")? {
         Some(bytes) => String::from_utf8(bytes).map_err(|exc| exc.to_string())?,
+        None if architecture == "deepseek41" => straydog_engine::arch::deepseek41::CHAT_TEMPLATE.to_string(),
         None => header.metadata.get("tokenizer.chat_template").and_then(|value| value.text())
             .ok_or("the GGUF has no chat template")?.to_string(),
     };

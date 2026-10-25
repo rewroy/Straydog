@@ -5,6 +5,13 @@
 pub mod engine;
 pub mod serve;
 
+/// DeepSeek-V4.1's chat template: Unsloth's port of the model's encoding.py (the UD GGUFs'),
+/// which renders the reference encoder's prompts (tests/golden/deepseek41_chat.json). Some GGUFs
+/// carry another: ISTA's GSQ-RCO writes the DSML tags without the leading space the model writes
+/// them with ("<｜DSML｜tool_calls>" for "<｜DSML｜ calls>"), so a reply that called a tool never
+/// read back as the model wrote it.
+pub const CHAT_TEMPLATE: &str = include_str!("chat_template.jinja");
+
 use super::{Keys, Tensors};
 use straydog_gguf::ModelHeader;
 

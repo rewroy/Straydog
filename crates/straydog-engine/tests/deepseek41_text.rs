@@ -48,16 +48,11 @@ fn the_gguf_tokenizer_encodes_as_the_official_one() {
     assert_eq!(ours.decode(&every).unwrap(), official.decode(&every).unwrap());
 }
 
-/// The GGUF's chat template against the reference encoder (tests/golden/deepseek41_chat.json, made
-/// by the model's encoding.py): the same prompt for every case.
-#[test]
-fn the_gguf_template_renders_as_the_reference_encoder() {
+/// A chat template against the reference encoder (tests/golden/deepseek41_chat.json, made by the
+/// model's encoding.py): the same prompt for every case.
+fn renders_as_the_reference_encoder(source: &str) {
     use straydog_engine::chat::ChatTemplate;
     use straydog_engine::pyjson::{self, Value};
-    let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
-    let mut file = std::io::BufReader::new(std::fs::File::open(first_shard(&PathBuf::from(model))).unwrap());
-    let header = straydog_gguf::inspect(&mut file).unwrap();
-    let source = header.metadata["tokenizer.chat_template"].text().unwrap();
     let template = ChatTemplate::new(source).unwrap();
     let golden = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/deepseek41_chat.json")).unwrap();
     let golden = pyjson::parse(&golden).unwrap();
@@ -67,4 +62,19 @@ fn the_gguf_template_renders_as_the_reference_encoder() {
         let prompt = template.render_with(case.get("messages").unwrap(), case.get("tools").unwrap(), &variables);
         assert_eq!(prompt.as_deref().map_err(|error| error.0.clone()), Ok(case.get("prompt").unwrap().as_str().unwrap()), "case {index}");
     }
+}
+
+/// The UD GGUF's chat template renders as the reference encoder.
+#[test]
+fn the_gguf_template_renders_as_the_reference_encoder() {
+    let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
+    let mut file = std::io::BufReader::new(std::fs::File::open(first_shard(&PathBuf::from(model))).unwrap());
+    let header = straydog_gguf::inspect(&mut file).unwrap();
+    renders_as_the_reference_encoder(header.metadata["tokenizer.chat_template"].text().unwrap());
+}
+
+/// So does the template Straydog serves DeepSeek-V4.1 with, whatever its GGUF carries.
+#[test]
+fn the_builtin_template_renders_as_the_reference_encoder() {
+    renders_as_the_reference_encoder(straydog_engine::arch::deepseek41::CHAT_TEMPLATE);
 }

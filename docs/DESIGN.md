@@ -456,7 +456,10 @@ across the bus costs more than the sum's launch. Each GPU's VRAM left after its 
 sequence state goes to expert slots, and the host tier gets what Straydog's other host memory
 leaves of 85% of the host memory (as the server measures it, cgroup limits included).
 Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the official
-tokenizer's ids; the template renders the reference encoder's prompts), replies split at the
+tokenizer's ids), but the template is Straydog's copy of the UD GGUFs' (Unsloth's port of the
+model's encoding.py, rendering the reference encoder's prompts): other GGUFs carry other templates,
+and one that writes the DSML tags otherwise than the model does never reads a reply that called a
+tool back as the model wrote it, so no turn continues the held sequence. Replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A
 prompt that extends the held sequence continues it; there are no checkpoints yet.
 
