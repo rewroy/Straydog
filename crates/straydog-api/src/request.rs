@@ -104,7 +104,7 @@ pub(crate) struct Shape {
 }
 
 /// The worker request for an OpenAI chat completion request, and the shape of its answer.
-pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, Shape), ApiError> {
+pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Result<(Value, Shape), ApiError> {
     let messages = match given(payload, "messages") {
         Some(Value::Array(messages)) if !messages.is_empty() => messages,
         _ => return Err(ApiError::invalid("messages must be a non-empty list")),
@@ -231,7 +231,7 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig) -> Result<(Value, S
         Some(_) => return Err(ApiError::invalid("stream_options must be an object")),
     };
 
-    let messages = messages.iter().map(message).collect::<Result<Vec<_>, _>>()?;
+    let messages = messages.iter().map(|item| message(item, vision)).collect::<Result<Vec<_>, _>>()?;
     // Qwen's card is the API's; another family's worker reports its own card and fills in what is
     // left null here.
     let (temperature, top_k, top_p, min_p, presence_penalty) = match markup {
@@ -289,8 +289,9 @@ fn same(value: &Value, other: &Value) -> bool {
 }
 
 /// A message for the template: the known fields in the client's order, a developer message
-/// as a system one, and the content as text.
-fn message(message: &Value) -> Result<Value, ApiError> {
+/// as a system one, and the content as text; with `vision` (a model that reads images), a user's
+/// or a tool's content with images as its parts.
+fn message(message: &Value, vision: bool) -> Result<Value, ApiError> {
     let role = message.get("role").and_then(Value::as_str);
     let (Value::Object(fields), Some("system" | "developer" | "user" | "assistant" | "tool")) = (message, role) else {
         return Err(ApiError::invalid("each message needs a role: system, developer, user, assistant or tool"));
@@ -302,6 +303,7 @@ fn message(message: &Value) -> Result<Value, ApiError> {
         }
         let value = match key.as_str() {
             "role" if role == Some("developer") => Value::Str("system".into()),
+            "content" if vision && matches!(role, Some("user" | "tool")) && has_images(value) => parts(value)?,
             "content" => Value::Str(text(value)?),
             _ => value.clone(),
         };
@@ -319,9 +321,43 @@ fn text(content: &Value) -> Result<String, ApiError> {
             .iter()
             .map(|part| match (part.get("type").and_then(Value::as_str), part.get("text")) {
                 (Some("text"), Some(Value::Str(text))) => Ok(text.as_str()),
-                _ => Err(ApiError::invalid("only text content is supported")),
+                (Some("image_url" | "image"), _) => Err(ApiError::invalid("this model reads no images")),
+                _ => Err(ApiError::invalid("only text and image content is supported")),
             })
             .collect::<Result<String, _>>(),
         _ => Err(ApiError::invalid("message content must be a string or a list of text parts")),
     }
+}
+
+fn has_images(content: &Value) -> bool {
+    matches!(content, Value::Array(parts) if parts.iter().any(|part| matches!(part.get("type").and_then(Value::as_str), Some("image_url" | "image"))))
+}
+
+/// Content with images, as its parts for the template (the worker takes the images out): text
+/// parts, and images as `image_url` parts with a `data:` URL or `image` parts with a base64 source.
+fn parts(content: &Value) -> Result<Value, ApiError> {
+    let Value::Array(parts) = content else { return Err(ApiError::invalid("message content must be a list of parts")) };
+    for part in parts {
+        let valid = match part.get("type").and_then(Value::as_str) {
+            Some("text") => matches!(part.get("text"), Some(Value::Str(_))),
+            Some("image_url") => {
+                let url = match part.get("image_url") {
+                    Some(Value::Str(url)) => Some(url.as_str()),
+                    Some(object) => object.get("url").and_then(Value::as_str),
+                    None => None,
+                };
+                match url {
+                    Some(url) if url.starts_with("data:") => true,
+                    Some(_) => return Err(ApiError::invalid("an image_url must be a data: URL (the server fetches nothing)")),
+                    None => false,
+                }
+            }
+            Some("image") => part.get("source").is_some_and(|source| source.get("data").and_then(Value::as_str).is_some()),
+            _ => false,
+        };
+        if !valid {
+            return Err(ApiError::invalid("only text and image content is supported"));
+        }
+    }
+    Ok(content.clone())
 }

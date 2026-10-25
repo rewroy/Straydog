@@ -51,6 +51,9 @@ use crate::moe;
 use crate::ops::{self, Buffer, Linear};
 use crate::transfer::Stream;
 
+mod vision;
+pub use vision::{encode_image_rows, IMAGE_TOKEN};
+
 type P = *const c_void;
 type M = *mut c_void;
 
@@ -291,6 +294,8 @@ struct Shard {
     reclaimed: u64,
     experts: DeviceExperts,
     checks: Option<SlotChecks>,
+    /// The routers' image biases (every layer's, one after another), uploaded with the first image.
+    image_bias: Option<Buffer>,
 }
 
 /// VRAM a device keeps a prompt pass's FP16 attention weights in (Backend::keep_expansions), for its
@@ -472,6 +477,11 @@ pub struct Engine<'a, T: Tensors> {
     /// kernel's direct reclaim whenever the host ran short of free pages, seconds at a time.
     stream_rows: Vec<f32>,
     engram_values: Vec<f32>,
+    /// The rows passes embed at image positions (ids from [`vision::IMAGE_TOKEN`]): each image
+    /// span's first position and its rows ([`Engine::set_images`]).
+    images: Vec<(usize, Arc<Vec<f32>>)>,
+    /// The running pass's rows at image positions (ranges), which route with the image biases.
+    image_rows: Vec<(usize, usize)>,
     /// Work::view calls the last decode token did not make because a graph replayed
     /// (DS41_COUNT_VIEWS; off, so it stays 0, unless that is set).
     views: ViewCounter,
@@ -757,7 +767,7 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
-            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, experts,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, experts, image_bias: None,
         })
     }
 
@@ -932,6 +942,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
             stream_rows: Vec::new(),
             engram_values: Vec::new(),
+            images: Vec::new(),
+            image_rows: Vec::new(),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
             primed: None,
             startup,
@@ -1444,9 +1456,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let bytes = row_bytes(embed.kind, embed.dims[0])?;
             stream.reserve(n * hc * w);
             let mut row = Vec::new();
-            for &token in tokens {
+            for (i, &token) in tokens.iter().enumerate() {
                 row.clear();
-                formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
+                if token >= vision::IMAGE_TOKEN {
+                    row.extend_from_slice(self.image_row(self.position + i)?);
+                } else {
+                    formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
+                }
                 for _ in 0..hc {
                     stream.extend_from_slice(&row);
                 }
@@ -1463,6 +1479,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.stream_rows = stream;
         if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens)?;
+        }
+        self.image_rows = vision::runs(tokens);
+        if !self.image_rows.is_empty() {
+            self.upload_image_bias()?;
         }
         self.mark("embedding")?;
         // A handed-over stream comes expanded, with the collapse coefficients of the layer before.
@@ -1625,7 +1645,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// Whether a pass of `n` rows has the first device's router publish its routes (see `mailbox`):
     /// a fused router's, of a few rows, with no prediction behind them.
     fn publishes(&self, layer: usize, n: usize, predict: bool) -> bool {
-        self.mailbox && !predict && n <= SLOT_ROWS
+        self.mailbox && !predict && n <= SLOT_ROWS && self.image_rows.is_empty()
             && self.shards[0].dense.get(&name(layer, "ffn_gate_inp")).is_some_and(|router| router.kind == 0 || router.kind == 1 || router.kind == 30)
     }
 
@@ -1835,6 +1855,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     router_ops(shard, &work, &hp, layer, attended, predict && index == 0, publish && index == 0)?;
                 }
             }
+            self.route_images(layer, attending, end)?;
             self.mark("router")?;
         }
         self.engram_values = gathered;
@@ -1888,8 +1909,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut rows = vec![Vec::new(); engram.tables.len()];
         for (i, &token) in tokens.iter().enumerate() {
             let before = history[history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-            for (module, rows) in rows.iter_mut().enumerate() {
-                engram.rows(module, token, &before, self.position + i, rows);
+            // (an image position gathers nothing: Engram passes it by)
+            if token < IMAGE_TOKEN {
+                for (module, rows) in rows.iter_mut().enumerate() {
+                    engram.rows(module, token, &before, self.position + i, rows);
+                }
             }
             history.push(token);
         }
@@ -1910,14 +1934,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut rows = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             let before = &history[history.len().saturating_sub(engram.ngram - 1)..];
-            engram.rows(module, token, before, self.position + i, &mut rows);
+            if token < IMAGE_TOKEN {
+                engram.rows(module, token, before, self.position + i, &mut rows);
+            }
             history.push(token);
         }
         let bytes = self.tensors.rows(name, &rows)?;
+        let values = self.hp.engram_columns() * engram.head_dim;
         gathered.clear();
-        gathered.reserve(tokens.len() * self.hp.engram_columns() * engram.head_dim);
-        for row in bytes.chunks_exact(width) {
-            formats::decode_into(kind, row, gathered)?;
+        gathered.reserve(tokens.len() * values);
+        // An image position's values are zeros: its gate's key and value are then zero, and the
+        // stream passes it unchanged (the reference shuts its gate).
+        let mut decoded = bytes.chunks_exact(width);
+        for &token in tokens {
+            if token >= IMAGE_TOKEN {
+                gathered.resize(gathered.len() + values, 0.0);
+                continue;
+            }
+            for row in decoded.by_ref().take(self.hp.engram_columns()) {
+                formats::decode_into(kind, row, gathered)?;
+            }
         }
         Ok(())
     }

@@ -1834,3 +1834,63 @@ unsafe extern "C" {
         timings: *mut f64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_vision_layer {
+    pub norm1: *const ::std::os::raw::c_void,
+    pub qkv: *const ::std::os::raw::c_void,
+    pub qkv_bias: *const ::std::os::raw::c_void,
+    pub out: *const ::std::os::raw::c_void,
+    pub out_bias: *const ::std::os::raw::c_void,
+    pub norm2: *const ::std::os::raw::c_void,
+    pub gate_up: *const ::std::os::raw::c_void,
+    pub down: *const ::std::os::raw::c_void,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_vision {
+    pub layers: u64,
+    pub width: u64,
+    pub heads: u64,
+    pub ffn: u64,
+    pub patch_values: u64,
+    pub out_width: u64,
+    pub downsample: u64,
+    pub eps: f32,
+    pub rope_theta: f32,
+    pub patch: *const ::std::os::raw::c_void,
+    pub patch_bias: *const ::std::os::raw::c_void,
+    pub norm: *const ::std::os::raw::c_void,
+    pub align1: *const ::std::os::raw::c_void,
+    pub align1_bias: *const ::std::os::raw::c_void,
+    pub align2: *const ::std::os::raw::c_void,
+    pub align2_bias: *const ::std::os::raw::c_void,
+    pub layer: *const sd_vision_layer,
+}
+unsafe extern "C" {
+    pub fn sd_vision_scratch_bytes(
+        model: *const sd_vision,
+        grid_h: u64,
+        grid_w: u64,
+        bytes: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_vision_encode(
+        handle: *mut ::std::os::raw::c_void,
+        model: *const sd_vision,
+        patches: *const ::std::os::raw::c_void,
+        grid_h: u64,
+        grid_w: u64,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_vision_half(
+        handle: *mut ::std::os::raw::c_void,
+        values: *mut ::std::os::raw::c_void,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}

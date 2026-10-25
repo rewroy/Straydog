@@ -169,7 +169,7 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
 /// The verity trees the worker reads: the pinned shards' in the data directory.
 fn trees(settings: &Settings) -> Result<Vec<PathBuf>, String> {
     use straydog_engine::bundle;
-    Ok(bundle::verity_pins(&settings.quant)?.iter().map(|(asset, _)| bundle::tree_path(&settings.data_dir, asset)).collect())
+    Ok(bundle::verity_pins_in(&settings.model, &settings.quant)?.iter().map(|(asset, _)| bundle::tree_path(&settings.data_dir, asset)).collect())
 }
 
 /// Whether verity trees are still to be built before the worker can start.
@@ -196,6 +196,8 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
         let sidecars = pins.sidecars.iter().map(|sidecar| &sidecar.asset);
         let mut files: Vec<PathBuf> =
             pins.shards.iter().chain(&pins.resources).chain(sidecars).map(|asset| settings.model.join(&asset.name)).collect();
+        // (the vision encoder when it is there: its tree is among the trees then)
+        files.extend(bundle::vision_source(&settings.quant)?.map(|vision| settings.model.join(&vision.asset.name)).filter(|path| path.is_file()));
         files.extend(trees);
         return Ok(straydog_isolation::Exposure {
             executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
@@ -308,7 +310,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}), prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}){}, prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -316,6 +318,12 @@ pub fn request_summary(event: &Value) -> String {
         match timings["agreed_tokens"].as_u64() {
             Some(agreed) if agreed > usage["cached_tokens"].as_u64().unwrap_or(0) => format!(", the same as before for {agreed}"),
             _ => String::new(),
+        },
+        // (images, and the time their rows took: the encoder's, for those not kept from a turn before)
+        match timings["images"].as_u64() {
+            Some(images) => format!(", {images} image{} ({:.2} s)", if images == 1 { "" } else { "s" },
+                                    timings["image_seconds"].as_f64().unwrap_or(0.0)),
+            None => String::new(),
         },
         number(&timings["prefill_tokens_per_second"], 0),
         number(&timings["ttft_seconds"], 2),
@@ -1097,7 +1105,7 @@ impl Engine for Runtime {
                 speculative: ready["speculative_drafts"].as_u64().unwrap_or(0),
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
-                                  "gpu": ready["gpu"], "sampling": ready["sampling"]}),
+                                  "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }

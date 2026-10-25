@@ -566,8 +566,8 @@ async fn invalid_requests_are_refused() {
         (json!({"messages": [{"content": "hi"}]}), role),
         (json!({"messages": [{"role": "robot", "content": "hi"}]}), role),
         (json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}),
-         "only text content is supported"),
-        (json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}), "only text content is supported"),
+         "this model reads no images"),
+        (json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}), "only text and image content is supported"),
         (json!({"messages": [{"role": "user", "content": 5}]}), content),
         (ask(json!({"n": 2})), "n is not supported (only 1)"),
         (ask(json!({"top_p": 0})), "top_p must be in (0, 1]"),
@@ -659,11 +659,11 @@ async fn invalid_requests_are_refused() {
 #[tokio::test]
 async fn oversized_bodies_are_refused() {
     let mock = Mock::new(Vec::new());
-    let large = format!(r#"{{"messages": "{}"}}"#, "a".repeat(15 * 1024 * 1024));
+    let large = format!(r#"{{"messages": "{}"}}"#, "a".repeat(64 * 1024 * 1024));
     let too_large = refused(413, "invalid_request_error", "request body too large");
     assert_eq!(fetch(app(&mock), chat(large)).await, too_large);
     let mut declared = chat("{}");
-    declared.headers_mut().insert("content-length", "16000000".parse().unwrap());
+    declared.headers_mut().insert("content-length", "68000000".parse().unwrap());
     assert_eq!(fetch(app(&mock), declared).await, too_large);
 }
 

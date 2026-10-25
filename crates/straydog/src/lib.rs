@@ -6,4 +6,5 @@ pub mod monitor;
 pub mod progress;
 pub mod runtime;
 pub mod worker;
+mod images;
 mod worker_on_demand;

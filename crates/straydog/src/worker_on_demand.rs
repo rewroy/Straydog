@@ -17,6 +17,7 @@ use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 
+use crate::images;
 use crate::worker::{engine_failed, gpu_info_or_null, refused, serve, Failure, Output, Plan, Served, WorkerArgs};
 
 /// The model and its template, on the thread that made them: the engines hold device state that
@@ -26,7 +27,13 @@ struct Loaded<E: Engines> {
     template: ChatTemplate,
     /// Whether the template takes a reasoning effort of its own (DeepSeek-V4.1's levels).
     efforts: bool,
+    /// The span rows of the images encoded last (by their bytes' digest), newest last: a
+    /// conversation sends its images again with every turn.
+    encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
 }
+
+/// Bytes of image rows kept for the turns after ([`Loaded::encoded`]).
+const ENCODED_BYTES: usize = 64 << 20;
 
 /// How an architecture's engines are placed.
 type Place<E> = fn(&Path, &str, &Path, &Settings, &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Session<E>, String>;
@@ -232,8 +239,9 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
                      "presence_penalty": card.presence_penalty},
         "load_seconds": seconds,
         "gpu": model.info()?,
+        "vision": model.engines.vision(),
     });
-    Ok((Loaded { model, template, efforts }, frame, Arc::new(text)))
+    Ok((Loaded { model, template, efforts, encoded: Vec::new() }, frame, Arc::new(text)))
 }
 
 impl<E: Engines> Loaded<E> {
@@ -241,6 +249,12 @@ impl<E: Engines> Loaded<E> {
            -> Result<Value, Failure> {
         use pyjson::Value as Py;
         let messages = body.get("messages").ok_or_else(|| refused("'messages'"))?;
+        // (each image part a marker of its own until the prompt is rendered)
+        let (messages, images) = images::take(messages).map_err(refused)?;
+        if !images.is_empty() && !self.model.engines.vision() {
+            return Err(refused("this model reads no images: its vision encoder file is not beside it (`straydog fetch` builds it)"));
+        }
+        let messages = &messages;
         let tools = body.get("tools").cloned().unwrap_or(Py::Null);
         let thinking = body.get("thinking").is_some_and(Py::truthy);
         let mut variables = vec![("enable_thinking", Py::Bool(thinking))];
@@ -262,8 +276,14 @@ impl<E: Engines> Loaded<E> {
             variables.push(("reasoning_effort", effort));
         }
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
-        let ids = text.encode(&prompt).map_err(Failure::from)?;
+        let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
+        let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
+        let (ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
         let encode_seconds = started.elapsed().as_secs_f64();
+        let image_started = Instant::now();
+        let rows = self.image_rows(&images, &spans)?;
+        self.model.engines.set_images(spans.iter().map(|&(index, start)| (start, rows[index].clone().unwrap_or_default())).collect());
+        let image_seconds = image_started.elapsed().as_secs_f64();
         let context = self.model.context;
         let max_new = match body.get("max_tokens") {
             None => 512,
@@ -340,6 +360,10 @@ impl<E: Engines> Loaded<E> {
         };
         let mut timings = self.model.last_metrics.clone();
         timings.insert("encode_seconds".into(), json!(encode_seconds));
+        if !spans.is_empty() {
+            timings.insert("images".into(), json!(spans.len()));
+            timings.insert("image_seconds".into(), json!(image_seconds));
+        }
         timings.insert("first_text_seconds".into(), json!(first_text));
         timings.insert("request_seconds".into(), json!(started.elapsed().as_secs_f64()));
         let cached = timings.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -350,5 +374,40 @@ impl<E: Engines> Loaded<E> {
             "gpu": gpu_info_or_null(self.model.info(), concat!(file!(), ":", line!(), " model.info")),
             "timings": timings,
         }))
+    }
+}
+
+impl<E: Engines> Loaded<E> {
+    /// The span rows of the placed images (by index; none for an image the prompt does not hold):
+    /// those encoded lately kept, the others encoded together.
+    fn image_rows(&mut self, images: &[images::Image], spans: &[(usize, usize)]) -> Result<Vec<Option<Arc<Vec<f32>>>>, Failure> {
+        let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
+        let mut missing = Vec::new();
+        for &(index, _) in spans {
+            match self.encoded.iter().position(|(digest, _)| *digest == images[index].digest) {
+                Some(at) => {
+                    let kept = self.encoded.remove(at);
+                    rows[index] = Some(kept.1.clone());
+                    self.encoded.push(kept);
+                }
+                None if !missing.contains(&index) => missing.push(index),
+                None => {}
+            }
+        }
+        if missing.is_empty() {
+            return Ok(rows);
+        }
+        let patches: Vec<_> = missing.iter().map(|&index| images[index].patches.clone()).collect();
+        // (a refusal: a device that failed fails the reset after it)
+        let encoded = self.model.engines.encode_images(&patches).map_err(|message| refused(format!("the vision encoder: {message}")))?;
+        for (index, values) in missing.into_iter().zip(encoded) {
+            let values = Arc::new(values);
+            rows[index] = Some(values.clone());
+            self.encoded.push((images[index].digest, values));
+        }
+        while self.encoded.iter().map(|(_, values)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+            self.encoded.remove(0);
+        }
+        Ok(rows)
     }
 }

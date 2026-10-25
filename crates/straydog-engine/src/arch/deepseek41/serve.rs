@@ -134,6 +134,19 @@ impl served::Engines for Engines {
         self.devices_per_expert
     }
 
+    fn vision(&self) -> bool {
+        self.engines[0].vision()
+    }
+
+    fn encode_images(&mut self, images: &[crate::vision::Patches]) -> Result<Vec<Vec<f32>>, String> {
+        self.engines[0].encode_images(images)
+    }
+
+    fn set_images(&mut self, spans: Vec<(usize, std::sync::Arc<Vec<f32>>)>) {
+        // (the first engine embeds the tokens; the others see image positions by their ids)
+        self.engines[0].set_images(spans);
+    }
+
     fn gpus(&self) -> Vec<&Backend> {
         self.engines.iter().flat_map(Engine::gpus).collect()
     }
@@ -277,7 +290,11 @@ fn layer_of(name: &str) -> Option<usize> {
 pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settings,
              progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Model, String> {
     let started = Instant::now();
-    let pins = bundle::on_demand(quantization)?;
+    let mut pins = bundle::on_demand(quantization)?;
+    // The vision encoder, when its file is there (the model reads no images without it).
+    if let Some(vision) = bundle::vision_source(quantization)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
+        pins.sidecars.push(bundle::Sidecar { asset: vision.asset, verity: vision.verity, architecture: bundle::VISION_ARCHITECTURE.into() });
+    }
     let mut files = Pinned::open(root, data_dir, &pins)?;
     files.cache_tables(settings.row_cache_bytes)?;
     let open_seconds = started.elapsed().as_secs_f64();
@@ -356,7 +373,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
         None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts),
     };
-    let whole_bytes = files.whole_bytes(|_| true);
+    // (the vision encoder's tensors are read with the first image, not at the start)
+    let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix)));
     let files: &'static Pinned = Box::leak(Box::new(files));
     let placed = Instant::now();
     let state_bytes = groups.iter().map(|(devices, range)| state(range) * devices.len() as u64).sum();

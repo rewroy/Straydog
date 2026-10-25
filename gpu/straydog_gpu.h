@@ -466,6 +466,49 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
                    uint64_t steps, uint64_t top_k, const int32_t* selected, int path, const float* input,
                    const float* down_input, float* gate_up, float* product, float* output, double* timings);
 
+/* DeepSeek-V4.1's vision encoder (gpu/vision.hpp), each weight a device address: products FP16
+ * (rows of their input's width; gate_up the gate's rows, then the up's), norms and biases F32. */
+typedef struct sd_vision_layer {
+    const void* norm1;
+    const void* qkv;
+    const void* qkv_bias;
+    const void* out;
+    const void* out_bias;
+    const void* norm2;
+    const void* gate_up;
+    const void* down;
+} sd_vision_layer;
+
+typedef struct sd_vision {
+    uint64_t layers;
+    uint64_t width;
+    uint64_t heads;
+    uint64_t ffn;
+    uint64_t patch_values;
+    uint64_t out_width;
+    uint64_t downsample;
+    float eps;
+    float rope_theta;
+    const void* patch;
+    const void* patch_bias;
+    const void* norm;
+    const void* align1;
+    const void* align1_bias;
+    const void* align2;
+    const void* align2_bias;
+    const sd_vision_layer* layer; /* host memory: `layers` of them */
+} sd_vision;
+
+/* The scratch bytes an image of grid_h x grid_w patches takes. */
+int sd_vision_scratch_bytes(const sd_vision* model, uint64_t grid_h, uint64_t grid_w, uint64_t* bytes);
+/* One image on the device's stream: `patches` ([grid_h * grid_w][patch_values], FP16, reading
+ * order) to `out`, the aligner's rows ([ceil(grid_h / downsample) * ceil(grid_w / downsample)]
+ * [out_width], F32, reading order). */
+int sd_vision_encode(void* handle, const sd_vision* model, const void* patches, uint64_t grid_h, uint64_t grid_w, void* scratch,
+                     uint64_t scratch_bytes, float* out);
+/* `count` BF16 values in place as FP16. */
+int sd_vision_half(void* handle, void* values, uint64_t count);
+
 #ifdef __cplusplus
 }
 #endif

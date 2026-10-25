@@ -103,8 +103,8 @@ const PLAN: [(&str, &str, Transform); 33] = [
     ("blk.48.hc_ffn_inject.weight", layer!("mlp_hyper_connection.block_inject_weight.weight"), Transform::Bf16),
 ];
 
-/// Range-fetch the pinned MTP tensors from `base` (the checkpoint's URL, ending in a slash)
-/// into one safetensors file at `target`, verifying each SHA-256.
+/// Range-fetch pinned official tensors (BF16 or F32) from `base` (the checkpoint's URL, ending in
+/// a slash) into one safetensors file at `target`, verifying each SHA-256.
 ///
 /// Several connections fetch pieces of `piece` bytes straight into their places in the file;
 /// each tensor is then hashed from the file, so no tensor is held in memory. `progress`
@@ -123,17 +123,18 @@ pub fn fetch_source(agent: &Agent, base: &str, pinned: &[SourceTensor], target: 
             headers.insert(&tensor.shard, shard_header(agent, &format!("{base}{}", tensor.shard))?);
         }
         let (size, table) = &headers[tensor.shard.as_str()];
-        let changed = || invalid(format!("MTP tensor changed upstream: {}", tensor.name));
+        let changed = || invalid(format!("official tensor changed upstream: {}", tensor.name));
         let info = table.get(&tensor.name).ok_or_else(changed)?;
         let (first, last) = data_offsets(info).ok_or_else(changed)?;
-        if info["dtype"] != "BF16" || last - first != tensor.bytes {
+        let dtype = info["dtype"].as_str().filter(|dtype| matches!(*dtype, "BF16" | "F32")).ok_or_else(changed)?;
+        if last - first != tensor.bytes {
             return Err(changed());
         }
         // Where the tensor starts in the shard: after the length, the header and its offset
         // there (whose end must be a possible one).
         let start = (8 + size).checked_add(last).map(|_| 8 + size + first).ok_or_else(changed)?;
         let span = [offset, offset + tensor.bytes];
-        meta.insert(tensor.name.clone(), json!({"dtype": "BF16", "shape": info["shape"], "data_offsets": span}));
+        meta.insert(tensor.name.clone(), json!({"dtype": dtype, "shape": info["shape"], "data_offsets": span}));
         spans.push((start, offset));
         offset += tensor.bytes;
     }
@@ -170,7 +171,7 @@ pub fn fetch_source(agent: &Agent, base: &str, pinned: &[SourceTensor], target: 
                 remaining -= count as u64;
             }
             if remaining > 0 || format!("{:x}", digest.finalize()) != tensor.sha256 {
-                return Err(invalid(format!("MTP tensor failed authentication: {}", tensor.name)));
+                return Err(invalid(format!("official tensor failed authentication: {}", tensor.name)));
             }
         }
         fs::rename(&partial, target).map_err(at(target))
@@ -254,35 +255,36 @@ fn fetch_piece(agent: &Agent, url: &str, start: u64, destination: u64, length: u
         }
         received += count as u64;
         if received > length {
-            return Err(invalid("MTP tensor download exceeded its range"));
+            return Err(invalid("official tensor download exceeded its range"));
         }
         output.write_all(&buffer[..count])?;
         progress(count as u64);
     }
     if received != length {
-        return Err(invalid("MTP tensor download ended early"));
+        return Err(invalid("official tensor download ended early"));
     }
     Ok(())
 }
 
-/// A tensor of the drafter GGUF.
-struct Entry<'a> {
-    name: &'a str,
+/// A tensor of a GGUF Straydog writes.
+pub(crate) struct Entry<'a> {
+    pub name: &'a str,
     /// GGUF order: the input dimension first.
-    dims: Vec<usize>,
-    kind: u32,
-    data: Cow<'a, [u8]>,
+    pub dims: Vec<usize>,
+    pub kind: u32,
+    pub data: Cow<'a, [u8]>,
 }
 
-/// A source tensor: its shape and BF16 bytes.
-struct Tensor<'a> {
-    shape: Vec<usize>,
-    data: &'a [u8],
+/// A source tensor: its shape and bytes (BF16, or F32 where `float`).
+pub(crate) struct Tensor<'a> {
+    pub shape: Vec<usize>,
+    pub float: bool,
+    pub data: &'a [u8],
 }
 
-/// The tensors of a safetensors file, as views of its bytes.
-fn source_tensors(file: &[u8]) -> io::Result<HashMap<String, Tensor<'_>>> {
-    let broken = || invalid("invalid MTP source file");
+/// The tensors of a safetensors file, as views of its bytes: BF16 ones, and with `f32` F32 ones.
+pub(crate) fn source_tensors(file: &[u8], f32: bool) -> io::Result<HashMap<String, Tensor<'_>>> {
+    let broken = || invalid("invalid official source file");
     let size = u64::from_le_bytes(file.get(..8).ok_or_else(broken)?.try_into().expect("eight bytes"));
     let base = usize::try_from(size).ok().and_then(|size| size.checked_add(8)).ok_or_else(broken)?;
     let header: Map<String, Value> = serde_json::from_slice(file.get(8..base).ok_or_else(broken)?).map_err(|_| broken())?;
@@ -294,11 +296,12 @@ fn source_tensors(file: &[u8]) -> io::Result<HashMap<String, Tensor<'_>>> {
         let data = at(first).zip(at(last)).and_then(|(first, last)| file.get(first..last)).ok_or_else(broken)?;
         let shape: Vec<usize> = info["shape"].as_array().ok_or_else(broken)?.iter()
             .map(|dim| dim.as_u64().and_then(|dim| usize::try_from(dim).ok())).collect::<Option<_>>().ok_or_else(broken)?;
-        let bytes = shape.iter().try_fold(2usize, |bytes, &dim| bytes.checked_mul(dim));
-        if info["dtype"] != "BF16" || bytes != Some(data.len()) {
-            return Err(invalid(format!("invalid MTP source tensor: {name}")));
+        let float = f32 && info["dtype"] == "F32";
+        let bytes = shape.iter().try_fold(if float { 4usize } else { 2 }, |bytes, &dim| bytes.checked_mul(dim));
+        if !(float || info["dtype"] == "BF16") || bytes != Some(data.len()) {
+            return Err(invalid(format!("invalid official source tensor: {name}")));
         }
-        tensors.insert(name.clone(), Tensor { shape, data });
+        tensors.insert(name.clone(), Tensor { shape, float, data });
     }
     Ok(tensors)
 }
@@ -344,7 +347,7 @@ pub fn convert(source: &Path, target: &Path, revision: &str, group: usize, progr
     // SAFETY: mapped read-only; the source is this process's own download, which nothing
     // else writes while the drafter is built.
     let map = unsafe { Mmap::map(&file) }.map_err(at(source))?;
-    let tensors = source_tensors(&map)?;
+    let tensors = source_tensors(&map, false)?;
     let tensor = |origin: &str| tensors.get(origin).ok_or_else(|| invalid(format!("MTP source tensor missing: {origin}")));
     let mismatch = |origin: &str| invalid(format!("MTP source tensor has an unexpected shape: {origin}"));
     let mut total = 0;
@@ -393,7 +396,8 @@ pub fn convert(source: &Path, target: &Path, revision: &str, group: usize, progr
         };
         entries.push(Entry { name, dims, kind, data });
     }
-    write_gguf(target, revision, &entries)
+    let metadata = [("general.architecture", "qwen4exp"), ("straydog.drafter", "mtp"), ("straydog.drafter.source_revision", revision)];
+    write_gguf(target, &metadata, &entries)
 }
 
 fn push_string(header: &mut Vec<u8>, text: &str) {
@@ -401,16 +405,14 @@ fn push_string(header: &mut Vec<u8>, text: &str) {
     header.extend(text.as_bytes());
 }
 
-/// One GGUF (version 3) of `entries` with the drafter's metadata and 32-byte alignment,
-/// written to a partial file and then renamed into place.
-fn write_gguf(target: &Path, revision: &str, entries: &[Entry]) -> io::Result<()> {
-    let metadata = [("general.architecture", "qwen4exp"), ("straydog.drafter", "mtp"),
-                    ("straydog.drafter.source_revision", revision)];
+/// One GGUF (version 3) of `entries` with `metadata` (strings) and 32-byte alignment, written to
+/// a partial file and then renamed into place.
+pub(crate) fn write_gguf(target: &Path, metadata: &[(&str, &str)], entries: &[Entry]) -> io::Result<()> {
     let mut header = b"GGUF".to_vec();
     header.extend(3u32.to_le_bytes());
     header.extend((entries.len() as u64).to_le_bytes());
     header.extend((metadata.len() as u64 + 1).to_le_bytes());
-    for (key, value) in metadata {
+    for &(key, value) in metadata {
         push_string(&mut header, key);
         header.extend(8u32.to_le_bytes());
         push_string(&mut header, value);
@@ -500,11 +502,11 @@ mod tests {
         pins[0].sha256 = "0".repeat(64);
         let tampered = scratch.path().join("tampered.safetensors");
         let message = fetch_source(&agent, &base, &pins, &tampered, PIECE, &|_| {}).unwrap_err().to_string();
-        assert_eq!(message, "MTP tensor failed authentication: mtp.b.weight");
+        assert_eq!(message, "official tensor failed authentication: mtp.b.weight");
         assert!(!tampered.exists() && !scratch.path().join("tampered.safetensors.part").exists());
         pins[0].bytes = 6;
         let message = fetch_source(&agent, &base, &pins, &tampered, PIECE, &|_| {}).unwrap_err().to_string();
-        assert_eq!(message, "MTP tensor changed upstream: mtp.b.weight");
+        assert_eq!(message, "official tensor changed upstream: mtp.b.weight");
     }
 
     #[test]
@@ -585,7 +587,7 @@ mod tests {
         assert_eq!(tensor("blk.48.attn_q.weight").dimensions, [64, 8]);
         // A norm is its BF16 widened, plus one.
         let map = fs::read(&source).unwrap();
-        let tensors = source_tensors(&map).unwrap();
+        let tensors = source_tensors(&map, false).unwrap();
         let norm = tensor("mtp.embed_norm.weight");
         assert_eq!(norm.quant_type, F32);
         let start = norm.offset as usize;
