@@ -64,6 +64,12 @@ pub trait Engines {
     fn make_room(&mut self) -> Result<bool, String> {
         Ok(true)
     }
+    /// Start reading what passes over `tokens` (continuing the held sequence) will read from the
+    /// drive (DeepSeek-V4.1's Engram rows), behind the pass before them; a pass reads them itself
+    /// otherwise.
+    fn prefetch_ahead(&mut self, _tokens: &[u32]) -> Result<(), String> {
+        Ok(())
+    }
     /// Copies of the sequence state the engines keep ([`Engines::checkpoint`]); none: a session
     /// continues only a sequence the prompt extends.
     fn checkpoints(&self) -> usize {
@@ -440,6 +446,14 @@ impl<E: Engines> Session<E> {
         for (index, piece) in tokens.chunks(self.batch).enumerate() {
             if index > 0 && cancelled() {
                 return Ok(None);
+            }
+            // (the next pass's drive reads start before this pass, to land while it runs)
+            let (first, ahead) = (index * self.batch, ((index + 2) * self.batch).min(tokens.len()));
+            if ahead > first + piece.len() {
+                if let Err(error) = self.engines.prefetch_ahead(&tokens[first..ahead]) {
+                    self.reset();
+                    return Err(error);
+                }
             }
             match self.engines.forward(piece) {
                 Ok(output) => logits = Some(output),
