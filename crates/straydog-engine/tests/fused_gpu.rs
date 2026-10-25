@@ -20,6 +20,8 @@
 //! - shapes whose sizes overflow, or whose launch would not fit, are refused;
 //! - sd_op_swiglu_linear_route against sd_op_swiglu_linear and sd_op_route (Qwen3.6's shared expert
 //!   down on one of two GPUs, 256 experts, top 8): the same bits.
+//! - sd_op_linear_route over BF16 rows (DeepSeek-V4.1's router) against sd_op_linear and sd_op_route
+//!   on its logits: the same routes, the logits within F32 rounding.
 //!
 //! cargo test --release -p straydog-engine --features hip --test fused_gpu, under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -477,6 +479,49 @@ fn f32_router_prefetch_keeps_odd_units_and_routes_bit_exact() {
                     assert_eq!(read(&mut gpu, &ids_a, k), read(&mut gpu, &ids_b, k), "ids {cols}/{experts}/{gating}");
                     assert_eq!(read(&mut gpu, &weights_a, k), read(&mut gpu, &weights_b, k), "weights {cols}/{experts}/{gating}");
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn bf16_router_routes_its_own_logits_in_one_launch() {
+    // DeepSeek-V4.1's router (384 experts of 5120 BF16 values) and smaller shapes: the fused launch's
+    // routes are the ones sd_op_route takes from its logits, and those are sd_op_linear's within
+    // F32 rounding (another kernel may sum them).
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x1f83_d9ab_fb41_bd6b);
+    let scratch = gpu.buffer(1 << 20).unwrap();
+    for (cols, experts) in [(5120usize, 384usize), (128, 33), (1024, 256)] {
+        let k = experts.min(6);
+        let bytes: Vec<u8> = random.floats(experts * cols, 0.02).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let matrix = gpu.upload_bytes(&bytes).unwrap();
+        let input = upload(&mut gpu, &random.floats(cols, 3.0));
+        let bias = upload(&mut gpu, &random.floats(experts, 0.1));
+        let baseline = gpu.buffer((experts * 4) as u64).unwrap();
+        let fused = gpu.buffer((experts * 4) as u64).unwrap();
+        let ids_a = gpu.buffer((k * 4) as u64).unwrap();
+        let ids_b = gpu.buffer((k * 4) as u64).unwrap();
+        let weights_a = gpu.buffer((k * 4) as u64).unwrap();
+        let weights_b = gpu.buffer((k * 4) as u64).unwrap();
+        gpu.linear(&matrix, 30, experts as u64, cols as u64, 0, input.base(), 0, 1, baseline.base(), 0, &scratch).unwrap();
+        let mut expected = vec![0f32; experts];
+        gpu.read_buffer(&baseline, 0, &mut expected).unwrap();
+        for gating in 0..3 {
+            // Run twice to check that the launch's completion counter resets.
+            for _ in 0..2 {
+                gpu.linear_route(&matrix, 30, experts as u64, cols as u64, input.base(), 1, fused.base(), Some(bias.base()),
+                                 k as u64, gating, true, 1.3, ids_b.base(), weights_b.base(), &scratch).unwrap();
+                let mut logits = vec![0f32; experts];
+                gpu.read_buffer(&fused, 0, &mut logits).unwrap();
+                for (expert, (&a, &b)) in expected.iter().zip(&logits).enumerate() {
+                    assert!((a - b).abs() <= 1e-5 * (1.0 + a.abs()), "logit {expert} of {cols}/{experts}: {a} against {b}");
+                }
+                gpu.route(fused.base(), Some(bias.base()), 1, experts as u64, k as u64, gating, true, 1.3, ids_a.base(),
+                          weights_a.base()).unwrap();
+                assert_eq!(read(&mut gpu, &ids_a, k), read(&mut gpu, &ids_b, k), "ids {cols}/{experts}/{gating}");
+                assert_eq!(read(&mut gpu, &weights_a, k), read(&mut gpu, &weights_b, k), "weights {cols}/{experts}/{gating}");
             }
         }
     }

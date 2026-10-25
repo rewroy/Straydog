@@ -2799,7 +2799,7 @@ static int linear_route(void* handle, const void* weights, int kind, uint64_t ex
     try {
         auto& value = device(handle);
         // (the softmax router of 256 experts has a one-wave route kernel of its own)
-        const bool fused = (kind == 0 || kind == 1) && steps >= 1 && steps <= 4 && !(experts == 256 && gating == 0 && !bias && scale == 1.0f);
+        const bool fused = (kind == 0 || kind == 1 || kind == 30) && steps >= 1 && steps <= 4 && !(experts == 256 && gating == 0 && !bias && scale == 1.0f);
         if (publish && (!fused || !value.route_mailbox || steps * k > route_mailbox_ids))
             throw std::runtime_error("Straydog routes are published by the fused router alone, into a cleared mailbox");
         if (!fused) {

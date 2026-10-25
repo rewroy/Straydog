@@ -729,7 +729,7 @@ __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* outp
 // last block, on the kernel and lanes gemv() would take; false (nothing launched) otherwise.
 bool gemv_route_launch(Device& d, const Matrix& matrix, const float* input, float* output, size_t vectors, size_t input_stride,
                        size_t output_stride, RouteTail tail, unsigned min_lanes) {
-    if (matrix.kind != 0 && matrix.kind != 1 || vectors < 1 || vectors > 4) return false;
+    if ((matrix.kind != 0 && matrix.kind != 1 && matrix.kind != 30) || vectors < 1 || vectors > 4) return false;
     unsigned lanes = gemv_lanes(matrix, input);
     size_t alignment = 0;
     if (lanes == 2 && min_lanes > 2 && matrix.cols / gemv_unit(matrix.kind, alignment) >= 32) lanes = std::min(32u, min_lanes);
@@ -744,6 +744,8 @@ bool gemv_route_launch(Device& d, const Matrix& matrix, const float* input, floa
     #define SD_ROUTED(format, v) gemv_routed_kind<format, v><<<blocks, 256, shared, d.stream>>>(list, input, output, tail)
     if (matrix.kind == 0) {
         switch (vectors) { case 1: SD_ROUTED(0, 1); break; case 2: SD_ROUTED(0, 2); break; case 3: SD_ROUTED(0, 3); break; default: SD_ROUTED(0, 4); }
+    } else if (matrix.kind == 30) {
+        switch (vectors) { case 1: SD_ROUTED(30, 1); break; case 2: SD_ROUTED(30, 2); break; case 3: SD_ROUTED(30, 3); break; default: SD_ROUTED(30, 4); }
     } else {
         switch (vectors) { case 1: SD_ROUTED(1, 1); break; case 2: SD_ROUTED(1, 2); break; case 3: SD_ROUTED(1, 3); break; default: SD_ROUTED(1, 4); }
     }

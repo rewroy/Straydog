@@ -1586,7 +1586,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// a fused router's, of a few rows, with no prediction behind them.
     fn publishes(&self, layer: usize, n: usize, predict: bool) -> bool {
         self.mailbox && !predict && n <= SLOT_ROWS
-            && self.shards[0].dense.get(&name(layer, "ffn_gate_inp")).is_some_and(|router| router.kind == 0 || router.kind == 1)
+            && self.shards[0].dense.get(&name(layer, "ffn_gate_inp")).is_some_and(|router| router.kind == 0 || router.kind == 1 || router.kind == 30)
     }
 
     /// The routes of the layer's router on the first device: published, or read back (read_start).
