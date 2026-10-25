@@ -499,18 +499,24 @@ impl<E: Engines> Session<E> {
         // otherwise than it was generated (a past turn's thinking dropped).
         // So is the state where its system prompt ends: the next conversation keeps that.
         let mut fed = reused;
+        // (the seconds the checkpoints took: copies of the whole state, made before the first token)
+        let mut checkpoint_seconds = 0.0;
         if let Some(root) = self.root_mark(tokens, reused) {
             if self.feed(&tokens[reused..root], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
+            let saving = Instant::now();
             self.save_checkpoint(true)?;
+            checkpoint_seconds += saving.elapsed().as_secs_f64();
             fed = root;
         }
         if let Some(start) = self.turn_mark(tokens, fed) {
             if self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
+            let saving = Instant::now();
             self.save_checkpoint(false)?;
+            checkpoint_seconds += saving.elapsed().as_secs_f64();
             fed = start;
         }
         let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
@@ -568,6 +574,7 @@ impl<E: Engines> Session<E> {
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
             "resume_seconds": resume_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
             // (store events of every device's share, a prefetched expert counted again when used;
             // the drive bytes are what the wait for the first token read)
             "prefill_experts": {"vram": hits - hits0, "host": host - host0, "drive": drive - drive0},
