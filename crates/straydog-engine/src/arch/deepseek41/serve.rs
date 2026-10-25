@@ -175,7 +175,8 @@ impl served::Engines for Engines {
             let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
             return self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot));
         }
-        self.saved[slot] = None;
+        // (the slot's snapshots, or one given up for room, are taken again in place: Engine::snapshot_into)
+        let mut reuse = self.saved[slot].take();
         self.order.retain(|&held| held != slot);
         // Room first, the copy after: the budget bounds the host memory at its peak too. The kept
         // slot (the conversation root's) gives its up last.
@@ -185,10 +186,16 @@ impl served::Engines for Engines {
             .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
         let Some(given_up) = evictions(&held, required, self.budget) else { return Ok(()) };
         for oldest in given_up {
-            self.saved[oldest] = None;
+            let freed = self.saved[oldest].take();
+            reuse = reuse.or(freed);
             self.order.retain(|&held| held != oldest);
         }
-        self.saved[slot] = Some(self.engines.iter_mut().map(Engine::snapshot).collect::<Result<Vec<_>, _>>()?);
+        let mut snapshots = reuse.unwrap_or_default();
+        snapshots.resize_with(self.engines.len(), Snapshot::default);
+        for (engine, snapshot) in self.engines.iter_mut().zip(&mut snapshots) {
+            engine.snapshot_into(snapshot)?;
+        }
+        self.saved[slot] = Some(snapshots);
         self.order.push(slot);
         Ok(())
     }

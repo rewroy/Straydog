@@ -377,6 +377,7 @@ fn check_slots(shard: &mut Shard, layer: usize, experts: &[usize], slots: &[Buff
 /// The sequence state a later pass continues, in host memory ([`Engine::snapshot`]): the window
 /// rings' rows of the last `window` positions (oldest first), each kv source's compressed rows,
 /// index keys and tail rows, and the counters.
+#[derive(Default)]
 pub struct Snapshot {
     position: usize,
     history: Vec<u32>,
@@ -1183,30 +1184,45 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// same (see the module documentation), so from the first. [`Engine::restore`] starts that
     /// sequence over from it, whatever ran in between.
     pub fn snapshot(&mut self) -> Result<Snapshot> {
+        let mut snapshot = Snapshot::default();
+        self.snapshot_into(&mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// [`Engine::snapshot`] into `snapshot`, its buffers taken again (resized, not made anew): a
+    /// checkpoint taken over an earlier one touches no new memory but for the sequence's growth,
+    /// where new memory every turn (hundreds of MB at long context) waited on the kernel's direct
+    /// reclaim whenever the host ran short of free pages.
+    pub fn snapshot_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
         let (window, dim, index_dim, ring, position) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring, self.position);
         let shard = &mut self.shards[0];
         let first = position.saturating_sub(window);
-        let mut windows = Vec::with_capacity(shard.rings.len());
-        for (&layer, buffer) in &shard.rings {
-            let mut rows = vec![0f32; (position - first) * dim];
+        snapshot.windows.resize_with(shard.rings.len(), Default::default);
+        for ((&layer, buffer), (kept_layer, rows)) in shard.rings.iter().zip(&mut snapshot.windows) {
+            *kept_layer = layer;
+            rows.resize((position - first) * dim, 0.0);
             for (at, run, done) in ring_runs(first, position, ring) {
                 shard.gpu.read_buffer(buffer, at * dim, &mut rows[done * dim..(done + run) * dim])?;
             }
-            windows.push((layer, rows));
         }
-        let mut rows = Vec::with_capacity(shard.sources.len());
-        for (&layer, buffers) in &shard.sources {
+        snapshot.rows.resize_with(shard.sources.len(), Default::default);
+        for ((&layer, buffers), (kept_layer, kept)) in shard.sources.iter().zip(&mut snapshot.rows) {
+            *kept_layer = layer;
             let groups = self.sources[&layer].groups;
-            let mut kept = [vec![0f32; groups * dim], vec![0f32; groups * index_dim], vec![0f32; dim], vec![0f32; dim]];
-            for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(&mut kept) {
+            for (values, len) in kept.iter_mut().zip([groups * dim, groups * index_dim, dim, dim]) {
+                values.resize(len, 0.0);
+            }
+            for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(kept.iter_mut()) {
                 if !values.is_empty() {
                     shard.gpu.read_buffer(buffer, 0, values)?;
                 }
             }
-            rows.push((layer, kept));
         }
-        let sources = self.sources.iter().map(|(&layer, source)| (layer, source.groups, source.tail)).collect();
-        Ok(Snapshot { position, history: self.history.clone(), sources, windows, rows })
+        snapshot.sources.clear();
+        snapshot.sources.extend(self.sources.iter().map(|(&layer, source)| (layer, source.groups, source.tail)));
+        snapshot.history.clone_from(&self.history);
+        snapshot.position = position;
+        Ok(())
     }
 
     /// Put a [`Engine::snapshot`] back on every device: the sequence as it was then.
