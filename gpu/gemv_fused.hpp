@@ -91,6 +91,32 @@ __global__ void gemv_norm_tail_kind(FixedGemv list, const float* input, float* o
                      sums, job.forward, job.inverse);
 }
 
+#if defined(__HIPCC__)
+// gemv_norm_tail_kind on the Q8 kernels' rows (gemv_q8_input: one input staged once), the same tail.
+template<int kind>
+__global__ void __launch_bounds__(256) gemv_norm_tail_q8(FixedGemv list, const float* input, float* output, NormTail tail) {
+    __shared__ float sums[256];
+    __shared__ bool last;
+    const GemvQ8Input in = gemv_q8_stage_list<1>(list, input);
+    const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    const GemvItem& item = gemv_q8_item(list, wave);
+    gemv_q8_rows<kind, 1>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, in, output, list.output_stride,
+                          list.residual);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&gemv_norm_tail_done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x == 0) gemv_norm_tail_done = 0;
+    op_rms_norm_row(tail.x, tail.weight, tail.width, tail.eps, tail.normed, sums);
+    __syncthreads();
+    const NormRopeJob& job = tail.side;
+    op_norm_rope_row(job.input, job.weight, job.width, job.eps, job.pairs, job.positions, job.frequencies, job.rows, job.output, 0,
+                     sums, job.forward, job.inverse);
+}
+#endif
+
 template<int kind>
 __global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* output) {
     extern __shared__ __align__(16) float cached[];
@@ -366,9 +392,16 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
         const unsigned blocks = unsigned((waves + 7) / 8);
         // (256 threads, whatever gemv() would take: the same waves, rows, lanes and dots)
         bool launched = false;
+#if defined(__HIPCC__)
+        if (const size_t lds = gemv_q8_input(value, list, input, 1)) {
+            if (kind == 13) gemv_norm_tail_q8<13><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
+            else gemv_norm_tail_q8<8><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
+            launched = true;
+        }
+#endif
         #define SD_NORM_TAIL(format) case format: \
             gemv_norm_tail_kind<format><<<blocks, 256, 0, value.stream>>>(list, input, output, tail); launched = true; break;
-        switch (kind) { SD_FAST_FORMATS(SD_NORM_TAIL) }
+        if (!launched) switch (kind) { SD_FAST_FORMATS(SD_NORM_TAIL) }
         #undef SD_NORM_TAIL
         if (launched) {
             check(hipGetLastError());

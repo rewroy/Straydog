@@ -879,6 +879,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let decoder = hp.layers.iter().enumerate().filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer).map(|_| layer))
             .max().filter(|_| std::env::var_os("DS41_FULL_DECODER").is_none());
         let linked = shards.len() == 2 && std::env::var("DS41_LINK").map_or(true, |value| value != "0");
+        // A decode row's Q5_K/Q8_0 projections and IQ2 experts' gate/up take INT8 activations (the
+        // Q8 kernels: DS41_Q8=0 keeps them F32).
+        let q8 = std::env::var("DS41_Q8").map_or(true, |value| value != "0");
+        for shard in &shards {
+            shard.gpu.configure_decode(q8)?;
+        }
         if let [first, second] = &mut shards[..] {
             if linked {
                 // (a row's output, or a decode row's activations: every route's and the shared expert's)

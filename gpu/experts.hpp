@@ -524,6 +524,158 @@ __global__ void slot_down_linked(SlotExperts plan, const uint64_t* bases, const 
     slot_down_rows<kind>(plan, bases, product, out, out_stride, link_tail_slot(tail));
     link_tail(tail);
 }
+#if defined(__HIPCC__)
+// ---- Q8 slot gate/up: a decode row's IQ2 experts on RDNA4 ----
+// The F32 kernel spends five 16-bit loads a unit and three VALU instructions a value. This one loads
+// two units' packed bytes a lane at once, takes each eight values' sign masks from a table in LDS,
+// and forms each four values' products with v_dot4 against the row's activations quantized per 32
+// values to INT8 (gemv_q8_stage): a unit's sum is exact in INT32, then scaled in F32. The grid's
+// lookups stay in (cached) global memory: in LDS beside the masks, the lookups held the kernel.
+// Eight grid bytes `g` against eight INT8 activations, value j negative where mask byte j is set:
+// sum s g x = sum g x - 2 sum (g & m) x (a grid byte is below 128: g and g & m are signed bytes too).
+__device__ __forceinline__ void slot_q8_dot8(uint2 g, uint2 m, uint32_t x0, uint32_t x1, int& pos, int& neg) {
+    pos = __builtin_amdgcn_sudot4(true, int(g.x), true, int(x0), pos, false);
+    neg = __builtin_amdgcn_sudot4(true, int(g.x & m.x), true, int(x0), neg, false);
+    pos = __builtin_amdgcn_sudot4(true, int(g.y), true, int(x1), pos, false);
+    neg = __builtin_amdgcn_sudot4(true, int(g.y & m.y), true, int(x1), neg, false);
+}
+// Two units (64 values) of a row: load() their packed bytes, dot() unit h with its activations
+// (eight words of INT8 values and their scale), as GemvFormat<kind> reads and scales them.
+template<int kind> struct SlotQ8;
+template<> struct SlotQ8<16> {   // IQ2_XXS: 66-byte blocks; a unit's four grid bytes and its sign/scale word
+    static constexpr int sign_entries = 128;
+    moe_word4 q;
+    uint32_t d;
+    __device__ void load(const uint8_t* row, size_t pair) {
+        const uint8_t* b = row + (pair / 4) * 66;
+        q = moe_u128(b + 2 + 16 * (pair % 4));
+        d = moe_u16(b);
+    }
+    __device__ float dot(int h, const uint2* masks, const uint32_t* x, float scale) const {
+        const uint2* grid = reinterpret_cast<const uint2*>(iq_grid2xxs);
+        const uint32_t g = q[2 * h], aux = q[2 * h + 1];
+        int pos = 0, neg = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) slot_q8_dot8(grid[(g >> (8 * l)) & 255], masks[(aux >> (7 * l)) & 127], x[2 * l], x[2 * l + 1], pos, neg);
+        return gemv_half(d) * (0.5f + float(aux >> 28)) * 0.25f * scale * float(pos - 2 * neg);
+    }
+};
+template<> struct SlotQ8<17> {   // IQ2_XS: 74-byte blocks; a unit's four 9-bit grid and 7-bit sign codes, two scales
+    static constexpr int sign_entries = 128;
+    moe_word4 q;
+    uint32_t d, scales;
+    __device__ void load(const uint8_t* row, size_t pair) {
+        const uint8_t* b = row + (pair / 4) * 74;
+        q = moe_u128(b + 2 + 16 * (pair % 4));
+        scales = moe_u16(b + 66 + 2 * (pair % 4));
+        d = moe_u16(b);
+    }
+    __device__ float dot(int h, const uint2* masks, const uint32_t* x, float scale) const {
+        const uint2* grid = reinterpret_cast<const uint2*>(iq_grid2xs);
+        int pos[2] = {0, 0}, neg[2] = {0, 0};
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const unsigned code = (q[2 * h + l / 2] >> (16 * (l & 1))) & 0xffffu;
+            slot_q8_dot8(grid[code & 511], masks[code >> 9], x[2 * l], x[2 * l + 1], pos[l / 2], neg[l / 2]);
+        }
+        const unsigned s = (scales >> (8 * h)) & 255;
+        const float d4 = gemv_half(d) * 0.25f * scale;
+        return d4 * (0.5f + float(s & 15)) * float(pos[0] - 2 * neg[0]) + d4 * (0.5f + float(s >> 4)) * float(pos[1] - 2 * neg[1]);
+    }
+};
+template<> struct SlotQ8<22> {   // IQ2_S: 82-byte blocks; a unit's grid bytes, sign bytes, high bits and two scales
+    static constexpr int sign_entries = 256;
+    uint2 low, signs;
+    uint32_t high, scales, d;
+    __device__ void load(const uint8_t* row, size_t pair) {
+        const uint8_t* b = row + (pair / 4) * 82;
+        const unsigned j = unsigned(pair % 4);
+        low = moe_u64(b + 2 + 8 * j);
+        signs = moe_u64(b + 34 + 8 * j);
+        high = moe_u16(b + 66 + 2 * j);
+        scales = moe_u16(b + 74 + 2 * j);
+        d = moe_u16(b);
+    }
+    __device__ float dot(int h, const uint2* masks, const uint32_t* x, float scale) const {
+        const uint2* grid = reinterpret_cast<const uint2*>(iq_grid2s);
+        const uint32_t g = h ? low.y : low.x, sg = h ? signs.y : signs.x, hi = (high >> (8 * h)) & 255;
+        int pos[2] = {0, 0}, neg[2] = {0, 0};
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const unsigned index = ((g >> (8 * l)) & 255) | ((hi << (8 - 2 * l)) & 0x300);
+            slot_q8_dot8(grid[index], masks[(sg >> (8 * l)) & 255], x[2 * l], x[2 * l + 1], pos[l / 2], neg[l / 2]);
+        }
+        const unsigned s = (scales >> (8 * h)) & 255;
+        const float d4 = gemv_half(d) * 0.25f * scale;
+        return d4 * (0.5f + float(s & 15)) * float(pos[0] - 2 * neg[0]) + d4 * (0.5f + float(s >> 4)) * float(pos[1] - 2 * neg[1]);
+    }
+};
+__host__ __device__ constexpr bool slot_q8_kind(int kind) { return kind == 16 || kind == 17 || kind == 22; }
+// LDS bytes of a kind's launch: its sign masks, then a row's activations of `cols` (INT8, a scale every 32).
+__host__ __device__ constexpr size_t slot_q8_lds(int kind, size_t cols) { return (kind == 22 ? 256 : 128) * 8 + cols + cols / 32 * 4; }
+// Byte j of mask x (y) is 0xff when sign bit j (4 + j) of a sign index's eight is set.
+__device__ __forceinline__ uint32_t slot_spread4(uint32_t bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xffu; }
+template<int kind>
+__device__ __forceinline__ void slot_q8_stage_masks(uint2* masks) {
+    for (int i = threadIdx.x; i < SlotQ8<kind>::sign_entries; i += blockDim.x) {
+        const unsigned bits = kind == 22 ? unsigned(i) : iq_signs(unsigned(i));
+        masks[i] = uint2{slot_spread4(bits & 15), slot_spread4(bits >> 4)};
+    }
+}
+// slot_gate_up_rows on the staged masks and activations (the same rows, lanes and epilogue).
+template<int kind>
+__device__ __forceinline__ void slot_gate_up_q8_rows(const SlotExperts& plan, const uint64_t* bases, const uint2* masks, const uint32_t* xq,
+                                                     const float* xd, const float* weights, float* product, float* peer) {
+    const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    const size_t route = wave / plan.waves[0];
+    if (route >= plan.top_k) return;
+    const size_t index = size_t(blockIdx.y) * plan.top_k + route;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(slot_base(plan, bases, index));
+    if (!base) return;
+    const Matrix &gate = plan.role[0], &up = plan.role[1];
+    const unsigned lanes = plan.lanes[0], lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = (wave % plan.waves[0]) * (32 / lanes) + lane / lanes, last = std::min(row, gate.rows - 1);
+    const uint8_t* gate_row = base + size_t(gate.data) + last * gate.row_bytes;
+    const uint8_t* up_row = base + size_t(up.data) + last * up.row_bytes;
+    const size_t pairs = gate.cols / 64;
+    float g = 0.0f, u = 0.0f;
+    #pragma unroll 2
+    for (size_t pair = sub; pair < pairs; pair += lanes) {
+        SlotQ8<kind> a, b;
+        a.load(gate_row, pair);
+        b.load(up_row, pair);
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const size_t unit = 2 * pair + h;
+            g += a.dot(h, masks, xq + unit * 8, xd[unit]);
+            u += b.dot(h, masks, xq + unit * 8, xd[unit]);
+        }
+    }
+    g = slot_reduce(g, lanes);
+    u = slot_reduce(u, lanes);
+    if (sub || row >= gate.rows) return;
+    if (plan.clamp > 0.0f) { g = fminf(g, plan.clamp); u = fminf(fmaxf(u, -plan.clamp), plan.clamp); }
+    const size_t at = index * plan.product_stride + plan.product_first + row;
+    const float value = g / (1.0f + expf(-g)) * u * (weights ? weights[index] : 1.0f);
+    product[at] = value;
+    if (peer) link_send(peer + at, value);
+}
+// slot_gate_up (SENT: slot_gate_up_sent) with the masks and the token's activations staged first.
+template<int kind, bool SENT>
+__global__ void __launch_bounds__(512) slot_gate_up_q8(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
+                                                       const float* weights, float* product, LinkTail tail, size_t send_at, int raise) {
+    extern __shared__ __align__(16) uint32_t slot_lds[];
+    uint2* masks = reinterpret_cast<uint2*>(slot_lds);
+    uint32_t* xq = reinterpret_cast<uint32_t*>(masks + SlotQ8<kind>::sign_entries);
+    const size_t cols = plan.role[0].cols;
+    float* xd = reinterpret_cast<float*>(xq + cols / 4);
+    slot_q8_stage_masks<kind>(masks);
+    gemv_q8_stage(xq, xd, nullptr, input + size_t(blockIdx.y) * input_stride, cols / 32);
+    __syncthreads();
+    slot_gate_up_q8_rows<kind>(plan, bases, masks, xq, xd, weights, product, SENT ? link_tail_slot(tail) + send_at : nullptr);
+    if (SENT && raise) link_tail(tail);
+}
+#endif
 // The stages (1 gate/up, 2 down) for `tokens` rows: product = SwiGLU of every route (tokens x top_k
 // rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
 // of different formats, takes the reference decoder a row per wave.
@@ -558,7 +710,36 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     const auto threads = [&](size_t waves) { return tokens * ((waves + 7) / 8) < 2 * size_t(d.compute_units) ? 64u : 256u; };
     const auto blocks_of = [](size_t waves, unsigned threads) { return unsigned((waves + threads / 32 - 1) / (threads / 32)); };
     const unsigned first_threads = threads(size_t(plan.top_k) * plan.waves[0]), second_threads = threads(plan.waves[1]);
+#if defined(__HIPCC__)
+    // The Q8 gate/up: an IQ2 kind's whole blocks and 16-byte aligned activations. Each block stages a
+    // token's activations once: as few blocks as fill every CU twice, each covering as many waves.
+    const size_t gate_lds = slot_q8_lds(gate_kind, gate.cols);
+    const bool q8_gate = d.q8_decode && gate_kind >= 0 && slot_q8_kind(gate_kind) && gate.cols % 256 == 0 &&
+                         reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
+    const auto gate_q8 = [&](bool sent) {
+        const size_t waves = size_t(plan.top_k) * plan.waves[0], slots = 2 * size_t(d.compute_units);
+        const size_t per_block = std::clamp<size_t>((waves + slots - 1) / slots, 2, 16);
+        const dim3 blocks(unsigned((waves + per_block - 1) / per_block), unsigned(tokens));
+        const unsigned threads = unsigned(32 * per_block);
+        #define SD_SLOT_GATE_Q8(format) case format: \
+            if (sent) slot_gate_up_q8<format, true><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, \
+                                                                                         product, *tail, send_at, raise); \
+            else slot_gate_up_q8<format, false><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, \
+                                                                                       product, LinkTail{}, 0, 0); \
+            break;
+        switch (gate_kind) { SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(22) }
+        #undef SD_SLOT_GATE_Q8
+        check(hipGetLastError());
+    };
+#else
+    constexpr bool q8_gate = false;
+    const auto gate_q8 = [](bool) {};
+#endif
     if (tail && !tail->out && stages == 1) {
+        if (q8_gate) {
+            gate_q8(true);
+            return true;
+        }
         const dim3 blocks(blocks_of(size_t(plan.top_k) * plan.waves[0], first_threads), unsigned(tokens));
         #define SD_SLOT_GATE_SENT(format) case format: \
             slot_gate_up_sent<format><<<blocks, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail, \
@@ -577,7 +758,8 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     const dim3 second(blocks_of(plan.waves[1], second_threads), unsigned(tokens));
     #define SD_SLOT_GATE(format) case format: \
         slot_gate_up<format><<<first, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product); break;
-    if (stages & 1) {
+    if ((stages & 1) && q8_gate) gate_q8(false);
+    else if (stages & 1) {
         switch (gate_kind) {
             SD_FAST_FORMATS(SD_SLOT_GATE)
             default: slot_gate_up<-1><<<first, first_threads, 0, d.stream>>>(plan, bases, input, input_stride, weights, product);

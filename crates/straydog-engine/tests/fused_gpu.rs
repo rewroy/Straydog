@@ -6,7 +6,7 @@
 //!   sd_op_linears launch per format: the same bits;
 //! - sd_op_norm_linears_rope (DeepSeek-V4.1's decode q_a norm and q_b on one of two GPUs, with
 //!   the kv row's norm and rope into a ring row beside them) against sd_op_rms_norm, sd_op_linears
-//!   and sd_op_norm_rope: the same bits;
+//!   and sd_op_norm_rope: the same bits (Q8_0 rows on the F32 and on the Q8 decode kernels);
 //! - sd_op_top_k against a reference of its rule (ties keep the lower index, -inf never kept, -1 for
 //!   empty slots) on scores with many ties, 511 to 131072 groups, top 512: the same indices;
 //! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
@@ -532,7 +532,10 @@ fn linears_norm_tail_graph_matches_separate_ops() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (rank, dim, rope, context) = (1280usize, 512usize, 64usize, 16usize);
-    for (kind, cols) in [(0u32, 128usize), (8, 5120)] {
+    // (Q8_0 rows also on the Q8 decode kernels: the same rows in either launch)
+    for (kind, cols, q8) in [(0u32, 128usize, false), (8, 5120, false), (8, 5120, true)] {
+        gpu.configure_decode(q8).unwrap();
+        let key = 121 + u64::from(q8);
         let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
             if kind == 0 { upload(&mut gpu, &random.floats(rows * cols, 0.02)) }
             else {
@@ -564,7 +567,7 @@ fn linears_norm_tail_graph_matches_separate_ops() {
         // The first invocation is captured: no prior launch initializes its counter.
         gpu.graph_begin().unwrap();
         gpu.linears_norm_rope(&items(&b), b[0].base(), &qweight, rank as u64, 1e-6, b[2].base(), &side).unwrap();
-        gpu.graph_end(121, true).unwrap();
+        gpu.graph_end(key, true).unwrap();
         for replay in 0..4 {
             gpu.write_buffer(&input, 0, &random.floats(cols, 2.0)).unwrap();
             gpu.write_buffer(&positions, 0, &[70_001i32 + replay]).unwrap();
@@ -573,9 +576,9 @@ fn linears_norm_tail_graph_matches_separate_ops() {
             gpu.rms_norm(a[0].base(), &qweight, 1, rank as u64, 1e-6, a[2].base()).unwrap();
             gpu.norm_rope(a[1].base(), &kvweight, 1, dim as u64, 1e-6, Some((rope as u64, &positions, &frequencies)),
                 Some(out_rows.base()), a[3].base(), context as u64).unwrap();
-            assert!(gpu.graph_run(121).unwrap());
+            assert!(gpu.graph_run(key).unwrap());
             for (i, count) in [rank, dim, rank, context * dim].into_iter().enumerate() {
-                assert_eq!(read(&mut gpu, &a[i], count), read(&mut gpu, &b[i], count), "kind {kind}, replay {replay}, output {i}");
+                assert_eq!(read(&mut gpu, &a[i], count), read(&mut gpu, &b[i], count), "kind {kind}, Q8 {q8}, replay {replay}, output {i}");
             }
         }
     }

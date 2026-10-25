@@ -71,6 +71,8 @@ fn upload(gpu: &mut Backend, values: &[f32]) -> Buffer {
 fn main() -> Result<(), String> {
     let iterations: usize = std::env::args().nth(1).map_or(200, |value| value.parse().unwrap());
     let mut gpu = Backend::new(0, 30 << 30)?;
+    // (as the engine takes them: the Q8 kernels where it has them, DS41_Q8=0 the F32 ones)
+    gpu.configure_decode(std::env::var("DS41_Q8").map_or(true, |value| value != "0"))?;
     let mut random = Random(0x9e37_79b9_7f4a_7c15);
     let x = upload(&mut gpu, &random.floats(WIDTH, 1.0));
     let weights = upload(&mut gpu, &random.floats(ROUTES, 0.3));

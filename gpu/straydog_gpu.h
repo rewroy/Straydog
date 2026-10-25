@@ -65,6 +65,8 @@ int sd_transfer_counts(void* handle, uint64_t* counts);
 
 /* Matrix products */
 int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision);
+// A decode row's Q5_K/Q8_0 GEMVs and IQ2 experts' gate/up on the Q8 kernels (q8: 1, RDNA4 only; else 0).
+int sd_decode_options(void* handle, int q8);
 int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);
 int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds, const uint64_t* rows, const uint64_t* cols, uint64_t count, const float* input, uint64_t input_count, float* output, uint64_t output_count);

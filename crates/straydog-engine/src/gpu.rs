@@ -293,6 +293,14 @@ impl Backend {
         check(unsafe { ffi::sd_gemm_options(self.handle, minimum_batch, c_int::from(half)) }).map(drop)
     }
 
+    /// Whether a decode row's Q5_K and Q8_0 GEMVs and IQ2 experts' gate/up take the Q8 kernels: their
+    /// input quantized per 32 values to INT8 with an F32 scale, the sums exact in INT32 (RDNA4 only;
+    /// elsewhere a no-op).
+    pub fn configure_decode(&self, q8: bool) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8)) }).map(drop)
+    }
+
     /// Upload an operand once; later uses of its key reuse the device copy. While uploads are
     /// deferred, mapped bytes are only allocated for (see [`Backend::defer_uploads`]).
     pub fn prepare(&mut self, operand: &Operand) -> Result<Entry> {

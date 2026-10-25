@@ -393,6 +393,7 @@ struct Device {
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
+    bool q8_decode = false;   // a decode row's Q5_K GEMVs and IQ2 experts' gate/up on the Q8 kernels (RDNA4)
     uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
     unsigned compute_units = 0;   // the device's CUs (SMs on CUDA)
@@ -2146,6 +2147,15 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision) {
         if (minimum_batch < 2 || minimum_batch > max_batch + 1 || (half_precision != 0 && half_precision != 1))
             throw std::runtime_error("invalid Straydog GEMM options");
         value.gemm_min_batch = size_t(minimum_batch); value.half_gemm = half_precision != 0;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_decode_options(void* handle, int q8) {
+    try {
+        auto& value = device(handle);
+        if (q8 != 0 && q8 != 1) throw std::runtime_error("invalid Straydog decode options");
+        value.q8_decode = q8 != 0 && value.rdna4;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

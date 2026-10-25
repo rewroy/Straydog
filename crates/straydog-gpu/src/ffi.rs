@@ -209,6 +209,9 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_decode_options(handle: *mut ::std::os::raw::c_void, q8: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_gemm_counts(
         handle: *mut ::std::os::raw::c_void,
         calls: *mut u64,
