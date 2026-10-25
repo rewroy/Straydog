@@ -1870,6 +1870,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
     }
 
+    /// Start reading the Engram rows passes over `tokens` (continuing the held sequence) will
+    /// gather, when this engine's layers hold a module ([`Engine::prefetch_engram`]): the session
+    /// asks for the next pass's before each pass, so its reads land while that pass runs.
+    pub fn prefetch_ahead(&self, tokens: &[u32]) -> Result<()> {
+        if self.hp.layers[self.settings.layers.clone()].iter().any(|plan| plan.engram.is_some()) {
+            self.prefetch_engram(tokens)?;
+        }
+        Ok(())
+    }
+
     /// Start reading every Engram row these tokens will gather, while the layers before
     /// the modules run.
     fn prefetch_engram(&self, tokens: &[u32]) -> Result<()> {

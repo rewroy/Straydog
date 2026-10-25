@@ -150,6 +150,10 @@ impl served::Engines for Engines {
         Ok(done)
     }
 
+    fn prefetch_ahead(&mut self, tokens: &[u32]) -> Result<(), String> {
+        self.engines.iter().try_for_each(|engine| engine.prefetch_ahead(tokens))
+    }
+
     fn verify_rows(&self) -> usize {
         self.verify_rows
     }
