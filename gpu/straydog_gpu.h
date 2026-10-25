@@ -30,6 +30,10 @@ void* sd_upload(void* handle, const void* data, uint64_t bytes);
  * device's stream, from any thread that owns a filler of the device, while nothing else uses
  * the device. */
 void* sd_allocate(void* handle, uint64_t bytes);
+/* Keep the FP16 expansions of uploaded weights (sd_upload's: never written after) that a prompt
+ * pass's GEMMs take, in a ring of `bytes` (an allocation within the budget; 0 keeps none), for the
+ * pass's next batches. Once only. */
+int sd_expansions(void* handle, uint64_t bytes);
 int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes);
 void* sd_filler_create(void* handle);
 void sd_filler_destroy(void* filler);

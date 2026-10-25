@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS,
+use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS, EXPANSIONS,
                     OWN_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Placed, Session, Settings};
@@ -319,7 +319,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         // a pass of up to the batch's rows, layer by layer: its buffers of every row (in the arena
         // lent to the expert store between long passes), and a few rows' own
         let rows = (settings.batch + OWN_ROWS.min(settings.batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
-        let fixed = resident + state(range) + rows + SCRATCH + RESERVE;
+        let expansions = if settings.half_gemm { EXPANSIONS } else { 0 };
+        let fixed = resident + state(range) + rows + SCRATCH + expansions + RESERVE;
         let free = vram.checked_sub(fixed)
             .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM on GPU {devices:?}", vram as f64 / (1u64 << 30) as f64))?;
         // Each device's share of an expert is 1/parts of a slot: free / share experts.

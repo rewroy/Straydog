@@ -53,6 +53,9 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {
+    pub fn sd_expansions(handle: *mut ::std::os::raw::c_void, bytes: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_write(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,
@@ -209,7 +212,10 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn sd_decode_options(handle: *mut ::std::os::raw::c_void, q8: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+    pub fn sd_decode_options(
+        handle: *mut ::std::os::raw::c_void,
+        q8: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_gemm_counts(
@@ -750,6 +756,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_half_values(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        values: u64,
+        output: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_gather_columns(
         handles: *const *mut ::std::os::raw::c_void,
         outs: *const *mut ::std::os::raw::c_void,
@@ -759,14 +773,6 @@ unsafe extern "C" {
         rows: u64,
         share: u64,
         full: u64,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn sd_op_half_values(
-        handle: *mut ::std::os::raw::c_void,
-        input: *const f32,
-        values: u64,
-        output: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]

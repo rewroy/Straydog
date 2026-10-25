@@ -293,6 +293,11 @@ struct Shard {
     checks: Option<SlotChecks>,
 }
 
+/// VRAM a device keeps a prompt pass's FP16 attention weights in (Backend::keep_expansions), for its
+/// batches after a layer's first (ATTENTION_ROWS): a layer's on two GPUs take ~170 MB. Expanded for
+/// every batch, they held a GPU ~0.23 s of an agent's 1.6K-token turn (2.9 s).
+pub const EXPANSIONS: u64 = 192 << 20;
+
 /// Rows of a pass on a device's own buffers of every row: decode, verify, a short prompt. A
 /// longer pass takes the arena lent to the expert store back as far as its rows reach (T8).
 pub const OWN_ROWS: usize = 64;
@@ -592,6 +597,10 @@ impl Shard {
         }
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
+        // (a prompt pass's attention weights expanded once a layer, not a batch: ATTENTION_ROWS)
+        if settings.half_gemm && settings.rows >= 32 {
+            gpu.keep_expansions(std::env::var("DS41_EXPANSIONS").map_or(EXPANSIONS, |value| if value == "0" { 0 } else { EXPANSIONS }))?;
+        }
         // The normal four-token warm takes GEMV; move BLAS's lazy setup ahead of requests. Initialize both policies: batches below 32 still use F32.
         // Synthetic zero matrices touch no model, expert store or sequence state. Release
         // them before the long-lived buffers/cache are allocated (no residency change).

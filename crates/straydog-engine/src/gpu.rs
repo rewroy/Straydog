@@ -296,6 +296,13 @@ impl Backend {
     /// Whether a decode row's Q5_K and Q8_0 GEMVs and IQ2 experts' gate/up take the Q8 kernels: their
     /// input quantized per 32 values to INT8 with an F32 scale, the sums exact in INT32 (RDNA4 only;
     /// elsewhere a no-op).
+    /// Keep the FP16 expansions of uploaded weights a prompt pass's GEMMs take, in `bytes` of VRAM
+    /// (within the budget), for its next batches (see the C header). Once only.
+    pub fn keep_expansions(&self, bytes: u64) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_expansions(self.handle, bytes) }).map(drop)
+    }
+
     pub fn configure_decode(&self, q8: bool) -> Result<()> {
         // SAFETY: a live handle.
         check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8)) }).map(drop)

@@ -166,6 +166,48 @@ __global__ void op_half_weight_checks(const __half* weights, size_t count, uint6
 // end), an FP16 GEMM with F32 sums. The GEMV gives a row at least op_lanes lanes, so that a wave
 // reads long runs of each row (short rows otherwise get two).
 constexpr unsigned op_lanes = 8;
+// Whether [pointer, pointer + bytes) lies in an allocation sd_upload made (weights).
+bool in_uploaded(const Device& d, const uint8_t* pointer, size_t bytes) {
+    auto next = d.uploaded.upper_bound(pointer);
+    if (next == d.uploaded.begin()) return false;
+    --next;
+    return size_t(pointer - next->first) <= next->second && bytes <= next->second - size_t(pointer - next->first);
+}
+// A write into an allocation (or its release): an upload's it touches holds weights no more, and
+// the expansions kept of weights go.
+void written(Device& d, const void* pointer) {
+    if (d.uploaded.empty()) return;
+    const auto* at = static_cast<const uint8_t*>(pointer);
+    auto next = d.uploaded.upper_bound(at);
+    if (next == d.uploaded.begin()) return;
+    --next;
+    if (size_t(at - next->first) < next->second) {
+        d.uploaded.erase(next);
+        d.expanded_weights.clear();
+    }
+}
+
+// The FP16 expansion of a weights matrix (an upload's: sd_upload) that the device keeps for a prompt
+// pass's next GEMMs, made the first time (a pass's attention runs its rows ATTENTION_ROWS at a time,
+// every batch taking the same weights): in a ring (sd_expansions), the expansions it overwrites
+// forgotten (queued on one stream, a GEMM still reading one runs before the expansion that
+// overwrites it). Null when the device keeps none of this matrix.
+const __half* kept_expansion(Device& d, const Matrix& matrix) {
+    if (!d.expansions || d.gemm_checks) return nullptr;
+    const size_t bytes = (matrix.rows * matrix.cols * 2 + 255) & ~size_t(255);
+    if (bytes > d.expansions_bytes || !in_uploaded(d, matrix.data, matrix.rows * matrix.row_bytes)) return nullptr;
+    for (const auto& kept : d.expanded_weights)
+        if (kept.data == matrix.data && kept.rows == matrix.rows && kept.cols == matrix.cols && kept.kind == matrix.kind)
+            return reinterpret_cast<const __half*>(d.expansions + kept.at);
+    const size_t at = d.expansions_at + bytes > d.expansions_bytes ? 0 : d.expansions_at;
+    auto& list = d.expanded_weights;
+    list.erase(std::remove_if(list.begin(), list.end(), [&](const auto& kept) { return kept.at < at + bytes && at < kept.at + kept.bytes; }),
+               list.end());
+    expand(matrix, reinterpret_cast<float*>(d.expansions + at), d.stream, true);
+    d.expanded_weights.push_back({matrix.data, matrix.rows, matrix.cols, matrix.kind, at, bytes});
+    d.expansions_at = at + bytes;
+    return reinterpret_cast<const __half*>(d.expansions + at);
+}
 void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t cols, size_t first,
                const float* input, size_t input_stride, size_t steps, float* output, size_t output_stride,
                float* scratch, size_t scratch_bytes, int precision = -1) {
@@ -187,6 +229,13 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
         if (d.gemm_checks)
             op_half_input_checks<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(
                 input, input_stride, cols, steps, half_input, d.gemm_checks);
+        if (const __half* kept = kept_expansion(d, matrix)) {
+            const float alpha = 1, beta = 0;
+            blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(rows), int(steps), int(cols), &alpha, kept, HIP_R_16F, int(cols),
+                                     half_input, HIP_R_16F, int(cols), &beta, output, HIP_R_32F, int(output_stride), HIPBLAS_COMPUTE_32F,
+                                     HIPBLAS_GEMM_DEFAULT));
+            return;
+        }
         const size_t piece = std::min(rows, (scratch_bytes - input_bytes) / (cols * 2));
         if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
         const float alpha = 1, beta = 0;

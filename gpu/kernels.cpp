@@ -484,6 +484,14 @@ struct Device {
     size_t readback_bytes = 0;
     // Allocations that live in mapped, page-locked host memory (sd_host_state): device pointer -> host pointer.
     std::unordered_map<void*, void*> host_states;
+    // sd_upload's allocations by address (weights: none of them is written after), and the FP16
+    // expansions of their matrices that a prompt pass's GEMMs keep for its next batches (op_linear):
+    // a ring in `expansions` (sd_expansions).
+    std::map<const uint8_t*, size_t> uploaded;
+    struct Expansion { const uint8_t* data; size_t rows, cols; int kind; size_t at, bytes; };
+    std::vector<Expansion> expanded_weights;
+    uint8_t* expansions = nullptr;
+    size_t expansions_bytes = 0, expansions_at = 0;
     // Page-locked host copies of recurrent sequence state (conversation checkpoints): pointer -> bytes.
     // Neither VRAM nor mapped state, so they take no budget and no K/V mirror rows.
     std::unordered_map<void*, size_t> checkpoints;
@@ -1629,6 +1637,7 @@ int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host
             throw std::runtime_error("invalid Straydog transfer");
         auto* at=static_cast<uint8_t*>(pointer)+offset;
         op_span(d,at,size_t(bytes),"a transferred range");
+        if (stream!=2) written(d,pointer);
         check_registered(host,size_t(bytes),stream==2);
         auto& t=transfers(d);
         if (stream==2) check(hipMemcpyAsync(host,at,size_t(bytes),hipMemcpyDeviceToHost,t.streams[1]));
@@ -1882,8 +1891,19 @@ void* sd_upload(void* handle, const void* data, uint64_t bytes) {
         void* pointer = allocate(value, bytes);
         upload(value, pointer, data, size_t(bytes));
         check(hipStreamSynchronize(value.stream));
+        value.uploaded.emplace(static_cast<const uint8_t*>(pointer), size_t(bytes));
         return pointer;
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
+}
+
+int sd_expansions(void* handle, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (value.expansions) throw std::runtime_error("Straydog expansions are kept already");
+        if (bytes) value.expansions = static_cast<uint8_t*>(allocate(value, bytes));
+        value.expansions_bytes = size_t(bytes);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
 void* sd_allocate(void* handle, uint64_t bytes) {
@@ -1897,6 +1917,7 @@ int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes) {
         auto found = value.allocations.find(pointer);
         if (!data || found == value.allocations.end() || found->second != bytes)
             throw std::runtime_error("invalid Straydog write");
+        written(value, pointer);
         upload(value, pointer, data, size_t(bytes));
         check(hipStreamSynchronize(value.stream));
         return 0;
@@ -1939,6 +1960,7 @@ int sd_release(void* handle, void* pointer) {
         auto& value = device(handle);
         auto found = value.allocations.find(pointer);
         if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        written(value, pointer);
         if (value.kv_prefetching && (pointer == value.kv_stage || pointer == value.kv_stage_owner)) {
             check(hipStreamSynchronize(value.kv_stream));
             value.kv_prefetching = false;
@@ -2374,6 +2396,7 @@ int sd_buffer_write(void* handle, void* buffer, uint64_t offset, const void* dat
         auto& value = device(handle);
         if (!data || offset > UINT64_MAX - bytes) throw std::runtime_error("invalid Straydog buffer write");
         op_span(value, static_cast<uint8_t*>(buffer) + offset, size_t(bytes), "a written buffer");
+        written(value, buffer);
         upload(value, static_cast<uint8_t*>(buffer) + offset, data, size_t(bytes));
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
