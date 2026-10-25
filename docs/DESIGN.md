@@ -191,7 +191,7 @@ option, named as llama-server names it where it has the same setting.
 | `--state-ram GIB` | host memory for sequence state | what the context needs (13 at 262144) |
 | `--row-cache MIB` | host memory caching rows of the PLE table (or a model's Engram table), read from the SSD as needed (§4.6); 0 reads them through the page cache | 256 |
 | `--data-dir DIR` | Straydog's data directory: the shards' verity trees, built there at the first start (reads after loading are checked against them, §3), and the expert store's warm-up state | `.straydog` in the model directory |
-| `--expert-ram GIB` | host memory for routed experts outside VRAM (a model read on demand) | three quarters of the host memory, less Straydog's other host memory (the row cache, 2 GiB for the rest) |
+| `--expert-ram GIB` | host memory for routed experts outside VRAM (a model read on demand) | 85% of the host memory, less Straydog's other host memory (the row cache, 2 GiB for the rest) |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |
@@ -454,7 +454,7 @@ reading the sum waits for the flag and adds the other's part as it reads it; a p
 (verify, prefill) sums them with a kernel once both are done, as storing its values one by one
 across the bus costs more than the sum's launch. Each GPU's VRAM left after its resident weights and
 sequence state goes to expert slots, and the host tier gets what Straydog's other host memory
-leaves of three quarters of the host memory (as the server measures it, cgroup limits included).
+leaves of 85% of the host memory (as the server measures it, cgroup limits included).
 Tokenizer and chat template come from the GGUF (`tokenizer.ggml.*` gives the official
 tokenizer's ids; the template renders the reference encoder's prompts), replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A

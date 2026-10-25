@@ -186,7 +186,7 @@ pub struct Options {
     /// Where Straydog keeps the shards' verity trees (built at the first start) and the experts' warm-up state [default: .straydog in the model directory]
     #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Host memory for routed experts outside VRAM, in GiB, for a bundle read on demand [default: what Straydog's other host memory leaves of three quarters of the host memory]
+    /// Host memory for routed experts outside VRAM, in GiB, for a bundle read on demand [default: what Straydog's other host memory leaves of 85% of the host memory]
     #[arg(long, env = "STRAYDOG_EXPERT_RAM", value_name = "GIB")]
     pub expert_ram: Option<f64>,
 }

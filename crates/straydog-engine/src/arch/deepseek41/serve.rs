@@ -327,10 +327,13 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         slots.push(held.min(range.len() * hp.experts) / devices.len() * devices.len());
     }
     let in_vram: u64 = groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).sum();
-    // (planned, the tier leaves the checkpoints their host memory)
+    // (planned, the tier leaves the checkpoints their host memory; it may hold more than the
+    // experts VRAM lacks: a long pass takes the slots lent to the store back and streams its
+    // experts through VRAM while the tier keeps theirs, and a tier of just the rest dropped ~1300
+    // experts an agent's turn, to read them from the drive the next)
     let host = match settings.host_expert_bytes {
         Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
-        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts.saturating_sub(in_vram)),
+        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts),
     };
     let whole_bytes = files.whole_bytes(|_| true);
     let files: &'static Pinned = Box::leak(Box::new(files));
