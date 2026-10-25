@@ -466,6 +466,11 @@ pub struct Engine<'a, T: Tensors> {
     /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
     profile_sync: bool,
+    /// A pass's host-side rows, kept between passes: the embeddings repeated into the hc copies,
+    /// and a layer's Engram rows decoded. New memory every pass (hundreds of MB) waited on the
+    /// kernel's direct reclaim whenever the host ran short of free pages, seconds at a time.
+    stream_rows: Vec<f32>,
+    engram_values: Vec<f32>,
     /// Work::view calls the last decode token did not make because a graph replayed
     /// (DS41_COUNT_VIEWS; off, so it stays 0, unless that is set).
     views: ViewCounter,
@@ -924,6 +929,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             half_policy: None,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
+            stream_rows: Vec::new(),
+            engram_values: Vec::new(),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
             primed: None,
             startup,
@@ -1413,8 +1420,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (positions, ring_rows, visible1, visible2) = pass_schedule(start, n, self.ring);
         // The previous pass queued this one-token schedule behind its logit copy.
         let skip = n == 1 && self.primed.take() == Some(start);
-        // embeddings repeated into the hc copies
-        let mut stream = Vec::new();
+        // embeddings repeated into the hc copies (in the buffer kept between passes)
+        let mut stream = std::mem::take(&mut self.stream_rows);
+        stream.clear();
         if range.start == 0 {
             let embed = self.tensors.tensor("token_embd.weight")?;
             let bytes = row_bytes(embed.kind, embed.dims[0])?;
@@ -1436,6 +1444,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 shard.gpu.write_buffer(&shard.work.stream, 0, &stream)?;
             }
         }
+        self.stream_rows = stream;
         if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens)?;
         }
@@ -1699,17 +1708,22 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let saves = n > 1 && self.rewindable(n);
         // (its rows all in one batch, from the first: rows_of)
         let link = self.link_pass;
-        // The Engram rows of every token, before the layer (each batch takes its own).
+        // The Engram rows of every token, before the layer (each batch takes its own), in the
+        // buffer kept between passes.
+        let mut gathered = std::mem::take(&mut self.engram_values);
         let engram = match plan.engram {
-            Some(module) => Some(self.engram_rows(module, tokens)?),
-            None => None,
+            Some(module) => {
+                self.engram_rows(module, tokens, &mut gathered)?;
+                true
+            }
+            None => false,
         };
         let engram_values = hp.engram_columns() * hp.engram.as_ref().map_or(0, |engram| engram.head_dim);
         for first in (from..n).step_by(self.settings.batch) {
             let end = (first + self.settings.batch).min(n);
             let rows = (end - first) as u64;
             let mut expand = expand;
-            if let Some(gathered) = &engram {
+            if engram {
                 let expanding = std::mem::take(&mut expand);
                 for shard in &mut self.shards {
                     let work = shard.work.view(first);
@@ -1807,6 +1821,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             self.mark("router")?;
         }
+        self.engram_values = gathered;
         if full_from < n {
             self.moe(layer, full_from, n, predict)?;
             if !link {
@@ -1858,8 +1873,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
-    /// The rows Engram module `module` gathers for `tokens`, decoded (a token's after another's).
-    fn engram_rows(&self, module: usize, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// The rows Engram module `module` gathers for `tokens`, decoded (a token's after another's)
+    /// into `gathered`.
+    fn engram_rows(&self, module: usize, tokens: &[u32], gathered: &mut Vec<f32>) -> Result<()> {
         let engram = self.hp.engram.as_ref().ok_or("no Engram metadata")?;
         let name = &engram.tables[module];
         let table = self.tensors.tensor(name)?;
@@ -1872,11 +1888,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
             history.push(token);
         }
         let bytes = self.tensors.rows(name, &rows)?;
-        let mut gathered = Vec::with_capacity(tokens.len() * self.hp.engram_columns() * engram.head_dim);
+        gathered.clear();
+        gathered.reserve(tokens.len() * self.hp.engram_columns() * engram.head_dim);
         for row in bytes.chunks_exact(width) {
-            formats::decode_into(kind, row, &mut gathered)?;
+            formats::decode_into(kind, row, gathered)?;
         }
-        Ok(gathered)
+        Ok(())
     }
 
     /// The experts of `layer` over the rows `first..n` of a pass, after the router (see
