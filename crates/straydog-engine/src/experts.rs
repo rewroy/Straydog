@@ -494,12 +494,18 @@ mod pin_failure_tests {
     }
 }
 
-/// Whole equal-sized arenas only: no final arena rounded beyond the class budget.
+/// Equal-sized arenas of at most ARENA bytes, as many as the class budget's slots need, the slots
+/// dealt evenly over them: never beyond the budget, and short of it by fewer slots than arenas.
+/// (Whole arenas of ARENA bytes alone left each class's last part unused: 4.8 of DeepSeek-V4.1's
+/// 90.6 GiB tier over its eight classes, which drive reads and host-tier drops paid for every turn.)
 /// A zero tier keeps only its bounded staging reserve, charged outside the tier.
 fn host_plan(budget: u64, host_bytes: u64, reserve: usize) -> (usize, usize, usize) {
     let slots = if budget == 0 { reserve } else { (budget / host_bytes) as usize };
-    let per_arena = ((ARENA as u64 / host_bytes) as usize).clamp(1, slots.max(1));
-    let arenas = slots / per_arena;
+    if slots == 0 {
+        return (0, 1, 0);
+    }
+    let arenas = slots.div_ceil(((ARENA as u64 / host_bytes) as usize).max(1));
+    let per_arena = slots / arenas;
     (if budget == 0 { 0 } else { arenas * per_arena }, per_arena, arenas)
 }
 
@@ -520,13 +526,15 @@ mod host_budget_tests {
     }
 
     #[test]
-    fn final_partial_arena_is_not_rounded_up() {
-        let bytes = 10 << 20;
-        let budget = ARENA as u64 + 3 * bytes;
-        let (capacity, per_arena, arenas) = host_plan(budget, bytes, 8);
-        assert_eq!(arenas, 1);
-        assert_eq!(capacity, per_arena);
-        assert!((arenas + 1) as u64 * per_arena as u64 * bytes > budget);
+    fn a_class_fills_its_budget_but_for_fewer_slots_than_arenas() {
+        for bytes in [7u64 << 20, 10 << 20, 17 << 20] {
+            for budget in [ARENA as u64 + 3 * bytes, 11 << 30, (11 << 30) + 5 * bytes, 91 << 30] {
+                let (capacity, per_arena, arenas) = host_plan(budget, bytes, 8);
+                let slots = (budget / bytes) as usize;
+                assert!(capacity <= slots && slots - capacity < arenas, "{bytes} x {capacity} of {slots} in {arenas}");
+                assert!(per_arena as u64 * bytes <= ARENA as u64);
+            }
+        }
     }
 
     #[test]
