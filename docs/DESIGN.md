@@ -232,7 +232,9 @@ authentication: no worker starts without them.
   as `n_ctx`).
 - `POST /v1/chat/completions`, streaming (SSE `chat.completion.chunk`) or not:
   - messages: system (and developer), user, assistant (content, `reasoning_content`,
-    `tool_calls`) and tool messages; content as a string or text parts;
+    `tool_calls`) and tool messages; content as a string or text parts, and for a model that
+    reads images (`/props` `modalities.vision`), a user's or a tool's also with image parts:
+    `image_url` with a `data:` URL or `image` with a base64 source (the server fetches nothing);
   - `tools`, `tool_choice` (`auto` or `none`);
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
@@ -462,6 +464,23 @@ and one that writes the DSML tags otherwise than the model does never reads a re
 tool back as the model wrote it, so no turn continues the held sequence. Replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A
 prompt that extends the held sequence continues it; there are no checkpoints yet.
+
+**Images.** The official checkpoint's vision tower (32 blocks of 1024, 16 heads, 2D rope, 14-pixel
+patches), its aligner (each 3x3 of patches to one row of 5120), the image span's learned START,
+NEWLINE and END rows and each layer's image routing bias make an optional file beside the bundle:
+`straydog fetch` range-fetches those 306 tensors (each SHA-256 pinned, at a pinned revision) into
+`DeepSeek-V4.1-Flash-1017-Vision-BF16.gguf`, itself pinned and opened against its tree like the
+shards; without it the model reads no images. An image is decoded in the worker (PNG, JPEG, WebP,
+GIF), sized as the reference plans it (at least 544x544 pixels' worth, at most 1024 positions) and
+padded to it as Pillow's `ImageOps.pad` does, bit for bit. The template renders each image part as
+a marker of its own (it reorders tool results), and the marker's place in the prompt takes the
+image's span, `START (IMAGE x columns, NEWLINE) x rows END`, its positions with ids from 2^31 up made
+from the image's digest (so a held sequence continues only with the same image). The encoder runs on
+the first GPU, in the arena a long pass takes from the expert store (its weights uploaded from the
+file each time, FP16 products with F32 sums); the last few images' rows are kept for the turns
+after. A pass embeds the span's rows, routes its rows with the image bias, and gathers no Engram
+rows there: their values are zeros, so the Engram gate adds nothing, and a token after an image
+starts its n-grams afresh, as the reference's do.
 
 A start does not begin cold: the runtime asks the worker for the experts its stores hold (least
 recently used first, in VRAM and in the host tier) every two minutes after requests and at

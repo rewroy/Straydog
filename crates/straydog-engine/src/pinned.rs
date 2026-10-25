@@ -105,7 +105,8 @@ impl Pinned {
                 }
                 let model: &ModelHeader = first.as_ref().ok_or("an on-demand bundle without shards")?;
                 let source = |header: &ModelHeader| header.metadata.get(&format!("{}.engram.source", pins.architecture)).cloned();
-                if source(&header) != source(model) {
+                // (the vision encoder's file is the official checkpoint's tensors as they are)
+                if sidecar.architecture != bundle::VISION_ARCHITECTURE && source(&header) != source(model) {
                     return Err(format!("Straydog sidecar {} was made from another model", asset.name));
                 }
             } else {

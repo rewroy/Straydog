@@ -25,6 +25,7 @@
 #define hipblasSetMathMode cublasSetMathMode
 #define hipblasSgemm cublasSgemm
 #define hipblasGemmEx cublasGemmEx
+#define hipblasGemmStridedBatchedEx cublasGemmStridedBatchedEx
 #define HIP_R_16F CUDA_R_16F
 #define HIP_R_32F CUDA_R_32F
 #define HIPBLAS_COMPUTE_32F CUBLAS_COMPUTE_32F
@@ -3681,3 +3682,4 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "gemv_fused.hpp"
 #include "moe_prefill.hpp"
 #include "host_exchange.hpp"
+#include "vision.hpp"

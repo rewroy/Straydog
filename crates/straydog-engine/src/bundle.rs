@@ -116,6 +116,70 @@ pub fn verity_pins(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
     Ok(pins)
 }
 
+/// [`verity_pins`] of the files a model in `root` has: with its vision encoder when one is pinned
+/// and there ([`vision_source`]).
+pub fn verity_pins_in(root: &std::path::Path, quantization: &str) -> Result<Vec<(Asset, String)>, String> {
+    let mut pins = verity_pins(quantization)?;
+    if let Some(vision) = vision_source(quantization)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
+        pins.push((vision.asset, vision.verity));
+    }
+    Ok(pins)
+}
+
+/// The GGUF `general.architecture` of DeepSeek-V4.1's vision encoder file.
+pub const VISION_ARCHITECTURE: &str = "deepseek41-vision";
+
+/// The pins of DeepSeek-V4.1's vision encoder: the official checkpoint's vision tower, aligner,
+/// image span embeddings and image routing biases, which provisioning range-fetches (each
+/// tensor's SHA-256 pinned) into one GGUF beside the bundle, itself pinned by size, SHA-256 and
+/// fs-verity digest. Optional: a model without the file reads no images.
+#[derive(Debug, Clone)]
+pub struct VisionSource {
+    pub asset: Asset,
+    pub verity: String,
+    pub repository: String,
+    pub revision: String,
+    /// In name order.
+    pub tensors: Vec<SourceTensor>,
+}
+
+const VISION_MANIFEST: &str = include_str!("assets_deepseek41_vision.json");
+
+/// The vision encoder pinned for an on-demand quantization's model, if it has one.
+pub fn vision_source(quantization: &str) -> Result<Option<VisionSource>, String> {
+    if !is_on_demand(quantization) {
+        return Ok(None);
+    }
+    let pins = on_demand(quantization)?;
+    let manifest: Value = serde_json::from_str(VISION_MANIFEST).map_err(|exc| exc.to_string())?;
+    if manifest["architecture"] != pins.architecture.as_str() {
+        return Ok(None);
+    }
+    let vision = &manifest["vision"];
+    if manifest["schema"] != 1 || vision["kind"] != "vision" {
+        return Err("unsupported Straydog vision manifest".into());
+    }
+    let incomplete = "manifest vision source incomplete";
+    let text = |value: &Value| value.as_str().map(str::to_string).ok_or(incomplete);
+    let mut tensors = Vec::new();
+    for (name, pin) in vision["source_tensors"].as_object().ok_or(incomplete)? {
+        tensors.push(SourceTensor {
+            name: name.clone(),
+            shard: text(&pin["shard"])?,
+            bytes: pin["bytes"].as_u64().ok_or(incomplete)?,
+            sha256: text(&pin["sha256"])?,
+        });
+    }
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Some(VisionSource {
+        asset: asset(vision)?,
+        verity: verity_of(vision)?,
+        repository: text(&vision["repository"])?,
+        revision: text(&vision["revision"])?,
+        tensors,
+    }))
+}
+
 /// The repository the resources (tokenizer, template, config) come from, at the manifest's
 /// tokenizer revision: the official model's.
 pub const RESOURCE_REPOSITORY: &str = "Qwen/Qwen3.8-Flash-Next";

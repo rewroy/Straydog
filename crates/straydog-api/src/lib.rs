@@ -134,7 +134,7 @@ impl SamplingDefaults {
 }
 
 /// The largest request body.
-const BODY_LIMIT: usize = 15 * 1024 * 1024;
+const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// What a request sees while the model loads (llama-server's wording).
 const LOADING: &str = "Loading model";
 
@@ -174,6 +174,11 @@ impl Api {
             EngineState::Loading { .. } => Err(ApiError::unavailable(LOADING)),
             EngineState::Failed(message) => Err(ApiError::unavailable(message)),
         }
+    }
+
+    /// Whether the model reads images (the worker reports its vision encoder).
+    fn vision(&self) -> bool {
+        matches!(self.engine.state(), EngineState::Ready { placement, .. } if placement["vision"] == true)
     }
 
     /// The engine's one slot as llama-server describes a slot: it answers one request at a
@@ -310,7 +315,7 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
     api.authorize(&headers)?;
     Ok(Json(json!({
         "default_generation_settings": api.slot()?, "total_slots": 1, "model_alias": api.config.model_id,
-        "modalities": {"vision": false, "audio": false},
+        "modalities": {"vision": api.vision(), "audio": false},
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }
@@ -327,7 +332,7 @@ async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body:
     api.authorize(&headers)?;
     api.ready()?;
     let payload = read_payload(&headers, body).await?;
-    let (request, shape) = request::translate(&payload, &api.config)?;
+    let (request, shape) = request::translate(&payload, &api.config, api.vision())?;
     let generation = api.engine.generate(request).await?;
     answer::respond(generation, shape, &api.config.model_id).await
 }

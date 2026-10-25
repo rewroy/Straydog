@@ -25,4 +25,5 @@ pub mod storage;
 pub mod text;
 pub mod transfer;
 pub mod verity;
+pub mod vision;
 pub mod weights;

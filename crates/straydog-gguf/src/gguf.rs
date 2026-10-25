@@ -67,7 +67,7 @@ impl Metadata {
 
 /// The architectures of the files beside a model's shards that are accepted though their names fall
 /// outside the usual characters: DeepSeek-V4.1's separate Engram tables.
-pub const SIDECAR_ARCHITECTURES: [&str; 1] = ["deepseek41-engram"];
+pub const SIDECAR_ARCHITECTURES: [&str; 2] = ["deepseek41-engram", "deepseek41-vision"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelHeader {

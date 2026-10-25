@@ -10,6 +10,7 @@
 mod assets;
 mod http;
 mod mtp;
+mod vision;
 
 #[cfg(test)]
 mod mock;
@@ -38,6 +39,7 @@ pub fn fetch(root: &Path, quantization: &str, offline: bool, data_dir: Option<&P
         let agent = http::agent(assets::TIMEOUT);
         // The trees authenticate the files present: they are not hashed twice.
         assets::fetch_with(&agent, root, &entries, offline, false, progress).map_err(|error| error.to_string())?;
+        build_vision(root, quantization, offline, progress).map_err(|error| error.to_string())?;
         return print_trees(root, quantization, &data_dir, false, progress);
     }
     fetch_assets(root, quantization, offline, true, progress)?;
@@ -79,7 +81,7 @@ fn writable(directory: &Path) -> io::Result<()> {
 /// when their digests are the pinned ones. That authenticates the files: every block hashes
 /// into the pinned root. Nothing but `data_dir` is written (by default in the model directory).
 fn build_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: bool, progress: Progress) -> io::Result<Vec<String>> {
-    let mut pins = bundle::verity_pins(quantization).map_err(invalid)?;
+    let mut pins = bundle::verity_pins_in(root, quantization).map_err(invalid)?;
     if missing_only {
         pins.retain(|(asset, _)| !bundle::tree_path(data_dir, asset).is_file());
     }
@@ -171,6 +173,35 @@ fn build_drafter(root: &Path, keep_source: bool, progress: Progress) -> io::Resu
         fs::remove_file(&source).map_err(at(&source))?;
     }
     Ok(target)
+}
+
+/// Build DeepSeek-V4.1's vision encoder file in `root` from the authenticated official tensors,
+/// when the quantization's model has one pinned and it is not there yet; with `offline`, leave it
+/// missing (the model then reads no images). Its verity tree then authenticates it.
+fn build_vision(root: &Path, quantization: &str, offline: bool, progress: Progress) -> io::Result<()> {
+    let Some(source_pins) = bundle::vision_source(quantization).map_err(invalid)? else { return Ok(()) };
+    let target = root.join(&source_pins.asset.name);
+    if offline || target.is_file() {
+        return Ok(());
+    }
+    let source = root.join(vision::SOURCE_FILE);
+    if !source.is_file() {
+        let stage = "downloading the official vision tensors";
+        let total = source_pins.tensors.iter().map(|tensor| tensor.bytes).sum();
+        let done = AtomicU64::new(0);
+        progress(stage, 0, total);
+        let count = |bytes: u64| progress(stage, done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
+        let base = format!("https://huggingface.co/{}/resolve/{}/", source_pins.repository, source_pins.revision);
+        let agent = http::agent(mtp::TIMEOUT);
+        mtp::fetch_source(&agent, &base, &source_pins.tensors, &source, mtp::PIECE, &count)?;
+    }
+    vision::convert(&source, &target, &source_pins.revision)?;
+    let label = format!("authenticating {}", source_pins.asset.name);
+    if let Err(error) = assets::verify_file(&target, &source_pins.asset, &label, progress) {
+        fs::remove_file(&target).map_err(at(&target))?;
+        return Err(error);
+    }
+    fs::remove_file(&source).map_err(at(&source))
 }
 
 /// A file or an answer that is not what it must be (the reference's ValueError), as opposed

@@ -70,6 +70,16 @@ pub trait Engines {
     fn prefetch_ahead(&mut self, _tokens: &[u32]) -> Result<(), String> {
         Ok(())
     }
+    /// Whether the engines read images (DeepSeek-V4.1 beside its vision encoder).
+    fn vision(&self) -> bool {
+        false
+    }
+    /// Each image's span rows ([`crate::vision::span`]), the model's width a position.
+    fn encode_images(&mut self, _images: &[crate::vision::Patches]) -> Result<Vec<Vec<f32>>, String> {
+        Err("this model reads no images".into())
+    }
+    /// The rows the next passes embed at image positions: each span's first position and its rows.
+    fn set_images(&mut self, _spans: Vec<(usize, std::sync::Arc<Vec<f32>>)>) {}
     /// Copies of the sequence state the engines keep ([`Engines::checkpoint`]); none: a session
     /// continues only a sequence the prompt extends.
     fn checkpoints(&self) -> usize {
@@ -478,7 +488,9 @@ impl<E: Engines> Session<E> {
         if tokens.is_empty() || max_new == 0 || tokens.len() + max_new > self.context {
             return Err("Straydog prompt plus output exceeds the allocated context".into());
         }
-        if tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+        // (an image position's id is past the vocabulary: engines that read images take its rows)
+        let vision = self.engines.vision();
+        if tokens.iter().any(|&token| token as usize >= self.vocabulary && !(vision && token >= crate::vision::IMAGE_TOKEN)) {
             return Err("Straydog token is out of range".into());
         }
         sampling.check()?;

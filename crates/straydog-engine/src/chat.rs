@@ -63,7 +63,7 @@ impl ChatTemplate {
     /// The prompt for `messages` and `tools`, ending with the assistant's generation prompt
     /// (templates that take `enable_thinking` and a `reasoning_effort` of low, medium or xhigh).
     pub fn render(&self, messages: &Value, tools: &Value, thinking: bool, effort: &str) -> Result<String, ChatError> {
-        let decoded = Self::messages(messages)?;
+        let decoded = Self::messages(messages, false)?;
         if !matches!(effort, "low" | "medium" | "xhigh") {
             return Err(error("invalid Straydog reasoning effort"));
         }
@@ -71,12 +71,14 @@ impl ChatTemplate {
     }
 
     /// The prompt for `messages` and `tools` with the template's own variables (a family's
-    /// thinking and effort controls), ending with the assistant's generation prompt.
+    /// thinking and effort controls), ending with the assistant's generation prompt. A message's
+    /// content may also be a list of text parts (a request's with images, each image's part a text
+    /// part by then: see the worker's images).
     pub fn render_with(&self, messages: &Value, tools: &Value, variables: &[(&str, Value)]) -> Result<String, ChatError> {
-        self.render_decoded(&Self::messages(messages)?, tools, variables)
+        self.render_decoded(&Self::messages(messages, true)?, tools, variables)
     }
 
-    fn messages(messages: &Value) -> Result<Vec<Value>, ChatError> {
+    fn messages(messages: &Value, parts: bool) -> Result<Vec<Value>, ChatError> {
         let Value::Array(items) = messages else {
             return Err(error("invalid Straydog messages"));
         };
@@ -85,8 +87,12 @@ impl ChatTemplate {
         }
         for message in items {
             let content = message.get("content");
+            let text_parts = |list: &[Value]| list.iter().all(|part| {
+                part.get("type").and_then(Value::as_str) == Some("text") && matches!(part.get("text"), Some(Value::Str(_)))
+            });
             if !matches!(message, Value::Object(_))
-                || !matches!(content, None | Some(Value::Null) | Some(Value::Str(_)))
+                || !(matches!(content, None | Some(Value::Null) | Some(Value::Str(_)))
+                     || parts && matches!(content, Some(Value::Array(list)) if text_parts(list)))
             {
                 return Err(error("Straydog initially supports text messages only"));
             }
