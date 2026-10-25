@@ -860,7 +860,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 roles[layer] = Some(layer_roles);
             }
             let laying = std::time::Instant::now();
-            let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?);
+            let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?.with_experts(hp.experts));
             let laid = laying.elapsed().as_secs_f64();
             let shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
             let [init, buffers, store, f32_warm, f16_warm] = shard.startup;

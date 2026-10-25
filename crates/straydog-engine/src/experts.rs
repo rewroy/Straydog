@@ -66,6 +66,9 @@ pub struct Layout {
     /// The roles (layer, role) whose slots keep some columns ([`keep_columns`](Self::keep_columns)).
     columns: HashMap<(usize, usize), Columns>,
     verifier: Option<Verifier>,
+    /// The experts of a layer, when known ([`with_experts`](Self::with_experts)): the host tier then
+    /// gives each size class first what its VRAM slots leave of its experts.
+    experts: usize,
 }
 
 impl Layout {
@@ -83,7 +86,13 @@ impl Layout {
                 return Err("an expert role's bytes exceed its stride".into());
             }
         }
-        Ok(Layout { files, layers, columns: HashMap::new(), verifier })
+        Ok(Layout { files, layers, columns: HashMap::new(), verifier, experts: 0 })
+    }
+
+    /// Each layer has `experts` experts (see the host tier's shares: DeviceExperts::new).
+    pub fn with_experts(mut self, experts: usize) -> Layout {
+        self.experts = experts;
+        self
     }
 
     /// VRAM slots keep only `columns` of `layer`'s role `role` (a resident store's: see [`Columns`]).
@@ -498,6 +507,35 @@ mod pin_failure_tests {
 /// dealt evenly over them: never beyond the budget, and short of it by fewer slots than arenas.
 /// (Whole arenas of ARENA bytes alone left each class's last part unused: 4.8 of DeepSeek-V4.1's
 /// 90.6 GiB tier over its eight classes, which drive reads and host-tier drops paid for every turn.)
+/// Each size class's bytes of the host tier (`distinct` its (VRAM, host) slot bytes, `shares` its
+/// layers, `counts` its VRAM slots), a staging slot each charged first: by its layers' share of the
+/// rest, as each layer takes as many routes; or, with `experts` a layer known, first what its VRAM
+/// slots leave of its experts (counting those it keeps free: its reserve, and [`PASS_FREE`] between
+/// requests) and the rest by its layers' share (short of that, each class the same part of what it
+/// lacks). By layers alone, a class of larger experts held fewer of each layer's
+/// experts in either tier: on DeepSeek-V4.1 (seven sizes) the three largest lacked ~90 a device
+/// while the tier had room to spare, read from the drive again every prompt.
+fn host_shares(distinct: &[(u64, u64)], shares: &[u64], counts: &[usize], experts: u64, budget: u64, staging: u64) -> Vec<u64> {
+    if budget == 0 {
+        return vec![0; distinct.len()];
+    }
+    let layers: u64 = shares.iter().sum();
+    let rest = budget - staging;
+    let by_layers = |rest: u64, index: usize| (rest as u128 * shares[index] as u128 / layers.max(1) as u128) as u64;
+    let needs: Vec<u64> = distinct.iter().zip(shares).zip(counts).map(|((&(_, host_bytes), &share), &count)| {
+        let free = ((count / 64).clamp(4, MAX_RESERVE) + PASS_FREE) as u64;
+        (share * experts + free).saturating_sub(count as u64).min(share * experts) * host_bytes
+    }).collect();
+    let needed: u64 = needs.iter().sum();
+    distinct.iter().enumerate().map(|(index, &(_, host_bytes))| host_bytes + if experts == 0 {
+        by_layers(rest, index)
+    } else if rest >= needed {
+        needs[index] + by_layers(rest - needed, index)
+    } else {
+        (rest as u128 * needs[index] as u128 / needed.max(1) as u128) as u64
+    }).collect()
+}
+
 /// A zero tier keeps only its bounded staging reserve, charged outside the tier.
 fn host_plan(budget: u64, host_bytes: u64, reserve: usize) -> (usize, usize, usize) {
     let slots = if budget == 0 { reserve } else { (budget / host_bytes) as usize };
@@ -511,7 +549,46 @@ fn host_plan(budget: u64, host_bytes: u64, reserve: usize) -> (usize, usize, usi
 
 #[cfg(test)]
 mod host_budget_tests {
-    use super::{host_plan, ARENA};
+    use super::{host_plan, host_shares, ARENA};
+
+    // DeepSeek-V4.1's classes on a device at 2200 slots (host bytes ~ VRAM bytes rounded up)
+    const CLASSES: [(u64, u64); 3] = [(4_500_000, 4_505_600), (5_200_000, 5_206_016), (6_100_000, 6_107_136)];
+    const SHARES: [u64; 3] = [16, 6, 1];
+    const COUNTS: [usize; 3] = [2186, 788, 113];
+
+    #[test]
+    fn with_experts_known_every_class_first_gets_what_vram_leaves_it() {
+        let staging: u64 = CLASSES.iter().map(|class| class.1).sum();
+        let needs: Vec<u64> = (0..3).map(|i| (SHARES[i] * 384 + (COUNTS[i] as u64 / 64).clamp(4, 32) + 64 - COUNTS[i] as u64) * CLASSES[i].1).collect();
+        let needed: u64 = needs.iter().sum();
+        // room to spare: each its need and staging, the rest by layers
+        let budget = needed + staging + (1 << 30);
+        let shares = host_shares(&CLASSES, &SHARES, &COUNTS, 384, budget, staging);
+        for i in 0..3 {
+            assert!(shares[i] >= needs[i] + CLASSES[i].1, "class {i}: {} for a need of {}", shares[i], needs[i]);
+        }
+        assert!(shares.iter().sum::<u64>() <= budget);
+        // too little: each the same part of its need
+        let budget = staging + needed / 2;
+        let shares = host_shares(&CLASSES, &SHARES, &COUNTS, 384, budget, staging);
+        for i in 0..3 {
+            let part = (shares[i] - CLASSES[i].1) as f64 / needs[i] as f64;
+            assert!((part - 0.5).abs() < 1e-6, "class {i}: {part}");
+        }
+        assert!(shares.iter().sum::<u64>() <= budget);
+    }
+
+    #[test]
+    fn without_experts_known_classes_share_by_layers() {
+        let staging: u64 = CLASSES.iter().map(|class| class.1).sum();
+        let budget = staging + 23 * (1 << 30);
+        let shares = host_shares(&CLASSES, &SHARES, &COUNTS, 0, budget, staging);
+        for i in 0..3 {
+            assert_eq!(shares[i], CLASSES[i].1 + SHARES[i] * (1 << 30));
+        }
+        assert_eq!(host_shares(&CLASSES, &SHARES, &COUNTS, 384, 0, staging), vec![0; 3]);
+    }
+
 
     #[test]
     fn whole_arenas_never_exceed_the_class_budget() {
@@ -548,6 +625,9 @@ mod host_budget_tests {
 
 /// The most VRAM slots a size class keeps free (its reserve).
 const MAX_RESERVE: usize = 32;
+/// VRAM slots a size class may keep free between requests besides its reserve: a prefill's first
+/// two waves of 32 (DeviceExperts::make_room), its streamed experts emptied behind it.
+const PASS_FREE: usize = 64;
 
 /// A store's experts as (layer, expert), least recently used first: those in VRAM slots, and
 /// those only in the host tier (see [`DeviceExperts::contents`]).
@@ -625,10 +705,11 @@ struct LentSlot {
 }
 
 /// The experts of one size (the layers whose experts take the same bytes): its VRAM slots and
-/// host slots, each with a free list and an LRU order. A layer's share of the budgets is the same
-/// for every layer (each takes the same number of routes per token), so a class's share is its
-/// layers' count; a slot is just its experts' size, not the largest layer's (on DeepSeek-V4.1,
-/// whose experts take 7.6 to 12.1 MB, that holds ~15% fewer drive reads per token).
+/// host slots, each with a free list and an LRU order. A layer's share of the VRAM budget is the
+/// same for every layer (each takes the same number of routes per token), so a class's share is its
+/// layers' count (of the host tier: see host_shares); a slot is just its experts' size, not the
+/// largest layer's (on DeepSeek-V4.1, whose experts take 7.6 to 12.1 MB, that holds ~15% fewer drive
+/// reads per token).
 struct Class {
     vram_bytes: u64,
     host_bytes: u64,
@@ -829,15 +910,15 @@ impl DeviceExperts {
         let class_of: Vec<Option<usize>> = sizes.iter()
             .map(|size| size.map(|size| distinct.iter().position(|&other| other == size).unwrap())).collect();
         let layers = class_of.iter().flatten().count() as u64;
+        let shares: Vec<u64> = (0..distinct.len()).map(|index| class_of.iter().filter(|class| **class == Some(index)).count() as u64).collect();
+        let counts: Vec<usize> = distinct.iter().zip(&shares).map(|(&(vram_bytes, _), &share)| count(share, layers, vram_bytes)).collect();
+        let budgets = host_shares(&distinct, &shares, &counts, layout.experts as u64, host_budget, staging);
         let mut classes = Vec::new();
         let mut all_slots = Vec::new();
         for (index, &(vram_bytes, host_bytes)) in distinct.iter().enumerate() {
-            let share = class_of.iter().filter(|class| **class == Some(index)).count() as u64;
-            let count = count(share, layers, vram_bytes);
+            let count = counts[index];
             let reserve = (count / 64).clamp(4, MAX_RESERVE);
-            let class_budget = if host_budget == 0 { 0 } else {
-                host_bytes + ((host_budget - staging) as u128 * share as u128 / layers as u128) as u64
-            };
+            let class_budget = budgets[index];
             let (host_capacity, per_arena, arenas) = host_plan(class_budget, host_bytes, reserve);
             let pinner = Pinner::new(arenas, per_arena * host_bytes as usize);
             let first = all_slots.len();
