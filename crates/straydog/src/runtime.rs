@@ -308,7 +308,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}), prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -319,6 +319,11 @@ pub fn request_summary(event: &Value) -> String {
         },
         number(&timings["prefill_tokens_per_second"], 0),
         number(&timings["ttft_seconds"], 2),
+        // (of which restoring a checkpoint and saving the request's: copies of the whole state)
+        match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
+            (restore, save) if restore + save >= 0.05 => format!(" (checkpoints: restore {restore:.2} s, save {save:.2} s)"),
+            _ => String::new(),
+        },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
         // (an engine that streams experts says where the prefill's came from: what the first token waited on)
