@@ -346,7 +346,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     Ok(Session::new(Placed {
         engines,
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch, end, turn_start,
-        card,
+        // (no root: both copies of the DeltaNets' state are the turns')
+        root_end: None, card,
         placement, state_bytes,
         load_seconds: vec![("open".to_string(), open_seconds), ("place".to_string(), place_seconds)],
     }))

@@ -115,4 +115,22 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert!(again.cached.is_some_and(|cached| (cached as usize) < third.len()), "regenerated from the third turn's checkpoint");
     let after = go(&mut model, &fifth, 8);
     assert!(after.cached.is_some_and(|cached| cached as usize > third.len()), "the fifth turn from the regenerated fourth's checkpoint");
+
+    // A long system prompt is its conversations' root: a new conversation with it starts from
+    // there and leaves what starting over leaves.
+    let long_system = format!("{{\"role\": \"system\", \"content\": {}}}", serde_json::to_string(&document).unwrap());
+    let opening = render(&format!("[{long_system}, {}]", user("What is this project?")));
+    let another = render(&format!("[{long_system}, {}]", user("Name its main parts.")));
+    model.forget();
+    go(&mut model, &opening, 8);
+    let rooted = go(&mut model, &another, 16);
+    assert_eq!(model.last_metrics["resumed_from"], "root");
+    assert!(rooted.cached.is_some_and(|cached| cached as usize > first.len() / 2 && (cached as usize) < another.len() - 4),
+            "the new conversation from the root: {:?}", rooted.cached);
+    model.forget();
+    let direct = go(&mut model, &another, 16);
+    assert_eq!(direct.cached, Some(0));
+    assert_eq!(rooted.logits, direct.logits, "prompt logits from the root");
+    assert_eq!(rooted.tokens, direct.tokens, "tokens from the root");
+    assert_eq!(rooted.state, direct.state, "state from the root");
 }

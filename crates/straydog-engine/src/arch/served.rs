@@ -75,6 +75,8 @@ pub trait Engines {
     fn checkpoint(&mut self, _slot: usize, _save: bool) -> Result<(), String> {
         Err("these engines keep no checkpoints".into())
     }
+    /// The checkpoint slot a budget gives up last (the conversation root's), if any.
+    fn keep_checkpoint(&mut self, _slot: Option<usize>) {}
     /// Whether a checkpoint holds the whole sequence state, positional too: restored after any
     /// other sequence (a conversation come back to after another), not only below a common prefix.
     fn whole_checkpoints(&self) -> bool {
@@ -193,11 +195,17 @@ pub struct Settings {
 /// Experts still to warm up with, as (layer, expert).
 type Pending = std::collections::VecDeque<(usize, usize)>;
 
-/// The sequence state saved where a prompt's reply began, and the tokens before it.
+/// The sequence state saved where a prompt's reply began (or, the root, where its system prompt
+/// ended), and the tokens before it.
 struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
+    root: bool,
 }
+
+/// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
+/// one prefills in about a second).
+const ROOT_MINIMUM: usize = 1024;
 
 /// Warm-up steps (a millisecond apart, the worker's) with no room and no read on its way before
 /// the warm-up gives up.
@@ -223,9 +231,15 @@ pub struct Session<E: Engines> {
     /// The token a reply's generation prompt begins with (`<|im_start|>`, `<｜Assistant｜>`): the
     /// state before it is checkpointed when the engines keep checkpoints.
     turn_start: Option<u32>,
+    /// The token a user message begins with (`<｜User｜>`): the state before a prompt's first is
+    /// its conversation's root (system prompt and tools), checkpointed for the next conversation.
+    root_end: Option<u32>,
     /// Saved states, oldest first: the last ("turn") where the last prompt's reply began, the
-    /// earlier ones ("prior") where earlier prompts' did.
+    /// earlier ones ("prior") where earlier prompts' did, and the last root ("root").
     checkpoints: Vec<Checkpoint>,
+    /// The last request's prompt tokens that agreed with what was held or checkpointed (more than
+    /// it reused when it changed what came before).
+    agreed: usize,
     /// The sampling the model card gives, for every mode.
     pub card: Sampling,
     /// How the model was placed (the ready frame shows it).
@@ -254,6 +268,7 @@ pub struct Placed<E: Engines> {
     pub batch: usize,
     pub end: Vec<u32>,
     pub turn_start: Option<u32>,
+    pub root_end: Option<u32>,
     pub card: Sampling,
     pub placement: Value,
     pub state_bytes: u64,
@@ -370,7 +385,7 @@ impl<E: Engines> Session<E> {
         Session {
             engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary, layers: placed.layers, experts: placed.experts,
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
-            checkpoints: Vec::new(), card: placed.card,
+            root_end: placed.root_end, checkpoints: Vec::new(), agreed: 0, card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
             last_metrics: Map::new(), prompt_logits: None, warming: Default::default(), warm_stalled: 0,
         }
@@ -454,7 +469,9 @@ impl<E: Engines> Session<E> {
         }
         sampling.check()?;
         self.files.check_unchanged()?;
+        self.agreed = 0;
         let (reused, resumed_from) = self.resume(tokens)?;
+        let agreed = self.agreed.max(reused);
         let resume_seconds = started.elapsed().as_secs_f64();
         let total = tokens.len();
         // (where the prefill's experts came from: the wait before the first token, broken down)
@@ -466,12 +483,20 @@ impl<E: Engines> Session<E> {
         // The state where this reply's generation prompt begins is saved on the way: the next
         // turn's prompt keeps what precedes it even where the template renders this reply
         // otherwise than it was generated (a past turn's thinking dropped).
+        // So is the state where its system prompt ends: the next conversation keeps that.
         let mut fed = reused;
-        if let Some(start) = self.turn_mark(tokens, reused) {
-            if self.feed(&tokens[reused..start], cancelled, &mut |done| progress(done, total))?.is_none() {
+        if let Some(root) = self.root_mark(tokens, reused) {
+            if self.feed(&tokens[reused..root], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
-            self.save_turn()?;
+            self.save_checkpoint(true)?;
+            fed = root;
+        }
+        if let Some(start) = self.turn_mark(tokens, fed) {
+            if self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
+                return Ok(());
+            }
+            self.save_checkpoint(false)?;
             fed = start;
         }
         let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
@@ -525,7 +550,7 @@ impl<E: Engines> Session<E> {
         let cpu2 = self.engines.cpu_routes();
         let per = |value: u64| if steps > 0 { json!(value as f64 / steps as f64) } else { Value::Null };
         self.last_metrics = json!({
-            "cached_tokens": reused, "resumed_from": resumed_from,
+            "cached_tokens": reused, "resumed_from": resumed_from, "agreed_tokens": agreed,
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
             "prefill_tokens_per_second": (total - reused) as f64 / prefill_seconds.max(1e-9),
             "resume_seconds": resume_seconds,
@@ -549,9 +574,9 @@ impl<E: Engines> Session<E> {
 
     /// The prompt tokens already held, after restoring the state they need: the held sequence when
     /// the prompt extends it ("live"), else the longest checkpoint the prompt extends that the
-    /// held sequence matches as far ("turn", the last, or "prior"; its K/V rows are then the held
-    /// ones) or, whole, whatever is held, else none (the engines start over). At least one prompt
-    /// token is left to run.
+    /// held sequence matches as far ("turn", the last, "prior", or "root"; its K/V rows are then
+    /// the held ones) or, whole, whatever is held, else none (the engines start over). At least one
+    /// prompt token is left to run.
     fn resume(&mut self, tokens: &[u32]) -> Result<(usize, &'static str), String> {
         let limit = tokens.len() - 1;
         let held = &self.history;
@@ -560,6 +585,10 @@ impl<E: Engines> Session<E> {
         }
         let span = held.len().min(limit);
         let common = (0..span).find(|&index| held[index] != tokens[index]).unwrap_or(span);
+        // (how far the prompt agrees with what is held or checkpointed: where a client changed it)
+        self.agreed = self.checkpoints.iter()
+            .map(|checkpoint| checkpoint.tokens.iter().zip(tokens).take_while(|(a, b)| a == b).count())
+            .chain([common]).max().unwrap_or(0);
         let whole = self.engines.whole_checkpoints();
         let best = self.checkpoints.iter().enumerate()
             .filter(|(_, checkpoint)| (whole || checkpoint.tokens.len() <= common) && checkpoint.tokens.len() <= limit
@@ -569,7 +598,13 @@ impl<E: Engines> Session<E> {
             self.reset();
             return Ok((0, "none"));
         };
-        let kind = if index + 1 == self.checkpoints.len() { "turn" } else { "prior" };
+        let kind = if checkpoint.root {
+            "root"
+        } else if self.checkpoints[index + 1..].iter().all(|later| later.root) {
+            "turn"
+        } else {
+            "prior"
+        };
         let (slot, saved) = (checkpoint.slot, checkpoint.tokens.clone());
         if let Err(error) = self.engines.checkpoint(slot, false) {
             self.reset();
@@ -587,25 +622,42 @@ impl<E: Engines> Session<E> {
         (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)
     }
 
-    /// Save the held state as the last turn's checkpoint: one of the same tokens just becomes the
-    /// last; else a free slot takes it, the oldest checkpoint giving its up when all are taken.
-    fn save_turn(&mut self) -> Result<(), String> {
+    /// Where the prompt's system prompt ends (its first user message begins), to be checkpointed
+    /// as its conversation's root: past what is held, at least [`ROOT_MINIMUM`] tokens in, and only
+    /// with a checkpoint left for the turns.
+    fn root_mark(&self, tokens: &[u32], reused: usize) -> Option<usize> {
+        let end = self.root_end.filter(|_| self.engines.checkpoints() > 1)?;
+        let root = tokens.iter().position(|&token| token == end)?;
+        (root >= ROOT_MINIMUM && reused < root).then_some(root)
+    }
+
+    /// Save the held state as a checkpoint, the root (the last root becoming a turn's) or the last
+    /// turn's: one of the same tokens just becomes the last; else a free slot takes it, the oldest
+    /// turn's giving its up when all are taken. The engines' budget gives the root's up last.
+    fn save_checkpoint(&mut self, root: bool) -> Result<(), String> {
         // (checkpoints the engines gave up are gone: one of the same tokens is taken again)
         let engines = &self.engines;
         self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
+        if root {
+            self.checkpoints.iter_mut().for_each(|checkpoint| checkpoint.root = false);
+        }
         if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
-            let same = self.checkpoints.remove(index);
+            let mut same = self.checkpoints.remove(index);
+            same.root |= root;
             self.checkpoints.push(same);
-            return Ok(());
+        } else {
+            let slots = self.engines.checkpoints();
+            if self.checkpoints.len() >= slots {
+                let oldest = self.checkpoints.iter().position(|checkpoint| !checkpoint.root).unwrap_or(0);
+                self.checkpoints.remove(oldest);
+            }
+            let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot))
+                .ok_or("no free Straydog checkpoint")?;
+            self.engines.checkpoint(slot, true)?;
+            self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone(), root });
         }
-        let slots = self.engines.checkpoints();
-        if self.checkpoints.len() >= slots {
-            self.checkpoints.remove(0);
-        }
-        let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot))
-            .ok_or("no free Straydog checkpoint")?;
-        self.engines.checkpoint(slot, true)?;
-        self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone() });
+        let kept = self.checkpoints.iter().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
+        self.engines.keep_checkpoint(kept);
         Ok(())
     }
 

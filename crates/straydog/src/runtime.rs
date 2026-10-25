@@ -308,10 +308,15 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}), prefill {} tok/s, first token {} s, {} tokens at {} tok/s{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
+        // (a prompt that agreed further than it could reuse: the client changed what came before)
+        match timings["agreed_tokens"].as_u64() {
+            Some(agreed) if agreed > usage["cached_tokens"].as_u64().unwrap_or(0) => format!(", the same as before for {agreed}"),
+            _ => String::new(),
+        },
         number(&timings["prefill_tokens_per_second"], 0),
         number(&timings["ttft_seconds"], 2),
         count(&usage["completion_tokens"]),

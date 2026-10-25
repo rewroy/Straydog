@@ -29,7 +29,8 @@ use served::{RESERVE, SCRATCH};
 pub type Model = Session<Engines>;
 
 /// Checkpoints kept, each the whole sequence state where a reply's generation prompt began (a
-/// conversation switched away from comes back from there).
+/// conversation switched away from comes back from there), one where the last long system prompt
+/// ended (a new conversation with it starts from there).
 pub const CHECKPOINTS: usize = 4;
 /// Host memory the checkpoints take at most, together and at any moment (a 20K-token
 /// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
@@ -50,6 +51,8 @@ pub struct Engines {
     saved: Vec<Option<Vec<Snapshot>>>,
     /// The slots holding one, oldest first.
     order: Vec<usize>,
+    /// The slot given up last ([`served::Engines::keep_checkpoint`]).
+    kept: Option<usize>,
     /// Host bytes they may take ([`CHECKPOINT_BYTES`]).
     budget: u64,
 }
@@ -174,9 +177,11 @@ impl served::Engines for Engines {
         }
         self.saved[slot] = None;
         self.order.retain(|&held| held != slot);
-        // Room first, the copy after: the budget bounds the host memory at its peak too.
+        // Room first, the copy after: the budget bounds the host memory at its peak too. The kept
+        // slot (the conversation root's) gives its up last.
         let required: u64 = self.engines.iter().map(Engine::snapshot_bytes).sum();
-        let held: Vec<(usize, u64)> = self.order.iter()
+        let kept = self.kept.filter(|&kept| kept != slot);
+        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| Some(held) != kept).chain(kept.iter().filter(|kept| self.order.contains(kept)))
             .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
         let Some(given_up) = evictions(&held, required, self.budget) else { return Ok(()) };
         for oldest in given_up {
@@ -186,6 +191,10 @@ impl served::Engines for Engines {
         self.saved[slot] = Some(self.engines.iter_mut().map(Engine::snapshot).collect::<Result<Vec<_>, _>>()?);
         self.order.push(slot);
         Ok(())
+    }
+
+    fn keep_checkpoint(&mut self, slot: Option<usize>) {
+        self.kept = slot;
     }
 
     fn whole_checkpoints(&self) -> bool {
@@ -403,17 +412,20 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "expert_bytes": total_experts,
         "prefill_batch_size": settings.batch,
     });
-    // (where a reply's generation prompt begins: its state is checkpointed there)
-    let turn_start = files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
-        .and_then(|tokens| tokens.iter().position(|token| token.text() == Some("<｜Assistant｜>")))
+    // (where a reply's generation prompt begins, and a user message: the states before them, and
+    // before a prompt's first user message, are checkpointed)
+    let special = |text: &str| files.header.metadata.get("tokenizer.ggml.tokens").and_then(|tokens| tokens.array())
+        .and_then(|tokens| tokens.iter().position(|token| token.text() == Some(text)))
         .map(|id| id as u32);
+    let (turn_start, root_end) = (special("<｜Assistant｜>"), special("<｜User｜>"));
     let drafts = std::env::var_os("DS41_DRAFTS").is_none_or(|value| value != "0");
     let verify_rows = if drafts { engines.iter().map(Engine::verify_rows).min().unwrap_or(1) } else { 1 };
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
-                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), budget: CHECKPOINT_BYTES },
+                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
+                           budget: CHECKPOINT_BYTES },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
-        end: vec![end], turn_start, card, placement, state_bytes,
+        end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
 }
