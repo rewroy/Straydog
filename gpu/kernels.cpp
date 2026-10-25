@@ -3271,14 +3271,21 @@ int sd_op_index_scores(void* handle, const float* q, const float* keys, const fl
 
 extern "C++" {
 // sd_op_index_select's counters: a row's score blocks done (the first index_row_capacity, each zeroed by its
-// row's last block), then sd_op_index_select_proj's four (op_index_select_proj_kernel).
-constexpr size_t index_row_capacity = 65536;
+// row's last block), then sd_op_index_select_proj's four (op_index_select_proj_kernel), then from
+// index_bins_at the bins of index_bin_rows rows' keys (op_index_select_kernel's, each zeroed by its row's
+// last block).
+constexpr size_t index_row_capacity = 65536, index_bins_at = index_row_capacity + 8, index_bin_rows = 4;
 static unsigned* index_counters(Device& value) {
+    constexpr size_t words = index_bins_at + index_bin_rows * top_k_bins;
     if (!value.index_rows) {
-        value.index_rows = static_cast<unsigned*>(allocate(value, (index_row_capacity + 5) * 4));
-        check(hipMemsetAsync(value.index_rows, 0, (index_row_capacity + 5) * 4, value.stream));
+        value.index_rows = static_cast<unsigned*>(allocate(value, words * 4));
+        check(hipMemsetAsync(value.index_rows, 0, words * 4, value.stream));
     }
     return value.index_rows;
+}
+// A few rows' bins (decode and verify passes), else none.
+static unsigned* index_bins(Device& value, uint64_t rows) {
+    return rows <= index_bin_rows ? index_counters(value) + index_bins_at : nullptr;
 }
 } // extern "C++"
 
@@ -3314,9 +3321,9 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
         return 0;
     }
 #endif
-    op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
+    op_index_select_kernel<<<dim3(unsigned((groups + index_block_groups - 1) / index_block_groups), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-        index_counters(value));
+        index_counters(value), index_bins(value, rows));
     SD_OP_END
 }
 
@@ -3350,16 +3357,17 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
         FixedGemv list{};
         list.items[0] = {matrix, 0, lanes};
         list.count = 1;
-        const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((groups + 31) / 32);
+        const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((groups + index_block_groups - 1) / index_block_groups);
         op_index_select_proj_kernel<30><<<proj_blocks + chunks, 256, 0, value.stream>>>(list, x, proj_blocks, q, keys, weights, visible,
             size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-            index_counters(value) + index_row_capacity);
+            index_counters(value) + index_row_capacity, index_bins(value, 1));
         check(hipGetLastError());
         return 0;
     }
     gemv(value, &matrix, 1, x, weights, 1, 0, 0, {}, op_lanes);
-    op_index_select_kernel<<<dim3(unsigned((groups + 31) / 32), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
-        size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value));
+    op_index_select_kernel<<<dim3(unsigned((groups + index_block_groups - 1) / index_block_groups), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
+        size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value),
+        index_bins(value, 1));
     SD_OP_END
 }
 
