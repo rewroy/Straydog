@@ -27,8 +27,10 @@ use crate::storage::{self, Buffer, ALIGN};
 
 /// The default cache budget across a model's row tables.
 pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
-/// Reads in flight: the device needs dozens to reach its random-read rate.
-pub const THREADS: usize = 32;
+/// Reads in flight: a drive needs a deep queue to reach its random-read rate (DeepSeek-V4.1's
+/// Engram rows on a PCIe 4.0 NVMe drive: 32 left a cold 55K-token prompt waiting 7-33 s on
+/// them, 128 waits 5.4-6.8 s).
+pub const THREADS: usize = 128;
 /// The most a read covers when rows lie in neighbouring blocks.
 const EXTENT: u64 = 64 << 10;
 /// Index and recency bytes per cached row, counted against the budget.
