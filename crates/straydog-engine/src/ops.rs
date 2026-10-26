@@ -830,6 +830,20 @@ impl Backend {
         check(unsafe { ffi::sd_debug_checksum(self.handle(), data.cast(), bytes, partials.cast()) })
     }
 
+    /// Development: queue a store of the device's wall clock into `stamps[slot]` (u64s).
+    pub fn debug_stamp(&mut self, stamps: M, slot: u64) -> Result<()> {
+        // SAFETY: a live handle; the library checks the slot against its allocations.
+        check(unsafe { ffi::sd_debug_stamp(self.handle(), stamps.cast(), slot) })
+    }
+
+    /// Development: the rate of [`debug_stamp`](Self::debug_stamp)'s clock, in kHz.
+    pub fn debug_clock_khz(&mut self) -> Result<u64> {
+        let mut khz = 0u64;
+        // SAFETY: a live handle and a valid output.
+        check(unsafe { ffi::sd_debug_clock_khz(self.handle(), &mut khz) })?;
+        Ok(khz)
+    }
+
     /// out += x (count values).
     pub fn add(&mut self, x: P, count: u64, out: M) -> Result<()> {
         // SAFETY: as above.

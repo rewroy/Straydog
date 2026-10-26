@@ -725,6 +725,38 @@ int sd_debug_checksum(void* handle, const void* data, uint64_t bytes, uint64_t* 
     SD_OP_END
 }
 
+__global__ void debug_stamp_kernel(unsigned long long* stamps, size_t slot) {
+#if defined(__HIPCC__)
+    stamps[slot] = wall_clock64();
+#else
+    unsigned long long now; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)); stamps[slot] = now;
+#endif
+}
+
+int sd_debug_stamp(void* handle, uint64_t* stamps, uint64_t slot) {
+    SD_OP_BEGIN
+    op_span(value, stamps + slot, 8, "a stamp");
+    debug_stamp_kernel<<<1, 1, 0, value.stream>>>(reinterpret_cast<unsigned long long*>(stamps), size_t(slot));
+    SD_OP_END
+}
+
+int sd_debug_clock_khz(void* handle, uint64_t* khz) {
+    try {
+        auto& value = device(handle);
+        if (!khz) throw std::runtime_error("no Straydog clock rate output");
+#if defined(__HIPCC__)
+        int rate = 0;
+        check(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, value.ordinal));
+        if (rate <= 0) throw std::runtime_error("invalid HIP wall clock rate");
+        *khz = uint64_t(rate);
+#else
+        (void)value;
+        *khz = 1000000;   // %globaltimer counts nanoseconds
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_op_scale_rows(void* handle, float* x, const float* scalars, uint64_t rows, uint64_t width) {
     SD_OP_BEGIN
     if (!rows || !width) throw std::runtime_error("invalid Straydog scale shape");
