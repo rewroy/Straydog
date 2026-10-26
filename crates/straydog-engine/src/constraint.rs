@@ -20,6 +20,9 @@ const THINK_CLOSE: &[u8] = b"</think>";
 /// Whitespace in a row the JSON may hold: a pretty-printed line's indentation fits, a model
 /// stuck emitting newlines does not.
 const WHITESPACE_RUN: usize = 64;
+/// Whitespace before the value starts, or after it ends: a model that wanted to write prose
+/// otherwise padded the answer with lines of it (16 blank lines before a `{`).
+const WHITESPACE_AROUND: usize = 4;
 /// Characters a number may hold.
 const NUMBER_LENGTH: usize = 40;
 /// How deep a schema may nest, `$ref`s followed.
@@ -396,7 +399,8 @@ impl JsonMatcher {
 
     fn space(&mut self, byte: u8) -> bool {
         self.whitespace += 1;
-        is_space(byte) && self.whitespace <= WHITESPACE_RUN
+        let around = matches!(self.stack.as_slice(), [] | [Frame::Value(_)]);
+        is_space(byte) && self.whitespace <= if around { WHITESPACE_AROUND } else { WHITESPACE_RUN }
     }
 
     fn taken(ok: bool) -> Step {
@@ -623,8 +627,13 @@ fn string_byte(escape: &mut Escape, byte: u8) -> Option<bool> {
 #[derive(Debug, Clone)]
 pub enum Alternative {
     Json(JsonMatcher),
-    /// The answer starts with `rest` (after at most `whitespace` whitespace bytes), then anything.
-    Prefix { rest: Vec<u8>, whitespace: usize },
+    /// The answer starts with `rest` (after at most `whitespace` whitespace bytes), then goes on
+    /// as `then`.
+    Prefix { rest: Vec<u8>, whitespace: usize, then: Box<Alternative> },
+    /// Anything up to and including `marker` (the bytes seen of it in `tail`), then `then`.
+    Until { marker: Vec<u8>, tail: Vec<u8>, then: Box<Alternative> },
+    /// Exactly `rest`, then nothing but the end.
+    Exact { rest: Vec<u8> },
     Free,
 }
 
@@ -633,32 +642,61 @@ impl Alternative {
         Alternative::Json(JsonMatcher::new(Arc::new(schema)))
     }
 
+    /// The answer starts with `text`, then anything.
     pub fn prefix(text: &str, whitespace: usize) -> Alternative {
-        Alternative::Prefix { rest: text.as_bytes().to_vec(), whitespace }
+        Alternative::Prefix { rest: text.as_bytes().to_vec(), whitespace, then: Box::new(Alternative::Free) }
     }
 
-    /// Take a token's bytes; `special` (a control token) only a prefix or free text takes.
+    /// One call: the answer starts with `text`, goes on to `marker` (the call's close), then is
+    /// exactly `close` and ends.
+    pub fn single_call(text: &str, whitespace: usize, marker: &str, close: &str) -> Alternative {
+        let closing = Alternative::Exact { rest: close.as_bytes().to_vec() };
+        let until = Alternative::Until { marker: marker.as_bytes().to_vec(), tail: Vec::new(), then: Box::new(closing) };
+        Alternative::Prefix { rest: text.as_bytes().to_vec(), whitespace, then: Box::new(until) }
+    }
+
+    /// Take a token's bytes; `special` (a control token) only the non-JSON ways take.
     fn take(&mut self, bytes: &[u8], special: bool) -> bool {
+        if let Alternative::Json(json) = self {
+            return !special && json.feed_all(bytes);
+        }
+        bytes.iter().all(|&byte| self.take_byte(byte))
+    }
+
+    fn take_byte(&mut self, byte: u8) -> bool {
         match self {
+            Alternative::Json(json) => json.feed(byte),
             Alternative::Free => true,
-            Alternative::Json(json) => !special && json.feed_all(bytes),
-            Alternative::Prefix { rest, whitespace } => {
-                let mut index = 0;
-                while index < bytes.len() && !rest.is_empty() {
-                    let byte = bytes[index];
-                    if byte == rest[0] {
-                        rest.remove(0);
-                        // (whitespace may only come before the prefix starts)
-                        *whitespace = 0;
-                    } else if *whitespace > 0 && is_space(byte) {
-                        *whitespace -= 1;
-                    } else {
-                        return false;
-                    }
-                    index += 1;
+            Alternative::Exact { rest } => {
+                if rest.first() != Some(&byte) {
+                    return false;
+                }
+                rest.remove(0);
+                true
+            }
+            Alternative::Prefix { rest, whitespace, then } => {
+                if rest.first() == Some(&byte) {
+                    rest.remove(0);
+                    // (whitespace may only come before the prefix starts)
+                    *whitespace = 0;
+                } else if *whitespace > 0 && is_space(byte) {
+                    *whitespace -= 1;
+                } else {
+                    return false;
                 }
                 if rest.is_empty() {
-                    *self = Alternative::Free;
+                    let then = std::mem::replace(then, Box::new(Alternative::Free));
+                    *self = *then;
+                }
+                true
+            }
+            Alternative::Until { marker, tail, then } => {
+                tail.push(byte);
+                if tail.ends_with(marker) {
+                    let then = std::mem::replace(then, Box::new(Alternative::Free));
+                    *self = *then;
+                } else if tail.len() > marker.len() {
+                    tail.remove(0);
                 }
                 true
             }
@@ -669,7 +707,8 @@ impl Alternative {
         match self {
             Alternative::Json(json) => json.complete(),
             Alternative::Free => true,
-            Alternative::Prefix { .. } => false,
+            Alternative::Exact { rest } => rest.is_empty(),
+            Alternative::Prefix { .. } | Alternative::Until { .. } => false,
         }
     }
 }
@@ -751,7 +790,16 @@ impl Constraint {
                     Some(Value::Int(count)) => usize::try_from(*count).map_err(|_| "a Straydog constraint's whitespace must be a count")?,
                     Some(_) => return Err("a Straydog constraint's whitespace must be a count".into()),
                 };
-                alternatives.push(Alternative::prefix(prefix, whitespace));
+                let text = |key: &str| match alternative.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Str(text)) => Ok(Some(text.as_str())),
+                    Some(_) => Err(format!("a Straydog constraint's {key} must be a string")),
+                };
+                alternatives.push(match (text("until")?, text("close")?) {
+                    (Some(marker), Some(close)) => Alternative::single_call(prefix, whitespace, marker, close),
+                    (None, None) => Alternative::prefix(prefix, whitespace),
+                    _ => return Err("a Straydog constraint's until and close come together".into()),
+                });
             } else {
                 return Err("a Straydog constraint alternative is json or prefix".into());
             }
@@ -839,6 +887,9 @@ mod tests {
         let any = Schema::any_object();
         assert!(!prefix(&any, &format!("{{{}", " ".repeat(WHITESPACE_RUN + 1))));
         assert!(prefix(&any, &format!("{{{}\"a\"", " ".repeat(WHITESPACE_RUN))));
+        assert!(prefix(&any, &format!("{}{{", " ".repeat(WHITESPACE_AROUND))));
+        assert!(!prefix(&any, &" ".repeat(WHITESPACE_AROUND + 1)), "padding before the value");
+        assert!(!prefix(&any, &format!("{{}}{}", " ".repeat(WHITESPACE_AROUND + 1))), "padding after it");
     }
 
     fn tokens(pieces: &[&str]) -> Arc<TokenBytes> {
@@ -886,5 +937,21 @@ mod tests {
         assert!(either.allows(2) && either.allows(3));
         either.advance(3);
         assert!(!either.allows(2) && either.allows(5));
+    }
+
+    #[test]
+    fn a_single_call_closes_after_its_invoke_and_ends() {
+        // 0 end, 1 "<call name=f>", 2 "x", 3 "</invoke>", 4 "\n</calls>", 5 "<call name=g>"
+        let vocabulary = tokens(&["<|end|>", "<call name=f>", "x", "</invoke>", "\n</calls>", "<call name=g>"]);
+        let one = Alternative::single_call("<call name=f>", 0, "</invoke>", "\n</calls>");
+        let mut constraint = Constraint::new(vocabulary, &[0], false, vec![one]);
+        assert!(constraint.allows(1) && !constraint.allows(5));
+        constraint.advance(1);
+        assert!(constraint.allows(2) && constraint.allows(5) && !constraint.allows(0), "free inside the call");
+        constraint.advance(2);
+        constraint.advance(3);
+        assert!(!constraint.allows(5) && !constraint.allows(0) && constraint.allows(4), "the close, nothing else");
+        constraint.advance(4);
+        assert!(constraint.allows(0) && !constraint.allows(2));
     }
 }
