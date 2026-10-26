@@ -16,6 +16,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
+use crate::constraint::{self, Constraint};
 use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::sampling::{self, Generated, Sampling};
@@ -29,7 +30,8 @@ const VERIFY_ROWS: usize = MAX_DRAFTS + 1;
 /// Longest fully resident prompt that runs as verification passes (about 27 ms per four rows)
 /// rather than as a batched prefill, whose fixed cost is about 110 ms on two R9700s.
 const VERIFIED_PREFILL: usize = 16;
-const END_TOKENS: [u32; 2] = [248044, 248046];
+/// The tokens that end a reply.
+pub const END_TOKENS: [u32; 2] = [248044, 248046];
 const IM_START: u32 = 248045;
 const IM_END: u32 = 248046;
 /// Drafts stop where the product of their probabilities under the drafter falls below
@@ -1473,6 +1475,16 @@ impl Model {
     pub fn generate(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
                     cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool, checkpoint: bool,
                     emit: &mut dyn FnMut(u32)) -> Result<()> {
+        self.generate_constrained(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, None)
+    }
+
+    /// [`Model::generate`] with the reply held to `constraint` ([`crate::constraint`]): every token
+    /// chosen against it, so without MTP drafts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_constrained(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
+                                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool,
+                                checkpoint: bool, emit: &mut dyn FnMut(u32), mut constraint: Option<&mut Constraint>)
+                                -> Result<()> {
         let started = Instant::now();
         self.last_metrics = Map::new();
         if tokens.is_empty() || max_new == 0 || max_new > self.context || tokens.len() + max_new > self.context {
@@ -1530,7 +1542,7 @@ impl Model {
         }
         let mut rng = Rng::new(seed);
         let Some(mut logits) = output else { return Ok(()) };
-        if self.speculative > 0 {
+        if self.speculative > 0 && constraint.is_none() {
             return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit);
         }
         let mut generated = Generated::new(VOCABULARY);
@@ -1538,7 +1550,7 @@ impl Model {
             if cancelled() {
                 return Ok(());
             }
-            let token = sampling::choose(&logits, sampling, &generated, &mut rng);
+            let token = constraint::pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
             generated.insert(token);
             if END_TOKENS.contains(&token) {
                 return Ok(());

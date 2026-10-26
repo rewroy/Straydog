@@ -446,9 +446,34 @@ async fn messages_and_tools_reach_the_engine_as_python_reads_them() {
     let (status, _, _) = send(app(&mock), chat(body)).await;
     assert_eq!(status, StatusCode::OK);
     let expected = format!(
-        r#"{{"messages": {messages}, "tools": {tools}, "max_tokens": null, "temperature": 0.5, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "presence_penalty": 0.0, "seed": 0, "thinking": true, "reasoning_effort": "xhigh", "checkpoint": true}}"#
+        r#"{{"messages": {messages}, "tools": {tools}, "max_tokens": null, "temperature": 0.5, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "presence_penalty": 0.0, "seed": 0, "thinking": true, "reasoning_effort": "xhigh", "checkpoint": true, "constraint": null}}"#
     );
     assert_eq!(pyjson::dumps(&mock.requests()[0]), expected);
+}
+
+#[tokio::test]
+async fn response_format_and_tool_choice_reach_the_worker_as_a_constraint() {
+    let dsml_call = r#"\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\""#;
+    let cases = [
+        (json!({"response_format": {"type": "json_object"}}), Markup::Qwen, r#"{"alternatives": [{"json": true}]}"#.to_string()),
+        (json!({"response_format": {"type": "text"}}), Markup::Qwen, "null".to_string()),
+        (json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}}),
+         Markup::Qwen, r#"{"alternatives": [{"json": {"type": "object"}}]}"#.to_string()),
+        (json!({"response_format": {"type": "json_object"}, "tools": read_file()}), Markup::Qwen,
+         r#"{"alternatives": [{"json": true}, {"prefix": "<tool_call>\n<function=", "whitespace": 4}]}"#.to_string()),
+        (json!({"response_format": {"type": "json_object"}, "tools": read_file(), "tool_choice": "none"}), Markup::Qwen,
+         r#"{"alternatives": [{"json": true}]}"#.to_string()),
+        (json!({"tools": read_file(), "tool_choice": "required"}), Markup::Dsml,
+         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}", "whitespace": 0}}]}}"#)),
+        (json!({"tools": read_file(), "tool_choice": {"type": "function", "function": {"name": "read_file"}}}), Markup::Qwen,
+         r#"{"alternatives": [{"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4}]}"#.to_string()),
+    ];
+    for (fields, markup, expected) in cases {
+        let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
+        let (status, _, _) = send(router(mock.clone(), ApiConfig { markup, ..config() }), chat(ask(fields.clone()).to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{fields}");
+        assert_eq!(pyjson::dumps(field(&mock.requests()[0], "constraint")), expected, "{fields}");
+    }
 }
 
 #[tokio::test]
@@ -496,7 +521,7 @@ async fn settings_reach_the_worker_request() {
         assert_eq!(status, StatusCode::OK, "{fields}");
         let request = pyjson::dumps(&mock.requests()[0]);
         assert!(request.contains(&format!(r#""max_tokens": {numbers}"#)), "{request}");
-        assert!(request.ends_with(&format!(r#""checkpoint": {checkpoint}}}"#)), "{request}");
+        assert!(request.ends_with(&format!(r#""checkpoint": {checkpoint}, "constraint": null}}"#)), "{request}");
     }
 }
 
@@ -584,8 +609,11 @@ async fn invalid_requests_are_refused() {
         (ask(json!({"logprobs": true})), "logprobs is not supported (only false)"),
         (ask(json!({"top_logprobs": 3})), "top_logprobs is not supported (only 0)"),
         (ask(json!({"parallel_tool_calls": false})), "parallel_tool_calls is not supported (only true)"),
-        (ask(json!({"response_format": {"type": "json_object"}})),
-         r#"response_format is not supported (only {"type": "text"})"#),
+        (ask(json!({"response_format": {"type": "xml"}})), "response_format type must be text, json_object or json_schema"),
+        (ask(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}})),
+         "response_format json_schema needs json_schema.schema"),
+        (ask(json!({"response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "date"}}}})),
+         "response_format json_schema: JSON schema type date is not supported"),
         (ask(json!({"modalities": ["text", "audio"]})), r#"modalities is not supported (only ["text"])"#),
         (ask(json!({"functions": [{"name": "f"}]})), "functions is not supported"),
         (ask(json!({"function_call": "auto"})), "function_call is not supported"),
@@ -593,9 +621,11 @@ async fn invalid_requests_are_refused() {
         (ask(json!({"prediction": {"type": "content", "content": "x"}})), "prediction is not supported"),
         (ask(json!({"tools": {"type": "function"}})), "tools must be a list of tool objects"),
         (ask(json!({"tools": ["read_file"]})), "tools must be a list of tool objects"),
-        (ask(json!({"tool_choice": "required"})), "tool_choice supports auto and none"),
+        (ask(json!({"tool_choice": "required"})), "tool_choice required needs tools"),
         (ask(json!({"tool_choice": {"type": "function", "function": {"name": "read_file"}}})),
-         "tool_choice supports auto and none"),
+         "tool_choice names read_file, which is not among the tools"),
+        (ask(json!({"tool_choice": "always"})),
+         r#"tool_choice must be auto, none, required or {"type": "function", "function": {"name": ...}}"#),
         (ask(json!({"max_tokens": 0})), "max_tokens must be a positive integer"),
         (ask(json!({"max_tokens": 1.5})), "max_tokens must be a positive integer"),
         (ask(json!({"max_tokens": true})), "max_tokens must be a positive integer"),
