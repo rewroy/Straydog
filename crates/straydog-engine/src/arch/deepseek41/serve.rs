@@ -34,8 +34,11 @@ pub type Model = Session<Engines>;
 pub const CHECKPOINTS: usize = 4;
 /// Host memory the checkpoints take at most, together and at any moment (a 20K-token
 /// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
-/// over it (past ~160K tokens) is not taken.
-pub const CHECKPOINT_BYTES: u64 = 1 << 30;
+/// over it is not taken. Enough for one at the full 262144-token context (~1.7 GiB): at 1 GiB a
+/// conversation past ~160K tokens kept none, and each new turn there (the template drops the last
+/// reply's reasoning) read the conversation again from an older checkpoint, 43K tokens in 48 s.
+/// The expert host tier gives up what this takes.
+pub const CHECKPOINT_BYTES: u64 = 2 << 30;
 /// Write-backs a device queues a step of making room between requests ([`Engines::make_room`]):
 /// ~20 MB, about what its downloads move in the worker's 1 ms between steps.
 const ROOM_STEP: usize = 4;
@@ -464,21 +467,22 @@ mod tests {
     use super::super::engine::snapshot_bytes;
     use super::*;
 
-    /// A checkpoint near a 262144-token context (DeepSeek-V4.1's 40 layers, sources 2, 8, 14 at
-    /// ratio 2 and 20 at ratio 1) is over the budget: not taken, and none given up for it. Under
-    /// the budget the oldest give theirs up until it fits, no more.
+    /// A checkpoint at the full 262144-token context (DeepSeek-V4.1's 40 layers, sources 2, 8, 14
+    /// at ratio 2 and 20 at ratio 1) fits the budget: the oldest give theirs up for it, no more.
+    /// One over the budget alone is not taken, and none given up for it.
     #[test]
-    fn a_checkpoint_over_the_budget_is_not_taken() {
-        let position = 262_000;
+    fn a_full_context_checkpoint_fits_and_one_over_the_budget_is_not_taken() {
+        let position = 262_144;
         let groups = [position / 2, position / 2, position / 2, position];
-        let huge = snapshot_bytes(position, 128, 40, 512, 128, &groups, position);
-        assert!(huge > CHECKPOINT_BYTES && huge < 2 * CHECKPOINT_BYTES, "{huge}");
+        let full = snapshot_bytes(position, 128, 40, 512, 128, &groups, position);
+        assert!(full > 1 << 30 && full < CHECKPOINT_BYTES, "{full}");
         let held = [(0, 300 << 20), (1, 300 << 20), (2, 300 << 20)];
-        assert_eq!(evictions(&held, huge, CHECKPOINT_BYTES), None);
+        assert_eq!(evictions(&held, full, CHECKPOINT_BYTES), Some(vec![0, 1]));
         let small = snapshot_bytes(4096, 128, 40, 512, 128, &[2048, 2048, 2048, 4096], 4096);
         assert!(small < 64 << 20, "{small}");
         assert_eq!(evictions(&held, small, CHECKPOINT_BYTES), Some(vec![]));
-        assert_eq!(evictions(&held, 400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
+        assert_eq!(evictions(&held, 1400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
+        assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
     }
 }
