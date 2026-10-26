@@ -13,6 +13,7 @@ use straydog_engine::arch::served::{Engines, Session, Settings};
 use straydog_engine::arch::{deepseek41, qwen35moe};
 use straydog_engine::bundle;
 use straydog_engine::chat::ChatTemplate;
+use straydog_engine::constraint::Constraint;
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
@@ -326,7 +327,9 @@ impl<E: Engines> Loaded<E> {
         let mut first_text: Option<f64> = None;
         let mut decode_error: Option<Failure> = None;
         let cancelled = || cancel.load(Ordering::SeqCst);
-        let result = self.model.generate(
+        let mut constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(),
+                                                      self.model.end_tokens(), thinking).map_err(refused)?;
+        let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
             &mut |token| {
@@ -342,6 +345,7 @@ impl<E: Engines> Loaded<E> {
                     }
                 }
             },
+            constraint.as_mut(),
         );
         result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
         if let Some(failure) = decode_error {

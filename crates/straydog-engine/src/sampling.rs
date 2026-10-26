@@ -468,6 +468,47 @@ pub fn choose(logits: &[f32], sampling: &Sampling, generated: &Generated, rng: &
     best as u32
 }
 
+/// Draws [`choose_where`] makes from the distribution before masking the refused tokens.
+const REDRAWS: usize = 32;
+
+/// [`choose`] among the tokens `allowed` accepts (constrained decoding): a draw from the same
+/// distribution, drawn again without a refused token, so the allowed ones keep their relative
+/// probabilities; after [`REDRAWS`] refusals, or once the draw's candidates are used up, the draw
+/// is made over the logits with every refused token masked. None when no token is allowed.
+pub fn choose_where(logits: &[f32], sampling: &Sampling, generated: &Generated, rng: &mut Rng,
+                    allowed: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
+    if sampling.temperature > 0.0 {
+        let mut distribution = distribution(logits, sampling, generated);
+        for _ in 0..REDRAWS {
+            let token = distribution.draw(rng);
+            // (a draw with no mass left returns a token it does not hold)
+            if distribution.probability(token) <= 0.0 {
+                break;
+            }
+            if allowed(token) {
+                return Some(token);
+            }
+            distribution = distribution.without(token);
+        }
+    } else {
+        let mut masked = logits.to_vec();
+        for _ in 0..REDRAWS {
+            let token = choose(&masked, sampling, generated, rng);
+            if masked[token as usize] == f32::NEG_INFINITY {
+                break;
+            }
+            if allowed(token) {
+                return Some(token);
+            }
+            masked[token as usize] = f32::NEG_INFINITY;
+        }
+    }
+    let masked: Vec<f32> = logits.iter().enumerate()
+        .map(|(token, &logit)| if logit > f32::NEG_INFINITY && allowed(token as u32) { logit } else { f32::NEG_INFINITY })
+        .collect();
+    masked.iter().any(|&logit| logit > f32::NEG_INFINITY).then(|| choose(&masked, sampling, generated, rng))
+}
+
 /// Accepted draft count and the next token, given the target logits of every row of a
 /// verification (`vocabulary` wide): a greedy match, or exact speculative sampling. A
 /// deterministic draft is a point proposal, accepted with its target probability; after a
@@ -504,6 +545,23 @@ pub fn accept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choose_where_draws_only_allowed_tokens_and_none_when_none_is() {
+        let logits = vec![2.0, 1.0, 0.5, 3.0, -1.0, 2.5];
+        let generated = Generated::new(6);
+        for sampling in [Sampling::GREEDY, Sampling { temperature: 1.0, top_k: 2, ..Sampling::GREEDY },
+                         Sampling { temperature: 0.7, top_p: 0.5, ..Sampling::GREEDY }] {
+            let mut rng = Rng::new(3);
+            for _ in 0..50 {
+                let token = choose_where(&logits, &sampling, &generated, &mut rng, &mut |token| token == 1 || token == 4).unwrap();
+                assert!(token == 1 || token == 4, "{token}");
+            }
+            assert_eq!(choose_where(&logits, &sampling, &generated, &mut rng, &mut |_| false), None);
+        }
+        let mut rng = Rng::new(3);
+        assert_eq!(choose_where(&logits, &Sampling::GREEDY, &generated, &mut rng, &mut |token| token != 3), Some(5));
+    }
 
     fn logits() -> Vec<f32> {
         vec![2.0, 1.0, 0.5, 3.0, -1.0, 2.5]

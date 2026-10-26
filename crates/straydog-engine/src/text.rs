@@ -20,6 +20,8 @@ fn gguf_pre_tokenizer(name: &str) -> Option<serde_json::Value> {
 
 pub struct Text {
     tokenizer: Tokenizer,
+    /// [`Text::token_bytes`], built on first use.
+    bytes: std::sync::OnceLock<std::sync::Arc<crate::constraint::TokenBytes>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +39,7 @@ impl Text {
     /// From the bytes of `tokenizer.json`, already authenticated.
     pub fn new(tokenizer_json: &[u8]) -> Result<Text, TextError> {
         let tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(|exc| TextError(exc.to_string()))?;
-        Ok(Text { tokenizer })
+        Ok(Text { tokenizer, bytes: std::sync::OnceLock::new() })
     }
 
     /// The tokenizer a GGUF describes (`tokenizer.ggml.*`): byte-level BPE over its tokens and
@@ -97,6 +99,32 @@ impl Text {
     /// Ids as text, special tokens included.
     pub fn decode(&self, ids: &[u32]) -> Result<String, TextError> {
         self.tokenizer.decode(ids, false).map_err(|exc| TextError(exc.to_string()))
+    }
+
+    /// Each token id's bytes, and whether it is a control token ([`crate::constraint`]): a
+    /// byte-level BPE token read back through GPT-2's alphabet, an added token as its text.
+    pub fn token_bytes(&self) -> std::sync::Arc<crate::constraint::TokenBytes> {
+        std::sync::Arc::clone(self.bytes.get_or_init(|| std::sync::Arc::new(self.build_token_bytes())))
+    }
+
+    fn build_token_bytes(&self) -> crate::constraint::TokenBytes {
+        let vocabulary = self.tokenizer.get_vocab(true);
+        let size = vocabulary.values().max().map_or(0, |id| *id as usize + 1);
+        let added = self.tokenizer.get_added_tokens_decoder();
+        let decoder = crate::constraint::byte_level_decoder();
+        let (mut bytes, mut special) = (vec![Vec::new(); size], vec![true; size]);
+        for (token, id) in vocabulary {
+            let index = id as usize;
+            if let Some(added) = added.get(&id) {
+                bytes[index] = added.content.as_bytes().to_vec();
+                special[index] = added.special;
+            } else {
+                bytes[index] = token.chars().map(|char| decoder.get(&char).copied()).collect::<Option<Vec<u8>>>()
+                    .unwrap_or_else(|| token.as_bytes().to_vec());
+                special[index] = false;
+            }
+        }
+        crate::constraint::TokenBytes::new(bytes, special)
     }
 
     /// Text for a stream of generated ids, one delta at a time.

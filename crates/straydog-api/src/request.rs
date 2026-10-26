@@ -70,7 +70,7 @@ impl FromStr for ReasoningEffort {
 
 /// Controls the engine does not implement, each with the one value a request may give: the
 /// one that turns it off.
-const NEUTRAL: [(&str, &str); 11] = [
+const NEUTRAL: [(&str, &str); 10] = [
     ("n", "1"),
     ("typical_p", "1"),
     ("frequency_penalty", "0"),
@@ -80,7 +80,6 @@ const NEUTRAL: [(&str, &str); 11] = [
     ("logprobs", "false"),
     ("top_logprobs", "0"),
     ("parallel_tool_calls", "true"),
-    ("response_format", r#"{"type": "text"}"#),
     ("modalities", r#"["text"]"#),
 ];
 
@@ -127,12 +126,50 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         }
         Some(_) => return Err(ApiError::invalid("tools must be a list of tool objects")),
     };
-    // Without tools in the prompt the model cannot call one; with them it might.
-    let tools = match given(payload, "tool_choice").map(Value::as_str) {
-        None | Some(Some("auto")) => tools,
-        Some(Some("none")) => None,
-        Some(_) => return Err(ApiError::invalid("tool_choice supports auto and none")),
+    // Without tools in the prompt the model cannot call one; with them it might, or (required, or
+    // a function named) must.
+    let choice_error = || ApiError::invalid("tool_choice must be auto, none, required or {\"type\": \"function\", \"function\": {\"name\": ...}}");
+    let (tools, forced) = match given(payload, "tool_choice") {
+        None => (tools, None),
+        Some(Value::Str(choice)) => match choice.as_str() {
+            "auto" => (tools, None),
+            "none" => (None, None),
+            "required" if tools.is_some() => (tools, Some(None)),
+            "required" => return Err(ApiError::invalid("tool_choice required needs tools")),
+            _ => return Err(choice_error()),
+        },
+        Some(choice @ Value::Object(_)) => {
+            let name = match (choice.get("type").and_then(Value::as_str), choice.get("function").and_then(|function| function.get("name"))) {
+                (Some("function"), Some(Value::Str(name))) => name.clone(),
+                _ => return Err(choice_error()),
+            };
+            let known = tools.as_ref().is_some_and(|tools| match tools {
+                Value::Array(list) => list.iter().any(|tool| tool.get("function").and_then(|function| function.get("name")) == Some(&Value::Str(name.clone()))),
+                _ => false,
+            });
+            if !known {
+                return Err(ApiError::invalid(format!("tool_choice names {name}, which is not among the tools")));
+            }
+            (tools, Some(Some(name)))
+        }
+        Some(_) => return Err(choice_error()),
     };
+    let json = match given(payload, "response_format") {
+        None => None,
+        Some(format) => match format.get("type").and_then(Value::as_str) {
+            Some("text") => None,
+            Some("json_object") => Some(Value::Bool(true)),
+            Some("json_schema") => {
+                let schema = format.get("json_schema").and_then(|spec| spec.get("schema"))
+                    .ok_or_else(|| ApiError::invalid("response_format json_schema needs json_schema.schema"))?;
+                straydog_engine::constraint::Schema::compile(schema)
+                    .map_err(|error| ApiError::invalid(format!("response_format json_schema: {error}")))?;
+                Some(schema.clone())
+            }
+            _ => return Err(ApiError::invalid("response_format type must be text, json_object or json_schema")),
+        },
+    };
+    let constraint = constraint(config.markup, json, tools.is_some(), forced);
 
     let limit = ["max_completion_tokens", "max_tokens"].into_iter().find_map(|key| Some((key, given(payload, key)?)));
     let max_tokens = match limit {
@@ -261,8 +298,35 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         ("thinking".into(), Value::Bool(thinking)),
         ("reasoning_effort".into(), Value::Str(level.into())),
         ("checkpoint".into(), Value::Bool(checkpoint)),
+        ("constraint".into(), constraint),
     ]);
     Ok((request, Shape { thinking, markup, tools, stops, stream, include_usage }))
+}
+
+/// What the worker holds the answer to ([`straydog_engine::constraint`]), as its request's
+/// `constraint`: a forced tool call's opening (the markup's, with the named function's name), or
+/// the JSON `response_format` asks for (`true`: any object), racing a tool call's opening when
+/// the model may call one. Null: nothing.
+fn constraint(markup: Markup, json: Option<Value>, tools: bool, forced: Option<Option<String>>) -> Value {
+    let call = |name: Option<&str>| {
+        let (open, whitespace) = match markup {
+            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{}", name.map_or(String::new(), |name| format!("{name}\">\n"))), 0),
+            Markup::Qwen => (format!("<tool_call>\n<function={}", name.map_or(String::new(), |name| format!("{name}>\n"))), 4),
+        };
+        Value::Object(vec![("prefix".into(), Value::Str(open)), ("whitespace".into(), Value::Int(whitespace))])
+    };
+    let alternatives = match (forced, json) {
+        (Some(name), _) => vec![call(name.as_deref())],
+        (None, Some(schema)) => {
+            let mut alternatives = vec![Value::Object(vec![("json".into(), schema)])];
+            if tools {
+                alternatives.push(call(None));
+            }
+            alternatives
+        }
+        (None, None) => return Value::Null,
+    };
+    Value::Object(vec![("alternatives".into(), Value::Array(alternatives))])
 }
 
 /// A number the request gives, checked by `valid`.

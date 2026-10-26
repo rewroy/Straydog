@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use clap::Args;
 use serde_json::{json, Value};
 use straydog_engine::chat::ChatTemplate;
+use straydog_engine::constraint::Constraint;
 use straydog_engine::group::{Group, SplitMode};
-use straydog_engine::model::{Model, Settings};
+use straydog_engine::model::{Model, Settings, END_TOKENS};
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
@@ -522,7 +523,9 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let mut first_text: Option<f64> = None;
     let mut decode_error: Option<Failure> = None;
     let cancelled = || cancel.load(Ordering::SeqCst);
-    let result = engine.model.generate(
+    let mut constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(), &END_TOKENS, thinking)
+        .map_err(refused)?;
+    let result = engine.model.generate_constrained(
         &ids, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
         turn, checkpoint,
@@ -539,6 +542,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
                 }
             }
         },
+        constraint.as_mut(),
     );
     result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
     if let Some(failure) = decode_error {

@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use serde_json::{json, Map, Value};
 
+use crate::constraint::{pick, Constraint};
 use crate::drafts::{Ngrams, Policy};
 use crate::experts::Contents;
 use crate::gpu::Backend;
@@ -320,21 +321,22 @@ struct Decoded {
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
 /// each token is fed with the drafts the sequence proposes after it (drafts::Ngrams), in one pass;
 /// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
-/// emitted after it and kept, the rest rewound.
+/// emitted after it and kept, the rest rewound. A `constraint` chooses every token itself (no
+/// drafts).
 #[allow(clippy::too_many_arguments)]
 fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>, vocabulary: usize, end: &[u32], max_new: usize,
-                      sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32))
-                      -> Result<Decoded, String> {
+                      sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
+                      mut constraint: Option<&mut Constraint>) -> Result<Decoded, String> {
     let mut rng = Rng::new(seed);
     let mut generated = Generated::new(vocabulary);
-    let rows = engines.verify_rows();
+    let rows = if constraint.is_some() { 1 } else { engines.verify_rows() };
     let mut ngrams = Ngrams::new();
     if rows > 1 {
         ngrams.extend(history);
     }
     let mut policy = Policy::new(rows);
     let mut done = Decoded::default();
-    let mut next = sampling::choose(&logits, sampling, &generated, &mut rng);
+    let mut next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
     loop {
         if cancelled() || end.contains(&next) {
             break;
@@ -357,7 +359,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             let logits = engines.forward(&[next])?;
             history.push(next);
             (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
-            next = sampling::choose(&logits, sampling, &generated, &mut rng);
+            next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
             continue;
         }
         let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
@@ -409,6 +411,11 @@ impl<E: Engines> Session<E> {
 
     pub fn vocabulary(&self) -> usize {
         self.vocabulary
+    }
+
+    /// The tokens that end a reply.
+    pub fn end_tokens(&self) -> &[u32] {
+        &self.end
     }
 
     /// Tests only: forget the held sequence and every checkpoint (the engines' copies are then
@@ -483,6 +490,14 @@ impl<E: Engines> Session<E> {
     #[allow(clippy::too_many_arguments)]
     pub fn generate(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool,
                     progress: &mut dyn FnMut(usize, usize), emit: &mut dyn FnMut(u32)) -> Result<(), String> {
+        self.generate_constrained(tokens, max_new, sampling, seed, cancelled, progress, emit, None)
+    }
+
+    /// [`Session::generate`] with the reply held to `constraint` ([`crate::constraint`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_constrained(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
+                                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), emit: &mut dyn FnMut(u32),
+                                constraint: Option<&mut Constraint>) -> Result<(), String> {
         let started = Instant::now();
         self.last_metrics = Map::new();
         if tokens.is_empty() || max_new == 0 || tokens.len() + max_new > self.context {
@@ -564,7 +579,7 @@ impl<E: Engines> Session<E> {
                              &mut |token| {
                                  ttft.get_or_insert_with(|| started.elapsed().as_secs_f64());
                                  emit(token);
-                             });
+                             }, constraint);
         let decoded = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -840,7 +855,7 @@ mod tests {
         let mut history = prompt.to_vec();
         let logits = toy.forward(prompt).unwrap();
         let mut out = Vec::new();
-        let decoded = decode(&mut toy, &mut history, logits, 8, end, max_new, sampling, seed, &|| false, &mut |token| out.push(token)).unwrap();
+        let decoded = decode(&mut toy, &mut history, logits, 8, end, max_new, sampling, seed, &|| false, &mut |token| out.push(token), None).unwrap();
         // the engines hold what the session thinks they hold
         assert_eq!(toy.held, history);
         assert_eq!(history.len(), prompt.len() + decoded.emitted - usize::from(decoded.emitted == max_new), "{decoded:?}");
@@ -848,6 +863,32 @@ mod tests {
     }
 
     const PROMPT: [u32; 9] = [1, 2, 3, 4, 5, 1, 2, 3, 6];
+
+    /// Every token a constrained reply takes keeps it a JSON object's prefix (whole once it
+    /// ends), with no drafts though the engines verify them.
+    #[test]
+    fn a_constrained_reply_holds_to_its_json_and_takes_no_drafts() {
+        use std::sync::Arc;
+
+        use crate::constraint::{Alternative, JsonMatcher, Schema, TokenBytes};
+        let pieces = ["<e>", "{", "}", "x", " ", "\"", "a", ":"];
+        let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]));
+        for seed in 1..20 {
+            let mut constraint = Constraint::new(Arc::clone(&tokens), &[0], false, vec![Alternative::json(Schema::any_object())]);
+            let mut toy = Toy { vocabulary: 8, rows: 3, held: Vec::new(), verified_from: None };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let mut out = Vec::new();
+            let sampling = Sampling { temperature: 1.0, ..Sampling::recommended(false) };
+            let done = decode(&mut toy, &mut history, logits, 8, &[0], 120, &sampling, seed, &|| false,
+                              &mut |token| out.push(token), Some(&mut constraint)).unwrap();
+            assert_eq!(done.drafted, 0);
+            let text: String = out.iter().map(|&token| pieces[token as usize]).collect();
+            let mut json = JsonMatcher::new(Arc::new(Schema::any_object()));
+            assert!(json.feed_all(text.as_bytes()), "seed {seed}: {text}");
+            assert!(done.emitted == 120 || json.complete(), "seed {seed}: {text}");
+        }
+    }
 
     #[test]
     fn greedy_drafts_change_nothing_but_the_passes() {

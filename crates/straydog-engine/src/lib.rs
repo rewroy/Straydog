@@ -4,6 +4,7 @@ pub mod alloc;
 pub mod arch;
 pub mod bundle;
 pub mod chat;
+pub mod constraint;
 pub mod digest;
 pub mod drafts;
 pub mod exchange;

@@ -235,7 +235,10 @@ authentication: no worker starts without them.
     `tool_calls`) and tool messages; content as a string or text parts, and for a model that
     reads images (`/props` `modalities.vision`), a user's or a tool's also with image parts:
     `image_url` with a `data:` URL or `image` with a base64 source (the server fetches nothing);
-  - `tools`, `tool_choice` (`auto` or `none`);
+  - `tools`, `tool_choice` (`auto`, `none`, `required`, or a function named);
+  - `response_format`: `text`, `json_object`, or `json_schema` (the structured-outputs subset:
+    `type` and its lists, `properties`, `required`, `additionalProperties`, `items`, `enum`,
+    `const`, `anyOf`/`oneOf`, `$ref` into `$defs`; other keywords accepted, not enforced);
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
   - `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and
@@ -254,8 +257,15 @@ authentication: no worker starts without them.
   stays exact: a draft is accepted with its probability under the same cut and penalty.
   A pass drafts while the product of the drafts' probabilities under the drafter stays
   at 0.6 or more, up to `--draft-max`.
+- Constrained decoding (`crates/straydog-engine/src/constraint.rs`): after the reasoning
+  (`</think>`), a JSON `response_format` holds the answer to a JSON value the schema allows
+  (racing a tool call's opening when tools may be called), and `tool_choice` `required` or a
+  named function makes the answer start with the markup's tool-call opening (the function's
+  name too), free after it. Each token is drawn from the model's distribution and drawn again
+  without a refused one (masked after 32), so allowed tokens keep their relative
+  probabilities; a constrained reply takes no MTP or n-gram drafts.
 - Sampling controls the engine does not implement (`n`, `typical_p`, frequency and
-  repetition penalties, `logprobs`, `logit_bias`, other `response_format`s, ...) are
+  repetition penalties, `logprobs`, `logit_bias`, ...) are
   accepted only at their neutral value; anything else is a 400, never ignored.
 - Extension (optional `straydog` object in the request): `checkpoint` set to false
   marks a one-off request (a summary, a title) that saves no conversation checkpoint.
