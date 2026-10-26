@@ -334,14 +334,15 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let largest = range.clone().map(|layer| expert_bytes[layer] / hp.experts as u64).max().unwrap_or(1).max(1);
         (largest / devices.len() as u64).next_multiple_of(256) * devices.len() as u64
     };
-    // The sequence state of an engine's layers, on each of its devices: window rings, and each
-    // kv source's compressed rows and keys.
+    // The sequence state of an engine's layers, on each of its devices: window rings (F32), each
+    // kv source's compressed rows and keys (BF16), and a batch's new ones in F32 before rounding.
     let state = |range: &std::ops::Range<usize>| -> u64 {
         let ring = (hp.window + settings.batch.min(ATTENTION_ROWS)) * hp.head_dim * 4 * range.len();
-        let sources: usize = hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer))
+        let sources: Vec<usize> = hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer))
             .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer))
-            .map(|c| (settings.context / c.ratio + 1) * (hp.head_dim + hp.index_dim) * 4).sum();
-        (ring + sources) as u64
+            .map(|c| (settings.context / c.ratio + 1) * (hp.head_dim + hp.index_dim) * 2).collect();
+        let staging = if sources.is_empty() { 0 } else { (settings.batch.min(ATTENTION_ROWS) + 2) * (hp.head_dim + hp.index_dim) * 4 };
+        (ring + sources.iter().sum::<usize>() + staging) as u64
     };
     let total_experts: u64 = expert_bytes.iter().sum();
     // Per engine: the experts its devices hold in VRAM together (each device its rows of every
@@ -475,9 +476,10 @@ mod tests {
         let position = 262_144;
         let groups = [position / 2, position / 2, position / 2, position];
         let full = snapshot_bytes(position, 128, 40, 512, 128, &groups, position);
-        assert!(full > 1 << 30 && full < CHECKPOINT_BYTES, "{full}");
-        let held = [(0, 300 << 20), (1, 300 << 20), (2, 300 << 20)];
-        assert_eq!(evictions(&held, full, CHECKPOINT_BYTES), Some(vec![0, 1]));
+        // (the compressed rows and index keys BF16: 0.85 GB)
+        assert!(full > 768 << 20 && full < 1 << 30, "{full}");
+        let held = [(0, 700 << 20), (1, 300 << 20), (2, 300 << 20)];
+        assert_eq!(evictions(&held, full, CHECKPOINT_BYTES), Some(vec![0]));
         let small = snapshot_bytes(4096, 128, 40, 512, 128, &[2048, 2048, 2048, 4096], 4096);
         assert!(small < 64 << 20, "{small}");
         assert_eq!(evictions(&held, small, CHECKPOINT_BYTES), Some(vec![]));

@@ -725,6 +725,24 @@ int sd_debug_checksum(void* handle, const void* data, uint64_t bytes, uint64_t* 
     SD_OP_END
 }
 
+// out[i] = x[i] as BF16, rounded to the nearest (ties to even; a NaN stays a NaN).
+__global__ void tm_to_bf16_kernel(const float* x, size_t count, uint16_t* out) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x) {
+        const uint32_t bits = __float_as_uint(x[i]);
+        out[i] = (bits & 0x7fffffffu) > 0x7f800000u ? uint16_t((bits >> 16) | 0x40u)
+                                                   : uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+    }
+}
+
+int sd_op_to_bf16(void* handle, const float* x, uint64_t count, void* out) {
+    SD_OP_BEGIN
+    if (!count) return 0;
+    op_span(value, x, checked_floats({count}), "values to round");
+    op_span(value, out, checked_product({count, 2}), "BF16 values");
+    tm_to_bf16_kernel<<<checked_blocks(size_t(count)), 256, 0, value.stream>>>(x, size_t(count), static_cast<uint16_t*>(out));
+    SD_OP_END
+}
+
 __global__ void debug_stamp_kernel(unsigned long long* stamps, size_t slot) {
 #if defined(__HIPCC__)
     stamps[slot] = wall_clock64();
