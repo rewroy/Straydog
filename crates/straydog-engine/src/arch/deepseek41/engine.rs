@@ -61,6 +61,49 @@ type M = *mut c_void;
 /// sound (the next linked pass starts the links over), so a reset engine takes the next request.
 pub const VOID_PASS: &str = "a DeepSeek-V4.1 part link's wait gave up: the pass is void";
 
+/// DS41_PROFILE=host+stamps's points of a decode layer, in the order device 0 reaches them.
+#[derive(Clone, Copy)]
+enum Stamp {
+    LayerStart,
+    /// The Engram (if any) is in; the attention's hyper-connection step is next.
+    AttentionStart,
+    /// The hyper-connection step before the attention is done (device 0, recorded with it).
+    HcDone,
+    /// The attention's output is complete on this device (summed over the part link in decode).
+    AttentionDone,
+    /// The routes are out (the shared expert's gate and up are next).
+    Routed,
+    /// The shared expert's gate and up are done.
+    SharedDone,
+    /// The host has the routes (queued right after its wait).
+    RoutesTaken,
+    /// The routed experts' first launch.
+    ExpertsStart,
+    /// The experts VRAM held: their gate and up are done (decode with misses).
+    HitsDone,
+    /// The missed experts' gate and up are done (they waited for their reads).
+    MissesDone,
+    /// The activations are summed across the devices.
+    ActivationsSummed,
+    LayerEnd,
+}
+
+impl Stamp {
+    const COUNT: usize = 12;
+}
+
+/// DS41_PROFILE=host+stamps's points of a decode pass apart from its layers (after them in the
+/// buffer): the pass's first launch, and the head's end.
+const PASS_STAMPS: usize = 2;
+
+/// The stamps' device buffer (a u64 a point of a layer) and its clock's rate.
+struct Stamps {
+    buffer: Buffer,
+    khz: f64,
+    /// The last decode pass's last layer's end and its head's (0: none), for the gap to the next.
+    last_end: Option<(u64, u64)>,
+}
+
 pub struct Settings {
     /// Longest sequence (positions) the state holds.
     pub context: usize,
@@ -473,9 +516,13 @@ pub struct Engine<'a, T: Tensors> {
     /// The devices' GEMM policy as last set: FP16 operands (see [`Settings::half_gemm`]).
     half_policy: Option<bool>,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
-    /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept).
+    /// (DS41_PROFILE=host: the host's time alone, nothing synchronized and graphs kept;
+    /// DS41_PROFILE=host+stamps: device 0's time of each decode layer's steps as well).
     profile: Option<(std::time::Instant, BTreeMap<&'static str, f64>)>,
     profile_sync: bool,
+    /// DS41_PROFILE=host+stamps: device 0's clock at points of every decode layer
+    /// ([`Stamp`]), turned after each pass into "gpu: …" phases of the profile.
+    stamps: Option<Stamps>,
     /// A pass's host-side rows, kept between passes: the embeddings repeated into the hc copies,
     /// and a layer's Engram rows decoded. New memory every pass (hundreds of MB) waited on the
     /// kernel's direct reclaim whenever the host ran short of free pages, seconds at a time.
@@ -943,7 +990,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             link_dirty: false,
             half_policy: None,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
-            profile_sync: std::env::var_os("DS41_PROFILE").is_none_or(|value| value != "host"),
+            profile_sync: std::env::var("DS41_PROFILE").is_ok_and(|value| !value.starts_with("host")),
+            stamps: None,
             stream_rows: Vec::new(),
             engram_values: Vec::new(),
             images: Vec::new(),
@@ -952,6 +1000,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             primed: None,
             startup,
         };
+        if std::env::var("DS41_PROFILE").is_ok_and(|value| value == "host+stamps") {
+            // (made before any graph is recorded: a recorded stamp keeps its address)
+            let gpu = &mut engine.shards[0].gpu;
+            let buffer = gpu.buffer(((engine.hp.layers.len() * Stamp::COUNT + PASS_STAMPS) * 8) as u64)?;
+            let khz = gpu.debug_clock_khz()? as f64;
+            engine.stamps = Some(Stamps { buffer, khz, last_end: None });
+        }
         let (reading, uploading) = engine.upload_dense()?;
         engine.startup.extend([("dense read".to_string(), reading), ("dense upload after".to_string(), uploading)]);
         let staging = std::time::Instant::now();
@@ -1078,6 +1133,100 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (since, phases) = self.profile.as_mut().unwrap();
         *phases.entry(phase).or_default() += since.elapsed().as_secs_f64();
         *since = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// DS41_PROFILE=host+stamps: queue device 0's clock into the slot of `point` of `layer` (a decode pass's).
+    fn stamp(&mut self, layer: usize, rows: usize, point: Stamp) -> Result<()> {
+        match &self.stamps {
+            Some(stamps) if rows <= VERIFY_ROWS => {
+                let at = stamps.buffer.base();
+                self.shards[0].gpu.debug_stamp(at, (layer * Stamp::COUNT + point as usize) as u64)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// DS41_PROFILE=host+stamps: queue device 0's clock into pass point `point` (< PASS_STAMPS).
+    fn stamp_pass(&mut self, rows: usize, point: usize) -> Result<()> {
+        let slot = (self.hp.layers.len() * Stamp::COUNT + point) as u64;
+        match &self.stamps {
+            Some(stamps) if rows <= VERIFY_ROWS => {
+                let at = stamps.buffer.base();
+                self.shards[0].gpu.debug_stamp(at, slot)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// DS41_PROFILE=host+stamps: after a decode pass, its layers' device time into the profile ("gpu: …").
+    fn read_stamps(&mut self, layers: std::ops::Range<usize>, n: usize) -> Result<()> {
+        let Some(stamps) = self.stamps.as_mut().filter(|_| n <= VERIFY_ROWS) else { return Ok(()) };
+        let mut ticks = vec![0u64; self.hp.layers.len() * Stamp::COUNT + PASS_STAMPS];
+        self.shards[0].gpu.read_buffer(&stamps.buffer, 0, &mut ticks)?;
+        let seconds = |from: u64, to: u64| to.saturating_sub(from) as f64 / (stamps.khz * 1e3);
+        let at = |layer: usize, point: Stamp| ticks[layer * Stamp::COUNT + point as usize];
+        let mut phases: Vec<(&'static str, f64)> = Vec::new();
+        for layer in layers.clone() {
+            let (start, end) = (at(layer, Stamp::LayerStart), at(layer, Stamp::LayerEnd));
+            let routed = at(layer, Stamp::Routed);
+            if routed == 0 {
+                // (a layer whose experts took another path: its time as a whole)
+                phases.push(("gpu: layer without stamps", seconds(start, end)));
+            } else {
+                let (shared, taken, experts) = (at(layer, Stamp::SharedDone), at(layer, Stamp::RoutesTaken), at(layer, Stamp::ExpertsStart));
+                let (attending, hc, attended) = (at(layer, Stamp::AttentionStart), at(layer, Stamp::HcDone), at(layer, Stamp::AttentionDone));
+                phases.push(("gpu: engram", seconds(start, attending)));
+                phases.push(("gpu: attention hc", seconds(attending, hc)));
+                phases.push(("gpu: attention", seconds(hc, attended)));
+                phases.push(("gpu: ffn hc and router", seconds(attended, routed)));
+                phases.push(("gpu: shared gate/up", seconds(routed, shared)));
+                phases.push(("gpu: routes to the host and back", seconds(shared, taken)));
+                phases.push(("gpu: host routing", seconds(taken, experts)));
+                let (hits, misses, summed) = (at(layer, Stamp::HitsDone), at(layer, Stamp::MissesDone), at(layer, Stamp::ActivationsSummed));
+                if hits > 0 && misses > 0 && summed > 0 {
+                    phases.push(("gpu: experts: hits' gate/up", seconds(experts, hits)));
+                    phases.push(("gpu: experts: misses' gate/up", seconds(hits, misses)));
+                    phases.push(("gpu: experts: activations summed", seconds(misses, summed)));
+                    phases.push(("gpu: experts: down", seconds(summed, end)));
+                } else {
+                    phases.push(("gpu: experts: no misses", seconds(experts, end)));
+                }
+            }
+            if layer > layers.start {
+                phases.push(("gpu: between layers", seconds(at(layer - 1, Stamp::LayerEnd), start)));
+            }
+        }
+        let pass = |point: usize| ticks[self.hp.layers.len() * Stamp::COUNT + point];
+        let (pass_start, head_end) = (pass(0), pass(1));
+        if let Some((last_end, last_head)) = stamps.last_end {
+            if last_head > 0 {
+                phases.push(("gpu: boundary: head", seconds(last_end, last_head)));
+                phases.push(("gpu: boundary: host between passes", seconds(last_head, pass_start)));
+            } else {
+                phases.push(("gpu: boundary: head and host between passes", seconds(last_end, pass_start)));
+            }
+            phases.push(("gpu: boundary: pass start to layer", seconds(pass_start, at(layers.start, Stamp::LayerStart))));
+        }
+        let pass_ms = seconds(pass_start, head_end) * 1e3;
+        stamps.last_end = Some((at(layers.end - 1, Stamp::LayerEnd), head_end));
+        // (every pass of a few rows, one line: the sums of its layers' steps, in ms)
+        let mut sums: BTreeMap<&'static str, f64> = BTreeMap::new();
+        for (phase, value) in &phases {
+            *sums.entry(phase).or_default() += value * 1e3;
+        }
+        eprintln!("Straydog stamps: rows {n}, pass {pass_ms:.3} ms; {}",
+                  sums.iter().map(|(phase, ms)| format!("{} {ms:.3}", phase.trim_start_matches("gpu: "))).collect::<Vec<_>>().join(", "));
+        ticks.fill(0);
+        self.shards[0].gpu.write_buffer(&stamps.buffer, 0, &ticks)?;
+        if n > 1 {
+            return Ok(());
+        }
+        if let Some((_, profile)) = self.profile.as_mut() {
+            for (phase, value) in phases {
+                *profile.entry(phase).or_default() += value;
+            }
+        }
         Ok(())
     }
 
@@ -1416,6 +1565,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
         self.select_work(n)?;
+        self.stamp_pass(n, 0)?;
         // A prompt pass's projections take FP16 operands as its FFN's do: in F32, its attention's
         // alone held each device ~6 of a 10.7K-token prompt's 36 s (F32 GEMMs and their weights
         // expanded to F32, every 256 rows).
@@ -1492,7 +1642,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // A handed-over stream comes expanded, with the collapse coefficients of the layer before.
         let mut pre_previous = range.start.checked_sub(1).map(|layer| layer % 2);
         for layer in range.clone() {
+            self.stamp(layer, n, Stamp::LayerStart)?;
             self.layer(layer, tokens, n, pre_previous, layer > range.start)?;
+            self.stamp(layer, n, Stamp::LayerEnd)?;
             pre_previous = Some(layer % 2);
         }
         let last_layer = range.end - 1;
@@ -1537,6 +1689,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     shard.gpu.part_status(work.head.at(outputs * part_rows))?;
                 }
             }
+            self.stamp_pass(n, 1)?;
             let mut failed = false;
             // One read outstanding per device (at most 1 MiB). Queue every device's copy
             // before waiting for any, so the second device's logits move while the first
@@ -1574,6 +1727,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             Some(logits)
         };
         self.verify_slot_checks()?;
+        self.read_stamps(range.clone(), n)?;
         if self.link_pass {
             self.link_dirty = false;
         }
@@ -1791,6 +1945,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // rows that attend). A miss builds them inside the recording. The other path is unchanged.
             let mut avoided = 0u64;
             let devices = self.shards.len();
+            self.stamp(layer, n, Stamp::AttentionStart)?;
+            // (device 0's stamp between the two, recorded with them)
+            let hc_stamp = self.stamps.as_ref().filter(|_| n <= VERIFY_ROWS)
+                .map(|stamps| (stamps.buffer.base(), (layer * Stamp::COUNT + Stamp::HcDone as usize) as u64));
             for index in 0..devices {
                 if record && fixed {
                     if recorded(&mut self.shards[index], key(0), |shard| {
@@ -1798,6 +1956,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                         let attend = shard.work.view(attending);
                         let target = if devices == 1 { attend.out.base() } else { attend.parts[0].base() };
                         hc_attention(shard, &work, &hp, layer, rows as usize, expand, pre_previous, link)?;
+                        if let Some((at, slot)) = hc_stamp.filter(|_| index == 0) {
+                            shard.gpu.debug_stamp(at, slot)?;
+                        }
                         attention_ops(shard, &work, &hp, &attention, target, link)
                     })? {
                         avoided += 2;
@@ -1810,6 +1971,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.views.replay(avoided);
             if !(record && fixed) {
                 self.mark("hyper-connections")?;
+                self.stamp(layer, n, Stamp::HcDone)?;
                 for index in 0..self.shards.len() {
                     let (work, target) = (self.shards[index].work.view(first), self.target(&self.shards[index].work.view(attending), 0));
                     attention_ops(&mut self.shards[index], &work, &hp, &attention, target, link)?;
@@ -1827,6 +1989,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             if !link {
                 self.sum_parts(0, attending, attended)?;
             }
+            self.stamp(layer, n, Stamp::AttentionDone)?;
             self.mark("attention")?;
             // (the flag is lowered before the router is queued: it may run at once)
             let publish = self.publishes(layer, n, predict);
@@ -2052,6 +2215,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // the shared expert's row goes first, and the routes' gate and up complete the sum. (With
         // more waves, the shared row's values wait unraised in the inbox slot the next sum fills.)
         let link = self.link_pass;
+        self.stamp(layer, rows, Stamp::Routed)?;
         for shard in &mut self.shards {
             let work = shard.work.view(first);
             let shared = shard.shared[&layer];
@@ -2061,8 +2225,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               work.products[0].at(routed_rows * ff as usize), work.parts[1].base(), 0, Some(split))?;
         }
         self.mark("shared expert")?;
+        self.stamp(layer, rows, Stamp::SharedDone)?;
         let mut routes = vec![0i32; read];
         self.take_routes(published, &mut routes)?;
+        self.stamp(layer, rows, Stamp::RoutesTaken)?;
         self.mark("route readback")?;
         let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
         let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
@@ -2105,6 +2271,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 routes.iter().map(|&expert| wave.binary_search(&(expert as usize)).map_or(0, |at| slots[at].base() as u64)).collect()
             };
             let linked = link && waves.len() == 1;
+            if index == 0 {
+                self.stamp(layer, rows, Stamp::ExpertsStart)?;
+            }
             for (shard, slots) in self.shards.iter_mut().zip(&acquired) {
                 let work = shard.work.view(first);
                 let split = if linked { shard.rows.sending_product(ACTIVATIONS, 0, false) } else { shard.rows.split(1) };
@@ -2172,6 +2341,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             routes.iter().map(|&expert| list.binary_search(&(expert as usize)).map_or(0, |at| slots[at].base() as u64)).collect()
         };
         let mut held = Vec::with_capacity(self.shards.len());
+        self.stamp(layer, rows, Stamp::ExpertsStart)?;
         for shard in &mut self.shards {
             let slots = shard.experts.acquire(&mut shard.gpu, layer, hits)?;
             check_slots(shard, layer, hits, &slots, expert_bytes, false)?;
@@ -2182,6 +2352,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                               work.parts[1].base(), 0, Some(split))?;
             held.push(slots);
         }
+        self.stamp(layer, rows, Stamp::HitsDone)?;
         self.mark("hits' gate/up")?;
         let mut every = Vec::with_capacity(self.shards.len());
         let mut filled = Vec::with_capacity(self.shards.len());
@@ -2204,6 +2375,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             every.push((both, slots[0].bytes));
             filled.push(slots);
         }
+        self.stamp(layer, rows, Stamp::MissesDone)?;
         self.mark("expert fills")?;
         // Every device's share of the activations, the shared expert's too.
         if self.link_pass {
@@ -2217,6 +2389,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.products[0].base() as P).collect();
             ops::sum_devices(&devices, &outs, &parts, (routed_rows + rows) as u64 * ff)?;
         }
+        self.stamp(layer, rows, Stamp::ActivationsSummed)?;
         for (((shard, (both, slot_bytes)), held), filled) in self.shards.iter_mut().zip(&every).zip(&held).zip(&filled) {
             let work = shard.work.view(first);
             let shared = shard.shared[&layer];

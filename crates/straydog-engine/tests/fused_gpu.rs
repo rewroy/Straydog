@@ -583,3 +583,39 @@ fn linears_norm_tail_graph_matches_separate_ops() {
         }
     }
 }
+
+/// DeepSeek-V4.1's routing (384 experts, square-root softplus, a bias, top 6), whose tail runs in
+/// one wave: the picks a host reference makes (the highest biased score, the lowest index on a tie,
+/// none twice) and their scores normalized and scaled.
+#[test]
+fn a_wave_routes_384_experts_as_the_reference_does() {
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let (experts, k, scale) = (384usize, 6usize, 1.5f32);
+    for trial in 0..20 {
+        // (values apart by far more than an ulp, and runs of equal ones: ties)
+        let logits: Vec<f32> = (0..experts).map(|e| if trial % 2 == 0 && e % 7 == 0 { 0.5 } else { (random.next() % 4000) as f32 / 500.0 - 4.0 })
+            .collect();
+        let bias: Vec<f32> = (0..experts).map(|e| if trial % 3 == 0 { 0.0 } else { ((e * 37 + trial) % 11) as f32 / 1000.0 }).collect();
+        let (logits_buffer, bias_buffer) = (upload(&mut gpu, &logits), upload(&mut gpu, &bias));
+        let (ids, weights) = (gpu.buffer(64).unwrap(), gpu.buffer(64).unwrap());
+        gpu.route(logits_buffer.base(), Some(bias_buffer.base()), 1, experts as u64, k as u64, 2, true, scale, ids.base(), weights.base())
+            .unwrap();
+        let mut got_ids = vec![0i32; k];
+        gpu.read_buffer(&ids, 0, &mut got_ids).unwrap();
+        let got_weights: Vec<f32> = read(&mut gpu, &weights, k).into_iter().map(f32::from_bits).collect();
+        let scores: Vec<f32> = logits.iter().map(|&x| if x > 20.0 { x.sqrt() } else { x.exp().ln_1p().sqrt() }).collect();
+        let mut picked: Vec<usize> = Vec::new();
+        for _ in 0..k {
+            let best = (0..experts).filter(|e| !picked.contains(e))
+                .reduce(|best, e| if scores[e] + bias[e] > scores[best] + bias[best] { e } else { best }).unwrap();
+            picked.push(best);
+        }
+        assert_eq!(got_ids, picked.iter().map(|&e| e as i32).collect::<Vec<_>>(), "trial {trial}");
+        let sum: f32 = picked.iter().map(|&e| scores[e]).sum();
+        for (slot, &e) in picked.iter().enumerate() {
+            let want = scores[e] / (sum + 1e-20) * scale;
+            assert!((got_weights[slot] - want).abs() <= 1e-5 * want.abs(), "trial {trial} slot {slot}: {} vs {want}", got_weights[slot]);
+        }
+    }
+}

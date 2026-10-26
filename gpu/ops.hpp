@@ -666,26 +666,56 @@ __device__ void route_row(const float* l, const float* bias, size_t experts, siz
     for (size_t e = threadIdx.x; e < experts; e += blockDim.x) biased[e] = scores[e] + (bias ? bias[e] : 0.0f);
     __syncthreads();
     const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-    for (size_t slot = 0; slot < k; ++slot) {
-        float value = -INFINITY;
-        int32_t index = -1;
-        for (size_t e = threadIdx.x; e < experts; e += blockDim.x) {
-            bool used = false;
-            for (size_t s = 0; s < slot; ++s) used |= picked[s] == int32_t(e);
-            if (!used) route_take(value, index, biased[e], int32_t(e));
+    // Up to 512 experts, the picks by the first wave alone, with no barrier (lane i holds experts
+    // i + 32m): each the highest biased score (the lowest index on a tie) of those left, as the
+    // block's argmax picks it. (Six block-wide picks were most of a DeepSeek router's tail.)
+    constexpr int WAVE_PICKS = 16;
+    if (experts <= 32 * WAVE_PICKS && k <= 64) {
+        if (wave) return;
+        float b[WAVE_PICKS];
+        unsigned left = 0;   // bit m: expert lane + 32m exists and is not picked
+        #pragma unroll
+        for (int m = 0; m < WAVE_PICKS; ++m) {
+            const size_t e = lane + 32 * size_t(m);
+            b[m] = e < experts ? biased[e] : 0.0f;
+            if (e < experts) left |= 1u << m;
         }
-        for (unsigned offset = 16; offset; offset /= 2) {
-            const float other_value = __shfl_xor(value, offset, 32);
-            const int32_t other = __shfl_xor(index, offset, 32);
-            route_take(value, index, other_value, other);
+        for (size_t slot = 0; slot < k; ++slot) {
+            float value = -INFINITY;
+            int32_t index = -1;
+            #pragma unroll
+            for (int m = 0; m < WAVE_PICKS; ++m) if (left >> m & 1u) route_take(value, index, b[m], int32_t(lane + 32 * m));
+            for (unsigned offset = 16; offset; offset /= 2) {
+                const float other_value = __shfl_xor(value, offset, 32);
+                const int32_t other = __shfl_xor(index, offset, 32);
+                route_take(value, index, other_value, other);
+            }
+            #pragma unroll
+            for (int m = 0; m < WAVE_PICKS; ++m) if (index == int32_t(lane + 32 * m)) left &= ~(1u << m);
+            if (!lane) picked[slot] = index;
         }
-        if (lane == 0) { best[wave] = index; best_value[wave] = value; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            for (unsigned w = 1; w < blockDim.x / 32; ++w) route_take(value, index, best_value[w], best[w]);
-            picked[slot] = index;
+    } else {
+        for (size_t slot = 0; slot < k; ++slot) {
+            float value = -INFINITY;
+            int32_t index = -1;
+            for (size_t e = threadIdx.x; e < experts; e += blockDim.x) {
+                bool used = false;
+                for (size_t s = 0; s < slot; ++s) used |= picked[s] == int32_t(e);
+                if (!used) route_take(value, index, biased[e], int32_t(e));
+            }
+            for (unsigned offset = 16; offset; offset /= 2) {
+                const float other_value = __shfl_xor(value, offset, 32);
+                const int32_t other = __shfl_xor(index, offset, 32);
+                route_take(value, index, other_value, other);
+            }
+            if (lane == 0) { best[wave] = index; best_value[wave] = value; }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                for (unsigned w = 1; w < blockDim.x / 32; ++w) route_take(value, index, best_value[w], best[w]);
+                picked[slot] = index;
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
     if (threadIdx.x) return;
     float sum = 0.0f;

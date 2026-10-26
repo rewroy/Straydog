@@ -1112,6 +1112,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_debug_stamp(
+        handle: *mut ::std::os::raw::c_void,
+        stamps: *mut u64,
+        slot: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_debug_clock_khz(
+        handle: *mut ::std::os::raw::c_void,
+        khz: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_link_sums(
         first: *mut ::std::os::raw::c_void,
         second: *mut ::std::os::raw::c_void,
