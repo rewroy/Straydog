@@ -412,7 +412,11 @@ pub(crate) fn refused(message: impl Into<String>) -> Failure {
 }
 
 pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
-    Failure { message: format!("{site}: {}", message.into()), fatal: true }
+    let message = message.into();
+    // A void pass leaves the devices sound: the request fails and the engine resets, so the next
+    // request restores from the checkpoints instead of waiting for a server restart.
+    let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS);
+    Failure { message: format!("{site}: {message}"), fatal }
 }
 
 /// Telemetry must not turn a completed generation into a failed request.
@@ -644,6 +648,15 @@ mod tests {
         assert_eq!(failed["fatal"], true);
         assert!(failed["message"].as_str().unwrap().contains("device fault: an illegal memory access"));
         assert_eq!(engine.lock().unwrap().resets, 1);
+    }
+
+    #[test]
+    fn a_void_pass_is_not_fatal_but_other_engine_failures_are() {
+        let void = straydog_engine::arch::deepseek41::engine::VOID_PASS;
+        let failed = engine_failed(void, "site");
+        assert!(!failed.fatal);
+        assert_eq!(failed.message, format!("site: {void}"));
+        assert!(engine_failed("an illegal memory access was encountered", "site").fatal);
     }
 
     #[test]
