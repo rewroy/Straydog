@@ -303,8 +303,8 @@ fn read_until<'a>(text: &'a str, at: usize, stops: &[&'static str]) -> (usize, &
 
 /// DSML tool calls from `\n\n<｜DSML｜ calls` to the end of the text, and the invokes dropped.
 /// Each invoke the reference's parser reads is a call: a string parameter's value is the text
-/// itself, any other's is JSON (here it must parse). An invoke it would refuse (the model's slip:
-/// a mismatched tag, a value that is not JSON, a name used twice) is dropped and the calls around
+/// itself, any other's is JSON (one that does not parse goes as a string). An invoke it would
+/// refuse (the model's slip: a mismatched tag, a name used twice) is dropped and the calls around
 /// it kept: the reference fails the whole reply, and its well-formed calls then reached the client
 /// as answer text, which ended an agent's run. None when no invoke reads.
 fn parse_dsml(markup: &str) -> Option<(Vec<ToolCall>, usize)> {
@@ -355,10 +355,12 @@ fn parse_invoke(invoke: &str) -> Option<(Option<String>, String, String)> {
             return None;
         }
         names.push(name);
-        let value = if string == "true" {
+        // A non-string value that is not JSON (the model's slip, such as an invalid escape) goes
+        // as the string it is: the call still reaches the client, whose schema check then says
+        // what is wrong, where the reference's parser would refuse the whole reply.
+        let value = if string == "true" || pyjson::parse(value).is_err() {
             pyjson::dumps(&Value::Str(value.to_string()))
         } else {
-            pyjson::parse(value).ok()?;
             value.to_string()
         };
         arguments.push(format!("{}: {value}", pyjson::dumps(&Value::Str(name.to_string()))));
@@ -532,10 +534,12 @@ mod tests {
         // Without tools, or not parsing (a value that is not JSON), the markup stays text.
         let (_, answer, calls) = split_dsml(&[text], false, None);
         assert_eq!((answer.as_str(), calls.len()), (text, 0));
+        // A non-string value that is not JSON goes as the string it is (the client's schema check
+        // then reports it), where the reference refuses the reply.
         let bad = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">oops\
                    </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let (_, answer, calls) = split_dsml(&["Answer.", bad], false, Some(&tools));
-        assert_eq!((answer, calls.len()), (format!("Answer.{bad}"), 0));
+        assert_eq!((answer.as_str(), calls.len(), calls[0].arguments.as_str()), ("Answer.", 1, r#"{"x": "oops"}"#));
         // Only the first </think> ends reasoning; a later one is the answer's text.
         let (thoughts, answer, _) = split_dsml(&["a</think>b</think>c"], true, None);
         assert_eq!((thoughts.as_str(), answer.as_str()), ("a", "b</think>c"));
@@ -558,9 +562,15 @@ mod tests {
                    (1, "read_file", r#"{"limit": 80, "path": "src/a.py"}"#));
         // A slip between two good calls keeps both, numbered in order.
         let good = "<｜DSML｜ invoke name=\"read_file\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">b</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n";
-        let text = format!("\n\n<｜DSML｜ calls>\n{good}<｜DSML｜ invoke name=\"x\">\n<｜DSML｜ parameter name=\"y\" string=\"false\">nope</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n{good}</｜DSML｜ calls>");
+        let text = format!("\n\n<｜DSML｜ calls>\n{good}<｜DSML｜ invoke name=\"x\">\n<｜DSML｜ parameter name=\"y\" string=\"false\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"y\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n{good}</｜DSML｜ calls>");
         let (_, answer, calls) = split_dsml(&[&text], false, Some(&tools));
         assert_eq!((answer.as_str(), calls.len(), calls[1].index), ("", 2, 1));
+        // The slip seen next: an invalid escape in an array argument; the call still comes, its value
+        // a string.
+        let escape = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n<｜DSML｜ parameter name=\"q\" string=\"false\">\
+                      [{\"p\": \"\\]\"}]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (_, answer, calls) = split_dsml(&[escape], false, Some(&tools));
+        assert_eq!((answer.as_str(), calls.len(), calls[0].arguments.as_str()), ("", 1, r#"{"q": "[{\"p\": \"\\]\"}]"}"#));
         // Text after the calls' close still makes the whole block text.
         let trailing = format!("\n\n<｜DSML｜ calls>\n{good}</｜DSML｜ calls>\nmore");
         let (_, answer, calls) = split_dsml(&[&trailing], false, Some(&tools));
