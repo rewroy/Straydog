@@ -79,8 +79,8 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
         for (int g = 0; g < KG; ++g) {
             const unsigned at = t + g * 128, k = at / 8, c0 = (at % 8) * 8;
             const float* key = keys[k];
-            ka[g][0] = key ? reinterpret_cast<const float4*>(key + d0 + c0)[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            ka[g][1] = key ? reinterpret_cast<const float4*>(key + d0 + c0)[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            ka[g][0] = state_float4(key, d0 + c0);
+            ka[g][1] = state_float4(key, d0 + c0 + 4);
         }
     };
     auto store = [&](int buffer) {
@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
         const float* key = index < total ? keys[index] : nullptr;
         #pragma unroll
         for (int j = 0; j < 8; ++j)
-            va[j] = key ? reinterpret_cast<const float4*>(key + d0 + vc0)[j] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            va[j] = state_float4(key, d0 + vc0 + 4 * j);
     };
     auto store = [&](int buffer) {
         #pragma unroll
@@ -282,9 +282,9 @@ __global__ void __launch_bounds__(256) ds_index_scores_wmma_rows(const float* q,
     #pragma unroll
     for (int n = 0; n < 2; ++n) {
         const size_t g = std::min(g0 + wave * 32 + n * 16 + lane % 16, groups - 1);
-        const float4* key = reinterpret_cast<const float4*>(keys + g * DIM);
+        const float* key = state_row(keys, g, DIM);
         #pragma unroll
-        for (int s = 0; s < KS; ++s) b[n][s] = ds_half8(key[(16 * s + 8 * half) / 4], key[(16 * s + 8 * half) / 4 + 1]);
+        for (int s = 0; s < KS; ++s) b[n][s] = ds_half8(state_float4(key, 16 * s + 8 * half), state_float4(key, 16 * s + 8 * half + 4));
     }
     const size_t rotated = DIM - 2 * pairs;
     const size_t last = std::min(rows, r0 + ds_index_rows);

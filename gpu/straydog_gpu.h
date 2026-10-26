@@ -301,6 +301,8 @@ int sd_op_add(void* handle, const float* x, uint64_t count, float* out);
 /* Development: 64 partial sums (each 32-bit word times a weight of its position, wrapping) of the
    bytes at data (a multiple of 4), queued into partials, for telling a range's contents apart. */
 int sd_debug_checksum(void* handle, const void* data, uint64_t bytes, uint64_t* partials);
+/* out = x as BF16 (count values; round to nearest, ties to even). */
+int sd_op_to_bf16(void* handle, const float* x, uint64_t count, void* out);
 /* Development: queue a store of the device's wall clock into stamps[slot] (device memory); the
    clock's rate in kHz (sd_debug_clock_khz) turns stamp differences into time. */
 int sd_debug_stamp(void* handle, uint64_t* stamps, uint64_t slot);

@@ -865,6 +865,37 @@ __global__ void op_scatter_add_kernel(const float* x, const int32_t* rows, size_
 
 // ---- Latent attention over a sliding window and selected compressed rows ----
 
+// DeepSeek-V4.1's compressed rows and index keys are held as BF16: their pointer then carries
+// bit 0 (state_tag), and a reader turns each value into F32 as it loads it (a window row, F32,
+// shares the attention's key table with them). An untagged pointer is F32.
+__host__ __device__ inline const float* state_tag(const void* bf16) {
+    return reinterpret_cast<const float*>(reinterpret_cast<uintptr_t>(bf16) | 1u);
+}
+__host__ __device__ inline bool state_bf16(const void* p) { return reinterpret_cast<uintptr_t>(p) & 1u; }
+__host__ __device__ inline const uint16_t* state_halves(const void* p) {
+    return reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(p) & ~uintptr_t(1));
+}
+__device__ __forceinline__ float state_bf16_value(uint32_t half) { return __uint_as_float(half << 16); }
+// Row `row` of `dim` values from `base`, tagged as base is.
+__device__ __forceinline__ const float* state_row(const float* base, size_t row, size_t dim) {
+    return state_bf16(base) ? state_tag(state_halves(base) + row * dim) : base + row * dim;
+}
+__device__ __forceinline__ float state_value(const float* row, size_t col) {
+    return state_bf16(row) ? state_bf16_value(state_halves(row)[col]) : row[col];
+}
+// Four values from column `col` (a multiple of 4; a BF16 row 8-byte aligned), zeros for no row: an
+// F32 row's in one 16-byte load when aligned.
+__device__ __forceinline__ float4 state_float4(const float* row, size_t col) {
+    if (!row) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (state_bf16(row)) {
+        const uint2 h = *reinterpret_cast<const uint2*>(state_halves(row) + col);
+        return make_float4(state_bf16_value(h.x & 0xffffu), state_bf16_value(h.x >> 16), state_bf16_value(h.y & 0xffffu),
+                           state_bf16_value(h.y >> 16));
+    }
+    const float* at = row + col;
+    if ((reinterpret_cast<uintptr_t>(at) & 15) == 0) return *reinterpret_cast<const float4*>(at);
+    return make_float4(at[0], at[1], at[2], at[3]);
+}
 // One block per (row, head). The keys, which are also the values, are the window rows
 // max(0, p - window + 1) .. p of `raw` (positions[row] = p; position q is row q % raw_rows, a
 // ring) and the compressed rows `selected` lists for the row (-1: none). Softmax with the
@@ -885,12 +916,12 @@ __global__ void op_sparse_attention_kernel(const float* q, const float* raw, siz
     const auto key = [&](size_t index) -> const float* {
         if (index < raw_count) return raw + size_t(first + int64_t(index)) % raw_rows * dim;
         const int32_t at = selected[row * selections + (index - raw_count)];
-        return at < 0 ? nullptr : compressed + size_t(at) * dim;
+        return at < 0 ? nullptr : state_row(compressed, size_t(at), dim);
     };
     for (size_t index = threadIdx.x; index < total; index += blockDim.x) {
         const float* k = key(index);
         float dot = 0.0f;
-        if (k) for (size_t i = 0; i < dim; ++i) dot += qs[i] * k[i];
+        if (k) for (size_t i = 0; i < dim; ++i) dot += qs[i] * state_value(k, i);
         scores[index] = k ? dot * scale : -INFINITY;
     }
     __syncthreads();
@@ -922,7 +953,7 @@ __global__ void op_sparse_attention_kernel(const float* q, const float* raw, siz
         float acc = 0.0f;
         for (size_t index = 0; index < total; ++index) {
             if (scores[index] == 0.0f) continue;
-            acc += scores[index] * key(index)[i];
+            acc += scores[index] * state_value(key(index), i);
         }
         o[i] = acc / denominator;
     }
@@ -944,7 +975,7 @@ __device__ __forceinline__ const float* attention_key(size_t index, size_t raw_c
     if (index < raw_count) return raw + size_t(first + int64_t(index)) % raw_rows * dim;
     if (index >= total) return nullptr;
     const int32_t at = selected[index - raw_count];
-    return at < 0 ? nullptr : compressed + size_t(at) * dim;
+    return at < 0 ? nullptr : state_row(compressed, size_t(at), dim);
 }
 // One row's rope, once: forward, then the inverse from the same angle times -1 (not a negated sine).
 __global__ void op_attention_turns_kernel(const int32_t* positions, const float* frequencies, size_t pairs, double2* forward,
@@ -1010,15 +1041,8 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
         #pragma unroll
         for (int i = 0; i < KV / 4; ++i) {
             const unsigned group = t + unsigned(i) * 256;
-            const float* key = keys[group / 16];
-            const float* addr = key ? key + d0 + (group % 16) * 4 : nullptr;
-            if (addr && (reinterpret_cast<uintptr_t>(addr) & 15) == 0) {
-                const float4 g = *reinterpret_cast<const float4*>(addr);
-                kv[i * 4] = g.x; kv[i * 4 + 1] = g.y; kv[i * 4 + 2] = g.z; kv[i * 4 + 3] = g.w;
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) kv[i * 4 + j] = addr ? addr[j] : 0.0f;
-            }
+            const float4 g = state_float4(keys[group / 16], d0 + (group % 16) * 4);
+            kv[i * 4] = g.x; kv[i * 4 + 1] = g.y; kv[i * 4 + 2] = g.z; kv[i * 4 + 3] = g.w;
         }
     };
     auto store = [&](int buffer) {
@@ -1117,8 +1141,7 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
         for (int i = 0; i < 4; ++i) {
             const unsigned at = t + i * 128;
             const size_t index = k0 + at / 16;
-            const float* key = index < total ? keys[index - begin] : nullptr;
-            v[i] = key ? *reinterpret_cast<const float4*>(key + d0 + 4 * (at % 16)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            v[i] = state_float4(index < total ? keys[index - begin] : nullptr, d0 + 4 * (at % 16));
         }
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -1243,7 +1266,7 @@ __global__ void __launch_bounds__(256) op_index_scores_kernel(const float* q, co
         }
         for (unsigned i = t; i < 32 * 32; i += blockDim.x) {
             const size_t g = g0 + i / 32, col = d0 + i % 32;
-            ks[i / 32][i % 32] = g < limit && col < dim ? keys[g * dim + col] : 0.0f;
+            ks[i / 32][i % 32] = g < limit && col < dim ? state_value(state_row(keys, g, dim), col) : 0.0f;
         }
         __syncthreads();
         const int width = int(std::min<size_t>(32, dim - d0));
@@ -1519,8 +1542,8 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
     for (int h = 0; h < H; ++h) acc[h] = 0.0f;
     const float* row_q = q + row * heads * dim;
     // (a thread past the row's groups reads its last group's key, and stores nothing)
-    const float* key = keys + std::min(g, groups - 1) * dim;
-    const bool wide = dim % 4 == 0 && reinterpret_cast<uintptr_t>(keys) % 16 == 0;
+    const float* key = state_row(keys, std::min(g, groups - 1), dim);
+    const bool wide = dim % 4 == 0 && (state_bf16(keys) || reinterpret_cast<uintptr_t>(keys) % 16 == 0);
     for (size_t d0 = 0; d0 < dim; d0 += 32) {
         __syncthreads();
         for (unsigned i = t; i < H * 32; i += blockDim.x) {
@@ -1542,12 +1565,12 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
         if (wide && width == 32) {
             #pragma unroll
             for (int c = 0; c < 32; c += 4) {
-                const float4 four = *reinterpret_cast<const float4*>(key + d0 + c);
+                const float4 four = state_float4(key, d0 + c);
                 k_[c] = four.x; k_[c + 1] = four.y; k_[c + 2] = four.z; k_[c + 3] = four.w;
             }
         } else {
             #pragma unroll
-            for (int c = 0; c < 32; ++c) k_[c] = c < width ? key[d0 + c] : 0.0f;
+            for (int c = 0; c < 32; ++c) k_[c] = c < width ? state_value(key, d0 + c) : 0.0f;
         }
         // (the columns past a short slice are zero on both sides: each fmaf adds +0 or keeps -0's sign, as
         // an fmaf of zeros does; the chains stop at the slice's width as before)

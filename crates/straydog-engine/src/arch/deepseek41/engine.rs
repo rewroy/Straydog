@@ -191,8 +191,9 @@ struct Source {
     tail: usize,
 }
 
-/// A device's copy of a kv source layer's compressed rows and index keys, and of the rows of its
-/// incomplete group (at most one: the ratio is 1 or 2).
+/// A device's copy of a kv source layer's compressed rows and index keys (BF16: the readers take
+/// them through tagged pointers, [`state_tagged`]), and of the rows of its incomplete group (at most
+/// one: the ratio is 1 or 2).
 struct SourceRows {
     rows: Buffer,
     keys: Buffer,
@@ -202,6 +203,16 @@ struct SourceRows {
     /// ratio 2), after the row waiting before it: what a rewind leaves in the tail.
     pass_kv: Buffer,
     pass_gate: Buffer,
+}
+
+/// A BF16 state buffer as the kernels take it: its address with bit 0 set (gpu/ops.hpp state_tag).
+fn state_tagged(buffer: &Buffer) -> M {
+    buffer.base().wrapping_byte_add(1)
+}
+
+/// The address `values` BF16 values into a state buffer.
+fn halves_at(buffer: &Buffer, values: usize) -> M {
+    buffer.base().wrapping_byte_add(values * 2)
 }
 
 /// The sequence state before the last pass that can be taken back ([`Engine::rewind`]): its first
@@ -327,6 +338,8 @@ struct Shard {
     scratch: Buffer,
     rings: BTreeMap<usize, Buffer>,
     sources: BTreeMap<usize, SourceRows>,
+    /// A batch's new compressed rows, then their index keys, in F32 (none without kv sources).
+    staging: Option<Buffer>,
     plain: Buffer,
     compressed_rope: Buffer,
     /// The pass's buffers (see [`Engine::select_work`]).
@@ -453,7 +466,8 @@ impl Snapshot {
 /// last `window` of `position` positions, each kv source's compressed rows and index keys (its
 /// `groups`) and its two tail rows, of `dim` and `index_dim` floats, and `history` tokens.
 pub fn snapshot_bytes(position: usize, window: usize, layers: usize, dim: usize, index_dim: usize, groups: &[usize], history: usize) -> u64 {
-    let floats = layers * position.min(window) * dim + groups.iter().map(|&groups| groups * (dim + index_dim) + 2 * dim).sum::<usize>();
+    // (the window rows and tails F32, the compressed rows and index keys BF16)
+    let floats = layers * position.min(window) * dim + groups.iter().map(|&groups| groups * (dim + index_dim) / 2 + 2 * dim).sum::<usize>();
     ((floats + history) * 4) as u64
 }
 
@@ -697,14 +711,15 @@ impl Shard {
         let own = OWN_ROWS.min(r);
         let ring = hp.window + b;
         let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count.max(1) * 4) as u64);
+        let halves = |gpu: &mut Backend, count: usize| gpu.buffer((count.max(1) * 2) as u64);
         let rings = range.clone().map(|layer| Ok((layer, floats(&mut gpu, ring * hp.head_dim)?))).collect::<Result<BTreeMap<_, _>>>()?;
         let mut sources = BTreeMap::new();
         for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
             if let Some(c) = plan.compressed.filter(|c| c.kv_source == layer) {
                 let groups = settings.context / c.ratio + 1;
                 sources.insert(layer, SourceRows {
-                    rows: floats(&mut gpu, groups * hp.head_dim)?,
-                    keys: floats(&mut gpu, groups * hp.index_dim)?,
+                    rows: halves(&mut gpu, groups * hp.head_dim)?,
+                    keys: halves(&mut gpu, groups * hp.index_dim)?,
                     tail_kv: floats(&mut gpu, hp.head_dim)?,
                     tail_gate: floats(&mut gpu, hp.head_dim)?,
                     pass_kv: floats(&mut gpu, (VERIFY_ROWS + 1) * hp.head_dim)?,
@@ -712,6 +727,8 @@ impl Shard {
                 });
             }
         }
+        // A batch's new compressed rows and index keys in F32 before they are rounded into the state
+        let staging = if sources.is_empty() { None } else { Some(floats(&mut gpu, (b + 2) * (hp.head_dim + hp.index_dim))?) };
         let max_groups = settings.context + 1;
         let identity: Vec<f32> = (0..r).flat_map(|_| (0..hc).map(|j| f32::from(u8::from(j == 0)))).collect();
         let all_rows: Vec<i32> = (0..b as i32).collect();
@@ -817,7 +834,7 @@ impl Shard {
             startup: [initialized, buffers, store, gemm_warm[0], gemm_warm[1]],
             checks,
             rows,
-            gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, plain: plain_buffer,
+            gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
             compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, experts, image_bias: None,
         })
     }
@@ -1321,13 +1338,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         for (&layer, buffers) in &shard.sources {
             let source = &self.sources[&layer];
-            let mut rows = vec![0f32; source.groups * dim];
-            let mut keys = vec![0f32; source.groups * index_dim];
+            let mut rows = vec![0u16; source.groups * dim];
+            let mut keys = vec![0u16; source.groups * index_dim];
             let mut tail = vec![0f32; 2 * source.tail.min(1) * dim];
             if source.groups > 0 {
                 shard.gpu.read_buffer(&buffers.rows, 0, &mut rows)?;
                 shard.gpu.read_buffer(&buffers.keys, 0, &mut keys)?;
             }
+            let widen = |halves: Vec<u16>| -> Vec<f32> { halves.into_iter().map(|half| f32::from_bits(u32::from(half) << 16)).collect() };
+            let (rows, keys) = (widen(rows), widen(keys));
             if !tail.is_empty() {
                 shard.gpu.read_buffer(&buffers.tail_kv, 0, &mut tail[..dim])?;
                 shard.gpu.read_buffer(&buffers.tail_gate, 0, &mut tail[dim..])?;
@@ -1374,7 +1393,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         for ((&layer, buffers), (kept_layer, kept)) in shard.sources.iter().zip(&mut snapshot.rows) {
             *kept_layer = layer;
             let groups = self.sources[&layer].groups;
-            for (values, len) in kept.iter_mut().zip([groups * dim, groups * index_dim, dim, dim]) {
+            // (the compressed rows and index keys as they are, BF16 pairs in F32 words; the dims are even)
+            for (values, len) in kept.iter_mut().zip([groups * dim / 2, groups * index_dim / 2, dim, dim]) {
                 values.resize(len, 0.0);
             }
             for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(kept.iter_mut()) {
@@ -2780,12 +2800,12 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
                 if proj.dims[1] != hp.index_heads {
                     return Err(format!("layer {layer}'s indexer projection has {} rows for {} heads", proj.dims[1], hp.index_heads));
                 }
-                shard.gpu.index_select_proj((&proj.buffer, proj.kind, proj.dims[0] as u64), q_work.x.base(), work.index_q.base(), keys.base(),
+                shard.gpu.index_select_proj((&proj.buffer, proj.kind, proj.dims[0] as u64), q_work.x.base(), work.index_q.base(), state_tagged(&keys),
                                             work.index_w.base(), q_work.visible[c.ratio].base(), plan.groups as u64, hp.index_heads as u64,
                                             hp.index_dim as u64, scale, rotation, work.scores.base(), hp.index_top_k as u64, chosen.base())?;
             } else {
                 shard.linear(&name(layer, "indexer.proj"), q_work.x.base(), n, work.index_w.base())?;
-                shard.gpu.index_select(work.index_q.base(), keys.base(), work.index_w.base(), q_work.visible[c.ratio].base(), n as u64,
+                shard.gpu.index_select(work.index_q.base(), state_tagged(&keys), work.index_w.base(), q_work.visible[c.ratio].base(), n as u64,
                                        plan.groups as u64, hp.index_heads as u64, hp.index_dim as u64, scale, rotation, work.scores.base(),
                                        hp.index_top_k as u64, chosen.base())?;
             }
@@ -2799,7 +2819,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     }
     let sinks = shard.dense(&name(layer, "attn_sinks"))?;
     shard.gpu.sparse_attention(work.q.base(), ring.base(), plan.ring_rows, q_work.positions.base(), hp.window as u64,
-                               compressed.map(|(rows, groups, _)| (rows.base() as P, groups as u64)),
+                               compressed.map(|(rows, groups, _)| (state_tagged(&rows) as P, groups as u64)),
                                compressed.map(|(_, _, chosen)| (chosen.base() as P, hp.index_top_k as u64)), sinks.buffer.base(),
                                n as u64, heads as u64, dim as u64, 1.0 / (dim as f32).sqrt(), Some((rope, &freqs)), Some(&scratch),
                                work.attended.base())?;
@@ -2877,11 +2897,13 @@ fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize
     let groups = (tail + n) / ratio;
     let left = (tail + n) % ratio;
     if groups > 0 {
-        let target = rows.at(first_group * dim);
+        // (formed in F32, the indexer's keys from the rows before their rope, then both rounded into the state)
+        let staging = shard.staging.ok_or("no staging for a kv source's rows")?;
+        let target = staging.base();
         shard.gpu.compress(work.pool_kv.at(first_row * dim), (ratio > 1).then(|| work.pool_gate.at(first_row * dim) as P),
                            groups as u64, ratio as u64, dim as u64, target)?;
         shard.norm(&name(layer, "attn_compressor_norm"), target, groups, dim, hp.norm_eps)?;
-        let key_target = keys.at(first_group * hp.index_dim);
+        let key_target = staging.at(groups * dim);
         let weight = shard.dense(&name(layer, "indexer.attn_k"))?;
         let scratch = shard.scratch;
         shard.gpu.linear(&weight.buffer, weight.kind, weight.dims[1] as u64, weight.dims[0] as u64, 0, target, 0, groups as u64,
@@ -2892,6 +2914,8 @@ fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize
         shard.gpu.norm_rope(key_target, &key_norm.buffer, groups as u64, hp.index_dim as u64, hp.norm_eps,
                             Some((hp.rope_dims as u64, &work.group_positions, &freqs)), None, key_target, groups as u64)?;
         shard.gpu.rope(target, groups as u64, 1, dim as u64, hp.rope_dims as u64, &work.group_positions, &freqs, false)?;
+        shard.gpu.to_bf16(target, (groups * dim) as u64, halves_at(&rows, first_group * dim))?;
+        shard.gpu.to_bf16(key_target, (groups * hp.index_dim) as u64, halves_at(&keys, first_group * hp.index_dim))?;
     }
     if left > 0 {
         let last = first_row + groups * ratio;

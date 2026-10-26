@@ -3126,6 +3126,12 @@ int sd_attention_turns_arm(void* handle, uint64_t rows) {
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// `values` values of DeepSeek-V4.1's state from `p`: BF16 when tagged (state_tag), else F32.
+static void op_state_span(Device& value, const float* p, size_t values, const char* what) {
+    if (state_bf16(p)) op_span(value, state_halves(p), values * 2, what);
+    else op_span(value, p, values * 4, what);
+}
+
 int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint64_t raw_rows, const int32_t* positions,
                            uint64_t window, const float* compressed, uint64_t compressed_rows, const int32_t* selected,
                            uint64_t selections, const float* sinks, uint64_t rows, uint64_t heads, uint64_t dim,
@@ -3140,7 +3146,7 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
     op_span(value, raw, size_t(raw_rows * dim) * 4, "window rows");
     op_span(value, positions, size_t(rows) * 4, "query positions");
     if (selections) {
-        op_span(value, compressed, size_t(compressed_rows * dim) * 4, "compressed rows");
+        op_state_span(value, compressed, size_t(compressed_rows * dim), "compressed rows");
         op_span(value, selected, size_t(rows * selections) * 4, "selected rows");
     }
     op_span(value, sinks, size_t(heads) * 4, "attention sinks");
@@ -3260,7 +3266,7 @@ int sd_op_index_scores(void* handle, const float* q, const float* keys, const fl
                        uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores) {
     SD_OP_BEGIN
     op_span(value, q, size_t(rows * heads * dim) * 4, "index queries");
-    op_span(value, keys, size_t(groups * dim) * 4, "index keys");
+    op_state_span(value, keys, size_t(groups * dim), "index keys");
     op_span(value, weights, size_t(rows * heads) * 4, "index weights");
     op_span(value, visible, size_t(rows) * 4, "visible counts");
     op_span(value, scores, size_t(rows * groups) * 4, "index scores");
@@ -3298,7 +3304,7 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
         k > (uint64_t(1) << 31) || rope_dims % 2 || rope_dims > dim || rope_dims > 128)
         throw std::runtime_error("invalid Straydog index shape");
     op_span(value, q, checked_floats({rows, heads, dim}), "index queries");
-    op_span(value, keys, checked_floats({groups, dim}), "index keys");
+    op_state_span(value, keys, checked_product({groups, dim}), "index keys");
     op_span(value, weights, checked_floats({rows, heads}), "index weights");
     op_span(value, visible, checked_floats({rows}), "visible counts");
     op_span(value, positions, checked_floats({rows}), "query positions");
@@ -3342,7 +3348,7 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
     op_span(value, proj_weights, checked_product({heads, row_bytes}), "a weight matrix");
     op_span(value, x, checked_floats({proj_cols}), "a linear input");
     op_span(value, q, checked_floats({heads, dim}), "index queries");
-    op_span(value, keys, checked_floats({groups, dim}), "index keys");
+    op_state_span(value, keys, checked_product({groups, dim}), "index keys");
     op_span(value, weights, checked_floats({heads}), "index weights");
     op_span(value, visible, 4, "visible counts");
     op_span(value, positions, 4, "query positions");

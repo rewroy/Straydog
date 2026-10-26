@@ -830,6 +830,12 @@ impl Backend {
         check(unsafe { ffi::sd_debug_checksum(self.handle(), data.cast(), bytes, partials.cast()) })
     }
 
+    /// out = `count` values of `x` as BF16 (round to nearest, ties to even).
+    pub fn to_bf16(&mut self, x: P, count: u64, out: M) -> Result<()> {
+        // SAFETY: a live handle; the library checks both ranges against its allocations.
+        check(unsafe { ffi::sd_op_to_bf16(self.handle(), x.cast(), count, out.cast()) })
+    }
+
     /// Development: queue a store of the device's wall clock into `stamps[slot]` (u64s).
     pub fn debug_stamp(&mut self, stamps: M, slot: u64) -> Result<()> {
         // SAFETY: a live handle; the library checks the slot against its allocations.

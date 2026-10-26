@@ -1112,6 +1112,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_to_bf16(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        count: u64,
+        out: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_debug_stamp(
         handle: *mut ::std::os::raw::c_void,
         stamps: *mut u64,
