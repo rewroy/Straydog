@@ -308,12 +308,20 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
 /// the JSON `response_format` asks for (`true`: any object), racing a tool call's opening when
 /// the model may call one. Null: nothing.
 fn constraint(markup: Markup, json: Option<Value>, tools: bool, forced: Option<Option<String>>) -> Value {
+    // A named function is called once: its invoke's close, then the block's, then the end.
     let call = |name: Option<&str>| {
-        let (open, whitespace) = match markup {
-            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{}", name.map_or(String::new(), |name| format!("{name}\">\n"))), 0),
-            Markup::Qwen => (format!("<tool_call>\n<function={}", name.map_or(String::new(), |name| format!("{name}>\n"))), 4),
+        let (open, whitespace, until, close) = match markup {
+            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{}", name.map_or(String::new(), |name| format!("{name}\">\n"))),
+                             0, "</｜DSML｜ invoke>", "\n</｜DSML｜ calls>"),
+            Markup::Qwen => (format!("<tool_call>\n<function={}", name.map_or(String::new(), |name| format!("{name}>\n"))), 4,
+                             "</function>", "\n</tool_call>"),
         };
-        Value::Object(vec![("prefix".into(), Value::Str(open)), ("whitespace".into(), Value::Int(whitespace))])
+        let mut fields = vec![("prefix".into(), Value::Str(open)), ("whitespace".into(), Value::Int(whitespace))];
+        if name.is_some() {
+            fields.push(("until".into(), Value::Str(until.into())));
+            fields.push(("close".into(), Value::Str(close.into())));
+        }
+        Value::Object(fields)
     };
     let alternatives = match (forced, json) {
         (Some(name), _) => vec![call(name.as_deref())],

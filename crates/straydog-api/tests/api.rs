@@ -466,7 +466,7 @@ async fn response_format_and_tool_choice_reach_the_worker_as_a_constraint() {
         (json!({"tools": read_file(), "tool_choice": "required"}), Markup::Dsml,
          format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}", "whitespace": 0}}]}}"#)),
         (json!({"tools": read_file(), "tool_choice": {"type": "function", "function": {"name": "read_file"}}}), Markup::Qwen,
-         r#"{"alternatives": [{"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4}]}"#.to_string()),
+         r#"{"alternatives": [{"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4, "until": "</function>", "close": "\n</tool_call>"}]}"#.to_string()),
     ];
     for (fields, markup, expected) in cases {
         let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
