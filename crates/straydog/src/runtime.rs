@@ -350,12 +350,18 @@ pub fn request_summary(event: &Value) -> String {
                                                   store["pin_seconds"].as_f64().unwrap_or(0.0)),
             _ => String::new(),
         },
-        // (with DS41_PROFILE: the prefill's phases, longest first)
+        // (with DS41_PROFILE: the prefill's phases, longest first; a "… (count)" phase counts
+        // events, so it has no unit and follows the timed ones)
         match &timings["prefill_profile"] {
             Value::Object(phases) if !phases.is_empty() => {
-                let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, seconds)| (phase, seconds.as_f64().unwrap_or(0.0))).collect();
-                phases.sort_by(|a, b| b.1.total_cmp(&a.1));
-                format!("; prefill phases: {}", phases.iter().map(|(phase, seconds)| format!("{phase} {seconds:.3} s")).collect::<Vec<_>>().join(", "))
+                let counter = |phase: &str| phase.ends_with(" (count)");
+                let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, value)| (phase, value.as_f64().unwrap_or(0.0))).collect();
+                phases.sort_by(|a, b| counter(a.0).cmp(&counter(b.0)).then(b.1.total_cmp(&a.1)));
+                format!("; prefill phases: {}", phases.iter().map(|(phase, value)| if counter(phase) {
+                    format!("{phase} {value:.0}")
+                } else {
+                    format!("{phase} {value:.3} s")
+                }).collect::<Vec<_>>().join(", "))
             }
             _ => String::new(),
         },
@@ -1150,6 +1156,16 @@ impl Engine for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A counted prefill phase reads as a count after the timed phases, not as seconds.
+    #[test]
+    fn a_counted_prefill_phase_has_no_unit() {
+        let event = json!({"event": "done", "tokens": [], "timings": {"prefill_profile": {
+            "fills: waves (count)": 1420.0, "shared expert": 0.545, "attention": 0.021}}});
+        let summary = request_summary(&event);
+        assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
+                "{summary}");
+    }
 
     /// A frame split across writes survives a read dropped between its halves (as when a
     /// control message wins the select), and frames after it stay in step.
