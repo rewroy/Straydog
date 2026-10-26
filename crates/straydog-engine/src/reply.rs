@@ -159,6 +159,8 @@ pub struct ToolCallSplitter {
     markup: Option<String>,
     line_start: bool,
     format: Markup,
+    /// Malformed tool calls [`ToolCallSplitter::finish`] dropped (DSML's: see `parse_dsml`).
+    pub dropped: usize,
 }
 
 fn is_string_schema(schema: Option<&Value>) -> bool {
@@ -202,6 +204,7 @@ impl ToolCallSplitter {
             markup: None,
             line_start: true,
             format,
+            dropped: 0,
         }
     }
 
@@ -238,11 +241,14 @@ impl ToolCallSplitter {
         let carry = std::mem::take(&mut self.carry);
         let Some(markup) = self.markup.take() else { return (carry, Vec::new()) };
         let parsed = match self.format {
-            Markup::Qwen => self.parse(&markup),
+            Markup::Qwen => self.parse(&markup).map(|calls| (calls, 0)),
             Markup::Dsml => parse_dsml(&markup),
         };
         match parsed {
-            Some(calls) => (carry, calls),
+            Some((calls, dropped)) => {
+                self.dropped = dropped;
+                (carry, calls)
+            }
             None => (carry + &markup, Vec::new()),
         }
     }
@@ -295,70 +301,85 @@ fn read_until<'a>(text: &'a str, at: usize, stops: &[&'static str]) -> (usize, &
     }
 }
 
-/// DSML tool calls from `\n\n<｜DSML｜ calls` to the end of the text, as the reference's parser reads
-/// them: a string parameter's value is the text itself, any other's is JSON (here it must parse).
-/// None when the markup is not that.
-fn parse_dsml(markup: &str) -> Option<Vec<ToolCall>> {
-    let mut at = markup.strip_prefix(DSML_CALLS_OPEN).map(|_| DSML_CALLS_OPEN.len())?;
-    let mut calls = Vec::new();
-    loop {
-        let (next, between, stop) = read_until(markup, at, &[DSML_INVOKE_OPEN, DSML_CALLS_CLOSE]);
+/// DSML tool calls from `\n\n<｜DSML｜ calls` to the end of the text, and the invokes dropped.
+/// Each invoke the reference's parser reads is a call: a string parameter's value is the text
+/// itself, any other's is JSON (here it must parse). An invoke it would refuse (the model's slip:
+/// a mismatched tag, a value that is not JSON, a name used twice) is dropped and the calls around
+/// it kept: the reference fails the whole reply, and its well-formed calls then reached the client
+/// as answer text, which ended an agent's run. None when no invoke reads.
+fn parse_dsml(markup: &str) -> Option<(Vec<ToolCall>, usize)> {
+    let body = markup.strip_prefix(DSML_CALLS_OPEN)?;
+    let body = body.strip_prefix(">\n")?;
+    // The calls end at their close, after which only whitespace may follow (the end-of-sentence
+    // token is not text); without one (an answer cut short) at the end.
+    let body = match body.find(DSML_CALLS_CLOSE) {
+        Some(close) if python_strip(&body[close + DSML_CALLS_CLOSE.len()..]).is_empty() => &body[..close],
+        Some(_) => return None,
+        None => body,
+    };
+    let starts: Vec<usize> = body.match_indices(DSML_INVOKE_OPEN).map(|(at, _)| at).collect();
+    if starts.first() != Some(&0) {
+        return None;
+    }
+    let (mut calls, mut dropped) = (Vec::new(), 0);
+    for (index, &start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(body.len());
+        match parse_invoke(&body[start + DSML_INVOKE_OPEN.len()..end]) {
+            Some((namespace, name, arguments)) => calls.push(ToolCall {
+                index: calls.len(),
+                id: format!("call_{}", random_hex(24)),
+                name,
+                arguments,
+                namespace,
+            }),
+            None => dropped += 1,
+        }
+    }
+    (!calls.is_empty()).then_some((calls, dropped))
+}
+
+/// One invoke after its `<｜DSML｜ invoke` (up to the next invoke or the calls' close): its
+/// namespace, name and JSON arguments, or None when the reference's parser would refuse it.
+fn parse_invoke(invoke: &str) -> Option<(Option<String>, String, String)> {
+    let (next, header, mut stop) = read_until(invoke, 0, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
+    let mut at = next;
+    let qualified = DSML_NAME.captures(header)?.get(1)?.as_str();
+    let mut arguments: Vec<String> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    while stop == Some(DSML_PARAMETER_OPEN) {
+        let (next, parameter, _) = read_until(invoke, at, &[DSML_PARAMETER_CLOSE]);
+        at = next;
+        let fields = DSML_PARAMETER.captures(parameter)?;
+        let (name, string, value) = (fields.get(1)?.as_str(), &fields[2], fields.get(3)?.as_str());
+        if names.contains(&name) {
+            return None;
+        }
+        names.push(name);
+        let value = if string == "true" {
+            pyjson::dumps(&Value::Str(value.to_string()))
+        } else {
+            pyjson::parse(value).ok()?;
+            value.to_string()
+        };
+        arguments.push(format!("{}: {value}", pyjson::dumps(&Value::Str(name.to_string()))));
+        let (next, between, after) = read_until(invoke, at, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
         if between != ">\n" {
             return None;
         }
-        at = next;
-        match stop {
-            Some(DSML_CALLS_CLOSE) => break,
-            None => return None,
-            _ => {}
-        }
-        let (next, header, mut stop) = read_until(markup, at, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
-        at = next;
-        let qualified = DSML_NAME.captures(header)?.get(1)?.as_str();
-        let mut arguments: Vec<String> = Vec::new();
-        let mut names: Vec<&str> = Vec::new();
-        while stop == Some(DSML_PARAMETER_OPEN) {
-            let (next, parameter, _) = read_until(markup, at, &[DSML_PARAMETER_CLOSE]);
-            at = next;
-            let fields = DSML_PARAMETER.captures(parameter)?;
-            let (name, string, value) = (fields.get(1)?.as_str(), &fields[2], fields.get(3)?.as_str());
-            if names.contains(&name) {
-                return None;
-            }
-            names.push(name);
-            let value = if string == "true" {
-                pyjson::dumps(&Value::Str(value.to_string()))
-            } else {
-                pyjson::parse(value).ok()?;
-                value.to_string()
-            };
-            arguments.push(format!("{}: {value}", pyjson::dumps(&Value::Str(name.to_string()))));
-            let (next, between, after) = read_until(markup, at, &[DSML_PARAMETER_OPEN, DSML_INVOKE_CLOSE]);
-            if between != ">\n" {
-                return None;
-            }
-            (at, stop) = (next, after);
-        }
-        if stop != Some(DSML_INVOKE_CLOSE) {
-            return None;
-        }
-        let (namespace, name) = match qualified.split_once("::") {
-            Some((namespace, name)) => (Some(namespace.to_string()), name),
-            None => (None, qualified),
-        };
-        if name.contains("::") {
-            return None;
-        }
-        calls.push(ToolCall {
-            index: calls.len(),
-            id: format!("call_{}", random_hex(24)),
-            name: name.to_string(),
-            arguments: format!("{{{}}}", arguments.join(", ")),
-            namespace,
-        });
+        (at, stop) = (next, after);
     }
-    // Only whitespace may follow (the end-of-sentence token is not text).
-    python_strip(&markup[at..]).is_empty().then_some(calls)
+    // the invoke's close, then the line it ends
+    if stop != Some(DSML_INVOKE_CLOSE) || invoke[at..] != *">\n" {
+        return None;
+    }
+    let (namespace, name) = match qualified.split_once("::") {
+        Some((namespace, name)) => (Some(namespace.to_string()), name),
+        None => (None, qualified),
+    };
+    if name.contains("::") {
+        return None;
+    }
+    Some((namespace, name.to_string(), format!("{{{}}}", arguments.join(", "))))
 }
 
 /// Undo the newline the template writes on each side of a value.
@@ -518,6 +539,32 @@ mod tests {
         // Only the first </think> ends reasoning; a later one is the answer's text.
         let (thoughts, answer, _) = split_dsml(&["a</think>b</think>c"], true, None);
         assert_eq!((thoughts.as_str(), answer.as_str()), ("a", "b</think>c"));
+    }
+
+    /// A malformed invoke (the model's slip, seen from DeepSeek-V4.1 IQ2_XS in an agent's run) is
+    /// dropped and the well-formed calls around it kept.
+    #[test]
+    fn a_malformed_dsml_invoke_drops_alone() {
+        let tools = pyjson::parse(r#"[{"type": "function", "function": {"name": "read_file", "parameters": {"properties": {"path": {"type": "string"}}}}}]"#).unwrap();
+        let slipped = "Let me read it.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n\
+                       <｜DSML｜ parameter name=\"limit\" string=\"false\">80</｜DSML｜ parameter>\n\
+                       <｜DSML｜ parameter name=\"path\" string=\"true\">src/a.py</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
+                       <｜DSML｜ invoke name=\"note\">placeholder</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let mut splitter = ToolCallSplitter::with_markup(Some(&tools), Markup::Dsml);
+        let answer = splitter.feed(slipped);
+        let (late, calls) = splitter.finish();
+        assert_eq!((answer.as_str(), late.as_str(), splitter.dropped), ("Let me read it.", "", 1));
+        assert_eq!((calls.len(), calls[0].name.as_str(), calls[0].arguments.as_str()),
+                   (1, "read_file", r#"{"limit": 80, "path": "src/a.py"}"#));
+        // A slip between two good calls keeps both, numbered in order.
+        let good = "<｜DSML｜ invoke name=\"read_file\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">b</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n";
+        let text = format!("\n\n<｜DSML｜ calls>\n{good}<｜DSML｜ invoke name=\"x\">\n<｜DSML｜ parameter name=\"y\" string=\"false\">nope</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n{good}</｜DSML｜ calls>");
+        let (_, answer, calls) = split_dsml(&[&text], false, Some(&tools));
+        assert_eq!((answer.as_str(), calls.len(), calls[1].index), ("", 2, 1));
+        // Text after the calls' close still makes the whole block text.
+        let trailing = format!("\n\n<｜DSML｜ calls>\n{good}</｜DSML｜ calls>\nmore");
+        let (_, answer, calls) = split_dsml(&[&trailing], false, Some(&tools));
+        assert_eq!((answer, calls.len()), (trailing.clone(), 0));
     }
 
     #[test]
