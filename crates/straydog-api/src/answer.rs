@@ -98,6 +98,9 @@ impl Reply {
             deltas.push(Delta::Reasoning(thought));
         }
         let (late, calls) = self.tools.finish();
+        if self.tools.dropped > 0 {
+            eprintln!("WARN Straydog dropped {} malformed tool call(s) of a reply and kept {}", self.tools.dropped, calls.len());
+        }
         if !late.is_empty() {
             deltas.push(Delta::Content(late));
         }
