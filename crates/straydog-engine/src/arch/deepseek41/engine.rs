@@ -57,6 +57,10 @@ pub use vision::{encode_image_rows, IMAGE_TOKEN};
 type P = *const c_void;
 type M = *mut c_void;
 
+/// The error of a pass whose cross-device wait gave up. Its results are void but the devices are
+/// sound (the next linked pass starts the links over), so a reset engine takes the next request.
+pub const VOID_PASS: &str = "a DeepSeek-V4.1 part link's wait gave up: the pass is void";
+
 pub struct Settings {
     /// Longest sequence (positions) the state holds.
     pub context: usize,
@@ -1506,7 +1510,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             if self.link_pass {
                 for shard in &mut self.shards {
                     if shard.gpu.part_failed()? {
-                        return Err("a DeepSeek-V4.1 part link's wait gave up: the pass is void".into());
+                        return Err(VOID_PASS.into());
                     }
                 }
             }
@@ -1564,7 +1568,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 failed |= link && rows[outputs * part_rows].to_bits() != 0;
             }
             if failed {
-                return Err("a DeepSeek-V4.1 part link's wait gave up: the pass is void".into());
+                return Err(VOID_PASS.into());
             }
             self.mark("head")?;
             Some(logits)
