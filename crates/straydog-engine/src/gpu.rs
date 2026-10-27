@@ -308,7 +308,7 @@ impl Backend {
     }
 
     /// [`configure_decode`](Self::configure_decode)'s Q8 kernels, and with `half` a decode or verify
-    /// pass's index scores through WMMA (FP16 operands, F32 sums; RDNA4 only).
+    /// pass's index and attention scores through WMMA (FP16 operands, F32 sums; RDNA4 only).
     pub fn decode_options(&self, q8: bool, half: bool) -> Result<()> {
         // SAFETY: a live handle.
         check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8) | c_int::from(half) << 1) }).map(drop)
