@@ -287,6 +287,8 @@ fn main() -> Result<(), String> {
     // rows the attention runs at a time within a pass of up to --chunk tokens
     let batch = option("--batch", 256);
     let context = option("--context", 8192);
+    let (generate_count, runs, forced_width) = (option("--generate", 0), option("--runs", 1), option("--width", usize::MAX));
+    let draft_bench = option("--draft-bench", 0);
     let half_gemm = match args.iter().position(|arg| arg == "--gemm") {
         Some(at) => {
             let mode = args.get(at + 1).ok_or("--gemm needs fp32 or fp16")?.clone();
@@ -296,8 +298,6 @@ fn main() -> Result<(), String> {
         None => false,
     };
     eprintln!("DS prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV", if half_gemm { "FP16 inputs, F32 sums/output" } else { "FP32" });
-    let (generate_count, runs, forced_width) = (option("--generate", 0), option("--runs", 1), option("--width", usize::MAX));
-    let draft_bench = option("--draft-bench", 0);
     let dump_path = args.iter().position(|arg| arg == "--dump-routes").map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);

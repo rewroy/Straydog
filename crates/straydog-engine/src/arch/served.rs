@@ -931,7 +931,7 @@ mod tests {
         let logits = toy.forward(prompt).unwrap();
         let mut out = Vec::new();
         let done = decode(&mut toy, &mut history, logits, 8, end, max_new, &Sampling::GREEDY, 1,
-            &|| false, &mut |token| out.push(token)).unwrap();
+            &|| false, &mut |token| out.push(token), None).unwrap();
         assert_eq!(toy.held, history);
         assert_eq!(history.len(), prompt.len() + done.emitted - usize::from(done.emitted == max_new));
         (toy, out, done)
@@ -1005,7 +1005,7 @@ mod tests {
             let mut history = vec![1];
             let logits = toy.forward(&history).unwrap();
             let error = decode(&mut toy, &mut history, logits, 8, &[], 2, &Sampling::GREEDY, 1,
-                &|| false, &mut |_| {}).unwrap_err();
+                &|| false, &mut |_| {}, None).unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(toy.held, [1]);
             assert_eq!(history, [1]);
