@@ -27,7 +27,7 @@
 //! --generate N instead continues each prompt greedily by N tokens of its own (no reference) and
 //! times it: per prompt the tokens' hash and milliseconds a token. With --dspark each round drafts
 //! ahead and verifies as many of the draft's tokens as the width policy picks
-//! (drafter::Policy, by DSpark's confidences and [`VERIFY_MS`]), keeps the matching ones and the
+//! (drafter::Policy, by DSpark's confidences and the passes' costs), keeps the matching ones and the
 //! target's next, and takes the rest back: the tokens must be those without the drafter. --runs R
 //! goes over the prompts R times (the first warms the expert stores). --width W verifies W of each
 //! draft whatever the policy picks; --draft-slots 0 takes the features but never drafts. Each pass
@@ -45,7 +45,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
-use straydog_engine::arch::deepseek41::drafter::{Drafter, Policy, DRAFT_MS, VERIFY_MS};
+use straydog_engine::arch::deepseek41::drafter::{Drafter, Policy, MAX_SLOTS};
 use straydog_engine::arch::deepseek41::engine::TAP_ROWS;
 use straydog_engine::arch::deepseek41::dspark::Dspark;
 use straydog_engine::arch::deepseek41::Hparams;
@@ -147,7 +147,7 @@ fn dump_routes(text: &mut String, run: usize, prompt: usize, round: usize, posit
 fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, drafter: &mut Option<Drafter>, prompts: &[Vec<u32>],
             settings: &Generate, dump: &mut Option<String>) -> Result<(), String> {
     let (count, vocabulary) = (settings.count, settings.vocabulary);
-    let mut policy = Policy::new(&VERIFY_MS, DRAFT_MS);
+    let mut policy = Policy::default();
     let counted = |engines: &[Engine<'_, files::Files>]| {
         engines.iter().map(Engine::cache_counts).fold(straydog_engine::experts::Counts::default(), |a, b| a + b)
     };
@@ -183,7 +183,7 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
                 // (a width given drafts every round: no pause)
                 if settings.drafts && room > 1 && (settings.width.is_some() || policy.drafting()) {
                     let timed = std::time::Instant::now();
-                    let draft = drafter.draft(&mut engines[0].beside()?, files, next, position, VERIFY_MS.len() - 1)?;
+                    let draft = drafter.draft(&mut engines[0].beside()?, files, next, position, MAX_SLOTS - 1)?;
                     let ms = 1e3 * timed.elapsed().as_secs_f64();
                     policy.drafted(ms);
                     if position >= straydog_engine::arch::deepseek41::drafter::RING {
@@ -196,7 +196,7 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
                     let width = width.min(room - 1).min(draft.tokens.len());
                     drafts = draft.tokens[..width].to_vec();
                     if let Some(text) = dump.as_mut() {
-                        let slots = VERIFY_MS.len() - 1;
+                        let slots = MAX_SLOTS - 1;
                         dump_routes(text, settings.run, index, rounds, position, slots, &drafter.routes(&mut engines[0].beside()?, slots)?);
                     }
                     (drafted, drafting) = (drafted + 1, drafting + ms / 1e3);
@@ -218,6 +218,9 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
             verified = fed.len() > 1;
             let row = |at: usize| argmax(&rows[at * vocabulary..(at + 1) * vocabulary]) as u32;
             let accepted = (0..drafts.len()).take_while(|&at| row(at) == drafts[at]).count();
+            if !drafts.is_empty() {
+                policy.verified(accepted);
+            }
             if accepted + 1 < fed.len() {
                 engines.iter_mut().try_for_each(|engine| engine.rewind(accepted + 1))?;
             }
@@ -392,18 +395,18 @@ fn main() -> Result<(), String> {
         let mut times = Vec::with_capacity(draft_bench);
         for _ in 0..draft_bench {
             let timed = std::time::Instant::now();
-            drafter.draft(&mut engines[0].beside()?, &files, next, position, VERIFY_MS.len() - 1)?;
+            drafter.draft(&mut engines[0].beside()?, &files, next, position, MAX_SLOTS - 1)?;
             times.push(1e3 * timed.elapsed().as_secs_f64());
         }
         let first = times[..2.min(times.len())].to_vec();
         times.sort_by(f64::total_cmp);
         println!("draft bench: {draft_bench} drafts of {} at position {position}: median {:.3} ms, min {:.3} ms, the first two {first:.3?} ms",
-                 VERIFY_MS.len() - 1, times[times.len() / 2], times[0]);
+                 MAX_SLOTS - 1, times[times.len() / 2], times[0]);
         return Ok(());
     }
     if generate_count > 0 {
         let mut settings = Generate { count: generate_count, chunk, vocabulary, show: show_drafts, drafts: !draft_slots.is_empty(),
-                                      width: (forced_width < VERIFY_MS.len()).then_some(forced_width), run: 0 };
+                                      width: (forced_width < MAX_SLOTS).then_some(forced_width), run: 0 };
         for run in 0..runs {
             settings.run = run;
             generate(&mut engines, &files, &mut drafter, &prompts, &settings, &mut dump)?;
