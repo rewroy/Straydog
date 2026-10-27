@@ -466,7 +466,12 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
         // the weights' loads first: issued with x's and the residual's, not after the stream's store
         // (which the compiler cannot tell from fn's memory): one trip to DRAM, not two
         float f[MIX];
-        if (fn) {
+        if (fn && (reinterpret_cast<uintptr_t>(fn) & 1u)) {
+            // BF16 weights (the address's bit 0 set, as state rows: state_bf16): half the bytes
+            const uint16_t* halves = reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(fn) & ~uintptr_t(1));
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) f[m] = __uint_as_float(uint32_t(halves[(m * HC + j) * width + col]) << 16);
+        } else if (fn) {
             #pragma unroll
             for (int m = 0; m < MIX; ++m) f[m] = fn[(m * HC + j) * width + col];
         }

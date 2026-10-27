@@ -2752,7 +2752,9 @@ static int hc_step_op(void* handle, int channel, const float* x, const float* re
         op_span(value, comb_in, size_t(rows * hc * hc) * 4, "combination coefficients");
     }
     if (fn) {
-        op_span(value, fn, mix * size_t(hc * width) * 4, "hyper-connection weights");
+        // (BF16 weights: tagged, as state rows are)
+        if (state_bf16(fn)) op_span(value, state_halves(fn), mix * size_t(hc * width) * 2, "hyper-connection weights");
+        else op_span(value, fn, mix * size_t(hc * width) * 4, "hyper-connection weights");
         op_span(value, base, mix * 4, "hyper-connection base");
         op_span(value, scale, 12, "hyper-connection scale");
         op_span(value, pre, size_t(rows * hc) * 4, "pre coefficients");
