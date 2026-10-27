@@ -1092,7 +1092,9 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
     constexpr int S = 64;
-    __shared__ float qs[2][attention_heads][S + 1], ks[2][attention_keys][S + 1];
+    // (rows of S + 4: 16-byte aligned for the dot's four-column LDS reads)
+    __shared__ __align__(16) float qs[2][attention_heads][S + 4];
+    __shared__ __align__(16) float ks[2][attention_keys][S + 4];
     __shared__ const float* keys[attention_keys];
     __shared__ double turns[64][2];   // the row's rotation per rope pair, filled once for the token
     for (size_t pair = t; pair < pairs; pair += blockDim.x) {
@@ -1107,8 +1109,8 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     const float* row_q = q + row * heads * dim;
     constexpr int QV = attention_heads * S / 256, KV = attention_keys * S / 256;
     float qv[QV], kv[KV];
-    // One thread takes four consecutive columns. A 16-byte load, then four scalar stores into the
-    // S+1 LDS. Rope stays the scalar double path, and so does a row that is not 16-byte aligned.
+    // One thread takes four consecutive columns: a 16-byte load, and a 16-byte store into LDS. Rope
+    // stays the scalar double path, and so does a row that is not 16-byte aligned.
     auto load = [&](size_t d0) {
         const unsigned q_head = t / 16, q_col = (t % 16) * 4;
         const size_t h = head0 + q_head, col = d0 + q_col;
@@ -1140,14 +1142,13 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     };
     auto store = [&](int buffer) {
         const unsigned q_head = t / 16, q_col = (t % 16) * 4;
-        #pragma unroll
-        for (int j = 0; j < QV; ++j) qs[buffer][q_head][q_col + j] = qv[j];
+        static_assert(QV == 4, "a thread's q columns are one float4");
+        *reinterpret_cast<float4*>(&qs[buffer][q_head][q_col]) = make_float4(qv[0], qv[1], qv[2], qv[3]);
         #pragma unroll
         for (int i = 0; i < KV / 4; ++i) {
             const unsigned group = t + unsigned(i) * 256;
             const unsigned key_index = group / 16, key_col = (group % 16) * 4;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) ks[buffer][key_index][key_col + j] = kv[i * 4 + j];
+            *reinterpret_cast<float4*>(&ks[buffer][key_index][key_col]) = make_float4(kv[i * 4], kv[i * 4 + 1], kv[i * 4 + 2], kv[i * 4 + 3]);
         }
     };
     load(0);
@@ -1158,11 +1159,17 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
     for (size_t step = 0; step < steps; ++step) {
         const int buffer = int(step & 1);
         if (step + 1 < steps) load((step + 1) * S);
-        #pragma unroll 8
-        for (int c = 0; c < S; ++c) {
-            const float k = ks[buffer][lane][c];
-            acc[0] = fmaf(qs[buffer][2 * wave][c], k, acc[0]);
-            acc[1] = fmaf(qs[buffer][2 * wave + 1][c], k, acc[1]);
+        // Four columns a read (the key's own, both heads' broadcast): a third of the LDS reads, which
+        // the dot was bound by (~0.8 us a step). The same products, summed in column order.
+        #pragma unroll 4
+        for (int c = 0; c < S; c += 4) {
+            const float4 k = *reinterpret_cast<const float4*>(&ks[buffer][lane][c]);
+            const float4 a = *reinterpret_cast<const float4*>(&qs[buffer][2 * wave][c]);
+            const float4 b = *reinterpret_cast<const float4*>(&qs[buffer][2 * wave + 1][c]);
+            acc[0] = fmaf(a.x, k.x, acc[0]); acc[1] = fmaf(b.x, k.x, acc[1]);
+            acc[0] = fmaf(a.y, k.y, acc[0]); acc[1] = fmaf(b.y, k.y, acc[1]);
+            acc[0] = fmaf(a.z, k.z, acc[0]); acc[1] = fmaf(b.z, k.z, acc[1]);
+            acc[0] = fmaf(a.w, k.w, acc[0]); acc[1] = fmaf(b.w, k.w, acc[1]);
         }
         if (step + 1 < steps) store(buffer ^ 1);
         __syncthreads();
@@ -1218,10 +1225,22 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
     if (t < attention_out_heads) {
         const size_t head = std::min(head0 + t, heads - 1);
         const float2* parts = partial + (row * heads + head) * chunks;
-        float top = sinks[head];
-        for (size_t c = 0; c < chunks; ++c) top = fmaxf(top, parts[c].x);
-        float denominator = expf(sinks[head] - top);
-        for (size_t c = 0; c < chunks; ++c) if (parts[c].y > 0.0f) denominator += parts[c].y * expf(parts[c].x - top);
+        float top = sinks[head], denominator;
+        if (chunks <= 32) {
+            // (every chunk's load issued before the first is used: they were waited for one by one)
+            float2 got[32];
+            #pragma unroll
+            for (int c = 0; c < 32; ++c) if (size_t(c) < chunks) got[c] = parts[c];
+            #pragma unroll
+            for (int c = 0; c < 32; ++c) if (size_t(c) < chunks) top = fmaxf(top, got[c].x);
+            denominator = expf(sinks[head] - top);
+            #pragma unroll
+            for (int c = 0; c < 32; ++c) if (size_t(c) < chunks && got[c].y > 0.0f) denominator += got[c].y * expf(got[c].x - top);
+        } else {
+            for (size_t c = 0; c < chunks; ++c) top = fmaxf(top, parts[c].x);
+            denominator = expf(sinks[head] - top);
+            for (size_t c = 0; c < chunks; ++c) if (parts[c].y > 0.0f) denominator += parts[c].y * expf(parts[c].x - top);
+        }
         tops[t] = top;
         denominators[t] = denominator;
         if (shares > 1 && share == 0 && blockIdx.x == 0 && head0 + t < heads) head_denominators[row * heads + head0 + t] = denominator;
