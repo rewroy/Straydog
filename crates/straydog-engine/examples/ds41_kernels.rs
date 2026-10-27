@@ -3,7 +3,9 @@
 //! each layer range's routed experts (gate and up, then down, six routes), the shared expert,
 //! hc_step, and the router's route. Prints the wall time a launch as a bound.
 //!
-//! cargo run --release --features hip -p straydog-engine --example ds41_kernels [ITERATIONS], under the GPU lock.
+//! cargo run --release --features hip -p straydog-engine --example ds41_kernels [ITERATIONS], under the GPU lock
+//! (DS41_KERNELS_ONLY=TEXT: only the rows whose label holds TEXT, "hc_step" and "route" among them; DS41_KERNELS_DUMP=PATH: each
+//! expert row's last product and output to PATH.LABEL as F32, to compare two builds bit for bit).
 
 use straydog_engine::gpu::Backend;
 use straydog_engine::ops::{Buffer, ExpertSplit};
@@ -74,6 +76,9 @@ fn main() -> Result<(), String> {
     // (as the engine takes them: the Q8 kernels where it has them, DS41_Q8=0 the F32 ones)
     gpu.configure_decode(std::env::var("DS41_Q8").map_or(true, |value| value != "0"))?;
     let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let only = std::env::var("DS41_KERNELS_ONLY").ok();
+    let wanted = |label: &str| only.as_ref().is_none_or(|text| label.contains(text.as_str()));
+    let dump = std::env::var_os("DS41_KERNELS_DUMP");
     let x = upload(&mut gpu, &random.floats(WIDTH, 1.0));
     let weights = upload(&mut gpu, &random.floats(ROUTES, 0.3));
     let product = gpu.buffer((ROUTES * FFN * 4) as u64)?;
@@ -85,6 +90,9 @@ fn main() -> Result<(), String> {
     for (label, gate, down, routes) in [("IQ2_XXS / IQ2_XXS", 16u32, 16u32, ROUTES), ("IQ2_XXS / IQ2_S", 16, 22, ROUTES),
                                         ("IQ2_XXS / IQ2_XS", 16, 17, ROUTES), ("IQ2_XS / IQ2_XS", 17, 17, ROUTES),
                                         ("Q5_K shared", 13, 13, 1)] {
+        if !wanted(label) {
+            continue;
+        }
         let gate_bytes = ffn_rows * row_bytes(gate, WIDTH);
         let down_bytes = hidden_rows * row_bytes(down, FFN);
         let slot = (2 * gate_bytes + down_bytes).next_multiple_of(256);
@@ -114,7 +122,19 @@ fn main() -> Result<(), String> {
         let megabytes = (routes * (2 * gate_bytes + down_bytes)) as f64 / 1e6;
         println!("{label:20} gate+up {:.2} MB, down {:.2} MB a step ({routes} routes): {each:.1} us a step (wall, both stages), {:.0} GB/s",
                  (routes * 2 * gate_bytes) as f64 / 1e6, (routes * down_bytes) as f64 / 1e6, megabytes / each * 1e3);
+        if let Some(path) = &dump {
+            let (mut products, mut outputs) = (vec![0f32; routes * FFN], vec![0f32; WIDTH]);
+            gpu.read_buffer(&product, 0, &mut products)?;
+            gpu.read_buffer(&out, 0, &mut outputs)?;
+            let bytes: Vec<u8> = products.iter().chain(&outputs).flat_map(|value| value.to_le_bytes()).collect();
+            let mut path = std::path::PathBuf::from(path);
+            path.as_mut_os_string().push(format!(".{}", label.replace([' ', '/'], "_")));
+            std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+        }
         gpu.release_buffer(bank)?;
+    }
+    if !wanted("hc_step") && !wanted("route") {
+        return Ok(());
     }
     // hc_step at decode: one row, four streams, the coefficients' weights from a bank
     let (hc, mix) = (4usize, 24usize);
