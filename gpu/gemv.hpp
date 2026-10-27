@@ -125,12 +125,17 @@ template<> struct GemvFormat<42> {
         for (int v = 0; v < V; ++v) r[v] = scale * (sum[v] - total[v]);
     }
 };
-__device__ __forceinline__ void gemv_scale_min(const uint8_t* q, int group, unsigned& scale, unsigned& minimum) {
-    if (group < 4) { scale = q[group] & 63; minimum = q[group + 4] & 63; }
-    else {
-        scale = (q[group + 4] & 15) | ((q[group - 4] >> 6) << 4);
-        minimum = (q[group + 4] >> 4) | ((q[group] >> 6) << 4);
-    }
+// The scales and mins of a Q4_K/Q5_K pair's two groups (the reference's get_scale_min_k4 of groups 2 * pair and 2 * pair + 1; the first
+// in the low byte of each word, the second in the next), from the block's 12 packed bytes as the words y, z, w with a group's 8 bits
+// apart in a field: pairs 0 and 1 hold them in 6 bits of y (scales) and z (mins), pairs 2 and 3 in the nibbles of w with their top two
+// bits in y and z. (An array of the bytes indexed by the pair compiles to chains of compares and selects, some 300 instructions a unit:
+// the Q5_K kernels were bound by them, not by the weights.)
+__device__ __forceinline__ void gemv_pair_scale_min(int pair, uint32_t y, uint32_t z, uint32_t w, uint32_t& scales, uint32_t& mins) {
+    const bool low = pair < 2;
+    const unsigned shift = 16 * (pair & 1);
+    const uint32_t mask = low ? 0x3F3Fu : 0x0F0Fu;
+    scales = (((low ? y : w) >> shift) & mask) | ((((low ? 0u : y) >> shift) >> 2) & 0x3030u);
+    mins = (((low ? z : w >> 4) >> shift) & mask) | ((((low ? 0u : z) >> shift) >> 2) & 0x3030u);
 }
 // Q4_K/Q5_K: one lane owns two 32-value groups that share 32 packed bytes.
 template<int kind> struct GemvK45 {
@@ -145,13 +150,9 @@ template<int kind> struct GemvK45 {
         const uint4 q0 = packed[0], q1 = packed[1];
         uint4 h0{}, h1{};
         if (kind == 13) { h0 = reinterpret_cast<const uint4*>(block + 16)[0]; h1 = reinterpret_cast<const uint4*>(block + 16)[1]; }
-        const uint8_t scales[12] = {
-            uint8_t(header.y), uint8_t(header.y >> 8), uint8_t(header.y >> 16), uint8_t(header.y >> 24),
-            uint8_t(header.z), uint8_t(header.z >> 8), uint8_t(header.z >> 16), uint8_t(header.z >> 24),
-            uint8_t(header.w), uint8_t(header.w >> 8), uint8_t(header.w >> 16), uint8_t(header.w >> 24)};
-        unsigned scale0, min0, scale1, min1;
-        gemv_scale_min(scales, 2 * pair, scale0, min0);
-        gemv_scale_min(scales, 2 * pair + 1, scale1, min1);
+        uint32_t scales, mins;
+        gemv_pair_scale_min(pair, header.y, header.z, header.w, scales, mins);
+        const unsigned scale0 = scales & 255, scale1 = scales >> 8, min0 = mins & 255, min1 = mins >> 8;
         const uint32_t codes[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
         const uint32_t high[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
         float a0[V], a1[V], s0[V], s1[V];
@@ -994,15 +995,8 @@ template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176
         const uint4* packed = reinterpret_cast<const uint4*>(block + 48 + 32 * pair);
         const uint4 q0 = packed[0], q1 = packed[1];
         const uint4 h0 = reinterpret_cast<const uint4*>(block + 16)[0], h1 = reinterpret_cast<const uint4*>(block + 16)[1];
-        // The pair's two groups' scales and mins, gemv_scale_min's of groups 2 * pair and 2 * pair + 1, from the 12 packed bytes
-        // y, z, w with a group's 8 bits apart in a field: pairs 0 and 1 hold them in 6 bits of y (scales) and z (mins), pairs 2
-        // and 3 in the nibbles of w with their top two bits in y and z. (Indexing an array of the bytes by the pair compiles to
-        // chains of selects, some 300 instructions a unit: the kernel was bound by them, not by the weights.)
-        const bool low = pair < 2;
-        const unsigned shift = 16 * (pair & 1);
-        const uint32_t y = header.y, z = header.z, w = header.w, mask = low ? 0x3F3Fu : 0x0F0Fu;
-        const uint32_t scales = (((low ? y : w) >> shift) & mask) | ((((low ? 0u : y) >> shift) >> 2) & 0x3030u);
-        const uint32_t mins = (((low ? z : w >> 4) >> shift) & mask) | ((((low ? 0u : z) >> shift) >> 2) & 0x3030u);
+        uint32_t scales, mins;
+        gemv_pair_scale_min(pair, header.y, header.z, header.w, scales, mins);
         const unsigned scale0 = scales & 255, scale1 = scales >> 8, min0 = mins & 255, min1 = mins >> 8;
         const uint32_t codes[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
         const uint32_t high[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
