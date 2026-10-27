@@ -951,29 +951,32 @@ __global__ void gemv_decode_shared_rdna4(Matrix matrix, unsigned lanes, const fl
 // F32 sum, for a format's mins), as llama.cpp's q8_1 vectors, staged in LDS by every block; a unit's
 // dot is exact in INT32 (v_dot4), then scaled. The F32 kernels spend some four VALU instructions a
 // value decoding and converting.
-__device__ __forceinline__ void gemv_q8_stage(uint32_t* values, float* scales, float* sums, const float* from, size_t groups) {
-    for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
-        float4 v[8];
-        float top = 0.0f, total = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            v[i] = gemv_load4(from + group * 32 + 4 * i);
-            top = fmaxf(top, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
-            total += gemv_sum4(v[i]);
-        }
-        const float inverse = top > 0.0f ? 127.0f / top : 0.0f;
-        uint32_t words[8];
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const auto byte = [&](float x) { return uint32_t(int(rintf(x * inverse)) & 255); };
-            words[i] = byte(v[i].x) | byte(v[i].y) << 8 | byte(v[i].z) << 16 | byte(v[i].w) << 24;
-        }
-        uint4* to = reinterpret_cast<uint4*>(values + group * 8);
-        to[0] = uint4{words[0], words[1], words[2], words[3]};
-        to[1] = uint4{words[4], words[5], words[6], words[7]};
-        scales[group] = top / 127.0f;
-        if (sums) sums[group] = total;
+// One group of 32 values: its INT8 values (8 words) at `values`, its scale at `scale` and, given `sum`, its F32 sum.
+__device__ __forceinline__ void gemv_q8_group(const float* from, uint32_t* values, float* scale, float* sum) {
+    float4 v[8];
+    float top = 0.0f, total = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = gemv_load4(from + 4 * i);
+        top = fmaxf(top, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+        total += gemv_sum4(v[i]);
     }
+    const float inverse = top > 0.0f ? 127.0f / top : 0.0f;
+    uint32_t words[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const auto byte = [&](float x) { return uint32_t(int(rintf(x * inverse)) & 255); };
+        words[i] = byte(v[i].x) | byte(v[i].y) << 8 | byte(v[i].z) << 16 | byte(v[i].w) << 24;
+    }
+    uint4* to = reinterpret_cast<uint4*>(values);
+    to[0] = uint4{words[0], words[1], words[2], words[3]};
+    to[1] = uint4{words[4], words[5], words[6], words[7]};
+    *scale = top / 127.0f;
+    if (sum) *sum = total;
+}
+__device__ __forceinline__ void gemv_q8_stage(uint32_t* values, float* scales, float* sums, const float* from, size_t groups) {
+    for (size_t group = threadIdx.x; group < groups; group += blockDim.x)
+        gemv_q8_group(from + group * 32, values + group * 8, scales + group, sums ? sums + group : nullptr);
 }
 // The staged input of V vectors: vector v's INT8 values at xq + v * stride, its scales at
 // xd + v * stride and its sums at xs + v * stride (stride in 4-byte words).
