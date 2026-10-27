@@ -6,10 +6,10 @@
 //!   own sum, as the kernel does);
 //! - a GEMV of two to four vectors (a verify pass's rows): each vector's result the bits of its own
 //!   one-vector GEMV;
-//! - the IQ2_XXS, IQ2_XS and IQ2_S experts' gate/up (two routes, SwiGLU clamped, times the routes'
+//! - the IQ2_XXS, IQ2_XS, IQ2_S and Q5_K experts' gate/up (two routes, SwiGLU clamped, times the routes'
 //!   weights): the same;
-//! - the IQ2_XXS, IQ2_XS and IQ2_S experts' down (three routes of three tokens' product rows): the
-//!   same, and each token's row the bits of the token fed alone;
+//! - the IQ2_XXS, IQ2_XS, IQ2_S and Q5_K experts' down (three routes of three tokens' product rows):
+//!   the same, and each token's row the bits of the token fed alone;
 //! - with the Q8 kernels off, the F32 kernels' results are the unquantized input's within F32
 //!   rounding, as before.
 //!
@@ -87,13 +87,22 @@ fn decoded(kind: u32, bytes: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Each row's dot with `x` as the kernels take it: the F32 kernels' with the input itself, the Q8 kernels' with the quantized input, and
+/// Each row's dot with `x` as the kernels take it: the F32 kernels' with the input itself, the Q8 kernels' with the quantized input (Q5_K's mins against the input itself), and
 /// the sum of the products' magnitudes.
 fn expected_dots(kind: u32, bytes: &[u8], cols: usize, x: &[f32], q8: bool) -> Vec<(f64, f64)> {
     if !q8 {
         return dots(&decoded(kind, bytes), cols, x);
     }
-    dots(&decoded(kind, bytes), cols, &quantized(x))
+    if kind != 13 {
+        return dots(&decoded(kind, bytes), cols, &quantized(x));
+    }
+    // Q5_K's values d * scale * q - dmin * min, apart: the first part (dmin zeroed) meets the quantized input, the second (d zeroed) the input
+    let zeroed = |at: usize| {
+        let mut copy = bytes.to_vec();
+        for block in copy.chunks_exact_mut(176) { block[at..at + 2].copy_from_slice(&[0, 0]); }
+        decoded(kind, &copy)
+    };
+    dots(&zeroed(2), cols, &quantized(x)).iter().zip(dots(&zeroed(0), cols, x)).map(|(&(a, sa), (b, sb))| (a + b, sa + sb)).collect()
 }
 
 #[test]
@@ -173,7 +182,7 @@ fn q8_expert_gate_up_matches_the_quantized_input_on_the_host() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x5be0_cd19_137e_2179);
     let (hidden, ffn, routes, clamp) = (2048usize, 512usize, 2usize, 10.0f32);
-    for kind in [16u32, 17, 22] {
+    for kind in [16u32, 17, 22, 13] {
         // two experts, each its gate, up and down (down unused: the gate/up stage alone)
         let gate_bytes = random.blocks(kind, ffn * hidden).len();
         let down_bytes = random.blocks(16, hidden * ffn).len();
@@ -227,7 +236,7 @@ fn q8_expert_down_matches_the_quantized_product_on_the_host() {
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (hidden, ffn, routes, tokens, experts) = (1536usize, 768usize, 3usize, 3usize, 4usize);
     // (IQ2_S's down stays on the F32 kernel)
-    for kind in [16u32, 17, 22] {
+    for kind in [16u32, 17, 22, 13] {
         // an expert's slot: gate and up (IQ2_XXS, unused: the down stage alone), then its down matrix
         let gate_bytes = random.blocks(16, ffn * hidden).len();
         let down_bytes = random.blocks(kind, hidden * ffn).len();
