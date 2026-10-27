@@ -198,6 +198,12 @@ impl Hparams {
             if layer >= layers || plan[layer].compressed.map(|c| c.index_source) != Some(layer) || blocks == 0 || block == 0 {
                 return Err("deepseek41 candidate source is not an index source".into());
             }
+            // (its blocks are of its kv source's compressed rows: every later indexer must score the same)
+            let source = plan[layer].compressed;
+            if plan.iter().enumerate().skip(layer + 1).filter_map(|(at, p)| p.compressed.filter(|c| c.index_source == at))
+                .any(|c| Some(c.kv_source) != source.map(|s| s.kv_source) || Some(c.ratio) != source.map(|s| s.ratio)) {
+                return Err("deepseek41 indexers after the candidate source read other compressed rows".into());
+            }
             Some((layer, blocks, block))
         } else {
             None

@@ -128,7 +128,7 @@ fn the_indexer_of_bf16_keys_is_that_of_their_f32_values() {
         let mut run = |keys: *const std::ffi::c_void| -> (Vec<u32>, Vec<i32>) {
             let (scores, out) = (gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
             gpu.index_select(q_b.base(), keys, weights_b.base(), visible_b.base(), rows as u64, groups as u64, heads as u64, dim as u64,
-                             0.01, (rope_dims as u64, &positions_b, &freq_b), scores.base(), k as u64, out.base()).unwrap();
+                             0.01, (rope_dims as u64, &positions_b, &freq_b), scores.base(), k as u64, out.base(), None).unwrap();
             let (mut s, mut o) = (vec![0u32; rows * groups], vec![0i32; rows * k]);
             gpu.read_buffer(&scores, 0, &mut s).unwrap();
             gpu.read_buffer(&out, 0, &mut o).unwrap();

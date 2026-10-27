@@ -14,6 +14,10 @@
 //!   same scores and indices, run twice (its row counters start over);
 //! - sd_op_index_select_proj (one row, the indexer's projection of x in the same launch, BF16 and
 //!   Q8_0 rows) against sd_op_linear and sd_op_index_select: the same weights, scores and indices;
+//! - sd_op_index_candidates and sd_op_index_select(_proj) among them (DeepSeek-V4.1's two-level
+//!   indexer: 2048 blocks of 8 of up to 23001 groups; one row and three, F32 and FP16 (WMMA), and the
+//!   FP16 prompt pass's 32)
+//!   against the reference's rule on the scores of every group: the same blocks and indices;
 //! - sd_op_attention_prepare against sd_op_split, sd_op_rms_norm, sd_op_rope_halves and
 //!   sd_op_scatter (Qwen3.6's attention shape on one of two GPUs: 8 query heads, a KV head of 256,
 //!   64 rotated dimensions): the same bits.
@@ -396,7 +400,7 @@ fn an_index_select_matches_rope_scores_and_top_k() {
         for run in 0..2 {
             let (scores_2, out_2) = (gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
             gpu.index_select(q_2.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64,
-                             scale, (rope_dims as u64, &positions, &frequencies), scores_2.base(), k as u64, out_2.base()).unwrap();
+                             scale, (rope_dims as u64, &positions, &frequencies), scores_2.base(), k as u64, out_2.base(), None).unwrap();
             assert_eq!(read(&mut gpu, &scores_1, rows * groups), read(&mut gpu, &scores_2, rows * groups), "{rows} rows, run {run}: scores");
             assert_eq!(read(&mut gpu, &out_1, rows * k), read(&mut gpu, &out_2, rows * k), "{rows} rows, run {run}: indices");
         }
@@ -436,15 +440,106 @@ fn an_index_select_with_its_projection_matches_the_two_ops() {
         let (weights_1, scores_1, out_1) = fresh(&mut gpu);
         gpu.linear(&matrix, kind, heads as u64, width as u64, 0, x.base(), 0, 1, weights_1.base(), 0, &scratch).unwrap();
         gpu.index_select(q.base(), keys.base(), weights_1.base(), visible.base(), 1, groups as u64, heads as u64, dim as u64, scale,
-                         (rope_dims as u64, &positions, &frequencies), scores_1.base(), k as u64, out_1.base()).unwrap();
+                         (rope_dims as u64, &positions, &frequencies), scores_1.base(), k as u64, out_1.base(), None).unwrap();
         for run in 0..2 {
             let (weights_2, scores_2, out_2) = fresh(&mut gpu);
             gpu.index_select_proj((&matrix, kind, width as u64), x.base(), q.base(), keys.base(), weights_2.base(), visible.base(),
                                   groups as u64, heads as u64, dim as u64, scale, (rope_dims as u64, &positions, &frequencies),
-                                  scores_2.base(), k as u64, out_2.base()).unwrap();
+                                  scores_2.base(), k as u64, out_2.base(), None).unwrap();
             assert_eq!(read(&mut gpu, &weights_1, heads), read(&mut gpu, &weights_2, heads), "kind {kind}, run {run}: weights");
             assert_eq!(read(&mut gpu, &scores_1, groups), read(&mut gpu, &scores_2, groups), "kind {kind}, run {run}: scores");
             assert_eq!(read(&mut gpu, &out_1, k), read(&mut gpu, &out_2, k), "kind {kind}, run {run}: indices");
+        }
+    }
+}
+
+#[test]
+fn the_two_level_indexer_matches_its_reference() {
+    let (heads, dim, rope_dims, k, blocks, block) = (32usize, 128usize, 64usize, 512usize, 2048usize, 8usize);
+    let mut random = Random(0x1f83_d9ab_fb41_bd6b);
+    let floats = |bits: Vec<u32>| bits.into_iter().map(f32::from_bits).collect::<Vec<_>>();
+    // one row, a few (one of them with fewer blocks than candidates: every one kept), F32 and with the
+    // FP16 prompt pass's products (WMMA scores), and that pass's 32 (its scores, then the top k over the
+    // candidates)
+    for (rows, groups, half) in [(1usize, 20000usize, false), (3, 23001, false), (1, 20000, true), (3, 23001, true), (32, 17000, true)] {
+        let mut gpu = Backend::new(0, 1 << 30).unwrap();
+        if half {
+            gpu.configure_gemm(32, true).unwrap();
+        }
+        let frequencies: Vec<f32> = (0..rope_dims / 2).map(|i| 1.6e5f32.powf(-(2.0 * i as f32) / rope_dims as f32)).collect();
+        let frequencies = upload(&mut gpu, &frequencies);
+        let keys = upload(&mut gpu, &random.floats(groups * dim, 1.0));
+        let seen: Vec<i32> = (0..rows).map(|row| if row == 1 { 16000 } else { (groups - 13 * row) as i32 }).collect();
+        let visible = gpu.buffer((rows * 4) as u64).unwrap();
+        gpu.write_buffer(&visible, 0, &seen).unwrap();
+        let positions = gpu.buffer((rows * 4) as u64).unwrap();
+        gpu.write_buffer(&positions, 0, &seen).unwrap();
+        let scale = 1.0 / ((dim as f32).sqrt() * (heads as f32).sqrt());
+        let rope = (rope_dims as u64, &positions, &frequencies);
+        let fresh = |gpu: &mut Backend| (gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
+        // the candidate source: every group, then its blocks
+        let (q, weights) = (upload(&mut gpu, &random.floats(rows * heads * dim, 2.0)), upload(&mut gpu, &random.floats(rows * heads, 1.0)));
+        let (scores, out) = fresh(&mut gpu);
+        gpu.index_select(q.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64, scale,
+                         rope, scores.base(), k as u64, out.base(), None).unwrap();
+        let candidates = gpu.buffer((rows * blocks * 4) as u64).unwrap();
+        let scratch = gpu.buffer((rows * groups.div_ceil(block) * 4) as u64).unwrap();
+        gpu.index_candidates(scores.base(), visible.base(), rows as u64, groups as u64, blocks as u64, block as u64, candidates.base(),
+                             &scratch).unwrap();
+        let source = floats(read(&mut gpu, &scores, rows * groups));
+        let chosen = read(&mut gpu, &candidates, rows * blocks);
+        let mut keep = vec![false; rows * groups];
+        for row in 0..rows {
+            let row_scores = &source[row * groups..(row + 1) * groups];
+            // each block's highest (in top_k_row's order), the newest visible one's +inf
+            let newest = (seen[row] as usize - 1) / block;
+            let best: Vec<f32> = (0..groups.div_ceil(block)).map(|b| if b == newest { f32::INFINITY } else {
+                row_scores[b * block..((b + 1) * block).min(groups)].iter().copied().max_by_key(|&score| top_k_key(score)).unwrap()
+            }).collect();
+            let expected = top_k_reference(&best, blocks);
+            assert_eq!(chosen[row * blocks..(row + 1) * blocks], expected[..], "{rows} rows, row {row}: candidate blocks");
+            for &b in expected.iter().filter(|&&b| b != u32::MAX) {
+                keep[row * groups + b as usize * block..(row * groups + (b as usize + 1) * block).min((row + 1) * groups)].fill(true);
+            }
+        }
+        // a later indexer: every group's scores, and its choice among the candidates against their top k
+        let (q, weights) = (upload(&mut gpu, &random.floats(rows * heads * dim, 2.0)), upload(&mut gpu, &random.floats(rows * heads, 1.0)));
+        let (every, _) = fresh(&mut gpu);
+        gpu.index_select(q.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64, scale,
+                         rope, every.base(), k as u64, out.base(), None).unwrap();
+        let masked: Vec<f32> = floats(read(&mut gpu, &every, rows * groups)).into_iter().zip(&keep)
+            .map(|(score, &kept)| if kept { score } else { f32::NEG_INFINITY }).collect();
+        let within = Some((candidates.base().cast_const(), blocks as u64, block as u64));
+        for run in 0..2 {
+            let (scores, out) = fresh(&mut gpu);
+            gpu.index_select(q.base(), keys.base(), weights.base(), visible.base(), rows as u64, groups as u64, heads as u64, dim as u64, scale,
+                             rope, scores.base(), k as u64, out.base(), within).unwrap();
+            let got = read(&mut gpu, &out, rows * k);
+            for row in 0..rows {
+                assert_eq!(got[row * k..(row + 1) * k], top_k_reference(&masked[row * groups..(row + 1) * groups], k)[..],
+                           "{rows} rows, run {run}, row {row}: indices among the candidates");
+            }
+        }
+        if rows == 1 {
+            // the decode launch: the indexer's projection of x into its weights, then the same choice
+            let width = 5120usize;
+            let x = upload(&mut gpu, &random.floats(width, 2.0));
+            let bf16: Vec<u8> = random.floats(heads * width, 0.05).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+            let matrix = gpu.upload_bytes(&bf16).unwrap();
+            let scratch = gpu.buffer(64 << 20).unwrap();
+            let formed = gpu.buffer((heads * 4) as u64).unwrap();
+            gpu.linear(&matrix, 30, heads as u64, width as u64, 0, x.base(), 0, 1, formed.base(), 0, &scratch).unwrap();
+            gpu.index_select(q.base(), keys.base(), formed.base(), visible.base(), 1, groups as u64, heads as u64, dim as u64, scale, rope,
+                             every.base(), k as u64, out.base(), None).unwrap();
+            let masked: Vec<f32> = floats(read(&mut gpu, &every, groups)).into_iter().zip(&keep)
+                .map(|(score, &kept)| if kept { score } else { f32::NEG_INFINITY }).collect();
+            for run in 0..2 {
+                let (scores, out) = fresh(&mut gpu);
+                let weights = gpu.buffer((heads * 4) as u64).unwrap();
+                gpu.index_select_proj((&matrix, 30, width as u64), x.base(), q.base(), keys.base(), weights.base(), visible.base(), groups as u64,
+                                      heads as u64, dim as u64, scale, rope, scores.base(), k as u64, out.base(), within).unwrap();
+                assert_eq!(read(&mut gpu, &out, k), top_k_reference(&masked, k), "run {run}: the decode launch's indices among the candidates");
+            }
         }
     }
 }

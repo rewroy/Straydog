@@ -45,7 +45,7 @@ fn main() -> Result<(), String> {
         let scale = 1.0 / ((DIM as f32).sqrt() * (HEADS as f32).sqrt());
         let run = |gpu: &mut Backend| gpu.index_select(p(&q), p(&keys), p(&weights), p(&visible), ROWS as u64, groups as u64, HEADS as u64,
                                                            DIM as u64, scale, (ROPE as u64, &positions, &frequencies), scores.base(),
-                                                           TOP as u64, out.base());
+                                                           TOP as u64, out.base(), None);
         run(&mut gpu)?;
         let mut sink = [0i32; 1];
         gpu.read_buffer(&out, 0, &mut sink)?;
