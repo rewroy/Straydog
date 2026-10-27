@@ -761,26 +761,48 @@ impl Drafter {
 }
 
 /// How many of a draft's tokens a round verifies: the most expected tokens per millisecond, by
-/// DSpark's confidences calibrated against teacher-forced match rates ([`CALIBRATION`]), a target
-/// pass's cost by its rows and the draft's. After [`PAUSE_AFTER`] rounds in a row that verify
-/// none it stops drafting for [`PAUSE_ROUNDS`] rounds (the draft's cost is paid either way).
+/// DSpark's confidences calibrated against teacher-forced match rates ([`CALIBRATION`]) and then
+/// against the drafts of this run ([`Policy::verified`]: on a prompt the drafter reads badly its
+/// confidences promise too much), a target pass's cost by its rows ([`PASS_COST`] times the
+/// cost of a one-row pass now, which every pass tells) and the draft's.
+///
+/// Whether to draft at all is a matter of what drafting has paid so far: a draft costs a few
+/// milliseconds whatever the round makes of it, and a round that verifies none, or tokens that cost
+/// as much as decoding them one at a time, saves nothing. The policy keeps a running mean of what
+/// each round that drafted saved against decoding its tokens without (a draft that was not
+/// verified: its cost lost); when that is below nothing it stops drafting for [`PAUSE_ROUNDS`]
+/// rounds, then tries again.
 pub struct Policy {
-    /// A target pass's milliseconds by its rows (1, 2, ...): a first guess, then running means of
-    /// [`Policy::passed`]'s (the drafter's own memory makes every pass dearer than without it).
-    verify_ms: Vec<f64>,
+    /// A one-row pass's milliseconds now: a running mean of the passes seen, each taken to its
+    /// one-row cost by [`PASS_COST`] (what a pass costs depends on how many of the experts it
+    /// reads the stores hold, which changes as a conversation goes on; its shape by rows does not).
+    unit_ms: f64,
     /// A draft's milliseconds (a running mean of [`Policy::drafted`]'s).
     draft_ms: f64,
-    zeros: usize,
+    /// How many of the drafts calibration expects are accepted, over those that were (a running
+    /// ratio, drifting back to 1 while no draft is verified).
+    skill: f64,
+    /// The last round's width and the accepted drafts calibration expected of it.
+    chosen: (usize, f64),
+    /// What a round that drafted saved, in milliseconds (a running mean).
+    saved: f64,
+    /// The last target pass's milliseconds.
+    pass_ms: f64,
     paused: usize,
 }
 
-/// A target pass's milliseconds on two GPUs by its rows, 1 to 4 (T133), and a draft's: where a
-/// [`Policy`] starts before it has seen the passes of the run.
-pub const VERIFY_MS: [f64; 4] = [25.4, 41.4, 57.0, 69.5];
-pub const DRAFT_MS: f64 = 5.0;
+/// A target pass's cost by its rows (1 to 4), in the cost of a pass of one row: verify passes on
+/// two R9700s took 33.0, 40.6 and 58.5 ms over a one-row pass's 20.4 (ds41_quality at 8K context),
+/// 56.8 over 17.8 for four rows served at 262144. The fourth row costs most: the GEMV kernels
+/// take up to four vectors, and a pass of four reads the experts of four tokens.
+const PASS_COST: [f64; MAX_SLOTS] = [1.0, 1.6, 2.2, 3.1];
 
-/// Rounds in a row that verify no draft before a pause, and the rounds a pause skips.
-pub const PAUSE_AFTER: usize = 4;
+/// Where a [`Policy`] starts before it has seen the passes of the run: a one-row pass's
+/// milliseconds and a draft's.
+pub const PASS_MS: f64 = 20.0;
+pub const DRAFT_MS: f64 = 4.2;
+
+/// The rounds a pause skips drafting for.
 pub const PAUSE_ROUNDS: usize = 16;
 
 /// Per slot, the rate at which a draft's token matches the target's greedy one, given that every
@@ -804,20 +826,25 @@ fn calibrated(slot: usize, confidence: f32) -> f64 {
 
 impl Default for Policy {
     fn default() -> Policy {
-        Policy::new(&VERIFY_MS, DRAFT_MS)
+        Policy::new(PASS_MS, DRAFT_MS)
     }
 }
 
 impl Policy {
-    /// With a target pass's milliseconds by its rows and a first guess at a draft's.
-    pub fn new(verify_ms: &[f64], draft_ms: f64) -> Policy {
-        Policy { verify_ms: verify_ms.to_vec(), draft_ms, zeros: 0, paused: 0 }
+    /// With a first guess at a one-row pass's and a draft's milliseconds.
+    pub fn new(pass_ms: f64, draft_ms: f64) -> Policy {
+        Policy { unit_ms: pass_ms, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0 }
     }
 
-    /// Whether this round drafts (not during a pause).
+    /// Whether this round drafts: not during a pause, which begins when drafts have not paid.
     pub fn drafting(&mut self) -> bool {
+        if self.saved < 0.0 && self.paused == 0 {
+            // (the first draft after a pause starts from nothing saved: it must pay or the pause comes back)
+            (self.saved, self.paused) = (0.0, PAUSE_ROUNDS);
+        }
         if self.paused > 0 {
             self.paused -= 1;
+            self.forgive();
             return false;
         }
         true
@@ -829,39 +856,66 @@ impl Policy {
     }
 
     /// A target pass of `rows` rows took `ms` (counted at most twice the mean so far: one pass that
-    /// waited on the drive must not make a width look too dear ever to be tried again).
+    /// waited on the drive must not make a width look too dear ever to be tried again). A pass of
+    /// other rows than the policy plans for is no one's.
     pub fn passed(&mut self, rows: usize, ms: f64) {
-        if let Some(mean) = rows.checked_sub(1).and_then(|at| self.verify_ms.get_mut(at)) {
-            *mean = 0.9 * *mean + 0.1 * ms.min(2.0 * *mean);
+        self.pass_ms = ms;
+        if let Some(&cost) = rows.checked_sub(1).and_then(|at| PASS_COST.get(at)) {
+            self.unit_ms = 0.85 * self.unit_ms + 0.15 * (ms / cost).min(2.0 * self.unit_ms);
         }
     }
 
-    /// A new context: no pause.
+    /// The last round's draft was verified and `accepted` of its tokens matched: the drafter's
+    /// confidences are worth what the drafts of this run say from here on, and the round saved
+    /// what decoding its tokens one at a time would have cost over what it did.
+    pub fn verified(&mut self, accepted: usize) {
+        let (width, expected) = std::mem::take(&mut self.chosen);
+        if width == 0 {
+            return;
+        }
+        if expected > 0.05 {
+            let seen = (accepted as f64 / expected).min(1.5);
+            self.skill += (seen - self.skill) * (0.1 * expected).min(0.25);
+        }
+        self.save((1 + accepted) as f64 * self.unit_ms - self.pass_ms - self.draft_ms);
+    }
+
+    fn save(&mut self, milliseconds: f64) {
+        self.saved = 0.9 * self.saved + 0.1 * milliseconds;
+    }
+
+    /// A round with no verified draft: what was learned of the drafter's confidences fades
+    /// (a prompt where it read badly may be followed by one where it reads well).
+    fn forgive(&mut self) {
+        self.skill += (1.0 - self.skill) * 0.01;
+    }
+
+    /// A new context: no pause, no verdict on the drafter.
     pub fn reset(&mut self) {
-        (self.zeros, self.paused) = (0, 0);
+        (self.paused, self.skill, self.chosen, self.saved) = (0, 1.0, (0, 0.0), 1.0);
     }
 
     /// The draft's tokens to verify (0 to `most`, at most a pass's rows less one): the width with
     /// the most expected tokens (the matched prefix and the target's next) per millisecond.
     pub fn width(&mut self, confidences: &[f32], most: usize) -> usize {
-        let (mut reach, mut expected) = (1.0, 1.0);
-        let mut best = (0, expected / (self.verify_ms[0] + self.draft_ms));
-        let most = most.min(self.verify_ms.len() - 1);
-        for (slot, &confidence) in confidences.iter().enumerate().take(most) {
-            reach *= calibrated(slot, confidence);
+        let (mut reach, mut raw, mut expected, mut expected_raw) = (1.0, 1.0, 1.0, 0.0);
+        let mut best = (0, expected / (self.unit_ms * PASS_COST[0] + self.draft_ms), 0.0);
+        for (slot, &confidence) in confidences.iter().enumerate().take(most.min(PASS_COST.len() - 1)) {
+            let matched = calibrated(slot, confidence);
+            raw *= matched;
+            reach *= (matched * self.skill).min(1.0);
             expected += reach;
-            let rate = expected / (self.verify_ms[slot + 1] + self.draft_ms);
+            expected_raw += raw;
+            let rate = expected / (self.unit_ms * PASS_COST[slot + 1] + self.draft_ms);
             if rate > best.1 {
-                best = (slot + 1, rate);
+                best = (slot + 1, rate, expected_raw);
             }
         }
+        self.chosen = (best.0, best.2);
         if best.0 == 0 {
-            self.zeros += 1;
-            if self.zeros >= PAUSE_AFTER {
-                (self.zeros, self.paused) = (0, PAUSE_ROUNDS);
-            }
-        } else {
-            self.zeros = 0;
+            // (the draft's cost lost)
+            self.forgive();
+            self.save(-self.draft_ms);
         }
         best.0
     }
@@ -962,55 +1016,112 @@ mod tests {
         policy.width(&[confidence; 3], 3)
     }
 
-    /// The most expected tokens a millisecond: a confident draft is verified whole, a hopeless one
-    /// not at all, and rounds that verify none pause the drafting for a while, which a draft that
-    /// is worth it ends.
+    /// The most expected tokens a millisecond: a confident draft is verified (to the width where
+    /// another row costs more than the token it is expected to bring), a hopeless one not at all;
+    /// drafts that save nothing pause the drafting for a while, then one is tried, which pays or
+    /// brings the pause back.
     #[test]
-    fn the_policy_verifies_confident_drafts_and_pauses_after_hopeless_ones() {
+    fn the_policy_verifies_confident_drafts_and_pauses_when_drafts_do_not_pay() {
         let mut policy = Policy::default();
-        assert_eq!(round(&mut policy, 1.0), 3);
-        assert_eq!(policy.width(&[1.0, 1.0, 1.0], 2), 2, "no more than the pass takes");
-        for _ in 0..PAUSE_AFTER - 1 {
-            assert!(policy.drafting());
+        // (a pass of three rows costs 2.2 one-row passes, of four 3.1: the third draft is not worth the fourth row)
+        assert_eq!(round(&mut policy, 1.0), 2);
+        assert_eq!(policy.width(&[1.0, 1.0, 1.0], 1), 1, "no more than the pass takes");
+        policy.reset();
+        // drafts that bring nothing cost their time: three, and the mean saved is below nothing
+        let mut asked = 0;
+        while policy.drafting() {
             assert_eq!(round(&mut policy, 0.1), 0);
+            asked += 1;
+            assert!(asked < 10);
         }
-        // (a round worth it in between starts the count again)
-        assert_eq!(round(&mut policy, 1.0), 3);
-        for _ in 0..PAUSE_AFTER {
-            assert_eq!(round(&mut policy, 0.1), 0);
-        }
-        for _ in 0..PAUSE_ROUNDS {
+        assert_eq!(asked, 3);
+        for _ in 0..PAUSE_ROUNDS - 1 {
             assert!(!policy.drafting());
         }
+        // the draft that ends the pause brings nothing either: the pause is back
         assert!(policy.drafting());
-        // a new context ends a pause
-        for _ in 0..PAUSE_AFTER {
-            round(&mut policy, 0.0);
-        }
+        assert_eq!(round(&mut policy, 0.1), 0);
+        assert!(!policy.drafting());
+        // one that pays (three tokens for a pass of three rows and a draft, a third of a pass less than one at a time) ...
+        policy.reset();
+        assert_eq!(round(&mut policy, 1.0), 2);
+        policy.passed(3, 44.0);
+        policy.verified(2);
+        assert!(policy.drafting() && policy.saved > 1.0);
+        // ... and one verified with nothing accepted costs its pass: the pause comes
+        assert_eq!(round(&mut policy, 1.0), 2);
+        policy.passed(3, 44.0);
+        policy.verified(0);
         assert!(!policy.drafting());
         policy.reset();
         assert!(policy.drafting());
     }
 
-    /// What the policy learns: a draft's cost a running mean; a pass's by its rows, one that waited
-    /// (on the drive) counted at most twice the mean; a pass of other rows than it plans for is
-    /// no one's.
+    /// What the policy learns of the costs: a draft's a running mean; a one-row pass's from every pass
+    /// by its rows, one that waited (on the drive) counted at most twice the mean; a pass of other
+    /// rows than it plans for is no one's.
     #[test]
     fn the_policy_learns_the_costs_it_sees_without_being_misled_by_one_slow_pass() {
-        let mut policy = Policy::new(&[20.0, 30.0], 5.0);
+        let mut policy = Policy::new(20.0, 5.0);
         policy.drafted(10.0);
         assert!((policy.draft_ms - 6.0).abs() < 1e-9);
         policy.passed(2, 1000.0);
-        assert!((policy.verify_ms[1] - (0.9 * 30.0 + 0.1 * 60.0)).abs() < 1e-9);
+        assert!((policy.unit_ms - (0.85 * 20.0 + 0.15 * 40.0)).abs() < 1e-9);
         policy.passed(1, 10.0);
-        assert!((policy.verify_ms[0] - 19.0).abs() < 1e-9);
-        for rows in [0, 3, 9] {
+        let unit = 0.85 * 23.0 + 0.15 * 10.0;
+        assert!((policy.unit_ms - unit).abs() < 1e-9);
+        // (a pass of four rows at 3.1 one-row passes shows the cost it is)
+        policy.passed(4, 3.1 * unit);
+        assert!((policy.unit_ms - unit).abs() < 1e-9);
+        for rows in [0, 5, 9] {
             policy.passed(rows, 1.0);
         }
-        assert_eq!(policy.verify_ms.len(), 2);
-        assert!((policy.verify_ms[1] - 33.0).abs() < 1e-9);
-        // the width is cut to the rows the policy knows
-        assert_eq!(policy.width(&[1.0, 1.0, 1.0], 3), 1);
+        assert!((policy.unit_ms - unit).abs() < 1e-9);
+        // (with passes that cost little beside their extra rows, drafts of the same confidence are verified wider)
+        assert_eq!(policy.width(&[0.8, 0.8, 0.8], 3), 2);
+        assert_eq!(Policy::new(2.0, 6.0).width(&[0.8, 0.8, 0.8], 3), 3);
+    }
+
+    /// Rounds of a drafter whose confidence is 0.9 throughout, `accepted` of a draft's tokens right;
+    /// passes cost what the policy first expects. The policy after them, and each round's width.
+    fn play(rounds: usize, accepted: impl Fn(usize) -> usize) -> (Policy, Vec<usize>) {
+        let mut policy = Policy::default();
+        let mut widths = Vec::new();
+        for _ in 0..rounds {
+            if !policy.drafting() {
+                policy.passed(1, PASS_MS);
+                continue;
+            }
+            let width = policy.width(&[0.9; 3], 3);
+            policy.passed(width + 1, PASS_MS * PASS_COST[width]);
+            if width > 0 {
+                policy.verified(accepted(width));
+            }
+            widths.push(width);
+        }
+        (policy, widths)
+    }
+
+    /// The drafter's confidences are trusted as far as its drafts bear them out: none accepted, and
+    /// drafts are rarer and narrower (a draft that was not worth it costs its time, and the pause);
+    /// all accepted, and the skill is above 1 and every draft is verified as wide as it can be worth.
+    #[test]
+    fn the_policy_trusts_the_confidence_as_far_as_the_drafts_bear_it_out() {
+        let (policy, widths) = play(400, |_| 0);
+        let drafted = widths.iter().filter(|&&width| width > 0).count();
+        assert!(widths[..3].iter().all(|&width| width > 0), "{widths:?}");
+        assert!(drafted < 60 && policy.skill < 0.8, "{drafted} drafted, skill {}", policy.skill);
+        let (policy, widths) = play(400, |width| width);
+        assert!(widths.iter().all(|&width| width == 2), "{widths:?}");
+        assert!(policy.skill > 1.0 && policy.skill <= 1.5 && policy.saved > 5.0, "skill {} saved {}", policy.skill, policy.saved);
+        // half of the tokens right: a draft costs what it saves, and few are made
+        let (policy, widths) = play(400, |width| width / 2);
+        assert!(widths.iter().filter(|&&width| width > 0).count() < 40 && policy.skill < 0.8, "skill {}", policy.skill);
+        // a new context starts with the drafter trusted again
+        let mut policy = policy;
+        policy.reset();
+        assert_eq!(policy.skill, 1.0);
+        assert!(policy.drafting() && policy.width(&[0.9; 3], 3) > 0);
     }
 
     /// A confidence maps to the rate a slot's token matches, linearly between the table's tenths.
