@@ -528,6 +528,37 @@ fn bf16_router_routes_its_own_logits_in_one_launch() {
 }
 
 #[test]
+fn a_verify_pass_routes_every_row_in_the_fused_launch() {
+    // A verify pass's 2-4 rows through DeepSeek-V4.1's BF16 router: each row's routes in the one
+    // launch are sd_op_route's of that row's logits (every thread takes every row's scores).
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x9b05_688c_2b3e_6c1f);
+    let scratch = gpu.buffer(1 << 20).unwrap();
+    let (cols, experts, k) = (5120usize, 384usize, 6usize);
+    let bytes: Vec<u8> = random.floats(experts * cols, 0.02).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let matrix = gpu.upload_bytes(&bytes).unwrap();
+    let bias = upload(&mut gpu, &random.floats(experts, 0.1));
+    for steps in 2..=4usize {
+        let input = upload(&mut gpu, &random.floats(steps * cols, 3.0));
+        let logits = gpu.buffer((steps * experts * 4) as u64).unwrap();
+        let (ids_a, ids_b) = (gpu.buffer((steps * k * 4) as u64).unwrap(), gpu.buffer((steps * k * 4) as u64).unwrap());
+        let (weights_a, weights_b) = (gpu.buffer((steps * k * 4) as u64).unwrap(), gpu.buffer((steps * k * 4) as u64).unwrap());
+        for gating in 0..3 {
+            gpu.linear_route(&matrix, 30, experts as u64, cols as u64, input.base(), steps as u64, logits.base(), Some(bias.base()),
+                             k as u64, gating, true, 1.3, ids_b.base(), weights_b.base(), &scratch).unwrap();
+            gpu.route(logits.base(), Some(bias.base()), steps as u64, experts as u64, k as u64, gating, true, 1.3, ids_a.base(),
+                      weights_a.base()).unwrap();
+            let (want, got) = (read(&mut gpu, &ids_a, steps * k), read(&mut gpu, &ids_b, steps * k));
+            assert_eq!(want, got, "ids of {steps} rows, gating {gating}");
+            // (the rows' routes differ: a row that took row 0's scores would show here)
+            assert_ne!(got[..k], got[k..2 * k], "rows 0 and 1 of {steps}, gating {gating}");
+            assert_eq!(read(&mut gpu, &weights_a, steps * k), read(&mut gpu, &weights_b, steps * k), "weights of {steps} rows, gating {gating}");
+        }
+    }
+}
+
+#[test]
 fn linears_norm_tail_graph_matches_separate_ops() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);

@@ -262,7 +262,7 @@ impl Hparams {
             }
             Some(engram)
         };
-        Ok(Hparams {
+        let hp = Hparams {
             vocabulary,
             width: keys.count("embedding_length")?,
             heads: keys.count("attention.head_count")?,
@@ -291,7 +291,12 @@ impl Hparams {
             compressed_rope: Rope { base: keys.float("attention.compress_rope_freq_base")?, yarn },
             engram,
             layers: plan,
-        })
+        };
+        // (the compressed rows and index keys are BF16 read by fours, and snapshots copy them as pairs)
+        if !hp.head_dim.is_multiple_of(4) || !hp.index_dim.is_multiple_of(4) {
+            return Err(format!("deepseek41 key lengths {} and {} must be multiples of 4", hp.head_dim, hp.index_dim));
+        }
+        Ok(hp)
     }
 
     /// Engram columns per module: every n-gram order above one, times the hash heads.

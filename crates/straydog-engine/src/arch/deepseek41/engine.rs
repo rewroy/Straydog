@@ -456,10 +456,18 @@ pub struct Snapshot {
 impl Snapshot {
     /// Host bytes it holds.
     pub fn bytes(&self) -> u64 {
-        let floats: usize = self.windows.iter().map(|(_, rows)| rows.len()).sum::<usize>()
-            + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::len)).sum::<usize>();
-        (floats * 4 + self.history.len() * 4) as u64
+        let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
+            + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::capacity)).sum::<usize>();
+        (floats * 4 + self.history.capacity() * 4) as u64
     }
+}
+
+/// `values` at `len` and no larger: a buffer taken again neither keeps an earlier, longer
+/// checkpoint's memory nor doubles as it grows (the budget counts what is held).
+fn fit<T: Clone + Default>(values: &mut Vec<T>, len: usize) {
+    values.reserve_exact(len.saturating_sub(values.len()));
+    values.resize(len, T::default());
+    values.shrink_to_fit();
 }
 
 /// Host bytes a [`Snapshot`] holds, known before it is taken: `layers` window rings' rows of the
@@ -1225,7 +1233,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             phases.push(("gpu: boundary: pass start to layer", seconds(pass_start, at(layers.start, Stamp::LayerStart))));
         }
-        let pass_ms = seconds(pass_start, head_end) * 1e3;
+        // (an engine before the last runs no head: its pass ends at its last layer)
+        let pass_end = if head_end > 0 { head_end } else { at(layers.end - 1, Stamp::LayerEnd) };
+        let pass_ms = seconds(pass_start, pass_end) * 1e3;
         stamps.last_end = Some((at(layers.end - 1, Stamp::LayerEnd), head_end));
         // (every pass of a few rows, one line: the sums of its layers' steps, in ms)
         let mut sums: BTreeMap<&'static str, f64> = BTreeMap::new();
@@ -1384,7 +1394,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         snapshot.windows.resize_with(shard.rings.len(), Default::default);
         for ((&layer, buffer), (kept_layer, rows)) in shard.rings.iter().zip(&mut snapshot.windows) {
             *kept_layer = layer;
-            rows.resize((position - first) * dim, 0.0);
+            fit(rows, (position - first) * dim);
             for (at, run, done) in ring_runs(first, position, ring) {
                 shard.gpu.read_buffer(buffer, at * dim, &mut rows[done * dim..(done + run) * dim])?;
             }
@@ -1395,7 +1405,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let groups = self.sources[&layer].groups;
             // (the compressed rows and index keys as they are, BF16 pairs in F32 words; the dims are even)
             for (values, len) in kept.iter_mut().zip([groups * dim / 2, groups * index_dim / 2, dim, dim]) {
-                values.resize(len, 0.0);
+                fit(values, len);
             }
             for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(kept.iter_mut()) {
                 if !values.is_empty() {
@@ -1405,7 +1415,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         snapshot.sources.clear();
         snapshot.sources.extend(self.sources.iter().map(|(&layer, source)| (layer, source.groups, source.tail)));
-        snapshot.history.clone_from(&self.history);
+        fit(&mut snapshot.history, self.history.len());
+        snapshot.history.copy_from_slice(&self.history);
         snapshot.position = position;
         Ok(())
     }
