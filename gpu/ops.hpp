@@ -303,6 +303,14 @@ __device__ void hc_coefficients_of(const float* m, float rsqrt, size_t hc, const
     for (size_t i = 0; i < hc * hc; ++i) comb[i] = c[i];
 }
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+// The value of the lane DPP control CTRL names (every lane active).
+template<int CTRL>
+__device__ __forceinline__ float dpp_mov(float v) {
+    const int bits = __float_as_int(v);
+    return __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, CTRL, 0xf, 0xf, false));
+}
+#endif
 // hc_coefficients_of with a lane per entry of the combination (hc * hc <= 32), called by a whole
 // wave: every sum is formed in hc_coefficients_of's order, so the results are the same.
 template<int HC>
@@ -316,6 +324,37 @@ __device__ void hc_coefficients_wave(const float* m, float rsqrt, const float* b
     }
     const bool live = lane < HC * HC;
     float c = live ? m[2 * HC + lane] * rsqrt * scale[2] + base[2 * HC + lane] : 0.0f;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    if constexpr (HC == 4) {
+        // The same exchanges without LDS permutes: a row's entries are a quad (quad_perm broadcasts),
+        // a column's the lanes ^ 4, ^ 8 and ^ 12 of a 16-lane row (row_xmask), taken in row order.
+        const unsigned jj = j % 4;
+        const auto pick = [jj](unsigned i, float g0, float g1, float g2, float g3) {
+            const unsigned at = i ^ jj;
+            return at == 0 ? g0 : at == 1 ? g1 : at == 2 ? g2 : g3;
+        };
+        float r0 = dpp_mov<0x00>(c), r1 = dpp_mov<0x55>(c), r2 = dpp_mov<0xAA>(c), r3 = dpp_mov<0xFF>(c);
+        const float top = fmaxf(fmaxf(fmaxf(fmaxf(-INFINITY, r0), r1), r2), r3);
+        float total = 0.0f;
+        total += expf(r0 - top); total += expf(r1 - top); total += expf(r2 - top); total += expf(r3 - top);
+        c = expf(c - top) / total + eps;
+        for (size_t iteration = 0; iteration < iterations; ++iteration) {
+            if (iteration) {
+                r0 = dpp_mov<0x00>(c); r1 = dpp_mov<0x55>(c); r2 = dpp_mov<0xAA>(c); r3 = dpp_mov<0xFF>(c);
+                float row = 0.0f;
+                row += r0; row += r1; row += r2; row += r3;
+                c /= row + eps;
+            }
+            const float g0 = c, g1 = dpp_mov<0x164>(c), g2 = dpp_mov<0x168>(c), g3 = dpp_mov<0x16C>(c);
+            float column = 0.0f;
+            column += pick(0, g0, g1, g2, g3); column += pick(1, g0, g1, g2, g3);
+            column += pick(2, g0, g1, g2, g3); column += pick(3, g0, g1, g2, g3);
+            c /= column + eps;
+        }
+        if (live) comb[lane] = c;
+        return;
+    }
+#endif
     float top = -INFINITY;
     #pragma unroll
     for (int i = 0; i < HC; ++i) top = fmaxf(top, __shfl(c, int(j * HC + i), 32));
