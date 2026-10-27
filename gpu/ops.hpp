@@ -457,6 +457,19 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     __syncthreads();
     if (!last) return;
     __threadfence();
+    // The row's columns, as the blocks left them (their stores are out: each block counted itself in after its fence), loaded now with
+    // their norm weights, so that those loads' latency is spent under the gather and the coefficients and not after them.
+    constexpr unsigned EACH = 24;
+    const bool early = width <= EACH * hc_step_threads;
+    float* o = out + row * width;
+    float early_x[EACH], early_w[EACH];
+    if (early) {
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = threadIdx.x + j * hc_step_threads;
+            if (col < width) { early_x[j] = hc_step_load(o + col); early_w[j] = norm_weight[col]; }
+        }
+    }
     // The blocks' sums arrive GATHER at a time, all loads at once (a thread's issued before it
     // stores any); each total adds them in order.
     float total = 0.0f;
@@ -483,6 +496,15 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     if (threadIdx.x < SUMS) totals[threadIdx.x] = total;
     __syncthreads();
     if (threadIdx.x == 0) *counter = 0;
+    const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
+    // (the norm needs only its factor: the other waves store their columns while the first forms the coefficients)
+    if (early && (!fn || wave)) {
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = threadIdx.x + j * hc_step_threads;
+            if (col < width) o[col] = early_x[j] * factor * early_w[j];
+        }
+    }
     if (fn) {
         const float rsqrt = rsqrtf(totals[MIX] / float(HC * width) + norm_eps);
         if constexpr (HC * HC <= 32) {
@@ -492,19 +514,26 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
         } else if (threadIdx.x == 0)
             hc_coefficients_of(totals, rsqrt, HC, base, scale, iterations, eps, pre + row * HC, post + row * HC, comb + row * HC * HC);
     }
-    const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
-    float* o = out + row * width;
+    if (early) {
+        if (fn && wave == 0) {
+            #pragma unroll
+            for (unsigned j = 0; j < EACH; ++j) {
+                const size_t col = threadIdx.x + j * hc_step_threads;
+                if (col < width) o[col] = early_x[j] * factor * early_w[j];
+            }
+        }
+        return;
+    }
     // the row's columns a few at a time, each group's loads issued before its stores
-    constexpr unsigned EACH = 8;
-    for (size_t col0 = 0; col0 < width; col0 += size_t(EACH) * blockDim.x) {
-        float loaded[EACH], weights[EACH];
+    for (size_t col0 = 0; col0 < width; col0 += size_t(8) * blockDim.x) {
+        float loaded[8], weights[8];
         #pragma unroll
-        for (unsigned j = 0; j < EACH; ++j) {
+        for (unsigned j = 0; j < 8; ++j) {
             const size_t col = col0 + j * blockDim.x + threadIdx.x;
             if (col < width) { loaded[j] = hc_step_load(o + col); weights[j] = norm_weight[col]; }
         }
         #pragma unroll
-        for (unsigned j = 0; j < EACH; ++j) {
+        for (unsigned j = 0; j < 8; ++j) {
             const size_t col = col0 + j * blockDim.x + threadIdx.x;
             if (col < width) o[col] = loaded[j] * factor * weights[j];
         }
