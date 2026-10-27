@@ -45,7 +45,8 @@ fn go(model: &mut Model, prompt: &[u32], max_new: usize) -> Outcome {
 /// A chat's turns (thinking on, the replies sent back without their reasoning), then another
 /// chat, then the first one's next turn: that turn resumes from the first chat's checkpoint (where
 /// its last reply's generation prompt began, the whole state in host memory) and leaves the same
-/// tokens and state as when it follows its chat directly.
+/// tokens and state as when it follows its chat directly. The checkpoints' rows are copied when a
+/// restore or a reset needs them, or (the switched run's first) in small steps between requests.
 #[test]
 fn a_switched_conversation_comes_back_from_its_checkpoint() {
     let Some(root) = common::model_env("STRAYDOG_DS41", "the DeepSeek-V4.1 GSQ-RCO IQ2_XS bundle directory") else { return };
@@ -82,6 +83,14 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     for switched in [false, true] {
         model.forget();
         go(&mut model, &first, 8);
+        if switched {
+            model.engines.limit_checkpoint_steps(1 << 20);
+            let mut steps = 1;
+            while !model.make_room().unwrap() {
+                steps += 1;
+            }
+            assert!(steps > 2, "the first turn's checkpoints copied in steps ({steps})");
+        }
         let next = go(&mut model, &second, 8);
         assert!(next.cached.is_some_and(|cached| cached as usize > first.len() / 2), "the second turn from the first's checkpoint");
         if switched {

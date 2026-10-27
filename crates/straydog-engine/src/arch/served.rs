@@ -765,8 +765,8 @@ impl<E: Engines> Session<E> {
         self.engines.settle()
     }
 
-    /// Between requests: a step of making the stores' room for the next prefill (without
-    /// waiting); whether that is done.
+    /// Between requests: a step of copying the checkpoints taken, then of making the stores' room
+    /// for the next prefill (without waiting); whether that is done.
     pub fn make_room(&mut self) -> Result<bool, String> {
         self.engines.make_room()
     }

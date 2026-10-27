@@ -477,10 +477,17 @@ pub struct Snapshot {
     windows: Vec<(usize, Vec<f32>)>,
     /// (layer, [compressed rows, index keys, tail kv, tail gate])
     rows: Vec<(usize, [Vec<f32>; 4])>,
+    /// Compressed rows and index keys still in the devices' buffers ([`Engine::finish_snapshot`]).
+    pending: bool,
 }
 
 impl Snapshot {
-    /// Host bytes it holds.
+    /// Whether its compressed rows and index keys are still to be copied.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Host bytes it holds (pending ones too: their room is taken).
     pub fn bytes(&self) -> u64 {
         let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
             + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::capacity)).sum::<usize>();
@@ -494,6 +501,13 @@ fn fit<T: Clone + Default>(values: &mut Vec<T>, len: usize) {
     values.reserve_exact(len.saturating_sub(values.len()));
     values.resize(len, T::default());
     values.shrink_to_fit();
+}
+
+/// `values` empty, with room for `len` and no more (as [`fit`]), for a copy to fill later.
+fn fit_room<T>(values: &mut Vec<T>, len: usize) {
+    values.clear();
+    values.shrink_to(len);
+    values.reserve_exact(len);
 }
 
 /// Host bytes a [`Snapshot`] holds, known before it is taken: `layers` window rings' rows of the
@@ -1436,13 +1450,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
     pub fn snapshot(&mut self) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         self.snapshot_into(&mut snapshot)?;
+        self.finish_snapshot(&mut snapshot, usize::MAX)?;
         Ok(snapshot)
     }
 
     /// [`Engine::snapshot`] into `snapshot`, its buffers taken again (resized, not made anew): a
     /// checkpoint taken over an earlier one touches no new memory but for the sequence's growth,
     /// where new memory every turn (hundreds of MB at long context) waited on the kernel's direct
-    /// reclaim whenever the host ran short of free pages.
+    /// reclaim whenever the host ran short of free pages. The compressed rows and index keys, nearly
+    /// all of it, are left [`pending`](Snapshot::pending) for [`Engine::finish_snapshot`]: the
+    /// sequence only grows past them until a reset, a restore or a rewind below the snapshot (a
+    /// served checkpoint copied them before the first token, ~0.2 s at 110K tokens and 2-4 s when
+    /// the host had to find the pages).
     pub fn snapshot_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
         let (window, dim, index_dim, ring, position) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring, self.position);
         let shard = &mut self.shards[0];
@@ -1460,15 +1479,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
             *kept_layer = layer;
             let groups = self.sources[&layer].groups;
             // (the compressed rows and index keys as they are, BF16 pairs in F32 words; the dims are even)
-            for (values, len) in kept.iter_mut().zip([groups * dim / 2, groups * index_dim / 2, dim, dim]) {
-                fit(values, len);
-            }
-            for (buffer, values) in [&buffers.rows, &buffers.keys, &buffers.tail_kv, &buffers.tail_gate].into_iter().zip(kept.iter_mut()) {
-                if !values.is_empty() {
-                    shard.gpu.read_buffer(buffer, 0, values)?;
-                }
+            let [rows, keys, tail_kv, tail_gate] = kept;
+            fit_room(rows, groups * dim / 2);
+            fit_room(keys, groups * index_dim / 2);
+            for (buffer, values) in [(&buffers.tail_kv, tail_kv), (&buffers.tail_gate, tail_gate)] {
+                fit(values, dim);
+                shard.gpu.read_buffer(buffer, 0, values)?;
             }
         }
+        snapshot.pending = snapshot.rows.iter().any(|(_, kept)| kept[0].capacity() + kept[1].capacity() > 0);
         snapshot.sources.clear();
         snapshot.sources.extend(self.sources.iter().map(|(&layer, source)| (layer, source.groups, source.tail)));
         fit(&mut snapshot.history, self.history.len());
@@ -1477,8 +1496,37 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
+    /// Copy up to `most` floats of a [`Engine::snapshot_into`]'s pending compressed rows and index
+    /// keys, while the sequence has not gone below it; the floats copied.
+    pub fn finish_snapshot(&mut self, snapshot: &mut Snapshot, most: usize) -> Result<usize> {
+        if !snapshot.pending {
+            return Ok(0);
+        }
+        let (dim, index_dim) = (self.hp.head_dim, self.hp.index_dim);
+        let shard = &mut self.shards[0];
+        let (mut copied, mut pending) = (0, false);
+        for (layer, kept) in &mut snapshot.rows {
+            let groups = snapshot.sources.iter().find(|source| source.0 == *layer).ok_or("a snapshot of another engine's layers")?.1;
+            let buffers = shard.sources.get(layer).ok_or("a snapshot of another engine's layers")?;
+            for ((buffer, len), values) in [(&buffers.rows, groups * dim / 2), (&buffers.keys, groups * index_dim / 2)].into_iter().zip(kept.iter_mut()) {
+                let (done, take) = (values.len(), (len - values.len()).min(most - copied));
+                if take > 0 {
+                    values.resize(done + take, 0.0);
+                    shard.gpu.read_buffer(buffer, done, &mut values[done..])?;
+                    copied += take;
+                }
+                pending |= values.len() < len;
+            }
+        }
+        snapshot.pending = pending;
+        Ok(copied)
+    }
+
     /// Put a [`Engine::snapshot`] back on every device: the sequence as it was then.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        if snapshot.pending {
+            return Err("a snapshot restored before its copy finished".into());
+        }
         let (dim, ring, position) = (self.hp.head_dim, self.ring, snapshot.position);
         // (the kv sources' buffers back from the expert stores before the snapshot's rows go in)
         self.reserve_state(position)?;
