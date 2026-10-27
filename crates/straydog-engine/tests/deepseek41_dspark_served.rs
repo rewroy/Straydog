@@ -55,7 +55,7 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
     let settings = Settings {
         devices: vec![0, 1], split_mode: SplitMode::Experts, vram_bytes: vec![28 << 30; 2], context: 16384, batch: 2048,
         host_expert_bytes: None, host_memory_bytes: straydog_engine::host::host_memory_bytes(),
-        row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: false,
+        row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: true,
     };
     let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
     model.prompt_logits = Some(Vec::new());
@@ -147,6 +147,28 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
     assert_eq!(engines.dspark_history(), Some(true));
     engines.reset();
     assert_eq!(engines.dspark_history(), Some(true), "(a draft at position 0 reads nothing)");
+
+    // The first rows of a sequence (and a few more) are attention sinks, their features past FP16's 65504, and a
+    // prompt of 32 rows or more is read with FP16 products: the drafter's injection of such a prompt's features must
+    // not cast them (infinite rows made every draft wrong for as long as one was in the window). The draft after a
+    // prompt read in one pass is the draft after the same prompt read in passes of fewer rows.
+    let sinks = render("Write a complete, well-commented Rust implementation of an LRU cache (a HashMap plus a doubly linked list \
+                        kept in a Vec by index), with unit tests. Output only code.");
+    assert!(sinks.len() > 32, "{}", sinks.len());
+    let anchor = sinks[sinks.len() - 1];
+    engines.reset();
+    engines.forward(&sinks).unwrap();
+    let whole = engines.dspark_probe(anchor, 3).unwrap().unwrap();
+    engines.reset();
+    for piece in sinks.chunks(16) {
+        engines.forward(piece).unwrap();
+    }
+    let pieces = engines.dspark_probe(anchor, 3).unwrap().unwrap();
+    eprintln!("a prompt of {} tokens, read whole: {:?} {:?}; in passes of 16: {:?} {:?}", sinks.len(), whole.tokens, whole.confidences,
+              pieces.tokens, pieces.confidences);
+    let agree = whole.tokens.iter().zip(&pieces.tokens).filter(|(a, b)| a == b).count();
+    assert!(whole.tokens.first() == pieces.tokens.first() && agree >= 2, "{whole:?} against {pieces:?}");
+    let anchor = tokens[300];
 
     // a verify pass taken back to part of it: the history has the rows kept, as when they were fed
     // one at a time, and not the rows taken back
