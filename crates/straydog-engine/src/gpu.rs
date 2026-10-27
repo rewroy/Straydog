@@ -304,8 +304,14 @@ impl Backend {
     }
 
     pub fn configure_decode(&self, q8: bool) -> Result<()> {
+        self.decode_options(q8, false)
+    }
+
+    /// [`configure_decode`](Self::configure_decode)'s Q8 kernels, and with `half` a decode or verify
+    /// pass's index scores through WMMA (FP16 operands, F32 sums; RDNA4 only).
+    pub fn decode_options(&self, q8: bool, half: bool) -> Result<()> {
         // SAFETY: a live handle.
-        check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8)) }).map(drop)
+        check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8) | c_int::from(half) << 1) }).map(drop)
     }
 
     /// Upload an operand once; later uses of its key reuse the device copy. While uploads are

@@ -394,6 +394,7 @@ struct Device {
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
+    bool half_decode = false;   // a decode or verify pass's index scores through WMMA, FP16 operands (RDNA4: the FP16 prompt pass's)
     bool q8_decode = false;   // a decode row's Q5_K GEMVs, IQ2 experts' gate/up and down (IQ2_S's down excepted) and Q5_K shared expert on the Q8 kernels (RDNA4)
     uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
@@ -2174,11 +2175,12 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision) {
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
-int sd_decode_options(void* handle, int q8) {
+int sd_decode_options(void* handle, int flags) {
     try {
         auto& value = device(handle);
-        if (q8 != 0 && q8 != 1) throw std::runtime_error("invalid Straydog decode options");
-        value.q8_decode = q8 != 0 && value.rdna4;
+        if (flags & ~3) throw std::runtime_error("invalid Straydog decode options");
+        value.q8_decode = (flags & 1) && value.rdna4;
+        value.half_decode = (flags & 2) && value.rdna4;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -3292,10 +3294,11 @@ static unsigned* index_counters(Device& value) {
     }
     return value.index_rows;
 }
-// The decode and verify passes' index scores through WMMA (index_select_block's half): with the prompt pass's
-// FP16 products on RDNA4, at its shape.
+// The decode and verify passes' index scores through WMMA (index_select_block's half): with FP16 decode
+// (half_decode, which the engine sets with the prompt pass's FP16 products: its GEMM policy turns them off for
+// a pass of a few rows) or those products, on RDNA4, at its shape.
 static bool index_half(const Device& value, uint64_t heads, uint64_t dim) {
-    return value.rdna4 && value.half_gemm && heads <= 32 && dim == 128;
+    return value.rdna4 && (value.half_decode || value.half_gemm) && heads <= 32 && dim == 128;
 }
 // A few rows' bins (decode and verify passes), else none.
 static unsigned* index_bins(Device& value, uint64_t rows) {
