@@ -3374,9 +3374,10 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
         return 0;
     }
 #endif
-    op_index_select_kernel<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
-        size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-        index_counters(value), index_bins(value, rows), candidates, size_t(blocks), size_t(block), index_half(value, heads, dim));
+    (heads <= 32 ? op_index_select_kernel<32> : op_index_select_kernel<64>)<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups),
+        unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups), size_t(heads), size_t(dim), scale,
+        size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value), index_bins(value, rows), candidates,
+        size_t(blocks), size_t(block), index_half(value, heads, dim));
     SD_OP_END
 }
 
@@ -3413,7 +3414,8 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
         list.items[0] = {matrix, 0, lanes};
         list.count = 1;
         const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((scored + index_block_groups - 1) / index_block_groups);
-        op_index_select_proj_kernel<30><<<proj_blocks + chunks, 256, 0, value.stream>>>(list, x, proj_blocks, q, keys, weights, visible,
+        (heads <= 32 ? op_index_select_proj_kernel<30, 32> : op_index_select_proj_kernel<30, 64>)<<<proj_blocks + chunks, 256, 0,
+            value.stream>>>(list, x, proj_blocks, q, keys, weights, visible,
             size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
             index_counters(value) + index_row_capacity, index_bins(value, 1), candidates, size_t(blocks), size_t(block),
             index_half(value, heads, dim));
@@ -3421,9 +3423,10 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
         return 0;
     }
     gemv(value, &matrix, 1, x, weights, 1, 0, 0, {}, op_lanes);
-    op_index_select_kernel<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
-        size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value),
-        index_bins(value, 1), candidates, size_t(blocks), size_t(block), index_half(value, heads, dim));
+    (heads <= 32 ? op_index_select_kernel<32> : op_index_select_kernel<64>)<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups),
+        1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2),
+        positions, frequencies, scores, size_t(k), out, index_counters(value), index_bins(value, 1), candidates, size_t(blocks),
+        size_t(block), index_half(value, heads, dim));
     SD_OP_END
 }
 

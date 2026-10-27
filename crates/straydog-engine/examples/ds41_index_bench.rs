@@ -64,6 +64,12 @@ fn main() -> Result<(), String> {
     // candidate source's scores), with the source's candidate pick alone.
     let (blocks, block) = (2048usize, 8usize);
     let (candidates, scratch) = (gpu.buffer((blocks * 4) as u64)?, gpu.buffer(1 << 20)?);
+    // the decode launch forms the weights too: the indexer's projection of x (BF16, 32 rows of 5120)
+    let width = 5120usize;
+    let x = upload(&mut gpu, &floats(width, 2.0));
+    let proj: Vec<u8> = floats(HEADS * width, 0.05).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+    let proj = gpu.upload_bytes(&proj)?;
+    let formed = gpu.buffer((HEADS * 4) as u64)?;
     for groups in [4096usize, 16384, 40000, 75000, 168000] {
         let halves: Vec<u8> = floats(groups * DIM, 1.0).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
         let keys = gpu.upload_bytes(&halves)?;
@@ -106,8 +112,12 @@ fn main() -> Result<(), String> {
             } else {
                 (0.0, every)
             };
-            println!("{groups:6} groups, {}: select over every group {every:7.1} us, among the candidates {within:7.1} us, the candidates' pick {pick:6.1} us",
-                     if half { "FP16" } else { "F32 " });
+            let with_proj = time(&mut gpu, &mut |gpu| gpu.index_select_proj((&proj, 30, width as u64), p(&x), p(&q), tagged, formed.base(),
+                                                                           p(&visible), groups.min(blocks * block) as u64, HEADS as u64,
+                                                                           DIM as u64, scale, rope, scores.base(), TOP as u64, out.base(),
+                                                                           None))?;
+            println!("{groups:6} groups, {}: select over every group {every:7.1} us, among the candidates {within:7.1} us, the candidates' pick {pick:6.1} us, \
+                      the decode launch (projection too) over {} groups {with_proj:7.1} us", if half { "FP16" } else { "F32 " }, groups.min(blocks * block));
         }
         let kept = chosen[1].iter().filter(|index| chosen[0].contains(index)).count();
         println!("{groups:6} groups: the FP16 choice keeps {kept} of the F32 one's {TOP}");
