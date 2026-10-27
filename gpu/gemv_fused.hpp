@@ -205,7 +205,7 @@ __global__ void gemv_prologue_kind2(FixedGemv list, GemvPrologue pro, float* out
 // The rows' plan as gemv() makes it for one vector (lanes per row, waves), so each row's dot is
 // the plain GEMV's; false when a matrix takes the reference decoder or there are more than two
 // kinds.
-bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input, unsigned min_lanes, FixedGemv& list,
+bool gemv_prologue_plan(const Device& d, const Matrix* matrices, size_t count, const float* input, unsigned min_lanes, FixedGemv& list,
                         size_t& waves) {
     if (!count || count > gemv_fixed_items) return false;
     list = FixedGemv{};
@@ -215,6 +215,7 @@ bool gemv_prologue_plan(const Matrix* matrices, size_t count, const float* input
         size_t alignment = 0;
         if (lanes == 2 && min_lanes > 2 && matrices[i].cols / gemv_unit(matrices[i].kind, alignment) >= 32)
             lanes = std::min(32u, min_lanes);
+        lanes = gemv_q8_lanes(d, matrices[i], lanes);
         if (!lanes) return false;
         bool seen = false;
         for (size_t j = 0; j < i; ++j) seen |= matrices[j].kind == matrices[i].kind;
@@ -332,7 +333,7 @@ void norm_linears(Device& value, const float* x, const float* weight, uint64_t w
     size_t waves = 0;
     GemvPrologue pro{2, x, weight, uint32_t(width), eps, normed};
     pro.side = side;
-    if (gemv_prologue_plan(matrices, size_t(count), normed, op_lanes, list, waves) && gemv_prologue_launch(value, list, waves, pro, output)) {
+    if (gemv_prologue_plan(value, matrices, size_t(count), normed, op_lanes, list, waves) && gemv_prologue_launch(value, list, waves, pro, output)) {
         check(hipGetLastError());
         if (side.publish) attention_turns_mark_ready(value, 1, side.pairs);
         return;
@@ -383,7 +384,7 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
     op_span(value, input, checked_floats({cols}), "a linear input");
     FixedGemv list;
     size_t waves = 0;
-    bool uniform = gemv_prologue_plan(matrices, size_t(count), input, op_lanes, list, waves);
+    bool uniform = gemv_prologue_plan(value, matrices, size_t(count), input, op_lanes, list, waves);
     for (size_t i = 0; uniform && i < count; ++i) uniform = matrices[i].kind == matrices[0].kind;
     // (gemv() takes other kernels for BF16 rows and a lone 2560 x 6144 matrix)
     const int kind = matrices[0].kind;
@@ -464,7 +465,7 @@ void swiglu_linear(Device& value, const void* weights, int kind, uint64_t rows, 
     const Matrix matrix{static_cast<const uint8_t*>(weights), row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
     FixedGemv list;
     size_t waves = 0;
-    if (gemv_prologue_plan(&matrix, 1, hidden, op_lanes, list, waves)) {
+    if (gemv_prologue_plan(value, &matrix, 1, hidden, op_lanes, list, waves)) {
         list.residual.gate = scale;
         const GemvPrologue pro{1, gate, up, uint32_t(cols), 0.0f, nullptr, route_logits, uint32_t(route_k), route_ids, route_weights};
         if (gemv_prologue_launch(value, list, waves, pro, out)) {
