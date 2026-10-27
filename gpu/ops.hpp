@@ -1874,18 +1874,17 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
     for (size_t i = t; i < k; i += blockDim.x)
         if (const int32_t at = out[row * k + i]; at >= 0) out[row * k + i] = int32_t(index_candidate(row_candidates, block, size_t(at), groups));
 }
+// (H: index_select_block's, 32 for up to 32 heads, else 64; one each, the launch picking: both in one kernel
+// took both one's shared memory, 61 KB a block, and spilled)
+template<int H>
 __global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, const float* keys, const float* weights,
                                                               const int32_t* visible, size_t groups, size_t heads, size_t dim,
                                                               float scale, size_t pairs, const int32_t* positions,
                                                               const float* frequencies, float* scores, size_t k, int32_t* out,
                                                               unsigned* counters, unsigned* bins, const int32_t* candidates,
                                                               size_t blocks, size_t block, bool half) {
-    if (heads <= 32)
-        index_select_block<32>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
-                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0, nullptr, nullptr, candidates, blocks, block, half);
-    else
-        index_select_block<64>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
-                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0, nullptr, nullptr, candidates, blocks, block);
+    index_select_block<H>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
+                          bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0, nullptr, nullptr, candidates, blocks, block, half);
 }
 // op_index_select_kernel of one row with the indexer's projection of x into its weights in the same launch
 // (proj: gemv_fixed_kind<kind, 1>'s plan and waves). A block takes a ticket as it starts: the first
@@ -1923,7 +1922,7 @@ __device__ __forceinline__ void index_rotate_q(const float* q, size_t heads, siz
     __syncthreads();
     if (!t) atomicAdd(done, 1u);
 }
-template<int kind>
+template<int kind, int H>
 __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         FixedGemv proj, const float* x, unsigned proj_blocks, const float* q, const float* keys, float* weights,
         const int32_t* visible, size_t groups, size_t heads, size_t dim, float scale, size_t pairs, const int32_t* positions,
@@ -1945,14 +1944,9 @@ __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         __syncthreads();
         if (!threadIdx.x) atomicAdd(counters + 1, 1u);
     } else {
-        if (heads <= 32)
-            index_select_block<32>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
-                                   counters + 3, bins, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
-                                   once ? index_rotated_q : nullptr, counters + 4, candidates, candidate_blocks, block, half);
-        else
-            index_select_block<64>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
-                                   counters + 3, bins, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
-                                   once ? index_rotated_q : nullptr, counters + 4, candidates, candidate_blocks, block);
+        index_select_block<H>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
+                              counters + 3, bins, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
+                              once ? index_rotated_q : nullptr, counters + 4, candidates, candidate_blocks, block, half);
     }
     __syncthreads();
     if (!threadIdx.x && atomicAdd(counters + 2, 1u) == blocks - 1) {
