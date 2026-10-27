@@ -40,6 +40,7 @@ pub fn fetch(root: &Path, quantization: &str, offline: bool, data_dir: Option<&P
         // The trees authenticate the files present: they are not hashed twice.
         assets::fetch_with(&agent, root, &entries, offline, false, progress).map_err(|error| error.to_string())?;
         build_vision(root, quantization, offline, progress).map_err(|error| error.to_string())?;
+        fetch_dspark(root, quantization, offline, progress).map_err(|error| error.to_string())?;
         return print_trees(root, quantization, &data_dir, false, progress);
     }
     fetch_assets(root, quantization, offline, true, progress)?;
@@ -81,28 +82,27 @@ fn writable(directory: &Path) -> io::Result<()> {
 /// when their digests are the pinned ones. That authenticates the files: every block hashes
 /// into the pinned root. Nothing but `data_dir` is written (by default in the model directory).
 fn build_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: bool, progress: Progress) -> io::Result<Vec<String>> {
-    let mut pins = bundle::verity_pins_in(root, quantization).map_err(invalid)?;
+    let mut pins = bundle::verity_files_in(root, quantization).map_err(invalid)?;
     if missing_only {
-        pins.retain(|(asset, _)| !bundle::tree_path(data_dir, asset).is_file());
+        pins.retain(|(_, asset, _)| !bundle::tree_path(data_dir, asset).is_file());
     }
     let mut names = Vec::new();
     if pins.is_empty() {
         return Ok(names);
     }
     writable(&data_dir.join("verity"))?;
-    for (asset, digest) in &pins {
-        let path = root.join(&asset.name);
-        if fs::metadata(&path).map_err(at(&path))?.len() != asset.bytes {
+    for (path, asset, digest) in &pins {
+        if fs::metadata(path).map_err(at(path))?.len() != asset.bytes {
             return Err(invalid(format!("size mismatch: {}", asset.name)));
         }
-        let file = fs::File::open(&path).map_err(at(&path))?;
+        let file = fs::File::open(path).map_err(at(path))?;
         let tree = bundle::tree_path(data_dir, asset);
         let partial = partial_path(&tree);
         let label = format!("building the verity tree of {}", asset.name);
         let done = AtomicU64::new(0);
         progress(&label, 0, asset.bytes);
         let count = |bytes: u64| progress(&label, done.fetch_add(bytes, Ordering::Relaxed) + bytes, asset.bytes);
-        let built = straydog_engine::verity::build(&file, &partial, &count).map_err(at(&path))?;
+        let built = straydog_engine::verity::build(&file, &partial, &count).map_err(at(path))?;
         let built: String = built.iter().map(|byte| format!("{byte:02x}")).collect();
         if built != *digest {
             fs::remove_file(&partial).map_err(at(&partial))?;
@@ -204,6 +204,24 @@ fn build_vision(root: &Path, quantization: &str, offline: bool, progress: Progre
     fs::remove_file(&source).map_err(at(&source))
 }
 
+/// Where DSpark's drafter is downloaded from, with its pin.
+fn dspark_entry(source: &bundle::DsparkSource) -> (bundle::Asset, String) {
+    (source.asset.clone(), format!("https://huggingface.co/{}/resolve/{}/{}", source.repository, source.revision, source.path))
+}
+
+/// Download DSpark's drafter into `root/dspark` when the quantization's model has one pinned and it
+/// is in neither of its directories ([`bundle::dspark_in`]) yet; with `offline`, leave it missing
+/// (the model then drafts from its own text only). Authenticated by its SHA-256 before it is
+/// published; its verity tree then authenticates it for good.
+fn fetch_dspark(root: &Path, quantization: &str, offline: bool, progress: Progress) -> io::Result<()> {
+    let Some(source) = bundle::dspark_source(quantization).map_err(invalid)? else { return Ok(()) };
+    if offline || bundle::dspark_in(root, quantization).map_err(invalid)?.is_some() {
+        return Ok(());
+    }
+    let agent = http::agent(assets::TIMEOUT);
+    assets::fetch_with(&agent, &root.join(bundle::DSPARK_DIRECTORY), &[dspark_entry(&source)], false, false, progress)
+}
+
 /// A file or an answer that is not what it must be (the reference's ValueError), as opposed
 /// to an I/O error: callers that try the next candidate tell them apart by this kind.
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -220,4 +238,35 @@ fn partial_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     target.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::Scratch;
+
+    fn quiet(_stage: &str, _done: u64, _total: u64) {}
+
+    /// DSpark's drafter is fetched from Unsloth's repository at its pinned revision into the model's
+    /// `dspark` directory, and only when the model has one pinned, it is not there already (in either
+    /// directory) and the fetch is not offline.
+    #[test]
+    fn the_dspark_drafter_is_fetched_from_its_pinned_revision_and_only_when_missing() {
+        let source = bundle::dspark_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned DSpark");
+        let (asset, url) = dspark_entry(&source);
+        assert_eq!(asset, source.asset);
+        assert_eq!(url, "https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/\
+                         dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf");
+        let scratch = Scratch::new("dspark");
+        let root = scratch.path().join("GSQ-RCO-IQ2_XS");
+        fs::create_dir_all(&root).unwrap();
+        // (no request is made in any of these)
+        fetch_dspark(&root, "GSQ-RCO-IQ2_XS", true, &quiet).unwrap();
+        fetch_dspark(&root, "UD-IQ2_XXS", false, &quiet).unwrap();
+        assert!(!root.join("dspark").exists() && !scratch.path().join("dspark").exists());
+        fs::create_dir_all(scratch.path().join("dspark")).unwrap();
+        fs::write(scratch.path().join("dspark").join(&asset.name), b"").unwrap();
+        fetch_dspark(&root, "GSQ-RCO-IQ2_XS", false, &quiet).unwrap();
+        assert!(!root.join("dspark").exists());
+    }
 }

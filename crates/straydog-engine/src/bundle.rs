@@ -116,14 +116,23 @@ pub fn verity_pins(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
     Ok(pins)
 }
 
-/// [`verity_pins`] of the files a model in `root` has: with its vision encoder when one is pinned
-/// and there ([`vision_source`]).
+/// [`verity_pins`] of the files a model in `root` has: with its vision encoder and its DSpark
+/// drafter when pinned and there ([`vision_source`], [`dspark_in`]).
 pub fn verity_pins_in(root: &std::path::Path, quantization: &str) -> Result<Vec<(Asset, String)>, String> {
-    let mut pins = verity_pins(quantization)?;
+    Ok(verity_files_in(root, quantization)?.into_iter().map(|(_, asset, digest)| (asset, digest)).collect())
+}
+
+/// [`verity_pins_in`] with where each file lies: the shards, sidecars and vision encoder in `root`,
+/// the DSpark drafter where [`dspark_in`] finds it.
+pub fn verity_files_in(root: &std::path::Path, quantization: &str) -> Result<Vec<(std::path::PathBuf, Asset, String)>, String> {
+    let mut files: Vec<_> = verity_pins(quantization)?.into_iter().map(|(asset, digest)| (root.join(&asset.name), asset, digest)).collect();
     if let Some(vision) = vision_source(quantization)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
-        pins.push((vision.asset, vision.verity));
+        files.push((root.join(&vision.asset.name), vision.asset, vision.verity));
     }
-    Ok(pins)
+    if let Some((dspark, path)) = dspark_in(root, quantization)? {
+        files.push((path, dspark.asset, dspark.verity));
+    }
+    Ok(files)
 }
 
 /// The GGUF `general.architecture` of DeepSeek-V4.1's vision encoder file.
@@ -178,6 +187,80 @@ pub fn vision_source(quantization: &str) -> Result<Option<VisionSource>, String>
         revision: text(&vision["revision"])?,
         tensors,
     }))
+}
+
+/// The GGUF `general.architecture` of DeepSeek-V4.1's DSpark drafter file.
+pub const DSPARK_ARCHITECTURE: &str = "dflash";
+
+/// The directory beside (or inside) a model's directory that holds its DSpark drafter.
+pub const DSPARK_DIRECTORY: &str = "dspark";
+
+/// The pins of DeepSeek-V4.1's DSpark drafter: Unsloth's Q8_0 GGUF of the three-stage block drafter
+/// (`mtp.0..2`) of the official checkpoint, pinned by size, SHA-256 (the repository's LFS oid) and
+/// fs-verity digest. A file of its own with tensor names of its own, so it opens apart from the
+/// shards ([`DsparkSource::pins`]). Optional: a model without the file drafts from its own text.
+#[derive(Debug, Clone)]
+pub struct DsparkSource {
+    pub asset: Asset,
+    pub verity: String,
+    pub repository: String,
+    pub revision: String,
+    /// The file's path in the repository.
+    pub path: String,
+}
+
+const DSPARK_MANIFEST: &str = include_str!("assets_deepseek41_dspark.json");
+
+impl DsparkSource {
+    /// The drafter as a bundle of one shard, to open ([`crate::pinned::Pinned::open`]) from the
+    /// directory it lies in.
+    pub fn pins(&self) -> OnDemand {
+        OnDemand {
+            model: "DeepSeek-V4.1-Flash".into(), architecture: DSPARK_ARCHITECTURE.into(), quantization: "DSpark".into(),
+            shards: vec![self.asset.clone()], verity: vec![self.verity.clone()], resources: Vec::new(), sidecars: Vec::new(),
+        }
+    }
+}
+
+/// The DSpark drafter pinned for an on-demand quantization, if it has one.
+pub fn dspark_source(quantization: &str) -> Result<Option<DsparkSource>, String> {
+    if !is_on_demand(quantization) {
+        return Ok(None);
+    }
+    let pins = on_demand(quantization)?;
+    let manifest: Value = serde_json::from_str(DSPARK_MANIFEST).map_err(|exc| exc.to_string())?;
+    let listed = manifest["quantizations"].as_array().is_some_and(|names| names.iter().any(|name| name == quantization));
+    if manifest["architecture"] != pins.architecture.as_str() || !listed {
+        return Ok(None);
+    }
+    let dspark = &manifest["dspark"];
+    let incomplete = "manifest DSpark source incomplete";
+    if manifest["schema"] != 1 || dspark["kind"] != "dspark" || dspark["architecture"] != DSPARK_ARCHITECTURE {
+        return Err("unsupported Straydog DSpark manifest".into());
+    }
+    let text = |value: &Value| value.as_str().map(str::to_string).ok_or(incomplete);
+    Ok(Some(DsparkSource {
+        asset: asset(dspark)?,
+        verity: verity_of(dspark)?,
+        repository: text(&dspark["repository"])?,
+        revision: text(&dspark["revision"])?,
+        path: text(&dspark["source_path"])?,
+    }))
+}
+
+/// Where a model in `root` keeps its DSpark drafter file: in `root/dspark`, else in a `dspark`
+/// directory beside `root` (a drafter belongs to the model, not to a quantization, so the
+/// directories of one model's quantizations share one).
+pub fn dspark_directories(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    [Some(root.join(DSPARK_DIRECTORY)), root.parent().map(|parent| parent.join(DSPARK_DIRECTORY))].into_iter().flatten().collect()
+}
+
+/// The DSpark drafter of the model in `root` and the file's path, when one is pinned for the
+/// quantization and there.
+pub fn dspark_in(root: &std::path::Path, quantization: &str) -> Result<Option<(DsparkSource, std::path::PathBuf)>, String> {
+    let Some(source) = dspark_source(quantization)? else { return Ok(None) };
+    let found = dspark_directories(root).into_iter().map(|directory| directory.join(&source.asset.name)).find(|path| path.is_file());
+    Ok(found.map(|path| (source, path)))
 }
 
 /// The repository the resources (tokenizer, template, config) come from, at the manifest's
@@ -460,5 +543,43 @@ mod tests {
         assert_eq!(verity_pins("GSQ-RCO-IQ2_XS").unwrap().len(), 5);
         assert_eq!(model_of("IQ2_XS").unwrap(), MODEL);
         assert!(on_demand("IQ3_S").is_err());
+    }
+
+    /// DSpark's drafter is pinned for the GSQ-RCO bundle alone, as Unsloth's file of a repository at
+    /// a revision, and found in its directory or beside it; when found, its verity tree is among the
+    /// bundle's (from the directory it lies in).
+    #[test]
+    fn the_dspark_drafter_is_pinned_for_the_gsq_rco_bundle_and_found_in_its_directories() {
+        let source = dspark_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned DSpark");
+        assert_eq!((source.asset.sha256.len(), source.verity.len(), source.revision.len()), (64, 64, 40));
+        assert_eq!((source.repository.as_str(), source.asset.name.as_str()), ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", source.path.as_str()));
+        assert!(!source.asset.name.contains('/') && source.asset.bytes > 7_000_000_000);
+        assert!(dspark_source("UD-IQ2_XXS").unwrap().is_none() && dspark_source("IQ2_XS").unwrap().is_none());
+        let pins = source.pins();
+        assert_eq!((pins.architecture.as_str(), pins.shards.len(), pins.verity.len(), pins.sidecars.len()), ("dflash", 1, 1, 0));
+
+        let family = std::env::temp_dir().join(format!("straydog-bundle-dspark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&family);
+        let root = family.join("GSQ-RCO-IQ2_XS");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(dspark_in(&root, "GSQ-RCO-IQ2_XS").unwrap().is_none());
+        assert_eq!(verity_pins_in(&root, "GSQ-RCO-IQ2_XS").unwrap().len(), 5);
+        // beside the model's directory (the quantizations' shared one)...
+        std::fs::create_dir_all(family.join("dspark")).unwrap();
+        std::fs::write(family.join("dspark").join(&source.asset.name), b"").unwrap();
+        let (found, path) = dspark_in(&root, "GSQ-RCO-IQ2_XS").unwrap().unwrap();
+        assert_eq!((found.asset, path.as_path()), (source.asset.clone(), family.join("dspark").join(&source.asset.name).as_path()));
+        let files = verity_files_in(&root, "GSQ-RCO-IQ2_XS").unwrap();
+        assert_eq!(files.len(), 6);
+        assert_eq!(files[5].0, path);
+        assert_eq!(files[5].1.name, source.asset.name);
+        assert_eq!(files[0].0, root.join(&files[0].1.name));
+        // ... or inside it, which comes first
+        std::fs::create_dir_all(root.join("dspark")).unwrap();
+        std::fs::write(root.join("dspark").join(&source.asset.name), b"").unwrap();
+        assert_eq!(dspark_in(&root, "GSQ-RCO-IQ2_XS").unwrap().unwrap().1, root.join("dspark").join(&source.asset.name));
+        // no other bundle's model has it
+        assert!(dspark_in(&root, "UD-IQ2_XXS").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&family);
     }
 }

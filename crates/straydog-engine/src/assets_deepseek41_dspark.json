@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "model": "DeepSeek-V4.1-Flash",
+  "architecture": "deepseek41",
+  "quantizations": [
+    "GSQ-RCO-IQ2_XS"
+  ],
+  "dspark": {
+    "kind": "dspark",
+    "name": "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
+    "bytes": 7976914240,
+    "sha256": "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a",
+    "verity": "62a72b75ab0af8e1f94b280ed1dee791a8caef6de730d8315fa6f9f89acbab49",
+    "architecture": "dflash",
+    "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+    "revision": "60ad3651641b5c97679c807e064ab1d7a3ca1455",
+    "source_path": "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+  }
+}
