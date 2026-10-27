@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 
-use super::engine::{columns, Beside};
+use super::engine::{columns, Beside, TAP_LAYERS, TAP_ROWS};
 use crate::arch::{Tensor, Tensors};
 use crate::formats;
 use crate::gpu::{Backend, Result};
@@ -53,20 +53,36 @@ const RANKING: [[u8; EXPERTS]; 3] = [
     [19, 58, 97, 98, 81, 127, 103, 16, 9, 17, 78, 38, 102, 12, 116, 6, 52, 101, 39, 83, 53, 27, 118, 45, 122, 88, 21, 120, 84, 67, 96, 93, 47, 110, 14, 51, 111, 61, 13, 80, 54, 85, 40, 15, 82, 49, 59, 77, 11, 66, 79, 94, 5, 91, 119, 112, 0, 1, 2, 3, 4, 7, 8, 10, 18, 20, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 41, 42, 43, 44, 46, 48, 50, 55, 56, 57, 60, 62, 63, 64, 65, 68, 69, 70, 71, 72, 73, 74, 75, 76, 86, 87, 89, 90, 92, 95, 99, 100, 104, 105, 106, 107, 108, 109, 113, 114, 115, 117, 121, 123, 124, 125, 126]
 ];
 
-/// The routed experts a stage keeps resident, in slot order: all, or with DS41_DSPARK_RESIDENT=A,B,C
-/// each stage's first A, B, C of [`RANKING`]. A draft routes among those alone (the router's bias
-/// keeps the others out of its top 3), so the drafter takes the target's expert store only their
-/// bytes: all 384 are 7.2 GB, the 166 that take 98% of the routes 3.1 GB.
-fn resident(stage: usize) -> Result<Vec<usize>> {
-    let Some(counts) = std::env::var_os("DS41_DSPARK_RESIDENT") else { return Ok((0..EXPERTS).collect()) };
-    let counts: Vec<usize> = counts.to_string_lossy().split(',').map(|count| count.trim().parse::<usize>())
-        .collect::<std::result::Result<_, _>>().map_err(|_| "DS41_DSPARK_RESIDENT takes three counts, A,B,C")?;
-    match counts.get(stage) {
-        Some(&count) if counts.len() == 3 && (USED..=EXPERTS).contains(&count) => {
-            Ok(RANKING[stage][..count].iter().map(|&expert| expert as usize).collect())
-        }
-        _ => Err(format!("DS41_DSPARK_RESIDENT takes three counts from {USED} to {EXPERTS}")),
+/// The routed experts each stage keeps resident unless told otherwise: their first 87, 50 and 29 of
+/// [`RANKING`], the experts of 98% of its routes. Of the 7.2 GB of routed experts that is 3.1 GB, and
+/// DSpark's acceptance is what it is with all of them (1.554 against 1.562 tokens of a draft of three
+/// accepted, teacher forced); a decode with the drafter ran 11% faster for the slots it freed.
+pub const RESIDENT: [usize; 3] = [87, 50, 29];
+
+/// How many of each stage's routed experts are kept: [`RESIDENT`], or with DS41_DSPARK_RESIDENT=A,B,C
+/// each stage's first A, B, C of [`RANKING`], or `all` for all of them.
+pub fn resident_counts() -> Result<[usize; 3]> {
+    parse_counts(std::env::var_os("DS41_DSPARK_RESIDENT").as_deref().map(|value| value.to_string_lossy()).as_deref())
+}
+
+fn parse_counts(setting: Option<&str>) -> Result<[usize; 3]> {
+    let Some(setting) = setting else { return Ok(RESIDENT) };
+    if setting.trim() == "all" {
+        return Ok([EXPERTS; 3]);
     }
+    let counts: Vec<usize> = setting.split(',').map(|count| count.trim().parse::<usize>())
+        .collect::<std::result::Result<_, _>>().map_err(|_| "DS41_DSPARK_RESIDENT takes three counts, A,B,C, or all")?;
+    match counts[..] {
+        [a, b, c] if counts.iter().all(|count| (USED..=EXPERTS).contains(count)) => Ok([a, b, c]),
+        _ => Err(format!("DS41_DSPARK_RESIDENT takes three counts from {USED} to {EXPERTS}, or all")),
+    }
+}
+
+/// The routed experts a stage keeps resident (`count` of them), in slot order: its first `count` of
+/// [`RANKING`]. A draft routes among those alone (the router's bias keeps the others out of its
+/// top 3), so the drafter takes the target's expert store only their bytes.
+fn resident(stage: usize, count: usize) -> Vec<usize> {
+    RANKING[stage][..count].iter().map(|&expert| expert as usize).collect()
 }
 const SCALE: f32 = 1.5;
 const FEATURES: usize = 3 * WIDTH;
@@ -171,8 +187,8 @@ pub struct Drafter {
     /// The block's anchor token (i32), for the Markov head's graph.
     anchor: Buffer,
     vocabulary: usize,
-    /// Per ring row, the position injected there (-1: none).
-    held: Vec<i64>,
+    /// The positions the rings hold.
+    held: History,
     /// The graph keys whose parts have run once (the next time records them).
     ran: HashSet<u64>,
     /// The target's token embedding rows, decoded on the host.
@@ -180,9 +196,47 @@ pub struct Drafter {
 }
 
 /// A draft: its tokens and DSpark's confidence in each.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Draft {
     pub tokens: Vec<u32>,
     pub confidences: Vec<f32>,
+}
+
+/// DSpark's rings of injected features as a checkpoint kept them ([`Drafter::save_rings`]).
+pub struct Rings {
+    /// Per device, per stage, a ring's [`RING`] rows.
+    rings: Vec<Vec<f32>>,
+    held: History,
+}
+
+/// Which positions the rings hold: per ring row, the position injected there (-1: none).
+#[derive(Clone)]
+struct History(Vec<i64>);
+
+impl History {
+    fn new() -> History {
+        History(vec![-1; RING])
+    }
+
+    /// The features of `position` were injected.
+    fn note(&mut self, position: usize) {
+        self.0[position % RING] = position as i64;
+    }
+
+    /// Every position from `position` on is forgotten (a rewind of the target to `position`).
+    fn forget_from(&mut self, position: usize) {
+        for held in &mut self.0 {
+            if *held >= position as i64 {
+                *held = -1;
+            }
+        }
+    }
+
+    /// The first of the last [`RING`] positions before `position` (or of all of them) that the
+    /// rings lack: what a draft at `position` reads is there when it is none.
+    fn lacking(&self, position: usize) -> Option<usize> {
+        (position - position.min(RING)..position).find(|&at| self.0[at % RING] != at as i64)
+    }
 }
 
 fn tensor<'t>(tensors: &'t impl Tensors, name: &str, kind: u32, dims: &[usize]) -> Result<Tensor<'t>> {
@@ -239,17 +293,17 @@ fn replay(gpu: &mut Backend, key: Option<u64>, ran: bool, ops: impl FnOnce(&mut 
 
 impl Part {
     /// Load this device's (`index` of `count`) part of DSpark.
-    fn load(gpu: &mut Backend, draft: &impl Tensors, index: usize, count: usize, head_rows: usize) -> Result<Part> {
+    fn load(gpu: &mut Backend, draft: &impl Tensors, index: usize, count: usize, head_rows: usize, counts: [usize; 3]) -> Result<Part> {
         let (heads, groups, ffn) = (HEADS / count, GROUPS / count, FFN / count);
         let mut stages = Vec::new();
         let (mut experts, mut shared_expert) = (None, None);
-        for stage in 0..3 {
+        for (stage, &resident_count) in counts.iter().enumerate() {
             let name = |suffix: &str| format!("blk.{stage}.{suffix}");
             let t = |suffix: &str, kind: u32, dims: &[usize]| tensor(draft, &name(suffix), kind, dims);
             let whole = |gpu: &mut Backend, suffix: &str, kind: u32, dims: &[usize]| upload(gpu, draft, &name(suffix), kind, dims);
             let routed = [t("ffn_gate_exps.weight", 39, &[WIDTH, FFN, EXPERTS])?, t("ffn_up_exps.weight", 39, &[WIDTH, FFN, EXPERTS])?,
                           t("ffn_down_exps.weight", 39, &[FFN, WIDTH, EXPERTS])?];
-            let kept = resident(stage)?;
+            let kept = resident(stage, resident_count);
             let (slots, slot) = expert_slots(gpu, &routed, &kept, index * ffn, ffn)?;
             let table = gpu.buffer(EXPERTS as u64 * 8)?;
             // (an expert not kept is never routed to: its entry is the first slot's)
@@ -428,6 +482,42 @@ impl Part {
     }
 }
 
+/// Whether DSpark splits among `devices` devices as the target does (heads, output groups and
+/// expert width in equal shares).
+pub fn splits(devices: usize) -> bool {
+    devices > 0 && HEADS.is_multiple_of(devices) && GROUPS.is_multiple_of(devices) && FFN.is_multiple_of(32 * devices)
+}
+
+/// Bytes of VRAM DSpark takes on device `index` of `devices` ([`Drafter::load`], with `resident`
+/// experts kept in each stage and the target's head of `vocabulary` rows split evenly): the
+/// weights it cuts for the device, its experts' slots, rings and work buffers, the first device's
+/// Markov head and logits too, and the target's feature tap ([`TAP_ROWS`]). A stage's graphs and
+/// the runtime's own memory are the placement's reserve. Placement counts this before it sizes
+/// the expert store; a test holds it to what a load allocates.
+pub fn footprint(index: usize, devices: usize, vocabulary: usize, resident: [usize; 3]) -> u64 {
+    let bytes = |kind: u32, rows: usize, cols: usize| formats::matrix_bytes(kind, rows, cols).expect("DSpark's types") as u64;
+    let floats = |count: usize| 4 * count as u64;
+    let (heads, groups, ffn, s) = (HEADS / devices, GROUPS / devices, FFN / devices, MAX_SLOTS);
+    let head_rows = vocabulary / devices;
+    let slot = 2 * bytes(39, ffn, WIDTH) + bytes(39, WIDTH, ffn);
+    let shared = 2 * bytes(8, ffn, WIDTH) + bytes(8, WIDTH, ffn);
+    let mut total = 0;
+    for kept in resident {
+        total += bytes(8, Q_RANK, WIDTH) + bytes(8, heads * HEAD_DIM, Q_RANK) + bytes(8, HEAD_DIM, WIDTH)
+            + bytes(8, groups * OUT_RANK, HEAD_DIM * HEADS / GROUPS) + bytes(8, WIDTH, groups * OUT_RANK);
+        total += floats(2 * WIDTH + Q_RANK + HEAD_DIM + heads + 2 * (HC * WIDTH * MIXES + MIXES + 3) + WIDTH * EXPERTS + EXPERTS);
+        total += EXPERTS as u64 * 8 + kept as u64 * slot + shared + floats(RING * HEAD_DIM);
+    }
+    let coefficients = 3 * floats(2 * s * HC + s * HC * HC);
+    total += bytes(8, WIDTH, FEATURES) + floats(2 * WIDTH + ROPE / 2) + coefficients + floats(s * HC);
+    total += floats(2 * s * HC * WIDTH + 5 * s * WIDTH + s * Q_RANK + 2 * s * heads * HEAD_DIM + s * HEAD_DIM + s * groups * OUT_RANK);
+    total += floats(s * MIXES + s * EXPERTS + 4 * s * USED + s * USED * ffn + s * head_rows + s + RING + RING * WIDTH) + (64 << 20);
+    if index == 0 {
+        total += 2 * bytes(30, MARKOV, vocabulary) + floats(WIDTH + MARKOV + 2 * s * vocabulary + 2 * s + 2);
+    }
+    total + floats(TAP_ROWS * TAP_LAYERS.len() * WIDTH)
+}
+
 impl Drafter {
     /// Load DSpark (`draft`, checked by [`super::dspark::Dspark`]) onto a target engine's devices,
     /// split among them; its head is theirs ([`Beside`]).
@@ -446,9 +536,10 @@ impl Drafter {
         if first_row != vocabulary {
             return Err(format!("the target's head has {first_row} rows, not {vocabulary}"));
         }
+        let counts = resident_counts()?;
         let mut parts = Vec::new();
         for (index, device) in devices.iter_mut().enumerate() {
-            parts.push(Part::load(device.gpu, draft, index, count, device.head_rows)?);
+            parts.push(Part::load(device.gpu, draft, index, count, device.head_rows, counts)?);
         }
         let gpu = &mut *devices[0].gpu;
         let floats = |gpu: &mut Backend, count: usize| gpu.buffer((count * 4) as u64);
@@ -464,7 +555,7 @@ impl Drafter {
             count: floats(gpu, 1)?,
             anchor: floats(gpu, 1)?,
             vocabulary,
-            held: vec![-1; RING],
+            held: History::new(),
             ran: HashSet::new(),
             embed_kind: target.tensor("token_embd.weight")?.kind,
         })
@@ -488,7 +579,7 @@ impl Drafter {
                               &part.frequencies, part.encoded.base(), &part.scratch)?;
         }
         for &position in positions {
-            self.held[position as usize % RING] = position as i64;
+            self.held.note(position as usize);
         }
         Ok(())
     }
@@ -508,11 +599,45 @@ impl Drafter {
 
     /// Forget every injected position from `position` on (a rewind of the target to `position`).
     pub fn forget_from(&mut self, position: usize) {
-        for held in &mut self.held {
-            if *held >= position as i64 {
-                *held = -1;
+        self.held.forget_from(position);
+    }
+
+    /// Whether a draft at `position` finds the history it reads (the last [`RING`] positions
+    /// before it, or all of them) in the rings.
+    pub fn has_history(&self, position: usize) -> bool {
+        self.held.lacking(position).is_none()
+    }
+
+    /// A copy of the rings (every device's, every stage's) and of which positions they hold, for a
+    /// checkpoint of the target's sequence ([`Drafter::restore_rings`] puts them back).
+    pub fn save_rings(&self, devices: &mut [Beside<'_>]) -> Result<Rings> {
+        if devices.len() != self.parts.len() {
+            return Err("DSpark's rings saved from other devices than it runs on".into());
+        }
+        let mut rings = Vec::with_capacity(devices.len() * self.parts[0].stages.len());
+        for (part, device) in self.parts.iter().zip(devices.iter_mut()) {
+            for stage in &part.stages {
+                let mut ring = vec![0f32; RING * HEAD_DIM];
+                device.gpu.read_buffer(&stage.ring, 0, &mut ring)?;
+                rings.push(ring);
             }
         }
+        Ok(Rings { rings, held: self.held.clone() })
+    }
+
+    /// Put rings back as [`Drafter::save_rings`] took them: the history of the sequence then.
+    pub fn restore_rings(&mut self, devices: &mut [Beside<'_>], saved: &Rings) -> Result<()> {
+        let stages = self.parts[0].stages.len();
+        if devices.len() != self.parts.len() || saved.rings.len() != devices.len() * stages {
+            return Err("DSpark's rings restored to other devices than they were saved from".into());
+        }
+        for ((part, device), rings) in self.parts.iter().zip(devices.iter_mut()).zip(saved.rings.chunks(stages)) {
+            for (stage, ring) in part.stages.iter().zip(rings) {
+                device.gpu.write_buffer(&stage.ring, 0, ring)?;
+            }
+        }
+        self.held.clone_from(&saved.held);
+        Ok(())
     }
 
     /// Whether the part under `key` has run before (and so records a graph now), noting that it has.
@@ -541,10 +666,8 @@ impl Drafter {
             return Err(format!("a DSpark draft of {slots} slots after token {anchor}"));
         }
         let history = position.min(RING);
-        for at in position - history..position {
-            if self.held[at % RING] != at as i64 {
-                return Err(format!("DSpark's history lacks position {at} (a draft at {position})"));
-            }
+        if let Some(at) = self.held.lacking(position) {
+            return Err(format!("DSpark's history lacks position {at} (a draft at {position})"));
         }
         let block = Block { rows: slots as u64, position, history };
         // the block's embeddings, repeated into the hc copies
@@ -651,6 +774,11 @@ pub struct Policy {
     paused: usize,
 }
 
+/// A target pass's milliseconds on two GPUs by its rows, 1 to 4 (T133), and a draft's: where a
+/// [`Policy`] starts before it has seen the passes of the run.
+pub const VERIFY_MS: [f64; 4] = [25.4, 41.4, 57.0, 69.5];
+pub const DRAFT_MS: f64 = 5.0;
+
 /// Rounds in a row that verify no draft before a pause, and the rounds a pause skips.
 pub const PAUSE_AFTER: usize = 4;
 pub const PAUSE_ROUNDS: usize = 16;
@@ -672,6 +800,12 @@ fn calibrated(slot: usize, confidence: f32) -> f64 {
     let (low, high) = (at.floor() as usize, at.ceil() as usize);
     let table = &CALIBRATION[slot.min(MAX_SLOTS - 1)];
     table[low] + (table[high] - table[low]) * (at - low as f64)
+}
+
+impl Default for Policy {
+    fn default() -> Policy {
+        Policy::new(&VERIFY_MS, DRAFT_MS)
+    }
 }
 
 impl Policy {
@@ -730,5 +864,161 @@ impl Policy {
             self.zeros = 0;
         }
         best.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noted(positions: std::ops::Range<usize>) -> History {
+        let mut history = History::new();
+        positions.for_each(|at| history.note(at));
+        history
+    }
+
+    /// A draft at a position reads the positions before it, the last ring of them: they are all
+    /// there only when each was injected and not overwritten or forgotten since.
+    #[test]
+    fn a_draft_finds_its_history_only_where_every_position_was_injected() {
+        let empty = History::new();
+        assert_eq!((empty.lacking(0), empty.lacking(1)), (None, Some(0)));
+        let some = noted(0..10);
+        assert_eq!((some.lacking(10), some.lacking(11)), (None, Some(10)));
+        // (past a ring the oldest positions are overwritten, and a draft reads only the last ring)
+        let long = noted(0..300);
+        assert_eq!((long.lacking(300), long.lacking(301)), (None, Some(300)));
+        let wrapped = noted(0..129);
+        assert_eq!((wrapped.lacking(129), wrapped.lacking(130)), (None, Some(129)));
+        // a position injected a ring ago does not stand for the one that shares its row
+        let mut stale = noted(0..128);
+        stale.forget_from(100);
+        stale.note(228);
+        assert_eq!(stale.lacking(229), Some(101));
+        assert_eq!(History(vec![5; RING]).lacking(6), Some(0));
+    }
+
+    /// A rewind of the target takes back the positions from where it went, and nothing before; a
+    /// new sequence takes back all. A position forgotten that had overwritten an older one takes
+    /// that one with it.
+    #[test]
+    fn forgetting_takes_back_the_positions_from_one_on() {
+        let mut history = noted(0..100);
+        history.forget_from(60);
+        assert_eq!((history.lacking(60), history.lacking(61)), (None, Some(60)));
+        history.note(60);
+        assert_eq!((history.lacking(61), history.lacking(100)), (None, Some(61)));
+        history.forget_from(0);
+        assert_eq!((history.lacking(0), history.lacking(1), history.lacking(300)), (None, Some(0), Some(172)));
+        let mut wrapped = noted(0..140);
+        wrapped.forget_from(135);
+        assert_eq!((wrapped.lacking(135), wrapped.lacking(140)), (Some(7), Some(135)));
+        // forgetting past what was injected changes nothing
+        let mut kept = noted(0..10);
+        kept.forget_from(10);
+        assert_eq!(kept.lacking(10), None);
+    }
+
+    #[test]
+    fn the_resident_experts_are_a_default_a_list_or_all() {
+        assert_eq!(parse_counts(None).unwrap(), [87, 50, 29]);
+        assert_eq!(parse_counts(Some("all")).unwrap(), [128; 3]);
+        assert_eq!(parse_counts(Some(" 128, 3 ,10")).unwrap(), [128, 3, 10]);
+        for wrong in ["", "87,50", "87,50,29,1", "2,50,29", "87,50,129", "a,b,c", "-1,50,29"] {
+            assert!(parse_counts(Some(wrong)).is_err(), "{wrong}");
+        }
+        // every stage ranks each of its experts once, and the default keeps the ones most used
+        for ranking in RANKING {
+            let mut seen = [false; EXPERTS];
+            ranking.iter().for_each(|&expert| seen[expert as usize] = true);
+            assert!(seen.iter().all(|&expert| expert));
+        }
+        assert_eq!(resident(2, 29).len(), 29);
+        assert_eq!(resident(0, 128).len(), EXPERTS);
+        assert_eq!(&resident(1, 3), &[121, 109, 61]);
+    }
+
+    /// The VRAM placement counts for DSpark: all its experts and one device is the file's size and
+    /// a little more (its work buffers and the target's feature tap); a device of two holds half
+    /// the split weights; the resident set takes the experts it leaves out off, each of
+    /// a device's share 3 x 1152 rows of MXFP4 blocks.
+    #[test]
+    fn the_drafters_footprint_is_its_file_its_experts_kept_and_its_buffers() {
+        let file = crate::bundle::dspark_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned DSpark").asset.bytes;
+        let vocabulary = 129_280;
+        let whole = footprint(0, 1, vocabulary, [EXPERTS; 3]);
+        assert!(whole > file && whole < file + (100 << 20), "{whole} for a file of {file}");
+        let slot = 3 * 1152 * (5120 / 32 * 17) as u64;
+        let (all, kept) = (footprint(0, 2, vocabulary, [EXPERTS; 3]), footprint(0, 2, vocabulary, RESIDENT));
+        assert_eq!(all - kept, (3 * 128 - 166) * slot);
+        // (the first device also holds the Markov heads and the logits)
+        let second = footprint(1, 2, vocabulary, RESIDENT);
+        assert!(kept > second && kept - second > 2 * 256 * vocabulary as u64 * 2, "{kept} {second}");
+        assert!(kept < 2200 << 20 && second > 1800 << 20, "{kept} {second}");
+        assert!(splits(1) && splits(2) && !splits(0) && !splits(3) && !splits(16));
+    }
+
+    fn round(policy: &mut Policy, confidence: f32) -> usize {
+        policy.width(&[confidence; 3], 3)
+    }
+
+    /// The most expected tokens a millisecond: a confident draft is verified whole, a hopeless one
+    /// not at all, and rounds that verify none pause the drafting for a while, which a draft that
+    /// is worth it ends.
+    #[test]
+    fn the_policy_verifies_confident_drafts_and_pauses_after_hopeless_ones() {
+        let mut policy = Policy::default();
+        assert_eq!(round(&mut policy, 1.0), 3);
+        assert_eq!(policy.width(&[1.0, 1.0, 1.0], 2), 2, "no more than the pass takes");
+        for _ in 0..PAUSE_AFTER - 1 {
+            assert!(policy.drafting());
+            assert_eq!(round(&mut policy, 0.1), 0);
+        }
+        // (a round worth it in between starts the count again)
+        assert_eq!(round(&mut policy, 1.0), 3);
+        for _ in 0..PAUSE_AFTER {
+            assert_eq!(round(&mut policy, 0.1), 0);
+        }
+        for _ in 0..PAUSE_ROUNDS {
+            assert!(!policy.drafting());
+        }
+        assert!(policy.drafting());
+        // a new context ends a pause
+        for _ in 0..PAUSE_AFTER {
+            round(&mut policy, 0.0);
+        }
+        assert!(!policy.drafting());
+        policy.reset();
+        assert!(policy.drafting());
+    }
+
+    /// What the policy learns: a draft's cost a running mean; a pass's by its rows, one that waited
+    /// (on the drive) counted at most twice the mean; a pass of other rows than it plans for is
+    /// no one's.
+    #[test]
+    fn the_policy_learns_the_costs_it_sees_without_being_misled_by_one_slow_pass() {
+        let mut policy = Policy::new(&[20.0, 30.0], 5.0);
+        policy.drafted(10.0);
+        assert!((policy.draft_ms - 6.0).abs() < 1e-9);
+        policy.passed(2, 1000.0);
+        assert!((policy.verify_ms[1] - (0.9 * 30.0 + 0.1 * 60.0)).abs() < 1e-9);
+        policy.passed(1, 10.0);
+        assert!((policy.verify_ms[0] - 19.0).abs() < 1e-9);
+        for rows in [0, 3, 9] {
+            policy.passed(rows, 1.0);
+        }
+        assert_eq!(policy.verify_ms.len(), 2);
+        assert!((policy.verify_ms[1] - 33.0).abs() < 1e-9);
+        // the width is cut to the rows the policy knows
+        assert_eq!(policy.width(&[1.0, 1.0, 1.0], 3), 1);
+    }
+
+    /// A confidence maps to the rate a slot's token matches, linearly between the table's tenths.
+    #[test]
+    fn a_confidence_is_calibrated_to_a_match_rate_per_slot() {
+        assert_eq!((calibrated(0, 0.0), calibrated(0, 1.0), calibrated(3, 1.0)), (0.0, 1.0, 1.0));
+        assert!((calibrated(0, 0.25) - (0.001 + 0.5 * (0.25 - 0.001))).abs() < 1e-9);
+        assert_eq!(calibrated(1, 2.0), 1.0, "past 1 is 1");
+        assert_eq!(calibrated(9, 0.5), calibrated(3, 0.5), "a slot past the table takes the last");
     }
 }

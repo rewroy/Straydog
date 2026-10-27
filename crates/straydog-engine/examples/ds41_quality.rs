@@ -35,6 +35,8 @@
 //! writes every draft's routes, a line a stage (read back after the draft, outside its timing).
 //! --draft-bench K prefills the first prompt (128 tokens or more), pauses a second, then drafts K
 //! times at its end alone and prints their times (for a kernel trace of the drafts).
+//! DSpark keeps its 87, 50 and 29 most used routed experts of each stage resident (the served
+//! default); DS41_DSPARK_RESIDENT=A,B,C keeps other counts, `all` all 128.
 
 #[path = "common/files.rs"]
 mod files;
@@ -43,7 +45,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use straydog_engine::arch::deepseek41::engine::{forward_split, verify_split, Engine, Settings};
-use straydog_engine::arch::deepseek41::drafter::{Drafter, Policy};
+use straydog_engine::arch::deepseek41::drafter::{Drafter, Policy, DRAFT_MS, VERIFY_MS};
 use straydog_engine::arch::deepseek41::engine::TAP_ROWS;
 use straydog_engine::arch::deepseek41::dspark::Dspark;
 use straydog_engine::arch::deepseek41::Hparams;
@@ -103,9 +105,6 @@ fn summary(label: &str, steps: &[Step]) -> String {
             steps.len(), kls.last().copied().unwrap_or(0.0), 100.0 * top1, ours.exp(), reference.exp())
 }
 
-/// A DeepSeek-V4.1 pass's milliseconds on two GPUs by its rows, 1 to 4 (T133), for the width policy.
-const VERIFY_MS: [f64; 4] = [25.4, 41.4, 57.0, 69.5];
-
 /// The drafter's history: the last pass's last `n` rows' target features (positions up to the
 /// engine's), from each device's tap.
 fn inject(engines: &mut [Engine<'_, files::Files>], drafter: &mut Option<Drafter>, n: usize) -> Result<(), String> {
@@ -148,7 +147,7 @@ fn dump_routes(text: &mut String, run: usize, prompt: usize, round: usize, posit
 fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, drafter: &mut Option<Drafter>, prompts: &[Vec<u32>],
             settings: &Generate, dump: &mut Option<String>) -> Result<(), String> {
     let (count, vocabulary) = (settings.count, settings.vocabulary);
-    let mut policy = Policy::new(&VERIFY_MS, 5.0);
+    let mut policy = Policy::new(&VERIFY_MS, DRAFT_MS);
     let counted = |engines: &[Engine<'_, files::Files>]| {
         engines.iter().map(Engine::cache_counts).fold(straydog_engine::experts::Counts::default(), |a, b| a + b)
     };
