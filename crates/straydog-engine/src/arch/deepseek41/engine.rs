@@ -1111,6 +1111,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 reading += read.elapsed().as_secs_f64();
                 // (engram_wkv is what others call engram_kv)
                 let placed = name.replace(".engram_wkv.", ".engram_kv.");
+                // The hyper-connection weights go to the device as BF16: half of hc_step's reads.
+                if tensor.kind == 0 && (placed.ends_with(".hc_attn_fn.weight") || placed.ends_with(".hc_ffn_fn.weight")) {
+                    let halves: Vec<u8> = tensor.data.chunks_exact(4)
+                        .flat_map(|bytes| crate::vision::bf16(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).to_le_bytes())
+                        .collect();
+                    if !send(&|| Resident::Made(placed.clone(), 30, tensor.dims.clone(), halves.clone())) {
+                        break;
+                    }
+                    continue;
+                }
                 if !send(&|| Resident::Tensor(placed.clone(), copy(&tensor))) {
                     break;
                 }
@@ -2698,6 +2708,11 @@ fn recorded(shard: &mut Shard, key: u64, ops: impl FnOnce(&mut Shard) -> Result<
     if shard.gpu.graph_run(key)? { Ok(false) } else { Err("a recorded graph went missing".into()) }
 }
 
+/// A sublayer's hyper-connection weights as hc_step takes them: BF16 ones tagged (see state_tagged).
+fn hc_weights(fn_: &Dense) -> M {
+    if fn_.kind == 30 { state_tagged(&fn_.buffer) } else { fn_.buffer.base() }
+}
+
 /// The hyper-connection weights of a sublayer and its input norm.
 fn sublayer(shard: &Shard, layer: usize, side: &str, norm: &str) -> Result<(Dense, Dense, Dense, Dense)> {
     Ok((shard.dense(&name(layer, &format!("hc_{side}_fn")))?, shard.dense(&name(layer, &format!("hc_{side}_base")))?,
@@ -2714,7 +2729,7 @@ fn hc_attention(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: u
     let pre = pre_previous.map_or(work.identity, |slot| work.pre_f[slot]);
     let x = if link { work.parts[1] } else { work.out };
     let expansion = expand.then(|| (x.base() as P, work.stream2.base() as P, work.post_f.base() as P, work.comb_f.base() as P));
-    shard.gpu.hc_step(expansion, work.stream.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(), work.pre_a.base(),
+    shard.gpu.hc_step(expansion, work.stream.base(), Some((hc_weights(&fn_), base.buffer.base(), scale.buffer.base(), work.pre_a.base(),
                       work.post_a.base(), work.comb_a.base())), hp.sinkhorn_iterations as u64, hp.hc_eps, hp.norm_eps, pre.base(),
                       norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace, work.x.base(),
                       (link && expand).then_some(EXPERTS))
@@ -2726,7 +2741,7 @@ fn hc_ffn(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, 
     let (fn_, base, scale, norm) = sublayer(shard, layer, "ffn", "ffn_norm")?;
     let x = if link { work.parts[0] } else { work.out };
     let expansion = (x.base() as P, work.stream.base() as P, work.post_a.base() as P, work.comb_a.base() as P);
-    shard.gpu.hc_step(Some(expansion), work.stream2.base(), Some((fn_.buffer.base(), base.buffer.base(), scale.buffer.base(),
+    shard.gpu.hc_step(Some(expansion), work.stream2.base(), Some((hc_weights(&fn_), base.buffer.base(), scale.buffer.base(),
                       work.pre_f[layer % 2].base(), work.post_f.base(), work.comb_f.base())), hp.sinkhorn_iterations as u64, hp.hc_eps,
                       hp.norm_eps, work.pre_a.base(), norm.buffer.base(), n as u64, hp.hc as u64, hp.width as u64, &work.hc_workspace,
                       work.x.base(), link.then_some(ATTENTION))
