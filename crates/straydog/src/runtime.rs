@@ -523,10 +523,15 @@ impl Process {
 
 impl Process {
     async fn send(&mut self, frame: &pyjson::Value) -> Result<(), String> {
-        let mut line = pyjson::dumps(frame).into_bytes();
+        let line = pyjson::dumps(frame).into_bytes();
         if line.len() >= FRAME_BYTES {
             return Err("Straydog request exceeds its IPC frame limit".into());
         }
+        self.send_line(line).await
+    }
+
+    /// A frame already written (shorter than [`FRAME_BYTES`]).
+    async fn send_line(&mut self, mut line: Vec<u8>) -> Result<(), String> {
         line.push(b'\n');
         self.stdin.write_all(&line).await.map_err(|exc| exc.to_string())?;
         self.stdin.flush().await.map_err(|exc| exc.to_string())
@@ -981,8 +986,15 @@ impl Driver {
     /// Run one generation, forwarding its events; Err only when the worker is unusable.
     async fn generation(&self, process: &mut Process, job: &Job, controls: &mut mpsc::UnboundedReceiver<Control>)
                         -> Result<(), String> {
-        process.send(&frame(vec![("id", pyjson::Value::Str(job.id.clone())), ("command", pyjson::Value::Str("chat".into())),
-                                 ("body", job.body.clone())])).await?;
+        let chat = pyjson::dumps(&frame(vec![("id", pyjson::Value::Str(job.id.clone())), ("command", pyjson::Value::Str("chat".into())),
+                                             ("body", job.body.clone())])).into_bytes();
+        if chat.len() >= FRAME_BYTES {
+            // (the request's fault: refused, and the worker serves on)
+            let message = format!("Straydog request too large for its worker ({} MiB; at most {} MiB)", chat.len() >> 20, FRAME_BYTES >> 20);
+            let _ = job.events.send(json!({"event": "error", "message": message, "fatal": false})).await;
+            return Ok(());
+        }
+        process.send_line(chat).await?;
         let cancel_frame = frame(vec![("id", pyjson::Value::Str(job.id.clone())),
                                       ("command", pyjson::Value::Str("cancel".into()))]);
         let mut forwarding = true;

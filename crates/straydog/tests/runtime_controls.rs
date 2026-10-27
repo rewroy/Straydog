@@ -3,7 +3,8 @@
 //! still reaches the worker at once, and the client then gets the generation's end; a worker
 //! that fails to start fails the runtime, which says so (the server then exits); closing the
 //! runtime returns only once every process of the worker's tree has exited, the one outside
-//! its process group too (as a sandbox's is). No GPU or model.
+//! its process group too (as a sandbox's is); a request too large for the worker is refused alone.
+//! No GPU or model.
 //!
 //! cargo test -p straydog --features hip --test runtime_controls
 
@@ -161,6 +162,27 @@ fn main() {
         assert!(deltas < 5000, "{deltas} deltas: the worker was not stopped early");
         println!("runtime_controls: interrupt reached the stand-in in {:.0} ms with the client not reading; {deltas} deltas",
                  started.elapsed().as_secs_f64() * 1e3);
+
+        // A request past the frame limit is refused alone, the worker serving on; one past the old
+        // 16 MiB limit (a conversation's tenth screenshot, which stopped the server) reaches it.
+        for (bytes, refused) in [(straydog::worker::FRAME_BYTES + 1, true), (20 << 20, false)] {
+            let body = pyjson::parse(&format!(r#"{{"messages": [{{"role": "user", "content": "{}"}}]}}"#, "x".repeat(bytes))).unwrap();
+            let mut generation = engine.generate(body).await.unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(30), generation.events.next()).await.unwrap().unwrap();
+            if refused {
+                assert_eq!((first["event"].as_str(), first["fatal"].as_bool()), (Some("error"), Some(false)), "{first}");
+                assert!(matches!(engine.state(), EngineState::Ready { .. }), "{:?}", engine.state());
+                continue;
+            }
+            assert_eq!(first["event"].as_str(), Some("delta"), "{first}");
+            (generation.interrupt)();
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(10), generation.events.next()).await.unwrap() {
+                if event["event"].as_str() == Some("done") {
+                    break;
+                }
+            }
+        }
+        println!("runtime_controls: a request past the frame limit refused alone; a 20 MiB one served");
         engine.close().await;
 
         // A worker that fails to start: the runtime fails with its reason, at once.

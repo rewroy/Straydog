@@ -134,7 +134,7 @@ impl SamplingDefaults {
 }
 
 /// The largest request body.
-const BODY_LIMIT: usize = 64 * 1024 * 1024;
+pub const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// What a request sees while the model loads (llama-server's wording).
 const LOADING: &str = "Loading model";
 
