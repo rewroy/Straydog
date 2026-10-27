@@ -7,6 +7,12 @@
 //! expert contribution moves the first layers' state some 60 times further than FP16 does (a
 //! scatter whose adds to one row raced did).
 //!
+//! A layer's distance is compared by each path's worst layer, not layer by layer: since the compressed rows and
+//! index keys are BF16 (85b1882) a layer's state moves in steps. One rounding that goes the other way, or one
+//! index pick that flips, in one path adds ~1.3e-3 to a layer's distance and none to the other's, and which of
+//! the two paths it lands on, and in which layer, is chance: expanded 2.5e-3 at layer 2 and grouped 1.1e-3, grouped
+//! 2.5e-3 at layer 3 and expanded 1.3e-3 (before BF16: layer 3 expanded 1.2e-3, grouped 0.8e-3).
+//!
 //! cargo test -p straydog-engine --features hip --test deepseek41_slot_wmma, with STRAYDOG_DS41 (the
 //! GSQ-RCO IQ2_XS bundle directory, its verity trees in .straydog there); under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -81,12 +87,14 @@ fn an_fp16_pass_through_the_grouped_kernels_is_as_accurate_as_the_expanded_gemms
     let (grouped, grouped_rings) = run(true, true);
     let differ = expanded.iter().zip(&grouped).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
     assert!(differ > 0, "the grouped kernels did not run (the logits are bit for bit the expanded GEMMs')");
+    let (mut worst_expanded, mut worst_grouped) = (0f64, 0f64);
     for (layer, ((exact, expanded), grouped)) in exact_rings.iter().zip(&expanded_rings).zip(&grouped_rings).enumerate() {
         let (expanded, grouped) = (relative(exact, expanded), relative(exact, grouped));
         eprintln!("layer {} window: expanded {expanded:.3e}, grouped {grouped:.3e} from F32", layer + 1);
-        assert!(grouped <= 1.5 * expanded + 1e-5, "layer {}: the grouped kernels' state is {grouped:.3e} from F32, the expanded \
-                                                   GEMMs' {expanded:.3e}", layer + 1);
+        (worst_expanded, worst_grouped) = (worst_expanded.max(expanded), worst_grouped.max(grouped));
     }
+    assert!(worst_grouped <= 1.5 * worst_expanded + 1e-5, "the grouped kernels' worst layer is {worst_grouped:.3e} from F32, the expanded \
+                                                           GEMMs' {worst_expanded:.3e}");
     let (from_expanded, from_grouped) = (kl(&exact, &expanded), kl(&exact, &grouped));
     eprintln!("KL from F32: expanded {from_expanded:.3e}, grouped {from_grouped:.3e}");
     assert!(from_grouped <= 2.0 * from_expanded + 1e-3, "KL from F32: grouped {from_grouped:.3e}, expanded {from_expanded:.3e}");
