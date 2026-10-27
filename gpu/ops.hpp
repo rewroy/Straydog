@@ -375,6 +375,19 @@ __device__ __forceinline__ float hc_step_load(float* at) {
     return *static_cast<volatile float*>(at);
 #endif
 }
+// v plus the value of lane ^ OFFSET of a 32-lane wave (OFFSET 1, 2, 4, 8 or 16): __shfl_xor's exchange, on
+// RDNA4 through DPP (row_xmask) and permlanex16 instead of an LDS permute (ds_bpermute's ~50-cycle
+// round trip), the same values in the same sums.
+template<unsigned OFFSET>
+__device__ __forceinline__ float wave_xor_add(float v) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const int bits = __float_as_int(v);
+    if constexpr (OFFSET == 16) return v + __int_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210u, 0xfedcba98u, false, false));
+    else return v + __int_as_float(__builtin_amdgcn_update_dpp(bits, bits, 0x160 | OFFSET, 0xf, 0xf, false));
+#else
+    return v + __shfl_xor(v, OFFSET, 32);
+#endif
+}
 template<int HC>
 __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
                                   float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
@@ -411,6 +424,13 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     for (size_t pair = threadIdx.x; pair < HC * hc_step_columns; pair += blockDim.x) {
         const size_t j = pair / hc_step_columns, c = pair % hc_step_columns, col = first + c;
         if (c >= columns) continue;
+        // the weights' loads first: issued with x's and the residual's, not after the stream's store
+        // (which the compiler cannot tell from fn's memory): one trip to DRAM, not two
+        float f[MIX];
+        if (fn) {
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) f[m] = fn[(m * HC + j) * width + col];
+        }
         float v;
         if (x) {
             const float xv = link.state ? summed[c] : x[row * width + col];
@@ -422,7 +442,7 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
         values[j][c] = v;
         if (fn) {
             #pragma unroll
-            for (int m = 0; m < MIX; ++m) acc[m] += fn[(m * HC + j) * width + col] * v;
+            for (int m = 0; m < MIX; ++m) acc[m] += f[m] * v;
         }
         acc[MIX] += v * v;
     }
@@ -437,7 +457,7 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     #pragma unroll
     for (int m = 0; m < SUMS; ++m) {
         float v = acc[m];
-        for (unsigned offset = 16; offset; offset /= 2) v += __shfl_xor(v, offset, 32);
+        v = wave_xor_add<16>(v); v = wave_xor_add<8>(v); v = wave_xor_add<4>(v); v = wave_xor_add<2>(v); v = wave_xor_add<1>(v);
         if (lane == 0) reduce[wave][m] = v;
     }
     __syncthreads();
