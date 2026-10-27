@@ -394,7 +394,7 @@ struct Device {
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
-    bool q8_decode = false;   // a decode row's Q5_K GEMVs and IQ2 experts' gate/up on the Q8 kernels (RDNA4)
+    bool q8_decode = false;   // a decode row's Q5_K GEMVs, IQ2 experts' gate/up and down (IQ2_S's down excepted) and Q5_K shared expert on the Q8 kernels (RDNA4)
     uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
     unsigned compute_units = 0;   // the device's CUs (SMs on CUDA)
