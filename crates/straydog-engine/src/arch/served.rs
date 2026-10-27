@@ -326,6 +326,10 @@ struct Decoded {
     engine_accepted: usize,
 }
 
+/// A prompt-lookup match of this many tokens (the lookup policy's widest) is verified without
+/// asking the engines for a draft ([`Engines::draft`]).
+const LONG_MATCH: usize = 8;
+
 /// Sample from `logits` (after the held sequence, `history`) and continue it: up to `max_new`
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
 /// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
@@ -358,19 +362,28 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         }
         let (drafts, engine_draft) = if rows > 1 {
             ngrams.push(next);
-            match engines.draft(next, rows - 1)? {
-                Some(mut proposal) => {
-                    proposal.truncate((rows - 1).min(max_new - done.emitted));
-                    if proposal.iter().any(|&token| token as usize >= vocabulary) {
-                        return Err("Straydog engine drafted a token out of range".into());
+            // A long match is verified as it is: those drafts are accepted nearly always (an edit
+            // repeats its source), and an engine's draft costs milliseconds to be no better.
+            let (proposal, matched) = ngrams.propose(rows - 1);
+            let mut lookup = None;
+            if matched >= LONG_MATCH {
+                lookup = Some(policy.width(matched).min(proposal.len()));
+            }
+            match lookup.filter(|&width| width > 0) {
+                Some(width) => (proposal[..width.min(max_new - done.emitted)].to_vec(), false),
+                None => match engines.draft(next, rows - 1)? {
+                    Some(mut proposal) => {
+                        proposal.truncate((rows - 1).min(max_new - done.emitted));
+                        if proposal.iter().any(|&token| token as usize >= vocabulary) {
+                            return Err("Straydog engine drafted a token out of range".into());
+                        }
+                        (proposal, true)
                     }
-                    (proposal, true)
-                }
-                None => {
-                    let (proposal, matched) = ngrams.propose(rows - 1);
-                    let width = policy.width(matched).min(proposal.len()).min(max_new - done.emitted);
-                    (proposal[..width].to_vec(), false)
-                }
+                    None => {
+                        let width = lookup.unwrap_or_else(|| policy.width(matched)).min(proposal.len()).min(max_new - done.emitted);
+                        (proposal[..width].to_vec(), false)
+                    }
+                },
             }
         } else {
             (Vec::new(), false)
@@ -958,7 +971,7 @@ mod tests {
 
     #[test]
     fn none_keeps_prompt_lookup_and_empty_explicitly_declines_it() {
-        let (plain, plain_done) = run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        let (plain, _) = run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
         let (_, lookup_done) = run(4, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
         assert!(lookup_done.drafted > 0 && lookup_done.accepted > 0);
         let (fallback, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(None)]);
@@ -966,11 +979,30 @@ mod tests {
         assert_eq!(done, lookup_done);
         assert!(!fallback.verified.is_empty() && !fallback.draft_calls.is_empty());
         assert_eq!((done.engine_drafted, done.engine_accepted), (0, 0));
-        let (empty, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(Some(Vec::new())); 80]);
+        // (eight tokens: the toy's reply repeats two tokens and its matches stay below a long one)
+        let (plain, plain_done) = run(1, &PROMPT, &[], 8, &Sampling::GREEDY, 1);
+        let (empty, out, done) = scripted(4, &PROMPT, &[], 8, vec![Ok(Some(Vec::new())); 8]);
         assert_eq!(out, plain);
         assert_eq!(done, plain_done);
-        assert_eq!(empty.draft_calls.len(), 79);
+        assert_eq!(empty.draft_calls.len(), 7);
         assert!(empty.verified.is_empty() && empty.rewinds.is_empty());
+    }
+
+    /// A lookup match of [`LONG_MATCH`] tokens is verified without asking the engine for a draft,
+    /// whatever it would have said; shorter matches leave the draft to the engine.
+    #[test]
+    fn a_long_lookup_match_is_verified_without_asking_the_engine() {
+        let (plain, _) = run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        // (the toy repeats 3, 6: the match reaches 8 tokens with the eighth reply token)
+        let (toy, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(Some(Vec::new())); 80]);
+        assert_eq!(out, plain);
+        assert_eq!(toy.draft_calls.len(), 7);
+        assert!(!toy.verified.is_empty() && done.drafted > 0 && done.accepted > 0);
+        assert_eq!((done.engine_drafted, done.engine_accepted), (0, 0));
+        // an engine that has drafts for every round is heard only while the matches are short
+        let (toy, out, done) = scripted(4, &PROMPT, &[], 80, vec![Ok(Some(vec![3])); 80]);
+        assert_eq!(out, plain);
+        assert!(toy.draft_calls.len() < done.passes && done.engine_drafted >= 1 && done.drafted > done.engine_drafted);
     }
 
     #[test]
