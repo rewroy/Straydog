@@ -205,6 +205,23 @@ struct SourceRows {
     pass_gate: Buffer,
 }
 
+/// A kv source's compressed rows or index keys lent to the device's expert store past the
+/// sequence's reach ([`Engine::reserve_state`]): the store's region, the source's ratio, a group's
+/// bytes there, the buffer's bytes, and how far from its start the store has given them back.
+#[derive(Clone, Copy)]
+struct StateRegion {
+    region: usize,
+    ratio: usize,
+    row_bytes: u64,
+    bytes: u64,
+    reclaimed: u64,
+}
+
+/// Tokens past a pass's reach its kv source buffers are taken back for (the next passes'
+/// groups), and past which, the sequence shorter, they go back to the expert store.
+const STATE_AHEAD: usize = 4096;
+const STATE_KEEP: usize = 16384;
+
 /// A BF16 state buffer as the kernels take it: its address with bit 0 set (gpu/ops.hpp state_tag).
 fn state_tagged(buffer: &Buffer) -> M {
     buffer.base().wrapping_byte_add(1)
@@ -353,8 +370,12 @@ struct Shard {
     /// [`Work::in_arena`]), lent to the expert store between such passes (DS41_LEND=0: not lent).
     arena: Option<Buffer>,
     shape: RowShape,
-    /// The bytes of `arena` the store gave back for the passes since the last of a few rows.
+    /// The bytes of `arena` the store gave back for the passes since the last of a few rows, and
+    /// the store's region `arena` is (none: not lent).
     reclaimed: u64,
+    arena_region: Option<usize>,
+    /// The kv sources' buffers lent to the store too.
+    state_regions: Vec<StateRegion>,
     experts: DeviceExperts,
     checks: Option<SlotChecks>,
     /// The routers' image biases (every layer's, one after another), uploaded with the first image.
@@ -838,8 +859,23 @@ impl Shard {
             hc, w, k, ff, top_k: hp.index_top_k, chosen: work.chosen.keys().copied().collect(), blocks, split: parts > 1, capacity: r,
         };
         let arena = if r > own { Some(gpu.buffer(shape.bytes(r))?) } else { None };
-        if let Some(arena) = arena.filter(|_| std::env::var("DS41_LEND").map_or(true, |value| value != "0")) {
-            experts.lend(arena)?;
+        let arena_region = match arena.filter(|_| std::env::var("DS41_LEND").map_or(true, |value| value != "0")) {
+            Some(arena) => Some(experts.lend_region(arena)?.0),
+            None => None,
+        };
+        // The kv sources' compressed rows and index keys past the sequence's reach hold experts
+        // too (DS41_LEND_STATE=0: not lent): a pass takes back what it reaches, a shorter sequence
+        // gives the rest back. Sized for the whole context, they sit mostly unused (a 75K-token
+        // sequence of 262144 reaches 29%).
+        let mut state_regions = Vec::new();
+        if std::env::var("DS41_LEND_STATE").map_or(true, |value| value != "0") {
+            for (&layer, rows) in &sources {
+                let ratio = hp.layers[layer].compressed.map_or(1, |c| c.ratio);
+                for (buffer, dim) in [(rows.rows, hp.head_dim), (rows.keys, hp.index_dim)] {
+                    let (region, _) = experts.lend_region(buffer)?;
+                    state_regions.push(StateRegion { region, ratio, row_bytes: (dim * 2) as u64, bytes: buffer.bytes, reclaimed: 0 });
+                }
+            }
         }
         let checks = match std::env::var_os("DS41_CHECK_SLOTS") {
             Some(_) => Some(SlotChecks { partials: gpu.buffer((CHECKS * 64 * 8) as u64)?, queued: Vec::new(), first: HashMap::new(), mismatches: 0 }),
@@ -850,7 +886,8 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
-            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, experts, image_bias: None,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, state_regions, experts,
+            image_bias: None,
         })
     }
 
@@ -1443,6 +1480,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// Put a [`Engine::snapshot`] back on every device: the sequence as it was then.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
         let (dim, ring, position) = (self.hp.head_dim, self.ring, snapshot.position);
+        // (the kv sources' buffers back from the expert stores before the snapshot's rows go in)
+        self.reserve_state(position)?;
         for shard in &mut self.shards {
             for (layer, rows) in &snapshot.windows {
                 let buffer = shard.rings.get(layer).ok_or("a snapshot of another engine's layers")?;
@@ -1570,6 +1609,29 @@ impl<'a, T: Tensors> Engine<'a, T> {
         VERIFY_ROWS.min(self.settings.batch).min(experts / self.hp.experts_used).max(1)
     }
 
+    /// Each device's kv source buffers taken back from its expert store as far as a sequence of
+    /// `tokens` reaches and [`STATE_AHEAD`] more, before a pass writes or reads them (between
+    /// passes: no slot held); past [`STATE_KEEP`] more, a shorter sequence's, given back (their
+    /// fills waiting for the work queued so far, the last to touch those bytes).
+    fn reserve_state(&mut self, tokens: usize) -> Result<()> {
+        for shard in &mut self.shards {
+            for state in &mut shard.state_regions {
+                let reach = |tokens: usize| ((tokens / state.ratio + 1) as u64 * state.row_bytes).min(state.bytes);
+                let need = reach(tokens + STATE_AHEAD);
+                if need > state.reclaimed {
+                    shard.experts.reclaim_region(&mut shard.gpu, state.region, need)?;
+                    state.reclaimed = need;
+                } else if reach(tokens + STATE_KEEP) < state.reclaimed {
+                    let keep = reach(tokens + STATE_KEEP);
+                    let after = shard.gpu.mark(Stream::Compute)?;
+                    shard.experts.restore_region(state.region, after, keep);
+                    state.reclaimed = keep;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Each device's buffers for a pass of `n`: its own for at most [`OWN_ROWS`] (the arena given
     /// back to its expert store, whose fills into it wait for the passes before), else the arena's,
     /// laid out for `n`, the store giving back the lent slots as far as they reach.
@@ -1580,8 +1642,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 Some(arena) if n > OWN_ROWS => {
                     let work = shard.own.in_arena(arena, n, &shard.shape)?;
                     let reach = shard.shape.bytes(n);
-                    if reach > shard.reclaimed {
-                        shard.experts.reclaim(&mut shard.gpu, reach)?;
+                    if let Some(region) = shard.arena_region.filter(|_| reach > shard.reclaimed) {
+                        shard.experts.reclaim_region(&mut shard.gpu, region, reach)?;
                         shard.reclaimed = reach;
                     }
                     // With several devices, each writes only its columns of an expert's gate, up and
@@ -1595,9 +1657,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     shard.work = work;
                 }
                 _ => {
-                    if shard.reclaimed > 0 {
+                    if let Some(region) = shard.arena_region.filter(|_| shard.reclaimed > 0) {
                         let after = shard.gpu.mark(Stream::Compute)?;
-                        shard.experts.restore(after);
+                        shard.experts.restore_region(region, after, 0);
                         shard.reclaimed = 0;
                     }
                     shard.work = shard.own.clone();
@@ -1614,6 +1676,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if n == 0 || n > self.settings.rows.max(self.settings.batch) || self.position + n > self.settings.context {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
+        self.reserve_state(self.position + n)?;
         self.select_work(n)?;
         self.stamp_pass(n, 0)?;
         // A prompt pass's projections take FP16 operands as its FFN's do: in F32, its attention's

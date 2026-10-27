@@ -514,6 +514,61 @@ fn a_lent_region_holds_experts_and_goes_back_to_its_lender() {
     std::fs::remove_file(&path).unwrap();
 }
 
+/// Several regions lent to the store (DeepSeek-V4.1's arena and its kv source buffers): each goes
+/// back by its own reclaim, the others' slots untouched; a region given back past a point keeps the
+/// bytes before it, and no expert lands in bytes its lender holds. Every expert reads back as the
+/// file has it.
+#[test]
+fn lent_regions_go_back_each_on_its_own() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let slot_bytes = store.slot_size(0).unwrap();
+    let (first, second) = (gpu.buffer(slot_bytes * 4).unwrap(), gpu.buffer(slot_bytes * 8 + 500).unwrap());
+    assert_eq!(store.lend_region(first).unwrap(), (0, 4));
+    assert_eq!(store.lend_region(second).unwrap(), (1, 8));
+    assert_eq!(store.lent_slots(), (12, 12));
+    let fill = |gpu: &mut Backend, store: &mut DeviceExperts, batches: &[std::ops::Range<usize>], held: &[(u64, u64)], what: &str| {
+        for batch in batches {
+            let batch: Vec<usize> = batch.clone().collect();
+            let slots = store.acquire(gpu, 0, &batch).unwrap();
+            check_slots(gpu, &roles, &batch, &slots, what);
+            for slot in &slots {
+                let start = slot.base() as u64;
+                assert!(held.iter().all(|&(from, to)| start + slot_bytes <= from || start >= to), "{what}: an expert in bytes a lender holds");
+            }
+            store.release(gpu).unwrap();
+        }
+    };
+    fill(&mut gpu, &mut store, &[0..8, 8..16, 16..24], &[], "into own and both regions' slots");
+    // The second region's first five slots back: the first region's four stay lent.
+    let (base, five) = (second.base() as u64, slot_bytes * 5);
+    store.reclaim_region(&mut gpu, 1, five).unwrap();
+    assert_eq!(store.lent_slots(), (7, 12));
+    let floats = five / 4;
+    let ones = gpu.buffer(floats * 4).unwrap();
+    gpu.write_buffer(&ones, 0, &vec![1.0f32; floats as usize]).unwrap();
+    for _ in 0..10 {
+        gpu.copy(ones.base().cast_const(), second.base(), five).unwrap();
+    }
+    fill(&mut gpu, &mut store, &[24..32, 0..8, 32..40], &[(base, base + five)], "after the second region's start went back");
+    // Given back from its third slot on: the first two stay with the lender.
+    let after = gpu.mark(straydog_engine::transfer::Stream::Compute).unwrap();
+    store.restore_region(1, after, slot_bytes * 2);
+    assert_eq!(store.lent_slots(), (10, 12));
+    fill(&mut gpu, &mut store, &[40..48, 8..16, 16..24], &[(base, base + slot_bytes * 2)], "after part of it came back");
+    // The first region back whole, and given back whole (the region the arena's reclaim and restore take).
+    store.reclaim(&mut gpu, slot_bytes * 4).unwrap();
+    assert_eq!(store.lent_slots(), (6, 12));
+    let after = gpu.mark(straydog_engine::transfer::Stream::Compute).unwrap();
+    store.restore(after);
+    assert_eq!(store.lent_slots(), (10, 12));
+    fill(&mut gpu, &mut store, &[0..8, 24..32], &[(base, base + slot_bytes * 2)], "after the first region came back");
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// Fills taken by [`DeviceExperts::acquire_gate_up`] read back whole once [`await_rest`] waited for
 /// their downs, and a release before that wait fails.
 #[test]
