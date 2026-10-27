@@ -44,6 +44,30 @@ const NORM_EPS: f32 = 1e-20;
 const HC_EPS: f32 = 1e-6;
 const SINKHORN: u64 = 20;
 const CLAMP: f32 = 10.0;
+/// Each stage's routed experts by how often DSpark's drafts routed to them, most first: route dumps
+/// of nine prompts (six probes, an essay, a tool call, code), generated and teacher forced, 26K
+/// routes a stage (2026-10-25). A stage uses few: 98% of its routes go to its first 87, 50 and 29.
+const RANKING: [[u8; EXPERTS]; 3] = [
+    [97, 43, 36, 85, 8, 121, 92, 19, 93, 95, 109, 33, 61, 17, 72, 45, 73, 5, 101, 3, 110, 47, 71, 24, 124, 27, 67, 69, 117, 42, 68, 96, 14, 59, 87, 23, 39, 65, 113, 77, 115, 26, 15, 76, 51, 34, 58, 6, 13, 75, 123, 100, 31, 63, 62, 120, 57, 83, 49, 46, 35, 60, 21, 119, 66, 112, 64, 125, 70, 4, 99, 108, 50, 111, 53, 118, 89, 82, 98, 122, 20, 22, 79, 48, 28, 114, 106, 78, 90, 11, 102, 107, 54, 74, 86, 7, 38, 105, 104, 2, 88, 41, 52, 126, 84, 16, 30, 56, 81, 80, 32, 37, 29, 0, 1, 9, 10, 12, 18, 25, 40, 44, 55, 91, 94, 103, 116, 127],
+    [121, 109, 61, 98, 78, 113, 126, 56, 58, 82, 71, 26, 29, 114, 5, 49, 24, 32, 10, 35, 79, 45, 100, 77, 53, 122, 66, 52, 74, 42, 76, 90, 97, 111, 39, 123, 63, 27, 21, 89, 28, 3, 62, 36, 22, 1, 18, 102, 115, 31, 25, 60, 116, 55, 73, 37, 7, 11, 125, 101, 68, 64, 118, 107, 110, 41, 19, 46, 95, 80, 96, 23, 47, 120, 30, 6, 124, 57, 51, 65, 43, 0, 2, 4, 8, 9, 12, 13, 14, 15, 16, 17, 20, 33, 34, 38, 40, 44, 48, 50, 54, 59, 67, 69, 70, 72, 75, 81, 83, 84, 85, 86, 87, 88, 91, 92, 93, 94, 99, 103, 104, 105, 106, 108, 112, 117, 119, 127],
+    [19, 58, 97, 98, 81, 127, 103, 16, 9, 17, 78, 38, 102, 12, 116, 6, 52, 101, 39, 83, 53, 27, 118, 45, 122, 88, 21, 120, 84, 67, 96, 93, 47, 110, 14, 51, 111, 61, 13, 80, 54, 85, 40, 15, 82, 49, 59, 77, 11, 66, 79, 94, 5, 91, 119, 112, 0, 1, 2, 3, 4, 7, 8, 10, 18, 20, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 41, 42, 43, 44, 46, 48, 50, 55, 56, 57, 60, 62, 63, 64, 65, 68, 69, 70, 71, 72, 73, 74, 75, 76, 86, 87, 89, 90, 92, 95, 99, 100, 104, 105, 106, 107, 108, 109, 113, 114, 115, 117, 121, 123, 124, 125, 126]
+];
+
+/// The routed experts a stage keeps resident, in slot order: all, or with DS41_DSPARK_RESIDENT=A,B,C
+/// each stage's first A, B, C of [`RANKING`]. A draft routes among those alone (the router's bias
+/// keeps the others out of its top 3), so the drafter takes the target's expert store only their
+/// bytes: all 384 are 7.2 GB, the 166 that take 98% of the routes 3.1 GB.
+fn resident(stage: usize) -> Result<Vec<usize>> {
+    let Some(counts) = std::env::var_os("DS41_DSPARK_RESIDENT") else { return Ok((0..EXPERTS).collect()) };
+    let counts: Vec<usize> = counts.to_string_lossy().split(',').map(|count| count.trim().parse::<usize>())
+        .collect::<std::result::Result<_, _>>().map_err(|_| "DS41_DSPARK_RESIDENT takes three counts, A,B,C")?;
+    match counts.get(stage) {
+        Some(&count) if counts.len() == 3 && (USED..=EXPERTS).contains(&count) => {
+            Ok(RANKING[stage][..count].iter().map(|&expert| expert as usize).collect())
+        }
+        _ => Err(format!("DS41_DSPARK_RESIDENT takes three counts from {USED} to {EXPERTS}")),
+    }
+}
 const SCALE: f32 = 1.5;
 const FEATURES: usize = 3 * WIDTH;
 /// The drafter's graph keys on a device: this, the part of a draft (a stage's attention, routes and
@@ -179,9 +203,9 @@ fn rows<'t>(tensor: &Tensor<'t>, first: usize, count: usize) -> Result<&'t [u8]>
     tensor.data.get(first * bytes..(first + count) * bytes).ok_or_else(|| "DSpark rows past a tensor's end".to_string())
 }
 
-/// This device's rows (`first..first + ffn` of the width) of each of `count` experts as slots: of
-/// gate and up those rows, of down those columns.
-fn expert_slots(gpu: &mut Backend, [gate, up, down]: &[Tensor<'_>; 3], count: usize, first: usize, ffn: usize) -> Result<(Buffer, Slot)> {
+/// This device's rows (`first..first + ffn` of the width) of each of `experts` as slots, in that
+/// order: of gate and up those rows, of down those columns.
+fn expert_slots(gpu: &mut Backend, [gate, up, down]: &[Tensor<'_>; 3], experts: &[usize], first: usize, ffn: usize) -> Result<(Buffer, Slot)> {
     let (width, hidden) = (gate.dims[1], down.dims[1]);
     let slot = |expert: usize| -> Result<Vec<u8>> {
         let down = columns(down.kind, hidden, width, rows(down, expert * hidden, hidden)?, first, ffn)?;
@@ -189,12 +213,12 @@ fn expert_slots(gpu: &mut Backend, [gate, up, down]: &[Tensor<'_>; 3], count: us
     };
     let gate_bytes = formats::matrix_bytes(gate.kind, ffn, gate.dims[0]).ok_or("unsupported expert type")? as u64;
     let up_bytes = formats::matrix_bytes(up.kind, ffn, up.dims[0]).ok_or("unsupported expert type")? as u64;
-    let first_slot = slot(0)?;
+    let first_slot = slot(experts[0])?;
     let bytes = first_slot.len() as u64;
-    let buffer = gpu.buffer(bytes * count as u64)?;
+    let buffer = gpu.buffer(bytes * experts.len() as u64)?;
     gpu.write_buffer(&buffer, 0, &first_slot)?;
-    for expert in 1..count {
-        gpu.write_buffer(&buffer, expert as u64 * bytes, &slot(expert)?)?;
+    for (index, &expert) in experts.iter().enumerate().skip(1) {
+        gpu.write_buffer(&buffer, index as u64 * bytes, &slot(expert)?)?;
     }
     Ok((buffer, Slot { bytes, offsets: [0, gate_bytes, gate_bytes + up_bytes] }))
 }
@@ -225,13 +249,18 @@ impl Part {
             let whole = |gpu: &mut Backend, suffix: &str, kind: u32, dims: &[usize]| upload(gpu, draft, &name(suffix), kind, dims);
             let routed = [t("ffn_gate_exps.weight", 39, &[WIDTH, FFN, EXPERTS])?, t("ffn_up_exps.weight", 39, &[WIDTH, FFN, EXPERTS])?,
                           t("ffn_down_exps.weight", 39, &[FFN, WIDTH, EXPERTS])?];
-            let (slots, slot) = expert_slots(gpu, &routed, EXPERTS, index * ffn, ffn)?;
+            let kept = resident(stage)?;
+            let (slots, slot) = expert_slots(gpu, &routed, &kept, index * ffn, ffn)?;
             let table = gpu.buffer(EXPERTS as u64 * 8)?;
-            let bases: Vec<u64> = (0..EXPERTS as u64).map(|expert| slots.base() as u64 + expert * slot.bytes).collect();
+            // (an expert not kept is never routed to: its entry is the first slot's)
+            let mut bases = vec![slots.base() as u64; EXPERTS];
+            for (at, &expert) in kept.iter().enumerate() {
+                bases[expert] = slots.base() as u64 + at as u64 * slot.bytes;
+            }
             gpu.expert_table(&table, &bases, slot.bytes)?;
             let shared = [t("ffn_gate_shexp.weight", 8, &[WIDTH, FFN])?, t("ffn_up_shexp.weight", 8, &[WIDTH, FFN])?,
                           t("ffn_down_shexp.weight", 8, &[FFN, WIDTH])?];
-            let (shared, shared_slot) = expert_slots(gpu, &shared, 1, index * ffn, ffn)?;
+            let (shared, shared_slot) = expert_slots(gpu, &shared, &[0], index * ffn, ffn)?;
             (experts, shared_expert) = (Some(slot), Some(shared_slot));
             // this device's heads of q_b and of the sinks, its groups of wo_a and their columns of wo_b
             let q_b = t("attn_q_b.weight", 8, &[Q_RANK, HEADS * HEAD_DIM])?;
@@ -254,7 +283,17 @@ impl Part {
                 hc_ffn: [whole(gpu, "hc_ffn_fn.weight", 0, &[HC * WIDTH, MIXES])?, whole(gpu, "hc_ffn_base.weight", 0, &[MIXES])?,
                          whole(gpu, "hc_ffn_scale.weight", 0, &[3])?],
                 router: whole(gpu, "ffn_gate_inp.weight", 0, &[WIDTH, EXPERTS])?,
-                bias: upload(gpu, draft, &name("exp_probs_b.bias"), 0, &[EXPERTS])?,
+                bias: {
+                    // (an expert not kept out of every top 3: the bias steers the choice alone)
+                    let data = tensor(draft, &name("exp_probs_b.bias"), 0, &[EXPERTS])?.data;
+                    let mut bias: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                    for (expert, value) in bias.iter_mut().enumerate() {
+                        if !kept.contains(&expert) {
+                            *value = -1e30;
+                        }
+                    }
+                    gpu.upload_bytes(&bias.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<u8>>())?
+                },
                 table,
                 shared,
                 ring: gpu.buffer((RING * HEAD_DIM * 4) as u64)?,
