@@ -878,6 +878,14 @@ size_t gemv_waves(const Matrix& m, unsigned lanes) {
     const size_t rows = lanes ? 32 / lanes : 1;
     return (m.rows + rows - 1) / rows;
 }
+// The lanes of a matrix on the Q8 decode kernels (gemv_q8_input): gemv_lanes', but a Q5_K row of 16 to 31 units (1024 to 1984 values;
+// DeepSeek-V4.1's q_b, 20 units) takes a lane a unit, a row a wave. Over two lanes a wave's loads fan out to sixteen rows and each
+// lane walks ten units in turn: 16384 x 1280 takes 29.2 us there, 27.2 on 32 lanes (the rows of 64 units, wo_a and wo_b, stream
+// faster on eight: 32 cost them a microsecond). Decided by the matrix and the device alone, as gemv_lanes is, so a row's sum is
+// the same whatever shares its launch.
+unsigned gemv_q8_lanes(const Device& d, const Matrix& m, unsigned lanes) {
+    return lanes && d.q8_decode && m.kind == 13 && m.cols >= 1024 && m.cols < 2048 && m.cols % 256 == 0 ? 32 : lanes;
+}
 #if !defined(__HIPCC__)
 // A block owns only one matrix, so its waves can share the same activation
 // vector even when adjacent matrices have different kinds or input offsets.
@@ -986,13 +994,16 @@ template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176
         const uint4* packed = reinterpret_cast<const uint4*>(block + 48 + 32 * pair);
         const uint4 q0 = packed[0], q1 = packed[1];
         const uint4 h0 = reinterpret_cast<const uint4*>(block + 16)[0], h1 = reinterpret_cast<const uint4*>(block + 16)[1];
-        const uint8_t scales[12] = {
-            uint8_t(header.y), uint8_t(header.y >> 8), uint8_t(header.y >> 16), uint8_t(header.y >> 24),
-            uint8_t(header.z), uint8_t(header.z >> 8), uint8_t(header.z >> 16), uint8_t(header.z >> 24),
-            uint8_t(header.w), uint8_t(header.w >> 8), uint8_t(header.w >> 16), uint8_t(header.w >> 24)};
-        unsigned scale0, min0, scale1, min1;
-        gemv_scale_min(scales, 2 * pair, scale0, min0);
-        gemv_scale_min(scales, 2 * pair + 1, scale1, min1);
+        // The pair's two groups' scales and mins, gemv_scale_min's of groups 2 * pair and 2 * pair + 1, from the 12 packed bytes
+        // y, z, w with a group's 8 bits apart in a field: pairs 0 and 1 hold them in 6 bits of y (scales) and z (mins), pairs 2
+        // and 3 in the nibbles of w with their top two bits in y and z. (Indexing an array of the bytes by the pair compiles to
+        // chains of selects, some 300 instructions a unit: the kernel was bound by them, not by the weights.)
+        const bool low = pair < 2;
+        const unsigned shift = 16 * (pair & 1);
+        const uint32_t y = header.y, z = header.z, w = header.w, mask = low ? 0x3F3Fu : 0x0F0Fu;
+        const uint32_t scales = (((low ? y : w) >> shift) & mask) | ((((low ? 0u : y) >> shift) >> 2) & 0x3030u);
+        const uint32_t mins = (((low ? z : w >> 4) >> shift) & mask) | ((((low ? 0u : z) >> shift) >> 2) & 0x3030u);
+        const unsigned scale0 = scales & 255, scale1 = scales >> 8, min0 = mins & 255, min1 = mins >> 8;
         const uint32_t codes[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
         const uint32_t high[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
         const size_t g0 = 2 * unit, g1 = g0 + 1;
@@ -1213,6 +1224,7 @@ bool gemv_linked_launch(Device& d, const Matrix& matrix, const float* input, flo
     unsigned lanes = gemv_lanes(matrix, input);
     size_t alignment = 0;
     if (lanes == 2 && min_lanes > 2 && matrix.cols / gemv_unit(matrix.kind, alignment) >= 32) lanes = std::min(32u, min_lanes);
+    lanes = gemv_q8_lanes(d, matrix, lanes);
     // (BF16 rows may read their input from shared memory, and 2560 x 6144 has kernels of its own)
     if (!lanes || matrix.kind == 30 || (matrix.rows == 2560 && matrix.cols == 6144)) return false;
     FixedGemv list{};
@@ -1247,6 +1259,7 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
         size_t alignment = 0;
         if (lanes == 2 && min_lanes > 2 && matrices[i].cols / gemv_unit(matrices[i].kind, alignment) >= 32)
             lanes = std::min(32u, min_lanes);
+        lanes = gemv_q8_lanes(d, matrices[i], lanes);
         list.items[i] = {matrices[i], uint32_t(waves), lanes};
         waves += gemv_waves(matrices[i], lanes);
     }

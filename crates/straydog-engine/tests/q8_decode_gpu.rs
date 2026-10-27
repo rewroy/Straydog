@@ -134,7 +134,7 @@ fn a_q8_gemv_of_several_vectors_gives_each_one_alones_bits() {
     let mut random = Random(0x2f0b_7f1e_33aa_91c5);
     let scratch = gpu.buffer(1 << 20).unwrap();
     gpu.configure_decode(true).unwrap();
-    for (kind, rows, cols) in [(13u32, 1280usize, 5120usize), (8, 1792, 5120), (13, 300, 4096)] {
+    for (kind, rows, cols) in [(13u32, 1280usize, 5120usize), (8, 1792, 5120), (13, 300, 4096), (13, 2048, 1280)] {
         let matrix = gpu.upload_bytes(&random.blocks(kind, rows * cols)).unwrap();
         let x = random.floats(4 * cols, 2.0);
         let input = upload(&mut gpu, &x);
