@@ -611,9 +611,12 @@ template<> struct SlotQ8<22> {   // IQ2_S: 82-byte blocks; a unit's grid bytes, 
     }
 };
 __host__ __device__ constexpr bool slot_q8_kind(int kind) { return kind == 16 || kind == 17 || kind == 22; }
-// LDS bytes of a kind's launch: its sign masks, then the activations of `vectors` rows of `cols` (INT8, a scale every 32).
+// Q5_K (DeepSeek-V4.1's shared expert) runs gemv.hpp's GemvQ8<13> units: no sign masks, and the activations staged with the group sums its
+// mins take.
+__host__ __device__ constexpr bool slot_q5k_kind(int kind) { return kind == 13; }
+// LDS bytes of a kind's launch: its sign masks, then the activations of `vectors` rows of `cols` (INT8, a scale every 32; Q5_K's a sum too).
 __host__ __device__ constexpr size_t slot_q8_lds(int kind, size_t cols, size_t vectors = 1) {
-    return (kind == 22 ? 256 : 128) * 8 + vectors * (cols + cols / 32 * 4);
+    return (kind == 13 ? 0 : kind == 22 ? 256 : 128) * 8 + vectors * (cols + cols / 32 * (kind == 13 ? 8 : 4));
 }
 // Byte j of mask x (y) is 0xff when sign bit j (4 + j) of a sign index's eight is set.
 __device__ __forceinline__ uint32_t slot_spread4(uint32_t bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xffu; }
@@ -679,6 +682,30 @@ __global__ void __launch_bounds__(512) slot_gate_up_q8(SlotExperts plan, const u
     });
     if (SENT && raise) link_tail(tail);
 }
+// slot_gate_up_q8 of a Q5_K pair of matrices.
+template<bool SENT>
+__global__ void __launch_bounds__(512) slot_gate_up_q5k(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
+                                                        const float* weights, float* product, LinkTail tail, size_t send_at, int raise) {
+    extern __shared__ __align__(16) uint32_t slot_lds[];
+    const size_t cols = plan.role[0].cols;
+    float* xd = reinterpret_cast<float*>(slot_lds + cols / 4);
+    float* xs = xd + cols / 32;
+    gemv_q8_stage(slot_lds, xd, xs, input + size_t(blockIdx.y) * input_stride, cols / 32);
+    __syncthreads();
+    const GemvQ8Input in{slot_lds, xd, xs, 0};
+    slot_gate_up_q8_rows(plan, bases, weights, product, SENT ? link_tail_slot(tail) + send_at : nullptr,
+                         [&](const uint8_t* gate_row, const uint8_t* up_row, unsigned sub, unsigned lanes, size_t width, float& g, float& u) {
+        for (size_t unit = sub; unit < width / 64; unit += lanes) {
+            float r[1];
+            GemvQ8<13>::dots<1>(gate_row, unit, in, r);
+            g += r[0];
+            GemvQ8<13>::dots<1>(up_row, unit, in, r);
+            u += r[0];
+        }
+    });
+    if (SENT && raise) link_tail(tail);
+}
+
 // ---- Q8 slot down ----
 // slot_down_rows on INT8 activations, as the gate/up above: the block quantizes each live route's product row (per 32 values) into LDS
 // first, and a lane sums its units of the row route by route.
@@ -747,6 +774,27 @@ __global__ void __launch_bounds__(512) slot_down_q8(SlotExperts plan, const uint
     });
     if (LINKED) link_tail(tail);
 }
+// slot_down_q8 of a Q5_K matrix.
+template<bool LINKED>
+__global__ void __launch_bounds__(512) slot_down_q5k(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride,
+                                                     LinkTail tail) {
+    extern __shared__ __align__(16) uint32_t slot_lds[];
+    const size_t cols = plan.role[2].cols;
+    float* xd = reinterpret_cast<float*>(slot_lds + plan.top_k * cols / 4);
+    float* xs = xd + plan.top_k * cols / 32;
+    slot_down_stage(plan, bases, product, slot_lds, xd, xs);
+    __syncthreads();
+    slot_down_q8_rows(plan, bases, out, out_stride, LINKED ? link_tail_slot(tail) : nullptr,
+                      [&](const uint8_t* row, size_t route, unsigned sub, unsigned lanes, size_t width, float& total) {
+        const GemvQ8Input in{slot_lds + route * (width / 4), xd + route * (width / 32), xs + route * (width / 32), 0};
+        for (size_t unit = sub; unit < width / 64; unit += lanes) {
+            float r[1];
+            GemvQ8<13>::dots<1>(row, unit, in, r);
+            total += r[0];
+        }
+    });
+    if (LINKED) link_tail(tail);
+}
 #endif
 // The stages (1 gate/up, 2 down) for `tokens` rows: product = SwiGLU of every route (tokens x top_k
 // rows), then out. Lanes per row as the GEMV chooses them; a format without units, or gate and up
@@ -773,17 +821,17 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     const int gate_kind = paired && gate_lanes && fast(gate.kind) ? gate.kind : -1;
     unsigned down_lanes = gemv_lanes(down, product, 1);
     const int down_kind = down_lanes && fast(down.kind) ? down.kind : -1;
-    // The Q8 kernels (DeepSeek-V4.1's decode: d.q8_decode): gate/up of the IQ2 kinds, down of IQ2_XXS and IQ2_XS (IQ2_S's lost nothing: 33.0 us on the F32
-    // kernel, 33.7 on this one).
+    // The Q8 kernels (DeepSeek-V4.1's decode: d.q8_decode): gate/up of the IQ2 kinds and Q5_K, down of IQ2_XXS, IQ2_XS and Q5_K
+    // (IQ2_S's down lost nothing: 33.0 us on the F32 kernel, 33.7 on this one).
     bool q8_gate = false, q8_down = false;
     size_t gate_lds = 0, down_lds = 0;
 #if defined(__HIPCC__)
     gate_lds = slot_q8_lds(gate_kind, gate.cols);
-    q8_gate = d.q8_decode && gate_kind >= 0 && slot_q8_kind(gate_kind) && gate.cols % 256 == 0 &&
+    q8_gate = d.q8_decode && gate_kind >= 0 && (slot_q8_kind(gate_kind) || slot_q5k_kind(gate_kind)) && gate.cols % 256 == 0 &&
               reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
     down_lds = slot_q8_lds(down_kind, down.cols, plan.top_k);
     q8_down = d.q8_decode && down_kind >= 0 &&
-              (down_kind == 16 || down_kind == 17) &&
+              (down_kind == 16 || down_kind == 17 || slot_q5k_kind(down_kind)) &&
               down.cols % 256 == 0 && plan.top_k <= 16 && reinterpret_cast<uintptr_t>(product) % 16 == 0 && plan.product_stride % 4 == 0 &&
               down_lds <= 65536;
 #endif
@@ -815,6 +863,12 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             break;
         switch (gate_kind) {
             SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(22)
+            case 13:
+                if (sent) slot_gate_up_q5k<true><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail,
+                                                                                         send_at, raise);
+                else slot_gate_up_q5k<false><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, product,
+                                                                                    LinkTail{}, 0, 0);
+                break;
         }
         #undef SD_SLOT_GATE_Q8
         check(hipGetLastError());
@@ -830,6 +884,10 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             break;
         switch (down_kind) {
             SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17)
+            case 13:
+                if (linked) slot_down_q5k<true><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, *tail);
+                else slot_down_q5k<false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{});
+                break;
         }
         #undef SD_SLOT_DOWN_Q8
         check(hipGetLastError());
