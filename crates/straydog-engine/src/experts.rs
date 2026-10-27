@@ -695,11 +695,12 @@ struct VramSlot {
     taken_back: bool,
 }
 
-/// A slot of the region lent to the store: where its bytes begin there, and whether the lender
-/// has it back ([`DeviceExperts::reclaim`]).
+/// A slot of a region lent to the store: the region (in the order lent), where its bytes begin
+/// there, and whether the lender has it back ([`DeviceExperts::reclaim_region`]).
 #[derive(Clone, Copy)]
 struct LentSlot {
     slot: usize,
+    region: usize,
     offset: u64,
     out: bool,
 }
@@ -829,8 +830,10 @@ pub struct DeviceExperts {
     /// Changes to which experts VRAM slots hold and which of them are ready (see
     /// [`vram_generation`](Self::vram_generation)).
     vram_changes: u64,
-    /// The slots of the region lent to the store, from its start.
+    /// The slots of the regions lent to the store, each region's from its start, and how many
+    /// regions there are.
     lent: Vec<LentSlot>,
+    regions: usize,
     /// Slots acquired with only their gate and up waited for ([`acquire_gate_up`](Self::acquire_gate_up)).
     rest: Vec<usize>,
 }
@@ -941,7 +944,7 @@ impl DeviceExperts {
             tails: Vec::new(),
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
-            counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), rest: Vec::new(),
+            counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
         })
     }
 
@@ -1378,10 +1381,21 @@ impl DeviceExperts {
     /// furthest below its share), one after another from the region's start. The lender takes
     /// them back from the start ([`reclaim`](Self::reclaim)). [`wave_limit`](Self::wave_limit) and
     /// [`pass_limit`](Self::pass_limit) count only the store's own slots. Returns the slots made.
+    /// (The store's first region: [`lend_region`](Self::lend_region) lends more.)
     pub fn lend(&mut self, region: Buffer) -> Result<usize> {
-        if !self.lent.is_empty() {
-            return Err("an expert store takes one lent region".into());
+        if self.regions > 0 {
+            return Err("an expert store's first lent region is lent once".into());
         }
+        self.lend_region(region).map(|(_, slots)| slots)
+    }
+
+    /// [`lend`](Self::lend) of one more region: its number (in the order lent, the first 0) and
+    /// the slots made. Each region goes back by its own [`reclaim_region`](Self::reclaim_region)
+    /// and [`restore_region`](Self::restore_region).
+    pub fn lend_region(&mut self, region: Buffer) -> Result<(usize, usize)> {
+        let number = self.regions;
+        self.regions += 1;
+        let made = self.lent.len();
         let shares: Vec<u64> = (0..self.classes.len())
             .map(|class| self.class_of.iter().filter(|other| **other == Some(class)).count() as u64).collect();
         let mut taken = vec![0u64; self.classes.len()];
@@ -1398,11 +1412,11 @@ impl DeviceExperts {
                 streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
-            self.lent.push(LentSlot { slot, offset: start, out: false });
+            self.lent.push(LentSlot { slot, region: number, offset: start, out: false });
             taken[class] += 1;
             at = start + bytes;
         }
-        Ok(self.lent.len())
+        Ok((number, self.lent.len() - made))
     }
 
     /// Take back the lent slots whose bytes begin within the region's first `bytes`, for work
@@ -1410,11 +1424,16 @@ impl DeviceExperts {
     /// eviction would), a fill still waiting for the drive leaves its read to the host tier, and
     /// the compute stream waits for every copy into or out of them. Between passes (no slot held).
     pub fn reclaim(&mut self, gpu: &mut Backend, bytes: u64) -> Result<()> {
+        self.reclaim_region(gpu, 0, bytes)
+    }
+
+    /// [`reclaim`](Self::reclaim) of the lent region `region` (none lent yet: nothing).
+    pub fn reclaim_region(&mut self, gpu: &mut Backend, region: usize, bytes: u64) -> Result<()> {
         let mut waits = Vec::new();
         let mut taken = Vec::new();
         for index in 0..self.lent.len() {
-            let LentSlot { slot, offset, out } = self.lent[index];
-            if out || offset >= bytes {
+            let LentSlot { slot, region: lent_region, offset, out } = self.lent[index];
+            if out || lent_region != region || offset >= bytes {
                 continue;
             }
             if self.slots[slot].held {
@@ -1454,7 +1473,13 @@ impl DeviceExperts {
     /// fill's upload into one waits for the compute stream to pass `after` (the lender's last use
     /// of its bytes).
     pub fn restore(&mut self, after: Mark) {
-        for lent in self.lent.iter_mut().filter(|lent| lent.out) {
+        self.restore_region(0, after, 0);
+    }
+
+    /// [`restore`](Self::restore) of the lent region `region`'s slots taken back whose bytes begin
+    /// at `from` or past it (the lender keeps the rest).
+    pub fn restore_region(&mut self, region: usize, after: Mark, from: u64) {
+        for lent in self.lent.iter_mut().filter(|lent| lent.out && lent.region == region && lent.offset >= from) {
             lent.out = false;
             let entry = &mut self.slots[lent.slot];
             entry.taken_back = false;

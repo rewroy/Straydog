@@ -121,11 +121,11 @@ impl<T: Tensors> Engine<'_, T> {
         let width = self.hp.width;
         let shard = &mut self.shards[0];
         let arena = shard.arena.ok_or("this placement has no arena for the vision encoder")?;
-        let (experts, reclaimed) = (&mut shard.experts, &mut shard.reclaimed);
+        let (experts, reclaimed, region) = (&mut shard.experts, &mut shard.reclaimed, shard.arena_region);
         // (the arena taken back from the expert store as far as the encoder reaches, as a long pass takes it)
         encode_image_rows(&mut shard.gpu, arena, self.tensors, width, images, |gpu, total| {
-            if total > *reclaimed {
-                experts.reclaim(gpu, total)?;
+            if let Some(region) = region.filter(|_| total > *reclaimed) {
+                experts.reclaim_region(gpu, region, total)?;
                 *reclaimed = total;
             }
             Ok(())
