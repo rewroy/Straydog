@@ -34,8 +34,11 @@ struct Loaded<E: Engines> {
     encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
 }
 
-/// Bytes of image rows kept for the turns after ([`Loaded::encoded`]).
-const ENCODED_BYTES: usize = 64 << 20;
+/// Bytes of image rows kept for the turns after ([`Loaded::encoded`]): ~30 screenshots (a
+/// 1440x900 one is ~740 positions of DeepSeek-V4.1-Flash's 5120 values, ~15 MB). At 64 MiB an
+/// agent's nine screenshots evicted each other in turn (each request sends them all, in order)
+/// and every request encoded all nine again, 2.7-2.9 s of each wait.
+const ENCODED_BYTES: usize = 512 << 20;
 
 /// How an architecture's engines are placed.
 type Place<E> = fn(&Path, &str, &Path, &Settings, &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Session<E>, String>;

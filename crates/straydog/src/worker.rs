@@ -22,8 +22,10 @@ use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
 
-/// The largest frame either way.
-pub const FRAME_BYTES: usize = 16 << 20;
+/// The largest frame either way: any request body the API takes ([`straydog_api::BODY_LIMIT`])
+/// with room for the frame around it. At 16 MiB a conversation's tenth screenshot (a 64 MiB body
+/// was taken) failed the runtime, and the server stopped serving.
+pub const FRAME_BYTES: usize = straydog_api::BODY_LIMIT + (16 << 20);
 
 /// What the runtime passes to its worker (not a public command line).
 #[derive(Debug, Clone, Args)]
