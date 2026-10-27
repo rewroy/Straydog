@@ -69,17 +69,21 @@ impl<'a> Dspark<'a> {
             }
         }
         let target_keys = Keys::new(target);
-        for (key, expected) in [
-            ("embedding_length", 5120), ("dspark.block_size", 5),
-            ("dspark.noise_token_id", 128799), ("dspark.markov_rank", 256),
-            ("dspark.expert_count", 128), ("dspark.expert_used_count", 3),
-        ] {
+        // (Unsloth's GGUFs declare the target's DSpark in full; GSQ-RCO's only its target layers)
+        let declared = target.metadata.contains_key("deepseek41.dspark.block_size");
+        let keys: &[(&str, i64)] = if declared {
+            &[("embedding_length", 5120), ("dspark.block_size", 5), ("dspark.noise_token_id", 128799), ("dspark.markov_rank", 256),
+              ("dspark.expert_count", 128), ("dspark.expert_used_count", 3)]
+        } else {
+            &[("embedding_length", 5120)]
+        };
+        for &(key, expected) in keys {
             let actual = target_keys.integer(key)?;
             if actual != expected {
                 return Err(format!("DSpark target deepseek41.{key}: expected {expected}, found {actual}"));
             }
         }
-        let layers = target_keys.integers("dspark.target_layers")?;
+        let layers = target_keys.integers(if declared { "dspark.target_layers" } else { "dspark_target_layer_ids" })?;
         if layers != [37, 38, 39] || target_keys.count("block_count")? <= 39 {
             return Err(format!("DSpark target layers must be [37, 38, 39] within the target: found {layers:?}"));
         }
