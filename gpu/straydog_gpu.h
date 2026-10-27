@@ -70,7 +70,7 @@ int sd_transfer_counts(void* handle, uint64_t* counts);
 /* Matrix products */
 int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision);
 // Decode options (RDNA4 only), flags: 1 a decode row's Q5_K/Q8_0 GEMVs and IQ2 experts' gate/up on the Q8
-// kernels; 2 a decode or verify pass's index scores through WMMA (FP16 operands, F32 sums).
+// kernels; 2 a decode or verify pass's index scores and attention scores through WMMA (FP16 operands, F32 sums).
 int sd_decode_options(void* handle, int flags);
 int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);

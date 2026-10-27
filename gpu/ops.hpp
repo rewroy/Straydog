@@ -1188,6 +1188,98 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
         if (lane == 0 && head < heads) partial[(row * heads + head) * chunks + blockIdx.x] = make_float2(top, sum);
     }
 }
+#if defined(__HIPCC__)
+// op_attention_scores_kernel with FP16 operands and F32 sums through WMMA (a decode or verify pass with half_decode,
+// RDNA4, 512 dims): the same grid, scores and partials. Wave w takes dims 64 w .. 64 w + 63 of the block's 16 heads (q
+// as the A operand, its rotated values as the step kernel forms them) against its 32 keys (two B tiles, a missing key
+// zeros), straight from memory; the waves' products then add in wave order through LDS, and the epilogue is the step
+// kernel's.
+__global__ void __launch_bounds__(256) op_attention_scores_half_kernel(
+        const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
+        const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const double2* forward,
+        size_t stride, float* scores, float2* partial) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const size_t row = blockIdx.y, head0 = size_t(blockIdx.z) * attention_heads, chunks = gridDim.x;
+    const int64_t p = positions[row];
+    const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
+    const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, side = lane / 16;
+    __shared__ float sums[8][attention_heads][attention_keys + 1];
+    __shared__ const float* keys[attention_keys];
+    __shared__ double turns[64][2];
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+        const double2 g = forward[row * pairs + pair];
+        turns[pair][0] = g.x; turns[pair][1] = g.y;
+    }
+    if (t < attention_keys)
+        keys[t] = attention_key(size_t(blockIdx.x) * attention_keys + t, raw_count, first, raw, raw_rows, compressed,
+                                selected + row * selections, total, dim);
+    __syncthreads();
+    const size_t rotated = dim - 2 * pairs, d0 = size_t(wave) * 64, h = head0 + lane % 16;
+    const float* row_q = q + row * heads * dim;
+    // A: the lane's head, columns d0 + 16 s + 8 side .. + 8
+    moe_half8 a[4];
+    #pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const size_t c0 = d0 + 16 * s + 8 * side;
+        float x[8] = {};
+        if (h < heads && c0 + 8 <= rotated) {
+            const float4 lo = *reinterpret_cast<const float4*>(row_q + h * dim + c0), hi = *reinterpret_cast<const float4*>(row_q + h * dim + c0 + 4);
+            x[0] = lo.x; x[1] = lo.y; x[2] = lo.z; x[3] = lo.w; x[4] = hi.x; x[5] = hi.y; x[6] = hi.z; x[7] = hi.w;
+        } else if (h < heads) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const size_t c = c0 + j;
+                if (c < rotated) { x[j] = row_q[h * dim + c]; continue; }
+                const size_t pair = (c - rotated) / 2;
+                const double u = row_q[h * dim + rotated + 2 * pair], v = row_q[h * dim + rotated + 2 * pair + 1];
+                const double cs = turns[pair][0], sn = turns[pair][1];
+                x[j] = (c - rotated) % 2 == 0 ? float(u * cs - v * sn) : float(u * sn + v * cs);
+            }
+        }
+        a[s] = moe_half8{_Float16(x[0]), _Float16(x[1]), _Float16(x[2]), _Float16(x[3]), _Float16(x[4]), _Float16(x[5]),
+                         _Float16(x[6]), _Float16(x[7])};
+    }
+    // B: key 16 n + lane % 16, the same columns; acc[n][i] is head 8 side + i against that key
+    moe_float8 acc[2] = {};
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        const float* key = keys[n * 16 + lane % 16];
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const size_t c0 = d0 + 16 * s + 8 * side;
+            const float4 lo = key ? state_float4(key, c0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 hi = key ? state_float4(key, c0 + 4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const moe_half8 b{_Float16(lo.x), _Float16(lo.y), _Float16(lo.z), _Float16(lo.w), _Float16(hi.x), _Float16(hi.y),
+                              _Float16(hi.z), _Float16(hi.w)};
+            acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[s], b, acc[n]);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < 2; ++n)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) sums[wave][side * 8 + i][n * 16 + lane % 16] = acc[n][i];
+    __syncthreads();
+    const size_t index = size_t(blockIdx.x) * attention_keys + lane;
+    const bool valid = keys[lane] != nullptr;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const unsigned local = 2 * wave + i;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) dot += sums[w][local][lane];
+        const size_t head = head0 + local;
+        const float score = valid ? dot * scale : -INFINITY;
+        if (head < heads && index < total) scores[(row * heads + head) * stride + index] = score;
+        float top = score;
+        for (unsigned offset = 16; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 32));
+        float sum = valid ? expf(score - top) : 0.0f;
+        for (unsigned offset = 16; offset; offset /= 2) sum += __shfl_xor(sum, offset, 32);
+        if (lane == 0 && head < heads) partial[(row * heads + head) * chunks + blockIdx.x] = make_float2(top, sum);
+    }
+#endif
+}
+#endif
 // The inverse rotation of an output's values col .. col + 3, from the token's inverse table.
 __device__ __forceinline__ void attention_unrotate(float (&o)[4], size_t row, size_t col, size_t rotated, size_t pairs,
                                                    const double2* inverse) {

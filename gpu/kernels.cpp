@@ -394,7 +394,7 @@ struct Device {
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
-    bool half_decode = false;   // a decode or verify pass's index scores through WMMA, FP16 operands (RDNA4: the FP16 prompt pass's)
+    bool half_decode = false;   // a decode or verify pass's index and attention scores through WMMA, FP16 operands (RDNA4: the FP16 prompt pass's)
     bool q8_decode = false;   // a decode row's Q5_K GEMVs, IQ2 experts' gate/up and down (IQ2_S's down excepted) and Q5_K shared expert on the Q8 kernels (RDNA4)
     uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
@@ -3222,8 +3222,16 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         } else {
             value.attention_turns_ready = false;
         }
-        op_attention_scores_kernel<<<dim3(unsigned(chunks), unsigned(rows), unsigned((heads + attention_heads - 1) / attention_heads)),
-                                     256, 0, value.stream>>>(
+        // (FP16 decode: the scores through WMMA, at 512 dims: a wave each 64 of them)
+        const dim3 score_grid{unsigned(chunks), unsigned(rows), unsigned((heads + attention_heads - 1) / attention_heads)};
+#if defined(__HIPCC__)
+        if (value.rdna4 && value.half_decode && dim == 512)
+            op_attention_scores_half_kernel<<<score_grid, 256, 0, value.stream>>>(
+                q, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads),
+                size_t(dim), scale, pairs, forward, stride, scores, partial);
+        else
+#endif
+        op_attention_scores_kernel<<<score_grid, 256, 0, value.stream>>>(
             q, raw, size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads),
             size_t(dim), scale, pairs, forward, stride, scores, partial);
         check(hipGetLastError());

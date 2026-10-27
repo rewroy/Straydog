@@ -989,8 +989,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let linked = shards.len() == 2 && std::env::var("DS41_LINK").map_or(true, |value| value != "0");
         // A decode row's Q5_K/Q8_0 projections, IQ2 experts' gate/up and down (IQ2_S's down excepted) and
         // Q5_K shared expert take INT8 activations (the Q8 kernels: DS41_Q8=0 keeps them F32); with the FP16
-        // prompt pass, a decode or verify pass's index scores take FP16 operands (the GEMM policy is F32 for
-        // those passes).
+        // prompt pass, a decode or verify pass's index and attention scores take FP16 operands (the GEMM policy
+        // is F32 for those passes).
         let q8 = std::env::var("DS41_Q8").map_or(true, |value| value != "0");
         for shard in &shards {
             shard.gpu.decode_options(q8, settings.half_gemm)?;
