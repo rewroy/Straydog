@@ -42,6 +42,9 @@ pub const CHECKPOINT_BYTES: u64 = 2 << 30;
 /// Write-backs a device queues a step of making room between requests ([`Engines::make_room`]):
 /// ~20 MB, about what its downloads move in the worker's 1 ms between steps.
 const ROOM_STEP: usize = 4;
+/// Floats of the checkpoints' compressed rows and index keys a step between requests copies
+/// ([`Engines::make_room`]): 32 MB, ~6 ms (~0.15 s when the host has to find the pages).
+const CHECKPOINT_STEP: usize = 8 << 20;
 
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
@@ -58,6 +61,8 @@ pub struct Engines {
     kept: Option<usize>,
     /// Host bytes they may take ([`CHECKPOINT_BYTES`]).
     budget: u64,
+    /// Floats a step between requests copies of their pending rows ([`CHECKPOINT_STEP`]).
+    step: usize,
 }
 
 impl served::Engines for Engines {
@@ -66,6 +71,8 @@ impl served::Engines for Engines {
     }
 
     fn reset(&mut self) {
+        // (a checkpoint whose copy fails is given up)
+        let _ = self.finish_checkpoints(usize::MAX);
         self.engines.iter_mut().for_each(Engine::reset);
     }
 
@@ -158,7 +165,11 @@ impl served::Engines for Engines {
         self.engines.iter_mut().try_for_each(Engine::settle)
     }
 
+    /// The checkpoints' copies a step at a time, then each store's room.
     fn make_room(&mut self) -> Result<bool, String> {
+        if !self.finish_checkpoints(self.step)? {
+            return Ok(false);
+        }
         let mut done = true;
         for engine in &mut self.engines {
             done &= engine.make_room(ROOM_STEP)?;
@@ -192,6 +203,8 @@ impl served::Engines for Engines {
             return Err("no such Straydog checkpoint".into());
         }
         if !save {
+            // (the restore takes the devices' buffers from under the copies still to be made)
+            self.finish_checkpoints(usize::MAX)?;
             let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
             return self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot));
         }
@@ -252,6 +265,35 @@ fn evictions(held: &[(usize, u64)], required: u64, cap: u64) -> Option<Vec<usize
 }
 
 impl Engines {
+    /// Copy up to `most` floats of the checkpoints' pending rows ([`Engine::snapshot_into`]);
+    /// whether none is left. One whose copy fails is given up (the error returned).
+    fn finish_checkpoints(&mut self, most: usize) -> Result<bool, String> {
+        let mut left = most;
+        for slot in 0..CHECKPOINTS {
+            let Some(snapshots) = self.saved[slot].as_mut() else { continue };
+            let copied = self.engines.iter_mut().zip(snapshots.iter_mut())
+                .try_fold(0, |copied, (engine, snapshot)| Ok::<_, String>(copied + engine.finish_snapshot(snapshot, left - copied)?));
+            match copied {
+                Ok(copied) => left -= copied,
+                Err(error) => {
+                    self.saved[slot] = None;
+                    self.order.retain(|&held| held != slot);
+                    return Err(error);
+                }
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        Ok(!self.saved.iter().flatten().flatten().any(Snapshot::pending))
+    }
+
+    /// Tests only: copy at most `floats` of the checkpoints' pending rows a step between requests.
+    #[doc(hidden)]
+    pub fn limit_checkpoint_steps(&mut self, floats: usize) {
+        self.step = floats;
+    }
+
     /// Tests only: let the checkpoints take at most `bytes` (a budget too low for one).
     #[doc(hidden)]
     pub fn limit_checkpoints(&mut self, bytes: u64) {
@@ -456,7 +498,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: CHECKPOINT_BYTES },
+                           budget: CHECKPOINT_BYTES, step: CHECKPOINT_STEP },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
