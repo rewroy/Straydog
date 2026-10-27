@@ -48,6 +48,10 @@ fn taken_whole(name: &str) -> bool {
     !name.ends_with("_exps.weight") && !gathered(name)
 }
 
+/// The GGUF architecture of a file whose every tensor is taken whole, routed experts too: DSpark's
+/// drafter, whose experts are cut by rows at load, not read by an expert store.
+const EAGER: &str = bundle::DSPARK_ARCHITECTURE;
+
 pub struct Pinned {
     /// The first shard's header: the model's metadata.
     pub header: ModelHeader,
@@ -63,6 +67,8 @@ pub struct Pinned {
     checked: Mutex<HashSet<String>>,
     /// Bytes of whole tensors verified so far.
     verified: AtomicU64,
+    /// Whether every tensor is taken whole (the DSpark drafter's file: [`EAGER`]).
+    eager: bool,
 }
 
 impl Pinned {
@@ -142,6 +148,7 @@ impl Pinned {
             files, maps, signatures, verifiers, tensors, rows: HashMap::new(),
             checked: Mutex::new(HashSet::new()),
             verified: AtomicU64::new(0),
+            eager: pins.architecture == EAGER,
         })
     }
 
@@ -168,6 +175,11 @@ impl Pinned {
         Ok(())
     }
 
+    /// Whether a tensor is taken whole (verified when taken) rather than read in pieces.
+    fn whole(&self, name: &str) -> bool {
+        self.eager || taken_whole(name)
+    }
+
     /// Bytes of the tensors taken whole and verified so far (loading progress).
     pub fn verified_bytes(&self) -> u64 {
         self.verified.load(Ordering::Relaxed)
@@ -175,7 +187,7 @@ impl Pinned {
 
     /// Bytes of the tensors the engine takes whole (as `filter` selects), for progress.
     pub fn whole_bytes(&self, filter: impl Fn(&str) -> bool) -> u64 {
-        self.tensors.iter().filter(|(name, _)| taken_whole(name) && filter(name)).map(|(_, (_, info))| info.bytes).sum()
+        self.tensors.iter().filter(|(name, _)| self.whole(name) && filter(name)).map(|(_, (_, info))| info.bytes).sum()
     }
 
     /// Tensor names and sizes, for planning.
@@ -229,7 +241,7 @@ fn table_rows(name: &str, info: &TensorInfo) -> Result<u64, String> {
 impl Tensors for Pinned {
     fn tensor(&self, name: &str) -> Result<Tensor<'_>, String> {
         let (file, info) = self.tensors.get(name).ok_or_else(|| format!("tensor {name} is missing"))?;
-        if taken_whole(name) && !self.checked.lock().unwrap().contains(name) {
+        if self.whole(name) && !self.checked.lock().unwrap().contains(name) {
             self.check(*file, info.offset, info.bytes)?;
             if self.checked.lock().unwrap().insert(name.to_string()) {
                 self.verified.fetch_add(info.bytes, Ordering::Relaxed);
@@ -251,7 +263,7 @@ impl Tensors for Pinned {
         let mut ordered = Vec::new();
         for name in names {
             let Some((file, info)) = self.tensors.get(name) else { continue };
-            if !taken_whole(name) || self.checked.lock().unwrap().contains(name) || indices.contains_key(name.as_str()) {
+            if !self.whole(name) || self.checked.lock().unwrap().contains(name) || indices.contains_key(name.as_str()) {
                 continue;
             }
             indices.insert(name.as_str(), ranges.len());
