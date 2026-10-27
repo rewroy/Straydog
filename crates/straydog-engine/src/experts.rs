@@ -682,6 +682,9 @@ struct VramSlot {
     used: u64,
     /// Filled by a prefetch and not yet acquired.
     speculative: bool,
+    /// A warm-up's placement ([`DeviceExperts::warm`]): a guess as a prefetch is (a pass skips its
+    /// layer's reads not yet started) but no prefetch of a request's, so not counted as one unused.
+    warmed: bool,
     /// Acquired or requested since the last release: not evicted before it.
     held: bool,
     /// Filled while a prefill streams its experts through ([`DeviceExperts::set_streaming`]): the
@@ -926,7 +929,7 @@ impl DeviceExperts {
             let pinner = Pinner::new(arenas, per_arena * host_bytes as usize);
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false, streamed: false, class: index,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, streamed: false, class: index,
                 place: None,
                 taken_back: false,
             }));
@@ -1241,7 +1244,10 @@ impl DeviceExperts {
             let entry = &mut self.slots[slot];
             if entry.speculative && entry.key.is_some_and(|key| key.0 == layer as u32) {
                 entry.speculative = false;
-                self.counts.prefetch_unused += 1;
+                // (a warm-up's placements came before any request: counted with none's prefetches)
+                if !std::mem::take(&mut entry.warmed) {
+                    self.counts.prefetch_unused += 1;
+                }
                 if let Some(host) = entry.waiting {
                     self.host[host].cancel.store(true, Ordering::Relaxed);
                 }
@@ -1322,15 +1328,16 @@ impl DeviceExperts {
     /// (and drive time: the scarcest), never a result. Its uploads queue apart from those a pass
     /// waits for.
     pub fn prefetch(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool) -> Result<()> {
-        self.prefetch_with(gpu, layer, experts, drive, CHUNK)
+        self.prefetch_with(gpu, layer, experts, drive, CHUNK, true)
     }
 
     /// A bulk prefill wave or warm-up, not decode/verify prediction.
     pub fn prefetch_bulk(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool) -> Result<()> {
-        self.prefetch_with(gpu, layer, experts, drive, BULK_CHUNK)
+        self.prefetch_with(gpu, layer, experts, drive, BULK_CHUNK, true)
     }
 
-    fn prefetch_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool, chunk: u64) -> Result<()> {
+    /// (`guess`: a prefetch of the passes', counted; else a warm-up's placement)
+    fn prefetch_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], drive: bool, chunk: u64, guess: bool) -> Result<()> {
         self.settled = false;
         let class = self.class_of.get(layer).copied().flatten().ok_or_else(|| format!("layer {layer} has no routed experts"))?;
         for &expert in experts {
@@ -1342,8 +1349,9 @@ impl DeviceExperts {
                 }
                 let slot = self.fill(gpu, key, false, chunk)?;
                 self.slots[slot].speculative = true;
+                self.slots[slot].warmed = !guess;
                 self.speculative.entry(layer as u32).or_default().push(slot);
-                self.counts.prefetched += 1;
+                self.counts.prefetched += u64::from(guess);
             }
         }
         self.pump(gpu, false)
@@ -1408,8 +1416,8 @@ impl DeviceExperts {
             }
             let slot = self.slots.len();
             self.slots.push(VramSlot {
-                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, held: false,
-                streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false,
+                held: false, streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
             self.lent.push(LentSlot { slot, region: number, offset: start, out: false });
@@ -1519,6 +1527,7 @@ impl DeviceExperts {
         self.touch(slot);
         let entry = &mut self.slots[slot];
         entry.speculative = false;
+        entry.warmed = false;
         entry.held = true;
         self.in_use.push(slot);
     }
@@ -1529,6 +1538,7 @@ impl DeviceExperts {
         let key = entry.key.take()?;
         self.vram_changes += 1;
         entry.speculative = false;
+        entry.warmed = false;
         let class = &mut self.classes[entry.class];
         class.lru.remove(&(entry.used, slot));
         class.free.push_back(slot);
@@ -2176,7 +2186,7 @@ impl DeviceExperts {
                         break;
                     }
                     if !self.classes[class].free.is_empty() {
-                        self.prefetch_with(gpu, layer, &[expert], true, chunk)?;
+                        self.prefetch_with(gpu, layer, &[expert], true, chunk, false)?;
                     } else if self.classes[class].host_capacity > 0 && !self.host_map.contains_key(&key) {
                         // (VRAM full of what requests brought in: the host tier, then)
                         self.read(gpu, key, false, false, chunk)?;
