@@ -8,6 +8,8 @@
 //!   one-vector GEMV;
 //! - the IQ2_XXS, IQ2_XS and IQ2_S experts' gate/up (two routes, SwiGLU clamped, times the routes'
 //!   weights): the same;
+//! - the IQ2_XXS, IQ2_XS and IQ2_S experts' down (three routes of three tokens' product rows): the
+//!   same, and each token's row the bits of the token fed alone;
 //! - with the Q8 kernels off, the F32 kernels' results are the unquantized input's within F32
 //!   rounding, as before.
 //!
@@ -83,6 +85,15 @@ fn decoded(kind: u32, bytes: &[u8]) -> Vec<f32> {
     let mut out = Vec::new();
     formats::decode_into(kind, bytes, &mut out).unwrap();
     out
+}
+
+/// Each row's dot with `x` as the kernels take it: the F32 kernels' with the input itself, the Q8 kernels' with the quantized input, and
+/// the sum of the products' magnitudes.
+fn expected_dots(kind: u32, bytes: &[u8], cols: usize, x: &[f32], q8: bool) -> Vec<(f64, f64)> {
+    if !q8 {
+        return dots(&decoded(kind, bytes), cols, x);
+    }
+    dots(&decoded(kind, bytes), cols, &quantized(x))
 }
 
 #[test]
@@ -172,7 +183,7 @@ fn q8_expert_gate_up_matches_the_quantized_input_on_the_host() {
         for _ in 0..routes {
             let start = bank.len();
             let (gate, up) = (random.blocks(kind, ffn * hidden), random.blocks(kind, ffn * hidden));
-            matrices.push((decoded(kind, &gate), decoded(kind, &up)));
+            matrices.push((gate.clone(), up.clone()));
             bank.extend(gate);
             bank.extend(up);
             bank.extend(random.blocks(16, hidden * ffn));
@@ -193,9 +204,9 @@ fn q8_expert_gate_up_matches_the_quantized_input_on_the_host() {
                         ffn as u64, 1, routes as u64, input.base(), 0, Some(weights.base()), clamp, false, product.base(), out.base(), 0,
                         Some(split)).unwrap();
             let got = read(&mut gpu, &product, routes * ffn);
-            let v = if q8 { quantized(&x) } else { x.clone() };
             for (route, (gate, up)) in matrices.iter().enumerate() {
-                for (row, (&(g, gs), &(u, us))) in dots(gate, hidden, &v).iter().zip(&dots(up, hidden, &v)).enumerate() {
+                let (gate, up) = (expected_dots(kind, gate, hidden, &x, q8), expected_dots(kind, up, hidden, &x, q8));
+                for (row, (&(g, gs), &(u, us))) in gate.iter().zip(&up).enumerate() {
                     let (g, u) = (g.min(f64::from(clamp)), u.clamp(-f64::from(clamp), f64::from(clamp)));
                     let expected = g / (1.0 + (-g).exp()) * u * f64::from(route_weights[route]);
                     // (the rounding of the dots, carried through SwiGLU: at most the product's slope times it)
@@ -203,6 +214,72 @@ fn q8_expert_gate_up_matches_the_quantized_input_on_the_host() {
                     let value = f64::from(got[route * ffn + row]);
                     assert!((value - expected).abs() <= tolerance, "kind {kind}, Q8 {q8}, route {route} row {row}: {value} against {expected}");
                 }
+            }
+        }
+        gpu.configure_decode(false).unwrap();
+    }
+}
+
+#[test]
+fn q8_expert_down_matches_the_quantized_product_on_the_host() {
+    straydog_engine::gpu::load_iq_tables().unwrap();
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let (hidden, ffn, routes, tokens, experts) = (1536usize, 768usize, 3usize, 3usize, 4usize);
+    // (IQ2_S's down stays on the F32 kernel)
+    for kind in [16u32, 17, 22] {
+        // an expert's slot: gate and up (IQ2_XXS, unused: the down stage alone), then its down matrix
+        let gate_bytes = random.blocks(16, ffn * hidden).len();
+        let down_bytes = random.blocks(kind, hidden * ffn).len();
+        let slot = (2 * gate_bytes + down_bytes).next_multiple_of(256);
+        let (mut bank, mut downs) = (Vec::new(), Vec::new());
+        for _ in 0..experts {
+            let start = bank.len();
+            bank.extend(random.blocks(16, 2 * ffn * hidden));
+            let down = random.blocks(kind, hidden * ffn);
+            bank.extend(&down);
+            downs.push(down);
+            bank.resize(start + slot, 0);
+        }
+        let bank = gpu.upload_bytes(&bank).unwrap();
+        let expert_of = |token: usize, route: usize| (token + 2 * route) % experts;
+        let bases: Vec<u64> = (0..tokens * routes).map(|r| bank.base() as u64 + (expert_of(r / routes, r % routes) * slot) as u64).collect();
+        let products = random.floats(tokens * routes * ffn, 3.0);
+        let (product, input) = (upload(&mut gpu, &products), upload(&mut gpu, &random.floats(tokens * hidden, 1.0)));
+        let out = gpu.buffer((tokens * hidden * 4) as u64).unwrap();
+        let split = ExpertSplit { ffn_first: 0, ffn_rows: ffn as u64, hidden_first: 0, hidden_rows: hidden as u64, stages: 2, send: 0, more: 0,
+                                  send_at: 0 };
+        let offsets = [0, gate_bytes as u64, 2 * gate_bytes as u64];
+        for q8 in [true, false] {
+            gpu.configure_decode(q8).unwrap();
+            gpu.experts(Some(&bases), slot as u64, offsets, [16, 16, kind], hidden as u64, ffn as u64, tokens as u64, routes as u64, input.base(),
+                        0, None, 10.0, false, product.base(), out.base(), 0, Some(split)).unwrap();
+            let got = read(&mut gpu, &out, tokens * hidden);
+            // (the F32 kernels, and IQ2_S's with the Q8 ones on, take the product itself)
+            let quantize = q8 && kind != 22;
+            for token in 0..tokens {
+                let mut sums = vec![(0.0f64, 0.0f64); hidden];
+                for route in 0..routes {
+                    let row = &products[(token * routes + route) * ffn..][..ffn];
+                    for (sum, (value, size)) in sums.iter_mut().zip(expected_dots(kind, &downs[expert_of(token, route)], ffn, row, quantize)) {
+                        *sum = (sum.0 + value, sum.1 + size);
+                    }
+                }
+                for (row, (&(sum, size), &value)) in sums.iter().zip(&got[token * hidden..(token + 1) * hidden]).enumerate() {
+                    assert!((f64::from(value) - sum).abs() <= 2e-6 * size + 1e-6,
+                            "kind {kind}, Q8 {q8}, token {token} row {row}: {value} against {sum} (products {size})");
+                }
+            }
+            // each token's row is the bits of the token fed alone (a verify pass's rows are those of the tokens one at a time)
+            for token in 0..tokens {
+                let (alone_product, alone_input) = (upload(&mut gpu, &products[token * routes * ffn..(token + 1) * routes * ffn]),
+                                                    upload(&mut gpu, &random.floats(hidden, 1.0)));
+                let alone_out = gpu.buffer((hidden * 4) as u64).unwrap();
+                gpu.experts(Some(&bases[token * routes..(token + 1) * routes]), slot as u64, offsets, [16, 16, kind], hidden as u64, ffn as u64, 1,
+                            routes as u64, alone_input.base(), 0, None, 10.0, false, alone_product.base(), alone_out.base(), 0, Some(split)).unwrap();
+                let bits: Vec<u32> = read(&mut gpu, &alone_out, hidden).iter().map(|value| value.to_bits()).collect();
+                let together: Vec<u32> = got[token * hidden..(token + 1) * hidden].iter().map(|value| value.to_bits()).collect();
+                assert_eq!(together, bits, "kind {kind}, Q8 {q8}: token {token} of {tokens}");
             }
         }
         gpu.configure_decode(false).unwrap();

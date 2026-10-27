@@ -611,8 +611,10 @@ template<> struct SlotQ8<22> {   // IQ2_S: 82-byte blocks; a unit's grid bytes, 
     }
 };
 __host__ __device__ constexpr bool slot_q8_kind(int kind) { return kind == 16 || kind == 17 || kind == 22; }
-// LDS bytes of a kind's launch: its sign masks, then a row's activations of `cols` (INT8, a scale every 32).
-__host__ __device__ constexpr size_t slot_q8_lds(int kind, size_t cols) { return (kind == 22 ? 256 : 128) * 8 + cols + cols / 32 * 4; }
+// LDS bytes of a kind's launch: its sign masks, then the activations of `vectors` rows of `cols` (INT8, a scale every 32).
+__host__ __device__ constexpr size_t slot_q8_lds(int kind, size_t cols, size_t vectors = 1) {
+    return (kind == 22 ? 256 : 128) * 8 + vectors * (cols + cols / 32 * 4);
+}
 // Byte j of mask x (y) is 0xff when sign bit j (4 + j) of a sign index's eight is set.
 __device__ __forceinline__ uint32_t slot_spread4(uint32_t bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xffu; }
 template<int kind>
@@ -622,10 +624,11 @@ __device__ __forceinline__ void slot_q8_stage_masks(uint2* masks) {
         masks[i] = uint2{slot_spread4(bits & 15), slot_spread4(bits >> 4)};
     }
 }
-// slot_gate_up_rows on the staged masks and activations (the same rows, lanes and epilogue).
-template<int kind>
-__device__ __forceinline__ void slot_gate_up_q8_rows(const SlotExperts& plan, const uint64_t* bases, const uint2* masks, const uint32_t* xq,
-                                                     const float* xd, const float* weights, float* product, float* peer) {
+// slot_gate_up_rows with the lane's sum of the row pair's dots (sum(gate_row, up_row, g, u) adds this lane's units' to g and u) on the staged
+// activations: the same rows, lanes and epilogue.
+template<class Sum>
+__device__ __forceinline__ void slot_gate_up_q8_rows(const SlotExperts& plan, const uint64_t* bases, const float* weights, float* product, float* peer,
+                                                     Sum sum) {
     const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
     const size_t route = wave / plan.waves[0];
     if (route >= plan.top_k) return;
@@ -635,22 +638,8 @@ __device__ __forceinline__ void slot_gate_up_q8_rows(const SlotExperts& plan, co
     const Matrix &gate = plan.role[0], &up = plan.role[1];
     const unsigned lanes = plan.lanes[0], lane = threadIdx.x % 32, sub = lane % lanes;
     const size_t row = (wave % plan.waves[0]) * (32 / lanes) + lane / lanes, last = std::min(row, gate.rows - 1);
-    const uint8_t* gate_row = base + size_t(gate.data) + last * gate.row_bytes;
-    const uint8_t* up_row = base + size_t(up.data) + last * up.row_bytes;
-    const size_t pairs = gate.cols / 64;
     float g = 0.0f, u = 0.0f;
-    #pragma unroll 2
-    for (size_t pair = sub; pair < pairs; pair += lanes) {
-        SlotQ8<kind> a, b;
-        a.load(gate_row, pair);
-        b.load(up_row, pair);
-        #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const size_t unit = 2 * pair + h;
-            g += a.dot(h, masks, xq + unit * 8, xd[unit]);
-            u += b.dot(h, masks, xq + unit * 8, xd[unit]);
-        }
-    }
+    sum(base + size_t(gate.data) + last * gate.row_bytes, base + size_t(up.data) + last * up.row_bytes, sub, lanes, gate.cols, g, u);
     g = slot_reduce(g, lanes);
     u = slot_reduce(u, lanes);
     if (sub || row >= gate.rows) return;
@@ -672,8 +661,91 @@ __global__ void __launch_bounds__(512) slot_gate_up_q8(SlotExperts plan, const u
     slot_q8_stage_masks<kind>(masks);
     gemv_q8_stage(xq, xd, nullptr, input + size_t(blockIdx.y) * input_stride, cols / 32);
     __syncthreads();
-    slot_gate_up_q8_rows<kind>(plan, bases, masks, xq, xd, weights, product, SENT ? link_tail_slot(tail) + send_at : nullptr);
+    slot_gate_up_q8_rows(plan, bases, weights, product, SENT ? link_tail_slot(tail) + send_at : nullptr,
+                         [&](const uint8_t* gate_row, const uint8_t* up_row, unsigned sub, unsigned lanes, size_t width, float& g, float& u) {
+        const size_t pairs = width / 64;
+        #pragma unroll 2
+        for (size_t pair = sub; pair < pairs; pair += lanes) {
+            SlotQ8<kind> a, b;
+            a.load(gate_row, pair);
+            b.load(up_row, pair);
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const size_t unit = 2 * pair + h;
+                g += a.dot(h, masks, xq + unit * 8, xd[unit]);
+                u += b.dot(h, masks, xq + unit * 8, xd[unit]);
+            }
+        }
+    });
     if (SENT && raise) link_tail(tail);
+}
+// ---- Q8 slot down ----
+// slot_down_rows on INT8 activations, as the gate/up above: the block quantizes each live route's product row (per 32 values) into LDS
+// first, and a lane sums its units of the row route by route.
+// The block's routes with a slot (a bit each), and their product rows staged: route r's values at xq + r * cols / 4, scales at xd +
+// r * cols / 32 (and sums at xs, given).
+__device__ __forceinline__ void slot_down_stage(const SlotExperts& plan, const uint64_t* bases, const float* product, uint32_t* xq, float* xd,
+                                                float* xs) {
+    const size_t cols = plan.role[2].cols, groups = cols / 32, first = size_t(blockIdx.y) * plan.top_k;
+    uint32_t live = 0;
+    for (uint32_t route = 0; route < plan.top_k; ++route) live |= (slot_base(plan, bases, first + route) ? 1u : 0u) << route;
+    for (size_t g = threadIdx.x; g < size_t(plan.top_k) * groups; g += blockDim.x) {
+        const size_t route = g / groups, local = g - route * groups;
+        if (live >> route & 1)
+            gemv_q8_group(product + (first + route) * plan.product_stride + local * 32, xq + route * (cols / 4) + local * 8,
+                          xd + route * groups + local, xs ? xs + route * groups + local : nullptr);
+    }
+}
+// slot_down_rows with the lane's sum of a route's units (sum(row, route, sub, lanes, cols, total) adds them to total).
+template<class Sum>
+__device__ __forceinline__ void slot_down_q8_rows(const SlotExperts& plan, const uint64_t* bases, float* out, size_t out_stride, float* peer, Sum sum) {
+    const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    if (wave >= plan.waves[1]) return;
+    const Matrix& down = plan.role[2];
+    const unsigned lanes = plan.lanes[1], lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = wave * (32 / lanes) + lane / lanes;
+    const size_t at = size_t(down.data) + std::min(row, down.rows - 1) * down.row_bytes;
+    float total = 0.0f;
+    for (size_t route = 0; route < plan.top_k; ++route) {
+        const uint64_t base = slot_base(plan, bases, size_t(blockIdx.y) * plan.top_k + route);
+        if (base) sum(reinterpret_cast<const uint8_t*>(base) + at, route, sub, lanes, down.cols, total);
+    }
+    total = slot_reduce(total, lanes);
+    if (sub || row >= down.rows) return;
+    float* target = out + size_t(blockIdx.y) * out_stride + plan.out_first + row;
+    const float value = plan.accumulate ? *target + total : total;
+    *target = value;
+    if (peer) link_send(peer + (target - out), value);
+}
+// LINKED: slot_down_linked's (the part link's sum), else slot_down's.
+template<int kind, bool LINKED>
+__global__ void __launch_bounds__(512) slot_down_q8(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride,
+                                                    LinkTail tail) {
+    extern __shared__ __align__(16) uint32_t slot_lds[];
+    uint2* masks = reinterpret_cast<uint2*>(slot_lds);
+    uint32_t* xq = reinterpret_cast<uint32_t*>(masks + SlotQ8<kind>::sign_entries);
+    const size_t cols = plan.role[2].cols;
+    float* xd = reinterpret_cast<float*>(xq + plan.top_k * cols / 4);
+    slot_q8_stage_masks<kind>(masks);
+    slot_down_stage(plan, bases, product, xq, xd, nullptr);
+    __syncthreads();
+    slot_down_q8_rows(plan, bases, out, out_stride, LINKED ? link_tail_slot(tail) : nullptr,
+                      [&](const uint8_t* row, size_t route, unsigned sub, unsigned lanes, size_t width, float& total) {
+        const uint32_t* x = xq + route * (width / 4);
+        const float* scales = xd + route * (width / 32);
+        const size_t pairs = width / 64;
+        #pragma unroll 2
+        for (size_t pair = sub; pair < pairs; pair += lanes) {
+            SlotQ8<kind> slot;
+            slot.load(row, pair);
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const size_t unit = 2 * pair + h;
+                total += slot.dot(h, masks, x + unit * 8, scales[unit]);
+            }
+        }
+    });
+    if (LINKED) link_tail(tail);
 }
 #endif
 // The stages (1 gate/up, 2 down) for `tokens` rows: product = SwiGLU of every route (tokens x top_k
@@ -697,11 +769,29 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     };
     // Offsets stand in for the slots' addresses, which are 256-byte aligned.
     const bool paired = gate.kind == up.kind && gate.row_bytes == up.row_bytes;
-    const unsigned gate_lanes = std::min(gemv_lanes(gate, input, plan.top_k * 2), gemv_lanes(up, input, plan.top_k * 2));
+    unsigned gate_lanes = std::min(gemv_lanes(gate, input, plan.top_k * 2), gemv_lanes(up, input, plan.top_k * 2));
     const int gate_kind = paired && gate_lanes && fast(gate.kind) ? gate.kind : -1;
-    plan.lanes[0] = gate_kind < 0 ? 32 : gate_lanes;
-    const unsigned down_lanes = gemv_lanes(down, product, 1);
+    unsigned down_lanes = gemv_lanes(down, product, 1);
     const int down_kind = down_lanes && fast(down.kind) ? down.kind : -1;
+    // The Q8 kernels (DeepSeek-V4.1's decode: d.q8_decode): gate/up of the IQ2 kinds, down of IQ2_XXS and IQ2_XS (IQ2_S's lost nothing: 33.0 us on the F32
+    // kernel, 33.7 on this one).
+    bool q8_gate = false, q8_down = false;
+    size_t gate_lds = 0, down_lds = 0;
+#if defined(__HIPCC__)
+    gate_lds = slot_q8_lds(gate_kind, gate.cols);
+    q8_gate = d.q8_decode && gate_kind >= 0 && slot_q8_kind(gate_kind) && gate.cols % 256 == 0 &&
+              reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
+    down_lds = slot_q8_lds(down_kind, down.cols, plan.top_k);
+    q8_down = d.q8_decode && down_kind >= 0 &&
+              (down_kind == 16 || down_kind == 17) &&
+              down.cols % 256 == 0 && plan.top_k <= 16 && reinterpret_cast<uintptr_t>(product) % 16 == 0 && plan.product_stride % 4 == 0 &&
+              down_lds <= 65536;
+#endif
+    // An IQ2 row of 4096 to 8191 values (DeepSeek-V4.1's gate and up, 5120) takes at most four lanes on the Q8 kernels: over eight a wave's loads
+    // fan out to four rows each and a lane walks ten pairs (IQ2_XXS 44.5 us a layer's gate/up, 40.5 on four lanes; IQ2_XS 53.1 -> 46.5; IQ2_S
+    // 53.1 -> 47.8); two lanes or sixteen lose. Decided by the matrix and the device alone (a row's sum is the same whatever shares its launch).
+    if (q8_gate && slot_q8_kind(gate_kind) && gate.cols >= 4096 && gate.cols < 8192) gate_lanes = std::min(gate_lanes, 4u);
+    plan.lanes[0] = gate_kind < 0 ? 32 : gate_lanes;
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
     plan.waves[0] = uint32_t((gate.rows + 32 / plan.lanes[0] - 1) / (32 / plan.lanes[0]));
     plan.waves[1] = uint32_t((down.rows + 32 / plan.lanes[1] - 1) / (32 / plan.lanes[1]));
@@ -711,11 +801,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     const auto blocks_of = [](size_t waves, unsigned threads) { return unsigned((waves + threads / 32 - 1) / (threads / 32)); };
     const unsigned first_threads = threads(size_t(plan.top_k) * plan.waves[0]), second_threads = threads(plan.waves[1]);
 #if defined(__HIPCC__)
-    // The Q8 gate/up: an IQ2 kind's whole blocks and 16-byte aligned activations. Each block stages a
-    // token's activations once: as few blocks as fill every CU twice, each covering as many waves.
-    const size_t gate_lds = slot_q8_lds(gate_kind, gate.cols);
-    const bool q8_gate = d.q8_decode && gate_kind >= 0 && slot_q8_kind(gate_kind) && gate.cols % 256 == 0 &&
-                         reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
+    // Each Q8 block stages a token's activations once: as few blocks as fill every CU twice, each covering as many waves.
     const auto gate_q8 = [&](bool sent) {
         const size_t waves = size_t(plan.top_k) * plan.waves[0], slots = 2 * size_t(d.compute_units);
         const size_t per_block = std::clamp<size_t>((waves + slots - 1) / slots, 2, 16);
@@ -727,13 +813,30 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             else slot_gate_up_q8<format, false><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, \
                                                                                        product, LinkTail{}, 0, 0); \
             break;
-        switch (gate_kind) { SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(22) }
+        switch (gate_kind) {
+            SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(22)
+        }
         #undef SD_SLOT_GATE_Q8
         check(hipGetLastError());
     };
+    const auto down_q8 = [&](bool linked) {
+        const size_t waves = plan.waves[1], slots = 2 * size_t(d.compute_units);
+        const size_t per_block = std::clamp<size_t>((waves + slots - 1) / slots, 2, 16);
+        const dim3 blocks(unsigned((waves + per_block - 1) / per_block), unsigned(tokens));
+        const unsigned threads = unsigned(32 * per_block);
+        #define SD_SLOT_DOWN_Q8(format) case format: \
+            if (linked) slot_down_q8<format, true><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, *tail); \
+            else slot_down_q8<format, false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{}); \
+            break;
+        switch (down_kind) {
+            SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17)
+        }
+        #undef SD_SLOT_DOWN_Q8
+        check(hipGetLastError());
+    };
 #else
-    constexpr bool q8_gate = false;
     const auto gate_q8 = [](bool) {};
+    const auto down_q8 = [](bool) {};
 #endif
     if (tail && !tail->out && stages == 1) {
         if (q8_gate) {
@@ -768,6 +871,10 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     }
     #undef SD_SLOT_GATE
     if (!(stages & 2)) return true;
+    if (tail && q8_down) {
+        down_q8(true);
+        return true;
+    }
     if (tail) {
         #define SD_SLOT_LINKED(format) case format: \
             slot_down_linked<format><<<second, second_threads, 0, d.stream>>>(plan, bases, product, out, out_stride, *tail); break;
@@ -776,6 +883,10 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
         }
         #undef SD_SLOT_LINKED
         check(hipGetLastError());
+        return true;
+    }
+    if (q8_down) {
+        down_q8(false);
         return true;
     }
     #define SD_SLOT_DOWN(format) case format: \
