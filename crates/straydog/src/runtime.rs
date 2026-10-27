@@ -196,8 +196,9 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
         let sidecars = pins.sidecars.iter().map(|sidecar| &sidecar.asset);
         let mut files: Vec<PathBuf> =
             pins.shards.iter().chain(&pins.resources).chain(sidecars).map(|asset| settings.model.join(&asset.name)).collect();
-        // (the vision encoder when it is there: its tree is among the trees then)
+        // (the vision encoder and DSpark's drafter when they are there: their trees are among the trees then)
         files.extend(bundle::vision_source(&settings.quant)?.map(|vision| settings.model.join(&vision.asset.name)).filter(|path| path.is_file()));
+        files.extend(bundle::dspark_in(&settings.model, &settings.quant)?.map(|(_, path)| path));
         files.extend(trees);
         return Ok(straydog_isolation::Exposure {
             executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
@@ -232,8 +233,9 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
     #[cfg(windows)]
     let keep: &[&str] = &straydog_isolation::WORKER_VARIABLES;
     #[cfg(not(windows))]
-    // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports)
-    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE"];
+    // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports; and
+    // the controls of DeepSeek-V4.1's drafts: DS41_DRAFTS, DS41_DSPARK and DS41_DSPARK_RESIDENT)
+    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT"];
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()
@@ -253,8 +255,13 @@ pub fn ready_summary(ready: &Value) -> String {
             format!("{}-{}{gpus}", range[0], range[1].as_u64().unwrap_or(1).saturating_sub(1))
         }).collect();
         let slots: Vec<String> = slots.iter().map(|slots| slots.to_string()).collect();
+        // (DeepSeek-V4.1's DSpark drafter, when it is placed: the experts it keeps in each stage)
+        let dspark = match placement["dspark"]["resident"].as_array() {
+            Some(kept) => format!(", DSpark drafter with {} experts a stage", kept.iter().map(Value::to_string).collect::<Vec<_>>().join("/")),
+            None => String::new(),
+        };
         return format!(
-            "Straydog ready: {} {}, context {}, layers {} with {} expert slots, {:.1} GiB host tier, prefill batch {}; {} using {:.1} of {:.1} GiB",
+            "Straydog ready: {} {}, context {}, layers {} with {} expert slots, {:.1} GiB host tier, prefill batch {}{dspark}; {} using {:.1} of {:.1} GiB",
             ready["model"].as_str().unwrap_or("-"), ready["quantization"].as_str().unwrap_or("-"), ready["context"],
             layers.join(" | "), slots.join(" | "), gib(&placement["host_expert_bytes"]), placement["prefill_batch_size"],
             ready["gpu"]["name"].as_str().unwrap_or("GPU"), gib(&ready["gpu"]["allocated_bytes"]), gib(&ready["gpu"]["budget_bytes"]),
@@ -310,7 +317,7 @@ pub fn request_summary(event: &Value) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}){}, prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}){}, prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -334,6 +341,13 @@ pub fn request_summary(event: &Value) -> String {
         },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
+        // (an engine that verifies drafts says how many it checked and kept, and of those the engine's own)
+        match timings["draft_tokens"].as_u64() {
+            Some(drafted) if drafted > 0 => format!(" ({} of {} drafts kept in {} passes; DSpark {} of {})", count(&timings["accepted_drafts"]), drafted,
+                                                   count(&timings["decode_passes"]), count(&timings["accepted_engine_drafts"]),
+                                                   count(&timings["engine_draft_tokens"])),
+            _ => String::new(),
+        },
         // (an engine that streams experts says where the prefill's came from: what the first token waited on)
         match &timings["prefill_experts"] {
             experts if experts.is_object() => format!("; prefill expert reads: VRAM {}, host {}, drive {} ({:.0} MB)",
@@ -1177,6 +1191,28 @@ mod tests {
         let summary = request_summary(&event);
         assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
                 "{summary}");
+    }
+
+    /// The ready line says whether DSpark is placed, and with how many experts a stage.
+    #[test]
+    fn the_ready_line_names_the_placed_dspark_drafter() {
+        let ready = json!({"model": "m", "quantization": "q", "context": 1, "gpu": {"name": "g"},
+                           "placement": {"expert_slots": [10], "layers": [[0, 4]], "devices": [[0, 1]], "host_expert_bytes": 0,
+                                         "prefill_batch_size": 4, "dspark": {"engine": 0, "resident": [87, 50, 29]}}});
+        assert!(ready_summary(&ready).contains("prefill batch 4, DSpark drafter with 87/50/29 experts a stage;"), "{}", ready_summary(&ready));
+        let mut plain = ready.clone();
+        plain["placement"]["dspark"] = Value::Null;
+        assert!(!ready_summary(&plain).contains("DSpark"));
+    }
+
+    /// A request that verified drafts says how many were kept, and how many of them DSpark's.
+    #[test]
+    fn the_summary_counts_a_requests_drafts() {
+        let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
+                                                          "engine_draft_tokens": 25, "accepted_engine_drafts": 18}});
+        assert!(request_summary(&event).contains("(31 of 40 drafts kept in 120 passes; DSpark 18 of 25)"), "{}", request_summary(&event));
+        let none = json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
+        assert!(!request_summary(&none).contains("drafts"));
     }
 
     /// A frame split across writes survives a read dropped between its halves (as when a

@@ -492,6 +492,32 @@ after. A pass embeds the span's rows, routes its rows with the image bias, and g
 rows there: their values are zeros, so the Engram gate adds nothing, and a token after an image
 starts its n-grams afresh, as the reference's do.
 
+**DSpark.** DeepSeek's three-stage block drafter (`mtp.0..2`, Unsloth's Q8_0 GGUF, 7.98 GB) is an
+optional file beside the GSQ-RCO bundle, pinned like the vision encoder by size, SHA-256 (the
+repository's LFS oid), fs-verity digest and its repository and revision; it lies in the model's
+`dspark` directory or in one beside the model's (a model's quantizations share it), and `straydog
+fetch` downloads it into the first. Its tensor names are the model's own, so it opens apart from the
+shards (`Pinned` of one file whose every tensor, experts too, verifies when taken) and its layout is
+checked against the model's header. Absent, the server runs as without it; `DS41_DSPARK=0` leaves it
+out. Beside the engine that runs layers 37-39 it reads the target's features there (the mean of the
+hyper-connection copies of those layers' inputs, kept by the engine for the last 128 rows of each
+pass) into rings of the last 128 positions, split over the engine's GPUs as the target is. Each
+round after a sampled token the drafter drafts three tokens; a width policy picks how many a
+verify pass checks: the most expected accepted tokens a millisecond, from the drafter's
+confidences (calibrated against teacher-forced match rates, then against the drafts of the run)
+and a pass's cost by its rows (1, 1.6, 2.2 and 3.1 one-row passes, the unit learned from the passes
+seen). A draft costs ~4 ms whatever the round makes of it, so the policy keeps what its rounds
+saved against decoding their tokens one at a time, and pauses drafting for 16 rounds when that is
+below nothing (prose, where DSpark roughly breaks even, then costs nothing). A lookup match of
+eight tokens or more (an edit repeating its source) is verified as it is, without a draft: those
+are accepted nearly always. Each pass puts its rows' features in the rings, a rewind only the rows it keeps, a
+reset empties them and a checkpoint keeps them with the sequence state, so a draft never reads
+another sequence's features. Placement counts the drafter's VRAM (`drafter::footprint`) before it
+sizes the expert store: each stage keeps its 87, 50 and 29 most used routed experts of 128
+(`DS41_DSPARK_RESIDENT=A,B,C`, or `all`), which cover 98% of its routes and leave its acceptance
+as it was, 3.1 GB of the 7.2 GB; the router's bias keeps the others out of a draft's top three.
+Verification stays exact: the tokens are those without the drafter.
+
 A start does not begin cold: the runtime asks the worker for the experts its stores hold (least
 recently used first, in VRAM and in the host tier) every two minutes after requests and at
 shutdown, and keeps them in the data directory (`<data-dir>/warm/<quant>-<key>.json`, the key

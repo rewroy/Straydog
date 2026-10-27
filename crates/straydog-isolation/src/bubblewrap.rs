@@ -23,9 +23,10 @@ const LOADER: [&str; 4] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.co
 
 /// The variables the worker keeps from the server's environment, when set there: the search
 /// path, the locale and time zone, and the GPU runtimes' device selection and architecture
-/// override, and the DeepSeek-V4.1 engine's phase timing switch (DS41_PROFILE). Nothing else
-/// reaches it: no proxy, token, key or credential the server may hold.
-const VARIABLES: [&str; 8] = [
+/// override, and the DeepSeek-V4.1 engine's switches: its phase timing (DS41_PROFILE), its drafts
+/// (DS41_DRAFTS) and DSpark's (DS41_DSPARK, DS41_DSPARK_RESIDENT). Nothing else reaches it: no
+/// proxy, token, key or credential the server may hold.
+const VARIABLES: [&str; 11] = [
     "PATH",
     "LANG",
     "TZ",
@@ -34,6 +35,9 @@ const VARIABLES: [&str; 8] = [
     "CUDA_VISIBLE_DEVICES",
     "HSA_OVERRIDE_GFX_VERSION",
     "DS41_PROFILE",
+    "DS41_DRAFTS",
+    "DS41_DSPARK",
+    "DS41_DSPARK_RESIDENT",
 ];
 
 /// GPU device nodes: AMD's, then NVIDIA's (further NVIDIA GPUs are found by name).
