@@ -86,6 +86,9 @@ fn resident(stage: usize, count: usize) -> Vec<usize> {
 }
 const SCALE: f32 = 1.5;
 const FEATURES: usize = 3 * WIDTH;
+/// The most rows a matrix product takes as GEMV (F32 sums of the F32 inputs, whatever the device's
+/// products): the engine's decode and verify passes, and the pieces features are injected in.
+const GEMV_ROWS: usize = 4;
 /// The drafter's graph keys on a device: this, the part of a draft (a stage's attention, routes and
 /// experts, then the head and the Markov head) << 8, the block's slots (apart from the target's,
 /// layer << 8 and below).
@@ -574,9 +577,17 @@ impl Drafter {
                 let s = &part.stages[stage];
                 DsparkInjectStage { kv: &s.kv, norm: &s.kv_norm, ring: &s.ring }
             });
-            let inject_positions = part.inject_positions.slice(0, (positions.len() * 4) as u64);
-            gpu.dspark_inject(device.tap.base(), &inject_positions, positions.len() as u64, &part.fc, &part.encoder_norm, &stages,
-                              &part.frequencies, part.encoded.base(), &part.scratch)?;
+            // In pieces of at most GEMV_ROWS rows, in order (the last row to a ring row wins, as in one call):
+            // a longer one's encoder is a GEMM, and a GEMM on a device set to FP16 products (what a
+            // prompt pass of 32 rows or more leaves it at) casts the features to FP16, where the rows of
+            // the sequence's attention sinks (1e5 and more, FP16 ends at 65504) become infinite and
+            // their ring rows NaN: drafts then go wrong for as long as such a row is in the window.
+            for (piece, rows) in positions.chunks(GEMV_ROWS).enumerate() {
+                let first = piece * GEMV_ROWS;
+                let inject_positions = part.inject_positions.slice((first * 4) as u64, (rows.len() * 4) as u64);
+                gpu.dspark_inject(device.tap.at(first * FEATURES), &inject_positions, rows.len() as u64, &part.fc, &part.encoder_norm, &stages,
+                                  &part.frequencies, part.encoded.base(), &part.scratch)?;
+            }
         }
         for &position in positions {
             self.held.note(position as usize);
