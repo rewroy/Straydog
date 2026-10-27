@@ -152,7 +152,11 @@ struct PartRead {
 __device__ inline uint32_t part_wait(const PartRead& link) {
     const uint32_t n = *static_cast<volatile uint32_t*>(link.state);
     const uint64_t start = peer_clock();
-    while (int32_t(peer_load(link.state + 1) - n) < 0 || int32_t(peer_load(link.state + 4) - (n - 1)) < 0) {
+    // Both flags are read together and relaxed, and the acquire is taken once, after the wait: a load of each with its own acquire (peer_load)
+    // made two round trips and two cache invalidations in series at the start of every consumer block.
+    for (;;) {
+        const uint32_t sent = peer_flag_load(link.state + 1), read = peer_flag_load(link.state + 4);
+        if (int32_t(sent - n) >= 0 && int32_t(read - (n - 1)) >= 0) break;
         if (*static_cast<volatile uint32_t*>(link.state + 2) || peer_clock() - start > link.timeout) {
             link.state[2] = n;
             break;
@@ -161,6 +165,11 @@ __device__ inline uint32_t part_wait(const PartRead& link) {
         __builtin_amdgcn_s_sleep(1);
 #endif
     }
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#else
+    __threadfence_system();
+#endif
     return n;
 }
 
