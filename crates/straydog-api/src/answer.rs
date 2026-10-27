@@ -15,7 +15,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Map, Value};
-use straydog_engine::reply::{ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter};
+use straydog_engine::reply::{Markup, ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter};
 
 use crate::request::Shape;
 use crate::{ApiError, Generation};
@@ -28,7 +28,11 @@ const KEEP_ALIVE: Duration = Duration::from_secs(1);
 pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -> Result<Response, ApiError> {
     let reply = Reply {
         stop: StopMatcher::new(&shape.stops),
-        reasoning: ReasoningSplitter::with_markup(shape.thinking, shape.markup),
+        // (DeepSeek-V4.1's workers mark its reasoning's end at the template's own `</think>` token)
+        reasoning: match shape.markup {
+            Markup::Dsml => ReasoningSplitter::with_markup(shape.thinking, shape.markup).ending_by_token(),
+            Markup::Qwen => ReasoningSplitter::with_markup(shape.thinking, shape.markup),
+        },
         tools: ToolCallSplitter::with_markup(shape.tools.as_ref(), shape.markup),
         calls: Vec::new(),
     };
@@ -85,6 +89,18 @@ impl Reply {
         }
         if !content.is_empty() {
             deltas.push(Delta::Content(content));
+        }
+        deltas
+    }
+
+    /// The reasoning's end the worker saw: the text the stop strings held, then the reasoning's,
+    /// as reasoning.
+    fn end_reasoning(&mut self) -> Vec<Delta> {
+        let held = self.stop.finish();
+        let mut deltas = self.split(&held);
+        let thought = self.reasoning.end();
+        if !thought.is_empty() {
+            deltas.push(Delta::Reasoning(thought));
         }
         deltas
     }
@@ -147,6 +163,12 @@ impl Completion {
                     if self.reply.stop.stopped && !stopped {
                         (self.generation.interrupt)();
                     }
+                    if !deltas.is_empty() {
+                        return Ok(Step::Deltas(deltas));
+                    }
+                }
+                Some("reasoning_end") => {
+                    let deltas = self.reply.end_reasoning();
                     if !deltas.is_empty() {
                         return Ok(Step::Deltas(deltas));
                     }

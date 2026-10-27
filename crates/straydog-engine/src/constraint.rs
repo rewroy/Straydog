@@ -32,12 +32,21 @@ const SCHEMA_DEPTH: usize = 48;
 pub struct TokenBytes {
     bytes: Vec<Vec<u8>>,
     special: Vec<bool>,
+    /// The template's `</think>` when it is one added token: only it ends a reasoning.
+    think_close: Option<u32>,
 }
 
 impl TokenBytes {
     pub fn new(bytes: Vec<Vec<u8>>, special: Vec<bool>) -> TokenBytes {
         assert_eq!(bytes.len(), special.len());
-        TokenBytes { bytes, special }
+        TokenBytes { bytes, special, think_close: None }
+    }
+
+    /// The same, with the vocabulary's `</think>` token: a reasoning ends at it, never at the same
+    /// text written otherwise (the reasoning quoting the tag), as the worker's reasoning_end does.
+    pub fn with_think_close(mut self, token: Option<u32>) -> TokenBytes {
+        self.think_close = token;
+        self
     }
 
     /// A token's bytes and whether it is a control token; None for an id no token has.
@@ -749,13 +758,20 @@ impl Constraint {
             if end {
                 return None;
             }
-            let mut joined = tail.clone();
-            joined.extend_from_slice(bytes);
-            let Some(at) = find(&joined, THINK_CLOSE) else {
-                let keep = joined.len().saturating_sub(THINK_CLOSE.len() - 1);
-                return Some(Constraint { thinking: Some(joined[keep..].to_vec()), ..self.clone() });
-            };
-            answer = &bytes[at + THINK_CLOSE.len() - tail.len()..];
+            if let Some(close) = self.tokens.think_close {
+                if token != close {
+                    return Some(self.clone());
+                }
+                answer = &[];
+            } else {
+                let mut joined = tail.clone();
+                joined.extend_from_slice(bytes);
+                let Some(at) = find(&joined, THINK_CLOSE) else {
+                    let keep = joined.len().saturating_sub(THINK_CLOSE.len() - 1);
+                    return Some(Constraint { thinking: Some(joined[keep..].to_vec()), ..self.clone() });
+                };
+                answer = &bytes[at + THINK_CLOSE.len() - tail.len()..];
+            }
         }
         if end {
             return self.alternatives.iter().any(Alternative::can_end).then(|| self.clone());
@@ -910,6 +926,24 @@ mod tests {
         assert!(!constraint.allows(0));
         constraint.advance(3);
         assert!(constraint.allows(0) && !constraint.allows(2));
+    }
+
+    #[test]
+    fn a_think_close_token_ends_the_reasoning_and_its_text_does_not() {
+        // 0 end, 1 "</think>" (the vocabulary's one token), 2 "</", 3 "think>", 4 "{", 5 "}"
+        let pieces = ["<|end|>", "</think>", "</", "think>", "{", "}"];
+        let vocabulary = TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; pieces.len()]);
+        let mut constraint = Constraint::new(Arc::new(vocabulary.with_think_close(Some(1))), &[0], true,
+                                             vec![Alternative::json(Schema::any_object())]);
+        // the reasoning writes the tag's text: still reasoning, anything goes
+        for token in [2, 3, 5] {
+            assert!(constraint.allows(token));
+            constraint.advance(token);
+        }
+        assert!(!constraint.allows(0));
+        constraint.advance(1);
+        // the answer is held to JSON
+        assert!(!constraint.allows(5) && constraint.allows(4));
     }
 
     #[test]

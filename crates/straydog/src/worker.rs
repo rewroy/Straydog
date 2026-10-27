@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 use serde_json::{json, Value};
-use straydog_engine::chat::ChatTemplate;
+use straydog_engine::chat::{self, ChatTemplate};
 use straydog_engine::constraint::Constraint;
+use straydog_engine::reply::THINK_CLOSE;
 use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings, END_TOKENS};
 use straydog_engine::pyjson;
@@ -466,6 +467,8 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         Some(Py::Str(effort)) => effort.as_str(),
         Some(_) => return Err(refused("invalid Straydog reasoning effort")),
     };
+    // (a message's own text never writes the template's tokens: see Text::defuse)
+    let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
     let prompt = engine.template.render(messages, &tools, thinking, effort).map_err(|exc| refused(exc.0))?;
     let ids = text.encode(&prompt).map_err(Failure::from)?;
     let encode_seconds = started.elapsed().as_secs_f64();
@@ -529,6 +532,10 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let cancelled = || cancel.load(Ordering::SeqCst);
     let mut constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(), &END_TOKENS, thinking)
         .map_err(refused)?;
+    // A reply that reasons ends it with the template's `</think>`, its one added token: the deltas go
+    // without it and a reasoning_end event marks the place. The same text otherwise written (the
+    // reasoning quoting a tag) stays the reasoning's.
+    let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
     let result = engine.model.generate_constrained(
         &ids, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -536,11 +543,18 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         &mut |token| {
             generated += 1;
             match stream.push(token) {
-                Ok(delta) if !delta.is_empty() => {
-                    first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                    output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+                Ok(delta) => {
+                    let ended = think_close == Some(token);
+                    let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                    if !delta.is_empty() {
+                        first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                        output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+                    }
+                    if ended {
+                        think_close = None;
+                        output.send(&json!({"id": id, "event": "reasoning_end", "tokens": generated}));
+                    }
                 }
-                Ok(_) => {}
                 Err(exc) => {
                     decode_error.get_or_insert_with(|| exc.into());
                 }
