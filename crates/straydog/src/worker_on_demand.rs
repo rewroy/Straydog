@@ -12,8 +12,9 @@ use serde_json::{json, Value};
 use straydog_engine::arch::served::{Engines, Session, Settings};
 use straydog_engine::arch::{deepseek41, qwen35moe};
 use straydog_engine::bundle;
-use straydog_engine::chat::ChatTemplate;
+use straydog_engine::chat::{self, ChatTemplate};
 use straydog_engine::constraint::Constraint;
+use straydog_engine::reply::THINK_CLOSE;
 use straydog_engine::pyjson;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
@@ -276,6 +277,8 @@ impl<E: Engines> Loaded<E> {
             };
             variables.push(("reasoning_effort", effort));
         }
+        // (a message's own text never writes the template's tokens: see Text::defuse)
+        let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
@@ -329,17 +332,28 @@ impl<E: Engines> Loaded<E> {
         let cancelled = || cancel.load(Ordering::SeqCst);
         let mut constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(),
                                                       self.model.end_tokens(), thinking).map_err(refused)?;
+        // A reply that reasons ends it with the template's `</think>`, its one added token: the deltas
+        // go without it and a reasoning_end event marks the place. The same text otherwise written (the
+        // reasoning quoting a tag) stays the reasoning's.
+        let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
             &mut |token| {
                 generated += 1;
                 match stream.push(token) {
-                    Ok(delta) if !delta.is_empty() => {
-                        first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                        output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+                    Ok(delta) => {
+                        let ended = think_close == Some(token);
+                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        if !delta.is_empty() {
+                            first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                            output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+                        }
+                        if ended {
+                            think_close = None;
+                            output.send(&json!({"id": id, "event": "reasoning_end", "tokens": generated}));
+                        }
                     }
-                    Ok(_) => {}
                     Err(exc) => {
                         decode_error.get_or_insert_with(|| exc.into());
                     }

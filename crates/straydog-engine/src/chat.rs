@@ -36,6 +36,32 @@ pub struct ChatTemplate {
     raised: Arc<Mutex<Option<String>>>,
 }
 
+/// `messages` with each message's own text through `defuse` (the worker's
+/// [`crate::text::Text::defuse`]): its content, a string or text parts, and its reasoning, which
+/// templates write as they are. Roles, names and tool calls stay as they were (a template writes
+/// arguments through `tojson`, which would spell the mark out).
+pub fn defuse_messages(messages: &Value, defuse: &dyn Fn(&str) -> String) -> Value {
+    let Value::Array(items) = messages else { return messages.clone() };
+    let part = |part: &Value| match part {
+        Value::Object(fields) => Value::Object(fields.iter().map(|(key, value)| match (key.as_str(), value) {
+            ("text", Value::Str(text)) => (key.clone(), Value::Str(defuse(text))),
+            _ => (key.clone(), value.clone()),
+        }).collect()),
+        _ => part.clone(),
+    };
+    Value::Array(items.iter().map(|message| match message {
+        Value::Object(fields) => Value::Object(fields.iter().map(|(key, value)| {
+            let value = match (key.as_str(), value) {
+                ("content" | "reasoning_content", Value::Str(text)) => Value::Str(defuse(text)),
+                ("content", Value::Array(parts)) => Value::Array(parts.iter().map(part).collect()),
+                _ => value.clone(),
+            };
+            (key.clone(), value)
+        }).collect()),
+        _ => message.clone(),
+    }).collect())
+}
+
 impl ChatTemplate {
     pub fn new(source: &str) -> Result<ChatTemplate, ChatError> {
         let mut environment = Environment::new();

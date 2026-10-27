@@ -9,7 +9,8 @@ use regex::Regex;
 use crate::chat::python_strip;
 use crate::pyjson::{self, Value};
 
-const THINK_CLOSE: &str = "</think>";
+/// The templates' end of reasoning.
+pub const THINK_CLOSE: &str = "</think>";
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 /// DSML: the tool calls follow the answer after a blank line (DeepSeek-V4.1's tag names start
 /// with a space).
@@ -84,6 +85,9 @@ pub struct ReasoningSplitter {
     answer_lead: bool,
     line_start: bool,
     markup: Markup,
+    /// Reasoning ends only at [`ReasoningSplitter::end`] (the worker's, at the template's own
+    /// `</think>` token), never at the text.
+    by_token: bool,
 }
 
 impl ReasoningSplitter {
@@ -93,13 +97,31 @@ impl ReasoningSplitter {
 
     pub fn with_markup(thinking: bool, markup: Markup) -> ReasoningSplitter {
         // The prompt ends with "<think>\n" (Qwen) or "<think>" (DSML).
-        ReasoningSplitter { reasoning: thinking, carry: String::new(), answer_lead: markup == Markup::Qwen, line_start: true, markup }
+        ReasoningSplitter { reasoning: thinking, carry: String::new(), answer_lead: markup == Markup::Qwen, line_start: true, markup,
+                            by_token: false }
+    }
+
+    /// The same, the reasoning ending only at [`ReasoningSplitter::end`]: the worker sees the
+    /// template's `</think>` as its token and leaves it out of the text, where the same text is
+    /// the reasoning's own (quoting the tag) and was taken for its end.
+    pub fn ending_by_token(mut self) -> ReasoningSplitter {
+        self.by_token = true;
+        self
+    }
+
+    /// The reasoning's end ([`ReasoningSplitter::ending_by_token`]): what it held, as reasoning.
+    pub fn end(&mut self) -> String {
+        self.reasoning = false;
+        std::mem::take(&mut self.carry)
     }
 
     /// (answer, reasoning) for one delta.
     pub fn feed(&mut self, text: &str) -> (String, String) {
         if !self.reasoning {
             return (self.answer(text), String::new());
+        }
+        if self.by_token {
+            return (String::new(), text.to_string());
         }
         let mut buffer = std::mem::take(&mut self.carry) + text;
         let close = match self.markup {
@@ -439,6 +461,18 @@ impl StopMatcher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reasoning_ending_by_token_keeps_a_quoted_tag() {
+        let mut splitter = ReasoningSplitter::with_markup(true, Markup::Dsml).ending_by_token();
+        assert_eq!(splitter.feed("Notes: after `</think>`; tool_choice"), (String::new(), "Notes: after `</think>`; tool_choice".to_string()));
+        assert_eq!(splitter.feed("</th"), (String::new(), "</th".to_string()));
+        assert_eq!(splitter.end(), "");
+        assert_eq!(splitter.feed("The answer."), ("The answer.".to_string(), String::new()));
+        // (by text, as before: the quoted tag ends it)
+        let mut by_text = ReasoningSplitter::with_markup(true, Markup::Dsml);
+        assert_eq!(by_text.feed("after `</think>`; x").0, "`; x");
+    }
+
     use super::*;
 
     fn split(deltas: &[&str], thinking: bool, tools: Option<&Value>) -> (String, String, Vec<ToolCall>) {

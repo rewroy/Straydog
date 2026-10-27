@@ -18,8 +18,16 @@ fn gguf_pre_tokenizer(name: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Marks, in a message's own text, an added token's text the template did not write
+/// ([`Text::defuse`]): [`Text::encode`] takes it as ordinary text, never as that token.
+pub const DEFUSED: char = '\u{e001}';
+
 pub struct Text {
     tokenizer: Tokenizer,
+    /// The same without its added tokens: a defused one's text as any other text.
+    plain: Tokenizer,
+    /// The added tokens' texts, longest first, anywhere and at the start of a text.
+    added: Option<(regex::Regex, regex::Regex)>,
     /// [`Text::token_bytes`], built on first use.
     bytes: std::sync::OnceLock<std::sync::Arc<crate::constraint::TokenBytes>>,
 }
@@ -39,7 +47,36 @@ impl Text {
     /// From the bytes of `tokenizer.json`, already authenticated.
     pub fn new(tokenizer_json: &[u8]) -> Result<Text, TextError> {
         let tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(|exc| TextError(exc.to_string()))?;
-        Ok(Text { tokenizer, bytes: std::sync::OnceLock::new() })
+        let mut json: serde_json::Value = serde_json::from_slice(tokenizer_json).map_err(|exc| TextError(exc.to_string()))?;
+        let mut contents: Vec<String> = json["added_tokens"].as_array().into_iter().flatten()
+            .filter_map(|token| token["content"].as_str().filter(|content| !content.is_empty()).map(str::to_string)).collect();
+        json["added_tokens"] = serde_json::Value::Array(Vec::new());
+        let plain = Tokenizer::from_bytes(json.to_string().as_bytes()).map_err(|exc| TextError(exc.to_string()))?;
+        contents.sort_by_key(|content| std::cmp::Reverse(content.len()));
+        let alternatives = contents.iter().map(|content| regex::escape(content)).collect::<Vec<_>>().join("|");
+        let added = if contents.is_empty() {
+            None
+        } else {
+            let compile = |pattern: String| regex::Regex::new(&pattern).map_err(|exc| TextError(exc.to_string()));
+            Some((compile(alternatives.clone())?, compile(format!("^(?:{alternatives})"))?))
+        };
+        Ok(Text { tokenizer, plain, added, bytes: std::sync::OnceLock::new() })
+    }
+
+    /// `text`, a message's own, with each added token's text in it marked [`DEFUSED`]: only the
+    /// chat template writes those tokens. A tool's output quoting `</think>` was the token itself
+    /// to the model, which then wrote it in its reasoning, and the reply ended its reasoning there.
+    pub fn defuse<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.added {
+            Some((anywhere, _)) => anywhere.replace_all(text, |found: &regex::Captures<'_>| format!("{DEFUSED}{}", &found[0])),
+            None => std::borrow::Cow::Borrowed(text),
+        }
+    }
+
+    /// The id of `content` when it is one added token (a template's tag), else None.
+    pub fn added_token(&self, content: &str) -> Option<u32> {
+        let id = self.tokenizer.token_to_id(content)?;
+        self.tokenizer.get_added_tokens_decoder().get(&id).filter(|added| added.content == content).map(|_| id)
     }
 
     /// The tokenizer a GGUF describes (`tokenizer.ggml.*`): byte-level BPE over its tokens and
@@ -90,9 +127,29 @@ impl Text {
         Text::new(tokenizer.to_string().as_bytes())
     }
 
-    /// The ids of a rendered prompt; special-token text in it becomes those tokens.
+    /// The ids of a rendered prompt; special-token text in it becomes those tokens, but for a
+    /// [`DEFUSED`] one's, ordinary text (a mark before anything else is dropped).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, TextError> {
-        let encoding = self.tokenizer.encode(text, false).map_err(|exc| TextError(exc.to_string()))?;
+        if !text.contains(DEFUSED) {
+            return Self::encode_with(&self.tokenizer, text);
+        }
+        let (mut ids, mut rest) = (Vec::new(), text);
+        while let Some(at) = rest.find(DEFUSED) {
+            ids.extend(Self::encode_with(&self.tokenizer, &rest[..at])?);
+            let after = &rest[at + DEFUSED.len_utf8()..];
+            let length = self.added.as_ref().and_then(|(_, at_start)| at_start.find(after)).map_or(0, |found| found.end());
+            ids.extend(Self::encode_with(&self.plain, &after[..length])?);
+            rest = &after[length..];
+        }
+        ids.extend(Self::encode_with(&self.tokenizer, rest)?);
+        Ok(ids)
+    }
+
+    fn encode_with(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, TextError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoding = tokenizer.encode(text, false).map_err(|exc| TextError(exc.to_string()))?;
         Ok(encoding.get_ids().to_vec())
     }
 
@@ -124,7 +181,7 @@ impl Text {
                 special[index] = false;
             }
         }
-        crate::constraint::TokenBytes::new(bytes, special)
+        crate::constraint::TokenBytes::new(bytes, special).with_think_close(self.added_token(crate::reply::THINK_CLOSE))
     }
 
     /// Text for a stream of generated ids, one delta at a time.

@@ -48,6 +48,28 @@ fn the_gguf_tokenizer_encodes_as_the_official_one() {
     assert_eq!(ours.decode(&every).unwrap(), official.decode(&every).unwrap());
 }
 
+/// A message's own text never writes the template's tokens (Text::defuse): its `</think>` and
+/// `<｜end▁of▁sentence｜>` encode as ordinary text and decode back as they were, while the
+/// template's own tags around it stay the tokens. (A tool output quoting `</think>` was the token
+/// to the model, which wrote it in its reasoning, and the reply's reasoning ended there.)
+#[test]
+fn a_message_s_own_tags_encode_as_text() {
+    let Some(model) = common::model_env("STRAYDOG_DEEPSEEK", "the DeepSeek-V4.1-Flash UD-IQ2_XXS directory") else { return };
+    let mut file = std::io::BufReader::new(std::fs::File::open(first_shard(&PathBuf::from(model))).unwrap());
+    let text = Text::from_gguf(&straydog_gguf::inspect(&mut file).unwrap()).unwrap();
+    let (close, end) = (text.added_token("</think>").unwrap(), text.added_token("<｜end▁of▁sentence｜>").unwrap());
+    let quoted = "replies split at the first `</think>`; a turn ends <｜end▁of▁sentence｜> there";
+    assert!(text.encode(quoted).unwrap().contains(&close), "undefused, the tag is the token");
+    let defused = text.defuse(quoted);
+    let ids = text.encode(&defused).unwrap();
+    assert!(!ids.contains(&close) && !ids.contains(&end), "{ids:?}");
+    assert_eq!(text.decode(&ids).unwrap(), quoted);
+    let prompt = text.encode(&format!("<think>{defused}</think>answer<｜end▁of▁sentence｜>")).unwrap();
+    assert_eq!((prompt.iter().filter(|&&id| id == close).count(), prompt.iter().filter(|&&id| id == end).count()), (1, 1));
+    assert_eq!(text.decode(&prompt).unwrap(), format!("<think>{quoted}</think>answer<｜end▁of▁sentence｜>"));
+    assert_eq!(text.added_token("think"), None);
+}
+
 /// A chat template against the reference encoder (tests/golden/deepseek41_chat.json, made by the
 /// model's encoding.py): the same prompt for every case.
 fn renders_as_the_reference_encoder(source: &str) {
