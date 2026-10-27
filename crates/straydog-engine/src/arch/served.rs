@@ -38,6 +38,11 @@ pub trait Engines {
     fn store_counts(&self) -> Option<crate::experts::Counts> {
         None
     }
+    /// How often the engines' own drafter was asked for a draft since the last call, and how many
+    /// tokens each verified (index 0: none, the draft thrown away), when there is one.
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+        None
+    }
     /// Seconds per phase of the passes since the last call, when the engines profile them
     /// (DS41_PROFILE), else nothing; the count restarts.
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
@@ -608,6 +613,7 @@ impl<E: Engines> Session<E> {
         let prefill_profile: Map<String, Value> = self.engines.take_profile().into_iter()
             .map(|(phase, seconds)| (phase.to_string(), json!(seconds))).collect();
         let cpu = self.engines.cpu_routes();
+        drop(self.engines.take_draft_stats());
         let mut ttft = None;
         let decoding = Instant::now();
         let decoded = decode(&mut self.engines, &mut self.history, logits, self.vocabulary, &self.end, max_new, sampling, seed, cancelled,
@@ -631,6 +637,7 @@ impl<E: Engines> Session<E> {
         let (hits2, host2, drive2) = self.engines.counts();
         let cpu2 = self.engines.cpu_routes();
         let per = |value: u64| if steps > 0 { json!(value as f64 / steps as f64) } else { Value::Null };
+        let draft_stats = self.engines.take_draft_stats();
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed_from, "agreed_tokens": agreed,
             "prefill_tokens": total - reused, "prefill_seconds": prefill_seconds,
@@ -653,6 +660,10 @@ impl<E: Engines> Session<E> {
         .as_object()
         .unwrap()
         .clone();
+        if let Some((runs, widths)) = draft_stats {
+            self.last_metrics.insert("engine_draft_runs".into(), json!(runs));
+            self.last_metrics.insert("engine_draft_widths".into(), json!(widths));
+        }
         Ok(())
     }
 

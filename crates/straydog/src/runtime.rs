@@ -343,9 +343,15 @@ pub fn request_summary(event: &Value) -> String {
         number(&timings["decode_tokens_per_second"], 1),
         // (an engine that verifies drafts says how many it checked and kept, and of those the engine's own)
         match timings["draft_tokens"].as_u64() {
-            Some(drafted) if drafted > 0 => format!(" ({} of {} drafts kept in {} passes; DSpark {} of {})", count(&timings["accepted_drafts"]), drafted,
+            Some(drafted) if drafted > 0 => format!(" ({} of {} drafts kept in {} passes; DSpark {} of {}{})", count(&timings["accepted_drafts"]), drafted,
                                                    count(&timings["decode_passes"]), count(&timings["accepted_engine_drafts"]),
-                                                   count(&timings["engine_draft_tokens"])),
+                                                   count(&timings["engine_draft_tokens"]),
+                                                   // (DSpark's drafts made, whatever was verified of them, and how wide)
+                                                   match (timings["engine_draft_runs"].as_u64(), timings["engine_draft_widths"].as_array()) {
+                                                       (Some(runs), Some(widths)) => format!(", {runs} draft runs by width {}",
+                                                           widths.iter().map(&count).collect::<Vec<_>>().join("/")),
+                                                       _ => String::new(),
+                                                   }),
             _ => String::new(),
         },
         // (an engine that streams experts says where the prefill's came from: what the first token waited on)
@@ -1211,6 +1217,11 @@ mod tests {
         let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
                                                           "engine_draft_tokens": 25, "accepted_engine_drafts": 18}});
         assert!(request_summary(&event).contains("(31 of 40 drafts kept in 120 passes; DSpark 18 of 25)"), "{}", request_summary(&event));
+        // (DSpark's draft runs, whatever was verified of them, by the width each was verified at)
+        let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
+                                                          "engine_draft_tokens": 25, "accepted_engine_drafts": 18,
+                                                          "engine_draft_runs": 30, "engine_draft_widths": [7, 4, 12, 7]}});
+        assert!(request_summary(&event).contains("DSpark 18 of 25, 30 draft runs by width 7/4/12/7)"), "{}", request_summary(&event));
         let none = json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
         assert!(!request_summary(&none).contains("drafts"));
     }

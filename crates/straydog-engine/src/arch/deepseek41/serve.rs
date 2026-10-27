@@ -137,6 +137,11 @@ impl served::Engines for Engines {
         self.engines.iter().map(Engine::cache_counts).reduce(|sum, counts| sum + counts)
     }
 
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+        let stats = self.drafting.as_mut()?.policy.take_stats();
+        Some((stats.runs, stats.widths.to_vec()))
+    }
+
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
         // (each engine is a layer group; their phases add up over the pass)
         let mut phases: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();

@@ -789,6 +789,16 @@ pub struct Policy {
     /// The last target pass's milliseconds.
     pass_ms: f64,
     paused: usize,
+    /// What the rounds since [`Policy::take_stats`] did.
+    stats: Stats,
+}
+
+/// What a [`Policy`]'s rounds did: the drafts it was asked for and, of those, how many tokens each
+/// verified (index 0: none, the draft thrown away).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub runs: usize,
+    pub widths: [usize; MAX_SLOTS],
 }
 
 /// A target pass's cost by its rows (1 to 4), in the cost of a pass of one row: verify passes on
@@ -833,7 +843,7 @@ impl Default for Policy {
 impl Policy {
     /// With a first guess at a one-row pass's and a draft's milliseconds.
     pub fn new(pass_ms: f64, draft_ms: f64) -> Policy {
-        Policy { unit_ms: pass_ms, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0 }
+        Policy { unit_ms: pass_ms, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0, stats: Stats::default() }
     }
 
     /// Whether this round drafts: not during a pause, which begins when drafts have not paid.
@@ -890,6 +900,11 @@ impl Policy {
         self.skill += (1.0 - self.skill) * 0.01;
     }
 
+    /// What the rounds did since the last call.
+    pub fn take_stats(&mut self) -> Stats {
+        std::mem::take(&mut self.stats)
+    }
+
     /// A new context: no pause, no verdict on the drafter.
     pub fn reset(&mut self) {
         (self.paused, self.skill, self.chosen, self.saved) = (0, 1.0, (0, 0.0), 1.0);
@@ -912,6 +927,8 @@ impl Policy {
             }
         }
         self.chosen = (best.0, best.2);
+        self.stats.runs += 1;
+        self.stats.widths[best.0] += 1;
         if best.0 == 0 {
             // (the draft's cost lost)
             self.forgive();
@@ -1055,6 +1072,19 @@ mod tests {
         assert!(!policy.drafting());
         policy.reset();
         assert!(policy.drafting());
+    }
+
+    /// Every draft the policy is asked about is counted with the width it was verified at, the
+    /// hopeless ones as width 0; the count starts over each time it is taken.
+    #[test]
+    fn the_policy_counts_its_draft_runs_by_width() {
+        let mut policy = Policy::default();
+        assert_eq!(policy.take_stats(), Stats::default());
+        assert_eq!(round(&mut policy, 1.0), 2);
+        assert_eq!(round(&mut policy, 0.1), 0);
+        assert_eq!(round(&mut policy, 1.0), 2);
+        assert_eq!(policy.take_stats(), Stats { runs: 3, widths: [1, 0, 2, 0] });
+        assert_eq!(policy.take_stats(), Stats::default());
     }
 
     /// What the policy learns of the costs: a draft's a running mean; a one-row pass's from every pass
