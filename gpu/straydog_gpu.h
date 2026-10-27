@@ -260,12 +260,19 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
 int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
 int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);
+/* DeepSeek-V4.1's candidate blocks (its indexer's first level): each row's `blocks` blocks of `block`
+   groups whose highest score is highest (scores rows x groups as sd_op_index_select stores them, -inf
+   past the visible; the block of a row's last visible group always kept, blocks of only -inf never), in
+   index order, -1 past the last: out rows x blocks. scratch holds rows * ceil(groups / block) floats. */
+int sd_op_index_candidates(void* handle, const float* scores, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t blocks, uint64_t block, int32_t* out, float* scratch, uint64_t scratch_bytes);
 /* sd_op_rope of q (rope_dims, positions, frequencies; q itself unchanged), sd_op_index_scores and
-   sd_op_top_k of the scores in one launch: the same scores and indices. */
-int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out);
+   sd_op_top_k of the scores in one launch: the same scores and indices.
+   With candidates (rows x blocks, sd_op_index_candidates'), each row's groups scored and chosen are its
+   candidates' (blocks * block, scores rows x that in candidate order), the indices the groups'. */
+int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out, const int32_t* candidates, uint64_t blocks, uint64_t block);
 /* sd_op_index_select of one row whose weights are first formed: weights = proj_weights . x (heads rows of
    proj_cols, as sd_op_linear forms them), in the same launch where it can. */
-int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kind, uint64_t proj_cols, const float* x, const float* q, const float* keys, float* weights, const int32_t* visible, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out);
+int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kind, uint64_t proj_cols, const float* x, const float* q, const float* keys, float* weights, const int32_t* visible, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out, const int32_t* candidates, uint64_t blocks, uint64_t block);
 
 /* Token mixers (any shape; gpu/token_mixing.hpp). conv_silu: x (steps x channels) becomes SiLU of
    each channel's causal convolution with its taps (channels x kernel, kernel <= 8) over history

@@ -1603,6 +1603,40 @@ __global__ void __launch_bounds__(256) op_top_k_kernel(const float* scores, size
     __shared__ uint32_t shared[256];
     top_k_row([s](size_t g) { return s[g]; }, groups, k, out + size_t(blockIdx.x) * k, shared);
 }
+// DeepSeek-V4.1's two-level indexer (the reference's select_candidate_blocks): the candidate source's
+// scores pick a row's candidate blocks (`block` groups each), and the later indexers score and choose
+// only among their groups. A row's candidates (`blocks` slots, in index order, -1 past the last) number
+// its groups blocks * block in candidate order: candidate group v is group candidates[v / block] * block
+// + v % block, past the row's groups where its slot is -1. Index order both ways, so a top k over the
+// candidates is the top k over every group with the others at -inf, ties and order alike.
+__device__ __forceinline__ size_t index_candidate(const int32_t* candidates, size_t block, size_t v, size_t groups) {
+    const int32_t b = candidates[v / block];
+    return b < 0 ? groups : size_t(b) * block + v % block;
+}
+// A row's blocks scored for its candidate pick (then op_top_k_kernel's top blocks: in index order, -1
+// past the last): each block's highest of the candidate source's scores (as its select stored them: -inf
+// past the row's visible groups), the block of the row's last visible group +inf (always kept: the newest,
+// partly filled, could lose to an older full one); blocks of only -inf are never kept. A thread a block.
+__global__ void __launch_bounds__(256) op_index_block_tops_kernel(const float* scores, const int32_t* visible, size_t groups,
+                                                                  size_t block, size_t count, float* tops) {
+    const size_t row = blockIdx.y, b = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (b >= count) return;
+    const float* s = scores + row * groups;
+    const size_t seen = std::min<size_t>(groups, size_t(max(visible[row], 0)));
+    float top = seen && b == (seen - 1) / block ? INFINITY : -INFINITY;
+    for (size_t g = b * block, end = std::min(groups, g + block); g < end; ++g) top = fmaxf(top, s[g]);
+    tops[row * count + b] = top;
+}
+// op_top_k_kernel over a row's candidate groups (scores of every group): the groups' indices.
+__global__ void __launch_bounds__(256) op_top_k_candidates_kernel(const float* scores, size_t groups, const int32_t* candidates,
+                                                                  size_t blocks, size_t block, size_t k, int32_t* out) {
+    const float* s = scores + size_t(blockIdx.x) * groups;
+    const int32_t* c = candidates + size_t(blockIdx.x) * blocks;
+    __shared__ uint32_t shared[256];
+    top_k_row([=](size_t v) { const size_t g = index_candidate(c, block, v, groups); return g < groups ? s[g] : -INFINITY; },
+              blocks * block, k, out + size_t(blockIdx.x) * k, shared,
+              [=](size_t v) { return int32_t(index_candidate(c, block, v, groups)); });
+}
 
 // Groups of a row a block of the indexer scores (a thread each).
 constexpr size_t index_block_groups = 256;
@@ -1614,16 +1648,26 @@ constexpr size_t index_block_groups = 256;
 // order. Then, with counters, the row's last block to finish takes the row's top k (op_top_k_kernel's),
 // reading the scores the other blocks stored from the device-wide cache. counters: a row's blocks done
 // (its last block zeroes it). With weights_done, the weights are another block's of the launch: read
-// once that many blocks counted themselves done there.
+// once that many blocks counted themselves done there. With candidates (blocks slots a row of `block`
+// groups, index_candidate's), the row's groups scored and chosen are its candidates', in candidate order:
+// scores [row][candidate], the top k mapped back to the groups' indices. With half (RDNA4, 32 heads of
+// 128), the dots take FP16 operands and sum in F32 through WMMA, as the prompt pass's
+// ds_index_scores_wmma_rows (the reference's indexer rounds q and the keys to FP4): q's heads two tiles of
+// 16 against each wave's 32 groups as two, a lane's eight heads of each weighted, then the halves added.
 template<int H>
 __device__ __forceinline__ void index_select_block(const float* q, const float* keys, const float* weights, const int32_t* visible,
                                                    size_t groups, size_t heads, size_t dim, float scale, size_t pairs,
                                                    const int32_t* positions, const float* frequencies, float* scores, size_t k,
                                                    int32_t* out, unsigned* counters, unsigned* bins, size_t chunk, size_t row,
                                                    size_t chunks, const unsigned* weights_done, unsigned weight_blocks,
-                                                   float* rotated_q = nullptr, const unsigned* rotated_done = nullptr) {
+                                                   float* rotated_q = nullptr, const unsigned* rotated_done = nullptr,
+                                                   const int32_t* candidates = nullptr, size_t blocks = 0, size_t block = 1,
+                                                   bool half = false) {
     const unsigned t = threadIdx.x;
-    const size_t g = chunk * index_block_groups + t;
+    // the thread's place in the row's scored groups, and the group there
+    const size_t scored = candidates ? blocks * block : groups, place = chunk * index_block_groups + t;
+    const int32_t* row_candidates = candidates ? candidates + row * blocks : nullptr;
+    const size_t g = !row_candidates ? place : place < scored ? index_candidate(row_candidates, block, place, groups) : groups;
     // (with bins: the block's keys counted by their top 12 bits here, then added to the row's)
     __shared__ uint32_t pool[top_k_bins];
     for (unsigned b = t; bins && b < top_k_bins; b += blockDim.x) pool[b] = 0u;
@@ -1656,7 +1700,56 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
     // (a thread past the row's groups reads its last group's key, and stores nothing)
     const float* key = state_row(keys, std::min(g, groups - 1), dim);
     const bool wide = dim % 4 == 0 && (state_bf16(keys) || reinterpret_cast<uintptr_t>(keys) % 16 == 0);
-    for (size_t d0 = 0; d0 < dim; d0 += 32) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const bool wmma = H == 32 && half && dim == 128 && wide;
+    const unsigned lane = t % 32, side = lane / 16;
+    moe_float8 tiles[2][2] = {};
+    if (wmma) {
+        __shared__ __attribute__((aligned(16))) _Float16 qh[32][128 + 8];
+        __syncthreads();   // (the turns)
+        for (unsigned at = t; at < 32 * 16; at += blockDim.x) {
+            const unsigned h = at / 16, c0 = (at % 16) * 8;
+            moe_half8 v = {};
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const size_t col = c0 + j;
+                float x = 0.0f;
+                if (h >= heads) x = 0.0f;
+                else if (rotated_q) x = hc_step_load(rotated_q + h * dim + col);
+                else if (col < rotated) x = row_q[h * dim + col];
+                else {
+                    const size_t pair = (col - rotated) / 2;
+                    const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
+                    const double c = turns[pair][0], s = turns[pair][1];
+                    x = (col - rotated) % 2 == 0 ? float(a * c - b * s) : float(a * s + b * c);
+                }
+                v[j] = _Float16(x);
+            }
+            *reinterpret_cast<moe_half8*>(&qh[h][c0]) = v;
+        }
+        __syncthreads();
+        // the wave's groups: 16 n + lane % 16 of its 32 (the last group's key past the row's), columns 16 s + 8 side .. + 8
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            const size_t at = chunk * index_block_groups + (t / 32) * 32 + n * 16 + lane % 16;
+            const size_t gn = !row_candidates ? at : at < scored ? index_candidate(row_candidates, block, at, groups) : groups;
+            const float* row_key = state_row(keys, std::min(gn, groups - 1), dim);
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                const float4 a = state_float4(row_key, 16 * s + 8 * side), b = state_float4(row_key, 16 * s + 8 * side + 4);
+                const moe_half8 kv = {_Float16(a.x), _Float16(a.y), _Float16(a.z), _Float16(a.w), _Float16(b.x), _Float16(b.y),
+                                      _Float16(b.z), _Float16(b.w)};
+                #pragma unroll
+                for (int m = 0; m < 2; ++m)
+                    tiles[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        *reinterpret_cast<const moe_half8*>(&qh[m * 16 + lane % 16][16 * s + 8 * side]), kv, tiles[m][n]);
+            }
+        }
+    }
+#else
+    constexpr bool wmma = false;
+#endif
+    for (size_t d0 = 0; !wmma && d0 < dim; d0 += 32) {
         __syncthreads();
         for (unsigned i = t; i < H * 32; i += blockDim.x) {
             const size_t h = i / 32, col = d0 + i % 32;
@@ -1711,21 +1804,48 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
         __syncthreads();
         index_acquire();
     }
-    if (g < groups) {
+    float mine = 0.0f;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    if (wmma) {
+        // the lane's heads 16 m + 8 side + i of both tiles, weighted, then the other side's added: the score
+        // of group 16 n + lane % 16, of which lane L keeps the wave's group L
+        float w[2][8];
+        #pragma unroll
+        for (int m = 0; m < 2; ++m)
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const size_t h = m * 16 + side * 8 + i;
+                const float* at = weights + row * heads + h;
+                w[m][i] = h < heads ? (weights_done ? hc_step_load(const_cast<float*>(at)) : *at) : 0.0f;
+            }
+        float sums[2];
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            float total = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < 2; ++m)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) total += fmaxf(tiles[m][n][i], 0.0f) * w[m][i];
+            sums[n] = total + __shfl_xor(total, 16, 32);
+        }
+        mine = side ? sums[1] : sums[0];
+    }
+#endif
+    if (place < scored) {
         // each head's term rounded on its own, then added in order (op_index_scores_kernel's, never fused)
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
-        float total = 0.0f;
+        float total = mine;
         #pragma unroll
         for (int h = 0; h < H; ++h) {
-            if (size_t(h) >= heads) break;
+            if (wmma || size_t(h) >= heads) break;
             const float* at = weights + row * heads + h;
             const float term = fmaxf(acc[h], 0.0f) * (weights_done ? hc_step_load(const_cast<float*>(at)) : *at);
             total = total + term;
         }
         const float score = g < limit ? total * scale : -INFINITY;
-        scores[row * groups + g] = score;
+        scores[row * scored + place] = score;
         const uint32_t key = top_k_key(score);
         if (bins && key > top_k_key(-INFINITY)) atomicAdd(&pool[key >> 20], 1u);
     }
@@ -1745,21 +1865,27 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
     index_acquire();
     if (!t) counters[row] = 0;
     __shared__ uint32_t shared[256];
-    float* row_scores = scores + row * groups;
-    if (bins && top_k_from_bins(row_scores, bins + row * top_k_bins, pool, groups, k, out + row * k, shared)) return;
-    top_k_row([row_scores](size_t index) { return hc_step_load(row_scores + index); }, groups, k, out + row * k, shared);
+    float* row_scores = scores + row * scored;
+    if (!bins || !top_k_from_bins(row_scores, bins + row * top_k_bins, pool, scored, k, out + row * k, shared))
+        top_k_row([row_scores](size_t index) { return hc_step_load(row_scores + index); }, scored, k, out + row * k, shared);
+    if (!row_candidates) return;
+    // (the block's own stores of the indices, seen after the barrier)
+    __syncthreads();
+    for (size_t i = t; i < k; i += blockDim.x)
+        if (const int32_t at = out[row * k + i]; at >= 0) out[row * k + i] = int32_t(index_candidate(row_candidates, block, size_t(at), groups));
 }
 __global__ void __launch_bounds__(256) op_index_select_kernel(const float* q, const float* keys, const float* weights,
                                                               const int32_t* visible, size_t groups, size_t heads, size_t dim,
                                                               float scale, size_t pairs, const int32_t* positions,
                                                               const float* frequencies, float* scores, size_t k, int32_t* out,
-                                                              unsigned* counters, unsigned* bins) {
+                                                              unsigned* counters, unsigned* bins, const int32_t* candidates,
+                                                              size_t blocks, size_t block, bool half) {
     if (heads <= 32)
         index_select_block<32>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
-                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0);
+                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0, nullptr, nullptr, candidates, blocks, block, half);
     else
         index_select_block<64>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out, counters,
-                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0);
+                               bins, blockIdx.x, blockIdx.y, gridDim.x, nullptr, 0, nullptr, nullptr, candidates, blocks, block);
 }
 // op_index_select_kernel of one row with the indexer's projection of x into its weights in the same launch
 // (proj: gemv_fixed_kind<kind, 1>'s plan and waves). A block takes a ticket as it starts: the first
@@ -1801,11 +1927,13 @@ template<int kind>
 __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         FixedGemv proj, const float* x, unsigned proj_blocks, const float* q, const float* keys, float* weights,
         const int32_t* visible, size_t groups, size_t heads, size_t dim, float scale, size_t pairs, const int32_t* positions,
-        const float* frequencies, float* scores, size_t k, int32_t* out, unsigned* counters, unsigned* bins) {
+        const float* frequencies, float* scores, size_t k, int32_t* out, unsigned* counters, unsigned* bins,
+        const int32_t* candidates, size_t candidate_blocks, size_t block, bool half) {
     __shared__ unsigned ticket;
     if (!threadIdx.x) ticket = atomicAdd(counters, 1u);
     __syncthreads();
-    const unsigned mine = ticket, chunks = unsigned((groups + index_block_groups - 1) / index_block_groups), blocks = proj_blocks + chunks;
+    const size_t scored = candidates ? candidate_blocks * block : groups;
+    const unsigned mine = ticket, chunks = unsigned((scored + index_block_groups - 1) / index_block_groups), blocks = proj_blocks + chunks;
     const bool once = heads * dim <= index_rotated_floats;
     if (mine < proj_blocks) {
         if (!mine && once) index_rotate_q(q, heads, dim, pairs, positions, frequencies, counters + 4);
@@ -1820,11 +1948,11 @@ __global__ void __launch_bounds__(256) op_index_select_proj_kernel(
         if (heads <= 32)
             index_select_block<32>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
                                    counters + 3, bins, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
-                                   once ? index_rotated_q : nullptr, counters + 4);
+                                   once ? index_rotated_q : nullptr, counters + 4, candidates, candidate_blocks, block, half);
         else
             index_select_block<64>(q, keys, weights, visible, groups, heads, dim, scale, pairs, positions, frequencies, scores, k, out,
                                    counters + 3, bins, mine - proj_blocks, 0, chunks, counters + 1, proj_blocks,
-                                   once ? index_rotated_q : nullptr, counters + 4);
+                                   once ? index_rotated_q : nullptr, counters + 4, candidates, candidate_blocks, block);
     }
     __syncthreads();
     if (!threadIdx.x && atomicAdd(counters + 2, 1u) == blocks - 1) {

@@ -1000,18 +1000,36 @@ impl Backend {
         })
     }
 
+    /// DeepSeek-V4.1's candidate blocks of each row (its indexer's first level): the `blocks` blocks of
+    /// `block` groups whose highest of `scores` (rows x groups, as [`index_select`](Self::index_select)
+    /// stores them) is highest, the block of the row's last visible group always among them, in index
+    /// order, -1 past the last: `out` rows x blocks (`scratch` holding rows x ceil(groups / block)
+    /// floats).
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_candidates(&mut self, scores: P, visible: P, rows: u64, groups: u64, blocks: u64, block: u64, out: M,
+                            scratch: &Buffer) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_index_candidates(self.handle(), scores.cast(), visible.cast(), rows, groups, blocks, block, out.cast(),
+                                        scratch.pointer.cast(), scratch.bytes)
+        })
+    }
+
     /// [`rope`](Self::rope) of q (`rope` = (dims, positions, frequencies); q itself unchanged),
     /// [`index_scores`](Self::index_scores) and [`top_k`](Self::top_k) of its scores in one launch:
-    /// the same scores and indices.
+    /// the same scores and indices. With `candidates` = (rows x blocks of
+    /// [`index_candidates`](Self::index_candidates), blocks, block), each row's groups scored and
+    /// chosen are its candidates' (scores rows x blocks * block, in candidate order).
     #[allow(clippy::too_many_arguments)]
     pub fn index_select(&mut self, q: P, keys: P, weights: P, visible: P, rows: u64, groups: u64, heads: u64, dim: u64, scale: f32,
-                        rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M) -> Result<()> {
+                        rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M, candidates: Option<(P, u64, u64)>) -> Result<()> {
         let (rope_dims, positions, frequencies) = rope;
+        let (list, blocks, block) = candidates.unwrap_or((std::ptr::null(), 0, 0));
         // SAFETY: as above.
         check(unsafe {
             ffi::sd_op_index_select(self.handle(), q.cast(), keys.cast(), weights.cast(), visible.cast(), rows, groups, heads, dim, scale,
                                     rope_dims, positions.pointer.cast_const().cast(), frequencies.pointer.cast_const().cast(),
-                                    scores.cast(), k, out.cast())
+                                    scores.cast(), k, out.cast(), list.cast(), blocks, block)
         })
     }
 
@@ -1020,14 +1038,16 @@ impl Backend {
     /// them, in the same launch where it can.
     #[allow(clippy::too_many_arguments)]
     pub fn index_select_proj(&mut self, proj: (&Buffer, u32, u64), x: P, q: P, keys: P, weights: M, visible: P, groups: u64, heads: u64,
-                             dim: u64, scale: f32, rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M) -> Result<()> {
+                             dim: u64, scale: f32, rope: (u64, &Buffer, &Buffer), scores: M, k: u64, out: M,
+                             candidates: Option<(P, u64, u64)>) -> Result<()> {
         let ((proj_weights, kind, cols), (rope_dims, positions, frequencies)) = (proj, rope);
+        let (list, blocks, block) = candidates.unwrap_or((std::ptr::null(), 0, 0));
         // SAFETY: as above.
         check(unsafe {
             ffi::sd_op_index_select_proj(self.handle(), proj_weights.pointer.cast_const(), kind as i32, cols, x.cast(), q.cast(), keys.cast(),
                                          weights.cast(), visible.cast(), groups, heads, dim, scale, rope_dims,
                                          positions.pointer.cast_const().cast(), frequencies.pointer.cast_const().cast(), scores.cast(), k,
-                                         out.cast())
+                                         out.cast(), list.cast(), blocks, block)
         })
     }
 

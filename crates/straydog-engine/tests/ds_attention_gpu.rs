@@ -111,7 +111,7 @@ fn the_wmma_indexer_of_an_fp16_pass_agrees_with_f32() {
         gpu.configure_gemm(8, half).unwrap();
         let (scores, out) = (gpu.buffer((rows * groups * 4) as u64).unwrap(), gpu.buffer((rows * k * 4) as u64).unwrap());
         gpu.index_select(q_b.base(), keys_b.base(), weights_b.base(), visible_b.base(), rows as u64, groups as u64, heads as u64, dim as u64,
-                         0.01, (rope_dims as u64, &positions_b, &frequencies_b), scores.base(), k as u64, out.base()).unwrap();
+                         0.01, (rope_dims as u64, &positions_b, &frequencies_b), scores.base(), k as u64, out.base(), None).unwrap();
         let (mut s, mut o) = (vec![0f32; rows * groups], vec![0i32; rows * k]);
         gpu.read_buffer(&scores, 0, &mut s).unwrap();
         gpu.read_buffer(&out, 0, &mut o).unwrap();

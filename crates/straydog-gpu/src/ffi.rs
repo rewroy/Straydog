@@ -928,6 +928,20 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_index_candidates(
+        handle: *mut ::std::os::raw::c_void,
+        scores: *const f32,
+        visible: *const i32,
+        rows: u64,
+        groups: u64,
+        blocks: u64,
+        block: u64,
+        out: *mut i32,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_index_select(
         handle: *mut ::std::os::raw::c_void,
         q: *const f32,
@@ -945,6 +959,9 @@ unsafe extern "C" {
         scores: *mut f32,
         k: u64,
         out: *mut i32,
+        candidates: *const i32,
+        blocks: u64,
+        block: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -968,6 +985,9 @@ unsafe extern "C" {
         scores: *mut f32,
         k: u64,
         out: *mut i32,
+        candidates: *const i32,
+        blocks: u64,
+        block: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

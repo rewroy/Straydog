@@ -252,6 +252,9 @@ struct Work {
     visible: [Buffer; 3],
     /// Per index source layer: its top-k compressed rows of each row.
     chosen: BTreeMap<usize, Buffer>,
+    /// Each row's candidate blocks, from the candidate source's indexer for the later ones (a slot
+    /// when the layers have none).
+    candidates: Buffer,
     /// The routes and their weights (after a decode row's routes, its predictions of the next
     /// layer's experts).
     ids: Buffer,
@@ -303,8 +306,8 @@ struct Work {
     ph: Buffer,
     ah: Buffer,
     tables: Buffer,
-    /// Values a row of the buffers of every row: hc, width, routes, selections.
-    widths: (usize, usize, usize, usize),
+    /// Values a row of the buffers of every row: hc, width, routes, selections, candidate blocks.
+    widths: (usize, usize, usize, usize, usize),
 }
 
 /// Experts acquired at a time by a pass of many rows (each wave's reads overlap the one before's
@@ -383,6 +386,7 @@ struct RowShape {
     ff: usize,
     top_k: usize,
     chosen: Vec<usize>,
+    blocks: usize,
     split: bool,
     capacity: usize,
 }
@@ -398,6 +402,7 @@ impl RowShape {
         let mut floats = vec![rows * hc * w, rows * hc * w, rows * hc, rows * hc, rows * hc * hc, rows * hc, rows * hc, rows * hc,
                               rows * hc * hc, rows * w, rows * w, split * w, split * w, rows, rows, rows, rows, rows];
         floats.extend(self.chosen.iter().map(|_| rows * self.top_k));
+        floats.push(rows * self.blocks);
         // (y: a wave's routes' outputs; xh, ph and ah: halves, two to a float)
         floats.extend([rows * k + PREDICTED, rows * k, rows * k, (rows * k).max(PREDICTED), rows * w, rows * ff, rows * ff,
                        routes * ff, if self.split { routes } else { 0 } * ff, routes * w, rows * w / 2, routes * ff / 2, routes * ff / 2]);
@@ -741,6 +746,7 @@ impl Shard {
         let identity: Vec<f32> = (0..r).flat_map(|_| (0..hc).map(|j| f32::from(u8::from(j == 0)))).collect();
         let all_rows: Vec<i32> = (0..b as i32).collect();
         let mut chosen = BTreeMap::new();
+        let blocks = candidate_blocks(hp, range.clone())?;
         for (layer, plan) in hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer)) {
             if plan.compressed.is_some_and(|c| c.index_source == layer) {
                 chosen.insert(layer, floats(&mut gpu, own * hp.index_top_k)?);
@@ -776,6 +782,7 @@ impl Shard {
             ring_rows,
             visible: [floats(&mut gpu, own)?, visible_1, visible_2],
             chosen,
+            candidates: floats(&mut gpu, own * blocks)?,
             ids: floats(&mut gpu, own * k + PREDICTED)?,
             weights: floats(&mut gpu, own * k)?,
             qr: floats(&mut gpu, b * hp.q_rank)?,
@@ -812,7 +819,7 @@ impl Shard {
             ph: floats(&mut gpu, routes * ff / 2)?,
             ah: floats(&mut gpu, routes * ff / 2)?,
             tables: gpu.buffer(SLOT_TABLE_BYTES)?,
-            widths: (hc, w, k, hp.index_top_k),
+            widths: (hc, w, k, hp.index_top_k, blocks),
         };
         gpu.write_buffer(&work.identity, 0, &identity)?;
         gpu.write_buffer(&work.all_rows, 0, &all_rows)?;
@@ -828,7 +835,7 @@ impl Shard {
                                              settings.host_expert_bytes)?;
         let store = building.elapsed().as_secs_f64();
         let shape = RowShape {
-            hc, w, k, ff, top_k: hp.index_top_k, chosen: work.chosen.keys().copied().collect(), split: parts > 1, capacity: r,
+            hc, w, k, ff, top_k: hp.index_top_k, chosen: work.chosen.keys().copied().collect(), blocks, split: parts > 1, capacity: r,
         };
         let arena = if r > own { Some(gpu.buffer(shape.bytes(r))?) } else { None };
         if let Some(arena) = arena.filter(|_| std::env::var("DS41_LEND").map_or(true, |value| value != "0")) {
@@ -2821,6 +2828,12 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
             let scale = 1.0 / ((hp.index_dim as f32).sqrt() * (hp.index_heads as f32).sqrt());
             let chosen = q_work.chosen[&layer];
             let rotation = (rope, &q_work.positions, &freqs);
+            // The two-level indexer (the reference's): the candidate source's scores pick each row's
+            // candidate blocks, and a later indexer chooses among their groups only. While a row's groups
+            // fit in its candidate blocks every one of them is a candidate: then neither is needed.
+            let two_level = hp.candidates.filter(|&(_, blocks, block)| plan.groups > blocks * block);
+            let within = two_level.filter(|&(source, _, _)| source < layer)
+                .map(|(_, blocks, block)| (q_work.candidates.base().cast_const(), blocks as u64, block as u64));
             if n == 1 {
                 let proj = shard.dense(&name(layer, "indexer.proj"))?;
                 if proj.dims[1] != hp.index_heads {
@@ -2828,12 +2841,17 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
                 }
                 shard.gpu.index_select_proj((&proj.buffer, proj.kind, proj.dims[0] as u64), q_work.x.base(), work.index_q.base(), state_tagged(&keys),
                                             work.index_w.base(), q_work.visible[c.ratio].base(), plan.groups as u64, hp.index_heads as u64,
-                                            hp.index_dim as u64, scale, rotation, work.scores.base(), hp.index_top_k as u64, chosen.base())?;
+                                            hp.index_dim as u64, scale, rotation, work.scores.base(), hp.index_top_k as u64, chosen.base(),
+                                            within)?;
             } else {
                 shard.linear(&name(layer, "indexer.proj"), q_work.x.base(), n, work.index_w.base())?;
                 shard.gpu.index_select(work.index_q.base(), state_tagged(&keys), work.index_w.base(), q_work.visible[c.ratio].base(), n as u64,
                                        plan.groups as u64, hp.index_heads as u64, hp.index_dim as u64, scale, rotation, work.scores.base(),
-                                       hp.index_top_k as u64, chosen.base())?;
+                                       hp.index_top_k as u64, chosen.base(), within)?;
+            }
+            if let Some((_, blocks, block)) = two_level.filter(|&(source, _, _)| source == layer) {
+                shard.gpu.index_candidates(work.scores.base(), q_work.visible[c.ratio].base(), n as u64, plan.groups as u64, blocks as u64,
+                                           block as u64, q_work.candidates.base(), &scratch)?;
             }
         }
         if plan.groups > 0 {
@@ -2979,8 +2997,22 @@ pub fn pass_row_bytes(hp: &Hparams, parts: usize, layers: std::ops::Range<usize>
     // positions and visible counts, selections, routes, gate, up and the activations (and their sum)
     // (and the grouped WMMA kernels' FP16 input row, products and summed activations: w / 2 + ff)
     let values = 2 * hc * w + 6 * hc + 2 * hc * hc + 4 * w + 2 * split * w + 5 + indexes * hp.index_top_k + 4 * k + (3 + split) * ff
-        + w / 2 + ff;
+        + w / 2 + ff + candidate_blocks(hp, layers).unwrap_or(0);
     (values * 4) as u64
+}
+
+/// The candidate blocks a row keeps for the layers `layers` (the candidate source's indexer picks them
+/// for the later ones): none without a candidate source there; an error when a later indexer there
+/// would read them from another engine's.
+fn candidate_blocks(hp: &Hparams, layers: std::ops::Range<usize>) -> Result<usize> {
+    let Some((source, blocks, _)) = hp.candidates else { return Ok(0) };
+    let users = hp.layers.iter().enumerate().any(|(layer, plan)| layers.contains(&layer) && layer > source
+                                                                 && plan.compressed.is_some_and(|c| c.index_source == layer));
+    match (layers.contains(&source), users) {
+        (true, _) => Ok(blocks),
+        (false, false) => Ok(0),
+        (false, true) => Err(format!("DeepSeek-V4.1 layers {layers:?} choose among layer {source}'s candidates, held by another engine")),
+    }
 }
 
 /// One pass over engines that run consecutive layers (on their own devices): each hands the stream
@@ -3022,7 +3054,8 @@ impl Work {
         Ok(Work {
             stream: next(), stream2: next(), pre_a: next(), post_a: next(), comb_a: next(), pre_f: [next(), next()], post_f: next(),
             comb_f: next(), x: next(), out: next(), parts: [next(), next()], positions: next(), ring_rows: next(),
-            visible: [next(), next(), next()], chosen: self.chosen.keys().map(|&layer| (layer, next())).collect(), ids: next(),
+            visible: [next(), next(), next()], chosen: self.chosen.keys().map(|&layer| (layer, next())).collect(), candidates: next(),
+            ids: next(),
             weights: next(), route_rows: next(), route_weights: next(), xe: next(), gate: next(), up: next(), act: next(),
             act_sum: next(), y: next(), xh: next(), ph: next(), ah: next(), ..self.clone()
         })
@@ -3030,7 +3063,7 @@ impl Work {
 
     /// The buffers with those of every row starting at row `first` (the rest as they are).
     fn view(&self, first: usize) -> Work {
-        let (hc, w, k, top_k) = self.widths;
+        let (hc, w, k, top_k, blocks) = self.widths;
         let at = |buffer: Buffer, values: usize| {
             let offset = (first * values * 4) as u64;
             buffer.slice(offset.min(buffer.bytes), buffer.bytes.saturating_sub(offset))
@@ -3041,7 +3074,8 @@ impl Work {
             comb_f: at(self.comb_f, hc * hc), identity: at(self.identity, hc), x: at(self.x, w), out: at(self.out, w),
             parts: self.parts.map(|buffer| at(buffer, w)), positions: at(self.positions, 1), ring_rows: at(self.ring_rows, 1),
             visible: self.visible.map(|buffer| at(buffer, 1)),
-            chosen: self.chosen.iter().map(|(&layer, &buffer)| (layer, at(buffer, top_k))).collect(), ids: at(self.ids, k),
+            chosen: self.chosen.iter().map(|(&layer, &buffer)| (layer, at(buffer, top_k))).collect(),
+            candidates: at(self.candidates, blocks), ids: at(self.ids, k),
             weights: at(self.weights, k), ..self.clone()
         }
     }

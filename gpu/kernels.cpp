@@ -3292,26 +3292,60 @@ static unsigned* index_counters(Device& value) {
     }
     return value.index_rows;
 }
+// The decode and verify passes' index scores through WMMA (index_select_block's half): with the prompt pass's
+// FP16 products on RDNA4, at its shape.
+static bool index_half(const Device& value, uint64_t heads, uint64_t dim) {
+    return value.rdna4 && value.half_gemm && heads <= 32 && dim == 128;
+}
 // A few rows' bins (decode and verify passes), else none.
 static unsigned* index_bins(Device& value, uint64_t rows) {
     return rows <= index_bin_rows ? index_counters(value) + index_bins_at : nullptr;
 }
+// A row's candidate groups (index_candidate's): blocks slots of block groups, or every group without them.
+static uint64_t index_scored(const int32_t* candidates, uint64_t rows, uint64_t groups, uint64_t blocks, uint64_t block, Device& value) {
+    if (!candidates) return groups;
+    if (!blocks || !block || blocks > (uint64_t(1) << 20) || block > 4096) throw std::runtime_error("invalid Straydog index candidates");
+    op_span(value, candidates, checked_floats({rows, blocks}), "index candidates");
+    return blocks * block;
+}
 } // extern "C++"
+
+int sd_op_index_candidates(void* handle, const float* scores, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t blocks,
+                           uint64_t block, int32_t* out, float* scratch, uint64_t scratch_bytes) {
+    SD_OP_BEGIN
+    if (!rows || rows > 65535 || !groups || groups > (uint64_t(1) << 31) || !blocks || blocks > (uint64_t(1) << 20) || !block ||
+        block > 4096)
+        throw std::runtime_error("invalid Straydog index candidates");
+    const uint64_t count = (groups + block - 1) / block;
+    op_span(value, scores, checked_floats({rows, groups}), "index scores");
+    op_span(value, visible, checked_floats({rows}), "visible counts");
+    op_span(value, out, checked_floats({rows, blocks}), "index candidates");
+    if (checked_floats({rows, count}) > scratch_bytes) throw std::runtime_error("Straydog index candidates need more scratch");
+    op_span(value, scratch, checked_floats({rows, count}), "index candidates' scratch");
+    // (each block's top by a thread of many blocks, then each row's top blocks: one block a row reading one value each)
+    op_index_block_tops_kernel<<<dim3(unsigned((count + 255) / 256), unsigned(rows)), 256, 0, value.stream>>>(scores, visible, size_t(groups),
+        size_t(block), size_t(count), scratch);
+    check(hipGetLastError());
+    op_top_k_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scratch, size_t(count), size_t(blocks), out);
+    SD_OP_END
+}
 
 int sd_op_index_select(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible,
                        uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims,
-                       const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out) {
+                       const int32_t* positions, const float* frequencies, float* scores, uint64_t k, int32_t* out,
+                       const int32_t* candidates, uint64_t blocks, uint64_t block) {
     SD_OP_BEGIN
     if (!rows || rows > 65535 || !groups || groups > (uint64_t(1) << 31) || !heads || heads > 64 || !dim || !k ||
         k > (uint64_t(1) << 31) || rope_dims % 2 || rope_dims > dim || rope_dims > 128)
         throw std::runtime_error("invalid Straydog index shape");
+    const uint64_t scored = index_scored(candidates, rows, groups, blocks, block, value);
     op_span(value, q, checked_floats({rows, heads, dim}), "index queries");
     op_state_span(value, keys, checked_product({groups, dim}), "index keys");
     op_span(value, weights, checked_floats({rows, heads}), "index weights");
     op_span(value, visible, checked_floats({rows}), "visible counts");
     op_span(value, positions, checked_floats({rows}), "query positions");
     if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
-    op_span(value, scores, checked_floats({rows, groups}), "index scores");
+    op_span(value, scores, checked_floats({rows, std::max(groups, scored)}), "index scores");
     op_span(value, out, checked_floats({rows, k}), "top-k indices");
 #if defined(__HIPCC__)
     // An FP16 prompt pass on RDNA4: the scores through WMMA (ds_index_scores_wmma_rows), every index head
@@ -3327,21 +3361,27 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
                                                                            size_t(heads), scale, size_t(rope_dims / 2), positions,
                                                                            frequencies, scores);
         check(hipGetLastError());
-        op_top_k_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), size_t(k), out);
+        // (every group scored, the top k over the candidates)
+        if (candidates)
+            op_top_k_candidates_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), candidates, size_t(blocks),
+                                                                                 size_t(block), size_t(k), out);
+        else
+            op_top_k_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), size_t(k), out);
         check(hipGetLastError());
         return 0;
     }
 #endif
-    op_index_select_kernel<<<dim3(unsigned((groups + index_block_groups - 1) / index_block_groups), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
+    op_index_select_kernel<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups), unsigned(rows)), 256, 0, value.stream>>>(q, keys, weights, visible,
         size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-        index_counters(value), index_bins(value, rows));
+        index_counters(value), index_bins(value, rows), candidates, size_t(blocks), size_t(block), index_half(value, heads, dim));
     SD_OP_END
 }
 
 int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kind, uint64_t proj_cols, const float* x,
                             const float* q, const float* keys, float* weights, const int32_t* visible, uint64_t groups,
                             uint64_t heads, uint64_t dim, float scale, uint64_t rope_dims, const int32_t* positions,
-                            const float* frequencies, float* scores, uint64_t k, int32_t* out) {
+                            const float* frequencies, float* scores, uint64_t k, int32_t* out, const int32_t* candidates,
+                            uint64_t blocks, uint64_t block) {
     SD_OP_BEGIN
     if (!proj_weights || !proj_cols || proj_cols > 8192 || !groups || groups > (uint64_t(1) << 31) || !heads || heads > 64 || !dim ||
         !k || k > (uint64_t(1) << 31) || rope_dims % 2 || rope_dims > dim || rope_dims > 128)
@@ -3355,7 +3395,8 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
     op_span(value, visible, 4, "visible counts");
     op_span(value, positions, 4, "query positions");
     if (rope_dims) op_span(value, frequencies, checked_floats({rope_dims / 2}), "rope frequencies");
-    op_span(value, scores, checked_floats({groups}), "index scores");
+    const uint64_t scored = index_scored(candidates, 1, groups, blocks, block, value);
+    op_span(value, scores, checked_floats({scored}), "index scores");
     op_span(value, out, checked_floats({k}), "top-k indices");
     // The projection as sd_op_linear runs it for one vector (gemv: its lanes, widened to op_lanes), in the
     // scores' launch where that is gemv_fixed_kind<30, 1> (BF16 rows too few for the shared-input launch).
@@ -3368,17 +3409,18 @@ int sd_op_index_select_proj(void* handle, const void* proj_weights, int proj_kin
         FixedGemv list{};
         list.items[0] = {matrix, 0, lanes};
         list.count = 1;
-        const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((groups + index_block_groups - 1) / index_block_groups);
+        const unsigned proj_blocks = unsigned((waves + 7) / 8), chunks = unsigned((scored + index_block_groups - 1) / index_block_groups);
         op_index_select_proj_kernel<30><<<proj_blocks + chunks, 256, 0, value.stream>>>(list, x, proj_blocks, q, keys, weights, visible,
             size_t(groups), size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out,
-            index_counters(value) + index_row_capacity, index_bins(value, 1));
+            index_counters(value) + index_row_capacity, index_bins(value, 1), candidates, size_t(blocks), size_t(block),
+            index_half(value, heads, dim));
         check(hipGetLastError());
         return 0;
     }
     gemv(value, &matrix, 1, x, weights, 1, 0, 0, {}, op_lanes);
-    op_index_select_kernel<<<dim3(unsigned((groups + index_block_groups - 1) / index_block_groups), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
+    op_index_select_kernel<<<dim3(unsigned((scored + index_block_groups - 1) / index_block_groups), 1), 256, 0, value.stream>>>(q, keys, weights, visible, size_t(groups),
         size_t(heads), size_t(dim), scale, size_t(rope_dims / 2), positions, frequencies, scores, size_t(k), out, index_counters(value),
-        index_bins(value, 1));
+        index_bins(value, 1), candidates, size_t(blocks), size_t(block), index_half(value, heads, dim));
     SD_OP_END
 }
 
