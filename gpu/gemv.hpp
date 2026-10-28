@@ -595,6 +595,45 @@ template<> struct GemvFormat<29> {   // IQ1_M: grid rows store value + 1, so a g
         for (int v = 0; v < V; ++v) r[v] = d0 * first[v] + d1 * second[v];
     }
 };
+// IQ1_M dots of two rows' units against the same activations (one vector), loaded and summed once: each row's arithmetic is GemvFormat<29>::dots'.
+__device__ __forceinline__ void gemv_iq1m_dots2(const uint8_t* row_a, const uint8_t* row_b, size_t unit, const float* x, const uint2* grid, float& result_a,
+                                                float& result_b) {
+    const uint16_t* h[2] = {reinterpret_cast<const uint16_t*>(row_a + (unit / 8) * 56), reinterpret_cast<const uint16_t*>(row_b + (unit / 8) * 56)};
+    const unsigned ib = unsigned(unit % 8);
+    uint32_t q[2];
+    unsigned high[2], scales[2], bits[2];
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        q[r] = iq_pair(h[r], 2 * ib);
+        high[r] = h[r][16 + ib];
+        scales[r] = h[r][24 + ib / 2] >> (6 * (ib & 1));
+        bits[r] = (h[r][24] >> 12) | ((h[r][25] >> 8) & 0xf0) | ((h[r][26] >> 4) & 0xf00) | (h[r][27] & 0xf000);
+    }
+    float first[2] = {0, 0}, second[2] = {0, 0};
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const float* values = x + unit * 32 + 8 * l;
+        const float4 lo = gemv_load4(values), hi = gemv_load4(values + 4);
+        const float total = gemv_sum4(lo) + gemv_sum4(hi);
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const unsigned nibble = (high[r] >> (4 * l)) & 15;
+            const uint2 g = grid[((q[r] >> (8 * l)) & 255) | ((nibble & 7) << 8)];
+            const float shift = nibble & 8 ? -1.125f : -0.875f;
+            float& sum = l < 2 ? first[r] : second[r];
+            sum = gemv_dot4(g.y, hi, gemv_dot4(g.x, lo, sum)) + shift * total;
+        }
+    }
+    float result[2];
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const float d = gemv_half(bits[r]);
+        const float d0 = d * float(2 * (scales[r] & 7) + 1), d1 = d * float(2 * ((scales[r] >> 3) & 7) + 1);
+        result[r] = d0 * first[r] + d1 * second[r];
+    }
+    result_a = result[0];
+    result_b = result[1];
+}
 template<> struct GemvFormat<19> {   // IQ1_S: grid rows store value + 1, so a group adds (delta - 1) * sum(x)
     static constexpr size_t elements = 32, alignment = 2;
     template<int V>
@@ -991,20 +1030,61 @@ template<int kind> struct GemvQ8;
 // (PAD: words after each unit's INT8 words in the staged input, see gemv_q8_stage_list; the slot kernels' staging has none)
 template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176-byte block, as GemvK45<13> reads them
     static constexpr size_t elements = 64;
+    // A unit's bytes: its block's header, its pair's codes and the block's high bits
+    struct Unit { uint4 header, q0, q1, h0, h1; };
+    __device__ static Unit load(const uint8_t* row, size_t unit) {
+        const uint8_t* block = row + (unit / 4) * 176;
+        const uint4* packed = reinterpret_cast<const uint4*>(block + 48 + 32 * (unit % 4));
+        return {*reinterpret_cast<const uint4*>(block), packed[0], packed[1], reinterpret_cast<const uint4*>(block + 16)[0],
+                reinterpret_cast<const uint4*>(block + 16)[1]};
+    }
     template<int V, uint32_t PAD = 0>
     __device__ static void dots(const uint8_t* row, size_t unit, const GemvQ8Input& in, float (&r)[V]) {
-        const uint8_t* block = row + (unit / 4) * 176;
+        dots<V>(load(row, unit), unit, Staged<PAD>{in, unit}, r);
+    }
+    // A unit's activations as dots reads them: word(v, i), i below 16, the INT8 words of the two groups (8 each), and group g's (0 or 1) scale and sum.
+    // Staged: in the block's LDS, PAD words after each unit's; Held: in the lane's registers.
+    template<uint32_t PAD>
+    struct Staged {
+        const GemvQ8Input& in;
+        size_t unit;
+        __device__ uint32_t word(int v, int i) const { return in.xq[v * in.stride + unit * (16 + PAD) + i]; }
+        __device__ float scale(int v, int g) const { return in.xd[v * in.stride + 2 * unit + g]; }
+        __device__ float sum(int v, int g) const { return in.xs[v * in.stride + 2 * unit + g]; }
+    };
+    template<int V>
+    struct Held {
+        uint32_t words[V][16];
+        float scales[V][2], sums[V][2];
+        template<uint32_t PAD>
+        __device__ void take(const GemvQ8Input& in, size_t unit) {
+            const Staged<PAD> staged{in, unit};
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                // (a unit's 16 words are 16-byte aligned in the staged input: gemv_q8_vector_words, PAD)
+                const uint4* at = reinterpret_cast<const uint4*>(in.xq + v * in.stride + unit * (16 + PAD));
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint4 four = at[k];
+                    words[v][4 * k] = four.x; words[v][4 * k + 1] = four.y; words[v][4 * k + 2] = four.z; words[v][4 * k + 3] = four.w;
+                }
+                #pragma unroll
+                for (int g = 0; g < 2; ++g) { scales[v][g] = staged.scale(v, g); sums[v][g] = staged.sum(v, g); }
+            }
+        }
+        __device__ uint32_t word(int v, int i) const { return words[v][i]; }
+        __device__ float scale(int v, int g) const { return scales[v][g]; }
+        __device__ float sum(int v, int g) const { return sums[v][g]; }
+    };
+    template<int V, class X>
+    __device__ static void dots(const Unit& bytes, size_t unit, const X& x, float (&r)[V]) {
         const int pair = int(unit % 4);
-        const uint4 header = *reinterpret_cast<const uint4*>(block);
-        const uint4* packed = reinterpret_cast<const uint4*>(block + 48 + 32 * pair);
-        const uint4 q0 = packed[0], q1 = packed[1];
-        const uint4 h0 = reinterpret_cast<const uint4*>(block + 16)[0], h1 = reinterpret_cast<const uint4*>(block + 16)[1];
+        const uint4 header = bytes.header, q0 = bytes.q0, q1 = bytes.q1, h0 = bytes.h0, h1 = bytes.h1;
         uint32_t scales, mins;
         gemv_pair_scale_min(pair, header.y, header.z, header.w, scales, mins);
         const unsigned scale0 = scales & 255, scale1 = scales >> 8, min0 = mins & 255, min1 = mins >> 8;
         const uint32_t codes[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
         const uint32_t high[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
-        const size_t g0 = 2 * unit, g1 = g0 + 1, at = unit * (16 + PAD);
         int s0[V] = {}, s1[V] = {};
         #pragma unroll
         for (int m = 0; m < 8; ++m) {
@@ -1012,16 +1092,14 @@ template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176
             const uint32_t c1 = ((codes[m] >> 4) & 0x0F0F0F0Fu) | (((high[m] >> (2 * pair + 1)) & 0x01010101u) << 4);
             #pragma unroll
             for (int v = 0; v < V; ++v) {
-                const uint32_t* x = in.xq + v * in.stride;
-                s0[v] = __builtin_amdgcn_sudot4(false, int(c0), true, int(x[at + m]), s0[v], false);
-                s1[v] = __builtin_amdgcn_sudot4(false, int(c1), true, int(x[at + 8 + m]), s1[v], false);
+                s0[v] = __builtin_amdgcn_sudot4(false, int(c0), true, int(x.word(v, m)), s0[v], false);
+                s1[v] = __builtin_amdgcn_sudot4(false, int(c1), true, int(x.word(v, 8 + m)), s1[v], false);
             }
         }
         #pragma unroll
         for (int v = 0; v < V; ++v) {
-            const float *xd = in.xd + v * in.stride, *xs = in.xs + v * in.stride;
-            r[v] = gemv_half(header.x) * (float(scale0) * xd[g0] * float(s0[v]) + float(scale1) * xd[g1] * float(s1[v]))
-                 - gemv_half(header.x >> 16) * (float(min0) * xs[g0] + float(min1) * xs[g1]);
+            r[v] = gemv_half(header.x) * (float(scale0) * x.scale(v, 0) * float(s0[v]) + float(scale1) * x.scale(v, 1) * float(s1[v]))
+                 - gemv_half(header.x >> 16) * (float(min0) * x.sum(v, 0) + float(min1) * x.sum(v, 1));
         }
     }
 };
@@ -1124,6 +1202,82 @@ __global__ void __launch_bounds__(256) gemv_q8_kind(FixedGemv list, const float*
                                              residual);
     if (LINKED) link_tail(tail);
 }
+// The 32-lane butterfly sums of gemv_q8_rows (total += __shfl_xor(total, offset, 32), offsets 16, 8, 4, 2, 1) of four rows' partial sums at
+// once, 6 exchanges where four rows one after another take 20. After the offset-16 step a row's sums are the same in lanes l and l ^ 16, and after
+// the offset-8 step in l and l ^ 8: so the step of two rows is one exchange (lanes with the bit set send the row the others keep, the others the
+// row they do not), their sums in the lanes the bit picks, and the last three steps run on the four rows at once. Every lane adds the same two
+// values it would in the row's own butterfly (an addition commutes), so the sums are the same. The rows' totals: row 0 in lane 0, row 1 in lane 16,
+// row 2 in lane 8, row 3 in lane 24.
+__device__ __forceinline__ float gemv_reduce4(float p0, float p1, float p2, float p3) {
+    const unsigned lane = threadIdx.x % 32;
+    const bool upper = lane & 16, middle = lane & 8;
+    const float ab = (upper ? p1 : p0) + __shfl_xor(upper ? p0 : p1, 16, 32);
+    const float cd = (upper ? p3 : p2) + __shfl_xor(upper ? p2 : p3, 16, 32);
+    float q = (middle ? cd : ab) + __shfl_xor(middle ? ab : cd, 8, 32);
+    q += __shfl_xor(q, 4, 32);
+    q += __shfl_xor(q, 2, 32);
+    q += __shfl_xor(q, 1, 32);
+    return q;
+}
+// gemv_q8_kind of a Q5_K list whose rows take a wave each and a unit a lane at most (gemv_q8_lanes: 32 lanes over 16 to 31 units; DeepSeek-V4.1's
+// q_b, 20), ROWS consecutive waves' rows to a wave, ROWS a multiple of four. Past its weights (14 MB: 28 us) a q_b row cost the LDS pipe, per vector
+// 4 reads of the lane's unit of the staged activations and 5 exchanges of the butterfly: 4 vectors took 59 us. Here the lane keeps its unit's
+// activations in registers for every row it meets, the next row's unit is loaded while this one is summed (the first, while the block stages),
+// and four rows' butterflies are one (gemv_reduce4): 33 us. Every row's sum is gemv_q8_rows': its unit's dot added to zero in the lane, the
+// lanes' sums butterflied.
+template<int V, int ROWS>
+__global__ void __launch_bounds__(256) gemv_q8_rows_wave(FixedGemv list, const float* input, float* output) {
+    using Q5 = GemvQ8<13>;
+    const GemvItem& last = list.items[list.count - 1];
+    const size_t waves = last.first_wave + last.matrix.rows;
+    const size_t first = (size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32) * ROWS;
+    const unsigned sub = threadIdx.x % 32;
+    const size_t units = list.items[0].matrix.cols / Q5::elements;
+    const auto fetch = [&](size_t wave) {
+        Q5::Unit unit{};
+        if (wave < waves && sub < units) {
+            const GemvItem& item = gemv_q8_item(list, wave);
+            const size_t row = wave - item.first_wave;
+            if (row < item.matrix.rows) unit = Q5::load(item.matrix.data + row * item.matrix.row_bytes, sub);
+        }
+        return unit;
+    };
+    Q5::Unit current = fetch(first);
+    const GemvQ8Input in = gemv_q8_stage_list<13, V>(list, input);
+    Q5::Held<V> held{};
+    if (sub < units) held.template take<gemv_q8_pad(13)>(in, sub);
+    #pragma unroll 1
+    for (int k = 0; k < ROWS && first + k < waves; k += 4) {
+        float part[V][4] = {};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const size_t wave = first + k + j;
+            const Q5::Unit next = fetch(wave + 1);
+            if (wave < waves && sub < units) {
+                const GemvItem& item = gemv_q8_item(list, wave);
+                if (wave - item.first_wave < item.matrix.rows) {
+                    float r[V];
+                    Q5::dots<V>(current, sub, held, r);
+                    #pragma unroll
+                    for (int v = 0; v < V; ++v) part[v][j] += r[v];
+                }
+            }
+            current = next;
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float total = gemv_reduce4(part[v][0], part[v][1], part[v][2], part[v][3]);
+            if (sub % 8 == 0) {
+                const size_t wave = first + k + (sub & 16 ? 1 : 0) + (sub & 8 ? 2 : 0);
+                if (wave < waves) {
+                    const GemvItem& item = gemv_q8_item(list, wave);
+                    const size_t row = wave - item.first_wave;
+                    if (row < item.matrix.rows) gemv_store(item.matrix, row, v, total, output, list.output_stride, list.residual);
+                }
+            }
+        }
+    }
+}
 // Whether a list of `vectors` takes the Q8 kernels: one kind they take, every matrix the same input
 // (offset and width: staged once), 16-byte aligned vectors; its LDS bytes, else 0.
 size_t gemv_q8_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors) {
@@ -1146,7 +1300,18 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
     const size_t lds = gemv_q8_input(d, list, input, V);
     if (!lds || (tail && (V != 1 || list.count != 1))) return false;
     const GemvItem& last = list.items[list.count - 1];
-    const unsigned blocks = unsigned((last.first_wave + gemv_waves(last.matrix, last.lanes) + 7) / 8);
+    const size_t waves = last.first_wave + gemv_waves(last.matrix, last.lanes);
+    const unsigned blocks = unsigned((waves + 7) / 8);
+    // A Q5_K row of one unit a lane (q_b: 16384 rows of 20 units) takes four rows to a wave (eight for three or four vectors) when that leaves every CU
+    // four blocks or more
+    constexpr size_t rows_per_wave = V >= 3 ? 8 : 4;
+    bool lone = !tail && list.items[0].matrix.kind == 13 && list.items[0].matrix.cols / 64 <= 32 && waves >= 8 * rows_per_wave * 4 * d.compute_units;
+    for (unsigned i = 0; i < list.count; ++i) lone &= list.items[i].lanes == 32;
+    if (lone) {
+        gemv_q8_rows_wave<V, rows_per_wave><<<unsigned((waves + 8 * rows_per_wave - 1) / (8 * rows_per_wave)), 256, lds, d.stream>>>(list, input, output);
+        check(hipGetLastError());
+        return true;
+    }
     #define SD_Q8_LAUNCH(format) \
         if (tail) gemv_q8_kind<format, V, true><<<blocks, 256, lds, d.stream>>>(list, input, output, *tail); \
         else gemv_q8_kind<format, V, false><<<blocks, 256, lds, d.stream>>>(list, input, output, LinkTail{});

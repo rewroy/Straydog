@@ -9,7 +9,10 @@
 //! - the IQ2_XXS, IQ2_XS, IQ2_S and Q5_K experts' gate/up (two routes, SwiGLU clamped, times the routes'
 //!   weights): the same;
 //! - the IQ2_XXS, IQ2_XS, IQ2_S and Q5_K experts' down (three routes of three tokens' product rows):
-//!   the same, and each token's row the bits of the token fed alone;
+//!   the same, and each token's row the bits of the token fed alone; so IQ1_M's, which the F32 kernels
+//!   take whatever the decode mode;
+//! - a GEMV's row is the bits it gets in a launch of few rows, whatever the launch holds (q_b's 16384 rows
+//!   take several to a wave, a smaller launch one);
 //! - with the Q8 kernels off, the F32 kernels' results are the unquantized input's within F32
 //!   rounding, as before.
 //!
@@ -39,10 +42,19 @@ impl Random {
             16 => (256, 66),
             17 => (256, 74),
             22 => (256, 82),
+            29 => (256, 56),
             _ => panic!("no format {kind}"),
         };
         let mut out: Vec<u8> = (0..values / per * bytes).map(|_| self.next() as u8).collect();
         for block in out.chunks_exact_mut(bytes) {
+            if kind == 29 {
+                // (IQ1_M's FP16 scale is spread over the top nibbles of four of its scale words)
+                block[49] &= 0x0f;
+                block[51] &= 0x0f;
+                block[53] = block[53] & 0x0f | 0xc0;
+                block[55] = block[55] & 0x0f | 0x20;
+                continue;
+            }
             block[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
             if kind == 13 {
                 block[2..4].copy_from_slice(&0x2400u16.to_le_bytes());
@@ -154,7 +166,8 @@ fn a_q8_gemv_of_several_vectors_gives_each_one_alones_bits() {
     let mut random = Random(0x2f0b_7f1e_33aa_91c5);
     let scratch = gpu.buffer(1 << 20).unwrap();
     gpu.configure_decode(true).unwrap();
-    for (kind, rows, cols) in [(13u32, 1280usize, 5120usize), (8, 1792, 5120), (13, 300, 4096), (13, 2048, 1280)] {
+    // (q_b's 16384 rows: four a wave for one or two vectors, eight for three or four; and a count that leaves the last waves part empty)
+    for (kind, rows, cols) in [(13u32, 1280usize, 5120usize), (8, 1792, 5120), (13, 300, 4096), (13, 2048, 1280), (13, 16384, 1280), (13, 16301, 1280)] {
         let matrix = gpu.upload_bytes(&random.blocks(kind, rows * cols)).unwrap();
         let x = random.floats(4 * cols, 2.0);
         let input = upload(&mut gpu, &x);
@@ -171,6 +184,34 @@ fn a_q8_gemv_of_several_vectors_gives_each_one_alones_bits() {
             for v in 0..vectors {
                 let bits: Vec<u32> = got[v * rows..(v + 1) * rows].iter().map(|value| value.to_bits()).collect();
                 assert_eq!(bits, alone[v], "kind {kind} {rows} x {cols}: vector {v} of {vectors}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_q8_gemv_row_is_the_same_whatever_launch_it_is_in() {
+    // (q_b's 16384 rows meet the kernel that takes several rows to a wave; a launch of a few of them meets the one that takes one)
+    straydog_engine::gpu::load_iq_tables().unwrap();
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x6a09_e667_f3bc_c908);
+    let scratch = gpu.buffer(1 << 20).unwrap();
+    gpu.configure_decode(true).unwrap();
+    let (rows, cols, chunk) = (16384usize, 1280usize, 1024usize);
+    let matrix = gpu.upload_bytes(&random.blocks(13, rows * cols)).unwrap();
+    let input = upload(&mut gpu, &random.floats(4 * cols, 2.0));
+    let (whole, parts) = (gpu.buffer((4 * rows * 4) as u64).unwrap(), gpu.buffer((4 * rows * 4) as u64).unwrap());
+    for vectors in 1..=4usize {
+        gpu.linear(&matrix, 13, rows as u64, cols as u64, 0, input.base(), cols as u64, vectors as u64, whole.base(), rows as u64, &scratch).unwrap();
+        for first in (0..rows).step_by(chunk) {
+            gpu.linear(&matrix, 13, chunk as u64, cols as u64, first as u64, input.base(), cols as u64, vectors as u64, parts.at(first), rows as u64,
+                       &scratch).unwrap();
+        }
+        let (whole, parts) = (read(&mut gpu, &whole, vectors * rows), read(&mut gpu, &parts, vectors * rows));
+        for vector in 0..vectors {
+            for row in 0..rows {
+                let at = vector * rows + row;
+                assert_eq!(whole[at].to_bits(), parts[at].to_bits(), "{vectors} vectors: vector {vector} row {row}: {} in 16384 rows, {} in {chunk}", whole[at], parts[at]);
             }
         }
     }
@@ -235,8 +276,8 @@ fn q8_expert_down_matches_the_quantized_product_on_the_host() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (hidden, ffn, routes, tokens, experts) = (1536usize, 768usize, 3usize, 3usize, 4usize);
-    // (IQ2_S's down stays on the F32 kernel)
-    for kind in [16u32, 17, 22, 13] {
+    // (IQ2_S's and IQ1_M's downs stay on the F32 kernels)
+    for kind in [16u32, 17, 22, 13, 29] {
         // an expert's slot: gate and up (IQ2_XXS, unused: the down stage alone), then its down matrix
         let gate_bytes = random.blocks(16, ffn * hidden).len();
         let down_bytes = random.blocks(kind, hidden * ffn).len();
@@ -265,7 +306,7 @@ fn q8_expert_down_matches_the_quantized_product_on_the_host() {
                         0, None, 10.0, false, product.base(), out.base(), 0, Some(split)).unwrap();
             let got = read(&mut gpu, &out, tokens * hidden);
             // (the F32 kernels, and IQ2_S's with the Q8 ones on, take the product itself)
-            let quantize = q8 && kind != 22;
+            let quantize = q8 && kind != 22 && kind != 29;
             for token in 0..tokens {
                 let mut sums = vec![(0.0f64, 0.0f64); hidden];
                 for route in 0..routes {

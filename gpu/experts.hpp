@@ -516,6 +516,42 @@ template<int kind>
 __global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) {
     slot_down_rows<kind>(plan, bases, product, out, out_stride, nullptr);
 }
+// slot_down of IQ1_M for several tokens, two rows to a lane group (`waves` of them): a lane's unit of both rows is dotted with the activations it
+// loads once. The F32 kernel's activation loads bind it (a unit's 32 values, 128 bytes from the next unit's, are 8 cache lines to a load) and
+// every lane group of every wave loads them again; here a row's share of them is half (2 to 4 tokens: 52 / 74 / 92 us to 49 / 68 / 87). Each row
+// is summed as slot_down_rows sums it.
+template<int kind>
+__global__ void slot_down_pairs(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride, uint32_t waves) {
+    static_assert(kind == 29, "slot_down_pairs: IQ1_M");
+    const uint2* grid = reinterpret_cast<const uint2*>(iq_grid1s);
+    const size_t wave = SD_WAVE_UNIFORM(blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32);
+    if (wave >= waves) return;
+    const Matrix& down = plan.role[2];
+    const unsigned lanes = plan.lanes[1], lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = (wave * (32 / lanes) + lane / lanes) * 2, last = down.rows - 1;
+    const size_t at = size_t(down.data) + std::min(row, last) * down.row_bytes, at_b = size_t(down.data) + std::min(row + 1, last) * down.row_bytes;
+    const size_t units = down.cols / GemvFormat<kind>::elements;
+    float sum = 0.0f, sum_b = 0.0f;
+    for (size_t route = 0; route < plan.top_k; ++route) {
+        const size_t index = size_t(blockIdx.y) * plan.top_k + route;
+        const uint64_t base = slot_base(plan, bases, index);
+        if (!base) continue;
+        const float* x = product + index * plan.product_stride;
+        #pragma unroll 2
+        for (size_t unit = sub; unit < units; unit += lanes) {
+            float a, b;
+            gemv_iq1m_dots2(reinterpret_cast<const uint8_t*>(base) + at, reinterpret_cast<const uint8_t*>(base) + at_b, unit, x, grid, a, b);
+            sum += a;
+            sum_b += b;
+        }
+    }
+    sum = slot_reduce(sum, lanes);
+    sum_b = slot_reduce(sum_b, lanes);
+    if (sub) return;
+    float* target = out + size_t(blockIdx.y) * out_stride + plan.out_first + row;
+    if (row < down.rows) *target = plan.accumulate ? *target + sum : sum;
+    if (row + 1 < down.rows) target[1] = plan.accumulate ? target[1] + sum_b : sum_b;
+}
 // slot_down whose output is this device's part of a linked sum (one row): the last block adds the
 // parts (link_tail).
 template<int kind>
@@ -875,7 +911,9 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     };
     const auto down_q8 = [&](bool linked) {
         const size_t waves = plan.waves[1], slots = 2 * size_t(d.compute_units);
-        const size_t per_block = std::clamp<size_t>((waves + slots - 1) / slots, 2, 16);
+        // (a pass of rows already fills every CU with blocks, which each stage the same routes' product rows: wider blocks, fewer of them; IQ2_XXS,
+        // 2 to 4 tokens: 58 / 74 / 94 us to 47 / 70 / 88)
+        const size_t per_block = std::clamp<size_t>(std::max<size_t>((waves + slots - 1) / slots, tokens >= 2 ? 8 : 0), 2, 16);
         const dim3 blocks(unsigned((waves + per_block - 1) / per_block), unsigned(tokens));
         const unsigned threads = unsigned(32 * per_block);
         #define SD_SLOT_DOWN_Q8(format) case format: \
@@ -945,6 +983,13 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     }
     if (q8_down) {
         down_q8(false);
+        return true;
+    }
+    if (down_kind == 29 && tokens >= 2) {
+        const uint32_t pair_waves = uint32_t((down.rows + 2 * (32 / plan.lanes[1]) - 1) / (2 * (32 / plan.lanes[1])));
+        const unsigned pair_threads = threads(pair_waves);
+        slot_down_pairs<29><<<dim3(blocks_of(pair_waves, pair_threads), unsigned(tokens)), pair_threads, 0, d.stream>>>(plan, bases, product, out, out_stride, pair_waves);
+        check(hipGetLastError());
         return true;
     }
     #define SD_SLOT_DOWN(format) case format: \
