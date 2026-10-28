@@ -192,8 +192,8 @@ pub struct Drafter {
     /// every slot's, [`MAX_SLOTS`] rows.
     tail: Buffer,
     corrected: Buffer,
-    /// The head's results, read back whole: its [`MAX_SLOTS`] tokens (i32), their confidences (F32)
-    /// and the count of them that are kept (u32).
+    /// The head's results, read back whole: its [`MAX_SLOTS`] tokens (i32), their confidences (F32),
+    /// the count of them that are kept (u32) and, for drawn tokens, their [`MAX_SLOTS`] probabilities (F32).
     results: Buffer,
     /// The block's anchor token (i32), for the Markov head's graph.
     anchor: Buffer,
@@ -213,11 +213,13 @@ pub struct Drafter {
     stream_rows: Vec<f32>,
 }
 
-/// A draft: its tokens and DSpark's confidence in each.
+/// A draft: its tokens and DSpark's confidence in each; for tokens the head drew, each one's probability under the
+/// softmax it was drawn from (none for the argmax).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Draft {
     pub tokens: Vec<u32>,
     pub confidences: Vec<f32>,
+    pub probabilities: Vec<f32>,
 }
 
 /// DSpark's rings of injected features as a checkpoint kept them ([`Drafter::save_rings`]).
@@ -574,7 +576,7 @@ impl Drafter {
             logits: floats(gpu, MAX_SLOTS * vocabulary)?,
             tail: floats(gpu, MAX_SLOTS * (vocabulary - head_rows).max(1))?,
             corrected: floats(gpu, MAX_SLOTS * vocabulary)?,
-            results: floats(gpu, 2 * MAX_SLOTS + 1)?,
+            results: floats(gpu, 3 * MAX_SLOTS + 1)?,
             anchor: floats(gpu, 1)?,
             sample: floats(gpu, 4)?,
             vocabulary,
@@ -630,13 +632,15 @@ impl Drafter {
         Ok(all)
     }
 
-    /// The head's logits (corrected by the Markov head) of the last draft's first `rows` slots, each the vocabulary
-    /// wide: the rows a drawn draft's tokens were drawn from the softmax of.
-    pub fn drawn_rows(&mut self, devices: &mut [Beside<'_>], rows: usize) -> Result<Vec<Vec<f32>>> {
+    /// The head's logits (corrected by the Markov head) of `slot` of the last draft, the vocabulary wide, read into `into`: the
+    /// row a drawn draft's token was drawn from the softmax of (they stay as the last draft left them until the next).
+    pub fn drawn_row(&mut self, devices: &mut [Beside<'_>], slot: usize, into: &mut Vec<f32>) -> Result<()> {
+        if slot >= MAX_SLOTS {
+            return Err(format!("a DSpark draft has no slot {slot}"));
+        }
         let gpu = &mut *devices[0].gpu;
-        let mut all = vec![0f32; rows.min(MAX_SLOTS) * self.vocabulary];
-        gpu.read_buffer(&self.corrected, 0, &mut all)?;
-        Ok(all.chunks(self.vocabulary).map(<[f32]>::to_vec).collect())
+        into.resize(self.vocabulary, 0.0);
+        gpu.read_buffer(&self.corrected, slot * self.vocabulary, into)
     }
 
     /// Forget every injected position from `position` on (a rewind of the target to `position`).
@@ -709,7 +713,7 @@ impl Drafter {
 
     /// [`Drafter::draft`], its tokens drawn from the softmax of the head's logits at the temperature `draw` gives
     /// instead of the argmax when it is given (each slot's Markov features then follow the token drawn before it);
-    /// [`Drafter::drawn_rows`] has the logits the draws were from.
+    /// [`Draft::probabilities`] has the probabilities of the draws and [`Drafter::drawn_row`] the logits they were from.
     pub fn draft_drawn(&mut self, devices: &mut [Beside<'_>], embed: &impl Tensors, anchor: u32, position: usize, slots: usize,
                        draw: Option<Draw>) -> Result<Draft> {
         if slots == 0 || slots > MAX_SLOTS || anchor as usize >= self.vocabulary || devices.len() != self.parts.len() {
@@ -809,6 +813,8 @@ impl Drafter {
         let tail = (split < vocabulary).then(|| (self.tail.base().cast_const(), split as u64));
         let gpu = &mut *first[0].gpu;
         gpu.write_buffer(&self.anchor, 0, &[anchor as i32])?;
+        // (the head's graph is recorded once, with the probabilities in it: they are left unread for a draft that draws nothing)
+        let drawn = draw.is_some();
         let draw = draw.map_or([0u32; 4], |draw| [draw.inverse_temperature.to_bits(), draw.seed as u32, (draw.seed >> 32) as u32, 0]);
         gpu.write_buffer(&self.sample, 0, &draw)?;
         let (markov, ran) = (key(10), self.ran(key(10)));
@@ -817,14 +823,19 @@ impl Drafter {
                             vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, Some(self.anchor.base().cast_const()),
                             Some(self.sample.base().cast_const()), 0.0, 0,
                             self.corrected.base(), self.results.at(0), self.results.at(MAX_SLOTS), self.results.at(2 * MAX_SLOTS),
-                            &self.parts[0].scratch)
+                            Some(self.results.at(2 * MAX_SLOTS + 1)), &self.parts[0].scratch)
         })?;
-        let mut results = [0u32; 2 * MAX_SLOTS + 1];
+        let mut results = [0u32; 3 * MAX_SLOTS + 1];
         gpu.read_buffer(&self.results, 0, &mut results)?;
         let kept = (results[2 * MAX_SLOTS] as usize).min(slots);
         Ok(Draft {
             tokens: results[..kept].to_vec(),
             confidences: results[MAX_SLOTS..MAX_SLOTS + kept].iter().map(|&bits| f32::from_bits(bits)).collect(),
+            probabilities: if drawn {
+                results[2 * MAX_SLOTS + 1..2 * MAX_SLOTS + 1 + kept].iter().map(|&bits| f32::from_bits(bits)).collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 }

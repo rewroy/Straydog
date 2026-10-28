@@ -36,11 +36,11 @@ __global__ void dspark_finish(const int32_t* tokens, float* confidences, size_t 
 int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, uint64_t tail_first, const float* hidden,
                       const void* w1, const void* w2, const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank,
                       uint64_t width, uint32_t anchor, const int32_t* anchor_at, const uint32_t* sample_at, float threshold, uint64_t minimum, float* logits,
-                      int32_t* tokens, float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes) {
+                      int32_t* tokens, float* confidences, uint32_t* count, float* probabilities, float* scratch, uint64_t scratch_bytes) {
     SD_OP_BEGIN
     if (!slots || slots > 5 || !vocabulary || vocabulary > INT32_MAX || !rank || !width ||
         anchor >= vocabulary || !std::isfinite(threshold) || threshold < 0 || threshold > 1 ||
-        (body_tail && (!tail_first || tail_first >= vocabulary)))
+        (body_tail && (!tail_first || tail_first >= vocabulary)) || (probabilities && !sample_at))
         throw std::runtime_error("invalid DSpark head shape, anchor or prefix limits");
     const size_t features = checked_sum({width, rank});
     const size_t feature_bytes = checked_floats({features});
@@ -63,6 +63,7 @@ int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, u
     op_span(value, scratch, needed, "DSpark scratch");
     if (anchor_at) op_span(value, anchor_at, 4, "DSpark anchor token");
     if (sample_at) op_span(value, sample_at, 16, "DSpark sampling parameters");
+    if (probabilities) op_span(value, probabilities, checked_floats({slots}), "DSpark draw probabilities");
     auto* partial = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(scratch) + partial_offset);
     const size_t tail_split = body_tail ? size_t(tail_first) : size_t(vocabulary);
     for (size_t slot = 0; slot < slots; ++slot) {
@@ -75,6 +76,7 @@ int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, u
             body_tail ? body_tail + slot * (vocabulary - tail_first) : nullptr, tail_split, size_t(vocabulary), logits + slot * vocabulary);
         if (sample_at) row_sample(value, logits + slot * vocabulary, 1, size_t(vocabulary), 0, sample_at, uint32_t(slot), partial, tokens + slot);
         else row_argmax(value, logits + slot * vocabulary, 1, size_t(vocabulary), 0, partial, tokens + slot);
+        if (probabilities) row_draw_probability(value, logits + slot * vocabulary, size_t(vocabulary), tokens + slot, sample_at, partial, probabilities + slot);
     }
     for (size_t first = 0; first < slots; first += size_t(gemv_max_vectors)) {
         const size_t steps = std::min(slots - first, size_t(gemv_max_vectors));

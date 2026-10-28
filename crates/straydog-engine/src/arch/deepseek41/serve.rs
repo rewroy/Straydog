@@ -290,9 +290,14 @@ impl served::Engines for Engines {
         if width == 0 {
             return Ok(None);
         }
-        // (the logits the verified tokens were drawn from, read back for them alone)
-        let drawn = if draw.is_some() { drafting.drafter.drawn_rows(&mut engine.beside()?, width)? } else { Vec::new() };
-        Ok(Some(Proposal { tokens: draft.tokens[..width].to_vec(), drawn }))
+        // (the logits row of a draft the target rejects stays on the device until then: `drawn_row`)
+        let probabilities = if draw.is_some() { draft.probabilities[..width].to_vec() } else { Vec::new() };
+        Ok(Some(Proposal { tokens: draft.tokens[..width].to_vec(), probabilities }))
+    }
+
+    fn drawn_row(&mut self, slot: usize, into: &mut Vec<f32>) -> Result<(), String> {
+        let drafting = self.drafting.as_mut().filter(|drafting| drafting.on).ok_or("no DSpark draft to read")?;
+        drafting.drafter.drawn_row(&mut self.engines[drafting.engine].beside()?, slot, into)
     }
 
     fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
