@@ -505,9 +505,11 @@ constexpr int moe_wave_n = 2;
 // Unfused (tests): the F32 gate and up sums go to `raw`, per route its gate then its up row.
 // Nonzero H, F, K fix the shape's hidden, ffn and top_k at compile time (the K loop's trip count
 // and the route-to-token division constant); zero takes them from `shape`.
-// A positive `clamp` caps gate above and up on both sides first, and `route_weights` (one per
-// grouped row) scale the product, as DeepSeek's SwiGLU does (op_swiglu_kernel).
-template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0>
+// With `weighted` (DeepSeek-V4.1's launch), a positive `clamp` caps gate above and up on both sides
+// first, and `route_weights` (one per grouped row) scale the product, as its SwiGLU does
+// (op_swiglu_kernel). Qwen3.8's instantiations are without: compiled in, the clamp and the weight
+// moved the FP16 products of its prefill (and its pinned generations with them).
+template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0, bool weighted = false>
 __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, const MoeTile* tiles,
                                                         const int32_t* positions, size_t steps, MoeShape shape,
                                                         const _Float16* input, _Float16* product,
@@ -621,10 +623,15 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
                 if (row < count) {
                     const float partner = theirs[(m * 16 + half * 8 + i) * up_stride + (wave % 4) * 16 + lane % 16];
                     const float value = wave < 4 ? sum[m][n][i] : sum[2 + m][n][i];
-                    float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
-                    if (clamp > 0.0f) { g = fminf(g, clamp); up = fminf(fmaxf(up, -clamp), clamp); }
-                    const float scale = route_weights ? route_weights[first + row] : 1.0f;
-                    product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up * scale);
+                    if constexpr (weighted) {
+                        float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
+                        if (clamp > 0.0f) { g = fminf(g, clamp); up = fminf(fmaxf(up, -clamp), clamp); }
+                        const float scale = route_weights ? route_weights[first + row] : 1.0f;
+                        product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up * scale);
+                    } else {
+                        const float g = wave < 4 ? value : partner, up = wave < 4 ? partner : value;
+                        product[(first + row) * ffn + j0 + 16 * n] = _Float16(g * hc_sigmoid(g) * up);
+                    }
                 }
             }
         if (n + 1 < N) __syncthreads();
