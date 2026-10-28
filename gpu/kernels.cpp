@@ -3064,7 +3064,7 @@ int sd_op_slot_moe_gate_up(void* handle, const uint64_t* bases, const uint32_t* 
     if (weights) op_span(value, weights, grouped * 4, "slot expert route weights");
     op_span(value, product, grouped * size_t(ffn_share) * 2, "slot expert products");
     if (count) {
-        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format, true><<<dim3(shape.ffn / (64 * moe_wave_n), count), 256, 0, \
+        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format, true, 0, 0, 0, true><<<dim3(shape.ffn / (64 * moe_wave_n), count), 256, 0, \
             value.stream>>>(groups, tiles, rows, size_t(steps), shape, static_cast<const _Float16*>(input), static_cast<_Float16*>(product), \
             nullptr, 0, false, nullptr, clamp, weights); break;
         switch (unit) { SD_MOE_UNITS(SD_GATE_UP) }
