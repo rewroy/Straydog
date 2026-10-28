@@ -941,10 +941,13 @@ impl Driver {
                 tail.push(b'\n');
                 let excess = tail.len().saturating_sub(STDERR_TAIL);
                 tail.drain(..excess);
-                if verbose {
-                    tracing::info!("worker: {}", String::from_utf8_lossy(&line));
+                let text = String::from_utf8_lossy(&line);
+                // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed)
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm"].iter().any(|start| text.starts_with(start));
+                if verbose || warm {
+                    tracing::info!("worker: {text}");
                 } else {
-                    tracing::debug!("worker: {}", String::from_utf8_lossy(&line));
+                    tracing::debug!("worker: {text}");
                 }
             }
         });
