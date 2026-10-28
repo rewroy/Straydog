@@ -670,7 +670,9 @@ names.
 
 The `DS41_*` variables are development controls for DeepSeek-V4.1 (`DS41_DSPARK`,
 `DS41_DRAFTS`, `DS41_DSPARK_RESIDENT`, `DS41_PROFILE`). They pass into the worker; nothing else
-in the environment does.
+in the environment does. `DS41_PROFILE` also makes Qwen3.8's request report its decode in phases
+(milliseconds a token, and a pass's by its rows: drafting, the first layer, the PLE rows, each
+device's layers, the head, the commit).
 
 **Subcommands.**
 - `straydog setup`: the first run.
