@@ -101,10 +101,10 @@ pub struct Options {
     /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash), UD-Q8_K_XL (Qwen3.6-35B-A3B) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
-    /// MTP drafter: its directory or its GGUF file (also -md)
+    /// Qwen3.8-Flash-Next's MTP drafter: its directory or its GGUF file (also -md). DeepSeek-V4.1's DSpark drafter takes no option: it drafts when its files sit beside the bundle (`straydog setup` puts them there; DS41_DSPARK=0 leaves it out)
     #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "PATH")]
     pub model_draft: Option<PathBuf>,
-    /// MTP drafts per pass, 0 turns speculation off [default: 3 with a drafter]
+    /// MTP drafts per pass, 0 turns MTP speculation off [default: 3 with a drafter]
     #[arg(long, env = "STRAYDOG_DRAFT_MAX", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub draft_max: Option<u8>,
     /// Context in tokens [default: 262144]

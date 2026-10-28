@@ -19,6 +19,7 @@ static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::Hu
 /// With no subcommand, `straydog` serves the API with the given settings, as llama-server does.
 #[derive(Parser)]
 #[command(name = "straydog", version, about = "A local inference engine with an OpenAI-compatible server",
+          after_help = "Getting started:\n  straydog setup   choose a model and where it goes, download it and write the settings\n  straydog         serve it on http://127.0.0.1:8080 (with no --model, the settings setup wrote)",
           args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(flatten)]
@@ -35,6 +36,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Choose a model and where it goes, download it and write the settings a plain `straydog` reads
+    Setup(Box<setup::SetupArgs>),
     /// Download and authenticate a model bundle
     Fetch {
         /// The bundle directory
@@ -60,8 +63,6 @@ enum Command {
         #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
-    /// Choose a model and where it goes, download it and write the settings a plain `straydog` reads
-    Setup(Box<setup::SetupArgs>),
     /// Build the pinned MTP drafter from the official tensors
     FetchMtp {
         /// The drafter directory
