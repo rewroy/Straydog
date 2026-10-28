@@ -4,8 +4,10 @@
 //! hc_step, and the router's route. Prints the wall time a launch as a bound.
 //!
 //! cargo run --release --features hip -p straydog-engine --example ds41_kernels [ITERATIONS], under the GPU lock
-//! (DS41_KERNELS_ONLY=TEXT: only the rows whose label holds TEXT, "hc_step" and "route" among them; DS41_KERNELS_DUMP=PATH: each
-//! expert row's last product and output to PATH.LABEL as F32, to compare two builds bit for bit).
+//! (DS41_KERNELS_ONLY=TEXT: only the rows whose label holds TEXT, "hc_step" and "route" among them; DS41_KERNELS_ROWS=N: a pass of N
+//! rows, each its own routes, DS41_KERNELS_SHARE=P percent (27) of them after the first row's an earlier row's expert, as a pass's are;
+//! DS41_KERNELS_DUMP=PATH: each expert row's last product and output to PATH.LABEL as F32, to compare two
+//! builds bit for bit).
 
 use straydog_engine::gpu::Backend;
 use straydog_engine::ops::{Buffer, ExpertSplit};
@@ -26,6 +28,7 @@ fn block(kind: u32) -> (usize, usize) {
         18 => (98, 256),
         19 => (50, 256),
         22 => (82, 256),
+        29 => (56, 256),
         _ => panic!("no format {kind}"),
     }
 }
@@ -79,16 +82,21 @@ fn main() -> Result<(), String> {
     let only = std::env::var("DS41_KERNELS_ONLY").ok();
     let wanted = |label: &str| only.as_ref().is_none_or(|text| label.contains(text.as_str()));
     let dump = std::env::var_os("DS41_KERNELS_DUMP");
-    let x = upload(&mut gpu, &random.floats(WIDTH, 1.0));
-    let weights = upload(&mut gpu, &random.floats(ROUTES, 0.3));
-    let product = gpu.buffer((ROUTES * FFN * 4) as u64)?;
-    let out = gpu.buffer((WIDTH * 4) as u64)?;
+    let rows: usize = std::env::var("DS41_KERNELS_ROWS").map_or(1, |value| value.parse().unwrap());
+    let share: u64 = std::env::var("DS41_KERNELS_SHARE").map_or(27, |value| value.parse().unwrap());
+    let mut lcg = 0x2545_f491_4f6c_dd1du64;
+    let x = upload(&mut gpu, &random.floats(WIDTH * rows, 1.0));
+    let weights = upload(&mut gpu, &random.floats(ROUTES * rows, 0.3));
+    let product = gpu.buffer((ROUTES * rows * FFN * 4) as u64)?;
+    let out = gpu.buffer((WIDTH * rows * 4) as u64)?;
     let (ffn_rows, hidden_rows) = (FFN / PARTS, WIDTH / PARTS);
     let split = |stages: i32| ExpertSplit { ffn_first: 0, ffn_rows: ffn_rows as u64, hidden_first: 0, hidden_rows: hidden_rows as u64, stages, send: 0, more: 0, send_at: 0 };
     // (gate and up, down, routes) of the GSQ-RCO IQ2_XS bundle: its routed experts' commonest pairs
     // (16, 7, 6 and 4 of 40 layers) and the shared expert (Q5_K, one route, every layer)
     for (label, gate, down, routes) in [("IQ2_XXS / IQ2_XXS", 16u32, 16u32, ROUTES), ("IQ2_XXS / IQ2_S", 16, 22, ROUTES),
                                         ("IQ2_XXS / IQ2_XS", 16, 17, ROUTES), ("IQ2_XS / IQ2_XS", 17, 17, ROUTES),
+                                        ("IQ1_M / IQ1_M", 29, 29, ROUTES), ("IQ2_XXS / IQ1_M", 16, 29, ROUTES),
+                                        ("IQ2_XS / IQ1_M", 17, 29, ROUTES), ("IQ1_M / IQ2_XXS", 29, 16, ROUTES),
                                         ("Q5_K shared", 13, 13, 1)] {
         if !wanted(label) {
             continue;
@@ -109,21 +117,30 @@ fn main() -> Result<(), String> {
         let offsets = [0, gate_bytes as u64, 2 * gate_bytes as u64];
         let started = std::time::Instant::now();
         for iteration in 0..iterations {
-            let bases: Vec<u64> = (0..routes).map(|route| bank.base() as u64 + (((iteration * routes + route) * 7) % experts * slot) as u64).collect();
-            gpu.experts(Some(&bases), slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1, routes as u64, x.base(), 0,
-                        Some(weights.base()), 10.0, false, product.base(), out.base(), 0, Some(split(1)))?;
+            // (a row's routes after the first: each, one in `share` percent, an expert an earlier row routes to, as a verify pass's rows do)
+            let mut chosen: Vec<usize> = Vec::with_capacity(rows * routes);
+            for index in 0..rows * routes {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let reuse = index >= routes && (lcg >> 33) % 100 < share;
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                chosen.push(if reuse { chosen[(lcg >> 33) as usize % (index / routes * routes)] } else { (iteration * rows * routes + index) * 7 % experts });
+            }
+            let bases: Vec<u64> = chosen.iter().map(|&expert| bank.base() as u64 + (expert * slot) as u64).collect();
+            gpu.experts(Some(&bases), slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, rows as u64, routes as u64, x.base(),
+                        WIDTH as u64, Some(weights.base()), 10.0, false, product.base(), out.base(), WIDTH as u64, Some(split(1)))?;
             // (one route: a uniform base, passed again; more: the first stage's routes reused)
-            gpu.experts(if routes == 1 { Some(&bases) } else { None }, slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64, 1,
-                        routes as u64, x.base(), 0, None, 10.0, false, product.base(), out.base(), 0, Some(split(2)))?;
+            gpu.experts(if routes == 1 { Some(&bases) } else { None }, slot as u64, offsets, [gate, gate, down], WIDTH as u64, FFN as u64,
+                        rows as u64, routes as u64, x.base(), WIDTH as u64, None, 10.0, false, product.base(), out.base(), WIDTH as u64,
+                        Some(split(2)))?;
         }
         let mut sink = [0f32; 1];
         gpu.read_buffer(&out, 0, &mut sink)?;
         let each = started.elapsed().as_secs_f64() / iterations as f64 * 1e6;
-        let megabytes = (routes * (2 * gate_bytes + down_bytes)) as f64 / 1e6;
-        println!("{label:20} gate+up {:.2} MB, down {:.2} MB a step ({routes} routes): {each:.1} us a step (wall, both stages), {:.0} GB/s",
-                 (routes * 2 * gate_bytes) as f64 / 1e6, (routes * down_bytes) as f64 / 1e6, megabytes / each * 1e3);
+        let megabytes = (rows * routes * (2 * gate_bytes + down_bytes)) as f64 / 1e6;
+        println!("{label:20} {rows} rows: gate+up {:.2} MB, down {:.2} MB a step ({routes} routes): {each:.1} us a step (wall, both stages), {:.0} GB/s",
+                 (rows * routes * 2 * gate_bytes) as f64 / 1e6, (rows * routes * down_bytes) as f64 / 1e6, megabytes / each * 1e3);
         if let Some(path) = &dump {
-            let (mut products, mut outputs) = (vec![0f32; routes * FFN], vec![0f32; WIDTH]);
+            let (mut products, mut outputs) = (vec![0f32; rows * routes * FFN], vec![0f32; rows * WIDTH]);
             gpu.read_buffer(&product, 0, &mut products)?;
             gpu.read_buffer(&out, 0, &mut outputs)?;
             let bytes: Vec<u8> = products.iter().chain(&outputs).flat_map(|value| value.to_le_bytes()).collect();
