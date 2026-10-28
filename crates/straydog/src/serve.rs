@@ -30,6 +30,26 @@ fn logging(settings: &config::Settings, buffer: Arc<LogBuffer>) -> Result<(), St
     Ok(())
 }
 
+/// What the starting line says of the drafter, after a comma: the MTP drafter given with its
+/// drafts, or DeepSeek-V4.1's DSpark, which takes no option and drafts when its file lies beside
+/// the model (the ready line then says how it was placed, and with how many experts); nothing
+/// otherwise, as only the engine knows whether a drafter can sit beside the layers.
+fn drafter_phrase(mtp_drafts: Option<u8>, dspark: bool) -> String {
+    match (mtp_drafts, dspark) {
+        (Some(drafts), _) => format!(", MTP drafter with {drafts} drafts"),
+        (None, true) => ", DSpark drafter".into(),
+        (None, false) => String::new(),
+    }
+}
+
+fn drafter_clause(settings: &config::Settings) -> String {
+    let off = |name| std::env::var_os(name).is_some_and(|value| value == "0");
+    let mtp = settings.model_draft.is_some().then_some(settings.draft_max).filter(|&drafts| drafts > 0);
+    let dspark = !off("DS41_DSPARK") && !off("DS41_DRAFTS")
+        && matches!(straydog_engine::bundle::dspark_in(&settings.model, &settings.quant), Ok(Some(_)));
+    drafter_phrase(mtp, dspark)
+}
+
 pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool) -> Result<(), String> {
     let (options, sources) = config::load(matches, config_file)?;
     let settings = config::resolve(options)?;
@@ -51,17 +71,14 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
         tracing::info!(
-            "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}, {}",
+            "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
             settings.quant,
             settings.model.display(),
             settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
             match &settings.vram { Vram::Auto => "auto".into(), budgets => format!("{budgets} GiB") },
             settings.ctx_size,
             settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()),
-            match (&settings.model_draft, settings.draft_max) {
-                (Some(_), drafts) if drafts > 0 => format!("MTP drafter with {drafts} drafts"),
-                _ => "no drafter".into(),
-            },
+            drafter_clause(&settings),
         );
         let engine = Arc::new(match command {
             Some(command) => Runtime::start(&settings, command),
@@ -141,4 +158,18 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let _ = interrupt.await;
     tracing::info!("Straydog stopping");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drafter_phrase;
+
+    /// The starting line names the drafter that will be used, and never says there is none when
+    /// DSpark's file is there.
+    #[test]
+    fn the_starting_line_names_the_drafter_or_nothing() {
+        assert_eq!(drafter_phrase(Some(3), false), ", MTP drafter with 3 drafts");
+        assert_eq!(drafter_phrase(None, true), ", DSpark drafter");
+        assert_eq!(drafter_phrase(None, false), "");
+    }
 }
