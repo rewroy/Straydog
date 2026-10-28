@@ -102,6 +102,9 @@ struct Stamps {
     khz: f64,
     /// The last decode pass's last layer's end and its head's (0: none), for the gap to the next.
     last_end: Option<(u64, u64)>,
+    /// The pass's routed experts so far, counted at the host: the union over its layers, those VRAM did not
+    /// hold, and of those the host tier did not hold ready (a drive read).
+    experts: [u32; 3],
 }
 
 pub struct Settings {
@@ -1112,7 +1115,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let gpu = &mut engine.shards[0].gpu;
             let buffer = gpu.buffer(((engine.hp.layers.len() * Stamp::COUNT + PASS_STAMPS) * 8) as u64)?;
             let khz = gpu.debug_clock_khz()? as f64;
-            engine.stamps = Some(Stamps { buffer, khz, last_end: None });
+            engine.stamps = Some(Stamps { buffer, khz, last_end: None, experts: [0; 3] });
         }
         let (reading, uploading) = engine.upload_dense()?;
         engine.startup.extend([("dense read".to_string(), reading), ("dense upload after".to_string(), uploading)]);
@@ -1334,7 +1337,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         for (phase, value) in &phases {
             *sums.entry(phase).or_default() += value * 1e3;
         }
-        eprintln!("Straydog stamps: rows {n}, pass {pass_ms:.3} ms; {}",
+        let [union, missed, drive] = std::mem::take(&mut stamps.experts);
+        eprintln!("Straydog stamps: rows {n}, pass {pass_ms:.3} ms; routed {union}, missed {missed}, drive {drive}; {}",
                   sums.iter().map(|(phase, ms)| format!("{} {ms:.3}", phase.trim_start_matches("gpu: "))).collect::<Vec<_>>().join(", "));
         ticks.fill(0);
         self.shards[0].gpu.write_buffer(&stamps.buffer, 0, &ticks)?;
@@ -2446,6 +2450,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
             .into_iter().collect();
         let wave = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
         let waves: Vec<&[usize]> = experts.chunks(wave).collect();
+        if let Some(stamps) = self.stamps.as_mut().filter(|_| rows <= VERIFY_ROWS) {
+            let store = &self.shards[0].experts;
+            let missed = experts.iter().filter(|&&expert| !store.in_vram(layer, expert)).collect::<Vec<_>>();
+            stamps.experts[0] += experts.len() as u32;
+            stamps.experts[1] += missed.len() as u32;
+            stamps.experts[2] += missed.iter().filter(|&&&expert| !store.in_host(layer, expert)).count() as u32;
+        }
         let drive = std::env::var_os("DS41_PREDICT_DRIVE").is_some();
         if waves.len() == 1 && self.hits_first {
             let (hits, misses): (Vec<usize>, Vec<usize>) = experts.iter().partition(|&&expert| self.shards[0].experts.in_vram(layer, expert));
