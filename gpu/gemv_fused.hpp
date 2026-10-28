@@ -97,11 +97,11 @@ template<int kind>
 __global__ void __launch_bounds__(256) gemv_norm_tail_q8(FixedGemv list, const float* input, float* output, NormTail tail) {
     __shared__ float sums[256];
     __shared__ bool last;
-    const GemvQ8Input in = gemv_q8_stage_list<1>(list, input);
+    const GemvQ8Input in = gemv_q8_stage_list<kind, 1>(list, input);
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     const GemvItem& item = gemv_q8_item(list, wave);
-    gemv_q8_rows<kind, 1>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, in, output, list.output_stride,
-                          list.residual);
+    gemv_q8_rows<kind, 1, gemv_q8_pad(kind)>(item.matrix, (wave - item.first_wave) * (32 / item.lanes), item.lanes, in, output,
+                                             list.output_stride, list.residual);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&gemv_norm_tail_done, 1u) == gridDim.x - 1;
