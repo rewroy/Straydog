@@ -98,7 +98,7 @@ pub struct Options {
     /// Model bundle: its directory (the pinned GGUF shards and tokenizer files of one quantization) or one of its shards
     #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "PATH")]
     pub model: Option<PathBuf>,
-    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), UD-IQ2_XXS (DeepSeek-V4.1-Flash), UD-Q8_K_XL (Qwen3.6-35B-A3B) [default: detected from its files]
+    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash), UD-Q8_K_XL (Qwen3.6-35B-A3B) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
     /// MTP drafter: its directory or its GGUF file (also -md)
@@ -252,6 +252,54 @@ pub fn expand_short_options(args: impl IntoIterator<Item = std::ffi::OsString>) 
 
 /// Where each setting came from, for `--print-config`.
 pub type Sources = Vec<(&'static str, String)>;
+
+/// Which platform's conventions name the folders Straydog keeps its models and settings in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Unix,
+    Windows,
+}
+
+impl Platform {
+    pub const THIS: Platform = if cfg!(windows) { Platform::Windows } else { Platform::Unix };
+}
+
+/// The folders for what `straydog setup` keeps: models and the settings file. On Linux the XDG
+/// ones (`$XDG_DATA_HOME` or `~/.local/share`, `$XDG_CONFIG_HOME` or `~/.config`; a relative
+/// value is not a base directory and is ignored), on Windows `%LOCALAPPDATA%`; `variable` reads
+/// the environment. None when the platform's variables name no home.
+pub fn user_folders(platform: Platform, variable: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<(PathBuf, PathBuf)> {
+    let absolute = |name: &str| variable(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    match platform {
+        Platform::Unix => {
+            let home = absolute("HOME");
+            let base = |name: &str, under: &str| absolute(name).or_else(|| home.as_ref().map(|home| home.join(under)));
+            Some((base("XDG_DATA_HOME", ".local/share")?.join("straydog"), base("XDG_CONFIG_HOME", ".config")?.join("straydog")))
+        }
+        Platform::Windows => {
+            let local = absolute("LOCALAPPDATA")
+                .or_else(|| absolute("USERPROFILE").map(|profile| profile.join("AppData").join("Local")))?;
+            Some((local.join("Straydog"), local.join("Straydog")))
+        }
+    }
+}
+
+/// Where `straydog setup` puts the models unless told otherwise: `models` in the data folder.
+pub fn default_models_dir() -> Option<PathBuf> {
+    user_folders(Platform::THIS, &|name| std::env::var_os(name)).map(|(data, _)| data.join("models"))
+}
+
+/// The settings file `straydog setup` writes and a plain `straydog` reads.
+pub fn default_config_path() -> Option<PathBuf> {
+    user_folders(Platform::THIS, &|name| std::env::var_os(name)).map(|(_, config)| config.join("config.toml"))
+}
+
+/// The file a server started without `--config` reads: [`default_config_path`], when it exists
+/// and no model is given (an option or `STRAYDOG_MODEL`). Whoever names the model starts the
+/// server with everything else in mind; a file's quantization or drafter would not fit another model.
+pub fn implicit_config(options: &Options, default: Option<PathBuf>) -> Option<PathBuf> {
+    default.filter(|path| options.model.is_none() && path.is_file())
+}
 
 /// Merge the command line (with its variables) over the config file, when one is given.
 pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sources), String> {
@@ -725,6 +773,55 @@ mod tests {
         std::fs::write(&stray, b"").unwrap();
         let matches = command().try_get_matches_from(["-m", stray.to_str().unwrap()]).unwrap();
         assert!(resolve(Options::from_arg_matches(&matches).unwrap()).is_err());
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    #[test]
+    fn the_folders_for_models_and_settings_follow_the_platform() {
+        let environment = |pairs: &'static [(&'static str, &'static str)]| move |name: &str| {
+            pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| std::ffi::OsString::from(value))
+        };
+        let (data, config) = user_folders(Platform::Unix, &environment(&[("HOME", "/home/u")])).unwrap();
+        assert_eq!((data, config), (PathBuf::from("/home/u/.local/share/straydog"), PathBuf::from("/home/u/.config/straydog")));
+        let moved = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/data"), ("XDG_CONFIG_HOME", "/etc/u")]);
+        assert_eq!(user_folders(Platform::Unix, &moved).unwrap(), (PathBuf::from("/data/straydog"), PathBuf::from("/etc/u/straydog")));
+        // (a relative XDG value is not a base directory)
+        let relative = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "data")]);
+        assert_eq!(user_folders(Platform::Unix, &relative).unwrap().0, PathBuf::from("/home/u/.local/share/straydog"));
+        assert!(user_folders(Platform::Unix, &environment(&[])).is_none());
+        let windows = environment(&[("LOCALAPPDATA", "C:\\Users\\u\\AppData\\Local"), ("USERPROFILE", "C:\\Users\\u")]);
+        if cfg!(windows) {
+            assert_eq!(user_folders(Platform::Windows, &windows).unwrap().0, PathBuf::from("C:\\Users\\u\\AppData\\Local").join("Straydog"));
+        } else {
+            // (a drive path is not absolute here; the profile's AppData is the fallback only where it is)
+            assert!(user_folders(Platform::Windows, &windows).is_none());
+            let posix = environment(&[("LOCALAPPDATA", "/c/Local")]);
+            assert_eq!(user_folders(Platform::Windows, &posix).unwrap(), (PathBuf::from("/c/Local/Straydog"), PathBuf::from("/c/Local/Straydog")));
+            let profile = environment(&[("USERPROFILE", "/c/Users/u")]);
+            assert_eq!(user_folders(Platform::Windows, &profile).unwrap().0, PathBuf::from("/c/Users/u/AppData/Local/Straydog"));
+        }
+    }
+
+    #[test]
+    fn a_plain_server_reads_the_default_settings_file_but_a_named_model_does_not() {
+        let model = bundle_directory("IQ3_S");
+        let file = model.join("default.toml");
+        std::fs::write(&file, format!("model = {:?}\nport = 9000\n", model.display())).unwrap();
+        let none = Options::default();
+        let named = Options { model: Some(model.clone()), ..Options::default() };
+        assert_eq!(implicit_config(&none, Some(file.clone())), Some(file.clone()));
+        // a model by option or variable: the file's quantization and drafter would not fit another model
+        assert_eq!(implicit_config(&named, Some(file.clone())), None);
+        assert_eq!(implicit_config(&none, Some(model.join("missing.toml"))), None);
+        assert_eq!(implicit_config(&none, None), None);
+        // read as the config file, it names itself as the source of what it sets, and options still win
+        let matches = command().try_get_matches_from(["--port", "9100"]).unwrap();
+        let (options, sources) = load(&matches, implicit_config(&none, Some(file.clone())).as_deref()).unwrap();
+        let settings = resolve(options).unwrap();
+        assert_eq!((settings.port, settings.quant.as_str()), (9100, "IQ3_S"));
+        let lines = describe(&settings, &sources);
+        assert!(lines.iter().any(|line| line.starts_with("model ") && line.ends_with(&format!("[config {}]", file.display()))));
+        assert!(lines.iter().any(|line| line.starts_with("port ") && line.ends_with("[option --port]")));
         std::fs::remove_dir_all(model).unwrap();
     }
 

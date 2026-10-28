@@ -44,6 +44,24 @@ bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm only.
 ## Run
 
 ```bash
+# the first run: look at this machine, choose a model and where it goes, download and
+# authenticate it, write the settings
+straydog setup
+# then serve it (http://127.0.0.1:8080)
+straydog
+```
+
+`straydog setup` lists the pinned models that can run on the machine it finds, with their
+sizes and what each needs, and recommends one; it asks where to put it (by default the
+platform's data folder), checks the free space, resumes or verifies what is there already, adds
+the extras you choose (DSpark and vision for DeepSeek-V4.1, MTP for Qwen3.8) and writes
+`config.toml` in the platform's config folder, which a plain `straydog` reads. Every answer is
+also an option: `straydog setup --yes --quant GSQ-RCO-IQ2_XXS --dir ~/models` asks nothing
+(`--offline` downloads nothing, `--config FILE` writes the settings elsewhere).
+
+By hand, and for scripts that name their model:
+
+```bash
 # DeepSeek-V4.1-Flash: download and authenticate a bundle (once), then serve it
 straydog fetch -m ~/models/ds41 --quant GSQ-RCO-IQ2_XXS
 straydog -m ~/models/ds41 -gpu 0,1 --api-key-file ~/.straydog-key
@@ -65,8 +83,9 @@ Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
 or its GGUF.
 Every setting is an option; each also reads a `STRAYDOG_*` variable (`STRAYDOG_CTX_SIZE`),
-and `--config FILE` reads them from a TOML file. Options beat variables, which beat the
-file. `--print-config` shows the settings in effect and where each came from.
+and `--config FILE` reads them from a TOML file (with no `--config` and no model given, the one
+`setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
+settings in effect and where each came from.
 
 | Model | Bundle (`--quant`) | Size | |
 | --- | --- | ---: | --- |

@@ -46,7 +46,7 @@ straydog-engine = { path = "../straydog-engine" }
 straydog-gpu = { path = "../straydog-gpu" }
 straydog-isolation = { path = "../straydog-isolation" }
 straydog-provision = { path = "../straydog-provision" }
-sysinfo = { version = "0.39.6", default-features = false, features = ["component", "system"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["component", "disk", "system"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal", "net"] }
 toml = "0.8"
 tracing = "0.1"
@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+straydog-provision = { path = "../straydog-provision", features = ["mock"] }
 # Tests read floats back from the server's JSON (the dashboard's sample times, which a test then
 # sends as its cursor): without float_roundtrip about 1 in 8 parse one ulp off, and a sample the
 # test already has comes back as newer. Tests only: the server's own parsing is unchanged.
