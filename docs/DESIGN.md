@@ -432,9 +432,10 @@ Then:
   though the placement counts the first device's footprint on both.
 
 The rest is expert slots. After the first passes each device also lends what its card has free
-beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 6067 slots
-per device (5291 placed, 625 lent between passes, 151 from the spare VRAM: 624 MiB) and a
-102.2 GiB host tier (12,629 experts' worth, of 15,360), using 60.6 of 61.5 GiB.
+beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 6064 slots
+per device with the default prefill batch of 8192 (6067 with 4096: the arena for a larger pass's
+rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, of 15,360), using
+60.6 of 61.5 GiB.
 
 ### 7.2 Passes
 
@@ -443,6 +444,22 @@ per device (5291 placed, 625 lent between passes, 151 from the spare VRAM: 624 M
   read once for them all, in waves, with the next wave's fills behind the one computing.
 - **A long prompt** takes back the slots lent to the store and streams its experts through VRAM,
   while the host tier keeps theirs.
+- **The prefill batch** is 8192 rows when nothing else is asked for, fewer (down to 256) while
+  its pass buffers (~0.3 MB a row on each GPU) would take over an eighth of the smallest GPU
+  budget; `--batch-size` takes up to 8192.
+  - Every pass reads the ~35 GB a GPU of experts the VRAM does not hold over the bus (~1.5 s at
+    ~24 GB/s on both GPUs), whatever its rows. A layer's experts over 4096 rows computed in
+    ~16 ms against ~40 ms of copies; over 8192 rows they compute in ~30 ms. A 70K-token prompt
+    moved ~600 GB a GPU in passes of 4096 and ~350 GB in 8192.
+  - The lent arena (§5) covers the larger buffers: the slot count between passes does not
+    change, and a long pass writes back the few hundred experts its buffers take.
+  - 16384 rows were slower than 4096 (88 s): the host side of a pass (the Engram rows read ahead
+    for three batches, 1 GB of embeddings a pass) outgrew the row cache and the free memory of a
+    machine whose host tier pins most of it.
+  - A pass embeds its tokens a slab of 1024 at a time, uploading each. The embedding rows of the
+    batches to come are read ahead before their Engram rows: those queue the drive 128 deep, and
+    a page fault of the embedding table behind them waited seconds.
+  - With `DS41_PROFILE`, each pass of 256 rows or more logs its seconds and its phases.
 - **The decoder reaches back only through its sliding windows.** The decoder is the layers from
   the last kv source on. Of a pass of n rows, layer k computes only the last
   1 + (layers − 1 − k) × (window − 1) rows, plus the K/V of the window − 1 rows before them. The
@@ -482,6 +499,7 @@ Two R9700s, 125 GiB of RAM, GSQ-RCO-IQ2_XXS with DSpark, the owner's agent sessi
 | Decode, 55-73K | ~57 tokens/s |
 | Prefill, a turn continuing the conversation | 800-1100 tokens/s |
 | First token, a fresh 19.5K prompt | 18-22 s |
+| First token, a fresh 70K prompt (2026-10-29, Engram's page cache dropped) | 45-46 s (58-62 s in passes of 4096) |
 
 | Pass, at ~50K context | Wall time | Misses |
 | --- | --- | --- |
@@ -704,7 +722,7 @@ named as llama-server names it where it has the same setting.
 | `-md, --model-draft DIR` | Qwen3.8's MTP drafter | none |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
-| `-b, --batch-size N` | prefill batch, 1-4096 | 1024; 4096 with 48 GiB or more of GPU budget, and for the models read on demand |
+| `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 8192 | 1024; 4096 with 48 GiB or more of GPU budget, and for Qwen3.5 MoE; DeepSeek-V4.1: 8192 (§7.2) |
 | `-gpu, --gpu LIST` | GPU ordinals (`-dev`, `--device` also accepted) | `0` |
 | `-sm, --split-mode MODE` | `experts`: every layer split across the GPUs; `layer`: ranges of layers | `experts` |
 | `--vram GIB[,GIB...]\|auto` | VRAM budget for every GPU, or one per GPU (`30,10`) | `auto` (§5) |

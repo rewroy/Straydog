@@ -106,7 +106,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
         split_mode: plan.split,
         vram_bytes: plan.budgets.clone(),
         context: args.context,
-        batch: plan.batch,
+        // (0: the architecture's own choice, from the memory it has: DeepSeek-V4.1's)
+        batch: if args.prefill_batch_size == "auto" && bundle::architecture_of(&args.quant)? == "deepseek41" { 0 } else { plan.batch },
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
         row_cache_bytes: args.row_cache_bytes.unwrap_or(straydog_engine::rows::DEFAULT_CACHE_BYTES),

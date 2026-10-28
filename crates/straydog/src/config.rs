@@ -111,9 +111,9 @@ pub struct Options {
     #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u32).range(1..=262144))]
     pub ctx_size: Option<u32>,
-    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for the models read on demand (Qwen3.5 MoE: fewer when an eighth of the GPU budget, or a quarter of what its weights and state leave, cannot hold them)]
+    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for the models read on demand (Qwen3.5 MoE: fewer when an eighth of the GPU budget, or a quarter of what its weights and state leave, cannot hold them); DeepSeek-V4.1: 8192, fewer when its pass buffers would take over an eighth of a GPU's budget]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
-          value_parser = clap::value_parser!(u16).range(1..=4096))]
+          value_parser = clap::value_parser!(u16).range(1..=8192))]
     pub batch_size: Option<u16>,
     /// GPU ordinals, comma separated (also -gpu; -dev and --device are accepted) [default: 0]
     #[arg(long = "gpu", alias = "device", env = "STRAYDOG_GPU", value_name = "LIST", value_delimiter = ',')]
@@ -444,6 +444,10 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
             return Err(format!("--vram gives {} budgets for {} GPUs: give one, or one per GPU", gib.len(), gpu.len()));
         }
     }
+    let deepseek = on_demand && bundle::architecture_of(&quant)? == "deepseek41";
+    if options.batch_size.is_some_and(|batch| batch > 4096) && !deepseek {
+        return Err("--batch-size above 4096 is for DeepSeek-V4.1 alone".into());
+    }
     let ctx_size = options.ctx_size.unwrap_or(262144);
     // The bundles read on demand read each routed expert a pass needs once per pass: the longer
     // the pass, the fewer reads. Qwen3.5 MoE's placement takes fewer rows when the GPU budget
@@ -451,6 +455,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     // With the budgets left to the worker, it chooses the same way from those it finds.
     let total = vram.bytes(gpu.len()).map(|bytes| bytes.iter().sum::<u64>());
     let batch_size = options.batch_size.or(match total {
+        // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 8192)
+        _ if deepseek => None,
         _ if on_demand => Some(4096),
         Some(total) => Some(if total >= 48 << 30 { 4096 } else { 1024 }),
         None => None,
@@ -627,8 +633,9 @@ mod tests {
         assert_eq!(beside.data_dir, model.canonicalize().unwrap().join(".straydog"));
         let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
         assert_eq!((settings.quant.as_str(), settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-UD-IQ2_XXS"));
-        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (Some(4096), Some(48.0), data.canonicalize().unwrap()));
+        assert_eq!((settings.batch_size, settings.expert_ram, settings.data_dir.clone()), (None, Some(48.0), data.canonicalize().unwrap()));
         assert!(parse(&["--model-draft", "/"]).unwrap_err().contains("no MTP drafter"));
+        assert_eq!(parse(&["--data-dir", data.to_str().unwrap(), "--batch-size", "8192"]).unwrap().batch_size, Some(8192));
         let worker = crate::runtime::worker_args(&settings);
         let text: Vec<String> = worker.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert!(text.windows(2).any(|pair| pair[0] == "--host-expert-bytes" && pair[1] == (48u64 << 30).to_string()));
@@ -646,6 +653,9 @@ mod tests {
         let model = bundle_directory(quant);
         let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
         assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, Some(4096)));
+        // (a prefill batch above 4096 is DeepSeek-V4.1's)
+        let long = resolve(Options { model: Some(model.clone()), batch_size: Some(8192), ..Options::default() });
+        assert!(long.unwrap_err().contains("DeepSeek-V4.1 alone"));
         let shard = model.join(&bundle::shards(quant).unwrap()[0].name);
         assert_eq!(resolve(Options { model: Some(shard), ..Options::default() }).unwrap().quant, quant);
         std::fs::remove_dir_all(model).unwrap();

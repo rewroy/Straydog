@@ -288,7 +288,8 @@ pub struct Settings {
     /// Each GPU's VRAM budget, in `devices` order.
     pub vram_bytes: Vec<u64>,
     pub context: usize,
-    /// Most tokens one pass takes (a prompt is prefilled in chunks of this many).
+    /// Most tokens one pass takes (a prompt is prefilled in chunks of this many); 0 lets DeepSeek-V4.1's
+    /// placement choose from the GPUs' budgets.
     pub batch: usize,
     /// The experts' host tier; None plans it from `host_memory_bytes`.
     pub host_expert_bytes: Option<u64>,
