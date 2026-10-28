@@ -111,10 +111,16 @@ impl Pinned {
                 }
                 let model: &ModelHeader = first.as_ref().ok_or("an on-demand bundle without shards")?;
                 let source = |header: &ModelHeader| header.metadata.get(&format!("{}.engram.source", pins.architecture)).cloned();
-                // (the vision encoder's file is the official checkpoint's tensors as they are)
-                if sidecar.architecture != bundle::VISION_ARCHITECTURE && source(&header) != source(model) {
+                // (the vision encoder's file is the official checkpoint's tensors as they are; a model
+                // that names no source for its Engram is matched by the pins alone)
+                if sidecar.architecture != bundle::VISION_ARCHITECTURE && source(model).is_some() && source(&header) != source(model) {
                     return Err(format!("Straydog sidecar {} was made from another model", asset.name));
                 }
+            } else if index > 0 && index + 1 == count && header.architecture == bundle::ENGRAM_ARCHITECTURE
+                && header.shard_index == 0 && header.shard_count == 1 {
+                // The last shard of a split model may be the Engram file made before the split layout
+                // (a GGUF of its own, numbered 0 of 1): pinned like every shard, it is the split's
+                // sixth because the pins say so.
             } else {
                 if header.shard_index != index as u64 || header.shard_count != count as u64 {
                     return Err(format!("Straydog shard identity mismatch: {}", asset.name));
@@ -374,20 +380,19 @@ mod tests {
         out.extend_from_slice(value.as_bytes());
     }
 
-    /// A GGUF shard: architecture and split metadata, F32 tensors of these dimensions laid out in
-    /// order, their values `seed + index`.
-    fn shard(index: u64, count: u64, tensors: &[(&str, &[u64])], seed: f32) -> Vec<u8> {
+    /// A GGUF file: architecture (if any) and split numbering (if any) as metadata, F32 tensors of
+    /// these dimensions laid out in order, their values `seed + index`.
+    fn gguf(architecture: Option<&str>, split: Option<(u64, u64)>, tensors: &[(&str, &[u64])], seed: f32) -> Vec<u8> {
         let mut out = Vec::from(*b"GGUF");
         out.extend_from_slice(&3u32.to_le_bytes());
         out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        // As the model's: only the first shard names the architecture.
-        out.extend_from_slice(&(if index == 0 { 3u64 } else { 2 }).to_le_bytes());
-        if index == 0 {
+        out.extend_from_slice(&(architecture.is_some() as u64 + 2 * split.is_some() as u64).to_le_bytes());
+        if let Some(architecture) = architecture {
             string(&mut out, "general.architecture");
             out.extend_from_slice(&8u32.to_le_bytes());
-            string(&mut out, "deepseek41");
+            string(&mut out, architecture);
         }
-        for (key, value) in [("split.no", index), ("split.count", count)] {
+        for (key, value) in split.into_iter().flat_map(|(index, count)| [("split.no", index), ("split.count", count)]) {
             string(&mut out, key);
             out.extend_from_slice(&10u32.to_le_bytes());
             out.extend_from_slice(&value.to_le_bytes());
@@ -414,6 +419,11 @@ mod tests {
         out
     }
 
+    /// A GGUF shard: as the model's, only the first shard names the architecture.
+    fn shard(index: u64, count: u64, tensors: &[(&str, &[u64])], seed: f32) -> Vec<u8> {
+        gguf((index == 0).then_some("deepseek41"), Some((index, count)), tensors, seed)
+    }
+
     struct Bundle {
         root: std::path::PathBuf,
         pins: OnDemand,
@@ -427,18 +437,22 @@ mod tests {
 
     /// Two shards with their trees in `root/data/verity` and their pins.
     fn bundle(name: &str) -> Bundle {
-        let root = std::env::temp_dir().join(format!("straydog-pinned-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("data/verity")).unwrap();
         // The second shard's table (rows of 176 bytes) runs past the header's 16 MiB, so later
         // bytes are read only when used.
-        let shards = [
+        bundle_of(name, [
             shard(0, 2, &[("token_embd.weight", &[3000])], 0.0),
             shard(1, 2, &[("per_layer_token_embd.weight", &[44, TABLE_ROWS]), ("blk.0.attn_norm.weight", &[5000]),
                           ("blk.0.ffn_gate_exps.weight", &[4096])], 0.5),
-        ];
+        ].to_vec())
+    }
+
+    /// Files in `root` with their trees in `root/data/verity`, pinned as the shards of a bundle.
+    fn bundle_of(name: &str, files: Vec<Vec<u8>>) -> Bundle {
+        let root = std::env::temp_dir().join(format!("straydog-pinned-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data/verity")).unwrap();
         let (mut assets, mut verity) = (Vec::new(), Vec::new());
-        for (index, bytes) in shards.iter().enumerate() {
+        for (index, bytes) in files.iter().enumerate() {
             let asset = Asset { name: format!("shard-{index}.gguf"), bytes: bytes.len() as u64, sha256: String::new() };
             std::fs::write(root.join(&asset.name), bytes).unwrap();
             let file = File::open(root.join(&asset.name)).unwrap();
@@ -614,6 +628,29 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(pooled.verified_bytes(), 32_000);
+    }
+
+    /// ISTA's GSQ-RCO IQ2_XXS is split in six, the last being the Engram file made before the split
+    /// layout: a GGUF of its own (0 of 1, its own architecture). It opens as the last shard and
+    /// nowhere else, and a shard of another numbering is still refused.
+    #[test]
+    fn the_engram_file_of_the_older_layout_is_the_last_shard_only() {
+        let first = shard(0, 3, &[("token_embd.weight", &[3000])], 0.0);
+        let middle = shard(1, 3, &[("blk.0.attn_norm.weight", &[5000])], 0.5);
+        let tables = gguf(Some(bundle::ENGRAM_ARCHITECTURE), None, &[("blk.1.engram_embd.weight", &[44, 900])], 0.25);
+        let last = shard(2, 3, &[("blk.1.engram_embd.weight", &[44, 900])], 0.25);
+        let opened = bundle_of("engram-last", vec![first.clone(), middle.clone(), tables.clone()]);
+        let files = open(&opened).unwrap();
+        assert_eq!((files.header.architecture.as_str(), files.header.shard_count), ("deepseek41", 3));
+        assert_eq!(files.location("blk.1.engram_embd.weight").unwrap().0, 2);
+        assert_eq!(files.rows("blk.1.engram_embd.weight", &[0, 899]).unwrap().len(), 2 * 44 * 4);
+        // a shard of its own numbering is the last as before
+        assert!(open(&bundle_of("engram-numbered", vec![first.clone(), middle.clone(), last])).is_ok());
+        // not in the middle, and not where the numbers say it is not
+        let misplaced = bundle_of("engram-middle", vec![first.clone(), tables.clone(), middle]);
+        assert!(open(&misplaced).err().unwrap().contains("shard identity mismatch"));
+        let wrong = shard(1, 3, &[("blk.1.engram_embd.weight", &[44, 900])], 0.25);
+        assert!(open(&bundle_of("engram-wrong", vec![first.clone(), wrong.clone(), wrong])).err().unwrap().contains("shard identity mismatch"));
     }
 
     #[test]

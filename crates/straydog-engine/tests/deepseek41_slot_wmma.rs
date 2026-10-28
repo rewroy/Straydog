@@ -14,7 +14,7 @@
 //! 2.5e-3 at layer 3 and expanded 1.3e-3 (before BF16: layer 3 expanded 1.2e-3, grouped 0.8e-3).
 //!
 //! cargo test -p straydog-engine --features hip --test deepseek41_slot_wmma, with STRAYDOG_DS41 (the
-//! GSQ-RCO IQ2_XS bundle directory, its verity trees in .straydog there); under the GPU lock.
+//! GSQ-RCO IQ2_XS bundle directory (STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS for the IQ2_XXS one), its verity trees in .straydog there); under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
@@ -70,7 +70,7 @@ fn an_fp16_pass_through_the_grouped_kernels_is_as_accurate_as_the_expanded_gemms
             host_expert_bytes: Some(12 << 30), host_memory_bytes: straydog_engine::host::host_memory_bytes(),
             row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: half,
         };
-        let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+        let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
         model.prompt_logits = Some(Vec::new());
         let prompt = Text::from_gguf(model.header()).unwrap().encode(&format!("{document}\n\nWhat is this project?")).unwrap();
         assert!(prompt.len() > 1000, "a prompt of several waves");

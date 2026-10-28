@@ -518,6 +518,19 @@ sizes the expert store: each stage keeps its 87, 50 and 29 most used routed expe
 as it was, 3.1 GB of the 7.2 GB; the router's bias keeps the others out of a draft's top three.
 Verification stays exact: the tokens are those without the drafter.
 
+**GSQ-RCO layouts.** ISTA's DeepSeek-V4.1 GSQ-RCO GGUFs come in two layouts. IQ2_XS (four shards, the
+Engram tables in a file beside them) keeps Engram's hash parameters in integer tensors, its norm weights
+apart (`engram_q`, `engram_k`, `engram_wkv`) and names its Engram's source and its DSpark target layers
+in the metadata. The repository's Oct-27 layout (IQ2_XXS, six shards) has them in the metadata
+(`ple.*`, `engram.token_map`; the offsets run on across the modules), `engram_kv` and the gate folded
+(`engram_gate`, q times k), each layer's image routing bias (`exp_probs_b_vl.bias`, which images use
+before the vision encoder's file) and names neither source nor target layers. The IQ2_XXS bundle pins
+the Engram file of the first layout as its sixth shard, since the tables are the same bytes the Oct-27
+file holds under one tensor's header: a split's last shard may be a GGUF of its own of the Engram
+architecture, and with tables a module each the metadata's offsets are taken from each module's first
+column. The bundle's source for that shard is the repository's earlier revision, where the file is.
+The chat template stays Straydog's (the Oct-27 GGUF's embeds a copy without the `medium` effort).
+
 A start does not begin cold: the runtime asks the worker for the experts its stores hold (least
 recently used first, in VRAM and in the host tier) every two minutes after requests and at
 shutdown, and keeps them in the data directory (`<data-dir>/warm/<quant>-<key>.json`, the key

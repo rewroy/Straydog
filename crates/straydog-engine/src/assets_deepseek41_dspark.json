@@ -3,7 +3,8 @@
   "model": "DeepSeek-V4.1-Flash",
   "architecture": "deepseek41",
   "quantizations": [
-    "GSQ-RCO-IQ2_XS"
+    "GSQ-RCO-IQ2_XS",
+    "GSQ-RCO-IQ2_XXS"
   ],
   "dspark": {
     "kind": "dspark",

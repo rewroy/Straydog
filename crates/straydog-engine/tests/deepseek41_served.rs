@@ -2,7 +2,7 @@
 //! checkpoint as if nothing had come between.
 //!
 //! cargo test -p straydog-engine --features hip --test deepseek41_served, with STRAYDOG_DS41 (the
-//! GSQ-RCO IQ2_XS bundle directory, its verity trees in .straydog there); under the GPU lock.
+//! GSQ-RCO IQ2_XS bundle directory (STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS for the IQ2_XXS one), its verity trees in .straydog there); under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
@@ -56,7 +56,7 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
         host_expert_bytes: None, host_memory_bytes: straydog_engine::host::host_memory_bytes(),
         row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: false,
     };
-    let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+    let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
     model.prompt_logits = Some(Vec::new());
     let text = Text::from_gguf(model.header()).unwrap();
     let template = ChatTemplate::new(straydog_engine::arch::deepseek41::CHAT_TEMPLATE).unwrap();

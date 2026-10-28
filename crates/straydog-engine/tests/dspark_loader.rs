@@ -111,6 +111,26 @@ fn incompatible_target_and_draft_metadata_are_rejected() {
     assert!(Dspark::from_headers(&draft, &target).unwrap_err().contains("dflash.attention.key_length"));
 }
 
+/// GSQ-RCO's first layout names the target layers in `dspark_target_layer_ids`; its split layout
+/// declares nothing about DSpark, and the drafter's own `target_layers` stand for the target's.
+#[test]
+fn a_target_that_declares_less_is_matched_by_the_drafters_own_layers() {
+    let (draft, mut target) = headers();
+    for key in ["dspark.block_size", "dspark.noise_token_id", "dspark.markov_rank", "dspark.expert_count", "dspark.expert_used_count"] {
+        target.metadata.remove(&format!("deepseek41.{key}"));
+    }
+    let layers = target.metadata.remove("deepseek41.dspark.target_layers").unwrap();
+    target.metadata.insert("deepseek41.dspark_target_layer_ids".into(), layers);
+    assert_eq!(Dspark::from_headers(&draft, &target).unwrap().tensors.len(), 78);
+    target.metadata.insert("deepseek41.dspark_target_layer_ids".into(), Metadata::Array(vec![Metadata::Signed(36); 3]));
+    assert!(Dspark::from_headers(&draft, &target).unwrap_err().contains("target layers"));
+    target.metadata.remove("deepseek41.dspark_target_layer_ids");
+    assert_eq!(Dspark::from_headers(&draft, &target).unwrap().tensors.len(), 78);
+    let mut other = draft.clone();
+    other.metadata.insert("dflash.target_layers".into(), Metadata::Array(vec![Metadata::Signed(36); 3]));
+    assert!(Dspark::from_headers(&other, &target).unwrap_err().contains("target_layers"));
+}
+
 #[test]
 fn real_dspark_file_matches_the_layout_when_requested() {
     let Some(path) = common::model_env("STRAYDOG_DSPARK", "the DSpark Q8_0 GGUF file") else { return };

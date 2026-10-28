@@ -138,6 +138,9 @@ pub fn verity_files_in(root: &std::path::Path, quantization: &str) -> Result<Vec
 /// The GGUF `general.architecture` of DeepSeek-V4.1's vision encoder file.
 pub const VISION_ARCHITECTURE: &str = "deepseek41-vision";
 
+/// The GGUF `general.architecture` of DeepSeek-V4.1's separate Engram tables file.
+pub const ENGRAM_ARCHITECTURE: &str = "deepseek41-engram";
+
 /// The pins of DeepSeek-V4.1's vision encoder: the official checkpoint's vision tower, aligner,
 /// image span embeddings and image routing biases, which provisioning range-fetches (each
 /// tensor's SHA-256 pinned) into one GGUF beside the bundle, itself pinned by size, SHA-256 and
@@ -354,10 +357,11 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
 /// worker checks every block it uses against them. A model whose official repository gives its
 /// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
-pub const ON_DEMAND_MANIFESTS: [&str; 4] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
-                                            include_str!("assets_ornith.json"), include_str!("assets_deepseek41_gsq.json")];
+pub const ON_DEMAND_MANIFESTS: [&str; 5] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
+                                            include_str!("assets_ornith.json"), include_str!("assets_deepseek41_gsq.json"),
+                                            include_str!("assets_deepseek41_gsq.json")];
 /// Every on-demand quantization, with the manifest that pins it.
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 4] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0", "GSQ-RCO-IQ2_XS"];
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 5] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -438,14 +442,18 @@ pub fn on_demand_sources(quantization: &str) -> Result<Vec<Source>, String> {
         value.as_str().map(str::to_string).ok_or_else(|| format!("manifest without {what}"))
     };
     let repository = text(&manifest["repository"], "a repository")?;
-    let revision = text(&manifest["revision"], "a revision")?;
-    let listed = manifest["bundles"][quantization]["assets"].as_array().ok_or("manifest list missing")?;
-    let sidecars = manifest["bundles"][quantization]["sidecars"].as_array().map_or(&[][..], Vec::as_slice);
+    // (a bundle may come from another revision than the manifest's, and a file of it from another still:
+    // the Engram file a later revision of the repository rewrote, which the bundle keeps as it was made)
+    let entry = &manifest["bundles"][quantization];
+    let revision = text(if entry["revision"].is_string() { &entry["revision"] } else { &manifest["revision"] }, "a revision")?;
+    let listed = entry["assets"].as_array().ok_or("manifest list missing")?;
+    let sidecars = entry["sidecars"].as_array().map_or(&[][..], Vec::as_slice);
     let assets = pins.shards.into_iter().chain(pins.sidecars.into_iter().map(|sidecar| sidecar.asset));
     let mut sources = assets
         .zip(listed.iter().chain(sidecars))
         .map(|(asset, item)| {
-            Ok(Source { asset, repository: repository.clone(), revision: revision.clone(), path: text(&item["source_path"], "a source path")? })
+            let revision = if item["revision"].is_string() { text(&item["revision"], "a revision")? } else { revision.clone() };
+            Ok(Source { asset, repository: repository.clone(), revision, path: text(&item["source_path"], "a source path")? })
         })
         .collect::<Result<Vec<_>, String>>()?;
     if !pins.resources.is_empty() {
@@ -541,6 +549,21 @@ mod tests {
         assert_eq!((gsq.model.as_str(), gsq.architecture.as_str(), gsq.shards.len()), ("DeepSeek-V4.1-Flash", "deepseek41", 4));
         assert_eq!(gsq.sidecars.iter().map(|sidecar| sidecar.architecture.as_str()).collect::<Vec<_>>(), ["deepseek41-engram"]);
         assert_eq!(verity_pins("GSQ-RCO-IQ2_XS").unwrap().len(), 5);
+        // its IQ2_XXS (the repository's Oct-27 split layout): six shards at their own revision, the sixth
+        // the Engram file as the IQ2_XS bundle has it (made before that layout, from the earlier
+        // revision, under the sixth shard's name), and no sidecars
+        let xxs = on_demand("GSQ-RCO-IQ2_XXS").unwrap();
+        assert_eq!((xxs.model.as_str(), xxs.architecture.as_str(), xxs.shards.len(), xxs.sidecars.len()), ("DeepSeek-V4.1-Flash", "deepseek41", 6, 0));
+        assert_eq!((xxs.shards[5].sha256.as_str(), xxs.verity[5].as_str(), xxs.shards[5].bytes),
+                   (gsq.sidecars[0].asset.sha256.as_str(), gsq.sidecars[0].verity.as_str(), gsq.sidecars[0].asset.bytes));
+        assert_eq!(xxs.shards[5].name, "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00006-of-00006.gguf");
+        assert_eq!(verity_pins("GSQ-RCO-IQ2_XXS").unwrap().len(), 6);
+        assert!(xxs.verity.iter().all(|digest| digest.bytes().any(|digit| digit != b'0')));
+        let (first, engram) = (on_demand_sources("GSQ-RCO-IQ2_XXS").unwrap(), on_demand_sources("GSQ-RCO-IQ2_XS").unwrap());
+        assert!(first[..5].iter().all(|source| source.revision == "a419d74cd28d5b9f8c5e2b9077d11a609c17bc32"));
+        assert_eq!((first[5].revision.as_str(), first[5].path.as_str()),
+                   ("cb02422c900df489cea5833e8a92171224059b3c", "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"));
+        assert!(engram.iter().all(|source| source.revision == "cb02422c900df489cea5833e8a92171224059b3c"));
         assert_eq!(model_of("IQ2_XS").unwrap(), MODEL);
         assert!(on_demand("IQ3_S").is_err());
     }
@@ -555,6 +578,7 @@ mod tests {
         assert_eq!((source.repository.as_str(), source.asset.name.as_str()), ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", source.path.as_str()));
         assert!(!source.asset.name.contains('/') && source.asset.bytes > 7_000_000_000);
         assert!(dspark_source("UD-IQ2_XXS").unwrap().is_none() && dspark_source("IQ2_XS").unwrap().is_none());
+        assert_eq!(dspark_source("GSQ-RCO-IQ2_XXS").unwrap().unwrap().asset, source.asset);
         let pins = source.pins();
         assert_eq!((pins.architecture.as_str(), pins.shards.len(), pins.verity.len(), pins.sidecars.len()), ("dflash", 1, 1, 0));
 

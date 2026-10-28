@@ -13,3 +13,10 @@ pub fn model_env(name: &str, what: &str) -> Option<std::ffi::OsString> {
     }
     value
 }
+
+/// The quantization of the DeepSeek-V4.1 GSQ-RCO bundle in STRAYDOG_DS41: STRAYDOG_DS41_QUANT, else
+/// IQ2_XS (GSQ-RCO-IQ2_XXS for the six-shard bundle).
+#[allow(dead_code)]
+pub fn deepseek41_quantization() -> String {
+    std::env::var("STRAYDOG_DS41_QUANT").unwrap_or_else(|_| "GSQ-RCO-IQ2_XS".into())
+}
