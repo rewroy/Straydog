@@ -61,11 +61,10 @@ fn b1_to_b5_history_0_37_128_match_independent_cpu() {
     let (q_gpu, ring_gpu, block_gpu, sinks_gpu) = (upload(&mut gpu, &q), upload(&mut gpu, &ring),
         upload(&mut gpu, &block), upload(&mut gpu, &sinks));
     let out = gpu.buffer((q.len() * 4) as u64).unwrap();
-    let scratch = gpu.buffer(120).unwrap();
     for slots in 1..=5 {
         for (history, anchor) in [(0, 0), (37, 149), (128, 389)] {
             gpu.dspark_attention(q_gpu.base(), &ring_gpu, block_gpu.base(), &sinks_gpu, HEADS as u64, slots as u64,
-                anchor as u32, None, history as u64, out.base(), &scratch).unwrap();
+                anchor as u32, None, history as u64, out.base()).unwrap();
             let expected = oracle(&q, &ring, &block, &sinks, HEADS, slots, anchor, history);
             check(&format!("B={slots} H={history} anchor={anchor}"), &read(&mut gpu, &out, expected.len()), &expected);
         }
@@ -74,7 +73,7 @@ fn b1_to_b5_history_0_37_128_match_independent_cpu() {
     for slots in [1, 4] {
         let half = HEADS / 2;
         gpu.dspark_attention(q_gpu.base(), &ring_gpu, block_gpu.base(), &sinks_gpu, half as u64, slots as u64, 149, None, 37,
-            out.base(), &scratch).unwrap();
+            out.base()).unwrap();
         let expected = oracle(&q, &ring, &block, &sinks, half, slots, 149, 37);
         check(&format!("B={slots} {half} heads"), &read(&mut gpu, &out, expected.len()), &expected);
     }
@@ -83,7 +82,7 @@ fn b1_to_b5_history_0_37_128_match_independent_cpu() {
     gpu.write_buffer(&anchor, 0, &[389i32]).unwrap();
     gpu.graph_begin().unwrap();
     gpu.dspark_attention(q_gpu.base(), &ring_gpu, block_gpu.base(), &sinks_gpu, HEADS as u64, 3, 389, Some(anchor.base().cast_const()), 128,
-        out.base(), &scratch).unwrap();
+        out.base()).unwrap();
     gpu.graph_end(140, true).unwrap();
     for at in [389usize, 200, 128] {
         gpu.write_buffer(&anchor, 0, &[at as i32]).unwrap();
@@ -94,11 +93,8 @@ fn b1_to_b5_history_0_37_128_match_independent_cpu() {
     for (heads, slots, anchor, history) in [(64, 0, 0, 0), (64, 6, 0, 0), (64, 1, 129, 129), (64, 1, 36, 37), (64, 1, u32::MAX, 0),
                                             (0, 1, 0, 0), (65, 1, 0, 0)] {
         assert!(gpu.dspark_attention(q_gpu.base(), &ring_gpu, block_gpu.base(), &sinks_gpu,
-            heads, slots, anchor, None, history, out.base(), &scratch).is_err());
+            heads, slots, anchor, None, history, out.base()).is_err());
     }
-    let short = scratch.slice(0, 119);
-    assert!(gpu.dspark_attention(q_gpu.base(), &ring_gpu, block_gpu.base(), &sinks_gpu,
-        HEADS as u64, 5, 128, None, 128, out.base(), &short).is_err());
 }
 
 #[test]
@@ -110,9 +106,8 @@ fn first_capture_future_key_and_sink_mass_are_observable() {
     let block_gpu = upload(&mut gpu, &block);
     let sinks = upload(&mut gpu, &[0.0; HEADS]);
     let out = gpu.buffer((5 * HEADS * DIM * 4) as u64).unwrap();
-    let scratch = gpu.buffer(120).unwrap();
     gpu.graph_begin().unwrap();
-    gpu.dspark_attention(q.base(), &ring, block_gpu.base(), &sinks, HEADS as u64, 5, 0, None, 0, out.base(), &scratch).unwrap();
+    gpu.dspark_attention(q.base(), &ring, block_gpu.base(), &sinks, HEADS as u64, 5, 0, None, 0, out.base()).unwrap();
     gpu.graph_end(139, true).unwrap();
     assert!(gpu.graph_run(139).unwrap());
     // Every query, including the first, sees five keys and one sink: (1+2+3+4+5)/6.

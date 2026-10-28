@@ -121,11 +121,13 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
 /* DSpark's greedy Markov chain, 1..5 slots. W1/W2 are BF16 [vocabulary,rank], conf is
    F32 [width+rank]; body [slots,vocabulary], hidden [slots,width]. Outputs are corrected
    logits, tokens, confidences and their usable prefix count (0 below minimum).
-   All inputs/outputs/scratch must be disjoint. Scratch: align16(4*(width+rank))+512 bytes.
+   With body_tail, the body's columns from tail_first on are [slots, vocabulary - tail_first] there
+   and body holds the columns below (rows of vocabulary).
+   All inputs/outputs/scratch must be disjoint. Scratch: slots * align16(4*(width+rank)) + 512 bytes.
    Reference defaults: threshold=0, minimum=0. No host readback; graph-capturable. */
-int sd_op_dspark_head(void* handle, const float* body, const float* hidden, const void* w1, const void* w2,
-                      const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank, uint64_t width,
-                      uint32_t anchor, const int32_t* anchor_at, float threshold, uint64_t minimum, float* logits,
+int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, uint64_t tail_first, const float* hidden,
+                      const void* w1, const void* w2, const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank,
+                      uint64_t width, uint32_t anchor, const int32_t* anchor_at, float threshold, uint64_t minimum, float* logits,
                       int32_t* tokens, float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes);
 /* Decode fusions (one vector): sd_op_norm_linears stores the RMS norm of x (weight, eps) in
    normed (width floats) and runs the linears over it (every item's input is normed, its columns
@@ -290,11 +292,10 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
    [128,512], block KV [slots,512], sinks [heads]. Q and all keys already have RoPE applied.
    Every query sees history positions [anchor-history,anchor) and ALL block keys.
    slots 1..5, history 0..128, anchor>=history and <=INT32_MAX. Scale 1/sqrt(512);
-   the sink contributes to the softmax denominator only. Scratch: 4*slots*(slots+1)
-   bytes for generated positions/selections. All ranges disjoint; graph-capturable. */
+   the sink contributes to the softmax denominator only. All ranges disjoint; graph-capturable. */
 int sd_op_dspark_attention(void* handle, const float* q, const float* ring, const float* block,
                            const float* sinks, uint64_t heads, uint64_t slots, uint32_t anchor, const int32_t* anchor_at,
-                           uint64_t history, float* out, int32_t* scratch, uint64_t scratch_bytes);
+                           uint64_t history, float* out);
 int sd_op_compress(void* handle, const float* kv, const float* gate, uint64_t groups, uint64_t ratio, uint64_t dim, float* out);
 int sd_op_index_scores(void* handle, const float* q, const float* keys, const float* weights, const int32_t* visible, uint64_t rows, uint64_t groups, uint64_t heads, uint64_t dim, float scale, float* scores);
 int sd_op_top_k(void* handle, const float* scores, uint64_t rows, uint64_t groups, uint64_t k, int32_t* out);

@@ -173,17 +173,16 @@ impl Backend {
     /// DSpark noncausal attention: all queries `[slots,heads,512]` (a device's heads, at most 64)
     /// see the same history `[anchor-history,anchor)` from the `[128,512]` ring and every block KV
     /// row `[slots,512]`. Queries and keys already have RoPE applied. Sinks `[heads]` enter only the
-    /// denominator. Slots 1..5, history <=128 and <=anchor. Scratch: `4*slots*(slots+1)` bytes. With
-    /// `anchor_at` the anchor position is read from that device i32 instead (a recorded graph's
-    /// changes as it replays; `anchor` still bounds the history when the op is queued).
-    /// All ranges are disjoint; the first invocation can be captured in a graph.
+    /// denominator. Slots 1..5, history <=128 and <=anchor. With `anchor_at` the anchor position is
+    /// read from that device i32 instead (a recorded graph's changes as it replays; `anchor` still
+    /// bounds the history when the op is queued). All ranges are disjoint; the first invocation can
+    /// be captured in a graph.
     #[allow(clippy::too_many_arguments)]
     pub fn dspark_attention(&mut self, q: P, ring: &Buffer, block: P, sinks: &Buffer, heads: u64, slots: u64,
-                            anchor: u32, anchor_at: Option<P>, history: u64, out: M, scratch: &Buffer) -> Result<()> {
+                            anchor: u32, anchor_at: Option<P>, history: u64, out: M) -> Result<()> {
         // SAFETY: live handle; native code checks shapes and every device allocation range.
         check(unsafe { ffi::sd_op_dspark_attention(self.handle(), q.cast(), ring.pointer.cast(), block.cast(),
-            sinks.pointer.cast(), heads, slots, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()), history, out.cast(),
-            scratch.pointer.cast(), scratch.bytes) })
+            sinks.pointer.cast(), heads, slots, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()), history, out.cast()) })
     }
 
     pub fn release_buffer(&mut self, buffer: Buffer) -> Result<()> {
@@ -275,19 +274,23 @@ impl Backend {
     }
 
     /// DSpark's greedy Markov chain. Inputs/outputs/scratch must be disjoint; scratch holds
-    /// `align16(4*(width+rank))+512` bytes. Only the first `count` tokens/confidences are used.
-    /// Reference defaults are `threshold=0.0`, `minimum=0` (llama.cpp be83657 common.h:330-333).
-    /// No host readback: the first invocation may be captured in a graph. With `anchor_at` the
-    /// anchor token is read from that device i32 instead (`anchor` still checked when queued).
+    /// `slots * 4 * (width+rank)` bytes (each slot's features, 16-byte aligned) and 512 more. Only the first
+    /// `count` tokens/confidences are used. Reference defaults are `threshold=0.0`, `minimum=0`
+    /// (llama.cpp be83657 common.h:330-333). No host readback: the first invocation may be captured
+    /// in a graph. With `anchor_at` the anchor token is read from that device i32 instead (`anchor`
+    /// still checked when queued). With `tail` = (logits, first), the body's columns from `first` on
+    /// are those, `[slots, vocabulary - first]`, not in `body` (which then holds the columns below
+    /// `first`, `[slots, vocabulary]`).
     #[allow(clippy::too_many_arguments)]
-    pub fn dspark_head(&mut self, body: P, hidden: P, w1: &Buffer, w2: &Buffer, conf: &Buffer,
+    pub fn dspark_head(&mut self, body: P, tail: Option<(P, u64)>, hidden: P, w1: &Buffer, w2: &Buffer, conf: &Buffer,
                        slots: u64, vocabulary: u64, rank: u64, width: u64, anchor: u32, anchor_at: Option<P>,
                        threshold: f32, minimum: u64, logits: M, tokens: M, confidences: M,
                        count: M, scratch: &Buffer) -> Result<()> {
+        let (tail, first) = tail.map_or((std::ptr::null(), 0), |(tail, first)| (tail, first));
         // SAFETY: a live handle; the native op checks shapes and all device allocation ranges.
         check(unsafe {
-            ffi::sd_op_dspark_head(self.handle(), body.cast(), hidden.cast(), w1.pointer.cast_const(), w2.pointer.cast_const(),
-                conf.pointer.cast(), slots, vocabulary, rank, width, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()),
+            ffi::sd_op_dspark_head(self.handle(), body.cast(), tail.cast(), first, hidden.cast(), w1.pointer.cast_const(),
+                w2.pointer.cast_const(), conf.pointer.cast(), slots, vocabulary, rank, width, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()),
                 threshold, minimum, logits.cast(), tokens.cast(), confidences.cast(), count.cast(), scratch.pointer.cast(), scratch.bytes)
         })
     }

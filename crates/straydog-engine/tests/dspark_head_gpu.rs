@@ -63,7 +63,7 @@ impl Case {
             w1: upload(gpu, &self.w1), w2: upload(gpu, &self.w2), conf: upload(gpu, &self.conf),
             logits: gpu.buffer((self.body.len() * 4) as u64).unwrap(),
             tokens: gpu.buffer(20).unwrap(), confidences: gpu.buffer(20).unwrap(), count: gpu.buffer(4).unwrap(),
-            scratch: gpu.buffer(((features * 4).div_ceil(16) * 16 + 512) as u64).unwrap(),
+            scratch: gpu.buffer((5 * (features * 4).div_ceil(16) * 16 + 512) as u64).unwrap(),
         }
     }
 }
@@ -78,7 +78,7 @@ impl Device {
     /// With the anchor token from a device i32.
     fn run_at(&self, gpu: &mut Backend, case: &Case, slots: u64, threshold: f32, minimum: u64, anchor: Option<&Buffer>)
               -> Result<(), String> {
-        gpu.dspark_head(self.body.base(), self.hidden.base(), &self.w1, &self.w2, &self.conf,
+        gpu.dspark_head(self.body.base(), None, self.hidden.base(), &self.w1, &self.w2, &self.conf,
             slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, anchor.map(|at| at.base().cast_const()), threshold, minimum,
             self.logits.base(), self.tokens.base(), self.confidences.base(), self.count.base(), &self.scratch)
     }
@@ -178,6 +178,40 @@ fn ties_odd_vocabulary_cutoff_and_invalid_arguments() {
     case.anchor = 33;
     assert!(device.run(&mut gpu, &case, 1, 0.0, 0).is_err());
     case.anchor = 32;
-    let short = Device { scratch: device.scratch.slice(0, device.scratch.bytes - 1), ..device };
+    // (a slot's features, 16-byte aligned, and the argmax's 512 bytes)
+    let one_slot = (case.w + case.r) * 4;
+    let short = Device { scratch: device.scratch.slice(0, (one_slot.div_ceil(16) * 16 + 512 - 1) as u64), ..device };
     assert!(short.run(&mut gpu, &case, 1, 0.0, 0).is_err());
+    let two = Device { scratch: device.scratch.slice(0, (2 * one_slot.div_ceil(16) * 16 + 512 - 1) as u64), ..short };
+    assert!(two.run(&mut gpu, &case, 2, 0.0, 0).is_err());
+}
+
+#[test]
+fn a_body_in_two_parts_is_the_body_whole() {
+    let (v, r, w, split) = (1031, 16, 64, 500);
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let case = Case { v, r, w, anchor: 7, body: random.floats(5 * v, 1.0), hidden: random.floats(5 * w, 0.1), w1: random.bf16(v * r),
+        w2: random.bf16(v * r), conf: random.floats(w + r, 0.05) };
+    let expected = case.oracle();
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let device = case.device(&mut gpu);
+    // the head's columns from `split` on in a buffer of their own, those below in the body's rows (the rest of them garbage)
+    let mut front = case.body.clone();
+    let mut tail = Vec::new();
+    for row in front.chunks_exact_mut(v) {
+        tail.extend_from_slice(&row[split..]);
+        row[split..].fill(f32::NAN);
+    }
+    let (front, tail) = (upload(&mut gpu, &front), upload(&mut gpu, &tail));
+    for slots in 1..=5u64 {
+        gpu.dspark_head(front.base(), Some((tail.base().cast_const(), split as u64)), device.hidden.base(), &device.w1, &device.w2,
+                        &device.conf, slots, v as u64, r as u64, w as u64, case.anchor, None, 0.0, 0, device.logits.base(),
+                        device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).unwrap();
+        device.check(&mut gpu, &case, &expected, slots as usize, slots as u32);
+    }
+    for first in [0, v as u64] {
+        assert!(gpu.dspark_head(front.base(), Some((tail.base().cast_const(), first)), device.hidden.base(), &device.w1, &device.w2,
+                                &device.conf, 1, v as u64, r as u64, w as u64, case.anchor, None, 0.0, 0, device.logits.base(),
+                                device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).is_err());
+    }
 }

@@ -382,6 +382,8 @@ unsafe extern "C" {
     pub fn sd_op_dspark_head(
         handle: *mut ::std::os::raw::c_void,
         body: *const f32,
+        body_tail: *const f32,
+        tail_first: u64,
         hidden: *const f32,
         w1: *const ::std::os::raw::c_void,
         w2: *const ::std::os::raw::c_void,
@@ -963,8 +965,6 @@ unsafe extern "C" {
         anchor_at: *const i32,
         history: u64,
         out: *mut f32,
-        scratch: *mut i32,
-        scratch_bytes: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
