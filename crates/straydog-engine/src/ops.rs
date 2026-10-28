@@ -282,18 +282,21 @@ impl Backend {
     /// are those, `[slots, vocabulary - first]`, not in `body` (which then holds the columns below
     /// `first`, `[slots, vocabulary]`). With `sample_at` (four device u32: an inverse temperature's float bits, 0 for
     /// greedy, and a 64-bit seed, low word first) each token is a draw from the softmax of its corrected logits at
-    /// that temperature, the chain following the drawn tokens; read when the op runs, so a graph follows it.
+    /// that temperature, the chain following the drawn tokens; read when the op runs, so a graph follows it. With
+    /// `probabilities` (a float a slot; needs `sample_at`) each drawn token's probability under the softmax it was drawn from
+    /// is stored there (0 where it is not valid).
     #[allow(clippy::too_many_arguments)]
     pub fn dspark_head(&mut self, body: P, tail: Option<(P, u64)>, hidden: P, w1: &Buffer, w2: &Buffer, conf: &Buffer,
                        slots: u64, vocabulary: u64, rank: u64, width: u64, anchor: u32, anchor_at: Option<P>, sample_at: Option<P>,
                        threshold: f32, minimum: u64, logits: M, tokens: M, confidences: M,
-                       count: M, scratch: &Buffer) -> Result<()> {
+                       count: M, probabilities: Option<M>, scratch: &Buffer) -> Result<()> {
         let (tail, first) = tail.map_or((std::ptr::null(), 0), |(tail, first)| (tail, first));
         // SAFETY: a live handle; the native op checks shapes and all device allocation ranges.
         check(unsafe {
             ffi::sd_op_dspark_head(self.handle(), body.cast(), tail.cast(), first, hidden.cast(), w1.pointer.cast_const(),
                 w2.pointer.cast_const(), conf.pointer.cast(), slots, vocabulary, rank, width, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()),
-                sample_at.map_or(std::ptr::null(), |at| at.cast()), threshold, minimum, logits.cast(), tokens.cast(), confidences.cast(), count.cast(), scratch.pointer.cast(), scratch.bytes)
+                sample_at.map_or(std::ptr::null(), |at| at.cast()), threshold, minimum, logits.cast(), tokens.cast(), confidences.cast(), count.cast(),
+                probabilities.map_or(std::ptr::null_mut(), |at| at.cast()), scratch.pointer.cast(), scratch.bytes)
         })
     }
 

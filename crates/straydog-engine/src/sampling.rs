@@ -246,6 +246,305 @@ fn dense_exp(value: f64) -> f64 {
     }
 }
 
+/// `a * b + c`, fused when `FUSED` (only where the code is compiled for a CPU with the instruction: else it is a library call).
+#[inline(always)]
+fn multiply_add<const FUSED: bool>(a: f64, b: f64, c: f64) -> f64 {
+    if FUSED {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
+/// exp(x) for x between [`VECTOR_EXP_FLOOR`] and 0 (or NaN, which stays NaN), to a rounding or two of f64: x = k ln2 + r with
+/// |r| <= ln2/2 (k found by the rounding of an added 1.5 * 2^52, and read from that sum's bits), the Taylor series of
+/// exp(r) to r^13 (its truncation is below 1e-17), and 2^k put together from its bits. Only multiplications, additions and
+/// bit operations, so that a loop of these vectorizes: libm's exp is a call per element.
+#[inline(always)]
+fn exp_lane<const FUSED: bool>(x: f64) -> f64 {
+    const ROUNDER: f64 = 6_755_399_441_055_744.0; // 1.5 * 2^52
+    // (fdlibm's split of ln 2: k * LN2_HIGH is exact for the k of this range)
+    const LN2_HIGH: f64 = 6.931_471_803_691_238e-1;
+    const LN2_LOW: f64 = 1.908_214_929_270_587_7e-10;
+    let shifted = multiply_add::<FUSED>(x, std::f64::consts::LOG2_E, ROUNDER);
+    let k = shifted - ROUNDER;
+    let r = multiply_add::<FUSED>(-k, LN2_LOW, multiply_add::<FUSED>(-k, LN2_HIGH, x));
+    let mut series = 1.0 / 6_227_020_800.0;
+    for divisor in [479_001_600.0, 39_916_800.0, 3_628_800.0, 362_880.0, 40_320.0, 5_040.0, 720.0, 120.0, 24.0, 6.0, 2.0, 1.0, 1.0] {
+        series = multiply_add::<FUSED>(series, r, 1.0 / divisor);
+    }
+    // (the low bits of `shifted` are k, two's complement)
+    let power = f64::from_bits(shifted.to_bits().wrapping_sub(ROUNDER.to_bits()).wrapping_add(1023) << 52);
+    series * power
+}
+
+/// A value below this, once the peak is taken off and the scale put on, is not one the vector exp does: it may be subnormal.
+const VECTOR_EXP_FLOOR: f64 = -700.0;
+
+/// The largest of `values` (NaN left out), sixteen at a time.
+fn peak_of(values: &[f32]) -> f32 {
+    let mut lanes = [f32::NEG_INFINITY; 16];
+    let mut chunks = values.chunks_exact(16);
+    for chunk in &mut chunks {
+        for i in 0..16 {
+            // (the comparison form is the machine's maximum, which leaves a NaN out)
+            lanes[i] = if chunk[i] > lanes[i] { chunk[i] } else { lanes[i] };
+        }
+    }
+    chunks.remainder().iter().chain(&lanes).fold(f32::NEG_INFINITY, |peak, &value| peak.max(value))
+}
+
+/// `out[i] = exp((input[i] - peak) * scale)`: [`dense_exp`] of each (to a rounding or two). The vector loop (sixteen values
+/// at a time: the series is a long chain of dependent operations, so several are in flight) notes whether any value was
+/// one it cannot do ([`VECTOR_EXP_FLOOR`]); the block is then done again by [`dense_exp`].
+#[inline(always)]
+fn exp_block_generic<const FUSED: bool>(out: &mut [f64], input: &[f32], peak: f64, scale: f64) {
+    let mut below = false;
+    let (mut outs, mut ins) = (out.chunks_exact_mut(16), input.chunks_exact(16));
+    for (target, chunk) in (&mut outs).zip(&mut ins) {
+        for i in 0..16 {
+            let x = (f64::from(chunk[i]) - peak) * scale;
+            below |= x < VECTOR_EXP_FLOOR;
+            target[i] = exp_lane::<FUSED>(x);
+        }
+    }
+    for (target, &value) in outs.into_remainder().iter_mut().zip(ins.remainder()) {
+        let x = (f64::from(value) - peak) * scale;
+        below |= x < VECTOR_EXP_FLOOR;
+        *target = exp_lane::<FUSED>(x);
+    }
+    if below {
+        for (target, &value) in out.iter_mut().zip(input) {
+            *target = dense_exp((f64::from(value) - peak) * scale);
+        }
+    }
+}
+
+/// [`multiply_add`] in single precision.
+#[inline(always)]
+fn multiply_add_f32<const FUSED: bool>(a: f32, b: f32, c: f32) -> f32 {
+    if FUSED {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
+    }
+}
+
+/// exp(x) in single precision, for x from -87 up to 0 (below it, exp(-87)) and NaN (which stays NaN), to 2e-7 of the value
+/// (Cephes' expf: the same reduction as [`exp_lane`], a series to r^7). Half the work of the double and twice the lanes.
+#[inline(always)]
+fn exp_lane_f32<const FUSED: bool>(x: f32) -> f32 {
+    const ROUNDER: f32 = 12_582_912.0; // 1.5 * 2^23
+    const LN2_HIGH: f32 = 355.0 / 512.0;
+    const LN2_LOW: f32 = -2.121_944_4e-4;
+    let x = if x < -87.0 { -87.0 } else { x };
+    let shifted = multiply_add_f32::<FUSED>(x, std::f32::consts::LOG2_E, ROUNDER);
+    let n = shifted - ROUNDER;
+    let r = multiply_add_f32::<FUSED>(-n, LN2_LOW, multiply_add_f32::<FUSED>(-n, LN2_HIGH, x));
+    let mut series = 1.987_569_1e-4;
+    for coefficient in [1.398_199_9e-3, 8.333_452e-3, 4.166_579_6e-2, 1.666_666_5e-1, 5e-1] {
+        series = multiply_add_f32::<FUSED>(series, r, coefficient);
+    }
+    let y = multiply_add_f32::<FUSED>(series, r * r, r + 1.0);
+    // (the low bits of `shifted` are n, two's complement)
+    let power = f32::from_bits(shifted.to_bits().wrapping_sub(ROUNDER.to_bits()).wrapping_add(127) << 23);
+    y * power
+}
+
+/// The sum of exp((input[i] - peak) * scale) to a few parts in 10^7: [`exp_lane_f32`] in sixteen lanes of single precision,
+/// each lane adding up 16 values before it goes into the double total.
+#[inline(always)]
+fn exp_sum_f32_generic<const FUSED: bool>(input: &[f32], peak: f32, scale: f32) -> f64 {
+    let mut total = 0.0f64;
+    let mut groups = input.chunks_exact(256);
+    for group in &mut groups {
+        let mut lanes = [0.0f32; 16];
+        for chunk in group.chunks_exact(16) {
+            for i in 0..16 {
+                lanes[i] += exp_lane_f32::<FUSED>((chunk[i] - peak) * scale);
+            }
+        }
+        total += lanes.into_iter().map(f64::from).sum::<f64>();
+    }
+    for &value in groups.remainder() {
+        total += f64::from(exp_lane_f32::<FUSED>((value - peak) * scale));
+    }
+    total
+}
+
+/// [`exp_lane_f32`] for x up to 87 as well as down to -87 (above it, exp(87)).
+#[inline(always)]
+fn exp_lane_f32_wide<const FUSED: bool>(x: f32) -> f32 {
+    exp_lane_f32::<FUSED>(if x > 87.0 { 87.0 } else { x })
+}
+
+/// What the weights of a rejected draft's replacement are made of: they are max(0, p - q) for p the target's probability of a
+/// token and q the drafter's, in single precision. p is exp((logit - peak) * scale) over the target's sum, q the probability
+/// of the draft that was drawn from the drafter's row times exp((logit - the draft's) * scale): the drafter's own sum is not
+/// needed, only the draft's probability, which the device has.
+struct Residual {
+    peak: f32,
+    scale: f32,
+    inverse_total: f32,
+    drawn_logit: f32,
+    drawn_probability: f32,
+}
+
+/// The weight of one token in the replacement of a rejected draft (see [`Residual`]).
+#[inline(always)]
+fn residual_lane<const FUSED: bool>(of: &Residual, target: f32, proposed: f32) -> f32 {
+    let p = exp_lane_f32::<FUSED>((target - of.peak) * of.scale) * of.inverse_total;
+    let q = of.drawn_probability * exp_lane_f32_wide::<FUSED>((proposed - of.drawn_logit) * of.scale);
+    let left = p - q;
+    if left > 0.0 {
+        left
+    } else {
+        0.0
+    }
+}
+
+/// The weights of the replacement of a rejected draft over the two rows' logits (see [`Residual`]), added up as
+/// [`exp_sum_f32_generic`] adds.
+#[inline(always)]
+fn residual_sum_generic<const FUSED: bool>(target: &[f32], proposed: &[f32], of: &Residual) -> f64 {
+    let mut total = 0.0f64;
+    let mut groups = target.chunks_exact(256).zip(proposed.chunks_exact(256));
+    for (target, proposed) in &mut groups {
+        let mut lanes = [0.0f32; 16];
+        for (target, proposed) in target.chunks_exact(16).zip(proposed.chunks_exact(16)) {
+            for i in 0..16 {
+                lanes[i] += residual_lane::<FUSED>(of, target[i], proposed[i]);
+            }
+        }
+        total += lanes.into_iter().map(f64::from).sum::<f64>();
+    }
+    let done = target.len() / 256 * 256;
+    for (&target, &proposed) in target[done..].iter().zip(&proposed[done..]) {
+        total += f64::from(residual_lane::<FUSED>(of, target, proposed));
+    }
+    total
+}
+
+/// `out[i]` = the weight of token i of the replacement of a rejected draft (see [`Residual`]).
+#[inline(always)]
+fn residual_block_generic<const FUSED: bool>(out: &mut [f32], target: &[f32], proposed: &[f32], of: &Residual) {
+    for ((out, &target), &proposed) in out.iter_mut().zip(target).zip(proposed) {
+        *out = residual_lane::<FUSED>(of, target, proposed);
+    }
+}
+
+/// [`exp_block_generic`], compiled for some CPU.
+type ExpBlock = fn(&mut [f64], &[f32], f64, f64);
+
+/// [`exp_sum_f32_generic`], compiled for some CPU.
+type ExpSum = fn(&[f32], f32, f32) -> f64;
+
+/// [`residual_sum_generic`], compiled for some CPU.
+type ResidualSum = fn(&[f32], &[f32], &Residual) -> f64;
+
+/// [`residual_block_generic`], compiled for some CPU.
+type ResidualBlock = fn(&mut [f32], &[f32], &[f32], &Residual);
+
+/// The vector loops compiled for the CPU's widest registers: chosen once.
+struct Kernels {
+    exp_block: ExpBlock,
+    exp_sum_f32: ExpSum,
+    residual_sum: ResidualSum,
+    residual_block: ResidualBlock,
+}
+
+/// (aarch64 has the fused instruction in its baseline; any other target gets plain multiplications and additions)
+const BASELINE_FUSED: bool = cfg!(target_arch = "aarch64");
+
+#[cfg(target_arch = "x86_64")]
+mod wide {
+    //! The loops of [`super::Kernels`] compiled with 256- and 512-bit registers and fused multiply-adds.
+    macro_rules! compiled_for {
+        ($module:ident, $features:literal) => {
+            pub mod $module {
+                #[target_feature(enable = $features)]
+                unsafe fn exp_block(out: &mut [f64], input: &[f32], peak: f64, scale: f64) {
+                    super::super::exp_block_generic::<true>(out, input, peak, scale)
+                }
+                #[target_feature(enable = $features)]
+                unsafe fn exp_sum_f32(input: &[f32], peak: f32, scale: f32) -> f64 {
+                    super::super::exp_sum_f32_generic::<true>(input, peak, scale)
+                }
+                #[target_feature(enable = $features)]
+                unsafe fn residual_sum(target: &[f32], proposed: &[f32], of: &super::super::Residual) -> f64 {
+                    super::super::residual_sum_generic::<true>(target, proposed, of)
+                }
+                #[target_feature(enable = $features)]
+                unsafe fn residual_block(out: &mut [f32], target: &[f32], proposed: &[f32], of: &super::super::Residual) {
+                    super::super::residual_block_generic::<true>(out, target, proposed, of)
+                }
+                // SAFETY (all four): only installed after the features are detected.
+                pub fn exp_block_safe(out: &mut [f64], input: &[f32], peak: f64, scale: f64) {
+                    unsafe { exp_block(out, input, peak, scale) }
+                }
+                pub fn exp_sum_f32_safe(input: &[f32], peak: f32, scale: f32) -> f64 {
+                    unsafe { exp_sum_f32(input, peak, scale) }
+                }
+                pub fn residual_sum_safe(target: &[f32], proposed: &[f32], of: &super::super::Residual) -> f64 {
+                    unsafe { residual_sum(target, proposed, of) }
+                }
+                pub fn residual_block_safe(out: &mut [f32], target: &[f32], proposed: &[f32], of: &super::super::Residual) {
+                    unsafe { residual_block(out, target, proposed, of) }
+                }
+            }
+        };
+    }
+    compiled_for!(avx2, "avx2,fma");
+    compiled_for!(avx512, "avx512f,avx512vl,avx2,fma");
+}
+
+fn kernels() -> &'static Kernels {
+    static KERNELS: std::sync::OnceLock<Kernels> = std::sync::OnceLock::new();
+    KERNELS.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Kernels {
+                    exp_block: wide::avx512::exp_block_safe,
+                    exp_sum_f32: wide::avx512::exp_sum_f32_safe,
+                    residual_sum: wide::avx512::residual_sum_safe,
+                    residual_block: wide::avx512::residual_block_safe,
+                };
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Kernels {
+                    exp_block: wide::avx2::exp_block_safe,
+                    exp_sum_f32: wide::avx2::exp_sum_f32_safe,
+                    residual_sum: wide::avx2::residual_sum_safe,
+                    residual_block: wide::avx2::residual_block_safe,
+                };
+            }
+        }
+        Kernels {
+            exp_block: exp_block_generic::<BASELINE_FUSED>,
+            exp_sum_f32: exp_sum_f32_generic::<BASELINE_FUSED>,
+            residual_sum: residual_sum_generic::<BASELINE_FUSED>,
+            residual_block: residual_block_generic::<BASELINE_FUSED>,
+        }
+    })
+}
+
+fn exp_block(out: &mut [f64], input: &[f32], peak: f64, scale: f64) {
+    (kernels().exp_block)(out, input, peak, scale)
+}
+
+fn exp_sum_f32(input: &[f32], peak: f32, scale: f32) -> f64 {
+    (kernels().exp_sum_f32)(input, peak, scale)
+}
+
+fn residual_sum(target: &[f32], proposed: &[f32], of: &Residual) -> f64 {
+    (kernels().residual_sum)(target, proposed, of)
+}
+
+fn residual_block(out: &mut [f32], target: &[f32], proposed: &[f32], of: &Residual) {
+    (kernels().residual_block)(out, target, proposed, of)
+}
+
 // A private pool keeps this bounded independently of tokenizer/expert reader pools.
 // Failed thread creation, or a single-core host, falls back to the same serial f64 code.
 fn dense_pool() -> Option<&'static rayon::ThreadPool> {
@@ -282,15 +581,12 @@ fn dense_distribution_on(
 ) -> Distribution {
     let mut weights = vec![0.0; logits.len()];
     let mut blocks = vec![0.0; logits.len().div_ceil(DENSE_BLOCK)];
+    let scale = 1.0 / temperature;
     if let Some(pool) = pool {
         pool.install(|| {
             let peak = logits
                 .par_chunks(DENSE_BLOCK)
-                .map(|chunk| {
-                    chunk
-                        .iter()
-                        .fold(f32::NEG_INFINITY, |peak, value| peak.max(*value))
-                })
+                .map(peak_of)
                 .reduce(|| f32::NEG_INFINITY, f32::max) as f64;
             weights
                 .par_chunks_mut(DENSE_BLOCK)
@@ -306,16 +602,12 @@ fn dense_distribution_on(
                         *mass = 0.0;
                         return;
                     }
-                    for (target, &value) in out.iter_mut().zip(input) {
-                        *target = dense_exp((f64::from(value) - peak) / temperature);
-                    }
+                    exp_block(out, input, peak, scale);
                     *mass = dense_total(out);
                 });
         });
     } else {
-        let peak = logits
-            .iter()
-            .fold(f32::NEG_INFINITY, |peak, value| peak.max(*value)) as f64;
+        let peak = peak_of(logits) as f64;
         for ((out, input), mass) in weights
             .chunks_mut(DENSE_BLOCK)
             .zip(logits.chunks(DENSE_BLOCK))
@@ -329,9 +621,7 @@ fn dense_distribution_on(
                 *mass = 0.0;
                 continue;
             }
-            for (target, &value) in out.iter_mut().zip(input) {
-                *target = dense_exp((f64::from(value) - peak) / temperature);
-            }
+            exp_block(out, input, peak, scale);
             *mass = dense_total(out);
         }
     }
@@ -346,6 +636,108 @@ fn dense_distribution_on(
         normalizer: total,
         remaining: total,
     }
+}
+
+/// What a plain softmax's ([`Sampling::plain`]) probability of a token, and a draw from it, need of a row of logits, without the
+/// whole distribution: the peak and the sums of exp((logit - peak) / temperature) over blocks of the row. A token has the
+/// probability a [`Distribution::DenseWeights`] of the row gives it, to a part in a million: the sums are in single precision
+/// (twice the lanes and half the work of the double's), as the drafter's draws are on the device, which knows its own
+/// probabilities no better.
+struct Partition {
+    peak: f32,
+    scale: f64,
+    /// The sum over each [`DENSE_BLOCK`] of the row.
+    blocks: Vec<f64>,
+    total: f64,
+}
+
+impl Partition {
+    /// One vectorized pass for the peak and one for the sums, on the calling thread (a row of the vocabulary's size is ~35 us;
+    /// the worker threads' wake-up is not much less). None for a row or a temperature the single-precision sum cannot do
+    /// (NaN logits, a temperature near 0): those go through [`distribution`].
+    fn of(logits: &[f32], temperature: f64) -> Option<Partition> {
+        let (peak, scale) = (peak_of(logits), 1.0 / temperature);
+        if !(scale as f32).is_finite() || !peak.is_finite() {
+            return None;
+        }
+        let blocks: Vec<f64> = logits.chunks(DENSE_BLOCK).map(|block| exp_sum_f32(block, peak, scale as f32)).collect();
+        let total = blocks.iter().sum::<f64>();
+        (total.is_finite() && total > 0.0).then_some(Partition { peak, scale, blocks, total })
+    }
+
+    /// The probability of the token with this logit.
+    fn probability(&self, logit: f32) -> f64 {
+        dense_exp((f64::from(logit) - f64::from(self.peak)) * self.scale) / self.total
+    }
+
+    /// A token drawn from the softmax of `logits` (the row this is the partition of), by one random number as
+    /// [`Distribution::draw`] takes: the block it falls in by the sums, then the token by the weights of that block alone.
+    fn draw(&self, logits: &[f32], rng: &mut Rng) -> u32 {
+        let mut target = rng.random() * self.total;
+        let last = self.blocks.len() - 1;
+        for (index, &mass) in self.blocks.iter().enumerate() {
+            if target < mass || index == last {
+                let block = &logits[index * DENSE_BLOCK..((index + 1) * DENSE_BLOCK).min(logits.len())];
+                let mut weights = [0.0f64; DENSE_BLOCK];
+                let weights = &mut weights[..block.len()];
+                exp_block(weights, block, f64::from(self.peak), self.scale);
+                return (index * DENSE_BLOCK + pick(weights, target)) as u32;
+            }
+            target -= mass;
+        }
+        unreachable!("a partition has a block")
+    }
+}
+
+/// The index at which the running sum of `weights` passes `target`; the last with weight if rounding leaves it past the end.
+fn pick<W: Copy + Into<f64>>(weights: &[W], mut target: f64) -> usize {
+    for (index, &weight) in weights.iter().enumerate() {
+        let weight: f64 = weight.into();
+        if target < weight {
+            return index;
+        }
+        target -= weight;
+    }
+    weights.iter().rposition(|&weight| weight.into() > 0.0).unwrap_or(0)
+}
+
+/// A token drawn from norm(max(0, p - q)), the replacement of a rejected draft, for p the softmax `target` is the partition of
+/// (the rows are the two softmaxes' logits) and q the softmax `proposed` is the row of, `drawn` the rejected draft, drawn from q at
+/// `drawn_probability`. One vectorized pass for the weights' sums over blocks and one over the block the draw falls in, by one
+/// random number as a [`Distribution`] draws; the draft itself is no candidate. None, with no random number used, when the
+/// weights add up to nothing (only rounding can leave that after a rejection).
+fn draw_residual(target: &Partition, target_row: &[f32], proposed_row: &[f32], drawn: u32, drawn_probability: f64, rng: &mut Rng) -> Option<u32> {
+    let of = Residual {
+        peak: target.peak,
+        scale: target.scale as f32,
+        inverse_total: (1.0 / target.total) as f32,
+        drawn_logit: *proposed_row.get(drawn as usize)?,
+        drawn_probability: drawn_probability as f32,
+    };
+    let mut blocks: Vec<f64> = target_row.chunks(DENSE_BLOCK).zip(proposed_row.chunks(DENSE_BLOCK)).map(|(target, proposed)| residual_sum(target, proposed, &of)).collect();
+    let drawn_weight = residual_lane::<false>(&of, target_row[drawn as usize], of.drawn_logit);
+    let drawn_block = drawn as usize / DENSE_BLOCK;
+    blocks[drawn_block] = (blocks[drawn_block] - f64::from(drawn_weight)).max(0.0);
+    let total = blocks.iter().sum::<f64>();
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    let mut remaining = rng.random() * total;
+    let last = blocks.len() - 1;
+    for (index, &mass) in blocks.iter().enumerate() {
+        if remaining < mass || index == last {
+            let range = index * DENSE_BLOCK..((index + 1) * DENSE_BLOCK).min(target_row.len());
+            let mut weights = [0.0f32; DENSE_BLOCK];
+            let weights = &mut weights[..range.len()];
+            residual_block(weights, &target_row[range.clone()], &proposed_row[range.clone()], &of);
+            if index == drawn_block {
+                weights[drawn as usize - range.start] = 0.0;
+            }
+            return Some((range.start + pick(weights, remaining)) as u32);
+        }
+        remaining -= mass;
+    }
+    None
 }
 
 /// Up to this many candidates are kept in order while scanning; more are selected in linear
@@ -528,7 +920,7 @@ pub fn accept(
     generated: &mut Generated,
     rng: &mut Rng,
 ) -> (usize, u32) {
-    accept_drawn(drafts, &[], logits, vocabulary, sampling, generated, rng)
+    accept_drawn(drafts, &mut Points, logits, vocabulary, sampling, generated, rng)
 }
 
 /// The distribution a rejected draft's replacement is drawn from: norm(max(0, p - q)), over
@@ -559,18 +951,70 @@ fn residual(p: &Distribution, q: &Distribution, vocabulary: usize) -> Option<Dis
     }
 }
 
+/// What the accept rule is told of drafts a drafter drew from the softmax of its own logits (see [`accept_drawn`]).
+pub trait Proposals {
+    /// Draft `slot`'s probability under the softmax it was drawn from; None for a draft that is a point proposal.
+    fn probability(&mut self, slot: usize, token: u32) -> Option<f64>;
+    /// The logits row (the vocabulary wide) of the softmax draft `slot` was drawn from. Asked for only when the draft is
+    /// rejected, and then once: a drafter whose rows are on a device reads back just that one.
+    fn row(&mut self, slot: usize) -> &[f32];
+}
+
+/// Drafts that are all point proposals (a lookup's, an argmax).
+struct Points;
+
+impl Proposals for Points {
+    fn probability(&mut self, _slot: usize, _token: u32) -> Option<f64> {
+        None
+    }
+
+    fn row(&mut self, _slot: usize) -> &[f32] {
+        &[]
+    }
+}
+
+/// Drafts drawn from the softmax of the rows in hand at the sampling's temperature, one row for each draft ([`Sampling::plain`]).
+pub struct Rows<'a> {
+    rows: &'a [Vec<f32>],
+    plain: Sampling,
+}
+
+impl<'a> Rows<'a> {
+    pub fn new(rows: &'a [Vec<f32>], sampling: &Sampling) -> Rows<'a> {
+        Rows { rows, plain: Sampling { temperature: sampling.temperature, ..Sampling::GREEDY } }
+    }
+}
+
+impl Proposals for Rows<'_> {
+    fn probability(&mut self, slot: usize, token: u32) -> Option<f64> {
+        let row = self.rows.get(slot)?;
+        let sums = (row.len() >= DENSE_WEIGHTS_MIN).then(|| Partition::of(row, self.plain.temperature)).flatten();
+        Some(match sums {
+            Some(sums) => sums.probability(row[token as usize]),
+            None => distribution(row, &self.plain, &Generated::new(row.len())).probability(token),
+        })
+    }
+
+    fn row(&mut self, slot: usize) -> &[f32] {
+        &self.rows[slot]
+    }
+}
+
 /// [`accept`] for drafts some of which were drawn from a distribution of the drafter's own
-/// (speculative sampling, Leviathan et al. 2023 and Chen et al. 2023): `drawn[i]` is the drafter's
-/// logits row (`vocabulary` wide) that draft `i` was drawn from the softmax of, at the sampling's
-/// temperature, with nothing cut ([`Sampling::plain`]); a draft with no row (a lookup's, a
-/// drafter's argmax) is a point proposal, as in [`accept`]. A drawn draft `x` is kept with
-/// probability min(1, p(x) / q(x)); a rejected one is replaced by a draw from norm(max(0, p - q)),
-/// so that the tokens that come out are drawn from the target's distribution all the same, and
+/// (speculative sampling, Leviathan et al. 2023 and Chen et al. 2023): `proposals` tells the probability
+/// of draft `i` under the softmax of the drafter's logits, at the sampling's temperature, that it was drawn from, with nothing cut
+/// ([`Sampling::plain`]); a draft with none (a lookup's, a drafter's argmax) is a point proposal, as in
+/// [`accept`]. A drawn draft `x` is kept with probability min(1, p(x) / q(x)); a rejected one is replaced by a draw
+/// from norm(max(0, p - q)), so that the tokens that come out are drawn from the target's distribution all the same, and
 /// the chance that a draft is kept is the overlap of p and q, 1 - TV(p, q), not p(argmax q).
-#[allow(clippy::too_many_arguments)]
+///
+/// Only a rejection needs the drafter's row, and only the one draft rejected; a kept draft is decided by the target's
+/// row sum ([`Partition`]) and the draft's logit in it, the replacement of a rejected draft and the token after the last kept
+/// one are drawn by passes over the rows that make no distribution of them. All in single precision (a part in a million of
+/// the probabilities); the distributions are built ([`distribution`]) where a row or a temperature does not suit that.
 pub fn accept_drawn(
     drafts: &[u32],
-    drawn: &[Vec<f32>],
+    proposals: &mut dyn Proposals,
     logits: &[f32],
     vocabulary: usize,
     sampling: &Sampling,
@@ -578,6 +1022,8 @@ pub fn accept_drawn(
     rng: &mut Rng,
 ) -> (usize, u32) {
     let row = |index: usize| &logits[index * vocabulary..(index + 1) * vocabulary];
+    let wide = sampling.plain() && vocabulary >= DENSE_WEIGHTS_MIN;
+    let mut drawn = false;
     for (index, draft) in drafts.iter().enumerate() {
         if sampling.temperature == 0.0 {
             let target = choose(row(index), sampling, generated, rng);
@@ -585,31 +1031,50 @@ pub fn accept_drawn(
                 return (index, target);
             }
         } else {
-            let distribution = distribution(row(index), sampling, generated);
-            match drawn.get(index) {
-                None => {
-                    if rng.random() >= distribution.probability(*draft) {
-                        return (index, distribution.without(*draft).draw(rng));
-                    }
-                }
-                Some(proposed) => {
-                    let proposal = self::distribution(proposed, sampling, generated);
-                    let (kept, drawn_from) = (distribution.probability(*draft), proposal.probability(*draft));
+            match proposals.probability(index, *draft) {
+                // A draft drawn from a softmax: kept with min(1, p / q).
+                Some(drawn_from) => {
+                    drawn = true;
+                    let sums = wide.then(|| Partition::of(row(index), sampling.temperature)).flatten();
+                    let (kept, dense) = match &sums {
+                        Some(target) => (target.probability(row(index)[*draft as usize]), None),
+                        None => {
+                            let target = distribution(row(index), sampling, generated);
+                            (target.probability(*draft), Some(target))
+                        }
+                    };
                     // (a token that was drawn has its probability above 0)
                     if drawn_from > 0.0 && rng.random() >= (kept / drawn_from).min(1.0) {
-                        let instead = residual(&distribution, &proposal, vocabulary)
-                            .unwrap_or_else(|| distribution.without(*draft));
-                        return (index, instead.draw(rng));
+                        let proposed = proposals.row(index);
+                        if let Some(token) = sums.as_ref().filter(|_| proposed.len() == vocabulary)
+                            .and_then(|target| draw_residual(target, row(index), proposed, *draft, drawn_from, rng)) {
+                            return (index, token);
+                        }
+                        let target = dense.unwrap_or_else(|| distribution(row(index), sampling, generated));
+                        let instead = if proposed.len() == vocabulary {
+                            residual(&target, &distribution(proposed, sampling, generated), vocabulary)
+                        } else {
+                            None
+                        };
+                        return (index, instead.unwrap_or_else(|| target.without(*draft)).draw(rng));
+                    }
+                }
+                None => {
+                    let distribution = distribution(row(index), sampling, generated);
+                    if rng.random() >= distribution.probability(*draft) {
+                        return (index, distribution.without(*draft).draw(rng));
                     }
                 }
             }
         }
         generated.insert(*draft);
     }
-    (
-        drafts.len(),
-        choose(row(drafts.len()), sampling, generated, rng),
-    )
+    let last = row(drafts.len());
+    // (after drafts that were drawn, the token after the last is drawn by the sums too)
+    if let Some(sums) = (drawn && wide).then(|| Partition::of(last, sampling.temperature)).flatten() {
+        return (drafts.len(), sums.draw(last, rng));
+    }
+    (drafts.len(), choose(last, sampling, generated, rng))
 }
 
 #[cfg(test)]
@@ -858,7 +1323,7 @@ mod tests {
     fn first_of_a_round(target: &[f32], drafter: &[f32], sampling: &Sampling, rng: &mut Rng) -> (u32, bool) {
         let draft = distribution(drafter, sampling, &Generated::new(target.len())).draw(rng);
         let rows: Vec<f32> = [target, target].concat();
-        let (accepted, next) = accept_drawn(&[draft], &[drafter.to_vec()], &rows, target.len(), sampling, &mut Generated::new(target.len()), rng);
+        let (accepted, next) = accept_drawn(&[draft], &mut Rows::new(&[drafter.to_vec()], sampling), &rows, target.len(), sampling, &mut Generated::new(target.len()), rng);
         if accepted == 1 { (draft, true) } else { (next, false) }
     }
 
@@ -1198,6 +1663,310 @@ mod tests {
         assert_eq!(blocks.iter().filter(|&&mass| mass != 0.0).count(), 1);
         assert_eq!(normalizer, 1.0);
         assert_eq!(remaining, 1.0);
+    }
+
+    /// Every compiled form of the vector exps: the plain loops (with and without fused operations) and what this CPU runs.
+    fn exp_blocks() -> Vec<(&'static str, ExpBlock)> {
+        let mut all: Vec<(&'static str, ExpBlock)> =
+            vec![("plain", exp_block_generic::<false>), ("fused", exp_block_generic::<true>), ("chosen", kernels().exp_block)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                all.push(("avx2", wide::avx2::exp_block_safe));
+            }
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                all.push(("avx512", wide::avx512::exp_block_safe));
+            }
+        }
+        all
+    }
+
+    fn exp_sums() -> Vec<(&'static str, ExpSum)> {
+        let mut all: Vec<(&'static str, ExpSum)> =
+            vec![("plain", exp_sum_f32_generic::<false>), ("fused", exp_sum_f32_generic::<true>), ("chosen", kernels().exp_sum_f32)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                all.push(("avx2", wide::avx2::exp_sum_f32_safe));
+            }
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                all.push(("avx512", wide::avx512::exp_sum_f32_safe));
+            }
+        }
+        all
+    }
+
+    /// The vector exp is libm's to a rounding or two, over the whole range it does, in every compiled form; below the range,
+    /// and for a NaN, a block is libm's exactly.
+    #[test]
+    fn the_vector_exp_is_libms_to_a_rounding_or_two() {
+        // Logits (peak 0, scale 1) from 0 down to -699, every kind of fraction, and the peak itself.
+        let input: Vec<f32> = (0..200_000).map(|i| -(i as f32) * 0.003_49).chain([0.0, -0.0, -1e-9, -699.9]).collect();
+        let mut wanted = vec![0.0f64; input.len()];
+        for (target, &value) in wanted.iter_mut().zip(&input) {
+            *target = f64::from(value).exp();
+        }
+        for (name, exp_block) in exp_blocks() {
+            let mut got = vec![0.0f64; input.len()];
+            for (out, chunk) in got.chunks_mut(DENSE_BLOCK).zip(input.chunks(DENSE_BLOCK)) {
+                exp_block(out, chunk, 0.0, 1.0);
+            }
+            let worst = got.iter().zip(&wanted).map(|(got, wanted)| ((got - wanted) / wanted).abs()).fold(0.0, f64::max);
+            assert!(worst < 5e-16, "{name}: relative error {worst:e}");
+        }
+        // A scale, and a peak other than 0.
+        for (name, exp_block) in exp_blocks() {
+            let (mut got, chunk) = (vec![0.0f64; 1000], &input[..1000]);
+            exp_block(&mut got, chunk, 3.5, 0.37);
+            for (&got, &value) in got.iter().zip(chunk) {
+                let wanted = ((f64::from(value) - 3.5) * 0.37).exp();
+                assert!(((got - wanted) / wanted).abs() < 5e-16, "{name}: {value}: {got} against {wanted}");
+            }
+        }
+        // Below the range (subnormal results and zeros), -inf and NaN: libm's own, bit for bit; a block with a NaN and
+        // nothing below the range keeps the NaN.
+        for (name, exp_block) in exp_blocks() {
+            let low: Vec<f32> = [0.0, -1.0, -705.0, -720.0, -745.0, -746.0, -800.0, f32::NEG_INFINITY, f32::NAN].repeat(5);
+            let mut got = vec![1.0f64; low.len()];
+            exp_block(&mut got, &low, 0.0, 1.0);
+            for (&got, &value) in got.iter().zip(&low) {
+                assert_eq!(got.to_bits(), dense_exp(f64::from(value)).to_bits().max(if value.is_nan() { got.to_bits() } else { 0 }), "{name}: {value}");
+                assert!(got.is_nan() == value.is_nan());
+            }
+            let mut got = vec![0.0f64; 40];
+            exp_block(&mut got, &[-1.0f32, f32::NAN].repeat(20), 0.0, 1.0);
+            assert!(got.iter().enumerate().all(|(i, got)| got.is_nan() == (i % 2 == 1)), "{name}: {got:?}");
+        }
+    }
+
+    /// The single-precision sum is the double's to a few parts in 10^7, in every compiled form, over rows of all spreads.
+    #[test]
+    fn the_single_precision_sum_is_the_exact_sum_to_a_few_parts_in_ten_million() {
+        let mut rng = Rng::new(23);
+        for count in [1usize, 15, 16, 255, 256, 257, 4096, 4099, 129_280] {
+            for spread in [0.01, 1.0, 16.0, 120.0] {
+                let row: Vec<f32> = (0..count).map(|_| ((rng.random() - 0.5) * spread) as f32).collect();
+                let peak = peak_of(&row);
+                for scale in [1.0f32, 0.5, 2.0, 10.0] {
+                    let wanted: f64 = row.iter().map(|&value| f64::from((value - peak) * scale).exp()).sum();
+                    for (name, exp_sum) in exp_sums() {
+                        let got = exp_sum(&row, peak, scale);
+                        // (what is under -87 is exp(-87) there: 1.6e-38 each, nothing against the peak's 1)
+                        assert!(((got - wanted) / wanted).abs() < 5e-7, "{name}: {count} values, spread {spread}, scale {scale}: {got} against {wanted}");
+                    }
+                }
+            }
+        }
+        for (name, exp_sum) in exp_sums() {
+            let mut with_nan = vec![0.0f32; 300];
+            with_nan[200] = f32::NAN;
+            assert!(exp_sum(&with_nan, 0.0, 1.0).is_nan(), "{name}");
+        }
+    }
+
+    /// A token's probability by a [`Partition`] is the dense distribution's, where the dense distribution is the exact one.
+    #[test]
+    fn a_partition_gives_the_probabilities_of_the_dense_distribution() {
+        let mut rng = Rng::new(31);
+        for count in [4096usize, 6000, 129_280] {
+            let row: Vec<f32> = (0..count).map(|_| ((rng.random() - 0.5) * 24.0) as f32).collect();
+            for temperature in [0.3, 1.0, 1.7] {
+                let sampling = Sampling { temperature, ..Sampling::GREEDY };
+                let (dense, partition) = (distribution(&row, &sampling, &Generated::new(count)), Partition::of(&row, temperature).unwrap());
+                for token in (0..count).step_by(7).chain([0, count - 1]) {
+                    let (wanted, got) = (dense.probability(token as u32), partition.probability(row[token]));
+                    assert!(wanted == 0.0 && got < 1e-30 || ((got - wanted) / wanted).abs() < 1e-6, "{count} at {temperature}: token {token}: {got} against {wanted}");
+                }
+            }
+        }
+        // The rows it leaves to the dense distribution: NaN, an infinite peak, a temperature that overflows the scale.
+        let mut row = vec![0.0f32; 5000];
+        row[7] = f32::NAN;
+        assert!(Partition::of(&row, 1.0).is_none());
+        row[7] = f32::INFINITY;
+        assert!(Partition::of(&row, 1.0).is_none());
+        assert!(Partition::of(&vec![0.0f32; 5000], 1e-300).is_none());
+        assert!(Partition::of(&vec![f32::NEG_INFINITY; 5000], 1.0).is_none());
+    }
+
+    /// Drawn drafts as a device tells them: their probabilities, and rows that are asked for (and noted) one at a time.
+    struct Given<'a> {
+        probabilities: &'a [f32],
+        rows: &'a [Vec<f32>],
+        asked: Vec<usize>,
+    }
+
+    impl Proposals for Given<'_> {
+        fn probability(&mut self, slot: usize, _token: u32) -> Option<f64> {
+            self.probabilities.get(slot).map(|&probability| f64::from(probability))
+        }
+
+        fn row(&mut self, slot: usize) -> &[f32] {
+            self.asked.push(slot);
+            &self.rows[slot]
+        }
+    }
+
+    /// accept_drawn as it was before the sums: a dense distribution of each row of every slot.
+    fn accept_drawn_by_distributions(drafts: &[u32], drawn: &[Vec<f32>], logits: &[f32], vocabulary: usize, sampling: &Sampling,
+                                     generated: &mut Generated, rng: &mut Rng) -> (usize, u32) {
+        let row = |index: usize| &logits[index * vocabulary..(index + 1) * vocabulary];
+        for (index, draft) in drafts.iter().enumerate() {
+            let target = distribution(row(index), sampling, generated);
+            let proposal = distribution(&drawn[index], sampling, generated);
+            let (kept, drawn_from) = (target.probability(*draft), proposal.probability(*draft));
+            if drawn_from > 0.0 && rng.random() >= (kept / drawn_from).min(1.0) {
+                let instead = residual(&target, &proposal, vocabulary).unwrap_or_else(|| target.without(*draft));
+                return (index, instead.draw(rng));
+            }
+            generated.insert(*draft);
+        }
+        (drafts.len(), choose(row(drafts.len()), sampling, generated, rng))
+    }
+
+    /// The decision by sums is the decision by distributions: the same drafts kept, the same random numbers used, over rounds of
+    /// every shape (a drafter close to the target and far from it; drafts kept, rejected at each slot, all kept). The token
+    /// that follows is drawn by passes in single precision and not from the distribution built, so that it is the same but for the
+    /// rare draw that falls within a few parts in 10^8 of the border of two tokens' shares (`agreeing`: most of them are).
+    #[test]
+    fn deciding_by_sums_is_deciding_by_distributions() {
+        for vocabulary in [4096usize, 6000, 129_280] {
+            let mut source = Rng::new(vocabulary as u64);
+            let rounds = if vocabulary > 100_000 { 400 } else { 1500 };
+            let (mut ended, mut agreeing) = ([0usize; 4], 0usize);
+            for round in 0..rounds {
+                let temperature = [0.7, 1.0, 1.3][round % 3];
+                let sampling = Sampling { temperature, ..Sampling::GREEDY };
+                let (slots, closeness) = (1 + round % 3, [0.2, 1.0, 3.0][(round / 3) % 3]);
+                let target: Vec<f32> = (0..(slots + 1) * vocabulary).map(|_| ((source.random() - 0.5) * 14.0) as f32).collect();
+                let drafter: Vec<Vec<f32>> = (0..slots)
+                    .map(|slot| target[slot * vocabulary..(slot + 1) * vocabulary].iter()
+                        .map(|&logit| logit + ((source.random() - 0.5) * 2.0 * closeness) as f32).collect())
+                    .collect();
+                let seed = source.random().to_bits();
+                let mut drawing = Rng::new(seed ^ 1);
+                let drafts: Vec<u32> = drafter.iter().map(|row| distribution(row, &sampling, &Generated::new(vocabulary)).draw(&mut drawing)).collect();
+                let (mut by_sums, mut by_distributions) = (Rng::new(seed), Rng::new(seed));
+                let a = accept_drawn(&drafts, &mut Rows::new(&drafter, &sampling), &target, vocabulary, &sampling, &mut Generated::new(vocabulary), &mut by_sums);
+                let b = accept_drawn_by_distributions(&drafts, &drafter, &target, vocabulary, &sampling, &mut Generated::new(vocabulary), &mut by_distributions);
+                assert_eq!(a.0, b.0, "round {round} at {vocabulary}");
+                assert!((a.1 as usize) < vocabulary && (a.0 == slots || a.1 != drafts[a.0]), "round {round}: the token {} after {} kept", a.1, a.0);
+                assert_eq!(by_sums.random().to_bits(), by_distributions.random().to_bits(), "round {round}: random numbers used");
+                agreeing += usize::from(a == b);
+                ended[a.0] += 1;
+                // The same with what a device gives: the draws' probabilities (in single precision) and the one row of a rejection, asked
+                // for once.
+                let probabilities: Vec<f32> = drafter.iter().zip(&drafts)
+                    .map(|(row, &draft)| distribution(row, &sampling, &Generated::new(vocabulary)).probability(draft) as f32).collect();
+                let mut given = Given { probabilities: &probabilities, rows: &drafter, asked: Vec::new() };
+                let mut by_device = Rng::new(seed);
+                let c = accept_drawn(&drafts, &mut given, &target, vocabulary, &sampling, &mut Generated::new(vocabulary), &mut by_device);
+                assert_eq!(c.0, b.0, "round {round} at {vocabulary}, probabilities given");
+                assert_eq!(given.asked, if c.0 < slots { vec![c.0] } else { Vec::new() }, "round {round}: the rows asked for");
+                agreeing += usize::from(c == b);
+            }
+            // (the rounds did end at every slot)
+            assert!(ended.iter().take(3).all(|&n| n > rounds / 40) && ended[0] + ended[1] + ended[2] + ended[3] == rounds, "{vocabulary}: ended at {ended:?}");
+            assert!(agreeing * 50 >= 2 * rounds * 49, "{vocabulary}: the token agreed in {agreeing} of {} rounds", 2 * rounds);
+        }
+    }
+
+    /// The weights of the replacement of a rejected draft, in every compiled form, are max(0, p - q) of the distributions built, to
+    /// a few parts in 10^7 of the largest of them (a sampling test would not see an error of a percent), and their sum is theirs.
+    #[test]
+    fn the_replacements_weights_are_the_residual_of_the_distributions() {
+        let mut source = Rng::new(91);
+        for (vocabulary, temperature) in [(300usize, 1.0), (4099, 0.8), (9000, 1.2)] {
+            let target: Vec<f32> = (0..vocabulary).map(|_| ((source.random() - 0.5) * 12.0) as f32).collect();
+            let proposed: Vec<f32> = target.iter().map(|&logit| logit + ((source.random() - 0.5) * 3.0) as f32).collect();
+            let sampling = Sampling { temperature, ..Sampling::GREEDY };
+            let (p, q) = (distribution(&target, &sampling, &Generated::new(vocabulary)), distribution(&proposed, &sampling, &Generated::new(vocabulary)));
+            let drawn = (0..vocabulary as u32).max_by(|&a, &b| q.probability(a).total_cmp(&q.probability(b))).unwrap();
+            let total: f64 = target.iter().map(|&logit| ((f64::from(logit) - f64::from(peak_of(&target))) / temperature).exp()).sum();
+            let of = Residual {
+                peak: peak_of(&target),
+                scale: (1.0 / temperature) as f32,
+                inverse_total: (1.0 / total) as f32,
+                drawn_logit: proposed[drawn as usize],
+                drawn_probability: q.probability(drawn) as f32,
+            };
+            let wanted: Vec<f64> = (0..vocabulary as u32).map(|t| (p.probability(t) - q.probability(t)).max(0.0)).collect();
+            let largest = wanted.iter().copied().fold(0.0, f64::max);
+            for (name, residual_sum, residual_block) in [
+                ("plain", residual_sum_generic::<false> as ResidualSum, residual_block_generic::<false> as ResidualBlock),
+                ("fused", residual_sum_generic::<true>, residual_block_generic::<true>),
+                ("chosen", kernels().residual_sum, kernels().residual_block),
+            ] {
+                let mut got = vec![0.0f32; vocabulary];
+                residual_block(&mut got, &target, &proposed, &of);
+                for (token, (&got, &wanted)) in got.iter().zip(&wanted).enumerate() {
+                    assert!((f64::from(got) - wanted).abs() <= 5e-7 * largest, "{name}, {vocabulary}: token {token}: {got} against {wanted} (largest {largest})");
+                }
+                let sum = residual_sum(&target, &proposed, &of);
+                let exact: f64 = wanted.iter().sum();
+                assert!((sum - exact).abs() <= 1e-6 * exact + 1e-9, "{name}, {vocabulary}: sum {sum} against {exact}");
+            }
+        }
+    }
+
+    /// The tokens the passes draw: after the last kept draft, from the softmax of the row, and in place of a rejected one from
+    /// norm(max(0, p - q)), never the rejected draft itself (chi-square over many draws against the distributions
+    /// built in double precision, with the tokens of small shares pooled).
+    #[test]
+    fn the_tokens_drawn_by_passes_follow_their_distributions() {
+        let vocabulary = 5000;
+        let mut source = Rng::new(77);
+        // A few tokens with most of the mass, the rest spread thin; the drafter's row the target's moved about.
+        let target: Vec<f32> = (0..vocabulary).map(|i| if i % 997 == 3 { 4.0 + (i % 5) as f32 * 0.3 } else { ((source.random() - 0.5) * 6.0) as f32 }).collect();
+        let proposed: Vec<f32> = target.iter().enumerate().map(|(i, &logit)| if i % 997 == 3 { logit - 0.6 * ((i / 997) % 3) as f32 } else { logit + ((source.random() - 0.5) * 3.0) as f32 }).collect();
+        let sampling = Sampling { temperature: 0.9, ..Sampling::GREEDY };
+        let (p, q) = (distribution(&target, &sampling, &Generated::new(vocabulary)), distribution(&proposed, &sampling, &Generated::new(vocabulary)));
+        let partition = Partition::of(&target, 0.9).unwrap();
+        // The draft: a token the drafter likes more than the target does, so that it is the one rejected.
+        let drawn = (0..vocabulary as u32).filter(|&t| q.probability(t) > p.probability(t)).max_by(|&a, &b| q.probability(a).total_cmp(&q.probability(b))).unwrap();
+        let trials = 400_000usize;
+        let chi_square = |counts: &[usize], shares: &[f64]| -> f64 {
+            // (tokens of an expected count under 20 pooled into one bin)
+            let (mut statistic, mut pooled, mut pooled_count) = (0.0, 0.0, 0usize);
+            let mut bins = 0;
+            for (&count, &share) in counts.iter().zip(shares) {
+                if share * trials as f64 >= 20.0 {
+                    statistic += (count as f64 - trials as f64 * share).powi(2) / (trials as f64 * share);
+                    bins += 1;
+                } else {
+                    (pooled, pooled_count) = (pooled + share, pooled_count + count);
+                }
+            }
+            if pooled > 0.0 {
+                statistic += (pooled_count as f64 - trials as f64 * pooled).powi(2) / (trials as f64 * pooled);
+                bins += 1;
+            }
+            // (the 0.001 point of a chi-square with `bins - 1` degrees of freedom, by the Wilson-Hilferty approximation)
+            let degrees = (bins - 1) as f64;
+            let limit = degrees * (1.0 - 2.0 / (9.0 * degrees) + 3.09 * (2.0 / (9.0 * degrees)).sqrt()).powi(3);
+            assert!(statistic < limit, "chi-square {statistic} over {bins} bins, limit {limit}");
+            statistic
+        };
+        // after the last kept draft
+        let shares: Vec<f64> = (0..vocabulary as u32).map(|t| p.probability(t)).collect();
+        let mut rng = Rng::new(5);
+        let mut counts = vec![0usize; vocabulary];
+        for _ in 0..trials {
+            counts[partition.draw(&target, &mut rng) as usize] += 1;
+        }
+        chi_square(&counts, &shares);
+        // in place of a rejected draft
+        let left: Vec<f64> = (0..vocabulary as u32).map(|t| if t == drawn { 0.0 } else { (p.probability(t) - q.probability(t)).max(0.0) }).collect();
+        let total: f64 = left.iter().sum();
+        let shares: Vec<f64> = left.iter().map(|share| share / total).collect();
+        let mut counts = vec![0usize; vocabulary];
+        for _ in 0..trials {
+            let token = draw_residual(&partition, &target, &proposed, drawn, q.probability(drawn), &mut rng).unwrap();
+            assert_ne!(token, drawn);
+            counts[token as usize] += 1;
+        }
+        chi_square(&counts, &shares);
+        assert_eq!(counts.iter().zip(&left).filter(|(&count, &share)| count > 0 && share == 0.0).count(), 0, "a token that is no candidate was drawn");
     }
 
     /// Diagnostic microbenchmark, never part of ordinary test execution.

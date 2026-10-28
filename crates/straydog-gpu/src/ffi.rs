@@ -401,6 +401,7 @@ unsafe extern "C" {
         tokens: *mut i32,
         confidences: *mut f32,
         count: *mut u32,
+        probabilities: *mut f32,
         scratch: *mut f32,
         scratch_bytes: u64,
     ) -> ::std::os::raw::c_int;

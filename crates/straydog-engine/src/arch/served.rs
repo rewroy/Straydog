@@ -25,12 +25,39 @@ pub struct Draw {
     pub seed: u64,
 }
 
-/// What an engine proposes after a token: the tokens and, when it drew them ([`Draw`]), the logits rows (one per
-/// token, the vocabulary wide) that its draws were from the softmax of; a token without a row is a point proposal.
+/// What an engine proposes after a token: the tokens and, when it drew them ([`Draw`]), each one's probability under the
+/// softmax it was drawn from ([`Engines::drawn_row`] has the logits of that softmax); a token without a probability is a
+/// point proposal.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Proposal {
     pub tokens: Vec<u32>,
-    pub drawn: Vec<Vec<f32>>,
+    pub probabilities: Vec<f32>,
+}
+
+/// An engine's drawn drafts as [`sampling::accept_drawn`] asks about them: their probabilities came with the proposal, and the
+/// logits row of a rejected one is read from the engine then, for that one alone.
+struct Drawn<'a, E: Engines> {
+    engines: &'a mut E,
+    probabilities: &'a [f32],
+    /// Where a row is read to (kept by the reply, so that it is allocated once).
+    row: &'a mut Vec<f32>,
+    failure: Option<String>,
+}
+
+impl<E: Engines> sampling::Proposals for Drawn<'_, E> {
+    fn probability(&mut self, slot: usize, _token: u32) -> Option<f64> {
+        self.probabilities.get(slot).map(|&probability| f64::from(probability))
+    }
+
+    fn row(&mut self, slot: usize) -> &[f32] {
+        match self.engines.drawn_row(slot, self.row) {
+            Ok(()) => self.row,
+            Err(error) => {
+                self.failure = Some(error);
+                &[]
+            }
+        }
+    }
 }
 
 /// An architecture's placed engines, as a session drives them.
@@ -146,6 +173,11 @@ pub trait Engines {
     /// distributions' probability, more than a token it did not draw.
     fn draft(&mut self, _anchor: u32, _max: usize, _draw: Option<Draw>) -> Result<Option<Proposal>, String> {
         Ok(None)
+    }
+    /// Read into `into` the logits row (the vocabulary wide) that the draft in `slot` of the last [`Engines::draft`] was drawn from
+    /// the softmax of ([`Proposal::probabilities`]); asked for only when the target rejects that draft, before the next draft.
+    fn drawn_row(&mut self, _slot: usize, _into: &mut Vec<f32>) -> Result<(), String> {
+        Err("this engine's drafts are not drawn".into())
     }
     /// One pass over `tokens` (at most [`Engines::verify_rows`]) continuing the held sequence: the
     /// logits after each, `tokens.len()` rows of the vocabulary. Each row is what feeding the
@@ -379,6 +411,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
                       sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
                       mut constraint: Option<&mut Constraint>) -> Result<Decoded, String> {
     let mut rng = Rng::new(seed);
+    let mut row = Vec::new();
     // (the seeds of a drafter's draws come from a generator of their own, so that the choices of this one are those of a
     // drafter that draws nothing)
     let mut draws = Rng::new(seed ^ 0x6472_6177_5eed_d5a2);
@@ -401,7 +434,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         if done.emitted == max_new {
             break;
         }
-        let mut drawn = Vec::new();
+        let mut probabilities = Vec::new();
         let (drafts, engine_draft) = if rows > 1 {
             ngrams.push(next);
             // A long match is verified as it is: those drafts are accepted nearly always (an edit
@@ -417,11 +450,11 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
                     Some(mut proposal) => {
                         let most = (rows - 1).min(max_new - done.emitted);
                         proposal.tokens.truncate(most);
-                        proposal.drawn.truncate(most);
+                        proposal.probabilities.truncate(most);
                         if proposal.tokens.iter().any(|&token| token as usize >= vocabulary) {
                             return Err("Straydog engine drafted a token out of range".into());
                         }
-                        drawn = proposal.drawn;
+                        probabilities = proposal.probabilities;
                         (proposal.tokens, true)
                     }
                     None => {
@@ -447,7 +480,11 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         }
         (done.passes, done.fed, done.drafted) = (done.passes + 1, done.fed + fed.len(), done.drafted + drafts.len());
         if engine_draft { done.engine_drafted += drafts.len(); }
-        let (accepted, token) = sampling::accept_drawn(&drafts, &drawn, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
+        let mut drawn = Drawn { engines: &mut *engines, probabilities: &probabilities, row: &mut row, failure: None };
+        let (accepted, token) = sampling::accept_drawn(&drafts, &mut drawn, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
+        if let Some(error) = drawn.failure {
+            return Err(error);
+        }
         if !engine_draft { policy.record(drafts.len(), accepted); }
         // The accepted drafts go out in order: an end token among them ends the reply unsent, the
         // last token allowed ends it sent; either is left out of the state, as without drafts.
@@ -939,7 +976,7 @@ mod tests {
         fn draft(&mut self, anchor: u32, max: usize, draw: Option<Draw>) -> Result<Option<Proposal>, String> {
             self.draft_calls.push((anchor, max));
             self.draws.push(draw);
-            self.proposals.pop_front().unwrap_or(Ok(None)).map(|tokens| tokens.map(|tokens| Proposal { tokens, drawn: Vec::new() }))
+            self.proposals.pop_front().unwrap_or(Ok(None)).map(|tokens| tokens.map(|tokens| Proposal { tokens, probabilities: Vec::new() }))
         }
         fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
             assert!(tokens.len() <= self.rows);

@@ -86,7 +86,7 @@ impl Device {
               -> Result<(), String> {
         gpu.dspark_head(self.body.base(), None, self.hidden.base(), &self.w1, &self.w2, &self.conf,
             slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, anchor.map(|at| at.base().cast_const()), None, threshold, minimum,
-            self.logits.base(), self.tokens.base(), self.confidences.base(), self.count.base(), &self.scratch)
+            self.logits.base(), self.tokens.base(), self.confidences.base(), self.count.base(), None, &self.scratch)
     }
     fn check(&self, gpu: &mut Backend, case: &Case, expected: &Expected, slots: usize, count: u32) {
         assert_eq!(read::<u32>(gpu, &self.count, 1), [count]);
@@ -212,13 +212,13 @@ fn a_body_in_two_parts_is_the_body_whole() {
     for slots in 1..=5u64 {
         gpu.dspark_head(front.base(), Some((tail.base().cast_const(), split as u64)), device.hidden.base(), &device.w1, &device.w2,
                         &device.conf, slots, v as u64, r as u64, w as u64, case.anchor, None, None, 0.0, 0, device.logits.base(),
-                        device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).unwrap();
+                        device.tokens.base(), device.confidences.base(), device.count.base(), None, &device.scratch).unwrap();
         device.check(&mut gpu, &case, &expected, slots as usize, slots as u32);
     }
     for first in [0, v as u64] {
         assert!(gpu.dspark_head(front.base(), Some((tail.base().cast_const(), first)), device.hidden.base(), &device.w1, &device.w2,
                                 &device.conf, 1, v as u64, r as u64, w as u64, case.anchor, None, None, 0.0, 0, device.logits.base(),
-                                device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).is_err());
+                                device.tokens.base(), device.confidences.base(), device.count.base(), None, &device.scratch).is_err());
     }
 }
 
@@ -248,11 +248,12 @@ fn drawn_tokens_follow_the_softmax_of_the_corrected_logits() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let device = case.device(&mut gpu);
     let sample = gpu.buffer(16).unwrap();
+    let probabilities = gpu.buffer(5 * 4).unwrap();
     let run = |gpu: &mut Backend, inverse: f32, seed: u64| -> Vec<i32> {
         gpu.write_buffer(&sample, 0, &[inverse.to_bits(), seed as u32, (seed >> 32) as u32, 0]).unwrap();
         gpu.dspark_head(device.body.base(), None, device.hidden.base(), &device.w1, &device.w2, &device.conf, slots, v as u64, r as u64, w as u64,
                         case.anchor, None, Some(sample.base().cast_const()), 0.0, 0, device.logits.base(), device.tokens.base(),
-                        device.confidences.base(), device.count.base(), &device.scratch).unwrap();
+                        device.confidences.base(), device.count.base(), Some(probabilities.base()), &device.scratch).unwrap();
         read::<i32>(gpu, &device.tokens, slots as usize)
     };
     // inverse temperature 0: the argmax chain
@@ -281,6 +282,24 @@ fn drawn_tokens_follow_the_softmax_of_the_corrected_logits() {
             assert!(chi < 31.3, "slot 1 after {t0} at {inverse}: chi-square {chi}, counts {:?}, expected {p1:?}", after[t0]);
         }
     }
+    // each draw's probability, from the device, is its probability under the softmax of the corrected logits it was drawn from
+    for inverse in [1.0f32, 1.5, 0.4] {
+        for seed in 0..40u64 {
+            let tokens = run(&mut gpu, inverse, 500 + seed);
+            let device_probabilities = read::<f32>(&mut gpu, &probabilities, slots as usize);
+            let logits = read::<f32>(&mut gpu, &device.logits, slots as usize * v);
+            for slot in 0..slots as usize {
+                let row: Vec<f64> = logits[slot * v..(slot + 1) * v].iter().map(|&logit| f64::from(logit)).collect();
+                let want = softmax(&row, f64::from(inverse))[tokens[slot] as usize];
+                let got = f64::from(device_probabilities[slot]);
+                assert!((got - want).abs() <= 1e-5 * want, "slot {slot} at {inverse}, seed {seed}: probability {got} against {want}");
+            }
+        }
+    }
+    // (a probability asked for without a draw is refused)
+    assert!(gpu.dspark_head(device.body.base(), None, device.hidden.base(), &device.w1, &device.w2, &device.conf, slots, v as u64, r as u64,
+                            w as u64, case.anchor, None, None, 0.0, 0, device.logits.base(), device.tokens.base(), device.confidences.base(),
+                            device.count.base(), Some(probabilities.base()), &device.scratch).is_err());
     // the corrected logits the draws were from are those of the drawn chain
     let tokens = run(&mut gpu, 1.0, 31);
     let logits = read::<f32>(&mut gpu, &device.logits, slots as usize * v);

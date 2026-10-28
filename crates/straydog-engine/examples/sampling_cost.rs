@@ -10,6 +10,23 @@ use straydog_engine::{
 const VOCAB: usize = 129_280;
 const SEED: u64 = 0x104f_a773_e4f2_076b;
 
+/// Drafts drawn from a drafter's softmax as a device hands them to the accept rule: their probabilities, and the drafter's rows
+/// (read only for a draft that is rejected).
+struct Drawn<'a> {
+    probabilities: Vec<f32>,
+    rows: &'a [Vec<f32>],
+}
+
+impl sampling::Proposals for Drawn<'_> {
+    fn probability(&mut self, slot: usize, _token: u32) -> Option<f64> {
+        self.probabilities.get(slot).map(|&probability| f64::from(probability))
+    }
+
+    fn row(&mut self, slot: usize) -> &[f32] {
+        &self.rows[slot]
+    }
+}
+
 fn measure<T>(samples: usize, mut f: impl FnMut() -> T) -> (f64, f64, usize) {
     for _ in 0..8 {
         black_box(f());
@@ -221,6 +238,35 @@ fn main() {
                     &mut rng,
                 )
             });
+            if config.plain() {
+                // Speculative sampling (DSpark's drafts, drawn from its own softmax): three drafts of a drafter that is the target (all
+                // kept, its rows never read), then a first draft that the target all but rules out (rejected, its replacement drawn).
+                let seen = Generated::new(VOCAB);
+                let kept = sampling::distribution(&logits, config, &seen);
+                let drawn_drafts = [1u32, 2, 3];
+                let rows = vec![logits.clone(); 3];
+                let target = [logits.clone(), logits.clone(), logits.clone(), logits.clone()].concat();
+                let probabilities: Vec<f32> = drawn_drafts.iter().map(|&draft| kept.probability(draft) as f32).collect();
+                let mut proposals = Drawn { probabilities: probabilities.clone(), rows: &rows };
+                let accepted = sampling::accept_drawn(&drawn_drafts, &mut proposals, &target, VOCAB, config, &mut Generated::new(VOCAB), &mut Rng::new(SEED));
+                assert_eq!(accepted.0, 3, "drawn accept path setup");
+                let mut drawn_seen = Generated::new(VOCAB);
+                print(shape, name, "accept_drawn_three_plus_next", samples, 4, || {
+                    let mut proposals = Drawn { probabilities: probabilities.clone(), rows: &rows };
+                    sampling::accept_drawn(black_box(&drawn_drafts), &mut proposals, black_box(&target), VOCAB, black_box(config), &mut drawn_seen, &mut rng)
+                });
+                let mut rejecting = target.clone();
+                rejecting[0] = -1000.0;
+                let first = [0u32];
+                let probabilities = vec![kept.probability(0) as f32];
+                let mut proposals = Drawn { probabilities: probabilities.clone(), rows: &rows };
+                let rejected = sampling::accept_drawn(&first, &mut proposals, &rejecting, VOCAB, config, &mut Generated::new(VOCAB), &mut Rng::new(SEED));
+                assert_eq!(rejected.0, 0, "drawn reject path setup");
+                print(shape, name, "accept_drawn_reject_first", samples, 1, || {
+                    let mut proposals = Drawn { probabilities: probabilities.clone(), rows: &rows };
+                    sampling::accept_drawn(black_box(&first), &mut proposals, black_box(&rejecting), VOCAB, black_box(config), &mut drawn_seen, &mut rng)
+                });
+            }
         }
     }
     let source: Vec<f32> = (0..VOCAB).map(|i| i as f32).collect();

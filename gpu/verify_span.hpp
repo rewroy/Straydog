@@ -222,6 +222,40 @@ void row_sample(Device& d, const float* values, size_t rows, size_t count, size_
     row_argmax_finish<<<unsigned(rows),256,0,d.stream>>>(scratch, indices, result);
 }
 
+// The probability of a drawn token under the softmax it was drawn from: the reciprocal of the sum over the row of
+// exp((value - the token's value) * inverse temperature). `sample_at` holds the inverse temperature's float bits in word 0
+// (the draw's: see row_sample_chunks). A sum that overflows (a token drawn at a probability below e^-88: none is) or a token
+// outside the row gives 0.
+__global__ void row_draw_sum_chunks(const float* values, size_t count, const int32_t* chosen, const uint32_t* sample_at, float* sums) {
+    const float inverse_temperature = __uint_as_float(sample_at[0]);
+    const int32_t token = chosen[0];
+    const float best = token >= 0 && size_t(token) < count ? values[token] : 0.0f;
+    const size_t per = (count + argmax_chunks - 1) / argmax_chunks, first = blockIdx.x * per, last = std::min(count, first + per);
+    float sum = 0.0f;
+    for (size_t i = first + threadIdx.x; i < last; i += blockDim.x) sum += expf((values[i] - best) * inverse_temperature);
+    __shared__ float shared[256];
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned offset = 128; offset; offset /= 2) {
+        if (threadIdx.x < offset) shared[threadIdx.x] += shared[threadIdx.x + offset];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) sums[blockIdx.x] = shared[0];
+}
+__global__ void row_draw_probability_finish(const float* sums, size_t count, const int32_t* chosen, float* result) {
+    if (threadIdx.x) return;
+    float sum = 0.0f;
+    for (unsigned i = 0; i < argmax_chunks; ++i) sum += sums[i];
+    const int32_t token = chosen[0];
+    result[0] = token >= 0 && size_t(token) < count && isfinite(sum) && sum > 0.0f ? 1.0f / sum : 0.0f;
+}
+// result[0] = the probability of `chosen[0]`, a token drawn from a row by row_sample, under that row's softmax (see above);
+// `scratch` holds argmax_chunks floats.
+void row_draw_probability(Device& d, const float* values, size_t count, const int32_t* chosen, const uint32_t* sample_at, float* scratch, float* result) {
+    row_draw_sum_chunks<<<argmax_chunks,256,0,d.stream>>>(values, count, chosen, sample_at, scratch);
+    row_draw_probability_finish<<<1,32,0,d.stream>>>(scratch, count, chosen, result);
+}
+
 // Per row, the chosen logit and the sum of exp(logit - chosen) over the row, as two floats
 // at result[2 * row]: a softmax's top probability, also across the halves of a split head.
 __global__ void row_exp_sum_chunks(const float* values, size_t count, size_t stride, const int32_t* chosen, float* sums) {

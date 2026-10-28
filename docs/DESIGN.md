@@ -272,6 +272,19 @@ target, and each row's logits equal what token-by-token decode would compute, bi
   own distribution q (DSpark, §7.4) is kept with probability min(1, p/q) and a rejected one is
   replaced by a draw from norm(max(0, p - q)): speculative sampling. Either way the output
   distribution is the target's.
+  - A drawn draft costs the host one pass over the target's row, not a distribution of each
+    (~0.15 ms a round at 129K logits, where building the target's and the drafter's cost ~1 ms):
+    - it is kept or not by the row's sum of exp((logit - peak) / temperature), the draft's logit
+      in it, and the draft's probability under the drafter's softmax (which the drafter gives:
+      §7.4);
+    - a rejected draft's replacement, and the token after the last kept draft, are drawn from the
+      rows by their block sums and the weights of the one block the draw falls in, with no
+      distribution built;
+    - the sums are in single precision (about 30 us over a row) and the probabilities right to a
+      part in a million, as finely as the drafter's own draws are known. The distributions the
+      other paths build (point proposals, cuts, penalties) are in double precision, by an exp
+      that matches libm's to a rounding and vectorizes (256- or 512-bit registers where the CPU
+      has them).
 - **Greedy decoding:** the text with drafts is the text without.
 
 Three drafters:
@@ -476,8 +489,11 @@ file beside the bundle.
   temperature, not their argmax:
   - the device draws (the Gumbel-max trick, noise from a seed each round has, the slot and the
     column), and each slot's Markov features follow the token drawn before it;
-  - the engine keeps the logits of the verified slots' draws with the draft, and the accept rule
-    ([`sampling::accept_drawn`], §6.2) keeps a draft with probability min(1, p/q);
+  - the device also gives each draw's probability under the softmax it was drawn from (a sum of
+    exp over the corrected logits: one more small kernel a slot in the head's graph), and the
+    accept rule ([`sampling::accept_drawn`], §6.2) keeps a draft with probability min(1, p/q);
+    the corrected logits of a draft the target rejects stay on the device until the rule asks for
+    that one row;
   - a draft is then kept with the overlap of the two distributions, 1 - TV(p, q), where an
     argmax is kept with p(argmax) alone;
   - with a cut or a penalty the draft stays the argmax, a point proposal.
