@@ -808,6 +808,10 @@ pub struct DeviceExperts {
     streaming: bool,
     heads_first: bool,
     tails: Vec<Tail>,
+    /// The experts a begun request still fills, and the read chunk it fills them with
+    /// ([`request_begin`](Self::request_begin)).
+    unfilled: VecDeque<Key>,
+    unfilled_chunk: u64,
     layout: Arc<Layout>,
     reader: Arc<Reader>,
     classes: Vec<Class>,
@@ -945,6 +949,8 @@ impl DeviceExperts {
             streaming: false,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
             tails: Vec::new(),
+            unfilled: VecDeque::new(),
+            unfilled_chunk: CHUNK,
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
@@ -1160,10 +1166,28 @@ impl DeviceExperts {
     }
 
     fn request_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], chunk: u64) -> Result<()> {
+        let mut filled = self.begin_with(gpu, layer, experts, chunk);
+        while filled.is_ok() && !self.unfilled.is_empty() {
+            filled = self.request_step(gpu).map(drop);
+        }
+        let ended = self.request_end(gpu);
+        filled.and(ended)
+    }
+
+    /// The first part of [`request`](Self::request), for a caller that starts several devices'
+    /// requests together ([`request_step`](Self::request_step) fills one expert, and
+    /// [`request_end`](Self::request_end) must follow, whatever the steps returned): the hits are
+    /// held, the misses are listed to fill.
+    pub fn request_begin(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize]) -> Result<()> {
+        self.begin_with(gpu, layer, experts, CHUNK)
+    }
+
+    fn begin_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], chunk: u64) -> Result<()> {
         self.settled = false;
         let started = std::time::Instant::now();
-        let result = (|| {
-            self.pump(gpu, false)?;
+        self.unfilled.clear();
+        self.unfilled_chunk = chunk;
+        let result = self.pump(gpu, false).map(|()| {
             // Hits first, as in acquire; all kept from eviction until the acquire's release.
             for &expert in experts {
                 let key = (layer as u32, expert as u32);
@@ -1171,26 +1195,45 @@ impl DeviceExperts {
                     self.counts.hits += 1;
                     self.hold(slot);
                     self.requested.push(key);
+                } else {
+                    self.unfilled.push_back(key);
                 }
             }
             // The misses' gates and ups go up first, then their downs: a pass waits for every
             // miss's gate and up before its downs, and one expert's down would hold the next's back.
             self.deferring = true;
-            let filled = (|| {
-                for &expert in experts {
-                    let key = (layer as u32, expert as u32);
-                    if !self.map.contains_key(&key) {
-                        let slot = self.fill(gpu, key, true, chunk)?;
-                        self.hold(slot);
-                        self.requested.push(key);
-                    }
-                }
-                Ok(())
-            })();
-            self.deferring = false;
-            let tails = self.upload_tails(gpu);
-            filled.and(tails)
+        });
+        self.counts.store_seconds += started.elapsed().as_secs_f64();
+        result
+    }
+
+    /// Start the fill of the next missing expert of a begun request; whether more remain. A step
+    /// that fails drops the rest.
+    pub fn request_step(&mut self, gpu: &mut Backend) -> Result<bool> {
+        let started = std::time::Instant::now();
+        let result = (|| {
+            let Some(key) = self.unfilled.pop_front() else { return Ok(()) };
+            // (a repeated expert finds the slot its first occurrence filled)
+            if !self.map.contains_key(&key) {
+                let slot = self.fill(gpu, key, true, self.unfilled_chunk)?;
+                self.hold(slot);
+                self.requested.push(key);
+            }
+            Ok(())
         })();
+        if result.is_err() {
+            self.unfilled.clear();
+        }
+        self.counts.store_seconds += started.elapsed().as_secs_f64();
+        result.map(|()| !self.unfilled.is_empty())
+    }
+
+    /// The last part of a request: every gate and up are queued, so the downs follow.
+    pub fn request_end(&mut self, gpu: &mut Backend) -> Result<()> {
+        let started = std::time::Instant::now();
+        self.unfilled.clear();
+        self.deferring = false;
+        let result = self.upload_tails(gpu);
         self.counts.store_seconds += started.elapsed().as_secs_f64();
         result
     }
@@ -1561,7 +1604,7 @@ impl DeviceExperts {
             Some(host) if !matches!(self.host[host].content, Content::Reading(_)) => {
                 self.counts.host_hits += 1;
                 let uploaded = if self.heads_first && self.deferring {
-                    self.upload_head(gpu, slot, host, stream).map(|tail| self.tails.push(tail))
+                    self.upload_head(gpu, slot, host, stream, false).map(|tail| self.tails.push(tail))
                 } else {
                     self.upload(gpu, slot, host, stream)
                 };
@@ -1592,12 +1635,18 @@ impl DeviceExperts {
 
     /// Upload host slot `host` into VRAM slot `slot` on `stream`; the host tier gives the expert up.
     fn upload(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<()> {
-        let tail = self.upload_head(gpu, slot, host, stream)?;
-        self.upload_tail(gpu, tail)
+        let tail = self.upload_head(gpu, slot, host, stream, true)?;
+        self.copy_tail(gpu, &tail)?;
+        let mark = gpu.mark(stream)?;
+        self.uploaded(slot, host, stream, mark);
+        Ok(())
     }
 
-    /// The first part of [`upload`](Self::upload): the gate and up, then the slot's `ready_first`.
-    fn upload_head(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream) -> Result<Tail> {
+    /// The first part of [`upload`](Self::upload): the gate and up, then the slot's `ready_first`
+    /// (with `mark`; else [`upload_tails`](Self::upload_tails) sets it, one mark behind every
+    /// gate and up it queues: an event between two copies of a stream left its DMA engine idle
+    /// ~15 us, more than a copy's own setup).
+    fn upload_head(&mut self, gpu: &mut Backend, slot: usize, host: usize, stream: Stream, mark: bool) -> Result<Tail> {
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
         if self.slots[slot].taken_back {
             return Err("an upload into a lent expert slot its lender has back".into());
@@ -1631,17 +1680,16 @@ impl DeviceExperts {
             }
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
-        self.slots[slot].ready_first = Some((stream, gpu.mark(stream)?));
+        self.slots[slot].ready_first = if mark { Some((stream, gpu.mark(stream)?)) } else { None };
         // Out of the host tier's LRU until the tail: no read or write-back takes the slot meanwhile.
         let entry = &self.host[host];
         self.classes[entry.class].host_lru.remove(&(entry.used, host));
         Ok(Tail { slot, host, stream, at })
     }
 
-    /// The rest of [`upload`](Self::upload): the down, then the slot's `ready`; the host tier
-    /// gives the expert up.
-    fn upload_tail(&mut self, gpu: &mut Backend, tail: Tail) -> Result<()> {
-        let Tail { slot, host, stream, mut at } = tail;
+    /// The rest of [`upload`](Self::upload), queued: the down.
+    fn copy_tail(&mut self, gpu: &mut Backend, tail: &Tail) -> Result<()> {
+        let &Tail { slot, host, stream, mut at } = tail;
         let (layer, expert) = self.slots[slot].key.ok_or("an upload into an empty slot")?;
         let base = self.host_pointer(host);
         let target = self.slot_buffer(slot);
@@ -1650,7 +1698,7 @@ impl DeviceExperts {
                 for span in self.layout.read_plan(layer as usize, expert as usize)?.into_iter().skip(2) {
                     // SAFETY: as in upload_head.
                     let bytes = unsafe { span.keep_columns(base) };
-                    // SAFETY: the host slot holds this expert until the mark below completes (busy).
+                    // SAFETY: the host slot holds this expert until the mark after the copies completes (busy).
                     unsafe { gpu.transfer(stream, &target, at, base.add(span.data as usize), bytes)? };
                     at += bytes;
                 }
@@ -1664,20 +1712,59 @@ impl DeviceExperts {
             }
             Content::Reading(_) => return Err("an upload of an expert still being read".into()),
         }
-        let mark = gpu.mark(stream)?;
-        self.uploaded(slot, host, stream, mark);
         Ok(())
     }
 
-    /// Upload the downs [`request`](Self::request) left for after every gate and up; each one
-    /// that fails empties its slot, and the first failure returns once all are queued.
+    /// Upload the downs [`request`](Self::request) left for after every gate and up: first one
+    /// mark behind all the gates and ups (each slot's `ready_first`), then the downs, then one
+    /// mark behind them all (each slot's `ready`, and the host tier gives its expert up). A pass
+    /// waits only for the newest mark of a stream among the slots it takes, so a mark for each
+    /// expert was never needed, and each cost its stream ~15 us of idle DMA. Each down that fails
+    /// empties its slot, and the first failure returns once all are queued.
     fn upload_tails(&mut self, gpu: &mut Backend) -> Result<()> {
         let mut first_error = None;
-        for tail in std::mem::take(&mut self.tails) {
-            let (slot, host) = (tail.slot, tail.host);
-            if let Err(error) = self.upload_tail(gpu, tail) {
-                self.discard(host, Some(slot));
-                first_error.get_or_insert(error);
+        let tails = std::mem::take(&mut self.tails);
+        for stream in [Stream::Upload, Stream::LaterUpload] {
+            if !tails.iter().any(|tail| tail.stream == stream) {
+                continue;
+            }
+            match gpu.mark(stream) {
+                Ok(mark) => {
+                    for tail in tails.iter().filter(|tail| tail.stream == stream) {
+                        self.slots[tail.slot].ready_first = Some((stream, mark));
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let mut queued = Vec::with_capacity(tails.len());
+        for tail in tails {
+            match self.copy_tail(gpu, &tail) {
+                Ok(()) => queued.push(tail),
+                Err(error) => {
+                    self.discard(tail.host, Some(tail.slot));
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        for stream in [Stream::Upload, Stream::LaterUpload] {
+            if !queued.iter().any(|tail| tail.stream == stream) {
+                continue;
+            }
+            match gpu.mark(stream) {
+                Ok(mark) => {
+                    for tail in queued.iter().filter(|tail| tail.stream == stream) {
+                        self.uploaded(tail.slot, tail.host, stream, mark);
+                    }
+                }
+                Err(error) => {
+                    for tail in queued.iter().filter(|tail| tail.stream == stream) {
+                        self.discard(tail.host, Some(tail.slot));
+                    }
+                    first_error.get_or_insert(error);
+                }
             }
         }
         first_error.map_or(Ok(()), Err)

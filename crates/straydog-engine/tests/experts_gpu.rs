@@ -620,6 +620,40 @@ fn a_request_uploads_the_gates_and_ups_before_the_downs() {
     std::fs::remove_file(&path).unwrap();
 }
 
+/// A request filled an expert at a time (as the engine does across devices) is a request of them
+/// all at once: the gates and ups are whole once [`DeviceExperts::acquire_gate_up`] returns (one
+/// mark behind all of them, not one for each expert), the downs once the rest is awaited.
+#[test]
+fn a_request_filled_an_expert_at_a_time_holds_every_byte() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    let head = roles[..2].iter().map(|role| role.bytes).sum::<u64>() as usize;
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    let mut random = Random(0x7a11_c0de);
+    for step in 0..60 {
+        let mut experts: Vec<usize> = (0..2 + random.below(5)).map(|_| random.below(EXPERTS)).collect();
+        experts.sort_unstable();
+        experts.dedup();
+        store.request_begin(&mut gpu, 0, &experts).unwrap();
+        while store.request_step(&mut gpu).unwrap() {}
+        store.request_end(&mut gpu).unwrap();
+        let slots = store.acquire_gate_up(&mut gpu, 0, &experts).unwrap();
+        for (&expert, slot) in experts.iter().zip(&slots) {
+            let want = expected(&roles, expert);
+            let mut got = vec![0u8; head];
+            gpu.read_buffer(slot, 0, &mut got).unwrap();
+            assert!(got == want[..head], "step {step}: expert {expert}'s gate and up differ from the file");
+        }
+        store.await_rest(&mut gpu).unwrap();
+        check_slots(&mut gpu, &roles, &experts, &slots, &format!("step {step}"));
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    assert!(store.counts().host_hits > 0, "{:?}", store.counts());
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// A pass's fill of experts whose roles take several read chunks uploads each chunk as it lands:
 /// [`DeviceExperts::acquire_gate_up`] gives the slots once their gate and up are in (read back
 /// right then), [`await_rest`] once their downs are too. A chunk that fails fails the pass that
