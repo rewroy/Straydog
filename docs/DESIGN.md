@@ -266,8 +266,12 @@ The engine holds one sequence.
 Drafts are proposals; verification decides. A verify pass computes every drafted row with the
 target, and each row's logits equal what token-by-token decode would compute, bit for bit.
 
-- **With temperature:** a draft is accepted with its probability under the same cut and
-  penalty, so the output distribution is the target's.
+- **With temperature:** a draft that is a point proposal (a lookup's, an argmax, or any under a
+  cut or a penalty) is accepted with its probability under the same cut and penalty, and a
+  rejected one is replaced by a draw from the target without it. A draft a drafter drew from its
+  own distribution q (DSpark, §7.4) is kept with probability min(1, p/q) and a rejected one is
+  replaced by a draw from norm(max(0, p - q)): speculative sampling. Either way the output
+  distribution is the target's.
 - **Greedy decoding:** the text with drafts is the text without.
 
 Three drafters:
@@ -467,6 +471,16 @@ file beside the bundle.
 - Each pass puts its rows' features in the rings, and a rewind keeps only the rows it keeps. A
   reset empties them, and a checkpoint keeps them with the sequence state, so a draft never
   reads another sequence's features.
+- **A sampled reply** (a temperature, nothing cut, no presence penalty: DeepSeek's default)
+  gets drafts the head draws from the softmax of its own corrected logits at the request's
+  temperature, not their argmax:
+  - the device draws (the Gumbel-max trick, noise from a seed each round has, the slot and the
+    column), and each slot's Markov features follow the token drawn before it;
+  - the engine keeps the logits of the verified slots' draws with the draft, and the accept rule
+    ([`sampling::accept_drawn`], §6.2) keeps a draft with probability min(1, p/q);
+  - a draft is then kept with the overlap of the two distributions, 1 - TV(p, q), where an
+    argmax is kept with p(argmax) alone;
+  - with a cut or a penalty the draft stays the argmax, a point proposal.
 
 **Its VRAM.** Each stage keeps its most used routed experts resident: 87, 50 and 29 of 128 (3.1 of
 7.2 GB). They cover 98% of its routes and leave its acceptance as it was. The router's bias keeps

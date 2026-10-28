@@ -17,6 +17,22 @@ use crate::model::Rng;
 use crate::pinned::Pinned;
 use crate::sampling::{self, Generated, Sampling};
 
+/// How a drafter chooses its tokens for a request that samples plainly ([`Sampling::plain`]): it draws each from the
+/// softmax of its own logits times `inverse_temperature` (the request's), the draw seeded by `seed`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Draw {
+    pub inverse_temperature: f32,
+    pub seed: u64,
+}
+
+/// What an engine proposes after a token: the tokens and, when it drew them ([`Draw`]), the logits rows (one per
+/// token, the vocabulary wide) that its draws were from the softmax of; a token without a row is a point proposal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub tokens: Vec<u32>,
+    pub drawn: Vec<Vec<f32>>,
+}
+
 /// An architecture's placed engines, as a session drives them.
 pub trait Engines {
     /// One pass over `tokens` (at most a batch) continuing the held sequence: the logits after
@@ -123,7 +139,12 @@ pub trait Engines {
     /// None uses prompt lookup; Some(empty) declines this round without that fallback.
     /// Candidates are capped at `max` and the request's remaining output. After verification,
     /// [`Engines::rewind`] must also restore any drafter state to the retained prefix.
-    fn draft(&mut self, _anchor: u32, _max: usize) -> Result<Option<Vec<u32>>, String> {
+    ///
+    /// With `draw` (the request samples plainly: [`Sampling::plain`]) a drafter that can may draw its tokens
+    /// from the softmax of its own logits at the request's temperature and give those logits with them
+    /// ([`Proposal::drawn`]): speculative sampling keeps a drawn token with the overlap of the two
+    /// distributions' probability, more than a token it did not draw.
+    fn draft(&mut self, _anchor: u32, _max: usize, _draw: Option<Draw>) -> Result<Option<Proposal>, String> {
         Ok(None)
     }
     /// One pass over `tokens` (at most [`Engines::verify_rows`]) continuing the held sequence: the
@@ -337,6 +358,12 @@ struct Decoded {
     engine_accepted: usize,
 }
 
+/// How a drafter is to choose its tokens for a request with this sampling: drawn from its own distribution when
+/// the request samples plainly, else by its argmax (the draft is then a point proposal for [`sampling::accept`]).
+fn draw_for(sampling: &Sampling, seeds: &mut Rng) -> Option<Draw> {
+    sampling.plain().then(|| Draw { inverse_temperature: (1.0 / sampling.temperature) as f32, seed: (seeds.random() * (1u64 << 53) as f64) as u64 })
+}
+
 /// A prompt-lookup match of this many tokens (the lookup policy's widest) is verified without
 /// asking the engines for a draft ([`Engines::draft`]).
 const LONG_MATCH: usize = 8;
@@ -352,6 +379,9 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
                       sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
                       mut constraint: Option<&mut Constraint>) -> Result<Decoded, String> {
     let mut rng = Rng::new(seed);
+    // (the seeds of a drafter's draws come from a generator of their own, so that the choices of this one are those of a
+    // drafter that draws nothing)
+    let mut draws = Rng::new(seed ^ 0x6472_6177_5eed_d5a2);
     let mut generated = Generated::new(vocabulary);
     let rows = if constraint.is_some() { 1 } else { engines.verify_rows() };
     let mut ngrams = Ngrams::new();
@@ -371,6 +401,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         if done.emitted == max_new {
             break;
         }
+        let mut drawn = Vec::new();
         let (drafts, engine_draft) = if rows > 1 {
             ngrams.push(next);
             // A long match is verified as it is: those drafts are accepted nearly always (an edit
@@ -382,13 +413,16 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             }
             match lookup.filter(|&width| width > 0) {
                 Some(width) => (proposal[..width.min(max_new - done.emitted)].to_vec(), false),
-                None => match engines.draft(next, rows - 1)? {
+                None => match engines.draft(next, rows - 1, draw_for(sampling, &mut draws))? {
                     Some(mut proposal) => {
-                        proposal.truncate((rows - 1).min(max_new - done.emitted));
-                        if proposal.iter().any(|&token| token as usize >= vocabulary) {
+                        let most = (rows - 1).min(max_new - done.emitted);
+                        proposal.tokens.truncate(most);
+                        proposal.drawn.truncate(most);
+                        if proposal.tokens.iter().any(|&token| token as usize >= vocabulary) {
                             return Err("Straydog engine drafted a token out of range".into());
                         }
-                        (proposal, true)
+                        drawn = proposal.drawn;
+                        (proposal.tokens, true)
                     }
                     None => {
                         let width = lookup.unwrap_or_else(|| policy.width(matched)).min(proposal.len()).min(max_new - done.emitted);
@@ -413,7 +447,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         }
         (done.passes, done.fed, done.drafted) = (done.passes + 1, done.fed + fed.len(), done.drafted + drafts.len());
         if engine_draft { done.engine_drafted += drafts.len(); }
-        let (accepted, token) = sampling::accept(&drafts, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
+        let (accepted, token) = sampling::accept_drawn(&drafts, &drawn, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
         if !engine_draft { policy.record(drafts.len(), accepted); }
         // The accepted drafts go out in order: an end token among them ends the reply unsent, the
         // last token allowed ends it sent; either is left out of the state, as without drafts.
@@ -850,6 +884,7 @@ mod tests {
         verified_from: Option<usize>,
         proposals: std::collections::VecDeque<Result<Option<Vec<u32>>, String>>,
         draft_calls: Vec<(u32, usize)>,
+        draws: Vec<Option<Draw>>,
         verified: Vec<Vec<u32>>,
         rewinds: Vec<usize>,
     }
@@ -901,9 +936,10 @@ mod tests {
         fn verify_rows(&self) -> usize {
             self.rows
         }
-        fn draft(&mut self, anchor: u32, max: usize) -> Result<Option<Vec<u32>>, String> {
+        fn draft(&mut self, anchor: u32, max: usize, draw: Option<Draw>) -> Result<Option<Proposal>, String> {
             self.draft_calls.push((anchor, max));
-            self.proposals.pop_front().unwrap_or(Ok(None))
+            self.draws.push(draw);
+            self.proposals.pop_front().unwrap_or(Ok(None)).map(|tokens| tokens.map(|tokens| Proposal { tokens, drawn: Vec::new() }))
         }
         fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
             assert!(tokens.len() <= self.rows);
@@ -961,6 +997,31 @@ mod tests {
             let mut json = JsonMatcher::new(Arc::new(Schema::any_object()));
             assert!(json.feed_all(text.as_bytes()), "seed {seed}: {text}");
             assert!(done.emitted == 120 || json.complete(), "seed {seed}: {text}");
+        }
+    }
+
+    /// Whether the engines are asked to draw their drafts: when the request samples plainly (a temperature, nothing cut,
+    /// no penalty), at its temperature and with a seed of each round's own; never for a greedy reply or a cut one, whose
+    /// drafts are point proposals.
+    #[test]
+    fn engines_are_asked_to_draw_only_for_a_plain_sample() {
+        let draws = |sampling: &Sampling| {
+            let mut toy = Toy { vocabulary: 8, rows: 4, ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            decode(&mut toy, &mut history, logits, 8, &[], 30, sampling, 5, &|| false, &mut |_| {}, None).unwrap();
+            toy.draws
+        };
+        let plain = Sampling { temperature: 0.5, ..Sampling::GREEDY };
+        let asked = draws(&plain);
+        assert!(asked.len() > 5 && asked.iter().all(|draw| draw.is_some_and(|draw| draw.inverse_temperature == 2.0)), "{asked:?}");
+        let seeds: std::collections::HashSet<u64> = asked.iter().map(|draw| draw.unwrap().seed).collect();
+        assert_eq!(seeds.len(), asked.len(), "a seed for each round");
+        assert_eq!(draws(&plain), asked, "the same seed asks the same");
+        for other in [Sampling::GREEDY, Sampling { top_k: 3, ..plain.clone() }, Sampling { top_p: 0.9, ..plain.clone() },
+                      Sampling { min_p: 0.05, ..plain.clone() }, Sampling { presence_penalty: 0.5, ..plain.clone() }] {
+            let asked = draws(&other);
+            assert!(!asked.is_empty() && asked.iter().all(Option::is_none), "{other:?}: {asked:?}");
         }
     }
 

@@ -56,6 +56,12 @@ impl Case {
         }
         out
     }
+    /// Slot `slot`'s corrected logits with `previous` the token before it.
+    fn logits_after(&self, slot: usize, previous: usize) -> Vec<f64> {
+        let body = &self.body[slot * self.v..(slot + 1) * self.v];
+        let m: Vec<f64> = self.w1[previous * self.r..(previous + 1) * self.r].iter().map(|&x| bf16(x)).collect();
+        self.w2.chunks_exact(self.r).zip(body).map(|(row, &l)| l as f64 + row.iter().zip(&m).map(|(&x, &y)| bf16(x) * y).sum::<f64>()).collect()
+    }
     fn device(&self, gpu: &mut Backend) -> Device {
         let features = self.w + self.r;
         Device {
@@ -79,7 +85,7 @@ impl Device {
     fn run_at(&self, gpu: &mut Backend, case: &Case, slots: u64, threshold: f32, minimum: u64, anchor: Option<&Buffer>)
               -> Result<(), String> {
         gpu.dspark_head(self.body.base(), None, self.hidden.base(), &self.w1, &self.w2, &self.conf,
-            slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, anchor.map(|at| at.base().cast_const()), threshold, minimum,
+            slots, case.v as u64, case.r as u64, case.w as u64, case.anchor, anchor.map(|at| at.base().cast_const()), None, threshold, minimum,
             self.logits.base(), self.tokens.base(), self.confidences.base(), self.count.base(), &self.scratch)
     }
     fn check(&self, gpu: &mut Backend, case: &Case, expected: &Expected, slots: usize, count: u32) {
@@ -205,13 +211,83 @@ fn a_body_in_two_parts_is_the_body_whole() {
     let (front, tail) = (upload(&mut gpu, &front), upload(&mut gpu, &tail));
     for slots in 1..=5u64 {
         gpu.dspark_head(front.base(), Some((tail.base().cast_const(), split as u64)), device.hidden.base(), &device.w1, &device.w2,
-                        &device.conf, slots, v as u64, r as u64, w as u64, case.anchor, None, 0.0, 0, device.logits.base(),
+                        &device.conf, slots, v as u64, r as u64, w as u64, case.anchor, None, None, 0.0, 0, device.logits.base(),
                         device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).unwrap();
         device.check(&mut gpu, &case, &expected, slots as usize, slots as u32);
     }
     for first in [0, v as u64] {
         assert!(gpu.dspark_head(front.base(), Some((tail.base().cast_const(), first)), device.hidden.base(), &device.w1, &device.w2,
-                                &device.conf, 1, v as u64, r as u64, w as u64, case.anchor, None, 0.0, 0, device.logits.base(),
+                                &device.conf, 1, v as u64, r as u64, w as u64, case.anchor, None, None, 0.0, 0, device.logits.base(),
                                 device.tokens.base(), device.confidences.base(), device.count.base(), &device.scratch).is_err());
+    }
+}
+
+fn softmax(logits: &[f64], inverse_temperature: f64) -> Vec<f64> {
+    let peak = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = logits.iter().map(|&l| ((l - peak) * inverse_temperature).exp()).collect();
+    let total: f64 = weights.iter().sum();
+    weights.iter().map(|w| w / total).collect()
+}
+
+fn chi_square(counts: &[usize], probabilities: &[f64]) -> f64 {
+    let total: usize = counts.iter().sum();
+    counts.iter().zip(probabilities).filter(|(_, &p)| p * total as f64 > 5.0)
+        .map(|(&c, &p)| (c as f64 - total as f64 * p).powi(2) / (total as f64 * p)).sum()
+}
+
+/// With sample_at the head's tokens are draws: slot 0's from the softmax of its corrected logits at the temperature, each later
+/// slot's from the softmax of its logits after the token drawn before it (the Markov features follow the draw); a seed gives the same
+/// tokens again, another gives others, and an inverse temperature of 0 is the argmax of the greedy head.
+#[test]
+fn drawn_tokens_follow_the_softmax_of_the_corrected_logits() {
+    let (v, r, w, slots) = (12, 8, 32, 3u64);
+    let mut random = Random(0x1234_5678_9abc_def1);
+    let case = Case { v, r, w, anchor: 5, body: random.floats(5 * v, 1.5), hidden: random.floats(5 * w, 0.1), w1: random.bf16(v * r),
+        w2: random.bf16(v * r), conf: random.floats(w + r, 0.05) };
+    let expected = case.oracle();
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let device = case.device(&mut gpu);
+    let sample = gpu.buffer(16).unwrap();
+    let run = |gpu: &mut Backend, inverse: f32, seed: u64| -> Vec<i32> {
+        gpu.write_buffer(&sample, 0, &[inverse.to_bits(), seed as u32, (seed >> 32) as u32, 0]).unwrap();
+        gpu.dspark_head(device.body.base(), None, device.hidden.base(), &device.w1, &device.w2, &device.conf, slots, v as u64, r as u64, w as u64,
+                        case.anchor, None, Some(sample.base().cast_const()), 0.0, 0, device.logits.base(), device.tokens.base(),
+                        device.confidences.base(), device.count.base(), &device.scratch).unwrap();
+        read::<i32>(gpu, &device.tokens, slots as usize)
+    };
+    // inverse temperature 0: the argmax chain
+    assert_eq!(run(&mut gpu, 0.0, 99), expected.tokens[..slots as usize]);
+    // the same seed, the same draws; others differ somewhere
+    let first = run(&mut gpu, 1.0, 7);
+    assert_eq!(run(&mut gpu, 1.0, 7), first);
+    assert!((8..40).any(|seed| run(&mut gpu, 1.0, seed) != first));
+    for (inverse, trials) in [(1.0f32, 12_000usize), (1.5, 12_000)] {
+        let (mut first_counts, mut after) = (vec![0usize; v], vec![vec![0usize; v]; v]);
+        for seed in 0..trials {
+            let tokens = run(&mut gpu, inverse, 1000 + seed as u64);
+            first_counts[tokens[0] as usize] += 1;
+            after[tokens[0] as usize][tokens[1] as usize] += 1;
+        }
+        let p0 = softmax(&case.logits_after(0, case.anchor as usize), f64::from(inverse));
+        // (11 degrees of freedom: 31.3 is the 0.001 point)
+        let chi = chi_square(&first_counts, &p0);
+        assert!(chi < 31.3, "slot 0 at {inverse}: chi-square {chi}, counts {first_counts:?}, expected {p0:?}");
+        // slot 1 after the two commonest first tokens
+        let mut order: Vec<usize> = (0..v).collect();
+        order.sort_by_key(|&t| std::cmp::Reverse(first_counts[t]));
+        for &t0 in &order[..2] {
+            let p1 = softmax(&case.logits_after(1, t0), f64::from(inverse));
+            let chi = chi_square(&after[t0], &p1);
+            assert!(chi < 31.3, "slot 1 after {t0} at {inverse}: chi-square {chi}, counts {:?}, expected {p1:?}", after[t0]);
+        }
+    }
+    // the corrected logits the draws were from are those of the drawn chain
+    let tokens = run(&mut gpu, 1.0, 31);
+    let logits = read::<f32>(&mut gpu, &device.logits, slots as usize * v);
+    for slot in 1..slots as usize {
+        let reference = case.logits_after(slot, tokens[slot - 1] as usize);
+        for (i, (&actual, &want)) in logits[slot * v..(slot + 1) * v].iter().zip(&reference).enumerate() {
+            assert!((actual as f64 - want).abs() <= 2e-5 * (1.0 + want.abs()), "slot {slot} logit {i}: {actual} vs {want}");
+        }
     }
 }

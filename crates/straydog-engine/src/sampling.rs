@@ -79,6 +79,13 @@ impl Sampling {
     fn cuts(&self) -> bool {
         self.top_k > 0 || self.top_p < 1.0 || self.min_p > 0.0
     }
+
+    /// Whether a draw is from the whole softmax of the logits at the temperature: above 0, with no
+    /// cut and no penalty. Only then can a drafter draw from its own logits what the target
+    /// draws from its own (see [`accept_drawn`]).
+    pub fn plain(&self) -> bool {
+        self.temperature > 0.0 && !self.cuts() && self.presence_penalty == 0.0
+    }
 }
 
 /// The tokens an answer holds, for the presence penalty.
@@ -521,6 +528,55 @@ pub fn accept(
     generated: &mut Generated,
     rng: &mut Rng,
 ) -> (usize, u32) {
+    accept_drawn(drafts, &[], logits, vocabulary, sampling, generated, rng)
+}
+
+/// The distribution a rejected draft's replacement is drawn from: norm(max(0, p - q)), over
+/// the candidates of `p` (or, with none cut, every token); None when p has nothing above q (only
+/// rounding can leave that after a rejection).
+fn residual(p: &Distribution, q: &Distribution, vocabulary: usize) -> Option<Distribution> {
+    match p {
+        Distribution::Sparse(candidates) => {
+            let left: Vec<(u32, f64)> = candidates
+                .iter()
+                .filter_map(|&(token, weight)| {
+                    let left = weight - q.probability(token);
+                    (left > 0.0).then_some((token, left))
+                })
+                .collect();
+            (!left.is_empty()).then_some(Distribution::Sparse(left))
+        }
+        _ => {
+            let left: Vec<f64> = match (p, q) {
+                (
+                    Distribution::DenseWeights { weights: of_p, normalizer: total_p, .. },
+                    Distribution::DenseWeights { weights: of_q, normalizer: total_q, .. },
+                ) => of_p.iter().zip(of_q).map(|(p, q)| (p / total_p - q / total_q).max(0.0)).collect(),
+                _ => (0..vocabulary as u32).map(|token| (p.probability(token) - q.probability(token)).max(0.0)).collect(),
+            };
+            (left.iter().any(|&weight| weight > 0.0)).then_some(Distribution::Dense(left))
+        }
+    }
+}
+
+/// [`accept`] for drafts some of which were drawn from a distribution of the drafter's own
+/// (speculative sampling, Leviathan et al. 2023 and Chen et al. 2023): `drawn[i]` is the drafter's
+/// logits row (`vocabulary` wide) that draft `i` was drawn from the softmax of, at the sampling's
+/// temperature, with nothing cut ([`Sampling::plain`]); a draft with no row (a lookup's, a
+/// drafter's argmax) is a point proposal, as in [`accept`]. A drawn draft `x` is kept with
+/// probability min(1, p(x) / q(x)); a rejected one is replaced by a draw from norm(max(0, p - q)),
+/// so that the tokens that come out are drawn from the target's distribution all the same, and
+/// the chance that a draft is kept is the overlap of p and q, 1 - TV(p, q), not p(argmax q).
+#[allow(clippy::too_many_arguments)]
+pub fn accept_drawn(
+    drafts: &[u32],
+    drawn: &[Vec<f32>],
+    logits: &[f32],
+    vocabulary: usize,
+    sampling: &Sampling,
+    generated: &mut Generated,
+    rng: &mut Rng,
+) -> (usize, u32) {
     let row = |index: usize| &logits[index * vocabulary..(index + 1) * vocabulary];
     for (index, draft) in drafts.iter().enumerate() {
         if sampling.temperature == 0.0 {
@@ -530,8 +586,22 @@ pub fn accept(
             }
         } else {
             let distribution = distribution(row(index), sampling, generated);
-            if rng.random() >= distribution.probability(*draft) {
-                return (index, distribution.without(*draft).draw(rng));
+            match drawn.get(index) {
+                None => {
+                    if rng.random() >= distribution.probability(*draft) {
+                        return (index, distribution.without(*draft).draw(rng));
+                    }
+                }
+                Some(proposed) => {
+                    let proposal = self::distribution(proposed, sampling, generated);
+                    let (kept, drawn_from) = (distribution.probability(*draft), proposal.probability(*draft));
+                    // (a token that was drawn has its probability above 0)
+                    if drawn_from > 0.0 && rng.random() >= (kept / drawn_from).min(1.0) {
+                        let instead = residual(&distribution, &proposal, vocabulary)
+                            .unwrap_or_else(|| distribution.without(*draft));
+                        return (index, instead.draw(rng));
+                    }
+                }
             }
         }
         generated.insert(*draft);
@@ -782,6 +852,74 @@ mod tests {
             assert_eq!(accepted, 0);
             assert!([3, 5].contains(&next));
         }
+    }
+
+    /// The token a round commits first and whether its draft was kept, drafting from `drafter` (logits) against `target`.
+    fn first_of_a_round(target: &[f32], drafter: &[f32], sampling: &Sampling, rng: &mut Rng) -> (u32, bool) {
+        let draft = distribution(drafter, sampling, &Generated::new(target.len())).draw(rng);
+        let rows: Vec<f32> = [target, target].concat();
+        let (accepted, next) = accept_drawn(&[draft], &[drafter.to_vec()], &rows, target.len(), sampling, &mut Generated::new(target.len()), rng);
+        if accepted == 1 { (draft, true) } else { (next, false) }
+    }
+
+    /// What a round decides: speculative sampling commits tokens from the target's distribution whatever the
+    /// drafter's (chi-square over many rounds against the target's probabilities), and keeps a draft with
+    /// probability sum(min(p, q)), more than the target gives the drafter's most likely token. Over a small
+    /// vocabulary (all in one vector) and over one of the size the weights are kept apart for (the mass on
+    /// six tokens, the rest far below).
+    #[test]
+    fn drafts_drawn_from_the_drafters_distribution_leave_the_targets_distribution_alone() {
+        let target = [2.0f32, 1.0, 0.5, 3.0, -1.0, 2.5];
+        let drafter = [1.0f32, 2.0, 0.0, 2.5, 0.5, 3.0];
+        for vocabulary in [6, 6000] {
+            let widen = |head: &[f32]| -> Vec<f32> { head.iter().copied().chain(std::iter::repeat_n(-40.0, vocabulary - 6)).collect() };
+            let (target, drafter) = (widen(&target), widen(&drafter));
+            let sampling = Sampling { temperature: 0.8, ..Sampling::GREEDY };
+            assert!(sampling.plain());
+            let generated = Generated::new(vocabulary);
+            let (p, q) = (distribution(&target, &sampling, &generated), distribution(&drafter, &sampling, &generated));
+            let (p, q): (Vec<f64>, Vec<f64>) = ((0..6).map(|t| p.probability(t)).collect(), (0..6).map(|t| q.probability(t)).collect());
+            let overlap: f64 = p.iter().zip(&q).map(|(p, q)| p.min(*q)).sum();
+            let argmax = (0..6).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
+            let (trials, mut rng) = (if vocabulary == 6 { 400_000usize } else { 100_000 }, Rng::new(7));
+            let (mut counts, mut kept) = ([0usize; 6], 0usize);
+            for _ in 0..trials {
+                let (token, was_kept) = first_of_a_round(&target, &drafter, &sampling, &mut rng);
+                counts[token as usize] += 1;
+                kept += usize::from(was_kept);
+            }
+            let chi_square: f64 = (0..6).map(|i| (counts[i] as f64 - trials as f64 * p[i]).powi(2) / (trials as f64 * p[i])).sum();
+            // (5 degrees of freedom: 20.5 is the 0.001 point)
+            assert!(chi_square < 20.5, "vocabulary {vocabulary}: chi-square {chi_square}: counts {counts:?} against {p:?}");
+            let rate = kept as f64 / trials as f64;
+            assert!((rate - overlap).abs() < 2.0 / (trials as f64).sqrt(), "vocabulary {vocabulary}: kept {rate}, overlap {overlap}");
+            assert!(overlap > p[argmax] + 0.05, "overlap {overlap} against p of the drafter's top {}", p[argmax]);
+        }
+    }
+
+    /// A drafter that is the target is always kept; a drafter that is sure of one token gives the point rule.
+    #[test]
+    fn a_drawn_draft_is_kept_by_the_overlap_and_a_certain_one_by_the_targets_probability() {
+        let target = [2.0f32, 1.0, 0.5, 3.0, -1.0, 2.5];
+        let sampling = Sampling { temperature: 1.0, ..Sampling::GREEDY };
+        let mut rng = Rng::new(3);
+        for _ in 0..2000 {
+            assert!(first_of_a_round(&target, &target, &sampling, &mut rng).1);
+        }
+        let mut sure = [-1e4f32; 6];
+        sure[5] = 1e4;
+        let p5 = dense(distribution(&target, &sampling, &Generated::new(6)))[5];
+        let (mut kept, trials) = (0usize, 200_000usize);
+        for _ in 0..trials {
+            let (token, was_kept) = first_of_a_round(&target, &sure, &sampling, &mut rng);
+            kept += usize::from(was_kept);
+            assert!(was_kept && token == 5 || !was_kept && token != 5, "a replacement is never the rejected draft");
+        }
+        assert!((kept as f64 / trials as f64 - p5).abs() < 0.005, "{kept} kept, p {p5}");
+    }
+
+    fn dense(distribution: Distribution) -> Vec<f64> {
+        (0..6).map(|token| distribution.probability(token)).collect()
     }
 
     fn dense_reference(logits: &[f32], config: &Sampling, generated: &Generated) -> Vec<f64> {

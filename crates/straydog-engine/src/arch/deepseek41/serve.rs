@@ -17,7 +17,7 @@ use super::dspark::Dspark;
 use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS, EXPANSIONS,
                     OWN_ROWS, TAP_LAYERS, TAP_ROWS};
 use super::Hparams;
-use crate::arch::served::{self, Placed, Session, Settings};
+use crate::arch::served::{self, Draw, Placed, Proposal, Session, Settings};
 use crate::bundle;
 use crate::experts::Contents;
 use crate::gpu::Backend;
@@ -99,6 +99,8 @@ struct Drafting {
     deciding: bool,
     /// Whether the verify pass to come checks DSpark's draft: the policy learns how much of it was kept.
     drafted: bool,
+    /// Tests only: verify this many of every draft, whatever the policy (which times the passes) would.
+    fixed_width: Option<usize>,
     /// Per checkpoint slot, the rings of the sequence it holds.
     rings: Vec<Option<Rings>>,
     /// The drafter's file, kept mapped.
@@ -267,21 +269,30 @@ impl served::Engines for Engines {
     /// verify pass (by the drafter's confidences and what the passes of this run cost); None when
     /// there is no drafter, it is paused, finds none worth it, or lacks the history (the lookup
     /// of the sequence's own text then drafts).
-    fn draft(&mut self, anchor: u32, max: usize) -> Result<Option<Vec<u32>>, String> {
+    fn draft(&mut self, anchor: u32, max: usize, draw: Option<Draw>) -> Result<Option<Proposal>, String> {
         let Some(drafting) = self.drafting.as_mut().filter(|drafting| drafting.on) else { return Ok(None) };
         drafting.deciding = true;
         let engine = &mut self.engines[drafting.engine];
         let position = engine.position();
         let slots = max.min(MAX_SLOTS - 1);
-        if slots == 0 || !drafting.policy.drafting() || !drafting.drafter.has_history(position) {
+        if slots == 0 || (drafting.fixed_width.is_none() && !drafting.policy.drafting()) || !drafting.drafter.has_history(position) {
             return Ok(None);
         }
         let started = Instant::now();
-        let draft = drafting.drafter.draft(&mut engine.beside()?, self.files, anchor, position, slots)?;
+        let draft = drafting.drafter.draft_drawn(&mut engine.beside()?, self.files, anchor, position, slots, draw)?;
         drafting.policy.drafted(1e3 * started.elapsed().as_secs_f64());
-        let width = drafting.policy.width(&draft.confidences, slots).min(draft.tokens.len());
+        let width = match drafting.fixed_width {
+            Some(width) => width.min(slots),
+            None => drafting.policy.width(&draft.confidences, slots),
+        }
+        .min(draft.tokens.len());
         drafting.drafted = width > 0;
-        Ok((width > 0).then(|| draft.tokens[..width].to_vec()))
+        if width == 0 {
+            return Ok(None);
+        }
+        // (the logits the verified tokens were drawn from, read back for them alone)
+        let drawn = if draw.is_some() { drafting.drafter.drawn_rows(&mut engine.beside()?, width)? } else { Vec::new() };
+        Ok(Some(Proposal { tokens: draft.tokens[..width].to_vec(), drawn }))
     }
 
     fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
@@ -420,6 +431,15 @@ impl Engines {
             drafting.on = on;
         }
         true
+    }
+
+    /// Tests only: verify `width` tokens of every DSpark draft (None: as its policy, which times the passes, picks). A sampled
+    /// reply is then the same one twice for a seed; with the policy's widths it is not, as they follow the passes' timing.
+    #[doc(hidden)]
+    pub fn draft_width(&mut self, width: Option<usize>) {
+        if let Some(drafting) = self.drafting.as_mut() {
+            drafting.fixed_width = width;
+        }
     }
 
     /// Tests only: whether a draft at the position the engines hold would find DSpark's history in its
@@ -716,7 +736,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     })?;
     let drafting = match (dspark_files, dspark_plan, drafter) {
         (Some(files), Some(plan), Some(drafter)) => Some(Drafting {
-            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, rings: (0..CHECKPOINTS).map(|_| None).collect(),
+            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: None, rings: (0..CHECKPOINTS).map(|_| None).collect(),
             _files: files,
         }),
         _ => None,

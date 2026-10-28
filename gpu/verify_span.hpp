@@ -187,6 +187,41 @@ void row_argmax(Device& d, const float* values, size_t rows, size_t count, size_
     row_argmax_finish<<<unsigned(rows),256,0,d.stream>>>(scratch, indices, result);
 }
 
+// A Gumbel(0, 1) variate for (seed, salt, index): a counter-based draw, so that a row's noise needs no state
+// and a seed gives the same tokens however the launch is scheduled. In double: the float tail would cut it at 17.
+__device__ __forceinline__ float gumbel_noise(uint64_t seed, uint64_t salt, uint64_t index) {
+    uint64_t z = seed + 0x9e3779b97f4a7c15ull * (index + 1) + 0xd1b54a32d192ed03ull * (salt + 1);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    const double uniform = (double(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return float(-log(-log(uniform)));
+}
+// row_argmax_chunks over values * inverse_temperature + Gumbel noise: the argmax of that is a draw from softmax(values * inverse_temperature).
+// `sample_at` holds, as uint32, the inverse temperature's float bits (0: no sampling, the plain argmax) and a 64-bit seed (low word first).
+__global__ void row_sample_chunks(const float* values, size_t count, size_t stride, const uint32_t* sample_at, uint32_t salt, float* best_values, uint32_t* best_indices) {
+    const float inverse_temperature = __uint_as_float(sample_at[0]);
+    const uint64_t seed = uint64_t(sample_at[1]) | uint64_t(sample_at[2]) << 32;
+    const float* row = values + size_t(blockIdx.y) * stride;
+    const size_t per = (count + argmax_chunks - 1) / argmax_chunks, first = blockIdx.x * per, last = std::min(count, first + per);
+    float best = -INFINITY; uint32_t index = UINT32_MAX;
+    for (size_t i = first + threadIdx.x; i < last; i += blockDim.x) {
+        const float value = inverse_temperature != 0.0f ? row[i] * inverse_temperature + gumbel_noise(seed, salt, i) : row[i];
+        if (value > best || (value == best && uint32_t(i) < index)) { best = value; index = uint32_t(i); }
+    }
+    __shared__ float shared_values[256]; __shared__ uint32_t shared_indices[256];
+    argmax_reduce(best, index, shared_values, shared_indices);
+    if (threadIdx.x == 0) {
+        best_values[blockIdx.y * argmax_chunks + blockIdx.x] = best; best_indices[blockIdx.y * argmax_chunks + blockIdx.x] = index;
+    }
+}
+// row_argmax, or a draw from the row's softmax when sample_at asks for one (see row_sample_chunks); `salt` tells the rows of one seed apart.
+void row_sample(Device& d, const float* values, size_t rows, size_t count, size_t stride, const uint32_t* sample_at, uint32_t salt, float* scratch, int32_t* result) {
+    auto* indices = reinterpret_cast<uint32_t*>(scratch + rows * argmax_chunks);
+    row_sample_chunks<<<dim3(argmax_chunks, unsigned(rows)),256,0,d.stream>>>(values, count, stride, sample_at, salt, scratch, indices);
+    row_argmax_finish<<<unsigned(rows),256,0,d.stream>>>(scratch, indices, result);
+}
+
 // Per row, the chosen logit and the sum of exp(logit - chosen) over the row, as two floats
 // at result[2 * row]: a softmax's top probability, also across the halves of a split head.
 __global__ void row_exp_sum_chunks(const float* values, size_t count, size_t stride, const int32_t* chosen, float* sums) {
