@@ -73,9 +73,12 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
         size_t offset = 0;
         for (size_t i = 0; i < 5; ++i) { m[i].output_offset = offset; offset += m[i].rows; }
         gemv(d, m, 5, v.mixed, v.qsa, steps, 2564, verify_qsa);
-        for (size_t b = 0; b < steps; ++b)
+        if (steps == 1)
             qsa_decode_attend(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context,
-                              v.positions + b, v.qsa + b * verify_qsa, v.attended + b * 6144);
+                              v.positions, v.qsa, v.attended);
+        else   // (the rows side by side: each row the one token's arithmetic)
+            qsa_decode_attend_rows(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context,
+                                   v.positions, v.qsa, verify_qsa, v.attended, steps);
         gemv(d, &m[5], 1, v.attended, nullptr, steps, 6144, 0, residual);
     }
     hc_operands(pointers + 4 + attention, kinds + 4 + attention, hc);

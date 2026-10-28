@@ -87,7 +87,8 @@ __global__ void qsa_save_history(const float* incoming, size_t base, size_t step
 }
 
 __global__ void qsa_block_scores(const float* queries, const float* blocks, size_t pool,
-                                 size_t base, size_t steps, float* scores, const uint32_t* dynamic_position=nullptr) {
+                                 size_t base, size_t steps, float* scores, const uint32_t* dynamic_position=nullptr,
+                                 size_t query_stride=512) {
     if (dynamic_position) base=*dynamic_position;
     const size_t token=blockIdx.y, block=size_t(blockIdx.x)*256+threadIdx.x;
     const size_t complete=(base+token+1)/4;
@@ -95,7 +96,7 @@ __global__ void qsa_block_scores(const float* queries, const float* blocks, size
     float a=0,b=0,c=0,d=0;
     for (size_t col=0;col<128;++col) {
         const float key=blocks[col*pool+block];
-        const float* query=queries+token*512+col;
+        const float* query=queries+token*query_stride+col;
         a+=key*query[0]; b+=key*query[128]; c+=key*query[256]; d+=key*query[384];
     }
     scores[token*pool+block]=fmaxf(a,0.0f)+fmaxf(b,0.0f)+fmaxf(c,0.0f)+fmaxf(d,0.0f);
