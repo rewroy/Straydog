@@ -156,9 +156,11 @@ The engine is built in layers:
     1914 of 6067 VRAM slots and 373 host slots, against 5291 and 4315 after a long run.)
   - **`counts`.** The state also keeps how many decode and verify passes used each expert
     (`[layer, expert, passes]`). A prefill's streamed layers are not counted: they take nearly every
-    expert whatever the prompt. A run with passes of its own halves the counts it was given and
-    adds its own, so a run's weight halves with each later run that served requests; one that served
-    none keeps them as they were. A state without `counts` (earlier versions) loads as one with none.
+    expert whatever the prompt. A run adds its own passes to the counts it was given, and ages the given
+    ones by what it adds: not at all when it served nothing, hardly for a restart's one reply, by half
+    when it added as many passes as they hold (so a long run's weight is half that of the runs before
+    it and a restart does not erase the history). A state without `counts` (earlier versions) loads
+    as one with none.
 - **Start with the same model and placement:** once ready, the worker reads those experts back
   while no request runs, a few reads at a time, behind any pass's own reads.
   - **Most recently used first, in their old places.** A start cut short has the experts likeliest to
