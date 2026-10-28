@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "bundles": {
+    "Q2_0": {
+      "dense": 3638853120,
+      "experts": 33973862400,
+      "tables": 28800138240,
+      "state_per_token": 54912
+    },
+    "IQ2_XS": {
+      "dense": 3759953920,
+      "experts": 35454976000,
+      "tables": 28800138240,
+      "state_per_token": 54912
+    },
+    "IQ3_XXS": {
+      "dense": 4115863040,
+      "experts": 42912972800,
+      "tables": 28800138240,
+      "state_per_token": 54912
+    },
+    "IQ3_S": {
+      "dense": 4514173440,
+      "experts": 50292326400,
+      "tables": 28800138240,
+      "state_per_token": 54912
+    },
+    "UD-IQ2_XXS": {
+      "dense": 8416207296,
+      "experts": 156881387520,
+      "tables": 135172021600,
+      "state_per_token": 3200
+    },
+    "UD-Q8_K_XL": {
+      "dense": 2704722432,
+      "experts": 35735470080,
+      "tables": 0,
+      "state_per_token": 40960
+    },
+    "GSQ-RCO-IQ2_XS": {
+      "dense": 6160185600,
+      "experts": 149060321280,
+      "tables": 110595290400,
+      "state_per_token": 3200
+    },
+    "GSQ-RCO-IQ2_XXS": {
+      "dense": 6159729088,
+      "experts": 132073390080,
+      "tables": 110595290400,
+      "state_per_token": 3200
+    }
+  }
+}

@@ -12,8 +12,9 @@ mod http;
 mod mtp;
 mod vision;
 
-#[cfg(test)]
-mod mock;
+/// A local HTTP server for the download tests (also for a crate's tests of what it builds on fetching: feature `mock`).
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 
 use std::fs;
 use std::io;
@@ -28,19 +29,45 @@ use straydog_engine::bundle;
 /// connections, files hashed two at a time).
 pub type Progress<'a> = &'a (dyn Fn(&str, u64, u64) + Sync);
 
+/// The optional files of a bundle read on demand that a fetch adds to its shards: DeepSeek-V4.1's
+/// DSpark drafter and its vision encoder (a model without either pinned has nothing to add).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extras {
+    pub dspark: bool,
+    pub vision: bool,
+}
+
+impl Extras {
+    pub const ALL: Extras = Extras { dspark: true, vision: true };
+}
+
+/// Download (resuming) and authenticate `files` (their pins and plain-HTTP URLs) into `root`, as the
+/// pinned bundles are fetched, from a test server: the pinned downloads are HTTPS only.
+#[cfg(any(test, feature = "mock"))]
+pub fn fetch_files_plain(root: &Path, files: &[(bundle::Asset, String)], progress: Progress) -> Result<(), String> {
+    assets::fetch_with(&http::plain(assets::TIMEOUT), root, files, false, true, progress).map_err(|error| error.to_string())
+}
+
 /// Download (resuming) and authenticate every pinned file of `quantization` into `root`;
 /// with `offline`, only authenticate what is there. The shards' verity trees are then built into
 /// `data_dir` (by default `.straydog` in `root`): all of a bundle read on demand's, which they
 /// authenticate, and the others' that are missing.
 pub fn fetch(root: &Path, quantization: &str, offline: bool, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
+    fetch_extras(root, quantization, offline, data_dir, Extras::ALL, progress)
+}
+
+/// [`fetch`], adding of a bundle read on demand's optional files only those `extras` names (those
+/// already there are authenticated all the same).
+pub fn fetch_extras(root: &Path, quantization: &str, offline: bool, data_dir: Option<&Path>, extras: Extras,
+                    progress: Progress) -> Result<(), String> {
     let data_dir = data_dir.map_or_else(|| bundle::default_data_dir(root), Path::to_path_buf);
     if bundle::is_on_demand(quantization) {
         let entries = assets::entries(quantization)?;
         let agent = http::agent(assets::TIMEOUT);
         // The trees authenticate the files present: they are not hashed twice.
         assets::fetch_with(&agent, root, &entries, offline, false, progress).map_err(|error| error.to_string())?;
-        build_vision(root, quantization, offline, progress).map_err(|error| error.to_string())?;
-        fetch_dspark(root, quantization, offline, progress).map_err(|error| error.to_string())?;
+        build_vision(root, quantization, offline || !extras.vision, progress).map_err(|error| error.to_string())?;
+        fetch_dspark(root, quantization, offline || !extras.dspark, progress).map_err(|error| error.to_string())?;
         return print_trees(root, quantization, &data_dir, false, progress);
     }
     fetch_assets(root, quantization, offline, true, progress)?;

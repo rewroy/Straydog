@@ -20,7 +20,7 @@ pub fn agent(timeout: Duration) -> Agent {
 }
 
 /// The same agent for plain-HTTP test servers on this machine, reached without a proxy.
-#[cfg(test)]
+#[cfg(any(test, feature = "mock"))]
 pub fn plain(timeout: Duration) -> Agent {
     build(Agent::config_builder().proxy(None), timeout)
 }

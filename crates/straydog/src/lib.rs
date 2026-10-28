@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod monitor;
 pub mod progress;
 pub mod runtime;
+pub mod setup;
 pub mod worker;
 mod images;
 mod worker_on_demand;

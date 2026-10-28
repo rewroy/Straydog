@@ -14,6 +14,9 @@ pub const CHUNKS: &str = include_str!("asset_chunks.json");
 /// block by block.
 pub const VERITY: &str = include_str!("asset_verity.json");
 pub const MODEL: &str = "Qwen3.8-Flash-Next";
+/// What each bundle's tensors are by how the engine places them ([`Footprint`]), summed from the
+/// pinned shards' headers (examples/asset_footprint.rs).
+pub const FOOTPRINTS: &str = include_str!("asset_footprint.json");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -68,6 +71,31 @@ pub fn bundle(quantization: &str) -> Result<Bundle, String> {
         resources: list(&manifest["resources"])?,
         drafter: asset(drafter)?,
     })
+}
+
+/// What a bundle's tensors come to by how the engine places them: the `dense` weights every token
+/// reads (they live in VRAM), the routed `experts` (VRAM slots over a host tier over the drive),
+/// and the `tables` read by row from the drive (Qwen3.8's PLE table, DeepSeek-V4.1's Engram).
+/// Headers and alignment are the little that is left of the shards' sizes. The sequence state grows
+/// with the context by `state_per_token` bytes a token (K/V and the like, from the model's
+/// hyperparameters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    pub dense: u64,
+    pub experts: u64,
+    pub tables: u64,
+    pub state_per_token: u64,
+}
+
+/// The footprint pinned for `quantization`.
+pub fn footprint(quantization: &str) -> Result<Footprint, String> {
+    let table: Value = serde_json::from_str(FOOTPRINTS).map_err(|exc| exc.to_string())?;
+    let entry = table["bundles"].get(quantization).ok_or_else(|| format!("no footprint pinned for {quantization}"))?;
+    let bytes = |key: &str| entry[key].as_u64().ok_or_else(|| format!("footprint of {quantization} without {key}"));
+    if table["schema"] != 1 {
+        return Err("unsupported Straydog footprint table".into());
+    }
+    Ok(Footprint { dense: bytes("dense")?, experts: bytes("experts")?, tables: bytes("tables")?, state_per_token: bytes("state_per_token")? })
 }
 
 /// The pinned chunk digests of the file whose whole SHA-256 is `sha256`, if any.
@@ -564,6 +592,34 @@ mod tests {
         assert!(engram.iter().all(|source| source.revision == "cb02422c900df489cea5833e8a92171224059b3c"));
         assert_eq!(model_of("IQ2_XS").unwrap(), MODEL);
         assert!(on_demand("IQ3_S").is_err());
+    }
+
+    /// Every bundle's footprint is the tensors of its files: what the three kinds add up to is the
+    /// files' bytes but for their headers and alignment, and the kinds are those the models have.
+    #[test]
+    fn every_bundle_has_a_footprint_that_adds_up_to_its_files() {
+        for quantization in quantizations() {
+            let footprint = footprint(quantization).unwrap();
+            let mut files: u64 = shards(quantization).unwrap().iter().map(|asset| asset.bytes).sum();
+            if is_on_demand(quantization) {
+                files += on_demand(quantization).unwrap().sidecars.iter().map(|sidecar| sidecar.asset.bytes).sum::<u64>();
+            }
+            let tensors = footprint.dense + footprint.experts + footprint.tables;
+            assert!(tensors <= files && files - tensors < files / 500, "{quantization}: {tensors} of {files}");
+            assert!(footprint.dense > 0 && footprint.experts > footprint.dense, "{quantization}");
+        }
+        // the state a token of context takes, which a model's bundles share: Qwen3.8's 13 GiB at 262144 (host
+        // memory), Qwen3.6's F32 K/V of ten attention layers, DeepSeek-V4.1's compressed rows
+        assert_eq!(footprint("Q2_0").unwrap().state_per_token * 262_144 / (1 << 30), 13);
+        assert_eq!(footprint("UD-Q8_K_XL").unwrap().state_per_token, 10 * 2 * 256 * 2 * 4);
+        assert!((3000..3500).contains(&footprint("GSQ-RCO-IQ2_XXS").unwrap().state_per_token));
+        assert_eq!(footprint("GSQ-RCO-IQ2_XXS").unwrap().state_per_token, footprint("UD-IQ2_XXS").unwrap().state_per_token);
+        // the tables read from the drive: Engram (DeepSeek-V4.1's own file), the PLE table (Qwen3.8's), none (Qwen3.6)
+        let engram = on_demand("GSQ-RCO-IQ2_XXS").unwrap().shards[5].bytes;
+        assert!(footprint("GSQ-RCO-IQ2_XXS").unwrap().tables > engram / 100 * 99 && footprint("GSQ-RCO-IQ2_XXS").unwrap().tables <= engram);
+        assert_eq!(footprint("Q2_0").unwrap().tables, footprint("IQ3_S").unwrap().tables);
+        assert_eq!(footprint("UD-Q8_K_XL").unwrap().tables, 0);
+        assert!(footprint("Q8_0").unwrap_err().contains("no footprint"));
     }
 
     /// DSpark's drafter is pinned for the GSQ-RCO bundle alone, as Unsloth's file of a repository at

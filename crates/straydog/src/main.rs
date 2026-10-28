@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use straydog::{config, progress, worker};
+use straydog::{config, progress, setup, worker};
 
 #[cfg(not(any(feature = "hip", feature = "cuda")))]
 compile_error!("the straydog executable links one GPU backend: build it with --features hip or --features cuda");
@@ -40,7 +40,7 @@ enum Command {
         /// The bundle directory
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
-        /// Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB), UD-IQ2_XXS (DeepSeek-V4.1-Flash, 300.5 GB) or UD-Q8_K_XL (Qwen3.6-35B-A3B, 38.5 GB)
+        /// Qwen3.8-Flash-Next: Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB); DeepSeek-V4.1-Flash: GSQ-RCO-IQ2_XXS (248.8 GB), GSQ-RCO-IQ2_XS (265.8 GB), UD-IQ2_XXS (300.5 GB); Qwen3.6-35B-A3B: UD-Q8_K_XL (38.5 GB). `straydog setup` chooses for you
         #[arg(long, value_name = "NAME")]
         quant: String,
         /// Authenticate what is there; download nothing
@@ -60,6 +60,8 @@ enum Command {
         #[arg(long, env = "STRAYDOG_DATA_DIR", value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
+    /// Choose a model and where it goes, download it and write the settings a plain `straydog` reads
+    Setup(Box<setup::SetupArgs>),
     /// Build the pinned MTP drafter from the official tensors
     FetchMtp {
         /// The drafter directory
@@ -85,7 +87,11 @@ fn main() -> ExitCode {
     let matches = <Cli as clap::CommandFactory>::command().get_matches_from(args);
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let result = match cli.command {
-        None => serve::main(&matches, cli.config.as_deref(), cli.print_config),
+        None => {
+            let file = cli.config.clone().or_else(|| config::implicit_config(&cli.options, config::default_config_path()));
+            serve::main(&matches, file.as_deref(), cli.print_config)
+        }
+        Some(Command::Setup(args)) => setup::main(&args),
         Some(Command::Fetch { model, quant, offline, data_dir }) => {
             straydog_provision::fetch(&model, &quant, offline, data_dir.as_deref(), &progress::report)
         }

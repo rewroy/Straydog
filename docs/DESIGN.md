@@ -212,7 +212,8 @@ option, named as llama-server names it where it has the same setting.
 Precedence: options, then `STRAYDOG_*` environment variables (`STRAYDOG_CTX_SIZE`),
 then the config file, then defaults. One `clap` definition gives the options and the
 variables; the file uses the same names. `--print-config` shows the settings in effect
-and where each came from. Nothing is read from a home directory unless given.
+and where each came from. Nothing is read from a home directory but the settings file
+`straydog setup` wrote (below).
 
 There is no `-ngl`. Residency is decided by measuring what fits:
 - full residency first, then host K/V, then a smaller prefill batch;
@@ -222,9 +223,51 @@ There is no `-ngl`. Residency is decided by measuring what fits:
 There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authenticated
 before use. The pins are compiled into the executable.
 
-Subcommands: `straydog fetch`, `straydog verify`, `straydog fetch-mtp` (provisioning).
-There is no setup command: a model is fetched once, then given by path. `fetch` and
-`verify` also build each shard's verity tree into the data directory
+Subcommands: `straydog setup` (the first run), `straydog fetch`, `straydog verify`,
+`straydog fetch-mtp` (provisioning).
+
+`setup` is a few questions on a terminal and the same choices as options for scripts. It looks
+at the machine (each GPU's name and memory, the host memory the server measures, the free
+space where the models would go), lists the pinned bundles that can run there with their
+download sizes and what each needs, and marks one recommended. It asks where the models go
+(`--dir`: the platform's data folder, `$XDG_DATA_HOME/straydog/models` or
+`%LOCALAPPDATA%\Straydog\models`; the bundle is `<dir>/<model>/<quant>`, or `<dir>` when that
+holds it already), checks the free space against the bundle, its verity trees and the extras
+less what is there, and asks which extras to add (DeepSeek-V4.1's DSpark drafter and vision
+encoder, Qwen3.8's MTP drafter; all by default, sizes shown). Then it fetches as `fetch` does,
+resuming and authenticating, and writes `model`, `quant`, `model_draft`, `gpu`, `data_dir` and, when the model starts with less, `ctx_size` into
+the settings file (`config.toml` in `$XDG_CONFIG_HOME/straydog` or `%LOCALAPPDATA%\Straydog`,
+or `--config`), keeping the other settings there and the earlier file as `config.toml.old`; the
+file is written whole and renamed, so a Ctrl-C leaves, besides what it downloaded and can
+resume, the file as it was. It prints the command to start and the URL. `--model-name` or
+`--quant` choose the model; `--yes` takes the recommended answer to whatever is left open;
+`--offline` authenticates what is there and downloads nothing.
+
+What a machine runs is the placement's own accounting over each bundle's footprint
+(`asset_footprint.json`, from the shards' headers and the model's hyperparameters, by
+examples/asset_footprint.rs): the dense weights every token reads, the routed experts, the tables
+read by row from the drive, and the sequence state a token of context takes. The dense weights, the
+model's working memory (measured on this machine's placements, in `setup/catalog.rs`: DeepSeek-V4.1
+2.34 GiB and 2.40 GiB a GPU with its DSpark drafter, Qwen3.6 0.25 GiB a GPU, Qwen3.8 2.9 GiB a GPU),
+the state (DeepSeek-V4.1's on every GPU, Qwen3.6's shared, Qwen3.8's in host memory) and `RESERVE`
+per GPU, with the rows of a prefill pass (1.4 GiB a GPU for DeepSeek-V4.1, which started at
+`--vram 14` on one GPU and not at 13), must fit the GPUs' memory less the margin of an automatic
+budget, or the bundle is not offered; to start at all a model is given the largest of 262144,
+131072, 65536, 32768 and 16384 tokens that fits (Qwen3.6's K/V is 10 GiB at 262144), and setup
+writes `ctx_size` when that is less than the default. The experts take the VRAM left, then the host
+tier (85% of the RAM less the row cache, 2 GiB, the checkpoints and Qwen3.8's state), and a bundle whose
+experts are more is told to read the rest from the drive. The first model, in the order DeepSeek-V4.1,
+Qwen3.8, Qwen3.6, that has a bundle held by VRAM and RAM alone is recommended, with its best bundle in
+that class; else the bundle reading least from the drive. On the owner's two R9700s and 125 GiB the rule
+leaves 77 GiB of GSQ-RCO-IQ2_XXS's experts in RAM (the placement left 76 GiB: 5832 of 15360 slots in
+VRAM, a 102 GiB tier); on a 12 GB GPU with 32 GB of RAM DeepSeek-V4.1 is not offered, Qwen3.6 is
+recommended with 131072 tokens, and the Qwen3.8 bundles read 17-33 GiB from the drive.
+
+A plain `straydog` (no `--config`, and no model by option or `STRAYDOG_MODEL`) reads the
+settings file `setup` wrote when it exists, below options and variables; a server started with
+a model of its own reads no file it was not given.
+
+`fetch` and `verify` also build each shard's verity tree into the data directory
 (`<data-dir>/verity/<shard>.verity`, by default `<model>/.straydog/verity/`, one read of the
 files) and keep it only when its digest is the pinned one; the server builds the trees it
 lacks the same way at its start, before the worker starts (shown as loading). Only the data
@@ -393,6 +436,10 @@ authentication: no worker starts without them.
    `--data-dir` says elsewhere: no flag is needed. The server writes it (at provisioning
    or before it starts the worker), never the worker; the trees are as trustworthy
    anywhere, being checked against the compiled-in digests.
+8. (2026-10-28) `straydog setup` writes a settings file in the platform's config folder and a
+   plain `straydog` reads it (item 4's implicit config, back, for the one case that has no
+   other way to name a model). Only a server started without `--config` and without a model
+   reads it; Homelab and every script that names its model are unchanged.
 
 ## 10. Model architectures
 

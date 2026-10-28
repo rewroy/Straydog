@@ -18,6 +18,8 @@ ureq = { version = "~3.4.2", default-features = false, features = ["rustls"] }
 # The GPU backend to link: the drafter build runs the library's CPU quantizer.
 hip = ["straydog-gpu/hip"]
 cuda = ["straydog-gpu/cuda"]
+# The test server of the download tests, for the tests of crates that build on fetching.
+mock = []
 
 [dev-dependencies]
 straydog-gguf = { path = "../straydog-gguf" }
