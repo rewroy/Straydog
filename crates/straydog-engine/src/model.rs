@@ -11,6 +11,7 @@
 //! (the end of the system prompt, and where the last user-initiated and the last tool-result
 //! request began generating).
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -77,6 +78,29 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
         return banks;
     }
     (memory / 2).saturating_sub(pinned_state)
+}
+
+/// With DS41_PROFILE set: seconds per phase of a request's decode, and of its passes by rows
+/// (count, seconds, phases). The host's clock alone: every call a phase covers returns after its
+/// device work, so no extra synchronization is added.
+#[derive(Default)]
+struct Profile {
+    phases: BTreeMap<&'static str, f64>,
+    /// The phases of the pass under way, until its rows are known.
+    pass: BTreeMap<&'static str, f64>,
+    rows: [(u64, f64, BTreeMap<&'static str, f64>); VERIFY_ROWS + 1],
+}
+
+impl Profile {
+    /// The pass under way ends: it had `rows` rows and took `seconds`.
+    fn end_pass(&mut self, rows: usize, seconds: f64) {
+        self.rows[rows].0 += 1;
+        self.rows[rows].1 += seconds;
+        for (name, spent) in std::mem::take(&mut self.pass) {
+            *self.phases.entry(name).or_default() += spent;
+            *self.rows[rows].2.entry(name).or_default() += spent;
+        }
+    }
 }
 
 struct Checkpoint {
@@ -253,6 +277,10 @@ pub struct Model {
     mtp_kept: u64,
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
+    profile: Option<Profile>,
+    /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
+    ple_counts: (u64, u64, u64),
+    ple_wait: f64,
 }
 
 impl Model {
@@ -331,6 +359,9 @@ impl Model {
             deferred: false,
             mtp_kept: 0,
             load_seconds: Vec::new(),
+            profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
+            ple_counts: (0, 0, 0),
+            ple_wait: 0.0,
         };
         // Placement allocates every weight before any is read; reading then fills them.
         model.group.defer_uploads();
@@ -921,8 +952,18 @@ impl Model {
         ngram_rows(&history, &tokens, &self.weights.integer_arrays)
     }
 
-    fn ple_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.weights.rows(PLE_TABLE, &self.ple_indices(&self.history, tokens)?)
+    fn ple_embeddings(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        let rows = self.weights.rows(PLE_TABLE, &self.ple_indices(&self.history, tokens)?);
+        self.ple_wait += started.elapsed().as_secs_f64();
+        rows
+    }
+
+    /// Add the time since `clock` to the profile's `name` and restart the clock (with DS41_PROFILE).
+    fn phase(&mut self, name: &'static str, clock: &mut Instant) {
+        if let Some(profile) = self.profile.as_mut() {
+            *profile.pass.entry(name).or_default() += lap(clock);
+        }
     }
 
     /// Start reading the PLE rows of `tokens` (after `before`) as soon as they are known: the
@@ -1003,21 +1044,26 @@ impl Model {
             }
             rows
         } else {
+            let mut clock = Instant::now();
             let mut hidden = self.group.decode_span(0, 1, &tile(&embeddings), position)?;
+            self.phase("step: first layer", &mut clock);
             if cancelled() {
                 self.reset()?;
                 return Ok(None);
             }
             let embeddings = self.ple_embeddings(tokens)?;
+            self.phase("step: PLE rows wait", &mut clock);
             hidden = self.with_operands(Model::ple_operands, |group, operands| {
                 group.ple("blk.1.", &hidden, &embeddings, operands)
             })?;
-            for (begin, end) in self.group.decoder_spans(1) {
+            self.phase("step: PLE layer", &mut clock);
+            for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
                 if cancelled() {
                     self.reset()?;
                     return Ok(None);
                 }
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
+                self.phase(["step: layers (first device)", "step: layers (second device)"][index.min(1)], &mut clock);
             }
             if self.speculative > 0 {
                 // The MTP layer's pair of the row before, its token now known (the longer
@@ -1031,6 +1077,7 @@ impl Model {
         if !logits {
             return Ok(Some(None));
         }
+        let mut clock = Instant::now();
         let row = last_row(&hidden).to_vec();
         let mixed = self.with_operands(
             |model| Ok(model.head_operands()?[..3].to_vec()),
@@ -1040,6 +1087,12 @@ impl Model {
             group.project_many(&[(operands[0].clone(), &mixed[..])])
         })?;
         let logits = output.into_iter().next().unwrap();
+        if tokens.len() == 1 {
+            self.phase("step: head", &mut clock);
+            if let Some(profile) = self.profile.as_mut() {
+                profile.end_pass(1, 0.0);
+            }
+        }
         if let Some(digests) = self.logits_digests.as_mut() {
             let bytes: Vec<u8> = logits.iter().flat_map(|value| value.to_le_bytes()).collect();
             digests.push(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes)));
@@ -1234,14 +1287,19 @@ impl Model {
     /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
+        let mut clock = Instant::now();
         self.protect(position as usize, position as usize + tokens.len() + limit)?;
         let embedded = self.token_embeddings(tokens)?;
+        self.phase("draft: embeddings", &mut clock);
         let rows = self.mtp_prologue(&embedded, hidden)?;
+        self.phase("draft: prologue", &mut clock);
         let output = self.group.verify_span(48, 49, &rows, position)?;
+        self.phase("draft: MTP layer", &mut clock);
         if limit == 0 {
             return Ok(Vec::new());
         }
         let (token, mut chain) = self.mtp_head(last_row(&output))?;
+        self.phase("draft: head", &mut clock);
         if chain < DRAFT_CUT {
             return Ok(Vec::new());
         }
@@ -1249,9 +1307,13 @@ impl Model {
         let (mut multi, mut position) = (last_row(&output).to_vec(), position + tokens.len() as u64);
         while drafts.len() < limit {
             let embedded = self.token_embeddings(&drafts[drafts.len() - 1..])?;
+            self.phase("draft: embeddings", &mut clock);
             let rows = self.mtp_prologue(&embedded, &multi)?;
+            self.phase("draft: prologue", &mut clock);
             let output = self.group.verify_span(48, 49, &rows, position)?;
+            self.phase("draft: MTP layer", &mut clock);
             let (token, probability) = self.mtp_head(&output)?;
+            self.phase("draft: head", &mut clock);
             chain *= probability;
             if chain < DRAFT_CUT {
                 break;
@@ -1310,8 +1372,10 @@ impl Model {
 
     fn verify(&mut self, tokens: &[u32], sampling: bool) -> Result<Verified> {
         let (first, embeddings, hidden) = self.verify_rows(tokens)?;
+        let mut clock = Instant::now();
         let (targets, scores, _) = self.with_operands(Model::head_operands,
                                                       |group, operands| group.output_head(operands, &hidden, sampling, false))?;
+        self.phase("verify: head", &mut clock);
         Ok((first, embeddings, hidden, targets, scores))
     }
 
@@ -1329,33 +1393,42 @@ impl Model {
 
     fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         // (every row verified is written, kept or not)
+        let mut clock = Instant::now();
         self.protect(self.history.len(), self.history.len() + tokens.len())?;
         let position = self.history.len() as u64;
         self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
+        self.phase("verify: protect, PLE prefetch, embeddings", &mut clock);
         let first = self.group.verify_span(0, 1, &hidden, position)?;
+        self.phase("verify: first layer", &mut clock);
         let embeddings = self.ple_embeddings(tokens)?;
+        self.phase("verify: PLE rows wait", &mut clock);
         self.group.copy_state("@ple-snapshot:blk.1.", "@ple:blk.1.", "blk.1.")?;
         let mut hidden = self.with_operands(Model::ple_operands, |group, operands| {
             group.ple_rows("blk.1.", &first, &embeddings, operands)
         })?;
-        for (begin, end) in self.group.decoder_spans(1) {
+        self.phase("verify: PLE layer", &mut clock);
+        for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
             hidden = self.group.verify_span(begin, end, &hidden, position)?;
+            self.phase(["verify: layers (first device)", "verify: layers (second device)"][index.min(1)], &mut clock);
         }
         Ok((first, embeddings, hidden))
     }
 
     /// Keep the first `kept` verified tokens; replay DeltaNet and PLE state for the rest.
     fn commit(&mut self, tokens: &[u32], kept: usize, first: &[f32], embeddings: &[f32]) -> Result<()> {
+        let mut clock = Instant::now();
         for (begin, end) in std::iter::once((0, 1)).chain(self.group.decoder_spans(1)) {
             self.group.verify_commit(begin, end, kept as u64)?;
         }
+        self.phase("commit: DeltaNet replay", &mut clock);
         if kept < tokens.len() {
             self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;
             let (first, embeddings) = (&first[..kept * WIDTH], &embeddings[..kept * HIDDEN]);
             self.with_operands(Model::ple_operands, |group, operands| {
                 group.ple_rows("blk.1.", first, embeddings, operands)
             })?;
+            self.phase("commit: PLE replay", &mut clock);
         }
         self.history.extend_from_slice(&tokens[..kept]);
         Ok(())
@@ -1418,16 +1491,22 @@ impl Model {
             let pass_started = Instant::now();
             let limit = self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
+            let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
+            self.phase("PLE prefetch", &mut clock);
             let drafts = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit)?;
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
+            let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &rows)?;
+            self.phase("PLE prefetch", &mut clock);
             if self.history.len() + rows.len() > self.context {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }
             let position = self.history.len() as u64;
             let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits())?;
+            let mut clock = Instant::now();
             let (accepted, following) = Self::accept(&drafts, &targets, scores.as_deref(), sampling, &mut generated, rng);
+            self.phase("accept", &mut clock);
             generated.insert(following);
             let mut emitted: Vec<u32> = drafts[..accepted].iter().copied().chain([following]).collect();
             let mut kept = accepted + 1;
@@ -1441,6 +1520,9 @@ impl Model {
             self.metric_count("drafted_tokens", drafts.len() as u64);
             self.metric_count("accepted_tokens", accepted as u64);
             self.metric_add("decode_seconds", pass_started.elapsed().as_secs_f64());
+            if let Some(profile) = self.profile.as_mut() {
+                profile.end_pass(rows.len(), pass_started.elapsed().as_secs_f64());
+            }
             for value in &emitted {
                 produced += 1;
                 self.metric_count("generated_tokens", 1);
@@ -1483,8 +1565,44 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     pub fn generate_constrained(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
                                 cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool,
-                                checkpoint: bool, emit: &mut dyn FnMut(u32), mut constraint: Option<&mut Constraint>)
+                                checkpoint: bool, emit: &mut dyn FnMut(u32), constraint: Option<&mut Constraint>)
                                 -> Result<()> {
+        if let Some(profile) = self.profile.as_mut() {
+            *profile = Profile::default();
+        }
+        self.ple_counts = self.weights.row_counts(PLE_TABLE).unwrap_or_default();
+        self.ple_wait = 0.0;
+        let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
+        self.report_profile();
+        result
+    }
+
+    /// The request's PLE row counts and wait, and with DS41_PROFILE its decode phases (milliseconds a
+    /// generated token) and its passes by rows, into the metrics.
+    fn report_profile(&mut self) {
+        let (asked, read, blocks) = self.weights.row_counts(PLE_TABLE).map_or((0, 0, 0), |now| {
+            (now.0 - self.ple_counts.0, now.1 - self.ple_counts.1, now.2 - self.ple_counts.2)
+        });
+        self.last_metrics.insert("ple_rows".into(), json!({"used": asked, "read": read, "blocks": blocks,
+                                                            "wait_seconds": self.ple_wait}));
+        let generated = self.last_metrics.get("generated_tokens").and_then(Value::as_u64).unwrap_or(0).max(1) as f64;
+        let Some(profile) = self.profile.as_ref() else { return };
+        let phases: Map<String, Value> = profile.phases.iter().map(|(name, seconds)| ((*name).to_string(), json!(1e3 * seconds / generated))).collect();
+        let rows: Map<String, Value> = profile.rows.iter().enumerate().filter(|(_, (passes, _, _))| *passes > 0)
+            .map(|(rows, (passes, seconds, phases))| {
+                let phases: Map<String, Value> = phases.iter().map(|(name, spent)| ((*name).to_string(), json!(1e3 * spent / *passes as f64))).collect();
+                (rows.to_string(), json!({"passes": passes, "ms": 1e3 * seconds / *passes as f64, "phases": phases}))
+            })
+            .collect();
+        self.last_metrics.insert("decode_profile".into(), Value::Object(phases));
+        self.last_metrics.insert("decode_pass_rows".into(), Value::Object(rows));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_request(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
+                        cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool,
+                        checkpoint: bool, emit: &mut dyn FnMut(u32), mut constraint: Option<&mut Constraint>)
+                        -> Result<()> {
         let started = Instant::now();
         self.last_metrics = Map::new();
         if tokens.is_empty() || max_new == 0 || max_new > self.context || tokens.len() + max_new > self.context {
@@ -1565,6 +1683,9 @@ impl Model {
                 let Some(next) = self.forward(&[token], true, &|| false)? else { return Ok(()) };
                 logits = next.unwrap();
                 self.metric_add("decode_seconds", decode_started.elapsed().as_secs_f64());
+                if let Some(profile) = self.profile.as_mut() {
+                    profile.rows[1].1 += decode_started.elapsed().as_secs_f64();
+                }
                 self.metric_count("decode_forward_tokens", 1);
                 self.update_rate();
             }

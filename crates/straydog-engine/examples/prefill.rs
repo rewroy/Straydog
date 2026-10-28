@@ -2,11 +2,18 @@
 //!
 //! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
 //!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer] [--row-cache MIB]
+//!     [--pause SECONDS] [--sampled] [--drafts N] [--chat]
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
-//! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, and "+N"
-//! appends N tokens to the previous prompt. --dump writes each prompt's first logits and its
-//! greedy generation, the material for checking a numerical change against a saved run.
+//! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, "+N"
+//! appends N tokens to the previous prompt, and "TOKENS:G" generates G tokens for that run instead
+//! of --generate's. --dump writes each prompt's first logits and its greedy generation, the material
+//! for checking a numerical change against a saved run. --pause sleeps before each run, so a
+//! profiler's trace of a run is apart from the one before; --drafts N drafts at most N tokens a pass
+//! (0: plain decode, with the drafter loaded all the same); --sampled generates with the model
+//! card's thinking sampling (temperature 1.0, top_p 0.95, top_k 20) instead of greedily; --chat puts each
+//! fresh prompt in a user turn that asks for an explanation (a reply that runs to its length, where raw text
+//! ends in an end token after a few).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -29,6 +36,8 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         batch
     });
+    let chat = args.iter().position(|arg| arg == "--chat").map(|at| args.remove(at)).is_some();
+    let sampled = args.iter().position(|arg| arg == "--sampled").map(|at| args.remove(at)).is_some();
     let mut option = |name: &str| args.iter().position(|arg| arg == name).map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -39,6 +48,8 @@ fn main() -> Result<(), String> {
     let generate: usize = option("--generate").map_or(1, |count| count.parse().unwrap());
     let corpus_file = option("--corpus").map(PathBuf::from);
     let gemm_min_batch: u64 = option("--gemm-min-batch").map_or(2, |count| count.parse().unwrap());
+    let pause: f64 = option("--pause").map_or(0.0, |seconds| seconds.parse().unwrap());
+    let drafts: Option<usize> = option("--drafts").map(|count| count.parse().unwrap());
     // --gemm f32: batched projections in F32 throughout (the numerical reference for FP16 GEMMs).
     let half_gemm = option("--gemm").as_deref() != Some("f32");
     // --row-cache MIB: the PLE row cache (0: rows through the page cache).
@@ -62,6 +73,9 @@ fn main() -> Result<(), String> {
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
+    if let Some(drafts) = drafts {
+        model.speculative = drafts.min(model.speculative);
+    }
     let steps: Vec<String> =
         model.load_seconds.iter().map(|(step, seconds)| format!("{step} {seconds:.2} s")).collect();
     eprintln!("load {:.2} s: devices and open {open_seconds:.2} s, {}", started.elapsed().as_secs_f64(),
@@ -83,10 +97,20 @@ fn main() -> Result<(), String> {
     };
     let corpus = text.encode(&corpus).map_err(|exc| exc.0)?;
     eprintln!("resident {} host_kv {} batch {}", model.resident, model.host_kv, model.prefill_batch_size);
+    for &device in &devices {
+        if let Ok((_, free, total)) = straydog_gpu::device_info(device) {
+            eprintln!("GPU {device}: {:.2} GiB free of {:.2} GiB after loading (budget {:.2} GiB)", free as f64 / (1u64 << 30) as f64,
+                      total as f64 / (1u64 << 30) as f64, budget as f64 / (1u64 << 30) as f64);
+        }
+    }
     // "+N" appends N tokens to the previous prompt (the conversation cache resumes it).
     let mut previous: Vec<u32> = Vec::new();
     let mut row_counts = (0, 0, 0);
     for (run, length) in lengths.iter().enumerate() {
+        let (length, generate) = match length.split_once(':') {
+            Some((length, count)) => (length, count.parse::<usize>().unwrap()),
+            None => (length.as_str(), generate),
+        };
         let (append, length) = match length.strip_prefix('+') {
             Some(count) => (true, count.parse::<usize>().unwrap()),
             None => (false, length.parse::<usize>().unwrap()),
@@ -101,13 +125,26 @@ fn main() -> Result<(), String> {
             prompt.push(corpus[offset % corpus.len()]);
             offset += 1;
         }
+        if chat && !append {
+            // (the chat template's user turn and the assistant's header, thinking off: as model_gpu's turns)
+            let ask = text.encode("\n\nExplain in detail, section by section, what the code above does.").map_err(|exc| exc.0)?;
+            let mut turn = vec![248045, 846, 198];
+            turn.extend_from_slice(&prompt);
+            turn.extend_from_slice(&ask);
+            turn.extend([248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]);
+            prompt = turn;
+        }
         let length = prompt.len();
         previous = prompt.clone();
+        if pause > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(pause));
+        }
         let started = Instant::now();
         model.logits_digests = Some(Vec::new());
         model.logits_capture = Some(Vec::new());
         let mut tokens = Vec::new();
-        model.generate(&prompt, generate, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false,
+        let sampling = if sampled { Sampling::recommended(true) } else { Sampling::GREEDY };
+        model.generate(&prompt, generate, &sampling, run as u64 + 1, &|| false, &mut |_, _| {}, true, false,
                        &mut |token| tokens.push(token))?;
         let digest = model.logits_digests.take().unwrap_or_default().first().cloned().unwrap_or_default();
         let logits = model.logits_capture.take().unwrap_or_default().into_iter().next().unwrap_or_default();
@@ -126,6 +163,11 @@ fn main() -> Result<(), String> {
             println!("decode {} tokens: {:.1} tok/s, {passes} passes of {:.2} ms", tokens.len(),
                      model.last_metrics["decode_tokens_per_second"].as_f64().unwrap_or(0.0),
                      1e3 * seconds / passes.max(1) as f64);
+            for key in ["drafted_tokens", "accepted_tokens", "decode_pass_rows", "decode_profile", "ple_rows"] {
+                if let Some(value) = model.last_metrics.get(key) {
+                    println!("  {key}: {value}");
+                }
+            }
         }
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
