@@ -81,6 +81,33 @@ struct Activity {
     completion_tokens: u64,
 }
 
+/// What a request's speculation did, whichever worker ran it: the drafts it verified and the
+/// drafts it kept, and by drafter (those that made any) the same. The Qwen3.8 worker reports its
+/// MTP drafter's as `drafted_tokens` and `accepted_tokens`; the worker of a model read on demand
+/// reports all the drafts as `draft_tokens` and `accepted_drafts`, of which DSpark's are
+/// `engine_draft_tokens` and `accepted_engine_drafts` and the rest prompt lookup's.
+fn speculation(timings: &Value) -> (u64, u64, Value) {
+    let count = |key: &str| timings[key].as_u64().unwrap_or(0);
+    let mut drafters = Vec::new();
+    let mut add = |kind: &str, drafted: u64, accepted: u64| {
+        if drafted > 0 {
+            drafters.push(json!({"kind": kind, "drafted": drafted, "accepted": accepted}));
+        }
+    };
+    let (drafted, accepted) = if timings["draft_tokens"].is_u64() {
+        let (drafted, accepted) = (count("draft_tokens"), count("accepted_drafts"));
+        let (engine, kept) = (count("engine_draft_tokens").min(drafted), count("accepted_engine_drafts").min(accepted));
+        add("dspark", engine, kept);
+        add("lookup", drafted - engine, accepted - kept);
+        (drafted, accepted)
+    } else {
+        let (drafted, accepted) = (count("drafted_tokens"), count("accepted_tokens"));
+        add("mtp", drafted, accepted);
+        (drafted, accepted)
+    };
+    (drafted, accepted, Value::Array(drafters))
+}
+
 /// The generation running now.
 struct Live {
     started: Instant,
@@ -101,10 +128,13 @@ impl Activity {
         let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |time| time.as_secs_f64());
         let mut entry = json!({"time": time, "finish_reason": event["finish_reason"], "prompt_tokens": usage["prompt_tokens"],
                                "cached_tokens": usage["cached_tokens"], "completion_tokens": usage["completion_tokens"]});
-        for key in ["prefill_tokens_per_second", "decode_tokens_per_second", "ttft_seconds", "request_seconds",
-                    "drafted_tokens", "accepted_tokens", "resumed_from"] {
+        for key in ["prefill_tokens_per_second", "decode_tokens_per_second", "ttft_seconds", "request_seconds", "resumed_from"] {
             entry[key] = timings[key].clone();
         }
+        let (drafted, accepted, drafters) = speculation(timings);
+        entry["drafted_tokens"] = drafted.into();
+        entry["accepted_tokens"] = accepted.into();
+        entry["drafters"] = drafters;
         if self.recent.len() == RECENT {
             self.recent.pop_front();
         }
@@ -1224,6 +1254,27 @@ mod tests {
         assert!(request_summary(&event).contains("DSpark 18 of 25, 30 draft runs by width 7/4/12/7)"), "{}", request_summary(&event));
         let none = json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
         assert!(!request_summary(&none).contains("drafts"));
+    }
+
+    /// The dashboard's speculative acceptance is the same stat for every worker: the drafts kept of
+    /// the drafts verified, and by drafter.
+    #[test]
+    fn a_requests_speculation_is_counted_for_every_worker() {
+        let mut activity = Activity::default();
+        // a model read on demand: DSpark's drafts and prompt lookup's make up the drafts
+        activity.record(&json!({"usage": {}, "timings": {"draft_tokens": 40, "accepted_drafts": 31, "engine_draft_tokens": 25, "accepted_engine_drafts": 18}}));
+        // Qwen3.8: its MTP drafter's
+        activity.record(&json!({"usage": {}, "timings": {"drafted_tokens": 30, "accepted_tokens": 21}}));
+        // no drafts, and DSpark alone
+        activity.record(&json!({"usage": {}, "timings": {"draft_tokens": 0, "accepted_drafts": 0, "engine_draft_tokens": 0}}));
+        activity.record(&json!({"usage": {}, "timings": {"draft_tokens": 10, "accepted_drafts": 9, "engine_draft_tokens": 10, "accepted_engine_drafts": 9}}));
+        let seen: Vec<(Value, Value, Value)> = activity.recent.iter()
+            .map(|entry| (entry["drafted_tokens"].clone(), entry["accepted_tokens"].clone(), entry["drafters"].clone())).collect();
+        assert_eq!(seen[0], (json!(40), json!(31), json!([{"kind": "dspark", "drafted": 25, "accepted": 18},
+                                                          {"kind": "lookup", "drafted": 15, "accepted": 13}])));
+        assert_eq!(seen[1], (json!(30), json!(21), json!([{"kind": "mtp", "drafted": 30, "accepted": 21}])));
+        assert_eq!(seen[2], (json!(0), json!(0), json!([])));
+        assert_eq!(seen[3], (json!(10), json!(9), json!([{"kind": "dspark", "drafted": 10, "accepted": 9}])));
     }
 
     /// A frame split across writes survives a read dropped between its halves (as when a

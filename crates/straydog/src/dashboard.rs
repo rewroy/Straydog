@@ -185,6 +185,8 @@ fn describe(settings: &Settings) -> Value {
         "model": settings.model.display().to_string(),
         "model_draft": settings.model_draft.as_ref().map(|path| path.display().to_string()),
         "draft_max": settings.draft_max,
+        // (whether the model has an MTP drafter to give: the Qwen3.8 bundles)
+        "mtp": !straydog_engine::bundle::is_on_demand(&settings.quant),
         "context": settings.ctx_size,
         "batch_size": settings.batch_size,
         "devices": settings.gpu,

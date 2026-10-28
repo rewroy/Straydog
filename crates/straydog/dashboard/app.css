@@ -13,7 +13,7 @@
   --decode: #5eead4;
   --prefill: #a78bfa;
   --ttft: #7dd3fc;
-  --mtp: #f9a8d4;
+  --speculative: #f9a8d4;
   --heat: #fb923c;
   --power: #facc15;
   --ok: #4ade80;
@@ -45,7 +45,7 @@
     --decode: #0d9488;
     --prefill: #7c3aed;
     --ttft: #0284c7;
-    --mtp: #db2777;
+    --speculative: #db2777;
     --heat: #ea580c;
     --power: #ca8a04;
     --ok: #16a34a;
@@ -205,7 +205,7 @@ main { min-height: 0; }
 .stat[data-series="decode"] b { color: var(--decode); }
 .stat[data-series="prefill"] b { color: var(--prefill); }
 .stat[data-series="ttft"] b { color: var(--ttft); }
-.stat[data-series="mtp"] b { color: var(--mtp); }
+.stat[data-series="speculative"] b { color: var(--speculative); }
 .speed .timechart { min-height: 90px; }
 .live-bar { height: 4px; border-radius: 4px; background: var(--faint); overflow: hidden; margin-top: 8px; flex: none; }
 .live-bar span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--prefill), var(--decode)); transition: width .3s; }

@@ -115,3 +115,40 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
     drop(dashboard);
     Arc::into_inner(runtime).unwrap().close().await;
 }
+
+/// The names of the strings one language of the page defines (`name: "..."`, outside the strings).
+fn string_names(script: &str, language: &str, next: &str) -> std::collections::BTreeSet<String> {
+    let from = script.find(&format!("  {language}: {{")).expect(language);
+    let block = &script[from..][..script[from..].find(next).expect(next)];
+    let (mut names, mut word, mut quoted, mut escaped) = (std::collections::BTreeSet::new(), String::new(), false, false);
+    for c in block.chars().skip(language.len() + 5) {
+        match (quoted, escaped, c) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => quoted = false,
+            (true, _, _) => {}
+            (false, _, '"') => quoted = true,
+            (false, _, ':') if !word.is_empty() => {
+                names.insert(std::mem::take(&mut word));
+            }
+            (false, _, c) if c.is_ascii_alphanumeric() || c == '_' => word.push(c),
+            (false, _, _) => word.clear(),
+        }
+    }
+    names
+}
+
+/// English and Japanese define the same strings, and every `data-i18n` the page names is one of them.
+#[test]
+fn the_page_has_the_same_strings_in_both_languages() {
+    let script = include_str!("../dashboard/app.js");
+    let english = string_names(script, "en", "\n  ja: {");
+    let japanese = string_names(script, "ja", "\n};");
+    assert!(english.len() > 100 && english.contains("speculative"), "{}", english.len());
+    assert_eq!(english.difference(&japanese).collect::<Vec<_>>(), Vec::<&String>::new());
+    assert_eq!(japanese.difference(&english).collect::<Vec<_>>(), Vec::<&String>::new());
+    for attribute in include_str!("../dashboard/index.html").split("data-i18n=\"").skip(1) {
+        let name = &attribute[..attribute.find('"').unwrap()];
+        assert!(english.contains(name), "data-i18n {name} has no string");
+    }
+}
