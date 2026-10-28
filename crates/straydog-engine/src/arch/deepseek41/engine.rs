@@ -2465,9 +2465,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         if let Some(first) = waves.first() {
-            for shard in &mut self.shards {
-                shard.experts.request(&mut shard.gpu, layer, first)?;
-            }
+            self.request_experts(layer, first)?;
         }
         // every device holds as many rows of an expert
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
@@ -2540,6 +2538,42 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.mark("routed experts")
     }
 
+    /// Start the fills of `experts` of `layer` on every device, a fill of each in turn: the second
+    /// device's copies begin one fill behind the first's, where all of the first device's fills
+    /// queued before the second's began (the pass then waited for the slower device, ~12 us a
+    /// miss later).
+    fn request_experts(&mut self, layer: usize, experts: &[usize]) -> Result<()> {
+        let mut failure = None;
+        let mut more = false;
+        for shard in &mut self.shards {
+            let started = shard.experts.request_begin(&mut shard.gpu, layer, experts)
+                .and_then(|()| shard.experts.request_step(&mut shard.gpu));
+            match started {
+                Ok(left) => more |= left,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        while more {
+            more = false;
+            for shard in &mut self.shards {
+                match shard.experts.request_step(&mut shard.gpu) {
+                    Ok(left) => more |= left,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        for shard in &mut self.shards {
+            if let Err(error) = shard.experts.request_end(&mut shard.gpu) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     /// [`Engine::experts_split`]'s one wave when VRAM holds some of its experts and not others:
     /// the others' fills start on every device, the held ones' gate and up run while they land,
     /// then the others'; the activations are summed across devices and every route's down runs at
@@ -2554,9 +2588,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let routed_rows = rows * k;
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
         let (offsets, expert_bytes) = ([0, gate_bytes, 2 * gate_bytes], 2 * gate_bytes + down_bytes);
-        for shard in &mut self.shards {
-            shard.experts.request(&mut shard.gpu, layer, misses)?;
-        }
+        self.request_experts(layer, misses)?;
         self.mark("misses requested")?;
         // A route to an expert of the other list has no slot here (a zero base: skipped).
         let bases = |list: &[usize], slots: &[Buffer]| -> Vec<u64> {
