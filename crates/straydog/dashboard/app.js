@@ -13,7 +13,7 @@ const STRINGS = {
     offline: "Server unreachable", unauthorized: "API key required", uptime: "Uptime", apiKey: "API key",
     apiKeyHelp: "This server requires its API key. It is kept in this tab only.", save: "Save", cancel: "Cancel",
     overview: "Overview", environment: "Environment", logsTab: "Log",
-    decode: "Decode", prefill: "Prefill", firstToken: "First token", mtp: "MTP acceptance", live: "live",
+    decode: "Decode", prefill: "Prefill", firstToken: "First token", speculative: "Speculative acceptance", live: "live",
     lastRequest: "last request", cached: "from cache", off: "off", throughput: "Speed", idle: "Idle",
     prefilling: "Prefilling", decoding: "Generating", preparing: "Starting", queued: "{0} waiting",
     lastAt: "last request at {0}", requests: "Requests", decodePerRequest: "Decode tok/s",
@@ -45,7 +45,7 @@ const STRINGS = {
     powerCap: "Power limit", deviceMemory: "Device memory", allocated: "Straydog allocation",
     budgetOf: "{0} / {1} GiB budget", noSensors: "No sensors for this GPU.", waiting: "Waiting for the engine…",
     time: "Time", prompt: "Prompt", completion: "Completion", ttft: "First token", finish: "Finish",
-    acceptance: "MTP accepted", stageAuthenticate: "authenticating the model", stageDrafter: "authenticating the drafter",
+    acceptance: "Speculative accepted", speculation: "Speculation", dspark: "DSpark", lookup: "lookup", mtpName: "MTP", stageAuthenticate: "authenticating the model", stageDrafter: "authenticating the drafter",
     stagePrepare: "placing the model on the GPUs", stageWarm: "warming up the GPU code", error: "Error",
   },
   ja: {
@@ -53,7 +53,7 @@ const STRINGS = {
     offline: "サーバーに接続できません", unauthorized: "API キーが必要です", uptime: "稼働時間", apiKey: "API キー",
     apiKeyHelp: "このサーバーには API キーが必要です。キーはこのタブの中だけに保存します。", save: "保存", cancel: "キャンセル",
     overview: "概要", environment: "環境", logsTab: "ログ",
-    decode: "デコード", prefill: "プレフィル", firstToken: "最初のトークン", mtp: "MTP 採択率", live: "ライブ",
+    decode: "デコード", prefill: "プレフィル", firstToken: "最初のトークン", speculative: "投機採択率", live: "ライブ",
     lastRequest: "直近のリクエスト", cached: "キャッシュ", off: "オフ", throughput: "処理速度", idle: "待機中",
     prefilling: "プレフィル中", decoding: "生成中", preparing: "開始中", queued: "{0} 件待ち",
     lastAt: "直近 {0}", requests: "リクエスト", decodePerRequest: "デコード tok/s",
@@ -85,7 +85,7 @@ const STRINGS = {
     powerCap: "電力上限", deviceMemory: "デバイスメモリ", allocated: "Straydog の確保",
     budgetOf: "予算 {1} GiB 中 {0}", noSensors: "この GPU のセンサーは読めません。", waiting: "エンジンを待っています…",
     time: "時刻", prompt: "プロンプト", completion: "生成", ttft: "最初のトークン", finish: "終了理由",
-    acceptance: "MTP 採択", stageAuthenticate: "モデルを検証中", stageDrafter: "drafter を検証中",
+    acceptance: "投機採択", speculation: "投機的デコード", dspark: "DSpark", lookup: "照合", mtpName: "MTP", stageAuthenticate: "モデルを検証中", stageDrafter: "drafter を検証中",
     stagePrepare: "モデルを GPU に配置中", stageWarm: "GPU のコードを準備中", error: "エラー",
   },
 };
@@ -638,7 +638,24 @@ speedChart.onAxes = (maxima) => {
 // A request that generated at most one token has no decode rate.
 const decodeRate = (entry) => (entry.completion_tokens > 1 ? entry.decode_tokens_per_second : null);
 const prefillRate = (entry) => (entry.prompt_tokens > entry.cached_tokens ? entry.prefill_tokens_per_second : null);
+// Speculative acceptance: the drafts kept of the drafts verified, whichever drafters made them.
 const acceptance = (entry) => (entry.drafted_tokens > 0 ? percent(entry.accepted_tokens, entry.drafted_tokens) : null);
+const drafterName = (kind) => ({ dspark: t("dspark"), lookup: t("lookup"), mtp: t("mtpName") })[kind] || kind;
+// "DSpark 78% · lookup 97%": each drafter's share of its own drafts kept in a request.
+const drafterShares = (entry) => (entry.drafters || [])
+  .map((drafter) => `${drafterName(drafter.kind)} ${number(percent(drafter.accepted, drafter.drafted))}%`).join(" · ");
+
+// What the engine runs, as its ready frame says ("" before it is ready).
+function speculationLabel(ready, detail = false) {
+  if (!ready || (ready.speculation === undefined && ready.speculative_drafts === undefined)) return "";
+  const kinds = Array.isArray(ready.speculation) ? ready.speculation
+    : ready.speculative_drafts ? [{ kind: "mtp", drafts: ready.speculative_drafts }] : [];
+  if (!kinds.length) return t("off");
+  return kinds.map((kind) => {
+    if (kind.kind === "mtp") return `${drafterName(kind.kind)} ${t("drafts", kind.drafts)}`;
+    return detail && kind.resident ? `${drafterName(kind.kind)} ${kind.resident.join("/")}` : drafterName(kind.kind);
+  }).join(" · ");
+}
 
 function renderSpeed(activity, ready, queued, sample) {
   const live = activity.live;
@@ -677,8 +694,8 @@ function renderSpeed(activity, ready, queued, sample) {
   $("prefill-note").textContent = last ? (prefill === null ? t("cached") : t("lastRequest")) : "";
   $("ttft-value").textContent = number(last?.ttft_seconds, 2);
   $("ttft-note").textContent = last ? t("lastRequest") : "";
-  $("mtp-value").textContent = number(last ? acceptance(last) : null);
-  $("mtp-note").textContent = ready.speculative_drafts === 0 ? t("off") : ready.speculative_drafts ? t("drafts", ready.speculative_drafts) : "";
+  $("speculative-value").textContent = number(last ? acceptance(last) : null);
+  $("speculative-note").textContent = (last && drafterShares(last)) || speculationLabel(ready);
 }
 
 // ---- requests ----
@@ -762,7 +779,7 @@ function showTooltip(event) {
     [t("prefill"), prefillRate(entry) === null ? t("cached") : `${number(prefillRate(entry))} tok/s`],
     [t("decode"), decodeRate(entry) === null ? "—" : `${number(decodeRate(entry), 1)} tok/s`],
     [t("ttft"), `${number(entry.ttft_seconds, 2)} s`],
-    accepted === null ? null : [t("acceptance"), `${number(accepted)}%`],
+    accepted === null ? null : [t("acceptance"), `${number(accepted)}% (${drafterShares(entry)})`],
     [t("finish"), entry.finish_reason],
   ]);
   tooltip.replaceChildren(element("b", "", clock(entry.time)), list);
@@ -802,7 +819,7 @@ function renderEngine(engine, ready, activity) {
     isReady && [t("context"), number(ready.context)],
     isReady && Array.isArray(placement.vram_budgets) && [t("vramBudget"), `${placement.vram_budgets.map((bytes) => gib(bytes)).join(" + ")} GiB`],
     isReady && [t("prefillBatch"), number(placement.prefill_batch_size)],
-    isReady && ["MTP", ready.speculative_drafts ? t("drafts", ready.speculative_drafts) : t("off")],
+    isReady && [t("speculation"), speculationLabel(ready, true)],
     isReady && [t("sequenceState"), `${gib(ready.state_bytes)} GiB`],
     isReady && [t("loadedIn"), `${number(ready.loaded_seconds)} s`],
     [t("queue"), number(engine.queued)],
@@ -863,15 +880,18 @@ function renderEnvironment(engine, host, server) {
       return section;
     }));
   }
-  const key = JSON.stringify(server);
+  const speculation = speculationLabel(engine.ready, true);
+  const key = JSON.stringify([server, speculation]);
   if (key === settingsShown) return;
   settingsShown = key;
   $("version-chip").textContent = `v${server.version} · ${server.backend}`;
   facts($("settings-facts"), [
     [t("model"), server.model, "path"],
     [t("quantization"), server.quantization],
-    [t("drafter"), server.model_draft || t("none"), server.model_draft ? "path" : ""],
-    [t("draftMax"), server.model_draft ? number(server.draft_max) : t("off")],
+    // (the MTP drafter is the Qwen3.8 bundles'; DeepSeek-V4.1's DSpark is a file beside its model)
+    server.mtp && [t("drafter"), server.model_draft || t("none"), server.model_draft ? "path" : ""],
+    server.mtp && [t("draftMax"), server.model_draft ? number(server.draft_max) : t("off")],
+    [t("speculation"), speculation || "—"],
     [t("context"), t("tokens", number(server.context))],
     [t("prefillBatch"), server.batch_size ? number(server.batch_size) : t("auto")],
     [t("devices"), server.devices.join(", ")],

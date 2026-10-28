@@ -239,6 +239,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "event": "ready", "protocol": 1, "engine": "Straydog",
         "model": straydog_engine::bundle::model_of(&args.quant)?, "architecture": architecture,
         "quantization": args.quant, "context": model.context, "state_bytes": model.state_bytes, "speculative_drafts": 0,
+        "speculation": speculation(&model.placement),
         "placement": model.placement,
         "sampling": {"temperature": card.temperature, "top_k": card.top_k, "top_p": card.top_p, "min_p": card.min_p,
                      "presence_penalty": card.presence_penalty},
@@ -247,6 +248,17 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "vision": model.engines.vision(),
     });
     Ok((Loaded { model, template, efforts, encoded: Vec::new() }, frame, Arc::new(text)))
+}
+
+/// The speculation a served model runs, as its ready frame says: DSpark when it is placed (with the
+/// experts it keeps in each stage), and always prompt lookup, which proposes where DSpark does not.
+fn speculation(placement: &Value) -> Value {
+    let mut kinds = Vec::new();
+    if let Some(kept) = placement["dspark"]["resident"].as_array() {
+        kinds.push(json!({"kind": "dspark", "resident": kept}));
+    }
+    kinds.push(json!({"kind": "lookup"}));
+    Value::Array(kinds)
 }
 
 impl<E: Engines> Loaded<E> {

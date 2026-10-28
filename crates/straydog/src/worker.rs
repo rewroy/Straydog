@@ -304,6 +304,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "event": "ready", "protocol": 1, "engine": "Straydog", "model": straydog_engine::bundle::MODEL,
         "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
+        "speculation": if model.speculative > 0 { json!([{"kind": "mtp", "drafts": model.speculative}]) } else { json!([]) },
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" }},

@@ -1,7 +1,8 @@
 //! The dashboard and the API over a simulated engine, for working on the page without a GPU
 //! or a model: `cargo run -p straydog --features hip --example dashboard [-- PORT]`, then
 //! open http://127.0.0.1:18090/dashboard. The worker is this program again; it speaks the
-//! worker protocol with made-up text and timings (no inference happens).
+//! worker protocol with made-up text and timings (no inference happens). It plays Qwen3.8 with
+//! its MTP drafter; with `DASHBOARD_MODEL=deepseek` it plays DeepSeek-V4.1 (DSpark and prompt lookup).
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -19,6 +20,12 @@ use tracing_subscriber::prelude::*;
 
 const GIB: u64 = 1 << 30;
 
+/// Whether to play DeepSeek-V4.1 rather than Qwen3.8: asked for by the variable, and told to the
+/// worker (which the server starts with an environment of its own) as its argument.
+fn deepseek() -> bool {
+    std::env::var("DASHBOARD_MODEL").is_ok_and(|model| model == "deepseek") || std::env::args().any(|arg| arg == "deepseek")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("simulate-worker") {
@@ -33,11 +40,13 @@ fn main() {
         .with(fmt::layer().with_target(false).with_writer(std::io::stderr))
         .with(fmt::layer().with_target(false).with_ansi(false).with_writer(move || LogSink(sink.clone())))
         .init();
+    let (quant, model_draft, draft_max) =
+        if deepseek() { ("GSQ-RCO-IQ2_XXS", None, 0) } else { ("IQ3_S", Some(PathBuf::from("/simulated/Qwen3.8-Flash-Next-MTP")), 3) };
     let settings = Settings {
-        model: PathBuf::from("/simulated/Qwen3.8-Flash-Next-IQ3_S"),
-        quant: "IQ3_S".into(),
-        model_draft: Some(PathBuf::from("/simulated/Qwen3.8-Flash-Next-MTP")),
-        draft_max: 3,
+        model: PathBuf::from("/simulated").join(quant),
+        quant: quant.into(),
+        model_draft,
+        draft_max,
         ctx_size: 262_144,
         batch_size: Some(4096),
         gpu: vec![0, 1],
@@ -51,7 +60,7 @@ fn main() {
         port,
         api_key: None,
         api_key_file: None,
-        alias: "Qwen3.8-Flash-Next-IQ3_S".into(),
+        alias: format!("simulated-{quant}"),
         temp: None,
         top_k: None,
         top_p: None,
@@ -65,7 +74,11 @@ fn main() {
         data_dir: PathBuf::from("/nonexistent/.straydog"),
         expert_ram: None,
     };
-    let command = (std::env::current_exe().unwrap(), vec!["simulate-worker".into()]);
+    let mut worker_args = vec!["simulate-worker".into()];
+    if deepseek() {
+        worker_args.push("deepseek".into());
+    }
+    let command = (std::env::current_exe().unwrap(), worker_args);
     tokio::runtime::Runtime::new().unwrap().block_on(async move {
         let engine = Arc::new(Runtime::start(&settings, command));
         let api = straydog_api::ApiConfig {
@@ -105,12 +118,24 @@ fn simulate() {
         }
     }
     let gpu = gpu_info();
-    send(json!({
-        "event": "ready", "protocol": 1, "engine": "Straydog", "model": "Qwen3.8-Flash-Next", "quantization": "IQ3_S",
-        "context": 262_144, "state_bytes": 7 * GIB, "speculative_drafts": 3,
-        "placement": {"resident": true, "partial": false, "host_kv": true, "prefill_batch_size": 4096},
-        "gpu": gpu,
-    }));
+    if deepseek() {
+        send(json!({
+            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "DeepSeek-V4.1-Flash", "quantization": "GSQ-RCO-IQ2_XXS",
+            "context": 262_144, "state_bytes": 3 * GIB, "speculative_drafts": 0,
+            "speculation": [{"kind": "dspark", "resident": [87, 50, 29]}, {"kind": "lookup"}],
+            "placement": {"expert_slots": [2916, 2916], "layers": [[0, 40]], "devices": [[0, 1]], "host_expert_bytes": 100 * GIB,
+                          "prefill_batch_size": 4096, "dspark": {"engine": 0, "resident": [87, 50, 29]}},
+            "gpu": gpu,
+        }));
+    } else {
+        send(json!({
+            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "Qwen3.8-Flash-Next", "quantization": "IQ3_S",
+            "context": 262_144, "state_bytes": 7 * GIB, "speculative_drafts": 3,
+            "speculation": [{"kind": "mtp", "drafts": 3}],
+            "placement": {"resident": true, "partial": false, "host_kv": true, "prefill_batch_size": 4096},
+            "gpu": gpu,
+        }));
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let mut generation: Option<std::thread::JoinHandle<()>> = None;
     for line in std::io::stdin().lock().lines() {
@@ -201,15 +226,26 @@ fn answer(frame: &Value, send: &(impl Fn(Value) + ?Sized), cancel: &AtomicBool) 
     }
     let decode_seconds = decode_started.elapsed().as_secs_f64();
     let drafted = tokens * 3 / 4;
+    let mut timings = json!({"cached_tokens": cached, "resumed_from": if cached > 0 { "live" } else { "none" },
+                             "prefill_tokens": fresh, "prefill_seconds": prefill_seconds,
+                             "prefill_tokens_per_second": fresh as f64 / prefill_seconds, "ttft_seconds": ttft,
+                             "decode_seconds": decode_seconds, "decode_tokens_per_second": tokens as f64 / decode_seconds,
+                             "generated_tokens": tokens, "request_seconds": started.elapsed().as_secs_f64()});
+    if deepseek() {
+        // (DSpark's drafts are most of them, prompt lookup's the rest)
+        let dspark = drafted * 2 / 3;
+        timings["draft_tokens"] = drafted.into();
+        timings["accepted_drafts"] = (dspark * 3 / 4 + (drafted - dspark) * 19 / 20).into();
+        timings["engine_draft_tokens"] = dspark.into();
+        timings["accepted_engine_drafts"] = (dspark * 3 / 4).into();
+    } else {
+        timings["drafted_tokens"] = drafted.into();
+        timings["accepted_tokens"] = (drafted * 7 / 10).into();
+    }
     send(json!({
         "id": id, "event": "done", "finish_reason": finish,
         "usage": {"prompt_tokens": prompt, "completion_tokens": tokens, "total_tokens": prompt + tokens, "cached_tokens": cached},
         "gpu": gpu_info(),
-        "timings": {"cached_tokens": cached, "resumed_from": if cached > 0 { "live" } else { "none" },
-                    "prefill_tokens": fresh, "prefill_seconds": prefill_seconds,
-                    "prefill_tokens_per_second": fresh as f64 / prefill_seconds, "ttft_seconds": ttft,
-                    "decode_seconds": decode_seconds, "decode_tokens_per_second": tokens as f64 / decode_seconds,
-                    "generated_tokens": tokens, "drafted_tokens": drafted, "accepted_tokens": drafted * 7 / 10,
-                    "request_seconds": started.elapsed().as_secs_f64()},
+        "timings": timings,
     }));
 }
