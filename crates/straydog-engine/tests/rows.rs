@@ -122,3 +122,56 @@ fn cached_blocks_come_from_the_page_cache_and_the_rest_past_it() {
     }
     std::fs::remove_file(&path).unwrap();
 }
+
+/// What Qwen3.8's PLE table gets when `--row-cache` is not given: all of it while half of the host
+/// memory beside the sequence state holds it, else that half, never less than the default budget.
+#[test]
+fn the_automatic_budget_holds_the_table_while_half_the_free_memory_does() {
+    const GIB: u64 = 1 << 30;
+    let (count, width) = (320_001_536u64, 90u64);
+    let all = rows::full_budget(count, width);
+    assert_eq!(all, count * 114);
+    // Homelab: 125 GiB with 14 GiB of state, half of 111 GiB holds the 34 GiB table.
+    assert_eq!(rows::auto_budget(count, width, 125 * GIB, 14 * GIB), all);
+    // 64 GiB: half of what the state leaves, not the table.
+    assert_eq!(rows::auto_budget(count, width, 64 * GIB, 14 * GIB), 25 * GIB);
+    assert_eq!(rows::auto_budget(count, width, 16 * GIB, 14 * GIB), GIB);
+    // Memory short, or unknown: today's default.
+    assert_eq!(rows::auto_budget(count, width, 14 * GIB + GIB / 4, 14 * GIB), rows::DEFAULT_CACHE_BYTES);
+    assert_eq!(rows::auto_budget(count, width, 0, 0), rows::DEFAULT_CACHE_BYTES);
+    assert_eq!(rows::auto_budget(count, width, 8 * GIB, 14 * GIB), rows::DEFAULT_CACHE_BYTES);
+    // A table smaller than the default has no use for more than itself.
+    assert_eq!(rows::auto_budget(1000, width, 125 * GIB, 0), rows::full_budget(1000, width));
+}
+
+/// A cache that holds a whole table of tens of millions of rows takes no memory until rows are met:
+/// its slots, owners and recency flags are zeroed memory and its index grows as it is used.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cache_for_a_whole_table_takes_memory_only_for_the_rows_met() {
+    fn resident_bytes() -> u64 {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        statm.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 4096
+    }
+    let (rows, width) = (40_000_000u64, 90usize);
+    let path = std::env::temp_dir().join(format!("straydog-rows-whole-{}.bin", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    // (sparse: zeros but for a few rows near the end)
+    file.set_len(rows * width as u64).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, &[7u8; 90], (rows - 1) * 90).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let before = resident_bytes();
+    let table = RowTable::new(&file, 0, width, rows, rows::full_budget(rows, width as u64), Arc::new(ReadPool::new(4)), None).unwrap();
+    let after = resident_bytes();
+    assert!(after - before < 100 << 20, "{} MiB resident for an empty cache of {} MiB", (after - before) >> 20,
+            rows::full_budget(rows, width as u64) >> 20);
+    let wanted = [0u32, 12_345_678, (rows - 1) as u32];
+    let got = table.read(&wanted).unwrap();
+    assert_eq!(&got[..90], &[0u8; 90]);
+    assert_eq!(&got[180..], &[7u8; 90]);
+    // Cached now: asked again, nothing is read.
+    let (_, read, _) = table.counts();
+    assert_eq!(table.read(&wanted).unwrap(), got);
+    assert_eq!(table.counts().1, read);
+    std::fs::remove_file(&path).unwrap();
+}

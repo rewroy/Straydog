@@ -148,8 +148,9 @@ pub struct Settings {
     /// CPU expert threads for partial residency (0: one per physical core).
     pub cpu_threads: u32,
     /// Bytes of the row cache the PLE table is read through (`crate::rows`); 0 reads its rows
-    /// through the mapping and the page cache instead.
-    pub row_cache_bytes: u64,
+    /// through the mapping and the page cache instead; none, as much as the host memory leaves
+    /// ([`crate::rows::auto_budget`]).
+    pub row_cache_bytes: Option<u64>,
 }
 
 /// A small deterministic generator for sampling (xoshiro256**, seeded by SplitMix64).
@@ -390,8 +391,16 @@ impl Model {
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
-        if settings.row_cache_bytes > 0 {
-            model.weights.cache_rows(PLE_TABLE, settings.row_cache_bytes)?;
+        let row_cache = match settings.row_cache_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let [_, rows] = model.weights.tensor(PLE_TABLE)?.dims[..] else { return Err("Straydog PLE table is not rows".into()) };
+                let width = model.weights.tensor(PLE_TABLE)?.bytes / rows;
+                crate::rows::auto_budget(rows, width, model.weights.host_memory_bytes, model.state_bytes)
+            }
+        };
+        if row_cache > 0 {
+            model.weights.cache_rows(PLE_TABLE, row_cache)?;
         }
         load_seconds.push(("plans", lap(&mut clock)));
         model.load_seconds = load_seconds;

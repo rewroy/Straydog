@@ -182,7 +182,9 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     push("vram-bytes", settings.vram.bytes(settings.gpu.len())
         .map_or_else(|| "auto".into(), |bytes| bytes.iter().map(u64::to_string).collect::<Vec<_>>().join(",")));
     push("state-ram-bytes", ((settings.state_ram * (1u64 << 30) as f64) as u64).to_string());
-    push("row-cache-bytes", (u64::from(settings.row_cache) << 20).to_string());
+    if let Some(mib) = settings.row_cache {
+        push("row-cache-bytes", (u64::from(mib) << 20).to_string());
+    }
     push("prefill-batch-size", settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()));
     push("gemm", if settings.gemm == Gemm::Fp16 { "fp16" } else { "fp32" }.into());
     push("gemm-min-batch", settings.gemm_min_batch.to_string());

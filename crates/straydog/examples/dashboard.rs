@@ -53,7 +53,7 @@ fn main() {
         split_mode: SplitMode::Experts,
         vram: Vram::Gib(vec![30.0]),
         state_ram: 0.0,
-        row_cache: 256,
+        row_cache: None,
         gemm: Gemm::Fp16,
         gemm_min_batch: 2,
         host: "127.0.0.1".into(),

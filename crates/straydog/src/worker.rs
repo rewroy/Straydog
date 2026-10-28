@@ -52,9 +52,10 @@ pub struct WorkerArgs {
     /// Tokens a prefill pass takes, or auto (from the budgets).
     #[arg(long)]
     pub prefill_batch_size: String,
-    /// Bytes of the PLE row cache (0: rows through the page cache).
-    #[arg(long, default_value_t = straydog_engine::rows::DEFAULT_CACHE_BYTES)]
-    pub row_cache_bytes: u64,
+    /// Bytes of the row cache of the PLE and Engram tables (0: rows through the page cache) [default:
+    /// the default budget, and for Qwen3.8's PLE table as much as the host memory leaves].
+    #[arg(long)]
+    pub row_cache_bytes: Option<u64>,
     #[arg(long, default_value = "fp16")]
     pub gemm: String,
     #[arg(long, default_value_t = 2)]
