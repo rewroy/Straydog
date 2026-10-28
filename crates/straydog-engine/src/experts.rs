@@ -629,6 +629,9 @@ const MAX_RESERVE: usize = 32;
 /// two waves of 32 (DeviceExperts::make_room), its streamed experts emptied behind it.
 const PASS_FREE: usize = 64;
 
+/// The recency ranks a warm-up may give ([`DeviceExperts::rank_warm`]): below any a request touches.
+pub const WARM_SPAN: u64 = 1 << 20;
+
 /// A store's experts as (layer, expert), least recently used first: those in VRAM slots, and
 /// those only in the host tier (see [`DeviceExperts::contents`]).
 pub type Contents = (Vec<(usize, usize)>, Vec<(usize, usize)>);
@@ -666,6 +669,9 @@ struct HostSlot {
     /// Its arena in the class, and its offset there.
     arena: usize,
     at: usize,
+    /// A warm-up's read: the place in the LRU order the expert takes once it lands (see
+    /// [`DeviceExperts::rank_warm`]), else it lands as just used.
+    rank: Option<u64>,
 }
 
 struct VramSlot {
@@ -843,6 +849,13 @@ pub struct DeviceExperts {
     regions: usize,
     /// Slots acquired with only their gate and up waited for ([`acquire_gate_up`](Self::acquire_gate_up)).
     rest: Vec<usize>,
+    /// How many passes (decode and verify; a prefill's streamed layers take nearly every expert
+    /// whatever its prompt) used each expert since the start or [`clear_uses`](Self::clear_uses).
+    uses: HashMap<Key, u32>,
+    /// The LRU places of a warm-up's coming placements ([`rank_warm`](Self::rank_warm)), and the
+    /// clock value they count from.
+    warm_ranks: HashMap<Key, u64>,
+    warm_origin: Option<u64>,
 }
 
 impl DeviceExperts {
@@ -954,6 +967,7 @@ impl DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
+            uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None,
         })
     }
 
@@ -1239,6 +1253,12 @@ impl DeviceExperts {
     }
 
     fn acquire_slots(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
+        if !self.streaming {
+            for &expert in experts {
+                let uses = self.uses.entry((layer as u32, expert as u32)).or_insert(0);
+                *uses = uses.saturating_add(1);
+            }
+        }
         self.pump(gpu, false)?;
         // Every hit is held before any miss is filled: a miss never evicts a slot this same
         // request uses later. Experts a request() started were counted there; those of a later
@@ -1882,6 +1902,7 @@ impl DeviceExperts {
         entry.streamed = streamed;
         entry.head = head;
         entry.copied = false;
+        entry.rank = None;
         self.reading += 1;
         self.host_map.insert(key, host);
         self.reader.submit(jobs, urgent);
@@ -1989,10 +2010,16 @@ impl DeviceExperts {
                     }
                 }
                 None => {
-                    // Read for nothing that still waits: the host tier keeps it.
+                    // Read for nothing that still waits: the host tier keeps it (a warm-up's read
+                    // in the place its earlier run had it).
                     let entry = &mut self.host[host];
-                    self.clock += 1;
-                    entry.used = self.clock;
+                    entry.used = match entry.rank.take() {
+                        Some(rank) => rank,
+                        None => {
+                            self.clock += 1;
+                            self.clock
+                        }
+                    };
                     self.classes[entry.class].host_lru.insert((entry.used, host));
                 }
             }
@@ -2186,7 +2213,7 @@ impl DeviceExperts {
         entry.hosts += 1;
         self.host.push(HostSlot {
             key: None, content: Content::Read, busy: None, used: 0, failed: None, cancel: Arc::new(AtomicBool::new(false)),
-            skipped: false, waiter: None, streamed: false, head: 0, copied: false, class, arena, at,
+            skipped: false, waiter: None, streamed: false, head: 0, copied: false, class, arena, at, rank: None,
         });
         self.host.len() - 1
     }
@@ -2216,7 +2243,8 @@ impl DeviceExperts {
     }
 
     /// The experts held, least recently used first: those in VRAM slots, and those only in the
-    /// host tier (read, or written back). A later run warms up with them ([`warm`](Self::warm)).
+    /// host tier (read, or written back; a read still in flight too, in the place it will take).
+    /// A later run warms up with them ([`warm`](Self::warm)).
     pub fn contents(&self) -> Contents {
         let mut vram: Vec<(u64, Key)> = self.classes.iter().flat_map(|class| class.lru.iter())
             .filter_map(|&(used, slot)| self.slots[slot].key.map(|key| (used, key)))
@@ -2224,6 +2252,8 @@ impl DeviceExperts {
         let mut host: Vec<(u64, Key)> = self.classes.iter().flat_map(|class| class.host_lru.iter())
             .filter_map(|&(used, slot)| self.host[slot].key.filter(|key| !self.map.contains_key(key)).map(|key| (used, key)))
             .collect();
+        host.extend(self.host.iter().filter(|entry| matches!(entry.content, Content::Reading(_)) && entry.failed.is_none())
+            .filter_map(|entry| entry.key.filter(|key| !self.map.contains_key(key)).map(|key| (entry.rank.unwrap_or(self.clock), key))));
         vram.sort_unstable();
         host.sort_unstable();
         let keys = |list: Vec<(u64, Key)>| list.into_iter().map(|(_, (layer, expert))| (layer as usize, expert as usize)).collect();
@@ -2259,7 +2289,9 @@ impl DeviceExperts {
                     if !self.host_room(class)? {
                         break;
                     }
-                    self.read(gpu, key, false, false, chunk)?;
+                    let rank = self.warm_ranks.remove(&key).map(|rank| self.warm_used(rank));
+                    let slot = self.read(gpu, key, false, false, chunk)?;
+                    self.host[slot].rank = rank;
                 }
             }
             hosted += 1;
@@ -2272,17 +2304,89 @@ impl DeviceExperts {
                     if !self.host_room(class)? {
                         break;
                     }
+                    let rank = self.warm_ranks.remove(&key).map(|rank| self.warm_used(rank));
                     if !self.classes[class].free.is_empty() {
                         self.prefetch_with(gpu, layer, &[expert], true, chunk, false)?;
+                        if let (Some(used), Some(&slot)) = (rank, self.map.get(&key)) {
+                            self.reorder(slot, used);
+                        }
                     } else if self.classes[class].host_capacity > 0 && !self.host_map.contains_key(&key) {
                         // (VRAM full of what requests brought in: the host tier, then)
-                        self.read(gpu, key, false, false, chunk)?;
+                        let slot = self.read(gpu, key, false, false, chunk)?;
+                        self.host[slot].rank = rank;
                     }
                 }
             }
             placed += 1;
         }
         Ok((self.poll(gpu)?, placed, hosted))
+    }
+
+    /// Tell the store the places in the LRU order (a higher rank is more recent, below [`WARM_SPAN`])
+    /// that a coming [`warm`](Self::warm) gives these experts when it places them: an earlier run's
+    /// recency, kept whatever order the warm-up reads in. Every rank is older than any a pass touches
+    /// after this call.
+    pub fn rank_warm(&mut self, ranks: &[((usize, usize), u64)]) {
+        if self.warm_origin.is_none() {
+            self.warm_origin = Some(self.clock);
+            self.clock += WARM_SPAN;
+        }
+        self.warm_ranks.extend(ranks.iter().map(|&((layer, expert), rank)| ((layer as u32, expert as u32), rank.min(WARM_SPAN - 1))));
+    }
+
+    /// The `used` value of a warm-up's rank.
+    fn warm_used(&self, rank: u64) -> u64 {
+        self.warm_origin.unwrap_or(0) + 1 + rank
+    }
+
+    /// Give VRAM slot `slot` (holding an expert) the place `used` in its class's LRU order.
+    fn reorder(&mut self, slot: usize, used: u64) {
+        let entry = &mut self.slots[slot];
+        let lru = &mut self.classes[entry.class].lru;
+        if entry.key.is_some() && lru.remove(&(entry.used, slot)) {
+            lru.insert((used, slot));
+        }
+        entry.used = used;
+    }
+
+    /// How many passes used each expert (decode and verify passes), as (layer, expert, passes).
+    pub fn uses(&self) -> Vec<(usize, usize, u32)> {
+        self.uses.iter().map(|(&(layer, expert), &uses)| (layer as usize, expert as usize, uses)).collect()
+    }
+
+    /// Forget the passes counted so far ([`uses`](Self::uses)).
+    pub fn clear_uses(&mut self) {
+        self.uses.clear();
+    }
+
+    /// Of `window` (the experts likeliest to be used first), those a fill can place now, in that
+    /// order: into the free VRAM slots (but the reserve and what a prefill's first waves take: see
+    /// [`PASS_FREE`]) first, then the host tier's free slots (but a reserve of them for the reads
+    /// that pass through). An expert held in a tier is skipped, as is one whose size class has no
+    /// room left; [`warm`](Self::warm) places the lists without evicting.
+    pub fn fill_plan(&self, window: &[(usize, usize)]) -> Contents {
+        let mut room: Vec<(usize, usize)> = self.classes.iter().map(|class| {
+            let free = class.free.iter().filter(|&&slot| !self.slots[slot].taken_back).count();
+            let hosted = class.hosts.saturating_sub(class.host_free.len());
+            let host = if class.host_capacity == 0 { 0 } else { class.host_capacity.saturating_sub(hosted).saturating_sub(class.reserve) };
+            (free.saturating_sub(class.reserve + PASS_FREE), host)
+        }).collect();
+        let (mut vram, mut host) = (Vec::new(), Vec::new());
+        for &(layer, expert) in window {
+            let Some(class) = self.class_of.get(layer).copied().flatten() else { continue };
+            let key = (layer as u32, expert as u32);
+            if self.map.contains_key(&key) || self.host_map.contains_key(&key) {
+                continue;
+            }
+            if room[class].0 > 0 {
+                room[class].0 -= 1;
+                vram.push((layer, expert));
+            } else if room[class].1 > 0 {
+                room[class].1 -= 1;
+                host.push((layer, expert));
+            }
+        }
+        (vram, host)
     }
 
     /// Whether a host slot of `class` is to be had without evicting an expert the host tier

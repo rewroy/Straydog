@@ -818,3 +818,77 @@ fn a_prefill_streams_through_and_room_is_made_between_requests() {
     drop(store);
     std::fs::remove_file(path).unwrap();
 }
+
+/// A warm-up reads the most recent first and still leaves the LRU order the earlier run had; the
+/// fill is offered only the room the stores have beside what they hold, and placing it evicts
+/// nothing the warm-up put there.
+#[test]
+fn a_warm_up_keeps_the_places_it_is_given_and_a_fill_takes_only_the_room_left() {
+    let layers = roles();
+    let (path, mut gpu, mut store, _reads) = open(&layers, 16, 30);
+    let (_, host_capacity) = store.capacity();
+    // (the host tier's arena pinned, as a served model has it before any warm-up)
+    store.prepare_staging().unwrap();
+    // read 8, 7, 6, 5 (the most recent first), given the places 3, 2, 1, 0
+    store.rank_warm(&[((0, 8), 3), ((0, 7), 2), ((0, 6), 1), ((0, 5), 0)]);
+    let (_, _, hosted) = store.warm(&mut gpu, &[], &[(0, 8), (0, 7), (0, 6), (0, 5)]).unwrap();
+    assert_eq!(hosted, 4);
+    store.settle(&mut gpu).unwrap();
+    let (vram, host) = store.contents();
+    assert!(vram.is_empty());
+    assert_eq!(host, vec![(0, 5), (0, 6), (0, 7), (0, 8)], "least recently used first, whatever the reads' order");
+    // the same into VRAM slots (a free one each): the places hold there too
+    store.rank_warm(&[((2, 9), 11), ((2, 4), 10)]);
+    store.warm(&mut gpu, &[(2, 9), (2, 4)], &[]).unwrap();
+    store.settle(&mut gpu).unwrap();
+    assert_eq!(store.contents().0, vec![(2, 4), (2, 9)]);
+    // the fill: VRAM's 16 slots are all reserve and a prefill's first waves, so nothing there; the host
+    // tier's room is its capacity less what it holds and a reserve of 4, and nothing held is planned
+    let all: Vec<(usize, usize)> = (0..EXPERTS).flat_map(|expert| [(0, expert), (2, expert)]).collect();
+    let (plan_vram, plan_host) = store.fill_plan(&all);
+    assert!(plan_vram.is_empty());
+    assert_eq!(plan_host.len(), host_capacity - 4 - 4);
+    assert!(plan_host.iter().all(|key| !host.contains(key) && !store.contents().0.contains(key)));
+    let mut left = plan_host.as_slice();
+    for _ in 0..1000 {
+        let (_, _, placed) = store.warm(&mut gpu, &[], left).unwrap();
+        left = &left[placed..];
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(left.is_empty());
+    store.settle(&mut gpu).unwrap();
+    let (_, now) = store.contents();
+    assert_eq!(now.len(), host_capacity - 4);
+    assert!(host.iter().all(|key| now.contains(key)), "the fill evicted what the warm-up had placed");
+    assert!(store.fill_plan(&all).1.is_empty(), "no room left");
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Decode passes count the experts they use; a prefill's streamed layers (nearly every expert, whatever
+/// the prompt) do not.
+#[test]
+fn passes_count_their_experts_but_a_prefills_streamed_layers_do_not() {
+    let layers = roles();
+    let (path, mut gpu, mut store, _reads) = open(&layers, 16, 24);
+    for experts in [vec![1, 2], vec![2, 5]] {
+        store.acquire(&mut gpu, 0, &experts).unwrap();
+        store.release(&mut gpu).unwrap();
+    }
+    store.set_streaming(&mut gpu, true).unwrap();
+    store.acquire(&mut gpu, 2, &[3, 4]).unwrap();
+    store.release(&mut gpu).unwrap();
+    store.set_streaming(&mut gpu, false).unwrap();
+    let mut uses = store.uses();
+    uses.sort_unstable();
+    assert_eq!(uses, vec![(0, 1, 1), (0, 2, 2), (0, 5, 1)]);
+    store.clear_uses();
+    assert!(store.uses().is_empty());
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}

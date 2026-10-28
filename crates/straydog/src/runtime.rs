@@ -712,8 +712,8 @@ impl Driver {
         };
         let holders = match launched {
             Ok(mut process) => {
-                self.restore_warm_state(&mut process).await;
-                let changed = self.serve(&mut process, &mut jobs, &mut controls).await;
+                let warming = self.restore_warm_state(&mut process).await;
+                let changed = self.serve(&mut process, &mut jobs, &mut controls, warming).await;
                 if changed {
                     self.save_warm_state(&mut process).await;
                 }
@@ -749,10 +749,13 @@ impl Driver {
 
     /// Run queued generations until the runtime closes or the worker fails.
     /// Serve generations until the runtime closes or the worker fails; whether the warm-up state
-    /// changed since it was last saved (it is saved meanwhile every [`WARM_SAVE`] it changed).
+    /// changed since it was last saved (it is saved meanwhile every [`WARM_SAVE`] it changed). A
+    /// worker that was handed a state to warm up with (`warming`) has changed the stores' contents
+    /// by itself: its state is saved at the end, whole (what it had not read yet kept), even when no
+    /// request came.
     async fn serve(&self, process: &mut Process, jobs: &mut mpsc::UnboundedReceiver<Job>,
-                   controls: &mut mpsc::UnboundedReceiver<Control>) -> bool {
-        let mut changed = false;
+                   controls: &mut mpsc::UnboundedReceiver<Control>, warming: bool) -> bool {
+        let mut changed = warming;
         let mut save = tokio::time::interval(WARM_SAVE);
         save.tick().await;
         loop {
@@ -825,20 +828,24 @@ impl Driver {
     }
 
     /// Hand the worker the state an earlier run saved for this model: it warms up with it in the
-    /// background, never ahead of a request.
-    async fn restore_warm_state(&self, process: &mut Process) {
-        let Some(path) = self.ready_frame().and_then(|_| self.warm_source()) else { return };
+    /// background, never ahead of a request. Whether it was handed one.
+    async fn restore_warm_state(&self, process: &mut Process) -> bool {
+        let Some(path) = self.ready_frame().and_then(|_| self.warm_source()) else { return false };
         let state = std::fs::File::open(&path).ok().and_then(|file| {
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut std::io::Read::take(file, WARM_BYTES + 1), &mut bytes).ok()?;
             (bytes.len() as u64 <= WARM_BYTES).then(|| std::str::from_utf8(&bytes).ok().and_then(|text| pyjson::parse(text).ok()))?
         });
-        let Some(state) = state.and_then(|saved| saved.get("state").cloned()) else { return };
+        let Some(state) = state.and_then(|saved| saved.get("state").cloned()) else { return false };
         tracing::info!("Straydog warming up with {}", path.display());
         let warm = frame(vec![("id", pyjson::Value::Str("warm".into())), ("command", pyjson::Value::Str("warm".into())),
                               ("state", state)]);
-        if let Err(message) = process.send(&warm).await {
-            tracing::warn!("Straydog could not hand its worker the warm-up state: {message}");
+        match process.send(&warm).await {
+            Ok(()) => true,
+            Err(message) => {
+                tracing::warn!("Straydog could not hand its worker the warm-up state: {message}");
+                false
+            }
         }
     }
 

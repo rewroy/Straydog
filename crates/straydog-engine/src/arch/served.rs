@@ -17,6 +17,8 @@ use crate::model::Rng;
 use crate::pinned::Pinned;
 use crate::sampling::{self, Generated, Sampling};
 
+pub use super::warm::{Warm, Warmed};
+
 /// How a drafter chooses its tokens for a request that samples plainly ([`Sampling::plain`]): it draws each from the
 /// softmax of its own logits times `inverse_temperature` (the request's), the draw seeded by `seed`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +102,24 @@ pub trait Engines {
     /// expert's layer to whichever store holds that layer now: the most recent of each.
     fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> Contents {
         (vram, host)
+    }
+    /// Tell the stores the recency rank (a higher one is more recent) that a coming [`warm`](Self::warm)
+    /// gives these experts when it places them, so that an earlier run's order holds whatever order
+    /// they are read in. Each rank is older than anything a request touches afterwards.
+    fn rank_warm(&mut self, _ranks: &[((usize, usize), u64)]) {}
+    /// How many passes used each expert since the start (or [`clear_uses`](Self::clear_uses)), as
+    /// (layer, expert, passes): only decode and verify passes, which take the experts a model
+    /// favors (a long prompt's take nearly every one).
+    fn uses(&self) -> Vec<(usize, usize, u32)> {
+        Vec::new()
+    }
+    /// Forget the passes counted so far.
+    fn clear_uses(&mut self) {}
+    /// Of `window` (the experts likeliest to be used first), those the stores' free slots take now,
+    /// into VRAM and into the host tier, each in the window's order; none when the stores have no
+    /// room to spare. Experts a store holds are not planned again.
+    fn fill_plan(&self, _window: &[(usize, usize)]) -> Contents {
+        (Vec::new(), Vec::new())
     }
     /// Take the landed reads, without waiting; the reads still in flight.
     fn poll(&mut self) -> Result<usize, String>;
@@ -280,9 +300,6 @@ pub struct Settings {
     pub half_gemm: bool,
 }
 
-/// Experts still to warm up with, as (layer, expert).
-type Pending = std::collections::VecDeque<(usize, usize)>;
-
 /// The sequence state saved where a prompt's reply began (or, the root, where its system prompt
 /// ended), and the tokens before it.
 struct Checkpoint {
@@ -295,10 +312,6 @@ struct Checkpoint {
 /// one prefills in about a second).
 const ROOT_MINIMUM: usize = 1024;
 
-/// Warm-up steps (a millisecond apart, the worker's) with no room and no read on its way before
-/// the warm-up gives up.
-const WARM_PATIENCE: usize = 30_000;
-
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
 
@@ -307,9 +320,6 @@ pub struct Session<E: Engines> {
     pub engines: E,
     files: &'static Pinned,
     vocabulary: usize,
-    /// Layers and experts per layer (a warm-up state's pairs must lie within).
-    layers: usize,
-    experts: usize,
     pub context: usize,
     pub batch: usize,
     /// The tokens the engines hold, in order.
@@ -338,11 +348,8 @@ pub struct Session<E: Engines> {
     /// Tests only: when set, each request's prompt logits (those its first token is chosen from).
     #[doc(hidden)]
     pub prompt_logits: Option<Vec<f32>>,
-    /// An earlier run's experts still to warm up with: (VRAM, host tier), least recently used
-    /// first, taken from the front.
-    warming: (Pending, Pending),
-    /// Warm-up steps in a row that found no room and no read on its way.
-    warm_stalled: usize,
+    /// The warm-up with an earlier run's experts (see [`Warm`]).
+    warmth: Warm,
 }
 
 /// What an architecture's placement gives a session.
@@ -518,11 +525,11 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
 impl<E: Engines> Session<E> {
     pub fn new(placed: Placed<E>) -> Session<E> {
         Session {
-            engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary, layers: placed.layers, experts: placed.experts,
+            engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary,
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
             root_end: placed.root_end, checkpoints: Vec::new(), agreed: 0, card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
-            last_metrics: Map::new(), prompt_logits: None, warming: Default::default(), warm_stalled: 0,
+            last_metrics: Map::new(), prompt_logits: None, warmth: Warm::new(placed.layers, placed.experts),
         }
     }
 
@@ -833,55 +840,26 @@ impl<E: Engines> Session<E> {
         Ok(())
     }
 
-    /// What a later start warms up with: the experts the engines hold, least recently used first,
-    /// in VRAM (`vram`) and only in the host tier (`host`), as [layer, expert] pairs.
+    /// What a later start warms up with ([`Warm::state`]).
     pub fn warm_state(&self) -> Value {
-        let (vram, host) = self.engines.contents();
-        json!({"vram": vram, "host": host})
+        self.warmth.state(&self.engines)
     }
 
     /// Warm up with an earlier run's [`warm_state`](Self::warm_state), step by step
-    /// ([`warm_step`](Self::warm_step)) while no request runs. Pairs outside the model are dropped,
-    /// and those the slots as placed do not hold. The experts to bring into VRAM and the host tier.
+    /// ([`warm_step`](Self::warm_step)) while no request runs ([`Warm::start`]). The experts to bring
+    /// into VRAM and the host tier.
     pub fn warm(&mut self, state: &Value) -> Result<(usize, usize), String> {
-        let (layers, experts) = (self.layers, self.experts);
-        let pairs = |key: &str| -> Result<Pending, String> {
-            let list = state.get(key).and_then(Value::as_array).ok_or("a Straydog warm-up state without its lists")?;
-            Ok(list.iter()
-                .filter_map(|pair| Some((pair.get(0)?.as_u64()? as usize, pair.get(1)?.as_u64()? as usize)))
-                .filter(|&(layer, expert)| layer < layers && expert < experts)
-                .collect())
-        };
-        let (vram, host) = self.engines.fit_warm(pairs("vram")?.into(), pairs("host")?.into());
-        self.warming = (vram.into(), host.into());
-        Ok((self.warming.0.len(), self.warming.1.len()))
+        self.warmth.start(&mut self.engines, state)
     }
 
-    /// Take the warm-up's reads that landed and, while fewer than `in_flight` are on their way
-    /// (each device's read of an expert counts), start up to `count` more (VRAM's first, the
-    /// experts a request is likeliest to use, then the host tier's; each least recently used
-    /// first, so the most recent end up the most recent), without waiting: a request that comes
-    /// meanwhile finds the drive and the bus nearly free. Whether the warm-up is over.
-    pub fn warm_step(&mut self, count: usize, in_flight: usize) -> Result<bool, String> {
-        let reading = self.engines.poll()?;
-        let left = self.warming.0.len() + self.warming.1.len();
-        if left == 0 || reading >= in_flight {
-            return Ok(left == 0 && reading == 0);
-        }
-        let count = count.min((in_flight - reading).div_ceil(self.engines.devices_per_expert()));
-        let vram: Vec<(usize, usize)> = self.warming.0.iter().take(count).copied().collect();
-        let host: Vec<(usize, usize)> = self.warming.1.iter().take(count - vram.len()).copied().collect();
-        // (those the stores have no room for yet stay first in line)
-        let (reads, placed, hosted) = self.engines.warm(&vram, &host)?;
-        self.warming.0.drain(..placed);
-        self.warming.1.drain(..hosted);
-        // No room for a long while (the stores full of what requests brought in) and nothing on
-        // its way: done. (Room comes as the host tier is pinned, and as reads land.)
-        self.warm_stalled = if placed + hosted == 0 && reads == 0 { self.warm_stalled + 1 } else { 0 };
-        if self.warm_stalled > WARM_PATIENCE {
-            self.warming = Default::default();
-        }
-        Ok(false)
+    /// One step of the warm-up ([`Warm::step`]).
+    pub fn warm_step(&mut self, count: usize, in_flight: usize) -> Result<Warmed, String> {
+        self.warmth.step(&mut self.engines, count, in_flight)
+    }
+
+    /// What the fill placed so far ([`Warm::filled`]).
+    pub fn filled(&self) -> (usize, usize, u64) {
+        self.warmth.filled(&self.engines)
     }
 
     /// Wait for the expert stores' reads and copies (before the process ends).

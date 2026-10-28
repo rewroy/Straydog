@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use straydog_engine::arch::served::{Engines, Session, Settings};
+use straydog_engine::arch::served::{Engines, Session, Settings, Warmed};
 use straydog_engine::arch::{deepseek41, qwen35moe};
 use straydog_engine::bundle;
 use straydog_engine::chat::{self, ChatTemplate};
@@ -126,35 +126,43 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                     return;
                 }
             };
-            // Between requests, an earlier run's experts come back a few reads at a time; then
-            // (and after each request) the stores make room for the next prefill a few
-            // write-backs at a time.
+            // Between requests, the stores make room for the next prefill a few write-backs at a
+            // time (and copy the checkpoints a request took); an earlier run's experts come back a
+            // few reads at a time, then the free slots fill, in the time that leaves.
             let mut warming: Option<Instant> = None;
+            let mut listed: Option<Instant> = None;
             let mut rooming = false;
             loop {
                 let job = if warming.is_some() || rooming {
                     match queue.recv_timeout(std::time::Duration::from_millis(1)) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some(since) = warming {
+                            if rooming {
+                                match served.model.make_room() {
+                                    Ok(done) => rooming = !done,
+                                    Err(error) => {
+                                        eprintln!("Straydog stopped making room for the next prefill: {error}");
+                                        rooming = false;
+                                    }
+                                }
+                            } else if let Some(since) = warming {
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
-                                    Ok(false) => {}
-                                    Ok(true) => {
+                                    Ok(Warmed::Going) => {}
+                                    Ok(Warmed::Listed) => {
                                         eprintln!("Straydog warmed up in {:.1} s", since.elapsed().as_secs_f64());
+                                        listed = Some(Instant::now());
+                                    }
+                                    Ok(Warmed::Done) => {
+                                        let (vram, host, bytes) = served.model.filled();
+                                        eprintln!("Straydog filled its free slots with {vram} experts for VRAM, {host} for the host tier \
+                                                   ({:.1} GiB from the drive) in {:.1} s", bytes as f64 / (1u64 << 30) as f64,
+                                                  listed.map_or(0.0, |listed| listed.elapsed().as_secs_f64()));
                                         warming = None;
                                         rooming = true;
                                     }
                                     Err(error) => {
                                         eprintln!("Straydog stopped warming up: {error}");
                                         warming = None;
-                                    }
-                                }
-                            } else {
-                                match served.model.make_room() {
-                                    Ok(done) => rooming = !done,
-                                    Err(error) => {
-                                        eprintln!("Straydog stopped making room for the next prefill: {error}");
-                                        rooming = false;
                                     }
                                 }
                             }
@@ -184,6 +192,7 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         Ok((vram, host)) => {
                             eprintln!("Straydog warming up with {vram} experts for VRAM, {host} for the host tier");
                             warming = Some(Instant::now());
+                            listed = None;
                         }
                         Err(error) => eprintln!("Straydog cannot warm up: {error}"),
                     },

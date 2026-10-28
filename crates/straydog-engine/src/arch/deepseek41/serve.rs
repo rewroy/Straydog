@@ -182,6 +182,33 @@ impl served::Engines for Engines {
         Ok((reading, placed, hosted))
     }
 
+    fn rank_warm(&mut self, ranks: &[((usize, usize), u64)]) {
+        for engine in &mut self.engines {
+            engine.rank_experts(ranks);
+        }
+    }
+
+    fn uses(&self) -> Vec<(usize, usize, u32)> {
+        self.engines.iter().flat_map(|engine| engine.expert_uses()).collect()
+    }
+
+    fn clear_uses(&mut self) {
+        for engine in &mut self.engines {
+            engine.clear_expert_uses();
+        }
+    }
+
+    fn fill_plan(&self, window: &[(usize, usize)]) -> crate::experts::Contents {
+        // each engine its layers' (the stores' free slots as they are now), in the window's order
+        let (mut in_vram, mut in_host) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for engine in &self.engines {
+            let (vram, host) = engine.fill_experts(window);
+            in_vram.extend(vram);
+            in_host.extend(host);
+        }
+        (window.iter().filter(|key| in_vram.contains(key)).copied().collect(), window.iter().filter(|key| in_host.contains(key)).copied().collect())
+    }
+
     fn fit_warm(&self, vram: Vec<(usize, usize)>, host: Vec<(usize, usize)>) -> crate::experts::Contents {
         // each engine its layers' (the stores' layers as placed now, whatever they were)
         let (mut kept_vram, mut kept_host) = (std::collections::HashSet::new(), std::collections::HashSet::new());
