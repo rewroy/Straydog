@@ -124,10 +124,15 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
    With body_tail, the body's columns from tail_first on are [slots, vocabulary - tail_first] there
    and body holds the columns below (rows of vocabulary).
    All inputs/outputs/scratch must be disjoint. Scratch: slots * align16(4*(width+rank)) + 512 bytes.
+   sample_at (device, 4 x uint32; null: greedy) makes each slot's token a draw rather than the argmax: with the
+   float bits of an inverse temperature (0: greedy again) in word 0 and a 64-bit seed in words 1-2, token i is
+   a draw from softmax(corrected logits * inverse temperature) (Gumbel-max, noise from the seed, the slot and the
+   column), and the next slot's Markov features follow the drawn token. The parameters are read when the op runs,
+   so a recorded graph follows them as it does anchor_at.
    Reference defaults: threshold=0, minimum=0. No host readback; graph-capturable. */
 int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, uint64_t tail_first, const float* hidden,
                       const void* w1, const void* w2, const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank,
-                      uint64_t width, uint32_t anchor, const int32_t* anchor_at, float threshold, uint64_t minimum, float* logits,
+                      uint64_t width, uint32_t anchor, const int32_t* anchor_at, const uint32_t* sample_at, float threshold, uint64_t minimum, float* logits,
                       int32_t* tokens, float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes);
 /* Decode fusions (one vector): sd_op_norm_linears stores the RMS norm of x (weight, eps) in
    normed (width floats) and runs the linears over it (every item's input is normed, its columns

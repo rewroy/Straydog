@@ -113,6 +113,30 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
     assert_eq!(live.tokens, whole.tokens[24..], "a live continuation");
     eprintln!("live continuation: {made} drafted, {kept} accepted");
 
+    // A sampled reply (a temperature, nothing cut: the server's own sampling for this model): the drafter draws its drafts from its
+    // own distribution, and a seed still gives the same reply twice, drafts and all (at a width of its own: the policy's widths follow
+    // the passes' timing, and a sampled reply depends on them).
+    let sampling = Sampling { temperature: 1.0, ..Sampling::GREEDY };
+    assert!(sampling.plain());
+    let mut sampled = |seed: u64| {
+        model.forget();
+        assert!(model.engines.draft_with_dspark(true));
+        model.engines.draft_width(Some(3));
+        let mut tokens = Vec::new();
+        model.generate(&essay, 120, &sampling, seed, &|| false, &mut |_, _| {}, &mut |token| tokens.push(token)).unwrap();
+        let count = |key: &str| model.last_metrics[key].as_u64().unwrap();
+        (tokens, count("engine_draft_tokens"), count("accepted_engine_drafts"))
+    };
+    let (first, made, kept) = sampled(5);
+    let (again, ..) = sampled(5);
+    let (other, ..) = sampled(6);
+    assert_eq!(first, again, "a seed gives the same sampled reply with the drafter");
+    assert_ne!(first, other, "another seed does not");
+    assert!(made > 0 && kept > 0, "DSpark drafted {made} and had {kept} accepted in a sampled reply");
+    eprintln!("a sampled reply: DSpark drafted {made}, {kept} accepted, {} passes for {} tokens", model.last_metrics["decode_passes"],
+              model.last_metrics["generated_tokens"]);
+    model.engines.draft_width(None);
+
     // The history through the engines' own passes, with the trait the session drives.
     let tokens = text.encode(&document).unwrap();
     assert!(tokens.len() > 420, "{}", tokens.len());

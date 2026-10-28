@@ -214,7 +214,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn sd_decode_options(
         handle: *mut ::std::os::raw::c_void,
-        q8: ::std::os::raw::c_int,
+        flags: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -394,6 +394,7 @@ unsafe extern "C" {
         width: u64,
         anchor: u32,
         anchor_at: *const i32,
+        sample_at: *const u32,
         threshold: f32,
         minimum: u64,
         logits: *mut f32,
@@ -569,6 +570,17 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_hc_collapse(
+        handle: *mut ::std::os::raw::c_void,
+        stream: *const f32,
+        pre: *const f32,
+        rows: u64,
+        hc: u64,
+        width: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_hc_mean(
         handle: *mut ::std::os::raw::c_void,
         stream: *const f32,
@@ -579,17 +591,6 @@ unsafe extern "C" {
         out: *mut f32,
         stride: u64,
         offset: u64,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
-    pub fn sd_op_hc_collapse(
-        handle: *mut ::std::os::raw::c_void,
-        stream: *const f32,
-        pre: *const f32,
-        rows: u64,
-        hc: u64,
-        width: u64,
-        out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

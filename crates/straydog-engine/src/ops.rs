@@ -273,17 +273,19 @@ impl Backend {
         })
     }
 
-    /// DSpark's greedy Markov chain. Inputs/outputs/scratch must be disjoint; scratch holds
+    /// DSpark's Markov chain, greedy (or drawn: see `sample_at`). Inputs/outputs/scratch must be disjoint; scratch holds
     /// `slots * 4 * (width+rank)` bytes (each slot's features, 16-byte aligned) and 512 more. Only the first
     /// `count` tokens/confidences are used. Reference defaults are `threshold=0.0`, `minimum=0`
     /// (llama.cpp be83657 common.h:330-333). No host readback: the first invocation may be captured
     /// in a graph. With `anchor_at` the anchor token is read from that device i32 instead (`anchor`
     /// still checked when queued). With `tail` = (logits, first), the body's columns from `first` on
     /// are those, `[slots, vocabulary - first]`, not in `body` (which then holds the columns below
-    /// `first`, `[slots, vocabulary]`).
+    /// `first`, `[slots, vocabulary]`). With `sample_at` (four device u32: an inverse temperature's float bits, 0 for
+    /// greedy, and a 64-bit seed, low word first) each token is a draw from the softmax of its corrected logits at
+    /// that temperature, the chain following the drawn tokens; read when the op runs, so a graph follows it.
     #[allow(clippy::too_many_arguments)]
     pub fn dspark_head(&mut self, body: P, tail: Option<(P, u64)>, hidden: P, w1: &Buffer, w2: &Buffer, conf: &Buffer,
-                       slots: u64, vocabulary: u64, rank: u64, width: u64, anchor: u32, anchor_at: Option<P>,
+                       slots: u64, vocabulary: u64, rank: u64, width: u64, anchor: u32, anchor_at: Option<P>, sample_at: Option<P>,
                        threshold: f32, minimum: u64, logits: M, tokens: M, confidences: M,
                        count: M, scratch: &Buffer) -> Result<()> {
         let (tail, first) = tail.map_or((std::ptr::null(), 0), |(tail, first)| (tail, first));
@@ -291,7 +293,7 @@ impl Backend {
         check(unsafe {
             ffi::sd_op_dspark_head(self.handle(), body.cast(), tail.cast(), first, hidden.cast(), w1.pointer.cast_const(),
                 w2.pointer.cast_const(), conf.pointer.cast(), slots, vocabulary, rank, width, anchor, anchor_at.map_or(std::ptr::null(), |at| at.cast()),
-                threshold, minimum, logits.cast(), tokens.cast(), confidences.cast(), count.cast(), scratch.pointer.cast(), scratch.bytes)
+                sample_at.map_or(std::ptr::null(), |at| at.cast()), threshold, minimum, logits.cast(), tokens.cast(), confidences.cast(), count.cast(), scratch.pointer.cast(), scratch.bytes)
         })
     }
 

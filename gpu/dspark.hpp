@@ -35,7 +35,7 @@ __global__ void dspark_finish(const int32_t* tokens, float* confidences, size_t 
 
 int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, uint64_t tail_first, const float* hidden,
                       const void* w1, const void* w2, const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank,
-                      uint64_t width, uint32_t anchor, const int32_t* anchor_at, float threshold, uint64_t minimum, float* logits,
+                      uint64_t width, uint32_t anchor, const int32_t* anchor_at, const uint32_t* sample_at, float threshold, uint64_t minimum, float* logits,
                       int32_t* tokens, float* confidences, uint32_t* count, float* scratch, uint64_t scratch_bytes) {
     SD_OP_BEGIN
     if (!slots || slots > 5 || !vocabulary || vocabulary > INT32_MAX || !rank || !width ||
@@ -62,6 +62,7 @@ int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, u
     op_span(value, count, 4, "DSpark prefix length");
     op_span(value, scratch, needed, "DSpark scratch");
     if (anchor_at) op_span(value, anchor_at, 4, "DSpark anchor token");
+    if (sample_at) op_span(value, sample_at, 16, "DSpark sampling parameters");
     auto* partial = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(scratch) + partial_offset);
     const size_t tail_split = body_tail ? size_t(tail_first) : size_t(vocabulary);
     for (size_t slot = 0; slot < slots; ++slot) {
@@ -72,7 +73,8 @@ int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, u
                   feature + width, 0, 1, logits + slot * vocabulary, 0, nullptr, 0);
         dspark_add_kernel<<<logit_blocks, 256, 0, value.stream>>>(body + slot * vocabulary,
             body_tail ? body_tail + slot * (vocabulary - tail_first) : nullptr, tail_split, size_t(vocabulary), logits + slot * vocabulary);
-        row_argmax(value, logits + slot * vocabulary, 1, size_t(vocabulary), 0, partial, tokens + slot);
+        if (sample_at) row_sample(value, logits + slot * vocabulary, 1, size_t(vocabulary), 0, sample_at, uint32_t(slot), partial, tokens + slot);
+        else row_argmax(value, logits + slot * vocabulary, 1, size_t(vocabulary), 0, partial, tokens + slot);
     }
     for (size_t first = 0; first < slots; first += size_t(gemv_max_vectors)) {
         const size_t steps = std::min(slots - first, size_t(gemv_max_vectors));

@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 
 use super::engine::{columns, Beside, TAP_LAYERS, TAP_ROWS};
+use crate::arch::served::Draw;
 use crate::arch::{Tensor, Tensors};
 use crate::formats;
 use crate::gpu::{Backend, Result};
@@ -196,6 +197,9 @@ pub struct Drafter {
     results: Buffer,
     /// The block's anchor token (i32), for the Markov head's graph.
     anchor: Buffer,
+    /// How the head's tokens are chosen (four u32: the inverse temperature's bits, 0 for the argmax, and a
+    /// 64-bit seed), read on the device, so that the head's graph follows it.
+    sample: Buffer,
     vocabulary: usize,
     /// The positions the rings hold.
     held: History,
@@ -572,6 +576,7 @@ impl Drafter {
             corrected: floats(gpu, MAX_SLOTS * vocabulary)?,
             results: floats(gpu, 2 * MAX_SLOTS + 1)?,
             anchor: floats(gpu, 1)?,
+            sample: floats(gpu, 4)?,
             vocabulary,
             held: History::new(),
             ran: HashSet::new(),
@@ -623,6 +628,15 @@ impl Drafter {
             all.push(routes);
         }
         Ok(all)
+    }
+
+    /// The head's logits (corrected by the Markov head) of the last draft's first `rows` slots, each the vocabulary
+    /// wide: the rows a drawn draft's tokens were drawn from the softmax of.
+    pub fn drawn_rows(&mut self, devices: &mut [Beside<'_>], rows: usize) -> Result<Vec<Vec<f32>>> {
+        let gpu = &mut *devices[0].gpu;
+        let mut all = vec![0f32; rows.min(MAX_SLOTS) * self.vocabulary];
+        gpu.read_buffer(&self.corrected, 0, &mut all)?;
+        Ok(all.chunks(self.vocabulary).map(<[f32]>::to_vec).collect())
     }
 
     /// Forget every injected position from `position` on (a rewind of the target to `position`).
@@ -690,6 +704,14 @@ impl Drafter {
     /// DSpark's confidence in each.
     pub fn draft(&mut self, devices: &mut [Beside<'_>], embed: &impl Tensors, anchor: u32, position: usize, slots: usize)
                  -> Result<Draft> {
+        self.draft_drawn(devices, embed, anchor, position, slots, None)
+    }
+
+    /// [`Drafter::draft`], its tokens drawn from the softmax of the head's logits at the temperature `draw` gives
+    /// instead of the argmax when it is given (each slot's Markov features then follow the token drawn before it);
+    /// [`Drafter::drawn_rows`] has the logits the draws were from.
+    pub fn draft_drawn(&mut self, devices: &mut [Beside<'_>], embed: &impl Tensors, anchor: u32, position: usize, slots: usize,
+                       draw: Option<Draw>) -> Result<Draft> {
         if slots == 0 || slots > MAX_SLOTS || anchor as usize >= self.vocabulary || devices.len() != self.parts.len() {
             return Err(format!("a DSpark draft of {slots} slots after token {anchor}"));
         }
@@ -787,10 +809,13 @@ impl Drafter {
         let tail = (split < vocabulary).then(|| (self.tail.base().cast_const(), split as u64));
         let gpu = &mut *first[0].gpu;
         gpu.write_buffer(&self.anchor, 0, &[anchor as i32])?;
+        let draw = draw.map_or([0u32; 4], |draw| [draw.inverse_temperature.to_bits(), draw.seed as u32, (draw.seed >> 32) as u32, 0]);
+        gpu.write_buffer(&self.sample, 0, &draw)?;
         let (markov, ran) = (key(10), self.ran(key(10)));
         replay(gpu, markov, ran, |gpu| {
             gpu.dspark_head(self.logits.base(), tail, self.parts[0].collapsed.base(), &self.markov[0], &self.markov[1], &self.confidence, rows,
-                            vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, Some(self.anchor.base().cast_const()), 0.0, 0,
+                            vocabulary as u64, MARKOV as u64, WIDTH as u64, anchor, Some(self.anchor.base().cast_const()),
+                            Some(self.sample.base().cast_const()), 0.0, 0,
                             self.corrected.base(), self.results.at(0), self.results.at(MAX_SLOTS), self.results.at(2 * MAX_SLOTS),
                             &self.parts[0].scratch)
         })?;
