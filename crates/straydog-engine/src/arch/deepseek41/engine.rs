@@ -1379,6 +1379,32 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.first().map_or((0, 0), |shard| shard.experts.capacity())
     }
 
+    /// Lend each device's expert store, for good, the VRAM its card has free beyond `keep` and its
+    /// budget still allows, once the first passes have taken what the runtime keeps beside the
+    /// counted buffers (kernels, handles, graphs): the placement's reserve and the budget's margin
+    /// are for those and for other programs, and what they leave is not used. The devices' stores
+    /// hold equal slots, so each lends the least any could; the bytes lent a device and the slots
+    /// they made in each store.
+    pub fn lend_spare(&mut self, keep: u64) -> Result<(u64, usize)> {
+        let mut bytes = u64::MAX;
+        for shard in &self.shards {
+            let (allocated, budget) = shard.gpu.memory()?;
+            bytes = bytes.min(spare_bytes(shard.gpu.free_bytes()?, keep, allocated, budget));
+        }
+        if bytes == 0 || bytes == u64::MAX {
+            return Ok((0, 0));
+        }
+        let regions = self.shards.iter_mut().map(|shard| shard.gpu.buffer(bytes)).collect::<Result<Vec<_>>>()?;
+        let mut made = None;
+        for (shard, region) in self.shards.iter_mut().zip(regions) {
+            let (_, slots) = shard.experts.lend_region(region)?;
+            if *made.get_or_insert(slots) != slots {
+                return Err("the devices' expert stores made different slots from the spare VRAM".into());
+            }
+        }
+        Ok((bytes, made.unwrap_or(0)))
+    }
+
     /// All shards' scheduled/minimum staging/currently pinned host expert bytes.
     pub fn expert_host_memory(&self) -> (u64, u64, u64) {
         self.shards.iter().map(|shard| shard.experts.host_memory())
@@ -3208,6 +3234,18 @@ pub fn divided(name: &str) -> bool {
 /// 32 s, 256 rows 26 s, 512 rows 25 s), and its scores take a row of the context each.
 pub const ATTENTION_ROWS: usize = 256;
 
+/// The least spare VRAM worth a region of its own, and the unit it is lent in.
+const SPARE_LEAST: u64 = 64 << 20;
+const SPARE_UNIT: u64 = 16 << 20;
+
+/// The VRAM a device can lend its expert store ([`Engine::lend_spare`]): what its card has `free`
+/// beyond `keep`, and what its budget has left of `allocated`, in whole units; none under
+/// [`SPARE_LEAST`].
+fn spare_bytes(free: u64, keep: u64, allocated: u64, budget: u64) -> u64 {
+    let bytes = free.saturating_sub(keep).min(budget.saturating_sub(allocated)) / SPARE_UNIT * SPARE_UNIT;
+    if bytes < SPARE_LEAST { 0 } else { bytes }
+}
+
 /// The bytes a device's buffers of every row take per row of a pass (see [`Settings::rows`]), on
 /// an engine of `parts` devices over `layers`: as `Shard::new` allocates them.
 pub fn pass_row_bytes(hp: &Hparams, parts: usize, layers: std::ops::Range<usize>) -> u64 {
@@ -3334,6 +3372,23 @@ mod tests {
     fn a_pass_packs_its_four_position_vectors_into_one_image() {
         let packed = super::pack_schedule(4, &[10, 11], &[2, 3], &[7, 8], &[1, 1]);
         assert_eq!(packed, vec![10, 11, 0, 0, 2, 3, 0, 0, 7, 8, 0, 0, 1, 1, 0, 0]);
+    }
+
+    /// A device lends what its card has free beyond what is kept, unless its budget has less left,
+    /// in whole units, and nothing under the least worth a region.
+    #[test]
+    fn the_spare_vram_is_what_the_card_and_the_budget_both_leave() {
+        const MIB: u64 = 1 << 20;
+        // the card holds 1400 MiB past 768 kept: 632, to 624 in units of 16; the budget has 1000 left
+        assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30000 * MIB, 31000 * MIB), 624 * MIB);
+        // a budget with 100 MiB left lends 96
+        assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30900 * MIB, 31000 * MIB), 96 * MIB);
+        // 63 MiB is under the least; 64 is not; a card below what is kept, or a full budget, lends none
+        assert_eq!(super::spare_bytes(831 * MIB, 768 * MIB, 0, 31000 * MIB), 0);
+        assert_eq!(super::spare_bytes(832 * MIB, 768 * MIB, 0, 31000 * MIB), 64 * MIB);
+        assert_eq!(super::spare_bytes(700 * MIB, 768 * MIB, 0, 31000 * MIB), 0);
+        assert_eq!(super::spare_bytes(5000 * MIB, 768 * MIB, 31000 * MIB, 31000 * MIB), 0);
+        assert_eq!(super::spare_bytes(5000 * MIB, 768 * MIB, 32000 * MIB, 31000 * MIB), 0);
     }
 
     #[test]

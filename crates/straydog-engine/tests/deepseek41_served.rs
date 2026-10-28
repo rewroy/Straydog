@@ -57,6 +57,12 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
         row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: false,
     };
     let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+    // (as the worker does after its first passes: the VRAM the cards have spare goes to the expert stores)
+    model.generate(&[0, 1000, 2000, 3000], 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, &mut |_| {}).unwrap();
+    model.forget();
+    let slots = model.placement["expert_slots"].clone();
+    model.lend_spare().unwrap();
+    assert!(model.placement["expert_slots"][0].as_u64() > slots[0].as_u64(), "the spare VRAM made slots: {slots} before, {} after", model.placement["expert_slots"]);
     model.prompt_logits = Some(Vec::new());
     let text = Text::from_gguf(model.header()).unwrap();
     let template = ChatTemplate::new(straydog_engine::arch::deepseek41::CHAT_TEMPLATE).unwrap();
