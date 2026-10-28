@@ -198,9 +198,11 @@ The expert store (`experts.rs`) has three tiers:
   expert types). The VRAM left after everything else is counted in units of the largest
   expert's share, and each class gets its layers' share of the bytes. Each class replaces its
   least recently used slot.
-  - VRAM idle between passes holds slots too: the prefill rows' arena, and each kv source's
-    compressed rows and index keys past what the sequence has reached. A pass takes back what it
-    reaches (its experts go to the host tier).
+  - VRAM idle between passes holds slots too: the prefill rows' arena, each kv source's
+    compressed rows and index keys past what the sequence has reached, and the batch buffers
+    (the index scores, the queries, the attended rows, Engram's values) past the rows a pass fills
+    and, for the scores, the groups its positions reach: 357 MiB a device at 262144 tokens, nearly
+    all of it for a short pass. A pass takes back what it reaches (its experts go to the host tier).
   - Once the server's first passes have run, each device lends its store, for good, the VRAM its
     card still has free beyond 768 MiB (within its budget). The placement's `RESERVE` and the
     budget's margin are for the runtime's own memory and other programs, and what they leave is
@@ -377,11 +379,15 @@ Then:
 - the DSpark drafter's footprint;
 - `RESERVE`, 1.625 GiB for the runtime's own memory. On DeepSeek-V4.1 that memory (kernels,
   handles, graphs) is 0.9 GiB; the rest of `RESERVE` covers Straydog's own buffers the terms above
-  do not count (0.5-0.64 GiB on the two R9700s).
+  do not count: the device's workspace (352 MiB: a 128 MiB GEMM expansion, 128 MiB of input and
+  output staging, 32 MiB of half inputs, 16 MiB of BLAS workspace, 48 MiB of attention partials)
+  and the batch buffers (about 366 MiB, 357 of them lent to the store between passes), less 75 MiB
+  the resident share is counted over. DSpark's Markov head (131 MiB) is on the first device alone,
+  though the placement counts the first device's footprint on both.
 
 The rest is expert slots. After the first passes each device also lends what its card has free
-beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 5983 slots
-per device (5291 placed, 541 lent between passes, 151 from the spare VRAM: 624 MiB) and a
+beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 6067 slots
+per device (5291 placed, 625 lent between passes, 151 from the spare VRAM: 624 MiB) and a
 102.2 GiB host tier (12,629 experts' worth, of 15,360), using 60.6 of 61.5 GiB.
 
 ### 7.2 Passes
