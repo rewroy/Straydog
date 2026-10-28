@@ -422,6 +422,8 @@ fn main() -> Result<(), String> {
         // per block size, over the prompts: rounds, tokens matched as a prefix, rounds whose prefix
         // reaches each slot, seconds drafting
         let mut drafted_all: Vec<(usize, usize, Vec<usize>, f64)> = draft_slots.iter().map(|&slots| (0, 0, vec![0; slots], 0.0)).collect();
+        // every draft's tokens and confidences, bit for bit
+        let mut draft_hash = 0xcbf2_9ce4_8422_2325u64;
         // DS41_PROFILE: the decode passes' phases, and the store's counters over them
         let (mut phases, mut stores) = (std::collections::BTreeMap::<&str, f64>::new(), straydog_engine::experts::Counts::default());
         for (index, tokens_file) in tokens_files.split(',').enumerate() {
@@ -478,6 +480,8 @@ fn main() -> Result<(), String> {
                             if let Some(text) = dump.as_mut() {
                                 dump_routes(text, run, index, step, position, slots, &drafter.routes(&mut engines[0].beside()?, slots)?);
                             }
+                            hash(&mut draft_hash, &proposal.iter().map(|&token| f32::from_bits(token)).collect::<Vec<_>>());
+                            hash(&mut draft_hash, &draft.confidences);
                             *rounds += 1;
                             *matched += prefix;
                             per_slot[..prefix].iter_mut().for_each(|reached| *reached += 1);
@@ -556,6 +560,9 @@ fn main() -> Result<(), String> {
         for (&slots, (rounds, matched, per_slot, spent)) in draft_slots.iter().zip(&drafted_all) {
             println!("  dspark all B={slots}: {rounds} rounds, mean accepted {:.3}, prefix reaches slot [{}], {:.2} ms a draft",
                      *matched as f64 / (*rounds).max(1) as f64, reach(*rounds, per_slot), 1e3 * spent / (*rounds).max(1) as f64);
+        }
+        if !draft_slots.is_empty() {
+            println!("  dspark draft hash {draft_hash:016x}");
         }
         let per_pass = |count: u64| count as f64 / decode_passes.max(1) as f64;
         println!("  a decode pass: {:.2} ms, {:.1} VRAM hits, {:.1} host-tier fills, {:.1} drive reads ({:.1} MiB), {:.1} write-backs; \
