@@ -65,6 +65,12 @@ pub trait Engines {
     fn gpus(&self) -> Vec<&Backend>;
     /// Wait for the stores' reads and copies (before the process ends).
     fn settle(&mut self) -> Result<(), String>;
+    /// After the first passes (the runtime has taken what it keeps beside the counted buffers): lend
+    /// the expert stores the VRAM the cards still have spare. Each engine's expert slots then; none:
+    /// nothing is lent.
+    fn lend_spare(&mut self) -> Result<Vec<usize>, String> {
+        Ok(Vec::new())
+    }
     /// Between requests: a few of the stores' write-backs that make room for the next prefill's
     /// experts; whether the room is made.
     fn make_room(&mut self) -> Result<bool, String> {
@@ -816,6 +822,16 @@ impl<E: Engines> Session<E> {
     /// for the next prefill (without waiting); whether that is done.
     pub fn make_room(&mut self) -> Result<bool, String> {
         self.engines.make_room()
+    }
+
+    /// After the first passes: lend the expert stores the VRAM the cards still have spare
+    /// ([`Engines::lend_spare`]); the placement then counts the slots they have now.
+    pub fn lend_spare(&mut self) -> Result<(), String> {
+        let slots = self.engines.lend_spare()?;
+        if !slots.is_empty() {
+            self.placement["expert_slots"] = json!(slots);
+        }
+        Ok(())
     }
 }
 

@@ -6,13 +6,15 @@
 //! reference's tokens under both. A hash of every logit produced tells runs apart bit for bit
 //! (a nondeterminism check: the same build and inputs must give the same hash).
 //!
-//! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
+//! ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--spare MIB] [--split L] [--tp N] [--host-gb N] [--row-cache MIB]
 //!     [--steps N] [--show KL] [--context N] [--gemm fp32|fp16] [--verify N[,N...]] [--accept-all] [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]]
 //!     [--generate N [--runs R] [--width W]] [--dump-routes FILE] [--draft-bench K]
 //! --verify N feeds the reference's tokens N at a time in verify passes, a pseudo-random number of
 //! each pass's accepted and the rest taken back (Engine::rewind): the logits hashed are those of
 //! the decode path, so the hashes must not change. With --accept-all every pass's are (passes of
 //! N rows throughout, for their cost); several N run the prompts once each, in turn.
+//! --spare MIB lends each engine's expert stores the VRAM the cards have free beyond MIB, as the server does
+//! after its first passes (Engine::lend_spare): more slots, the same hashes.
 //! --show prints every position whose KL exceeds KL, with both sides' top tokens. With
 //! DS41_QUALITY_SAVE=DIR, each prompt's logits (its last position's, then one row per step) go to
 //! DIR/prompt-INDEX.logits as F32, to compare two of our runs.
@@ -286,6 +288,8 @@ fn main() -> Result<(), String> {
     });
     let (chunk, slots, split, tp) = (option("--chunk", 64), option("--slots", 1900), option("--split", 0), option("--tp", 1));
     let (host_gb, row_cache, max_steps) = (option("--host-gb", 0), option("--row-cache", 256) as u64, option("--steps", usize::MAX));
+    // (--spare MIB: the VRAM kept free; 0, the default: none lent)
+    let spare = Some(option("--spare", 0) as u64).filter(|&mib| mib > 0).map(|mib| mib << 20);
     // rows the attention runs at a time within a pass of up to --chunk tokens
     let batch = option("--batch", 256);
     let context = option("--context", 8192);
@@ -330,7 +334,7 @@ fn main() -> Result<(), String> {
         value
     });
     let [dir, tokens_files] = &args[..] else {
-        return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--split L] [--tp N] [--host-gb N] \
+        return Err("usage: ds41_quality SHARD_DIR TOKENS[,TOKENS...] [--chunk N] [--batch N] [--slots N] [--spare MIB] [--split L] [--tp N] [--host-gb N] \
                     [--row-cache MIB] [--steps N] [--context N] [--verify N[,N...]] [--accept-all] \
                     [--dspark DIR [--draft-slots N[,N...]] [--show-drafts]] [--generate N [--runs R] [--width W]] [--dump-routes FILE] [--draft-bench K]".into());
     };
@@ -357,6 +361,13 @@ fn main() -> Result<(), String> {
                                   scratch_bytes: 512 << 20, half_gemm, layers: part };
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
+    }
+    if let Some(keep) = spare {
+        for engine in &mut engines {
+            let before = engine.expert_capacity().0;
+            let (bytes, made) = engine.lend_spare(keep)?;
+            println!("spare: {} MiB a GPU lent as {made} expert slots ({before} before)", bytes >> 20);
+        }
     }
     let dspark_files = dspark_dir.as_ref().map(|dir| files::Files::open(Path::new(dir))).transpose()?;
     let mut drafter = match &dspark_files {

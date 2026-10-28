@@ -229,6 +229,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     // One short prompt and a token, so no request pays for the first passes' setup.
     model.generate(&[0, 1000, 2000, 3000], 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, &mut |_| {})?;
     model.reset();
+    // (the runtime has what it keeps beside the counted buffers now: the VRAM left over is slots)
+    model.lend_spare()?;
     let mut seconds = serde_json::Map::new();
     for (step, value) in &model.load_seconds {
         seconds.insert(step.to_string(), (*value).into());

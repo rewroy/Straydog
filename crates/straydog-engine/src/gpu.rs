@@ -270,6 +270,11 @@ impl Backend {
         Ok((used, budget))
     }
 
+    /// The device's free memory as the runtime reports it (the card's, other programs' included).
+    pub fn free_bytes(&self) -> Result<u64> {
+        straydog_gpu::device_info(self.ordinal).map(|(_, free, _)| free).map_err(|error| error.to_string())
+    }
+
     /// Enable quality-only observers of FP16 casts once, before graphs are recorded.
     pub fn enable_gemm_checks(&self) -> Result<()> {
         // SAFETY: a live device; native allocation is tracked until this backend drops.

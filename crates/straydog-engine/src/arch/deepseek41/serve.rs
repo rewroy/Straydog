@@ -41,6 +41,14 @@ pub const CHECKPOINTS: usize = 4;
 /// reply's reasoning) read the conversation again from an older checkpoint, 43K tokens in 48 s.
 /// The expert host tier gives up what this takes.
 pub const CHECKPOINT_BYTES: u64 = 2 << 30;
+/// VRAM left free on each card, as the runtime reports it, when the spare is lent to the expert
+/// stores ([`Engines::lend_spare`], after the first passes). The least margin an automatic budget
+/// leaves is 512 MiB; the driver counts 204 MiB of a card's memory used that the runtime's free
+/// does not show (both R9700s, 31.9 GiB each); and everything a session can first use (a 144K-token
+/// prompt, an image, a JSON schema, a required tool call, thinking, sampling, every verify width)
+/// took a further 25 MiB of the card's used memory (46 MiB of the runtime's free) after the first
+/// passes. 768 MiB keeps 564 MiB of the card free past all of that; the budget caps what is lent.
+const SPARE_KEEP: u64 = 768 << 20;
 /// Write-backs a device queues a step of making room between requests ([`Engines::make_room`]):
 /// ~20 MB, about what its downloads move in the worker's 1 ms between steps.
 const ROOM_STEP: usize = 4;
@@ -216,6 +224,23 @@ impl served::Engines for Engines {
 
     fn settle(&mut self) -> Result<(), String> {
         self.engines.iter_mut().try_for_each(Engine::settle)
+    }
+
+    /// Each engine's devices lend their stores what their cards have free beyond [`SPARE_KEEP`]
+    /// (DS41_LEND_SPARE=0: nothing); a failure to is reported, and the placement stands.
+    fn lend_spare(&mut self) -> Result<Vec<usize>, String> {
+        if off("DS41_LEND_SPARE") {
+            return Ok(Vec::new());
+        }
+        for engine in &mut self.engines {
+            let before = engine.expert_capacity().0;
+            match engine.lend_spare(SPARE_KEEP) {
+                Ok((bytes, slots)) => eprintln!("Straydog spare VRAM: {:.0} MiB a GPU lent as {slots} expert slots ({before} before)",
+                                                bytes as f64 / (1u64 << 20) as f64),
+                Err(error) => eprintln!("Straydog could not lend its spare VRAM: {error}"),
+            }
+        }
+        Ok(self.engines.iter().map(|engine| engine.expert_capacity().0).collect())
     }
 
     /// The checkpoints' copies a step at a time, then each store's room.
