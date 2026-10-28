@@ -833,6 +833,68 @@ __device__ void route_row(const float* l, const float* bias, size_t experts, siz
         if (published) published[slot] = picked[slot];
     }
 }
+// Whether the rows of a launch of `vectors` rows are routed by a wave a row (route_row_wave) rather than one after another by
+// the block (route_row): their picks are a wave's (up to 512 experts) and no softmax sums them first (gating 0 does).
+__host__ __device__ inline bool route_by_waves(size_t vectors, size_t experts, size_t k, int gating) {
+    return vectors > 1 && vectors <= 8 && gating != 0 && experts <= 512 && k <= 64;
+}
+// The dynamic LDS bytes a launch of `vectors` rows' routes takes: route_row's scores and biased scores, and for
+// route_row_wave's rows each their picks (64 words) too.
+__host__ __device__ inline size_t route_scratch_bytes(size_t vectors, size_t experts, size_t k, int gating) {
+    return route_by_waves(vectors, experts, k, gating) ? vectors * (experts * 8 + 256) : experts * 8;
+}
+// route_row's routes of one row by one wave alone (lane = threadIdx.x % 32), for the rows of a launch that waves route side by
+// side with no barrier: the same scores, biased scores, picks and weights, with the same arithmetic. Not gating 0, and up to 512
+// experts. `scores` is this row's experts x 2 floats, `picked` its 64 words.
+__device__ void route_row_wave(const float* l, const float* bias, size_t experts, size_t k, int gating, int normalize, float scale,
+                               int32_t* ids, float* weights, float* scores, int32_t* picked, int32_t* published = nullptr) {
+    float* biased = scores + experts;
+    const unsigned lane = threadIdx.x % 32;
+    for (size_t e = lane; e < experts; e += 32) {
+        const float x = hc_step_load(const_cast<float*>(l + e));
+        scores[e] = gating == 1 ? 1.0f / (1.0f + expf(-x)) : gating == 2 ? sqrtf(x > 20.0f ? x : log1pf(expf(x))) : x;
+    }
+    for (size_t e = lane; e < experts; e += 32) biased[e] = scores[e] + (bias ? bias[e] : 0.0f);
+    constexpr int WAVE_PICKS = 16;
+    float b[WAVE_PICKS];
+    unsigned left = 0;   // bit m: expert lane + 32m exists and is not picked
+    #pragma unroll
+    for (int m = 0; m < WAVE_PICKS; ++m) {
+        const size_t e = lane + 32 * size_t(m);
+        b[m] = e < experts ? biased[e] : 0.0f;
+        if (e < experts) left |= 1u << m;
+    }
+    for (size_t slot = 0; slot < k; ++slot) {
+        float value = -INFINITY;
+        int32_t index = -1;
+        #pragma unroll
+        for (int m = 0; m < WAVE_PICKS; ++m) if (left >> m & 1u) route_take(value, index, b[m], int32_t(lane + 32 * m));
+        for (unsigned offset = 16; offset; offset /= 2) {
+            const float other_value = __shfl_xor(value, offset, 32);
+            const int32_t other = __shfl_xor(index, offset, 32);
+            route_take(value, index, other_value, other);
+        }
+        #pragma unroll
+        for (int m = 0; m < WAVE_PICKS; ++m) if (index == int32_t(lane + 32 * m)) left &= ~(1u << m);
+        if (!lane) picked[slot] = index;
+    }
+    // (the first lane read the scores and picks the others wrote, in one wave's order)
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
+#else
+    __syncwarp();
+#endif
+    if (lane) return;
+    float sum = 0.0f;
+    for (size_t slot = 0; slot < k; ++slot) sum += scores[picked[slot]];
+    for (size_t slot = 0; slot < k; ++slot) {
+        const float chosen = scores[picked[slot]];
+        ids[slot] = picked[slot];
+        weights[slot] = (normalize && k > 1 ? chosen / (sum + 1e-20f) : chosen) * scale;
+        if (published) published[slot] = picked[slot];
+    }
+    if (published) __threadfence_system();
+}
 __global__ void op_route_kernel(const float* logits, const float* bias, size_t experts, size_t k, int gating,
                                 int normalize, float scale, int32_t* ids, float* weights) {
     extern __shared__ float scores[];   // the scores, then the scores + bias
@@ -895,10 +957,22 @@ __global__ void gemv_routed_kind(FixedGemv list, const float* input, float* outp
     __threadfence();
     if (threadIdx.x == 0) *tail.counter = 0;
     const size_t stride = V > 1 ? list.output_stride : 0;
-    for (int row = 0; row < V; ++row) {
-        route_row(output + row * stride, tail.bias, tail.experts, tail.k, tail.gating, tail.normalize, tail.scale, tail.ids + row * tail.k,
-                  tail.weights + row * tail.k, scores, tail.published ? tail.published + row * tail.k : nullptr);
+    if (route_by_waves(V, tail.experts, tail.k, tail.gating)) {
+        // a wave a row, side by side (the rows' routes one after another by the block took most of a four-row router's time)
+        const unsigned row = threadIdx.x / 32;
+        if (row < V) {
+            float* mine = scores + row * (tail.experts * 2 + 64);
+            route_row_wave(output + row * stride, tail.bias, tail.experts, tail.k, tail.gating, tail.normalize, tail.scale,
+                           tail.ids + row * tail.k, tail.weights + row * tail.k, mine, reinterpret_cast<int32_t*>(mine + tail.experts * 2),
+                           tail.published ? tail.published + row * tail.k : nullptr);
+        }
         __syncthreads();
+    } else {
+        for (int row = 0; row < V; ++row) {
+            route_row(output + row * stride, tail.bias, tail.experts, tail.k, tail.gating, tail.normalize, tail.scale, tail.ids + row * tail.k,
+                      tail.weights + row * tail.k, scores, tail.published ? tail.published + row * tail.k : nullptr);
+            __syncthreads();
+        }
     }
     // (thread 0 wrote every row's published ids)
     if (tail.flag && threadIdx.x == 0) {
@@ -925,7 +999,7 @@ bool gemv_route_launch(Device& d, const Matrix& matrix, const float* input, floa
     list.input_stride = uint32_t(input_stride);
     list.output_stride = uint32_t(output_stride);
     const unsigned blocks = unsigned((gemv_waves(matrix, lanes) + 7) / 8);
-    const size_t shared = tail.experts * 8;
+    const size_t shared = route_scratch_bytes(vectors, tail.experts, tail.k, tail.gating);
     #define SD_ROUTED(format, v) gemv_routed_kind<format, v><<<blocks, 256, shared, d.stream>>>(list, input, output, tail)
     if (matrix.kind == 0) {
         switch (vectors) { case 1: SD_ROUTED(0, 1); break; case 2: SD_ROUTED(0, 2); break; case 3: SD_ROUTED(0, 3); break; default: SD_ROUTED(0, 4); }
