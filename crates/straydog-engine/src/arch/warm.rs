@@ -70,8 +70,8 @@ impl Warm {
 
     /// What a later start warms up with: the experts the engines hold, least recently used first,
     /// in VRAM (`vram`) and only in the host tier (`host`), as [layer, expert] pairs; and how often
-    /// the passes used each expert (`counts`, as [layer, expert, passes]: the earlier run's halved
-    /// once this run has passes of its own to add, else as they were). The experts of an earlier
+    /// the passes used each expert (`counts`, as [layer, expert, passes]: the earlier run's, aged by
+    /// what this run adds to them, plus its own). The experts of an earlier
     /// state this run has not yet read are kept, older than all the engines hold (they are the less
     /// recent end of that state, the warm-up reading the more recent first): a run that ends
     /// before its warm-up does forgets nothing its state listed but what its own requests evicted.
@@ -89,9 +89,14 @@ impl Warm {
     fn counts_to_save<E: Engines>(&self, engines: &E) -> Vec<[u64; 3]> {
         let (layers, experts) = (self.layers, self.experts);
         let uses = engines.uses();
+        // The earlier counts age by how much this run adds to them: not at all when it added nothing,
+        // hardly for a few passes (a restart's one reply), by half when it added as many as they held
+        // (the most, so that a long run does not erase them).
+        let (had, ran) = (self.prior.iter().map(|&count| u64::from(count)).sum::<u64>(), uses.iter().map(|use_| u64::from(use_.2)).sum::<u64>());
+        let keep = if ran == 0 { 1.0 } else { (had as f64 / (had + ran) as f64).max(0.5) };
         let mut counts = vec![0u32; layers * experts];
         for (count, &before) in counts.iter_mut().zip(&self.prior) {
-            *count = if uses.is_empty() { before } else { before / 2 };
+            *count = (f64::from(before) * keep).round() as u32;
         }
         for (layer, expert, passes) in uses {
             if layer < layers && expert < experts {
@@ -447,9 +452,10 @@ mod tests {
     }
 
     /// Decides: a state as earlier versions saved it (no counts) still warms up, its fill goes by
-    /// expert and layer, and the counts a state keeps are halved once the run has passes of its own.
+    /// expert and layer, and the counts a state keeps age by what the run adds to them: a restart's
+    /// few passes hardly, a run that adds as many as they hold by half.
     #[test]
-    fn an_old_state_loads_and_the_counts_it_keeps_age_by_half() {
+    fn an_old_state_loads_and_the_counts_it_keeps_age_by_what_a_run_adds() {
         let old = json!({"vram": [[0, 1]], "host": []});
         let mut stores = Stores::new(3, 0);
         let mut warm = Warm::new(2, 4);
@@ -463,13 +469,16 @@ mod tests {
         let order = fill_order(&[0, 0, 0, 5, 0, 0, 0, 0], 2, 4);
         assert_eq!(order[0], (0, 3), "the most used first");
         assert_eq!(&order[1..4], &[(0, 0), (1, 0), (0, 1)], "the rest by expert, then layer");
-        // a run that served nothing keeps the counts it was given; one with passes halves them first
+        // a run that served nothing keeps the counts it was given; a few passes age them by 9 of 12
+        // (they held 9, the run adds 3), and a run that adds as many as they held (or more) by half
         let given = json!({"vram": [], "host": [], "counts": [[0, 3, 5], [1, 2, 4]]});
         let mut stores = Stores::new(3, 0);
         let mut warm = Warm::new(2, 4);
         warm.start(&mut stores, &given).unwrap();
         assert_eq!(warm.state(&stores)["counts"], json!([[0, 3, 5], [1, 2, 4]]));
         stores.uses = vec![(0, 3, 2), (1, 0, 1)];
-        assert_eq!(warm.state(&stores)["counts"], json!([[0, 3, 4], [1, 0, 1], [1, 2, 2]]));
+        assert_eq!(warm.state(&stores)["counts"], json!([[0, 3, 6], [1, 0, 1], [1, 2, 3]]));
+        stores.uses = vec![(0, 3, 20), (1, 0, 1)];
+        assert_eq!(warm.state(&stores)["counts"], json!([[0, 3, 23], [1, 0, 1], [1, 2, 2]]));
     }
 }
