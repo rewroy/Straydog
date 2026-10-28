@@ -291,11 +291,11 @@ mod tests {
         assert_eq!(entries[2].1, "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/\
             de4b8e4d43b917e7706784d8bb445c9af86a3540/tokenizer.json");
         // A bundle read on demand: its GGUF from the GGUF repository, its resources from the official one.
-        let ornith = super::entries("Q8_0").unwrap();
-        assert_eq!(ornith[0].1, "https://huggingface.co/ornith-ai/Ornith-1.5-122B-GGUF/resolve/\
-            5514dc9eb187cb71eb3b1089716fbe1bdd7e7a7d/Ornith-1.5-122B-Q8_0.gguf");
-        assert_eq!(ornith[1].1, "https://huggingface.co/ornith-ai/Ornith-1.5-122B/resolve/\
-            dfa07bab90e90746ffbfc0b0cba3126eb9265de2/tokenizer.json");
+        let qwen = super::entries("UD-Q8_K_XL").unwrap();
+        assert_eq!(qwen[0].1, "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/\
+            a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf");
+        assert_eq!(qwen[1].1, "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/\
+            995ad96eacd98c81ed38be0c5b274b04031597b0/tokenizer.json");
         assert!(super::entries("Q4_K_M").unwrap_err().contains("unsupported"));
     }
 

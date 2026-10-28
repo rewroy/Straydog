@@ -1,4 +1,4 @@
-//! Qwen3.5 MoE (`qwen35moe`, Ornith-1.5): a single residual stream through blocks that are
+//! Qwen3.5 MoE (`qwen35moe`, Qwen3.6-35B-A3B): a single residual stream through blocks that are
 //! either a Gated DeltaNet (linear attention with a recurrent state) or gated full attention
 //! (Q/K normalized, partial rotary positions, causal GQA, a sigmoid output gate), each followed
 //! by a softmax-routed MoE with a sigmoid-gated shared expert. The definitions follow the

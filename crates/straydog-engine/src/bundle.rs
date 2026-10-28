@@ -357,11 +357,10 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
 /// worker checks every block it uses against them. A model whose official repository gives its
 /// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
-pub const ON_DEMAND_MANIFESTS: [&str; 5] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
-                                            include_str!("assets_ornith.json"), include_str!("assets_deepseek41_gsq.json"),
-                                            include_str!("assets_deepseek41_gsq.json")];
+pub const ON_DEMAND_MANIFESTS: [&str; 4] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
+                                            include_str!("assets_deepseek41_gsq.json"), include_str!("assets_deepseek41_gsq.json")];
 /// Every on-demand quantization, with the manifest that pins it.
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 5] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "Q8_0", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 4] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -538,7 +537,6 @@ mod tests {
         }
         assert_eq!((model_of("UD-Q8_K_XL").unwrap().as_str(), architecture_of("UD-Q8_K_XL").unwrap().as_str()),
                    ("Qwen3.6-35B-A3B", "qwen35moe"));
-        assert_eq!((model_of("Q8_0").unwrap().as_str(), architecture_of("Q8_0").unwrap().as_str()), ("Ornith-1.5-122B", "qwen35moe"));
         let qwen = on_demand_sources("UD-Q8_K_XL").unwrap();
         let tokenizer = qwen.iter().find(|source| source.asset.name == "tokenizer.json").unwrap();
         assert_eq!((tokenizer.repository.as_str(), tokenizer.path.as_str()), ("Qwen/Qwen3.6-35B-A3B", "tokenizer.json"));

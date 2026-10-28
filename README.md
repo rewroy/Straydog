@@ -1,8 +1,8 @@
 # Straydog
 
 A local inference engine with an OpenAI-compatible server, in one executable per GPU
-backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash,
-Qwen3.6-35B-A3B and Ornith-1.5-122B.
+backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash and
+Qwen3.6-35B-A3B.
 
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
@@ -78,7 +78,6 @@ file. `--print-config` shows the settings in effect and where each came from.
 | | IQ3_XXS | 75.8 GB | |
 | | IQ3_S | 83.6 GB | closest to BF16 |
 | Qwen3.6-35B-A3B | UD-Q8_K_XL | 38.5 GB | for small VRAM and 32 GB of RAM |
-| Ornith-1.5-122B | Q8_0 | 132.6 GB | |
 
 DeepSeek-V4.1's sizes include its 110.6 GB Engram tables, which stay on the SSD and are read
 a few rows per token; its DSpark drafter adds 8.0 GB. On two R9700s and 128 GB of RAM,

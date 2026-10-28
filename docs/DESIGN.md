@@ -7,8 +7,8 @@ Updated: 2026-10-28.
 
 Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as
 one executable per GPU backend. It began with Qwen3.8-Flash-Next (§1-§9 describe that path
-unless they say otherwise) and now also serves DeepSeek-V4.1-Flash (§10.2), Qwen3.6-35B-A3B
-and Ornith-1.5-122B (§10.3).
+unless they say otherwise) and now also serves DeepSeek-V4.1-Flash (§10.2) and
+Qwen3.6-35B-A3B (§10.3).
 
 ## 1. Goals
 
@@ -187,7 +187,7 @@ option, named as llama-server names it where it has the same setting.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `-m, --model DIR` | model bundle directory (the pinned GGUF shards of one quantization, with Qwen3.8's tokenizer/template files), or its first shard | from config |
-| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next); GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash); UD-Q8_K_XL (Qwen3.6-35B-A3B); Q8_0 (Ornith-1.5-122B), when the directory alone does not say | detected from the pinned files |
+| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next); GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash); UD-Q8_K_XL (Qwen3.6-35B-A3B), when the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | MTP drafter directory | none |
 | `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
@@ -551,7 +551,7 @@ hashing the pinned shards and the placement, written by the runtime: the worker 
 access). After the next start with the same model and placement is ready, the worker reads those
 experts back while no request runs, a few reads at a time behind any pass's.
 
-### 10.3 Qwen3.5 MoE (Qwen3.6-35B-A3B UD-Q8_K_XL, Ornith-1.5-122B Q8_0)
+### 10.3 Qwen3.5 MoE (Qwen3.6-35B-A3B UD-Q8_K_XL)
 
 The `qwen35moe` architecture: one residual stream through blocks whose mixer is either a Gated
 DeltaNet (three of every four) or gated full attention, each followed by a softmax top-8 MoE
@@ -607,7 +607,7 @@ which then errors, and a reset starts both counts over. A decode step's sums fol
 that form their parts (`gpu/link_tail.hpp`: each block also stores its values into the other's inbox,
 the last one in raises the flag, waits and adds). A longer pass is queued a sum at a time
 on each GPU in turn, so neither waits on a part the other was not given. The host joins the
-logits in vocabulary order. Ornith, which needs the host tier, stays split by layers.
+logits in vocabulary order. A model that needs the host tier stays split by layers.
 
 Where its experts go depends on what the GPUs hold:
 - **All of a GPU's experts fit in its VRAM** (Qwen3.6 on two GPUs): they are read in at
