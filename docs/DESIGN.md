@@ -2,10 +2,13 @@
 
 Status: phases R1-R6 done on Linux but for the first release (the Rust executable serves
 the API with its worker contained, provisions bundles and builds the drafter byte for byte;
-the Python reference is removed). Windows builds but has not run. Updated: 2026-10-20.
+the Python reference is removed). DeepSeek-V4.1 has run on Linux with ROCm only.
+Updated: 2026-10-28.
 
-Straydog is a local inference engine for Qwen3.8-Flash-Next and a server with an
-OpenAI-compatible API, shipped as one executable per GPU backend.
+Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as
+one executable per GPU backend. It began with Qwen3.8-Flash-Next (§1-§9 describe that path
+unless they say otherwise) and now also serves DeepSeek-V4.1-Flash (§10.2), Qwen3.6-35B-A3B
+and Ornith-1.5-122B (§10.3).
 
 ## 1. Goals
 
@@ -28,11 +31,15 @@ logic: they follow from the official chat template and the OpenAI message format
 
 ## 3. Contracts
 
-- **Exactness.** Activations are never quantized. Weights decode exactly to F32.
-  FP16 products (GEMM over prompt batches, and RDNA4's prefill attention) are the default
-  (`--gemm fp16`); `--gemm f32` computes them in F32.
-  A speculative verification pass is bitwise identical to token-by-token decode in the
-  same placement. Unsupported formats are an error, never a silent conversion.
+- **Exactness.** Weights decode exactly to F32, and every rounding is named (README,
+  Numerics). FP16 products (GEMM over prompt batches, and RDNA4's prefill attention) are the
+  default (`--gemm fp16`); `--gemm fp32` computes them in F32. DeepSeek-V4.1 also rounds in
+  decode and verification: INT8 inputs (per 32 values, F32 scale) to its Q8_0/Q5_K
+  projections and IQ2 experts' gate/up, FP16 operands for its attention and index scores
+  (off with `--gemm fp32`), and BF16 for its compressed K/V rows, index keys and
+  hyper-connection weights. A speculative verification pass is bitwise identical to
+  token-by-token decode in the same placement. Unsupported formats are an error, never a
+  silent conversion.
 - **Isolation.** The engine runs in a separate worker process without network
   access: bubblewrap on Linux, an AppContainer of its own on Windows. The worker is
   the same executable. Every model and drafter file is pinned by SHA-256 and
@@ -179,8 +186,8 @@ option, named as llama-server names it where it has the same setting.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `-m, --model DIR` | model bundle directory (the pinned GGUF shards and tokenizer/template files of one quantization) | from config |
-| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S or UD-IQ2_XXS (DeepSeek-V4.1-Flash), when the directory alone does not say | detected from the pinned files |
+| `-m, --model DIR` | model bundle directory (the pinned GGUF shards of one quantization, with Qwen3.8's tokenizer/template files), or its first shard | from config |
+| `--quant NAME` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next); GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash); UD-Q8_K_XL (Qwen3.6-35B-A3B); Q8_0 (Ornith-1.5-122B), when the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | MTP drafter directory | none |
 | `--draft-max N` | most MTP drafts per pass (0 turns speculation off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
@@ -195,7 +202,7 @@ option, named as llama-server names it where it has the same setting.
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large matrix products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none: no key required |
-| `--alias NAME` | model id in `/v1/models` and answers | `Qwen3.8-Flash-Next-<quant>` |
+| `--alias NAME` | model id in `/v1/models` and answers | `<model>-<quant>` (`Qwen3.8-Flash-Next-IQ3_S`) |
 | `--temp T`, `--top-k K`, `--top-p P`, `--min-p P`, `--presence-penalty X` | sampling when a request gives none | the model card's for the request's mode |
 | `--seed N` | seed when a request gives none | a fresh one per request |
 | `--reasoning-effort E` | reasoning when a request gives none: none, low, medium, high | high (the template's default) |
@@ -209,7 +216,8 @@ and where each came from. Nothing is read from a home directory unless given.
 
 There is no `-ngl`. Residency is decided by measuring what fits:
 - full residency first, then host K/V, then a smaller prefill batch;
-- partial residency with CPU and GPU expert slots otherwise.
+- partial residency otherwise: VRAM expert slots over a host tier, whose experts the Qwen
+  models compute on the CPU and DeepSeek-V4.1 uploads into a slot when a token routes to them.
 
 There is no arbitrary-GGUF mode: a model is one of the pinned bundles, authenticated
 before use. The pins are compiled into the executable.
@@ -250,10 +258,11 @@ authentication: no worker starts without them.
 - Sampling: greedy at temperature 0, else `softmax(logits / temperature)` cut to
   `top_k`, then `top_p`, then `min_p` (vLLM's order), after `presence_penalty` is
   subtracted from every token the answer already holds. A control a request leaves
-  out takes the server's setting, else the model card's for the request's mode:
+  out takes the server's setting, else the model card's for the request's mode. Qwen3.8's:
   thinking `temperature=1.0, top_p=0.95, top_k=20`, non-thinking `temperature=0.7,
-  top_p=0.80, top_k=20, presence_penalty=1.5` (`min_p=0` in both). Greedy decoding
-  repeats itself endlessly with this model; it is never the default. MTP verification
+  top_p=0.80, top_k=20, presence_penalty=1.5` (`min_p=0` in both). A GGUF with no
+  `general.sampling.*` (DeepSeek-V4.1's) samples at `temperature=1.0` without truncation.
+  Greedy decoding repeats itself endlessly with Qwen3.8; it is never the default. MTP verification
   stays exact: a draft is accepted with its probability under the same cut and penalty.
   A pass drafts while the product of the drafts' probabilities under the drafter stays
   at 0.6 or more, up to `--draft-max`.
@@ -428,10 +437,12 @@ checked against per-block digests of the pinned file before they are used.
 The Qwen path keeps its specialized code until layer programs match its speed on the
 A/B harness; then it is expressed in the same terms.
 
-### 10.2 DeepSeek-V4.1 Flash (UD-IQ2_XXS)
+### 10.2 DeepSeek-V4.1 Flash (GSQ-RCO IQ2_XXS; GSQ-RCO IQ2_XS and UD-IQ2_XXS also pinned)
 
-Measured from the file and a reference implementation (12 prompts, 1,536 generated
-tokens): every token reads 7.5 GB of dense weights (attention, shared expert, router,
+Served now: ISTA's GSQ-RCO IQ2_XXS with DSpark on two R9700s decodes 57-77 tokens/s once a
+request's experts are in memory (prose to code, 2026-10-28). The plan below started from
+Unsloth's UD-IQ2_XXS, measured from the file and a reference implementation (12 prompts,
+1,536 generated tokens): every token reads 7.5 GB of dense weights (attention, shared expert, router,
 hyper-connections, head) and 2.45 GB of routed experts (6 of 384 in each of 40 layers,
 157 GB in all), plus 48 rows of 135 GB of n-gram tables. A per-layer cache holding a
 third of the experts, refreshed by use, catches 83-90% of the routes (a fixed
@@ -444,8 +455,8 @@ page-locked RAM, a token costs 20-25 ms on two R9700s; the goal is 30 tokens/s.
   up and down) and the CPU.
 - **D3**: ops and the layer program, validated layer by layer against the reference's
   tensors and its logits (KL divergence, top-1).
-- **D4**: the tiered expert store (VRAM cache, page-locked RAM, CPU execution of
-  misses), table rows from the SSD, prefetch.
+- **D4**: the tiered expert store (VRAM cache over page-locked RAM; misses are uploaded,
+  as CPU execution of them did not pay), table rows from the SSD, prefetch.
 - **D5**: prefill streaming the experts each batch picks, layer by layer. The model is a
   causal encoder (layers 0-19) and a decoder (20-39) whose global K/V is projected from
   the encoder's output: a prompt runs the encoder over every token and the decoder only
@@ -473,7 +484,8 @@ model's encoding.py, rendering the reference encoder's prompts): other GGUFs car
 and one that writes the DSML tags otherwise than the model does never reads a reply that called a
 tool back as the model wrote it, so no turn continues the held sequence. Replies split at the
 first `</think>` and at DSML tool calls, and unset sampling follows `general.sampling.*`. A
-prompt that extends the held sequence continues it; there are no checkpoints yet.
+prompt that extends the held sequence continues it; one that leaves it at an earlier turn
+starts from a conversation checkpoint (the whole sequence state, in host memory).
 
 **Images.** The official checkpoint's vision tower (32 blocks of 1024, 16 heads, 2D rope, 14-pixel
 patches), its aligner (each 3x3 of patches to one row of 5120), the image span's learned START,
@@ -505,8 +517,9 @@ pass) into rings of the last 128 positions, split over the engine's GPUs as the 
 round after a sampled token the drafter drafts three tokens; a width policy picks how many a
 verify pass checks: the most expected accepted tokens a millisecond, from the drafter's
 confidences (calibrated against teacher-forced match rates, then against the drafts of the run)
-and a pass's cost by its rows (1, 1.6, 2.2 and 3.1 one-row passes, the unit learned from the passes
-seen). A draft costs ~4 ms whatever the round makes of it, so the policy keeps what its rounds
+and a pass's cost by its rows (1, 1.6, 2.1 and 2.8 one-row passes, the unit learned from one-row
+passes and the shape scaled by what the 2-4-row passes seen cost). A draft costs ~2.3 ms whatever
+the round makes of it, so the policy keeps what its rounds
 saved against decoding their tokens one at a time, and pauses drafting for 16 rounds when that is
 below nothing (prose, where DSpark roughly breaks even, then costs nothing). A lookup match of
 eight tokens or more (an edit repeating its source) is verified as it is, without a draft: those
