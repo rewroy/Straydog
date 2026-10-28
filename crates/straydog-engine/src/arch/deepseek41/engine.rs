@@ -1481,6 +1481,37 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.shards.first().map_or((Vec::new(), Vec::new()), |shard| shard.experts.fit_warm(&vram, &host))
     }
 
+    /// Give the experts of this engine's layers among `ranks` the places in the stores' LRU orders
+    /// that their warm-up placements take (see `DeviceExperts::rank_warm`), on every device.
+    pub fn rank_experts(&mut self, ranks: &[((usize, usize), u64)]) {
+        let (layers, count) = (self.settings.layers.clone(), self.hp.experts);
+        let mine: Vec<((usize, usize), u64)> = ranks.iter().filter(|((layer, expert), _)| layers.contains(layer) && *expert < count).copied().collect();
+        for shard in &mut self.shards {
+            shard.experts.rank_warm(&mine);
+        }
+    }
+
+    /// How many passes used each of this engine's experts (the first device's count; each uses the
+    /// same experts), as (layer, expert, passes).
+    pub fn expert_uses(&self) -> Vec<(usize, usize, u32)> {
+        self.shards.first().map_or_else(Vec::new, |shard| shard.experts.uses())
+    }
+
+    /// Forget the passes counted so far.
+    pub fn clear_expert_uses(&mut self) {
+        for shard in &mut self.shards {
+            shard.experts.clear_uses();
+        }
+    }
+
+    /// Of `window` (likeliest first), this engine's experts that its stores' free slots take now
+    /// (see `DeviceExperts::fill_plan`; every device has the same slots).
+    pub fn fill_experts(&self, window: &[(usize, usize)]) -> crate::experts::Contents {
+        let (layers, count) = (self.settings.layers.clone(), self.hp.experts);
+        let mine: Vec<(usize, usize)> = window.iter().filter(|(layer, expert)| layers.contains(layer) && *expert < count).copied().collect();
+        self.shards.first().map_or((Vec::new(), Vec::new()), |shard| shard.experts.fill_plan(&mine))
+    }
+
     /// Take the expert reads that have landed, without waiting; those still in flight.
     pub fn poll_experts(&mut self) -> Result<usize> {
         let mut reading = 0;

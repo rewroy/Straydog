@@ -467,6 +467,41 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok((reading, taken_up_to(placed, &vram_at, vram.len()), taken_up_to(hosted, &host_at, host.len())))
     }
 
+    /// Give the experts of this engine's layers (of its part's experts) among `ranks` the places in
+    /// the store's LRU order that their warm-up placements take (see `DeviceExperts::rank_warm`).
+    pub fn rank_experts(&mut self, ranks: &[((usize, usize), u64)]) {
+        if self.resident.is_some() {
+            return;
+        }
+        let layers = self.settings.layers.clone();
+        let experts = self.settings.part.experts(&self.hp);
+        let mine: Vec<((usize, usize), u64)> = ranks.iter().filter(|((layer, expert), _)| layers.contains(layer) && experts.contains(expert)).copied().collect();
+        self.experts.rank_warm(&mine);
+    }
+
+    /// How many passes used each expert, as (layer, expert, passes); none for resident experts
+    /// (all are always held).
+    pub fn expert_uses(&self) -> Vec<(usize, usize, u32)> {
+        if self.resident.is_some() { Vec::new() } else { self.experts.uses() }
+    }
+
+    /// Forget the passes counted so far.
+    pub fn clear_expert_uses(&mut self) {
+        self.experts.clear_uses();
+    }
+
+    /// Of `window` (likeliest first), this engine's experts that its store's free slots take now
+    /// (see `DeviceExperts::fill_plan`); none when they are all resident.
+    pub fn fill_experts(&self, window: &[(usize, usize)]) -> Contents {
+        if self.resident.is_some() {
+            return (Vec::new(), Vec::new());
+        }
+        let layers = self.settings.layers.clone();
+        let experts = self.settings.part.experts(&self.hp);
+        let mine: Vec<(usize, usize)> = window.iter().filter(|(layer, expert)| layers.contains(layer) && experts.contains(expert)).copied().collect();
+        self.experts.fill_plan(&mine)
+    }
+
     /// Take the expert reads that have landed, without waiting; those still in flight.
     pub fn poll_experts(&mut self) -> Result<usize> {
         self.experts.poll(&mut self.gpu)

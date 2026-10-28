@@ -144,12 +144,34 @@ The engine is built in layers:
   trees.
 - **Startup times.** DeepSeek-V4.1's server is ready in 14 s with its dense weights in the page
   cache. Qwen3.8's IQ3_S with its drafter takes 22-23 s from a cold start and 13-14 s cached.
-- **Warm-up.** Every two minutes after requests, and at shutdown, the runtime asks the worker
+- **Warm-up.** Every two minutes after requests, and at shutdown (also when no request came but
+  the worker was handed a state to warm up with), the runtime asks the worker
   which experts its stores hold, least recently used first, and keeps the list in the data
   directory (`<data-dir>/warm/<quant>-<key>.json`). The key hashes the pinned shards and the
   placement. The runtime writes this file; the worker has no write access.
+  - **The state never loses what the old state listed.** A run that ends before its warm-up has
+    read everything (a request came, or it was stopped) saves the experts still pending, older
+    than anything its stores hold, besides what they hold; only what its own requests evicted
+    leaves the list. (Saving only what the stores held shrank the file with every short run:
+    1914 of 6067 VRAM slots and 373 host slots, against 5291 and 4315 after a long run.)
+  - **`counts`.** The state also keeps how many decode and verify passes used each expert
+    (`[layer, expert, passes]`). A prefill's streamed layers are not counted: they take nearly every
+    expert whatever the prompt. A run with passes of its own halves the counts it was given and
+    adds its own, so a run's weight halves with each later run that served requests; one that served
+    none keeps them as they were. A state without `counts` (earlier versions) loads as one with none.
 - **Start with the same model and placement:** once ready, the worker reads those experts back
   while no request runs, a few reads at a time, behind any pass's own reads.
+  - **Most recently used first, in their old places.** A start cut short has the experts likeliest to
+    be needed. Each read lands in the LRU place it had in the old state (the stores take a rank for
+    each expert before its read, `DeviceExperts::rank_warm`), so reading in the other order leaves
+    the old order. They are older than anything a request touches.
+  - **The fill.** Once the listed experts have landed, the free slots are offered the rest of the
+    model's experts, the ones most used first (`counts`; none counted: by expert, then layer, so
+    that each layer gets as many). The likeliest go to the free VRAM slots (beyond each size class's
+    reserve and the room a prefill's first waves take), the next to the host tier (beyond a reserve
+    of its slots). It never evicts and ends when the stores are full, and the fill's experts are
+    older than the old state's in the LRU order. `Warm` (`arch/warm.rs`) drives all of it; between
+    requests the worker makes room (and copies checkpoints) before it takes a warm-up step.
 
 ### 4.2 Row tables
 
