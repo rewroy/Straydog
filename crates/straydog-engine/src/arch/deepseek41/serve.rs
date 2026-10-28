@@ -613,6 +613,16 @@ fn split(hp: &Hparams, dense: &[u64], head: u64, budgets: &[u64]) -> Result<Vec<
     served::split_layers(layers, &cuts, &load, budgets).ok_or_else(|| format!("DeepSeek-V4.1 cannot be split across {} GPUs", budgets.len()))
 }
 
+/// The prefill batches placement chooses among when none is asked for, largest first.
+const AUTO_BATCHES: [usize; 6] = [8192, 4096, 2048, 1024, 512, 256];
+
+/// The largest of [`AUTO_BATCHES`] whose pass buffers (`per_row` bytes a row, and a few rows of a
+/// pass's own) take no more than an eighth of a GPU's `budget`; the least when none does.
+fn auto_batch(budget: u64, per_row: u64) -> usize {
+    AUTO_BATCHES.into_iter().find(|&batch| (batch + OWN_ROWS.min(batch)) as u64 * per_row.max(1) <= budget / 8)
+        .unwrap_or(AUTO_BATCHES[AUTO_BATCHES.len() - 1])
+}
+
 fn layer_of(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
@@ -657,6 +667,19 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
             settings.devices.iter().zip(ranges).map(|(&device, range)| (vec![device], range)).collect()
         }
     };
+    // The prefill batch: as asked, or (0) the largest of AUTO_BATCHES whose pass buffers take no
+    // more than an eighth of the least GPU budget. A pass reads the experts the VRAM does not hold
+    // from the host tier whatever its rows: a layer's experts over 4096 rows computed in ~16 ms
+    // against ~40 ms of copies, over 8192 in ~30 ms. A cold 70K-token prompt on two R9700s took
+    // 62-89 s in passes of 4096, 48-57 s in 8192 and 88 s in 16384 (whose Engram rows outgrew the
+    // row cache, and whose host buffers the free memory).
+    let batch = if settings.batch > 0 {
+        settings.batch
+    } else {
+        let budget = settings.vram_bytes.iter().copied().min().unwrap_or(0);
+        let per_row = groups.iter().map(|(devices, range)| pass_row_bytes(&hp, devices.len(), range.clone())).max().unwrap_or(1);
+        auto_batch(budget, per_row)
+    };
     // DSpark, when its file is there: opened (and its layout checked against the model's), and
     // the VRAM it takes counted with the engine it sits beside.
     let (dspark_files, dspark_plan) = match open_dspark(root, quantization, data_dir, &files, &groups)? {
@@ -676,11 +699,11 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     // The sequence state of an engine's layers, on each of its devices: window rings (F32), each
     // kv source's compressed rows and keys (BF16), and a batch's new ones in F32 before rounding.
     let state = |range: &std::ops::Range<usize>| -> u64 {
-        let ring = (hp.window + settings.batch.min(ATTENTION_ROWS)) * hp.head_dim * 4 * range.len();
+        let ring = (hp.window + batch.min(ATTENTION_ROWS)) * hp.head_dim * 4 * range.len();
         let sources: Vec<usize> = hp.layers.iter().enumerate().filter(|(layer, _)| range.contains(layer))
             .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer))
             .map(|c| (settings.context / c.ratio + 1) * (hp.head_dim + hp.index_dim) * 2).collect();
-        let staging = if sources.is_empty() { 0 } else { (settings.batch.min(ATTENTION_ROWS) + 2) * (hp.head_dim + hp.index_dim) * 4 };
+        let staging = if sources.is_empty() { 0 } else { (batch.min(ATTENTION_ROWS) + 2) * (hp.head_dim + hp.index_dim) * 4 };
         (ring + sources.iter().sum::<usize>() + staging) as u64
     };
     let total_experts: u64 = expert_bytes.iter().sum();
@@ -698,7 +721,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         let resident: u64 = range.clone().map(|layer| whole[layer] + parted[layer].div_ceil(parts)).sum::<u64>() + head;
         // a pass of up to the batch's rows, layer by layer: its buffers of every row (in the arena
         // lent to the expert store between long passes), and a few rows' own
-        let rows = (settings.batch + OWN_ROWS.min(settings.batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
+        let rows = (batch + OWN_ROWS.min(batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
         let expansions = if settings.half_gemm { EXPANSIONS } else { 0 };
         let fixed = resident + state(range) + rows + SCRATCH + expansions + RESERVE + dspark_bytes(index);
         let free = vram.checked_sub(fixed)
@@ -746,8 +769,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
                 }
                 let engine_settings = EngineSettings {
                     context: settings.context,
-                    rows: settings.batch,
-                    batch: settings.batch.min(ATTENTION_ROWS),
+                    rows: batch,
+                    batch: batch.min(ATTENTION_ROWS),
                     expert_slots: slots / devices.len(),
                     host_expert_bytes: share,
                     scratch_bytes: SCRATCH,
@@ -796,7 +819,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         "expert_vram_bytes": groups.iter().zip(&slots).map(|(group, &slots)| slots as u64 * slot_bytes(group)).collect::<Vec<_>>(),
         "host_expert_bytes": host,
         "expert_bytes": total_experts,
-        "prefill_batch_size": settings.batch,
+        "prefill_batch_size": batch,
         "dspark": drafting.as_ref().map(|drafting| json!({"engine": drafting.engine, "resident": drafting.resident})),
     });
     // (where a reply's generation prompt begins, and a user message: the states before them, and
@@ -811,7 +834,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
                            budget: CHECKPOINT_BYTES, step: CHECKPOINT_STEP, files, drafting },
-        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch: settings.batch,
+        files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
@@ -840,5 +863,18 @@ mod tests {
         assert_eq!(evictions(&held, 1400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
+    }
+
+    /// With the 0.31 MB a row takes on each of two GPUs, 8192 rows are chosen for the R9700s' 30.7 GiB
+    /// budgets and for 24 GiB cards, fewer on a 16 GiB card, and the least where nothing fits.
+    #[test]
+    fn the_prefill_batch_is_the_largest_whose_buffers_take_an_eighth_of_the_budget() {
+        const GIB: u64 = 1 << 30;
+        let per_row = 320_000;
+        assert_eq!(auto_batch(30 * GIB, per_row), 8192);
+        assert_eq!(auto_batch(22 * GIB, per_row), 8192);
+        assert_eq!(auto_batch(16 * GIB, per_row), 4096);
+        assert_eq!(auto_batch(8 * GIB, per_row), 2048);
+        assert_eq!(auto_batch(GIB, per_row), 256);
     }
 }

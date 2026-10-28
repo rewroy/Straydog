@@ -1297,6 +1297,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
+    /// Attribute `parts` (phases whose seconds the caller timed) and restart the host's clock past
+    /// them (profiling only).
+    fn lap(&mut self, parts: &[(&'static str, f64)]) {
+        if let Some((since, phases)) = self.profile.as_mut() {
+            for &(phase, seconds) in parts {
+                *phases.entry(phase).or_default() += seconds;
+            }
+            *since = std::time::Instant::now();
+        }
+    }
+
     /// DS41_PROFILE=host+stamps: queue device 0's clock into the slot of `point` of `layer` (a decode pass's).
     fn stamp(&mut self, layer: usize, rows: usize, point: Stamp) -> Result<()> {
         match &self.stamps {
@@ -1899,6 +1910,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if n == 0 || n > self.settings.rows.max(self.settings.batch) || self.position + n > self.settings.context {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
+        // (DS41_PROFILE: a long pass's seconds and phases are logged when it ends)
+        let pass_began = (n >= 256).then(|| (std::time::Instant::now(), self.profile.as_ref().map(|(_, phases)| phases.clone())));
         self.reserve_state(self.position + n)?;
         self.reserve_rows(n)?;
         self.select_work(n)?;
@@ -1939,38 +1952,57 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (positions, ring_rows, visible1, visible2) = pass_schedule(start, n, self.ring);
         // The previous pass queued this one-token schedule behind its logit copy.
         let skip = n == 1 && self.primed.take() == Some(start);
-        // embeddings repeated into the hc copies (in the buffer kept between passes)
-        let mut stream = std::mem::take(&mut self.stream_rows);
-        stream.clear();
-        if range.start == 0 {
-            let embed = self.tensors.tensor("token_embd.weight")?;
-            let bytes = row_bytes(embed.kind, embed.dims[0])?;
-            stream.reserve(n * hc * w);
-            let mut row = Vec::new();
-            for (i, &token) in tokens.iter().enumerate() {
-                row.clear();
-                if token >= vision::IMAGE_TOKEN {
-                    row.extend_from_slice(self.image_row(self.position + i)?);
-                } else {
-                    formats::decode_into(embed.kind, &embed.data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
-                }
-                for _ in 0..hc {
-                    stream.extend_from_slice(&row);
-                }
-            }
-        }
         for shard in &mut self.shards {
             if !(skip && schedule_is_packed(&shard.work, positions.len())) {
                 upload_rows(shard, &positions, &ring_rows, &visible1, &visible2)?;
             }
-            if !stream.is_empty() {
-                shard.gpu.write_buffer(&shard.work.stream, 0, &stream)?;
+        }
+        // The embeddings repeated into the hc copies, a slab of tokens at a time (in the buffer kept
+        // between passes): a pass of 8192 tokens would take 540 MB of the host's memory at once, and
+        // on a machine with its memory full of pinned experts that pushed out what other passes held.
+        let mut stream = std::mem::take(&mut self.stream_rows);
+        if range.start == 0 {
+            const SLAB: usize = 1024;
+            let began = std::time::Instant::now();
+            let mut decoding = 0.0f64;
+            let embed = self.tensors.tensor("token_embd.weight")?;
+            let bytes = row_bytes(embed.kind, embed.dims[0])?;
+            let (kind, data) = (embed.kind, embed.data);
+            let mut row = Vec::with_capacity(w);
+            for (slab, piece) in tokens.chunks(SLAB).enumerate() {
+                let (first_token, decode_began) = (slab * SLAB, std::time::Instant::now());
+                // (every value is written below: the slab's tokens' embeddings, or an image's rows)
+                stream.resize(piece.len() * hc * w, 0.0);
+                // each token's embedding repeated into its hc copies
+                for (i, &token) in piece.iter().enumerate() {
+                    if token >= vision::IMAGE_TOKEN {
+                        continue;
+                    }
+                    row.clear();
+                    formats::decode_into(kind, &data[token as usize * bytes..(token as usize + 1) * bytes], &mut row)?;
+                    if row.len() != w {
+                        return Err(format!("token {token}'s embedding has {} values, not {w}", row.len()));
+                    }
+                    stream[i * hc * w..(i + 1) * hc * w].chunks_exact_mut(w).for_each(|copy| copy.copy_from_slice(&row));
+                }
+                // (an image position's rows come from the encoder)
+                for (i, _) in piece.iter().enumerate().filter(|(_, &token)| token >= vision::IMAGE_TOKEN) {
+                    let row = self.image_row(self.position + first_token + i)?;
+                    stream[i * hc * w..(i + 1) * hc * w].chunks_exact_mut(w).for_each(|copy| copy.copy_from_slice(row));
+                }
+                decoding += decode_began.elapsed().as_secs_f64();
+                for shard in &mut self.shards {
+                    shard.gpu.write_buffer(&shard.work.stream, (first_token * hc * w * 4) as u64, &stream)?;
+                }
             }
+            let total = began.elapsed().as_secs_f64();
+            self.lap(&[("embedding: decode", decoding), ("embedding: upload", total - decoding)]);
         }
         self.stream_rows = stream;
         if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens)?;
         }
+        self.mark("embedding: Engram reads")?;
         self.image_rows = vision::runs(tokens);
         if !self.image_rows.is_empty() {
             self.upload_image_bias()?;
@@ -2065,6 +2097,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         };
         self.verify_slot_checks()?;
         self.read_stamps(range.clone(), n)?;
+        if let (Some((began, Some(before))), Some((_, phases))) = (pass_began, self.profile.as_ref()) {
+            let mut spent: Vec<(&str, f64)> = phases.iter().map(|(phase, seconds)| (*phase, seconds - before.get(phase).copied().unwrap_or(0.0)))
+                .filter(|(phase, seconds)| *seconds >= 0.02 && !phase.ends_with("(count)")).collect();
+            spent.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!("Straydog pass: {n} rows from position {}, {:.3} s: {}", self.position, began.elapsed().as_secs_f64(),
+                      spent.iter().map(|(phase, seconds)| format!("{phase} {seconds:.2}")).collect::<Vec<_>>().join(", "));
+        }
         if self.link_pass {
             self.link_dirty = false;
         }
@@ -2244,7 +2283,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let mut gathered = std::mem::take(&mut self.engram_values);
         let engram = match plan.engram {
             Some(module) => {
-                self.engram_rows(module, tokens, &mut gathered)?;
+                let began = std::time::Instant::now();
+                let waited = self.engram_rows(module, tokens, &mut gathered)?;
+                self.lap(&[("engram: row bytes", waited), ("engram: ids and decode", began.elapsed().as_secs_f64() - waited)]);
                 true
             }
             None => false,
@@ -2401,9 +2442,26 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// gather, when this engine's layers hold a module ([`Engine::prefetch_engram`]): the session
     /// asks for the next pass's before each pass, so its reads land while that pass runs.
     pub fn prefetch_ahead(&self, tokens: &[u32]) -> Result<()> {
+        // (the embeddings first: the Engram reads queue the drive 128 deep, and a page fault of the
+        // embedding table behind them took seconds of a cold prompt's first pass)
+        if self.settings.layers.start == 0 {
+            self.prefetch_embeddings(tokens)?;
+        }
         if self.hp.layers[self.settings.layers.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens)?;
         }
+        Ok(())
+    }
+
+    /// Start reading the embedding rows of these tokens (each once) from the file.
+    fn prefetch_embeddings(&self, tokens: &[u32]) -> Result<()> {
+        let embed = self.tensors.tensor("token_embd.weight")?;
+        let bytes = row_bytes(embed.kind, embed.dims[0])?;
+        let mut ids: Vec<u32> = tokens.iter().copied().filter(|&token| token < vision::IMAGE_TOKEN).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let rows: Vec<&[u8]> = ids.iter().filter_map(|&token| embed.data.get(token as usize * bytes..(token as usize + 1) * bytes)).collect();
+        self.tensors.prefetch(&rows);
         Ok(())
     }
 
@@ -2430,8 +2488,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// The rows Engram module `module` gathers for `tokens`, decoded (a token's after another's)
-    /// into `gathered`.
-    fn engram_rows(&self, module: usize, tokens: &[u32], gathered: &mut Vec<f32>) -> Result<()> {
+    /// into `gathered`. The seconds the rows' bytes took to arrive.
+    fn engram_rows(&self, module: usize, tokens: &[u32], gathered: &mut Vec<f32>) -> Result<f64> {
         let engram = self.hp.engram.as_ref().ok_or("no Engram metadata")?;
         let name = &engram.tables[module];
         let table = self.tensors.tensor(name)?;
@@ -2445,7 +2503,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             history.push(token);
         }
+        let reading = std::time::Instant::now();
         let bytes = self.tensors.rows(name, &rows)?;
+        let waited = reading.elapsed().as_secs_f64();
         let values = self.hp.engram_columns() * engram.head_dim;
         gathered.clear();
         gathered.reserve(tokens.len() * values);
@@ -2461,7 +2521,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 formats::decode_into(kind, row, gathered)?;
             }
         }
-        Ok(())
+        Ok(waited)
     }
 
     /// The experts of `layer` over the rows `first..n` of a pass, after the router (see
