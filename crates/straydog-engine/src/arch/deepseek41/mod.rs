@@ -110,6 +110,22 @@ fn key<'k>(keys: &Keys<'_>, current: &'k str, older: &'k str) -> &'k str {
     if keys.has(current) { current } else { older }
 }
 
+/// Row offsets for tables of a module's own: each module's start at 0. The metadata of the layout
+/// that joins every module's rows in one table (`ple.head_offsets`) runs the offsets on across the
+/// modules; with tables apart (ISTA's GSQ-RCO IQ2_XXS beside the Engram file made before that
+/// layout, whose tables are the one table's modules in order) each module's are taken from its
+/// first column's. Offsets that already start at 0 stay.
+fn module_offsets(mut offsets: Vec<u64>, modules: usize) -> Result<Vec<u64>, String> {
+    let columns = offsets.len() / modules.max(1);
+    for module in offsets.chunks_mut(columns.max(1)) {
+        let base = module[0];
+        for offset in module {
+            *offset = offset.checked_sub(base).ok_or("deepseek41 Engram offsets fall within a module")?;
+        }
+    }
+    Ok(offsets)
+}
+
 /// An integer table of the model's (I32 or I64, `dims`), exactly: none if the model has no such
 /// tensor.
 fn integers(tensors: Option<&dyn Tensors>, name: &str, dims: &[usize]) -> Result<Option<Vec<i64>>, String> {
@@ -258,7 +274,8 @@ impl Hparams {
                 head_dim: keys.count(key(&keys, "engram_head_dim", "embedding_length_per_layer_input"))?,
                 multipliers: words("ple.layer_multipliers", "engram_multipliers.weight", ngram)?,
                 primes: words("ple.head_vocab_sizes", "engram_primes.weight", columns)?,
-                offsets: words("ple.head_offsets", "engram_offsets.weight", columns)?,
+                offsets: if separate { module_offsets(words("ple.head_offsets", "engram_offsets.weight", columns)?, modules)? }
+                         else { words("ple.head_offsets", "engram_offsets.weight", columns)? },
                 pad: *token_map.get(pad_token).ok_or("Engram padding token outside the token map")?,
                 token_map,
                 tables: if separate { own } else { vec!["per_layer_token_embd.weight".to_string(); modules] },
@@ -430,5 +447,46 @@ mod tests {
         let mut short = tensors;
         short.0.insert("engram_primes.weight", (27, vec![4, 1], i64s(&[101, 103, 107, 109])));
         assert!(Hparams::from_model(&header(), &short).is_err());
+    }
+
+    /// ISTA's GSQ-RCO IQ2_XXS layout: the Engram's hash parameters in the metadata (`ple.*`, the
+    /// offsets running on across the modules) with the tables either one for every module or, as
+    /// the Engram file made before that layout keeps them, a module each: the second module's rows
+    /// then start at 0 in its table, and in the one table after the first module's.
+    #[test]
+    fn ple_metadata_with_one_table_or_a_table_each() {
+        let mut header = header();
+        for key in ["engram_max_ngram_size", "engram_n_heads", "engram_head_dim", "engram_pad_token_id", "engram.layer_ids"] {
+            header.metadata.remove(&format!("deepseek41.{key}"));
+        }
+        let numbers = |values: &[u64]| Metadata::Array(values.iter().map(|&value| Metadata::Unsigned(value)).collect());
+        let mut put = |key: &str, value: Metadata| { header.metadata.insert(format!("deepseek41.{key}"), value); };
+        put("ple.layers", numbers(&[0, 2]));
+        for (key, value) in [("ple.ngram_size", 3), ("ple.heads_per_ngram", 2), ("embedding_length_per_layer_input", 4), ("engram.pad_token_id", 1)] {
+            put(key, Metadata::Unsigned(value));
+        }
+        put("engram.token_map", numbers(&[4, 3, 2, 1, 0]));
+        put("ple.layer_multipliers", numbers(&[3, 5, 7, 11, 13, 17]));
+        put("ple.head_vocab_sizes", numbers(&[101, 103, 107, 109, 113, 127, 131, 137]));
+        put("ple.head_offsets", numbers(&[0, 101, 204, 311, 420, 533, 660, 791]));
+        let apart = Fake(BTreeMap::from([
+            ("blk.0.engram_embd.weight", (20, vec![32, 420], Vec::new())),
+            ("blk.2.engram_embd.weight", (20, vec![32, 508], Vec::new())),
+        ]));
+        let joined = Fake(BTreeMap::from([("per_layer_token_embd.weight", (20, vec![32, 928], Vec::new()))]));
+        let (apart, joined) = (Hparams::from_model(&header, &apart).unwrap().engram.unwrap(), Hparams::from_model(&header, &joined).unwrap().engram.unwrap());
+        assert_eq!((apart.ngram, apart.heads, apart.head_dim, apart.pad), (3, 2, 4, 3));
+        assert_eq!(apart.tables, ["blk.0.engram_embd.weight", "blk.2.engram_embd.weight"]);
+        assert_eq!(joined.tables, ["per_layer_token_embd.weight"; 2]);
+        assert_eq!(apart.offsets, [0, 101, 204, 311, 0, 113, 240, 371]);
+        assert_eq!(joined.offsets, [0, 101, 204, 311, 420, 533, 660, 791]);
+        // the same buckets: the one table's rows of the second module are the first's table's size on
+        for token in 0..5 {
+            let (mut own, mut all) = (Vec::new(), Vec::new());
+            apart.rows(1, token, &[1, 2], 5, &mut own);
+            joined.rows(1, token, &[1, 2], 5, &mut all);
+            assert!(own.iter().all(|&row| row < 508));
+            assert_eq!(own.iter().map(|row| row + 420).collect::<Vec<_>>(), all);
+        }
     }
 }

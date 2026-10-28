@@ -77,8 +77,10 @@ impl<T: Tensors> Engine<'_, T> {
         let experts = self.hp.experts;
         let mut values = Vec::with_capacity(self.hp.layers.len() * experts);
         for layer in 0..self.hp.layers.len() {
-            let name = format!("layers.{layer}.ffn.gate.bias_vl");
-            let tensor = self.tensors.tensor(&name).map_err(|_| "this model has no image routing (its vision encoder file is missing)")?;
+            // (in the model's own GGUF where its layout has them, else in the vision encoder's file)
+            let name = format!("blk.{layer}.exp_probs_b_vl.bias");
+            let tensor = self.tensors.tensor(&name).or_else(|_| self.tensors.tensor(&format!("layers.{layer}.ffn.gate.bias_vl")))
+                .map_err(|_| "this model has no image routing (its vision encoder file is missing)")?;
             if tensor.kind != 0 || tensor.dims != [experts] {
                 return Err(format!("{name} is not {experts} F32 values"));
             }

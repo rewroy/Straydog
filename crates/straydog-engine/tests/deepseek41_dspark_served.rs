@@ -3,7 +3,7 @@
 //! verify passes and rewinds, resets and checkpoints, so that a draft never reads another sequence's.
 //!
 //! cargo test -p straydog-engine --features hip --test deepseek41_dspark_served, with STRAYDOG_DS41 (the
-//! GSQ-RCO IQ2_XS bundle directory, its verity trees in .straydog there, DSpark's file in its dspark
+//! GSQ-RCO IQ2_XS bundle directory (STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS for the IQ2_XXS one), its verity trees in .straydog there, DSpark's file in its dspark
 //! directory or beside it); under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
@@ -57,7 +57,7 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
         host_expert_bytes: None, host_memory_bytes: straydog_engine::host::host_memory_bytes(),
         row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: true,
     };
-    let mut model = place(&root, "GSQ-RCO-IQ2_XS", &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+    let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
     model.prompt_logits = Some(Vec::new());
     assert!(model.engines.draft_with_dspark(true), "the DSpark drafter is not loaded: its file is not beside the model");
     assert_eq!(model.placement["dspark"]["resident"], serde_json::json!([87, 50, 29]));

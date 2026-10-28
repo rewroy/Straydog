@@ -46,6 +46,54 @@
           "architecture": "deepseek41-engram"
         }
       ]
+    },
+    "GSQ-RCO-IQ2_XXS": {
+      "revision": "a419d74cd28d5b9f8c5e2b9077d11a609c17bc32",
+      "assets": [
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf",
+          "bytes": 5780704,
+          "sha256": "f356f198561f56df36f7ab92d7238a926646d76de992c34f15bcb939a5f529b9",
+          "verity": "61044b7968d2f4f3c95ae69f34fd1a5733a6e39c532ad5aa9af7f20faa192314"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00006.gguf",
+          "bytes": 39535781184,
+          "sha256": "25af3785ccf925f54137e1ead4c481a8952315dc0b1af6519a99407f67bce8f3",
+          "verity": "2d0a3590e254416a28baa061e538bc6ba27756232252510f8f6b2381225f9c87"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00006.gguf",
+          "bytes": 39736712000,
+          "sha256": "8168d0998fc494def2e1952d83c131425a108660aae9d29190f5a8670ab62b48",
+          "verity": "0e9629e6ffdd659adf26277c98842525a1b8f39b610ec678f313aa5ca394341e"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00006.gguf",
+          "bytes": 39036908384,
+          "sha256": "9eb9b4de1968f150dfc207eb31c27be9cd9b5666a9a6246bde8a22b184b4bee0",
+          "verity": "017eb08491c3541a55aa33c678a29f1fcf156be22ef638fc2242b3fbcb76e889"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00005-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00005-of-00006.gguf",
+          "bytes": 19923784832,
+          "sha256": "7e35f6b4e6fc46f6c4b152b593d84d683c5ece695ae6ad734f556198c041bec1",
+          "verity": "caf59768240388f0fdac40a1eb6b9cb38c963427c1c1a4c391167a450f863c11"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00006-of-00006.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+          "revision": "cb02422c900df489cea5833e8a92171224059b3c",
+          "bytes": 110595290816,
+          "sha256": "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a",
+          "verity": "9e7a67f276e45441a0f2426d891da3bb69ac18a914906d13cd33574c9f79df31"
+        }
+      ]
     }
   }
 }

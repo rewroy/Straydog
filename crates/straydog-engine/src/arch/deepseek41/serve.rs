@@ -561,8 +561,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     let (mut head_whole, mut head_parted) = (0u64, 0u64);
     for (name, bytes) in files.tensor_bytes() {
         match layer_of(name) {
-            // (Engram's tables are read a row at a time, never resident)
-            _ if crate::pinned::gathered(name) => {}
+            // (Engram's tables are read a row at a time, never resident; the image routing biases are read with the first image)
+            _ if crate::pinned::gathered(name) || name.ends_with(".exp_probs_b_vl.bias") => {}
             Some(layer) if layer < layers && name.ends_with("_exps.weight") => expert_bytes[layer] += bytes,
             Some(layer) if layer < layers && divided(name) => parted[layer] += bytes,
             Some(layer) if layer < layers => whole[layer] += bytes,
@@ -640,7 +640,8 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
         None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts),
     };
     // (the vision encoder's tensors are read with the first image, not at the start)
-    let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix)))
+    let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix))
+                                               && !name.ends_with(".exp_probs_b_vl.bias"))
         + dspark_files.as_ref().map_or(0, |files| files.whole_bytes(|_| true));
     let files: &'static Pinned = Box::leak(Box::new(files));
     let placed = Instant::now();

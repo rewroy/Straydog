@@ -68,8 +68,11 @@ impl<'a> Dspark<'a> {
                 return Err(format!("DSpark dflash.{key}: expected [10, 10, 10], found {actual:?}"));
             }
         }
+        // (the layers the drafter reads, as it declares them: checked above)
+        let drafter_layers = keys.integers("target_layers")?;
         let target_keys = Keys::new(target);
-        // (Unsloth's GGUFs declare the target's DSpark in full; GSQ-RCO's only its target layers)
+        // (Unsloth's GGUFs declare the target's DSpark in full; GSQ-RCO's first layout only its target
+        // layers, and its split layout nothing: the drafter's own are the target's then)
         let declared = target.metadata.contains_key("deepseek41.dspark.block_size");
         let keys: &[(&str, i64)] = if declared {
             &[("embedding_length", 5120), ("dspark.block_size", 5), ("dspark.noise_token_id", 128799), ("dspark.markov_rank", 256),
@@ -83,7 +86,13 @@ impl<'a> Dspark<'a> {
                 return Err(format!("DSpark target deepseek41.{key}: expected {expected}, found {actual}"));
             }
         }
-        let layers = target_keys.integers(if declared { "dspark.target_layers" } else { "dspark_target_layer_ids" })?;
+        let layers = if declared {
+            target_keys.integers("dspark.target_layers")?
+        } else if target_keys.has("dspark_target_layer_ids") {
+            target_keys.integers("dspark_target_layer_ids")?
+        } else {
+            drafter_layers
+        };
         if layers != [37, 38, 39] || target_keys.count("block_count")? <= 39 {
             return Err(format!("DSpark target layers must be [37, 38, 39] within the target: found {layers:?}"));
         }
