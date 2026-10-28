@@ -3,26 +3,30 @@
 // Single-token flash decoding over the explicit causal selection. Each block
 // owns 32 selected keys of one KV head and all twelve query heads sharing it;
 // partial softmax statistics are merged exactly in F32 afterwards.
+// Several consecutive tokens (a verification's rows, blockIdx.z) are the same blocks side by side:
+// row r is a token at position[r] with its query, selection and partials in the layout of `steps`
+// rows (steps = 1: the layout of one token).
 constexpr size_t qsa_decode_chunk=32;
 template<bool mirrored=false>
 __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,size_t selected,size_t chunks,
                                  const float* input,float* partial,const uint32_t* position=nullptr,
-                                 const float* mirror=nullptr,size_t mirror_rows=0) {
-    const size_t chunk=blockIdx.x,kv=blockIdx.y,t=threadIdx.x,lane=t%32,wave=t/32;
-    const size_t index_start=24*256+1024;
-    const size_t count=size_t(input[index_start+selected]);
+                                 const float* mirror=nullptr,size_t mirror_rows=0,size_t steps=1) {
+    const size_t chunk=blockIdx.x,kv=blockIdx.y,row=blockIdx.z,t=threadIdx.x,lane=t%32,wave=t/32;
+    const size_t index_start=steps*(24*256+1024);
+    const size_t count=size_t(input[index_start+steps*selected+row]);
     const size_t first=chunk*qsa_decode_chunk;
     if (first>=count) return;
-    const size_t limit=position ? size_t(*position) : base;
+    const size_t limit=position ? size_t(position[row]) : base;
+    partial+=row*24*chunks*258;
     __shared__ float query[12*256],sums[8*12*32],probabilities[12*32];
     __shared__ int tokens[qsa_decode_chunk];
     #pragma unroll
-    for (size_t i=t;i<12*256;i+=256) query[i]=input[kv*12*256+i];
+    for (size_t i=t;i<12*256;i+=256) query[i]=input[(row*24+kv*12)*256+i];
     if (t<qsa_decode_chunk) {
         const size_t slot=first+t;
         int token=-1;
         if (slot<count && slot<selected) {
-            const float raw=input[index_start+slot];
+            const float raw=input[index_start+row*selected+slot];
             if (raw>=0 && raw<=float(limit) && raw<float(context)) token=int(raw);
         }
         tokens[t]=token;
@@ -97,11 +101,12 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
 }
 // One block per query head; thread c owns chunk c's softmax statistics (at most
 // 256 chunks, checked on the host) and then column c of the weighted sum.
-__global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selected,const float* input,float* output) {
-    const size_t head=blockIdx.x,column=threadIdx.x;
-    const size_t count=size_t(input[24*256+1024+selected]);
+__global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selected,const float* input,float* output,
+                                 size_t steps=1) {
+    const size_t head=blockIdx.x,row=blockIdx.y,column=threadIdx.x;
+    const size_t count=size_t(input[steps*(24*256+1024)+steps*selected+row]);
     const size_t used=(count+qsa_decode_chunk-1)/qsa_decode_chunk;
-    const float* source=partial+head*chunks*258;
+    const float* source=partial+(row*24+head)*chunks*258;
     __shared__ float scale[256],reduce[8];
     const float own=column<used ? source[column*258+256] : -INFINITY;
     float maximum=own;
@@ -122,7 +127,7 @@ __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selec
     float numerator=0;
     #pragma unroll 8
     for (size_t chunk=0;chunk<used;++chunk) numerator+=scale[chunk]*source[chunk*258+column];
-    output[head*256+column]=numerator/denominator;
+    output[(row*24+head)*256+column]=numerator/denominator;
 }
 
 
@@ -246,6 +251,23 @@ void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,si
         qsa_decode_parts<false><<<dim3(unsigned(chunks),2),256,0,d.stream>>>(
             static_cast<float*>(kv),context,base,selected,chunks,input,d.attention_scores,position);
     qsa_decode_merge<<<24,256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output);
+}
+// qsa_attention's single-token arithmetic for `steps` consecutive tokens in one launch of each kernel
+// (their positions position[0..steps)): the layout of `steps` rows in `input`, row r's attended
+// values at output + r * 6144.
+void qsa_attention_rows(Device& d,void* kv,size_t context,size_t steps,size_t selected,
+                        const float* input,float* output,const uint32_t* position,
+                        const float* mirror=nullptr,size_t mirror_rows=0) {
+    const size_t chunks=(selected+qsa_decode_chunk-1)/qsa_decode_chunk;
+    if (chunks>256 || steps*24*chunks*258*4>attention_score_bytes)
+        throw std::runtime_error("QSA decode selection exceeds the merge capacity");
+    if (mirror)
+        qsa_decode_parts<true><<<dim3(unsigned(chunks),2,unsigned(steps)),256,0,d.stream>>>(
+            static_cast<float*>(kv),context,0,selected,chunks,input,d.attention_scores,position,mirror,mirror_rows,steps);
+    else
+        qsa_decode_parts<false><<<dim3(unsigned(chunks),2,unsigned(steps)),256,0,d.stream>>>(
+            static_cast<float*>(kv),context,0,selected,chunks,input,d.attention_scores,position,nullptr,0,steps);
+    qsa_decode_merge<<<dim3(24,unsigned(steps)),256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output,steps);
 }
 
 // Exclusive prefix sum over a block of `waves` waves of 32 lanes; `total` receives the sum.

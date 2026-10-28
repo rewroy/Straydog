@@ -11,7 +11,7 @@ models:
 This document describes what the code does now. It does not keep the project's history; git
 does. The roundings are listed in the README's Numerics, which this document does not repeat.
 
-Updated: 2026-10-28. All three models run on Linux with ROCm. The Qwen models have run on
+Updated: 2026-10-29. All three models run on Linux with ROCm. The Qwen models have run on
 Windows with CUDA; DeepSeek-V4.1 and `straydog setup` have not.
 
 ## 1. Goals
@@ -569,6 +569,34 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   while the layers before it compute.
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
+
+**Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
+layer (§6.2).
+- **Placement of a pass.** The first GPU owns the layers up to the 25th, the second the rest, the
+  head and the MTP layer. A layer's routed experts are split in halves between the GPUs, so the
+  one that does not own the layer computes its half of the experts and otherwise waits: a third of
+  each GPU's pass is spent in the kernels that wait for the other.
+- **A verification's attention** runs its rows side by side, one launch of each kernel for all of
+  them (`qsa_decode_attend_rows`): each row has the arithmetic of one token's decode, so the
+  rows' state and logits equal token-by-token decode bit for bit, but a row costs the layer no
+  launches of its own and its selection runs beside the others'. A 4-row pass takes 3 ms less
+  at 20K tokens (33.9 to 30.9 ms) and 5 ms less at 60K (40.2 to 35.2 ms).
+- **Measured** at IQ3_S on two R9700s, 262144 context, MTP 3, in tool-shaped conversations of
+  about 20K and 60K tokens with the model card's sampling (2026-10-29):
+
+  | Context | Decode | Tokens a pass | A pass of 1 / 2 / 3 / 4 rows |
+  | --- | --- | --- | --- |
+  | ~20K | 81-98 tok/s | 1.9-3.0 | 17.4-17.6 / 22.5-23.2 / 26.6-26.9 / 30.7-31.1 ms |
+  | ~60K | 68-85 tok/s | 2.0-2.9 | 19.2-20.5 / 25.3-27.6 / 30.3-33.7 / 35.1-39.5 ms |
+
+  Without the drafter a step takes 16 ms at 20K (62 tok/s) and 17.5-18.5 ms at 60K.
+- **Where a pass goes** (a 20K token, 12 ms): the layers 78%, drafting 12% (the MTP layer 0.85 ms
+  and its head 0.55 ms a draft), the head of the verification 4%, the first layer and the PLE
+  layer 4%, the commit, accept and prefetches 2%. The bandwidth floor of a pass is 6.8 ms (one
+  row) to 9.0 (four) at 640 GB/s: a row reads 5.2 GB (the HyperConnection matrices 1.3, DeltaNet
+  and attention 2.0, routed experts 1.0, the head 0.5, shared experts, routers and PLE 0.4). A
+  layer takes 300 µs against 130 µs of bandwidth: some 17 kernels, each followed by 3.2 µs of
+  graph dispatch, and the projections reach 300-400 GB/s.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
