@@ -22,7 +22,7 @@ fn main() -> Result<(), String> {
                                 straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: 4096,
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
-                              row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES };
+                              row_cache_bytes: Some(straydog_engine::rows::DEFAULT_CACHE_BYTES) };
     let model = Model::new(weights, group, &settings, &|_, _, _| {})?;
     let info = model.info()?;
     println!("resident {} partial {} host_kv {} batch {} speculative {}", model.resident, model.partial, model.host_kv,

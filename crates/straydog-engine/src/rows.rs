@@ -27,6 +27,19 @@ use crate::storage::{self, Buffer, ALIGN};
 
 /// The default cache budget across a model's row tables.
 pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
+/// The cache budget that holds every row of a table of `rows` rows of `width` bytes.
+pub fn full_budget(rows: u64, width: u64) -> u64 {
+    rows.saturating_mul(width + OVERHEAD)
+}
+/// The budget of a table's row cache when none is asked for: every row if half of the host memory
+/// left beyond `other` bytes (the sequence state Straydog keeps there) holds them, else that half.
+/// The other half stays to the page cache, to parked sequences and checkpoints, and to the rest
+/// of the machine. Never less than [`DEFAULT_CACHE_BYTES`] (what an unknown `host_memory`, 0,
+/// gets), nor more than the table.
+pub fn auto_budget(rows: u64, width: u64, host_memory: u64, other: u64) -> u64 {
+    let half = host_memory.saturating_sub(other) / 2;
+    full_budget(rows, width).min(half.max(DEFAULT_CACHE_BYTES))
+}
 /// Reads in flight: a drive needs a deep queue to reach its random-read rate (DeepSeek-V4.1's
 /// Engram rows on a PCIe 4.0 NVMe drive: 32 left a cold 55K-token prompt waiting 7-33 s on
 /// them, 128 waits 5.4-6.8 s).
@@ -35,7 +48,9 @@ pub const THREADS: usize = 128;
 const EXTENT: u64 = 64 << 10;
 /// Index and recency bytes per cached row, counted against the budget.
 const OVERHEAD: u64 = 24;
-const EMPTY: u32 = u32::MAX;
+/// A slot's `owner` while it holds no row; a row's entry is the row plus one, so that a cache for
+/// a whole table of hundreds of millions of rows is zeroed memory that costs nothing until used.
+const EMPTY: u32 = 0;
 
 /// Checks a read of the table's file at `offset` (whole aligned blocks, zero past the file's
 /// end) before its rows are used.
@@ -132,9 +147,9 @@ impl Cache {
             }
         };
         if self.owner[slot] != EMPTY {
-            self.index.remove(&self.owner[slot]);
+            self.index.remove(&(self.owner[slot] - 1));
         }
-        self.owner[slot] = row;
+        self.owner[slot] = row + 1;
         self.used[slot] = true;
         self.index.insert(row, slot as u32);
         self.slots[slot * width..(slot + 1) * width].copy_from_slice(bytes);
@@ -254,7 +269,7 @@ impl RowTable {
     pub fn new(file: &File, base: u64, width: usize, rows: u64, budget: u64, pool: Arc<ReadPool>,
                verifier: Option<Verifier>) -> std::io::Result<RowTable> {
         let size = file.metadata()?.len();
-        if width == 0 || rows > EMPTY as u64 || base + rows * width as u64 > size {
+        if width == 0 || rows >= u32::MAX as u64 || base + rows * width as u64 > size {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid row table"));
         }
         let capacity = (budget / (width as u64 + OVERHEAD)).min(rows) as usize;
@@ -262,7 +277,9 @@ impl RowTable {
             slots: vec![0; capacity * width],
             owner: vec![EMPTY; capacity],
             used: vec![false; capacity],
-            index: HashMap::with_capacity(capacity),
+            // (grown as rows are met: a cache for a whole table of hundreds of millions of rows
+            // takes memory for the rows a conversation has used)
+            index: HashMap::with_capacity(capacity.min(1 << 20)),
             hand: 0,
             pending: HashMap::new(),
             batches: HashMap::new(),

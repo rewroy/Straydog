@@ -48,7 +48,7 @@ fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &
         prefill_batch_size: 4096,
         speculative,
         cpu_threads: 0,
-        row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES,
+        row_cache_bytes: None,
     };
     Model::new(weights, group, &settings, &|_, _, _| {}).unwrap()
 }

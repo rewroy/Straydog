@@ -52,8 +52,8 @@ fn main() -> Result<(), String> {
     let drafts: Option<usize> = option("--drafts").map(|count| count.parse().unwrap());
     // --gemm f32: batched projections in F32 throughout (the numerical reference for FP16 GEMMs).
     let half_gemm = option("--gemm").as_deref() != Some("f32");
-    // --row-cache MIB: the PLE row cache (0: rows through the page cache).
-    let row_cache = option("--row-cache").map_or(straydog_engine::rows::DEFAULT_CACHE_BYTES, |mib| mib.parse::<u64>().unwrap() << 20);
+    // --row-cache MIB: the PLE row cache (0: rows through the page cache; none: as the server sizes it).
+    let row_cache = option("--row-cache").map(|mib| mib.parse::<u64>().unwrap() << 20);
     let split = match option("--split").as_deref() {
         Some("layer") => SplitMode::Layer,
         _ => SplitMode::Experts,

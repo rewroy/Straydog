@@ -128,7 +128,7 @@ pub struct Options {
     /// Host memory for sequence state in GiB [default: what the context needs]
     #[arg(long, env = "STRAYDOG_STATE_RAM", value_name = "GIB")]
     pub state_ram: Option<f64>,
-    /// Host memory caching rows of the PLE table, read from the SSD as needed, in MiB; 0 reads them through the page cache [default: 256]
+    /// Host memory caching rows of the PLE and Engram tables, read from the SSD as needed, in MiB; 0 reads them through the page cache [default: 256; Qwen3.8's PLE table, 28.8 GB, all of it while half of the host memory left beside the sequence state holds it, else that half]
     #[arg(long, env = "STRAYDOG_ROW_CACHE", value_name = "MIB")]
     pub row_cache: Option<u32>,
     /// Input precision of large matrix products [default: fp16]
@@ -205,8 +205,8 @@ pub struct Settings {
     pub split_mode: SplitMode,
     pub vram: Vram,
     pub state_ram: f64,
-    /// MiB.
-    pub row_cache: u32,
+    /// MiB; none: the model's own default.
+    pub row_cache: Option<u32>,
     pub gemm: Gemm,
     pub gemm_min_batch: u16,
     pub host: String,
@@ -462,8 +462,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if !(0.01..=256.0).contains(&state_ram) {
         return Err("--state-ram must be between 0.01 and 256 GiB".into());
     }
-    let row_cache = options.row_cache.unwrap_or(256);
-    if row_cache > 65536 {
+    let row_cache = options.row_cache;
+    if row_cache.is_some_and(|mib| mib > 65536) {
         return Err("--row-cache must be at most 65536 MiB".into());
     }
     if options.temp.is_some_and(|temp| !(0.0..=2.0).contains(&temp)) {
@@ -554,7 +554,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("split_mode", format!("{:?}", settings.split_mode).to_lowercase()),
         ("vram", settings.vram.to_string()),
         ("state_ram", settings.state_ram.to_string()),
-        ("row_cache", settings.row_cache.to_string()),
+        ("row_cache", settings.row_cache.map_or_else(|| "(the model's default)".into(), |mib| mib.to_string())),
         ("gemm", format!("{:?}", settings.gemm).to_lowercase()),
         ("gemm_min_batch", settings.gemm_min_batch.to_string()),
         ("host", settings.host.clone()),

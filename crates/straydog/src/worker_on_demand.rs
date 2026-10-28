@@ -109,7 +109,7 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
         batch: plan.batch,
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
-        row_cache_bytes: args.row_cache_bytes,
+        row_cache_bytes: args.row_cache_bytes.unwrap_or(straydog_engine::rows::DEFAULT_CACHE_BYTES),
         half_gemm: args.gemm == "fp16",
     };
     let (jobs, queue) = mpsc::channel::<Job>();

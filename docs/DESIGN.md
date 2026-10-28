@@ -158,7 +158,12 @@ Some embedding tables are read only a few rows per token, at random:
 - DeepSeek-V4.1's Engram tables: 110.6 GB in the GSQ-RCO bundles.
 
 These tables are never resident. Their rows are read from the authenticated file into a row
-cache of the engine's own (`rows.rs`, `--row-cache`, 256 MiB).
+cache of the engine's own (`rows.rs`, `--row-cache`). It is 256 MiB, except for Qwen3.8's PLE
+table: that one takes every row of the table (36.5 GB with the cache's index) while half of the
+host memory left beside Straydog's sequence state holds them, else that half, and never less
+than 256 MiB. The other half stays to the page cache, parked sequences, checkpoints and the
+rest of the machine. The cache fills as rows are used, so memory is taken only for the rows a
+conversation has met.
 
 - **Why rows rather than pages.** A 4 KiB page holds dozens of rows, and one of them is wanted.
   Meanwhile, 70-98% of row uses in agent sessions and chats repeat an earlier row. So 64-256 MB
@@ -652,7 +657,7 @@ named as llama-server names it where it has the same setting.
 | `-sm, --split-mode MODE` | `experts`: every layer split across the GPUs; `layer`: ranges of layers | `experts` |
 | `--vram GIB[,GIB...]\|auto` | VRAM budget for every GPU, or one per GPU (`30,10`) | `auto` (§5) |
 | `--state-ram GIB` | host memory for sequence state | what the context needs |
-| `--row-cache MIB` | row cache of the PLE and Engram tables; 0 reads them through the page cache | 256 |
+| `--row-cache MIB` | row cache of the PLE and Engram tables; 0 reads them through the page cache | 256; Qwen3.8's PLE table: as the host memory allows (§4.2) |
 | `--expert-ram GIB` | host tier for experts outside VRAM | 85% of host memory less Straydog's other host memory |
 | `--data-dir DIR` | verity trees and warm-up state | `.straydog` in the model directory |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large products, smallest batch that uses GEMM | fp16, 2 |
