@@ -220,10 +220,32 @@ struct StateRegion {
     reclaimed: u64,
 }
 
+/// A batch buffer lent to the device's expert store past the rows a pass uses ([`Engine::reserve_rows`]):
+/// the store's region, the bytes a row takes there (for the index scores, a group of a row: they take
+/// a position's group each), the buffer's bytes, and how far from its start the store has given them back.
+#[derive(Clone, Copy)]
+struct RowRegion {
+    region: usize,
+    unit: u64,
+    by_groups: bool,
+    bytes: u64,
+    reclaimed: u64,
+}
+
+impl RowRegion {
+    /// The bytes from its start that a pass of `rows` rows fills, `groups` positions' groups each for the
+    /// index scores, in whole MiB (the least the store need give back at a time).
+    fn need(&self, rows: u64, groups: u64) -> u64 {
+        (rows * if self.by_groups { groups * self.unit } else { self.unit }).next_multiple_of(1 << 20).min(self.bytes)
+    }
+}
+
 /// Tokens past a pass's reach its kv source buffers are taken back for (the next passes'
 /// groups), and past which, the sequence shorter, they go back to the expert store.
 const STATE_AHEAD: usize = 4096;
 const STATE_KEEP: usize = 16384;
+/// The least batch buffer worth lending to the expert store (about a slot).
+const ROWS_LEAST: u64 = 4 << 20;
 
 /// A BF16 state buffer as the kernels take it: its address with bit 0 set (gpu/ops.hpp state_tag).
 fn state_tagged(buffer: &Buffer) -> M {
@@ -379,6 +401,8 @@ struct Shard {
     arena_region: Option<usize>,
     /// The kv sources' buffers lent to the store too.
     state_regions: Vec<StateRegion>,
+    /// And the batch buffers a pass fills only as far as its rows (the index scores, queries, attended rows).
+    row_regions: Vec<RowRegion>,
     experts: DeviceExperts,
     checks: Option<SlotChecks>,
     /// The routers' image biases (every layer's, one after another), uploaded with the first image.
@@ -566,6 +590,8 @@ pub struct Engine<'a, T: Tensors> {
     position: usize,
     history: Vec<u32>,
     ring: usize,
+    /// The least ratio of an indexing layer's compression (its scores take a position's group each, per ratio positions).
+    index_ratio: usize,
     sources: BTreeMap<usize, Source>,
     /// The first layer of the decoder (the last kv source), whose layers run only the rows the last
     /// row's output needs (see the module documentation); None: every layer runs every row.
@@ -915,6 +941,18 @@ impl Shard {
                 }
             }
         }
+        // The batch buffers are sized for ATTENTION_ROWS rows (the index scores for each row's groups of
+        // the whole context), and a pass fills the first rows it has (DS41_LEND_ROWS=0: not lent).
+        let mut row_regions = Vec::new();
+        if std::env::var("DS41_LEND_ROWS").map_or(true, |value| value != "0") {
+            for (buffer, by_groups) in [(work.scores, true), (work.q, false), (work.attended, false), (work.engram_kv, false),
+                                        (work.low, false), (work.index_q, false)] {
+                if buffer.bytes >= ROWS_LEAST {
+                    let (region, _) = experts.lend_region(buffer)?;
+                    row_regions.push(RowRegion { region, unit: if by_groups { 4 } else { buffer.bytes / b as u64 }, by_groups, bytes: buffer.bytes, reclaimed: 0 });
+                }
+            }
+        }
         let checks = match std::env::var_os("DS41_CHECK_SLOTS") {
             Some(_) => Some(SlotChecks { partials: gpu.buffer((CHECKS * 64 * 8) as u64)?, queued: Vec::new(), first: HashMap::new(), mismatches: 0 }),
             None => None,
@@ -925,7 +963,7 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
-            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, state_regions, experts,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, state_regions, row_regions, experts,
             image_bias: None,
         })
     }
@@ -1077,8 +1115,11 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 Backend::link_parts(&mut first.gpu, &mut second.gpu, hp.width.max((hp.experts_used + 1) * hp.expert_ff) as u64)?;
             }
         }
+        let index_ratio = hp.layers.iter().enumerate()
+            .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.index_source == layer).map(|c| c.ratio)).min().unwrap_or(1).max(1);
         let mut engine = Engine {
             ring: hp.window + settings.batch,
+            index_ratio,
             decoder,
             outputs: 1,
             rewind: None,
@@ -1758,6 +1799,31 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
+    /// Each device's batch buffers taken back from its expert store as far as a pass of `n` tokens fills
+    /// them: the first rows of the queries, attended rows and the like, a row of the index scores for each
+    /// of the groups the sequence reaches (and [`STATE_AHEAD`] tokens more); the rest stays with the store.
+    /// Given back as far as a later pass needs less (between passes: no slot held; their fills wait for the work queued so far).
+    fn reserve_rows(&mut self, n: usize) -> Result<()> {
+        let batch = self.settings.batch;
+        let rows = n.min(batch).max(VERIFY_ROWS.min(batch)) as u64;
+        let groups = ((self.position + n + STATE_AHEAD).min(self.settings.context) / self.index_ratio + 1) as u64;
+        for shard in &mut self.shards {
+            for region in &mut shard.row_regions {
+                let need = region.need(rows, groups);
+                if need > region.reclaimed {
+                    shard.experts.reclaim_region(&mut shard.gpu, region.region, need)?;
+                } else if need < region.reclaimed {
+                    let after = shard.gpu.mark(Stream::Compute)?;
+                    shard.experts.restore_region(region.region, after, need);
+                } else {
+                    continue;
+                }
+                region.reclaimed = need;
+            }
+        }
+        Ok(())
+    }
+
     /// Each device's buffers for a pass of `n`: its own for at most [`OWN_ROWS`] (the arena given
     /// back to its expert store, whose fills into it wait for the passes before), else the arena's,
     /// laid out for `n`, the store giving back the lent slots as far as they reach.
@@ -1803,6 +1869,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return Err("DeepSeek-V4.1 forward exceeds the rows of a pass or the context".into());
         }
         self.reserve_state(self.position + n)?;
+        self.reserve_rows(n)?;
         self.select_work(n)?;
         self.stamp_pass(n, 0)?;
         // A prompt pass's projections take FP16 operands as its FFN's do: in F32, its attention's
@@ -3372,6 +3439,20 @@ mod tests {
     fn a_pass_packs_its_four_position_vectors_into_one_image() {
         let packed = super::pack_schedule(4, &[10, 11], &[2, 3], &[7, 8], &[1, 1]);
         assert_eq!(packed, vec![10, 11, 0, 0, 2, 3, 0, 0, 7, 8, 0, 0, 1, 1, 0, 0]);
+    }
+
+    /// A batch buffer is filled as far as a pass's rows reach: a row of the index scores holds a group of
+    /// every position, a query row its heads; never beyond the buffer, in whole MiB.
+    #[test]
+    fn a_batch_buffer_is_filled_as_far_as_the_rows_reach() {
+        let scores = super::RowRegion { region: 0, unit: 4, by_groups: true, bytes: 256 << 20, reclaimed: 0 };
+        assert_eq!(scores.need(4, 5000), 1 << 20);
+        assert_eq!(scores.need(256, 50_000), 49 << 20);
+        assert_eq!(scores.need(256, 262_145), 256 << 20);
+        let queries = super::RowRegion { region: 1, unit: 128 << 10, by_groups: false, bytes: 32 << 20, reclaimed: 0 };
+        assert_eq!(queries.need(4, 99), 1 << 20);
+        assert_eq!(queries.need(40, 99), 5 << 20);
+        assert_eq!(queries.need(256, 99), 32 << 20);
     }
 
     /// A device lends what its card has free beyond what is kept, unless its budget has less left,
