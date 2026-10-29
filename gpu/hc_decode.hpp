@@ -35,6 +35,8 @@ __device__ __forceinline__ void hc_load8(const uint8_t* row, size_t unit, float 
 
 // V tokens share each weight read: token v reads x + v*10240 and keeps its
 // partial sums at scratch + v*hc_decode_scratch, with the one-token arithmetic.
+// Two waves take a row, each half its units (a wave walking all ten of a lane's in turn waited on each: 11 us one row, 17 four),
+// and the second's sum is added to the first's.
 constexpr size_t hc_decode_scratch = 4 * 324 + 4;
 template<int down_kind, int inject_kind, int V>
 __global__ void hc_decode_partial(Matrix down, Matrix inject, bool has_inject, const float* x, const float* norm,
@@ -62,14 +64,14 @@ __global__ void hc_decode_partial(Matrix down, Matrix inject, bool has_inject, c
         scale[v] = 1.0f / sqrtf(total / 2560.0f + 1e-6f);
         if (blockIdx.x == 0 && threadIdx.x == 0) inverse[v * hc_decode_scratch + stream] = scale[v];
     }
-    const size_t row = size_t(blockIdx.x) * 8 + wave, rows = 320 + (has_inject ? 4 : 0);
-    if (row >= rows) return;
-    const bool injection = row >= 320;
+    const size_t row = size_t(blockIdx.x) * 4 + wave / 2, half = wave % 2, rows = 320 + (has_inject ? 4 : 0);
+    __shared__ float halves[V][4];
+    const bool injection = row >= 320, live = row < rows;
     const Matrix& m = injection ? inject : down;
     const uint8_t* data = m.data + (injection ? row - 320 : row) * m.row_bytes;
     const float* ns = norm + stream * 2560;
     float sum[V] = {};
-    for (size_t unit = lane; unit < 320; unit += 32) {
+    for (size_t unit = half * 160 + lane; live && unit < half * 160 + 160; unit += 32) {
         float w[8];
         if (injection) hc_load8<inject_kind>(data, stream * 320 + unit, w);
         else hc_load8<down_kind>(data, stream * 320 + unit, w);
@@ -90,8 +92,13 @@ __global__ void hc_decode_partial(Matrix down, Matrix inject, bool has_inject, c
     for (int v = 0; v < V; ++v) {
         float total = sum[v];
         for (unsigned offset = 16; offset; offset /= 2) total += __shfl_xor(total, offset, 32);
-        if (lane == 0) partial[v * hc_decode_scratch + stream * 324 + row] = total * scale[v];
+        sum[v] = total;
+        if (lane == 0 && half) halves[v][wave / 2] = total;
     }
+    __syncthreads();
+    if (lane || half || !live) return;
+    #pragma unroll
+    for (int v = 0; v < V; ++v) partial[v * hc_decode_scratch + stream * 324 + row] = (sum[v] + halves[v][wave / 2]) * scale[v];
 }
 
 template<int up_kind, int V>
@@ -151,7 +158,7 @@ __global__ void hc_decode_finish(Matrix up, bool has_inject, const float* partia
 template<int down_kind, int V>
 void hc_decode_stage_one(Device& d, const Matrix& down, const Matrix& inject, bool has_inject,
                          const float* x, const float* norm, float* partial, float* inverse) {
-    const dim3 grid(has_inject ? 41 : 40, 4);
+    const dim3 grid(has_inject ? 81 : 80, 4);
     switch (has_inject ? inject.kind : down_kind) {
         case 0: hc_decode_partial<down_kind, 0, V><<<grid, 256, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
         case 1: hc_decode_partial<down_kind, 1, V><<<grid, 256, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;

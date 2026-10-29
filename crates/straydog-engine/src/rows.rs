@@ -99,8 +99,12 @@ impl ReadPool {
         if jobs.is_empty() {
             return;
         }
+        let count = jobs.len();
         self.queue.0.lock().unwrap().0.extend(jobs);
-        self.queue.1.notify_all();
+        // A thread a job: waking all 128 for a decode row's 16 cost the caller ~0.1 ms, on the pass's critical path.
+        for _ in 0..count.min(self.workers.len()) {
+            self.queue.1.notify_one();
+        }
     }
 }
 

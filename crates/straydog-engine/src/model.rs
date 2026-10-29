@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::constraint::{self, Constraint};
-use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, HIDDEN, WIDTH};
+use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
@@ -233,7 +233,7 @@ fn tile(embeddings: &[f32]) -> Vec<f32> {
 
 /// A verification pass: the first layer's rows, the PLE embeddings, the final rows, each
 /// row's argmax and, when sampling, the rows' logits.
-type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Vec<f32>>);
+type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Scores>);
 
 /// Seconds since `clock`, which restarts.
 fn lap(clock: &mut Instant) -> f64 {
@@ -468,7 +468,7 @@ impl Model {
     }
 
     fn ple_operands(&self) -> Result<Vec<Operand<'_>>> {
-        let mut operands = vec![self.projection("blk.1.ple_key.weight")?, self.projection("blk.1.ple_value.weight")?];
+        let mut operands = vec![self.q8_projection("blk.1.ple_key.weight")?, self.q8_projection("blk.1.ple_value.weight")?];
         for name in ["ple_norm_key.weight", "ple_norm_query.weight", "ple_norm_conv.weight", "ple_conv1d.weight"] {
             operands.push(self.vector(&format!("blk.1.{name}"), None)?);
         }
@@ -1406,11 +1406,23 @@ impl Model {
            && tokens > self.prefill_batch_size)
     }
 
-    fn verify(&mut self, tokens: &[u32], sampling: bool) -> Result<Verified> {
+    /// The rows through every layer and the head: with `sampling`, each row's logits for the draw, or its `top` greatest
+    /// when the draw reads only those (sampling::Sampling::top_candidates: the GPU picks them, the host reads a few pairs a row).
+    fn verify(&mut self, tokens: &[u32], sampling: bool, top: usize) -> Result<Verified> {
+        if self.group.chains_verification() {
+            let embeddings = self.verify_chained(tokens)?;
+            let mut clock = Instant::now();
+            let ((targets, scores, _), hidden) = self.with_operands(Model::head_operands, |group, operands| {
+                group.output_head_chained(operands, 47, tokens.len(), sampling, top, false)
+            })?;
+            self.phase("verify: head", &mut clock);
+            return Ok((Vec::new(), embeddings, hidden, targets, scores));
+        }
         let (first, embeddings, hidden) = self.verify_rows(tokens)?;
         let mut clock = Instant::now();
-        let (targets, scores, _) = self.with_operands(Model::head_operands,
-                                                      |group, operands| group.output_head(operands, &hidden, sampling, false))?;
+        let (targets, scores, _) = self.with_operands(Model::head_operands, |group, operands| {
+            group.output_head(operands, &hidden, sampling, top, false)
+        })?;
         self.phase("verify: head", &mut clock);
         Ok((first, embeddings, hidden, targets, scores))
     }
@@ -1425,6 +1437,31 @@ impl Model {
             rows.extend_from_slice(&hidden);
         }
         Ok(rows)
+    }
+
+    /// [`Model::verify_rows`] with the host out of the pass (Group::chains_verification): the first layer, the PLE layer and
+    /// every span queued on their devices one after the other, the rows handed GPU to GPU between them, for the head to read
+    /// where the last span left them. The PLE rows' embeddings come back (a partial acceptance replays them).
+    fn verify_chained(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut clock = Instant::now();
+        self.protect(self.history.len(), self.history.len() + tokens.len())?;
+        let position = self.history.len() as u64;
+        self.prefetch_ple(&self.history, tokens)?;
+        let hidden = tile(&self.token_embeddings(tokens)?);
+        self.phase("verify: protect, PLE prefetch, embeddings", &mut clock);
+        self.group.verify_queue(0, 1, &hidden, position)?;
+        self.phase("verify: first layer", &mut clock);
+        let embeddings = self.ple_embeddings(tokens)?;
+        self.phase("verify: PLE rows wait", &mut clock);
+        self.with_operands(Model::ple_operands, |group, operands| group.ple_front_queue("blk.1.", &embeddings, operands))?;
+        self.phase("verify: PLE layer", &mut clock);
+        let mut after = 1;
+        for (begin, end) in self.group.decoder_spans(1) {
+            self.group.verify_chain(after, begin, end, tokens.len(), position)?;
+            after = end;
+        }
+        self.phase("verify: layers (queued)", &mut clock);
+        Ok(embeddings)
     }
 
     fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
@@ -1492,9 +1529,14 @@ impl Model {
 
     /// Accepted draft count and the next token: a match with the GPU's argmax when greedy,
     /// else decided on the rows' logits (see [`sampling::accept`]).
-    fn accept(drafts: &[u32], targets: &[i32], scores: Option<&[f32]>, sampling: &Sampling, generated: &mut Generated,
+    fn accept(drafts: &[u32], targets: &[i32], scores: Option<&Scores>, sampling: &Sampling, generated: &mut Generated,
               rng: &mut Rng) -> (usize, u32) {
-        let Some(scores) = scores.filter(|_| sampling.needs_logits()) else {
+        let scores = match scores.filter(|_| sampling.needs_logits()) {
+            Some(Scores::Top(top)) => return sampling::accept_top(drafts, top, sampling, generated, rng),
+            Some(Scores::Logits(logits)) => Some(logits.as_slice()),
+            None => None,
+        };
+        let Some(scores) = scores else {
             let accepted = drafts.iter().zip(targets).take_while(|(draft, target)| **draft == **target as u32).count();
             for draft in &drafts[..accepted] {
                 generated.insert(*draft);
@@ -1559,9 +1601,10 @@ impl Model {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }
             let position = self.history.len() as u64;
-            let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits())?;
+            let top = sampling.top_candidates().unwrap_or(0);
+            let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits(), top)?;
             let mut clock = Instant::now();
-            let (accepted, following) = Self::accept(&drafts, &targets, scores.as_deref(), sampling, &mut generated, rng);
+            let (accepted, following) = Self::accept(&drafts, &targets, scores.as_ref(), sampling, &mut generated, rng);
             self.phase("accept", &mut clock);
             generated.insert(following);
             let mut emitted: Vec<u32> = drafts[..accepted].iter().copied().chain([following]).collect();

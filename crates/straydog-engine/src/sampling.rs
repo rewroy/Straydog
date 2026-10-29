@@ -80,6 +80,13 @@ impl Sampling {
         self.top_k > 0 || self.top_p < 1.0 || self.min_p > 0.0
     }
 
+    /// How many of a row's greatest logits a draw reads, when it reads only those: at a temperature above 0, with no
+    /// penalty and a top_k of at most [`SCANNED_TOP_K`], its top_k (the GPU picks them, gpu::Scores::Top; see
+    /// [`accept_top`]).
+    pub fn top_candidates(&self) -> Option<usize> {
+        (self.temperature > 0.0 && self.presence_penalty == 0.0 && (1..=SCANNED_TOP_K).contains(&self.top_k)).then_some(self.top_k)
+    }
+
     /// Whether a draw is from the whole softmax of the logits at the temperature: above 0, with no
     /// cut and no penalty. Only then can a drafter draw from its own logits what the target
     /// draws from its own (see [`accept_drawn`]).
@@ -781,7 +788,7 @@ pub fn distribution(logits: &[f32], sampling: &Sampling, generated: &Generated) 
     }
     // The candidates by logit, most likely first (the lower token on a tie).
     let top_k = sampling.top_k.min(logits.len());
-    let mut candidates: Vec<(f64, u32)> = if (1..=SCANNED_TOP_K).contains(&top_k) {
+    let candidates: Vec<(f64, u32)> = if (1..=SCANNED_TOP_K).contains(&top_k) {
         let mut best: Vec<(f64, u32)> = Vec::with_capacity(top_k + 1);
         // A token whose logit, raised by the most the penalty can raise it, is at most the last
         // kept cannot be kept (the last kept only rises): a run of such tokens is passed over at
@@ -819,6 +826,12 @@ pub fn distribution(logits: &[f32], sampling: &Sampling, generated: &Generated) 
         all.sort_by(descending);
         all
     };
+    cut(candidates, sampling)
+}
+
+/// The draw among `candidates` (by logit, most likely first, the lower token on a tie; top_k of them at most): top_p and
+/// min_p cut, the rest normalized at the temperature.
+fn cut(mut candidates: Vec<(f64, u32)>, sampling: &Sampling) -> Distribution {
     let peak = candidates[0].0;
     let mut weights: Vec<f64> = candidates
         .iter()
@@ -906,6 +919,22 @@ pub fn choose_where(logits: &[f32], sampling: &Sampling, generated: &Generated, 
         .map(|(token, &logit)| if logit > f32::NEG_INFINITY && allowed(token as u32) { logit } else { f32::NEG_INFINITY })
         .collect();
     masked.iter().any(|&logit| logit > f32::NEG_INFINITY).then(|| choose(&masked, sampling, generated, rng))
+}
+
+/// [`accept`] of point drafts from each row's greatest logits (`top`: at least [`Sampling::top_candidates`] of them, most
+/// likely first, the lower token first on a tie) rather than the whole rows: the same distributions, so the same draws.
+pub fn accept_top(drafts: &[u32], top: &[Vec<(f32, u32)>], sampling: &Sampling, generated: &mut Generated, rng: &mut Rng)
+                  -> (usize, u32) {
+    let keep = sampling.top_candidates().unwrap_or(SCANNED_TOP_K);
+    let distribution = |row: &[(f32, u32)]| cut(row.iter().take(keep).map(|&(logit, token)| (f64::from(logit), token)).collect(), sampling);
+    for (index, draft) in drafts.iter().enumerate() {
+        let target = distribution(&top[index]);
+        if rng.random() >= target.probability(*draft) {
+            return (index, target.without(*draft).draw(rng));
+        }
+        generated.insert(*draft);
+    }
+    (drafts.len(), distribution(&top[drafts.len()]).draw(rng))
 }
 
 /// Accepted draft count and the next token, given the target logits of every row of a

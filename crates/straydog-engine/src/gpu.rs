@@ -14,7 +14,21 @@ use crate::formats;
 
 pub type Result<T> = std::result::Result<T, String>;
 /// A head's rows: each row's first maximum, its logits and its probability when asked.
-pub type Head = (Vec<i32>, Option<Vec<f32>>, Option<Vec<f32>>);
+/// A verification head's rows for drawing the next tokens: every logit, or (`Top`) each row's greatest logits with their
+/// tokens, most likely first and the lower token first on a tie, which is all a draw reads when its cut keeps at most
+/// that many (sampling::Sampling::top_candidates).
+pub enum Scores {
+    Logits(Vec<f32>),
+    Top(Vec<Vec<(f32, u32)>>),
+}
+pub type Head = (Vec<i32>, Option<Scores>, Option<Vec<f32>>);
+
+/// Where a head's rows are: on the host, or in a decoder layer's workspace on the head's device.
+#[derive(Clone, Copy)]
+pub enum Rows<'a> {
+    Host(&'a [f32]),
+    Layer(usize),
+}
 
 /// The native library pads every VRAM allocation (allocation_tail in kernels.cpp).
 pub const ALLOCATION_TAIL: u64 = 64;
@@ -948,12 +962,20 @@ impl Backend {
     /// workspace for [`Backend::ple_front`] to continue from.
     pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
         let steps = Self::rows(values, WIDTH)?;
-        if begin >= end || end > 49 || position > 262144 - steps as u64 {
+        self.verify_queue_rows(begin, end, Some(values), steps, position)
+    }
+
+    /// [`Backend::verify_queue`] of `steps` rows, from `values` or (None) from the span's workspace, where the layers
+    /// before it or a handoff ([`prefill_handoff`]) left them.
+    pub fn verify_queue_rows(&mut self, begin: usize, end: usize, values: Option<&[f32]>, steps: usize, position: u64) -> Result<()> {
+        if begin >= end || end > 49 || !(1..=VERIFY_MAX).contains(&steps) || position > 262144 - steps as u64
+            || values.is_some_and(|values| values.len() != steps * WIDTH)
+        {
             return Err("invalid Straydog verification span".into());
         }
-        // SAFETY: `steps` rows in.
-        check(unsafe { ffi::sd_verify_queue(self.handle, begin as u64, end as u64, position, steps as u64, values.as_ptr()) })
-            .map(drop)
+        let input = values.map_or(std::ptr::null(), <[f32]>::as_ptr);
+        // SAFETY: `steps` rows in, or none.
+        check(unsafe { ffi::sd_verify_queue(self.handle, begin as u64, end as u64, position, steps as u64, input) }).map(drop)
     }
 
     /// The PLE layer over the rows [`Backend::verify_queue`] left in `layer`'s workspace, in one wait: the PLE state is
@@ -974,6 +996,21 @@ impl Backend {
         })?;
         Self::finite(&hidden, "decoder state")?;
         Ok((first, hidden))
+    }
+
+    /// [`Backend::ple_front`] with nothing read back or waited for: the layers after it continue from the workspace.
+    pub fn ple_front_queue(&mut self, prefix: &str, layer: usize, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
+        let steps = Self::rows(embeddings, HIDDEN)?;
+        let state = self.state(&format!("@ple:{prefix}"), 10, WIDTH as u64, false)?;
+        let snapshot = self.state(&format!("@ple-snapshot:{prefix}"), 10, WIDTH as u64, false)?;
+        let kept = self.state(&format!("@ple-rows:{prefix}"), VERIFY_MAX as u64, WIDTH as u64, false)?;
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: `steps` rows of embeddings; the states are this device's; no rows out.
+        check(unsafe {
+            ffi::sd_ple_front(self.handle, pointers.as_ptr(), kinds.as_ptr(), state.pointer, snapshot.pointer, kept.pointer,
+                              layer as u64, steps as u64, embeddings.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
+        })
+        .map(drop)
     }
 
     /// After a partial acceptance: the PLE state back as [`Backend::ple_front`] snapshotted it, then the layer over the
@@ -999,10 +1036,22 @@ impl Backend {
     }
 
     /// The head's mixing and vocabulary rows: each row's first maximum, and when asked its
-    /// logits and its probability.
-    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, confidence: bool,
+    /// logits (`top` 0) or its `top` greatest (at most 64), and its probability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, top: usize, confidence: bool,
                        split: Option<(u64, *mut c_void)>) -> Result<Head> {
         let steps = Self::rows(values, WIDTH)?;
+        self.output_head_rows(operands, Rows::Host(values), steps, logits, top, confidence, split).map(|(head, _)| head)
+    }
+
+    /// [`Backend::output_head`] of `steps` rows from the host or from a layer's workspace ([`Rows::Layer`]: the last span of a
+    /// chained verification), those rows handed back with the head's, in its one wait.
+    #[allow(clippy::too_many_arguments)]
+    pub fn output_head_rows(&mut self, operands: &[Operand], rows: Rows, steps: usize, logits: bool, top: usize, confidence: bool,
+                            split: Option<(u64, *mut c_void)>) -> Result<(Head, Vec<f32>)> {
+        if !(1..=VERIFY_MAX).contains(&steps) || matches!(rows, Rows::Host(values) if values.len() != steps * WIDTH) {
+            return Err("invalid Straydog output head rows".into());
+        }
         let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
         if operands.len() != 4 || operands[3].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
             || split.is_some_and(|(split, _)| split == 0 || split >= vocabulary)
@@ -1010,23 +1059,46 @@ impl Backend {
             return Err("invalid Straydog output head operands".into());
         }
         let (pointers, kinds) = self.operands(operands)?;
+        if top > 64 {
+            return Err("invalid Straydog output head operands".into());
+        }
         let mut tokens = vec![0i32; steps];
-        let mut scores = logits.then(|| vec![0f32; steps * vocabulary as usize]);
+        let top = if logits { top } else { 0 };
+        let mut scores = (logits && top == 0).then(|| vec![0f32; steps * vocabulary as usize]);
         let target = scores.as_mut().map_or(std::ptr::null_mut(), |scores| scores.as_mut_ptr());
-        let mut top = confidence.then(|| vec![0f32; steps]);
-        let probabilities = top.as_mut().map_or(std::ptr::null_mut(), |top| top.as_mut_ptr());
+        let mut best = vec![0f32; steps * 2 * top];
+        let mut chosen = confidence.then(|| vec![0f32; steps]);
+        let probabilities = chosen.as_mut().map_or(std::ptr::null_mut(), |chosen| chosen.as_mut_ptr());
+        let (input, layer) = match rows {
+            Rows::Host(values) => (values.as_ptr(), 0),
+            Rows::Layer(layer) => (std::ptr::null(), layer as u64),
+        };
+        let mut hidden = if matches!(rows, Rows::Layer(_)) { vec![0f32; steps * WIDTH] } else { Vec::new() };
         // SAFETY: four operands; `steps` rows in; tokens and optional logits and probabilities sized above.
         check(unsafe {
             match split {
                 None => ffi::sd_output_head(self.handle, pointers.as_ptr(), kinds.as_ptr(), steps as u64, vocabulary,
-                                            values.as_ptr(), tokens.as_mut_ptr(), target, probabilities),
+                                            input, tokens.as_mut_ptr(), target, probabilities, top as u64,
+                                            best.as_mut_ptr(), layer, hidden.as_mut_ptr()),
                 Some((split, peer)) => ffi::sd_output_head_split(self.handle, pointers.as_ptr(), kinds.as_ptr(),
                                                                  steps as u64, vocabulary, split, peer,
-                                                                 values.as_ptr(), tokens.as_mut_ptr(), target,
-                                                                 probabilities),
+                                                                 input, tokens.as_mut_ptr(), target,
+                                                                 probabilities, top as u64, best.as_mut_ptr(), layer,
+                                                                 hidden.as_mut_ptr()),
             }
         })?;
-        Ok((tokens, scores, top))
+        let scores = if top > 0 {
+            // (a row: its `top` values, then their tokens as the bits of the same words)
+            Some(Scores::Top(best.chunks_exact(2 * top)
+                .map(|row| row[..top].iter().zip(&row[top..]).map(|(&logit, &token)| (logit, token.to_bits())).collect())
+                .collect()))
+        } else {
+            scores.map(Scores::Logits)
+        };
+        if !hidden.is_empty() {
+            Self::finite(&hidden, "decoder state")?;
+        }
+        Ok(((tokens, scores, chosen), hidden))
     }
 
     /// MTP layer inputs from token embeddings (rows of 2560) and backbone hidden rows.

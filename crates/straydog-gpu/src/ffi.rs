@@ -1670,6 +1670,10 @@ unsafe extern "C" {
         tokens: *mut i32,
         logits: *mut f32,
         confidence: *mut f32,
+        top: u64,
+        best: *mut f32,
+        layer: u64,
+        rows: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1685,6 +1689,10 @@ unsafe extern "C" {
         tokens: *mut i32,
         logits: *mut f32,
         confidence: *mut f32,
+        top: u64,
+        best: *mut f32,
+        layer: u64,
+        rows: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

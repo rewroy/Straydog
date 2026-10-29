@@ -414,6 +414,39 @@ impl Group {
         self.backends[owner].ple_front(prefix, 0, embeddings, operands)
     }
 
+    /// [`Group::ple_front`] queued, nothing read back: the next span continues from its device's workspace.
+    pub fn ple_front_queue(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
+        let owner = self.index(prefix);
+        self.backends[owner].ple_front_queue(prefix, 0, embeddings, operands)
+    }
+
+    /// Whether a verification's spans and head can follow each other on the devices with no wait on the host: the
+    /// first layer and the PLE layer on one device, the last layer on the head's.
+    pub fn chains_verification(&self) -> bool {
+        self.front_chained() && self.owner(47) == self.backends.len() - 1
+    }
+
+    /// Span [begin, end) of a chained verification, queued over the rows the span before it (ending at `after`) left: moved
+    /// GPU to GPU first when that span ran on another device.
+    pub fn verify_chain(&mut self, after: usize, begin: usize, end: usize, steps: usize, position: u64) -> Result<()> {
+        self.prefill_handoff(after - 1, begin, steps as u64)?;
+        let owner = self.owner_of_span(begin, end)?;
+        self.backends[owner].verify_queue_rows(begin, end, None, steps, position)
+    }
+
+    /// The head over the rows a chained verification's last span left in layer `layer`'s workspace, those rows handed back
+    /// with the head's in its one wait.
+    #[allow(clippy::too_many_arguments)]
+    pub fn output_head_chained(&mut self, operands: &[Operand], layer: usize, steps: usize, logits: bool, top: usize,
+                               confidence: bool) -> Result<(Head, Vec<f32>)> {
+        let last = self.backends.len() - 1;
+        if self.owner(layer) != last {
+            return Err("Straydog chained head is not on the last layer's device".into());
+        }
+        let lower = self.pin_head(&operands[3])?;
+        self.backends[last].output_head_rows(operands, crate::gpu::Rows::Layer(layer), steps, logits, top, confidence, lower)
+    }
+
     /// The PLE layer replayed over the first rows [`Group::ple_front`] kept, after a partial acceptance (queued).
     pub fn ple_replay(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
         let owner = self.index(prefix);
@@ -449,11 +482,11 @@ impl Group {
 
     /// The vocabulary head and its mixing on the last GPU. In the two-GPU mode the first GPU
     /// evaluates the lower half of the vocabulary rows from its own copy at the same time.
-    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, confidence: bool)
+    pub fn output_head(&mut self, operands: &[Operand], values: &[f32], logits: bool, top: usize, confidence: bool)
                        -> Result<Head> {
         let last = self.backends.len() - 1;
         let lower = self.pin_head(&operands[3])?;
-        self.backends[last].output_head(operands, values, logits, confidence, lower)
+        self.backends[last].output_head(operands, values, logits, top, confidence, lower)
     }
 
     /// Pin the vocabulary head on the last GPU and, in the two-GPU mode, its lower half of the

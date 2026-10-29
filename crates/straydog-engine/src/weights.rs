@@ -709,11 +709,13 @@ impl Weights {
     }
 }
 
-/// Whether a tensor is a HyperConnection's down or up projection, uploaded quantized to Q8_0 (`STRAYDOG_HC_Q8=0`: as it is).
+/// Whether a tensor is a HyperConnection's down or up projection or the PLE layer's key or value projection (BF16 matrices a
+/// pass reads whole), uploaded quantized to Q8_0 (`STRAYDOG_HC_Q8=0`: as it is).
 pub fn hc_quantized(name: &str) -> bool {
     (name.ends_with("hc_attn_down.weight") || name.ends_with("hc_attn_up.weight") || name.ends_with("hc_ffn_down.weight")
      || name.ends_with("hc_ffn_up.weight") || name.ends_with("output_hc_down.weight") || name.ends_with("output_hc_up.weight")
-     || name.ends_with("hc_out_down.weight") || name.ends_with("hc_out_up.weight"))
+     || name.ends_with("hc_out_down.weight") || name.ends_with("hc_out_up.weight") || name.ends_with(".ple_key.weight")
+     || name.ends_with(".ple_value.weight"))
         && std::env::var("STRAYDOG_HC_Q8").map_or(true, |value| value != "0")
 }
 
