@@ -694,6 +694,13 @@ layer (§6.2).
   draws, at a seed the same tokens, without 2 MB of logits a pass. The PLE key and value projections go up
   as Q8_0 too, a row read thread is woken a job (all 128 for a decode row's 16 rows cost the pass ~0.1 ms),
   and two waves share an HC row's units. A pass at 20K: 1 row 15.4 to 15.2 ms, 4 rows 24.3 to 23.8.
+- **Kernels the trace showed slow.** The HC row back on one wave (two waves' sums made each block take the
+  stream's mean squares twice: 16.7 to 20.6 us at four rows), and for one or two rows 32-row blocks that stage
+  the stream's x * norm in LDS once (12.5 to 9.4 us at one row; at three or four the 30-40 KB left a CU one
+  block). A decode or verification row's block selection takes the register-held 1024-thread kernel the long
+  prompt chunks take (41 to 37 us at 20K). The head's top-k is found by each wave in shuffle rounds and then
+  by the block's first wave (a chunk 42 us with a block-wide best each round, two barriers apiece). A pass:
+  20K 1 row 15.3 to 14.8 ms, 4 rows 23.8 to 23.4; 60K 4 rows 28.3 to 27.2.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
