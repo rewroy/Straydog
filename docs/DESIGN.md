@@ -701,6 +701,12 @@ layer (§6.2).
   prompt chunks take (41 to 37 us at 20K). The head's top-k is found by each wave in shuffle rounds and then
   by the block's first wave (a chunk 42 us with a block-wide best each round, two barriers apiece). A pass:
   20K 1 row 15.3 to 14.8 ms, 4 rows 23.8 to 23.4; 60K 4 rows 28.3 to 27.2.
+- **Expert kernels of a format.** The decode stages run the kernel of the layer's routed format (gate and up
+  alike), with the shared expert's down rows of IQ4_NL or Q8_0 beside: 70-118 VGPRs where the kernel of every
+  format took 186 (eight waves a SIMD), so a gate or up row takes 8 lanes (10 units each, not 20 for 4 lanes):
+  1 row 26.9 to 19.9 us. The shared expert's gate and up (whose F32 or Q8 rows in that kernel took 204) run on
+  the Q8 GEMV on a side stream, forked and joined by events (graph branches). A pass: 20K 1 row 14.8 to 14.3
+  ms, 4 rows 23.3 to 22.5; 60K 4 rows 27.2 to 26.4.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
