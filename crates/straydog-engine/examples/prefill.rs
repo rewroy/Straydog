@@ -47,6 +47,8 @@ fn main() -> Result<(), String> {
     let dump = option("--dump").map(PathBuf::from);
     let generate: usize = option("--generate").map_or(1, |count| count.parse().unwrap());
     let corpus_file = option("--corpus").map(PathBuf::from);
+    // --ask TEXT: the chat turn's request after the prompt (default: explain the code above).
+    let ask = option("--ask").unwrap_or_else(|| "\n\nExplain in detail, section by section, what the code above does.".to_string());
     let gemm_min_batch: u64 = option("--gemm-min-batch").map_or(2, |count| count.parse().unwrap());
     let pause: f64 = option("--pause").map_or(0.0, |seconds| seconds.parse().unwrap());
     let drafts: Option<usize> = option("--drafts").map(|count| count.parse().unwrap());
@@ -127,7 +129,7 @@ fn main() -> Result<(), String> {
         }
         if chat && !append {
             // (the chat template's user turn and the assistant's header, thinking off: as model_gpu's turns)
-            let ask = text.encode("\n\nExplain in detail, section by section, what the code above does.").map_err(|exc| exc.0)?;
+            let ask = text.encode(&ask).map_err(|exc| exc.0)?;
             let mut turn = vec![248045, 846, 198];
             turn.extend_from_slice(&prompt);
             turn.extend_from_slice(&ask);

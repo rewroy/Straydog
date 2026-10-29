@@ -1820,6 +1820,18 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_draft_vocabulary(
+        handle: *mut ::std::os::raw::c_void,
+        head: *mut ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        vocabulary: u64,
+        rows: u64,
+        tokens: *const i32,
+        count: u64,
+        reset: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_execution_counts(
         handle: *mut ::std::os::raw::c_void,
         graphs: *mut u64,

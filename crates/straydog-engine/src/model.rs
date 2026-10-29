@@ -11,7 +11,7 @@
 //! (the end of the system prompt, and where the last user-initiated and the last tool-result
 //! request began generating).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -41,6 +41,14 @@ const IM_END: u32 = 248046;
 /// more tokens per second than an acceptance-rate estimate. A draft row costs about 3.5 ms of
 /// verification and 1.35 ms of drafting against a 15 ms pass.
 const DRAFT_CUT: f32 = 0.6;
+/// A draft's vocabulary with the head split across two GPUs: the head's first 100000 rows (English, code and the common CJK
+/// characters: every token of the served cases' replies) and the rows of the tokens past them that the sequence has held (a
+/// Japanese text's words: 97-99.6% of its tokens with the text before it, 82% without). A draft step's head reads 40% of the
+/// rows: a pass 0.6 ms shorter, the same drafts on the served cases. Verification reads the whole head.
+/// `STRAYDOG_DRAFT_VOCABULARY=0` drafts over the whole head.
+const DRAFT_ROWS: u64 = 100_000;
+/// Tokens past DRAFT_ROWS a draft's vocabulary holds at most (sd_draft_vocabulary's space).
+const DRAFT_EXTRAS: usize = 16384;
 /// Conversation checkpoints, each a page-locked host copy of the recurrent state (~118 MB):
 /// root (the end of the system prompt), turn (where the reply to the last user message
 /// began), prior (the same for the message before) and step (the reply to the last tool result).
@@ -276,6 +284,10 @@ pub struct Model {
     deferred: bool,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
+    /// A draft's vocabulary (DRAFT_ROWS) in use; the tokens past DRAFT_ROWS it holds, and those noted but not yet on the device.
+    draft_vocabulary: bool,
+    draft_extras: HashSet<u32>,
+    draft_pending: Vec<u32>,
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
     profile: Option<Profile>,
@@ -368,6 +380,9 @@ impl Model {
             logits_capture: None,
             deferred: false,
             mtp_kept: 0,
+            draft_vocabulary: false,
+            draft_extras: HashSet::new(),
+            draft_pending: Vec::new(),
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
             ple_counts: (0, 0, 0),
@@ -400,7 +415,12 @@ impl Model {
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
-        // The K/V stages take the VRAM left after the decoder and any expert slots.
+        if drafting && model.resident && model.weights.drafter
+            && std::env::var("STRAYDOG_DRAFT_VOCABULARY").map_or(true, |value| value != "0")
+        {
+            model.draft_vocabulary = model.group.draft_vocabulary(&head, DRAFT_ROWS, &[], true)?;
+        }
+        // The K/V stages take the VRAM left after the decoder, any expert slots and a draft's vocabulary.
         model.group.grow_kv_stages(context64)?;
         let row_cache = match settings.row_cache_bytes {
             Some(bytes) => bytes,
@@ -994,6 +1014,7 @@ impl Model {
                     return Err(error);
                 }
                 let (tokens, final_hidden) = (std::mem::take(&mut parked.tokens), parked.final_hidden.take());
+                self.draft_note(&tokens);
                 self.history = tokens;
                 self.final_hidden = final_hidden;
                 self.parked = swapped;
@@ -1050,6 +1071,7 @@ impl Model {
             self.group.restore_positions(history)?;
         }
         self.final_hidden = hidden;
+        self.draft_note(&saved);
         self.history = saved;
         Ok((self.history.len(), kind))
     }
@@ -1217,6 +1239,7 @@ impl Model {
             hidden
         };
         self.history.extend_from_slice(tokens);
+        self.draft_note(tokens);
         self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
         if !logits {
             return Ok(Some(None));
@@ -1438,6 +1461,42 @@ impl Model {
         Ok(())
     }
 
+    /// Note the tokens past DRAFT_ROWS among `tokens` (entering the history) for the draft's vocabulary.
+    fn draft_note(&mut self, tokens: &[u32]) {
+        if self.draft_vocabulary {
+            for &token in tokens {
+                if u64::from(token) >= DRAFT_ROWS && self.draft_extras.insert(token) {
+                    self.draft_pending.push(token);
+                }
+            }
+        }
+    }
+
+    /// The noted tokens' rows into the draft's vocabulary; when it is full, the history's tokens alone (the latest first).
+    fn draft_vocabulary_update(&mut self) -> Result<()> {
+        if self.draft_pending.is_empty() {
+            return Ok(());
+        }
+        let reset = self.draft_extras.len() > DRAFT_EXTRAS;
+        if reset {
+            self.draft_extras.clear();
+            self.draft_pending.clear();
+            for &token in self.history.iter().rev() {
+                if u64::from(token) >= DRAFT_ROWS && self.draft_extras.insert(token) {
+                    self.draft_pending.push(token);
+                    if self.draft_pending.len() == DRAFT_EXTRAS {
+                        break;
+                    }
+                }
+            }
+        }
+        let pending = std::mem::take(&mut self.draft_pending);
+        self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
+            group.draft_vocabulary(&operands[0], DRAFT_ROWS, &pending, reset)
+        })?;
+        Ok(())
+    }
+
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
     /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
     /// Each step is one call: a draft's row stays on the device for the next step to read.
@@ -1445,6 +1504,7 @@ impl Model {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
         let mut clock = Instant::now();
         self.protect(position as usize, position as usize + tokens.len() + limit)?;
+        self.draft_vocabulary_update()?;
         let embedded = self.token_embeddings(tokens)?;
         self.phase("draft: embeddings", &mut clock);
         let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0)?;
@@ -1635,6 +1695,7 @@ impl Model {
             self.phase("commit: PLE replay", &mut clock);
         }
         self.history.extend_from_slice(&tokens[..kept]);
+        self.draft_note(&tokens[..kept]);
         Ok(())
     }
 

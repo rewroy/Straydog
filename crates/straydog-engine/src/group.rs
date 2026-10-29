@@ -732,6 +732,17 @@ impl Group {
         self.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, lower)
     }
 
+    /// A draft's vocabulary on the MTP layer's device when the head is split across the GPUs (see
+    /// [`Backend::draft_vocabulary`]); false (nothing done) when it is not.
+    pub fn draft_vocabulary(&mut self, head: &Operand, rows: u64, tokens: &[u32], reset: bool) -> Result<bool> {
+        if !(self.expert_parallel()? && self.linked) {
+            return Ok(false);
+        }
+        let last = self.backends.len() - 1;
+        self.backends[last].draft_vocabulary(head, rows, tokens, reset)?;
+        Ok(true)
+    }
+
     /// Pin dense operands, each on the device owning its layer.
     pub fn pin(&mut self, operands: &[Operand]) -> Result<()> {
         for device in 0..self.backends.len() {

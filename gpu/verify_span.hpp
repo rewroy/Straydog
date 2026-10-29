@@ -538,17 +538,30 @@ __global__ void head_part(const float* logits, size_t width, const int32_t* chos
     result[2 * row] = logits[row * width + chosen[row]];
     result[2 * row + 1] = __int_as_float(chosen[row]);
 }
+// (rows past `own_rows`: the tokens of `extra_tokens`, a draft's vocabulary)
 __global__ void head_choose(const float* logits, size_t width, size_t split, const int32_t* chosen, const float* peer,
-                            size_t steps, int32_t* tokens) {
+                            size_t steps, int32_t* tokens, size_t own_rows = SIZE_MAX, const int32_t* extra_tokens = nullptr) {
     const size_t row = threadIdx.x;
     if (row >= steps) return;
     const float own = logits[row * width + chosen[row]];
-    tokens[row] = peer[2 * row] >= own ? __float_as_int(peer[2 * row + 1]) : int32_t(split) + chosen[row];
+    const int32_t token = size_t(chosen[row]) < own_rows ? int32_t(split) + chosen[row] : extra_tokens[size_t(chosen[row]) - own_rows];
+    tokens[row] = peer[2 * row] >= own ? __float_as_int(peer[2 * row + 1]) : token;
 }
+// `rows_of` (a draft's vocabulary): the peer's rows [0, low) and this device's [first, end) and `extra_count` rows of the tokens of
+// `extra_tokens` at `extras` (rows_of.end 0: the whole head).
+struct HeadRows { size_t low = 0, first = 0, end = 0, extra_count = 0; const uint8_t* extras = nullptr; const int32_t* extra_tokens = nullptr; };
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
                        void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence,
-                       const float* source = nullptr, unsigned top_count = 0, float* best_out = nullptr, float* rows_out = nullptr) {
+                       const float* source = nullptr, unsigned top_count = 0, float* best_out = nullptr, float* rows_out = nullptr,
+                       HeadRows rows_of = {}) {
     Device* peer = d.link.peer;
+    if (!rows_of.end) rows_of = {split, split, vocabulary};
+    if (rows_of.low > split || !rows_of.low || rows_of.first >= rows_of.end || rows_of.end > vocabulary ||
+        ((logits || top_count) && (rows_of.low != split || rows_of.first != split || rows_of.end != vocabulary || rows_of.extra_count)) ||
+        (rows_of.extra_count && (!rows_of.extras || !rows_of.extra_tokens)))
+        throw std::runtime_error("invalid Straydog split output head rows");
+    const size_t low_rows = rows_of.low, high_rows = rows_of.end - rows_of.first, own_rows = high_rows + rows_of.extra_count;
+    if (steps * own_rows > d.output_capacity) throw std::runtime_error("invalid Straydog split output head rows");
     if (!peer || !steps || steps > verify_max || (!input && !source) || !tokens || !split || split >= vocabulary ||
         steps * vocabulary > d.output_capacity || steps * split > peer->output_capacity ||
         64 + steps * split > d.link.rows * 2560 || 2560 * steps > peer->link.rows * 2560 ||
@@ -579,15 +592,15 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     float* received = peer_partials(d.link);
     on_device(peer->ordinal, [&]() {
         Device& h = *peer;
-        const Matrix low{static_cast<const uint8_t*>(peer_head), row_bytes, split, 2560, 0, 0, 0, kinds[3]};
+        const Matrix low{static_cast<const uint8_t*>(peer_head), row_bytes, low_rows, 2560, 0, 0, 0, kinds[3]};
         float* scratch = h.input;
         auto* best = reinterpret_cast<int32_t*>(scratch + 2 * verify_max * argmax_chunks);
         peer_receive_rows(h);
-        gemv(h, &low, 1, peer_inputs(h.link), h.output, steps, 2560, split);
-        row_argmax(h, h.output, steps, split, split, scratch, best);
-        head_part<<<1, 32, 0, h.stream>>>(h.output, split, best, steps, peer_remote_partials(h.link));
+        gemv(h, &low, 1, peer_inputs(h.link), h.output, steps, 2560, low_rows);
+        row_argmax(h, h.output, steps, low_rows, low_rows, scratch, best);
+        head_part<<<1, 32, 0, h.stream>>>(h.output, low_rows, best, steps, peer_remote_partials(h.link));
         // The lower half's (logit, sum) pairs follow its choices, before the logits at 64.
-        if (confidence) row_exp_sum(h, h.output, steps, split, split, best, scratch, peer_remote_partials(h.link) + 16);
+        if (confidence) row_exp_sum(h, h.output, steps, low_rows, low_rows, best, scratch, peer_remote_partials(h.link) + 16);
         if (logits) peer_copy<<<1024, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, h.output, steps, split, split);
         // (its rows' tops at 64 instead of its logits: a few pairs a row over the link)
         if (top_count) {
@@ -598,14 +611,16 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         peer_signal_peer(h);
         check(hipGetLastError());
     });
-    Matrix high{static_cast<const uint8_t*>(pointers[3]) + split * row_bytes, row_bytes, vocabulary - split, 2560, 0, 0, 0, kinds[3]};
-    gemv(d, &high, 1, mixed, d.output, steps, 2564, vocabulary - split);
-    row_argmax(d, d.output, steps, vocabulary - split, vocabulary - split, partial, chosen);
+    const Matrix own[2] = {{static_cast<const uint8_t*>(pointers[3]) + rows_of.first * row_bytes, row_bytes, high_rows, 2560, 0, 0, 0, kinds[3]},
+                           {rows_of.extras, row_bytes, rows_of.extra_count, 2560, 0, high_rows, 0, kinds[3]}};
+    gemv(d, own, rows_of.extra_count ? 2 : 1, mixed, d.output, steps, 2564, own_rows);
+    row_argmax(d, d.output, steps, own_rows, own_rows, partial, chosen);
     peer_receive(d);
-    head_choose<<<1, 32, 0, d.stream>>>(d.output, vocabulary - split, split, chosen, received, steps, final_tokens);
+    head_choose<<<1, 32, 0, d.stream>>>(d.output, own_rows, rows_of.first, chosen, received, steps, final_tokens, high_rows,
+                                        rows_of.extra_tokens);
     float* top = reinterpret_cast<float*>(final_tokens + verify_max);
     if (confidence) {
-        row_exp_sum(d, d.output, steps, vocabulary - split, vocabulary - split, chosen, partial, top);
+        row_exp_sum(d, d.output, steps, own_rows, own_rows, chosen, partial, top);
         head_confidence<<<1, 32, 0, d.stream>>>(top, received + 16, steps, top + 2 * verify_max);
     }
     float* ranked = top + 4 * verify_max;
@@ -723,7 +738,15 @@ void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer,
     const float* last = output + (steps - 1) * 10240;
     int32_t token_row[verify_max];
     float confidence_row[verify_max];
-    if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, confidence_row, last);
+    // (a draft's vocabulary, sd_draft_vocabulary: the extra tokens' rows here, the head's first rows split so that both devices
+    // read as many)
+    HeadRows rows_of{};
+    if (split && d.draft_rows && d.draft_rows < vocabulary) {
+        const size_t low = std::min({split, (d.draft_rows + d.draft_extra_count) / 2, d.draft_rows - 1});
+        rows_of = {low, low, d.draft_rows, d.draft_extra_count, d.draft_extras, d.draft_extra_tokens};
+    }
+    if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, confidence_row, last,
+                                 0, nullptr, nullptr, rows_of);
     else {
         output_head(d, head, head_kinds, 1, vocabulary, nullptr, token_row, nullptr, confidence_row, last);
         if (parts) finish_with_helper(d);

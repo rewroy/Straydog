@@ -156,11 +156,13 @@ unsigned resident_lanes(const std::vector<Matrix>& weights,size_t role,const flo
     const unsigned first=gemv_lanes(weights[role],input,concurrent), second=gemv_lanes(weights[3+role],input,concurrent);
     return first==second ? first : 0;
 }
+// shared_done: the shared expert's gate and up are in `output` already (moe_tokens_experts' router launch).
 void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* groups,const int32_t* selected,
                             bool down,const float* input,float* output,
-                            size_t tokens=1,size_t input_stride=0,size_t output_stride=0) {
+                            size_t tokens=1,size_t input_stride=0,size_t output_stride=0,bool shared_done=false) {
     const auto& weights=plan.weights;
     const size_t shared=plan.experts*3, roles=down ? 1 : 2;
+    const bool with_shared=plan.shared && !(shared_done && !down);
     ExpertGemv geometry{};
     for (size_t role=0;role<3;++role) { geometry.mapped[role]=plan.mapped[role]; geometry.bytes[role]=plan.host_bytes[role]; }
     geometry.assist=plan.mapped[0] ? d.assist : 0;
@@ -168,7 +170,7 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
     const int routed=weights[down ? 2 : 0].kind;
     const auto in=[](int kind,std::initializer_list<int> kinds) { return std::find(kinds.begin(),kinds.end(),kind)!=kinds.end(); };
-    bool kind=in(routed,{12,13,14,18,20,21,22,23,42}) && (down || weights[1].kind==routed) && (!down || !plan.shared ||
+    bool kind=in(routed,{12,13,14,18,20,21,22,23,42}) && (down || weights[1].kind==routed) && (!down || !with_shared ||
               in(weights[shared+2].kind,{8,20})) && (down || d.q8_wide);
     size_t waves=0;
     for (size_t r=0;r<roles;++r) {
@@ -179,11 +181,11 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
         if (down) matrix.input_offset=10*640;
         geometry.shared_lanes[r]=gemv_lanes(matrix,input,10*roles);
         // (a part without the shared expert has none of its waves; nor a gate and up stage that runs it beside)
-        geometry.shared_waves[r]=plan.shared && !(kind && !down) ? uint32_t(gemv_waves(matrix,geometry.shared_lanes[r])) : 0;
+        geometry.shared_waves[r]=with_shared && !(kind && !down) ? uint32_t(gemv_waves(matrix,geometry.shared_lanes[r])) : 0;
         waves+=10*size_t(geometry.routed_waves[r])+geometry.shared_waves[r];
         kind&=geometry.routed_lanes[r]!=0;
     }
-    const bool beside=kind && !down && plan.shared;
+    const bool beside=kind && !down && with_shared;
     // (Layers in parts, qwen_parts.hpp, run it first on the device's stream: on the side stream, every pass of three or
     // four rows took 7.5 ms more at 20K.)
     const bool aside=beside && d.qwen_parts==1;
@@ -504,10 +506,23 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     Matrix projections[2]={plan.weights[(experts+1)*3],plan.weights[(experts+1)*3+1]};
     projections[1].output_offset=experts;   // each token: router scores then mix
     float* gate_up=plan.workspace; float* product=gate_up+routes*1280;
-    gemv(d,projections,2,input,d.output,tokens,input_stride,experts+1);
-    resident_route<<<unsigned(tokens),256,0,d.stream>>>(d.output,d.output+experts,experts,moe.selected,moe.probabilities,
-                                                        experts+1,experts+1);
-    resident_expert_launch(d,plan,moe.groups,moe.selected,false,input,gate_up,tokens,input_stride,11*1280);
+    // Layers in parts (qwen_parts.hpp): the shared expert's half, gate and up, runs in the router's launch (the same row read;
+    // one launch a layer less), the scores after the decode workspace with the gate and up rows' stride.
+    constexpr size_t scores=4*11*4480+512;
+    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && plan.capacity*49302+65536>=scores+4*11*1280;
+    if (together) {
+        Matrix list[4]={projections[0],projections[1],plan.weights[experts*3],plan.weights[experts*3+1]};
+        list[0].output_offset=scores; list[1].output_offset=scores+experts;
+        list[2].output_offset=10*1280; list[3].output_offset=10*1280+640;
+        gemv(d,list,4,input,gate_up,tokens,input_stride,11*1280);
+        resident_route<<<unsigned(tokens),256,0,d.stream>>>(gate_up+scores,gate_up+scores+experts,experts,moe.selected,
+                                                            moe.probabilities,11*1280,11*1280);
+    } else {
+        gemv(d,projections,2,input,d.output,tokens,input_stride,experts+1);
+        resident_route<<<unsigned(tokens),256,0,d.stream>>>(d.output,d.output+experts,experts,moe.selected,moe.probabilities,
+                                                            experts+1,experts+1);
+    }
+    resident_expert_launch(d,plan,moe.groups,moe.selected,false,input,gate_up,tokens,input_stride,11*1280,together);
     moe_product<<<unsigned((routes*640+255)/256),256,0,d.stream>>>(gate_up,routes,product);
     resident_expert_launch(d,plan,moe.groups,moe.selected,true,product,moe.outputs,tokens,11*640,11*2560);
 }

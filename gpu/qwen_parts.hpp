@@ -17,12 +17,41 @@ namespace {
 // as a whole layer's residual update does (hidden[s] += mix[s] * sum, mix after the row's 2560 inputs, `mixed_stride` apart):
 // link_sum_kernel's steps.
 #if defined(__HIPCC__)
-__global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, uint32_t steps, float* hidden, const float* mixed,
-                                                       size_t mixed_stride, uint32_t* state, uint32_t* peer_flag, float* peer_inbox,
-                                                       const float* inbox, size_t capacity, uint64_t timeout) {
+// A layer's expert outputs as a part (moe_part_partial's sum, formed by the sum's own block: one launch less a layer).
+struct QwenExpertPart {
+    const float* outputs; const float* probabilities; const int32_t* selected; const MoeGroup* groups; bool shared;
+};
+template<bool experts>
+__global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, QwenExpertPart moe, uint32_t steps, float* hidden,
+                                                       const float* mixed, size_t mixed_stride, uint32_t* state, uint32_t* peer_flag,
+                                                       float* peer_inbox, const float* inbox, size_t capacity, uint64_t timeout) {
     const uint32_t count = steps * 2560, next = state[0] + 1;
     const size_t slot = size_t(next & 1) * capacity;
-    for (uint32_t i = threadIdx.x; i < count; i += blockDim.x) link_send(peer_inbox + slot + i, part[i]);
+    __shared__ bool held[4][10];
+    if constexpr (experts) {
+        if (threadIdx.x < steps * 10) held[threadIdx.x / 10][threadIdx.x % 10] = moe.groups[moe.selected[threadIdx.x]].weights[2].data != nullptr;
+        __syncthreads();
+    }
+    // (a pass's rows are at most four: ten values a thread)
+    float own[10];
+    #pragma unroll
+    for (uint32_t k = 0; k < 10; ++k) {
+        const uint32_t i = threadIdx.x + k * 1024;
+        if (i >= count) break;
+        if constexpr (experts) {
+            // moe_own_partial's sum in route order, then the shared expert's (moe_part_partial's)
+            const uint32_t token = i / 2560, column = i % 2560;
+            float sum = 0;
+            for (size_t route = 0; route < 10; ++route)
+                if (held[token][route])
+                    sum += moe.probabilities[token * 11 + route] * moe_route_output(moe.outputs, steps, false, token, route)[column];
+            if (moe.shared) sum += moe.probabilities[token * 11 + 10] * moe.outputs[(token * 11 + 10) * 2560 + column];
+            own[k] = sum;
+        } else {
+            own[k] = part[i];
+        }
+        link_send(peer_inbox + slot + i, own[k]);
+    }
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (!threadIdx.x) {
@@ -36,9 +65,12 @@ __global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, uint32_
         }
     }
     __syncthreads();
-    for (uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+    #pragma unroll
+    for (uint32_t k = 0; k < 10; ++k) {
+        const uint32_t i = threadIdx.x + k * 1024;
+        if (i >= count) break;
         const uint32_t token = i / 2560, column = i % 2560;
-        const float total = part[i] + link_load(inbox + slot + i);
+        const float total = own[k] + link_load(inbox + slot + i);
         const float* mix = mixed + token * mixed_stride + 2560;
         #pragma unroll
         for (uint32_t stream = 0; stream < 4; ++stream) hidden[token * 10240 + stream * 2560 + column] += mix[stream] * total;
@@ -105,12 +137,21 @@ __global__ void qwen_gather_receive(size_t steps, size_t first, size_t count, co
         else mixed[steps * 2560 + first * 4 + (i - count * 2560)] = link_load(reinterpret_cast<const float*>(slot + count * 2560) + (i - count * 2560));
     }
 }
-void qwen_sum_rows(Device& d, const float* part, size_t steps, float* hidden, const float* mixed, size_t mixed_stride) {
+// `part` null: the part is the experts' of `moe` (verify_layer_part's).
+void qwen_sum_rows(Device& d, const float* part, size_t steps, float* hidden, const float* mixed, size_t mixed_stride,
+                   const TokenMoe* moe = nullptr) {
     SumLink& link = d.sums;
-    if (!link.peer || !steps || steps * 2560 > link.capacity) throw std::runtime_error("invalid Straydog part sum");
+    if (!link.peer || !steps || steps > 4 || steps * 2560 > link.capacity || (!part && !moe))
+        throw std::runtime_error("invalid Straydog part sum");
 #if defined(__HIPCC__)
-    qwen_part_sum<<<1, 1024, 0, d.stream>>>(part, uint32_t(steps), hidden, mixed, mixed_stride, link.state, link.peer_flag,
-                                            link.peer_inbox, link.inbox, link.capacity, d.await_timeout);
+    if (part) {
+        qwen_part_sum<false><<<1, 1024, 0, d.stream>>>(part, QwenExpertPart{}, uint32_t(steps), hidden, mixed, mixed_stride, link.state,
+                                                       link.peer_flag, link.peer_inbox, link.inbox, link.capacity, d.await_timeout);
+    } else {
+        const QwenExpertPart experts{moe->outputs, moe->probabilities, moe->selected, moe->groups, moe->plan->shared};
+        qwen_part_sum<true><<<1, 1024, 0, d.stream>>>(nullptr, experts, uint32_t(steps), hidden, mixed, mixed_stride, link.state,
+                                                      link.peer_flag, link.peer_inbox, link.inbox, link.capacity, d.await_timeout);
+    }
     check(hipGetLastError());
 #else
     (void)hidden; (void)mixed; (void)mixed_stride;
@@ -253,9 +294,7 @@ void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const Verify
     hc_decode(d, hc, true, v.hidden, d.output, v.mixed, steps, 2564);
     const TokenMoe moe = token_moe(d, plan.moe, steps);
     moe_tokens_experts(d, moe, steps, v.mixed, 2564);
-    moe_part_partial<<<dim3(10, unsigned(steps)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, steps,
-                                                                     false, moe.plan->shared, v.branch);
-    qwen_sum_rows(d, v.branch, steps, v.hidden, v.mixed, 2564);
+    qwen_sum_rows(d, nullptr, steps, v.hidden, v.mixed, 2564, &moe);
 }
 
 // A prefill batch through a layer's part: prefill_span's steps, the HyperConnections and residual updates of this device's rows

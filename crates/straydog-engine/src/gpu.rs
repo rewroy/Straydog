@@ -1336,6 +1336,19 @@ impl Backend {
         Ok(Some((token, confidence)))
     }
 
+    /// A draft's vocabulary when the head is split (see `sd_draft_vocabulary`): `head`'s rows [0, rows) and the rows of `tokens`
+    /// (each at least `rows`), after the ones given before unless `reset`.
+    pub fn draft_vocabulary(&mut self, head: &Operand, rows: u64, tokens: &[u32], reset: bool) -> Result<()> {
+        let entry = self.prepare(head)?;
+        let tokens: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
+        // SAFETY: `tokens` holds `count` ids; the native side checks the head allocation and every id.
+        check(unsafe {
+            ffi::sd_draft_vocabulary(self.handle, entry.pointer, entry.kind, head.rows, rows, tokens.as_ptr(), tokens.len() as u64,
+                                     c_int::from(reset))
+        })
+        .map(drop)
+    }
+
     /// Feed the MTP layer one batch of prompt pairs, the hidden rows coming from `stash`'s
     /// decoder workspace (see `sd_mtp_prompt_rows`).
     #[allow(clippy::too_many_arguments)]
