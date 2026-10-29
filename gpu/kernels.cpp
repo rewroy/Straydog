@@ -395,6 +395,7 @@ struct Device {
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
     bool half_decode = false;   // a decode or verify pass's index and attention scores through WMMA, FP16 operands (RDNA4: the FP16 prompt pass's)
+    bool q8_wide = false;   // a decode row's Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 GEMVs on the Q8 kernels, mixed lists with BF16 rows in one launch (RDNA4: Qwen3.8)
     bool q8_decode = false;   // a decode row's Q5_K GEMVs, IQ2 experts' gate/up and down (IQ2_S's down excepted) and Q5_K shared expert on the Q8 kernels (RDNA4)
     uint64_t* gemm_checks = nullptr;   // optional quality-only cast counters, enabled before graphs
     bool rdna4 = false;
@@ -2214,8 +2215,9 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision) {
 int sd_decode_options(void* handle, int flags) {
     try {
         auto& value = device(handle);
-        if (flags & ~3) throw std::runtime_error("invalid Straydog decode options");
+        if (flags & ~7) throw std::runtime_error("invalid Straydog decode options");
         value.q8_decode = (flags & 1) && value.rdna4;
+        value.q8_wide = (flags & 4) && value.rdna4;
         value.half_decode = (flags & 2) && value.rdna4;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
@@ -2375,7 +2377,15 @@ int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds,
             }
             first = last;
         }
-        if (fallback_count) {
+        if (fallback_count && value.q8_wide) {
+            // (gemv()'s kernels, so a decode step's head takes the Q8 kernels as a verification's does)
+            for (size_t first = 0; first < fallback_count; first += gemv_fixed_items) {
+                Matrix group[gemv_fixed_items];
+                const size_t size = std::min(gemv_fixed_items, fallback_count - first);
+                for (size_t i = 0; i < size; ++i) group[i] = fallback[first + i].matrix;
+                gemv(value, group, size, value.input, value.output);
+            }
+        } else if (fallback_count) {
             upload(value, value.matrices, fallback, fallback_count * sizeof(GemvItem));
             gemv_list<<<unsigned((fallback_waves+7)/8), 256, 0, value.stream>>>(value.matrices, fallback_count, value.input, value.output);
             check(hipGetLastError());

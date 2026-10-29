@@ -664,6 +664,11 @@ layer (§6.2).
   rest) and the head 0.56 ms (0.43 of it the half vocabulary's GEMV at 590 GB/s), all device time;
   the host turnaround between steps (the token to its embedding and back, about 0.15 ms) is what
   chaining cannot take away without the embedding table on the device.
+- **INT8 activations.** A decode or verification row's projections (Q4_K, Q5_K, Q6_K, IQ4_XS and
+  Q8_0) take the Q8 kernels: each 32 values of a row's input are quantized to INT8 with one F32
+  scale, staged once per block, and a unit's dots are exact in INT32 before scaling. A layer's
+  qkv, gate, beta and alpha stay one launch: a block owns one matrix, and the BF16 ones read the
+  F32 input. `STRAYDOG_Q8=0` keeps every projection on F32.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 

@@ -394,7 +394,7 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
         // (256 threads, whatever gemv() would take: the same waves, rows, lanes and dots)
         bool launched = false;
 #if defined(__HIPCC__)
-        if (const size_t lds = gemv_q8_input(value, list, input, 1)) {
+        if (const size_t lds = kind == 13 || kind == 8 ? gemv_q8_input(value, list, input, 1) : 0) {
             if (kind == 13) gemv_norm_tail_q8<13><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
             else gemv_norm_tail_q8<8><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
             launched = true;
