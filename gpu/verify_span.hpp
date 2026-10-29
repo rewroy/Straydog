@@ -335,83 +335,98 @@ void row_exp_sum(Device& d, const float* values, size_t rows, size_t count, size
 }
 // The `top` greatest of each row of `count` values, the lower index first on a tie (the order of sampling's candidates: a draw
 // among them is the draw among the whole row's when its cut keeps at most `top`), as (value, index) pairs most likely
-// first: every chunk's `top` (argmax_chunks blocks a row), then one block a row the chunks'. Each round takes the block's
-// best not yet taken: a thread's best of the values it holds, then the block's of the threads'.
+// first: every chunk's `top` (argmax_chunks blocks a row), then one block a row the chunks'. A wave takes its share's `top`
+// in rounds of shuffles alone (each lane's best kept, found again only when taken), the block's first wave the waves'
+// (rounds of block-wide bests, two barriers each, took a chunk 42 us).
 constexpr unsigned head_top_max = 64, head_top_held = 16;
 __device__ __forceinline__ bool top_better(float a, uint32_t ia, float b, uint32_t ib) { return a > b || (a == b && ia < ib); }
-// The block's `top` of the values each thread holds (`held` of them, some not set: -inf at index ~0u); thread 0 writes them.
-__device__ void top_rounds(float (&values)[head_top_held], uint32_t (&indices)[head_top_held], unsigned top, float* out_values,
-                           uint32_t* out_indices) {
-    __shared__ float wave_values[32];
-    __shared__ uint32_t wave_indices[32];
-    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32, waves = blockDim.x / 32;
+// The wave's `top` best of the pairs its lanes hold (unset: -inf at index ~0u), most likely first, written by lane 0.
+__device__ void top_wave(float (&values)[head_top_held], uint32_t (&indices)[head_top_held], unsigned top, float* out_values,
+                         uint32_t* out_indices) {
+    float best = -INFINITY; uint32_t at = ~0u;
+    const auto rescan = [&]() {
+        best = -INFINITY; at = ~0u;
+        #pragma unroll
+        for (unsigned i = 0; i < head_top_held; ++i)
+            if (top_better(values[i], indices[i], best, at)) { best = values[i]; at = indices[i]; }
+    };
+    rescan();
     for (unsigned round = 0; round < top; ++round) {
-        float value = -INFINITY; uint32_t index = ~0u;
-        #pragma unroll
-        for (unsigned i = 0; i < head_top_held; ++i)
-            if (top_better(values[i], indices[i], value, index)) { value = values[i]; index = indices[i]; }
+        float value = best; uint32_t index = at;
         for (unsigned offset = 16; offset; offset /= 2) {
-            const float other = __shfl_xor(value, offset, 32); const uint32_t at = __shfl_xor(index, offset, 32);
-            if (top_better(other, at, value, index)) { value = other; index = at; }
+            const float other = __shfl_xor(value, offset, 32); const uint32_t other_at = __shfl_xor(index, offset, 32);
+            if (top_better(other, other_at, value, index)) { value = other; index = other_at; }
         }
-        if (!lane) { wave_values[wave] = value; wave_indices[wave] = index; }
-        __syncthreads();
-        value = wave_values[0]; index = wave_indices[0];
-        for (unsigned w = 1; w < waves; ++w)
-            if (top_better(wave_values[w], wave_indices[w], value, index)) { value = wave_values[w]; index = wave_indices[w]; }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned i = 0; i < head_top_held; ++i)
-            if (indices[i] == index) { values[i] = -INFINITY; indices[i] = ~0u; }
-        if (!threadIdx.x) { out_values[round] = value; out_indices[round] = index; }
+        if (threadIdx.x % 32 == 0) { out_values[round] = value; out_indices[round] = index; }
+        if (index != ~0u && at == index) {
+            #pragma unroll
+            for (unsigned i = 0; i < head_top_held; ++i)
+                if (indices[i] == index) { values[i] = -INFINITY; indices[i] = ~0u; }
+            rescan();
+        }
     }
+}
+// The block's `top` of `count` pairs (from_values[i], from_indices ? from_indices[i] : first + i), into out: each wave its run's,
+// then the first wave the waves'. At most 8 x 32 x head_top_held pairs.
+__device__ void top_block(const float* from_values, const uint32_t* from_indices, size_t first, size_t count, unsigned top,
+                          float* out_values, uint32_t* out_indices) {
+    __shared__ float wave_values[8 * head_top_max];
+    __shared__ uint32_t wave_indices[8 * head_top_max];
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32, waves = blockDim.x / 32;
+    const size_t share = (count + waves - 1) / waves, begin = std::min(count, size_t(wave) * share), end = std::min(count, begin + share);
+    float held[head_top_held]; uint32_t at[head_top_held];
+    #pragma unroll
+    for (unsigned i = 0; i < head_top_held; ++i) {
+        const size_t j = begin + lane + size_t(i) * 32;
+        const bool in = j < end;
+        held[i] = in ? from_values[j] : -INFINITY;
+        at[i] = in ? (from_indices ? from_indices[j] : uint32_t(first + j)) : ~0u;
+    }
+    top_wave(held, at, top, wave_values + wave * top, wave_indices + wave * top);
+    __syncthreads();
+    if (wave) return;
+    #pragma unroll
+    for (unsigned i = 0; i < head_top_held; ++i) {
+        const size_t j = lane + size_t(i) * 32;
+        const bool in = j < size_t(waves) * top;
+        held[i] = in ? wave_values[j] : -INFINITY; at[i] = in ? wave_indices[j] : ~0u;
+    }
+    top_wave(held, at, top, out_values, out_indices);
 }
 __global__ void __launch_bounds__(256) row_top_chunks(const float* values, size_t count, size_t stride, unsigned top,
                                                       float* chunk_values, uint32_t* chunk_indices) {
     const size_t row = blockIdx.y, per = (count + argmax_chunks - 1) / argmax_chunks;
-    const size_t first = size_t(blockIdx.x) * per, last = std::min(count, first + per);
-    float held[head_top_held]; uint32_t at[head_top_held];
-    #pragma unroll
-    for (unsigned i = 0; i < head_top_held; ++i) {
-        const size_t index = first + threadIdx.x + size_t(i) * blockDim.x;
-        const bool in = index < last;
-        held[i] = in ? values[row * stride + index] : -INFINITY; at[i] = in ? uint32_t(index) : ~0u;
-    }
+    const size_t first = std::min(count, size_t(blockIdx.x) * per), last = std::min(count, first + per);
     const size_t slot = (row * argmax_chunks + blockIdx.x) * top;
-    top_rounds(held, at, top, chunk_values + slot, chunk_indices + slot);
+    top_block(values + row * stride + first, nullptr, first, last - first, top, chunk_values + slot, chunk_indices + slot);
 }
 __global__ void __launch_bounds__(256) row_top_finish(const float* chunk_values, const uint32_t* chunk_indices, unsigned top,
                                                       float* result) {
     const size_t row = blockIdx.x, candidates = size_t(argmax_chunks) * top;
-    float held[head_top_held]; uint32_t at[head_top_held];
-    #pragma unroll
-    for (unsigned i = 0; i < head_top_held; ++i) {
-        const size_t index = threadIdx.x + size_t(i) * blockDim.x;
-        const bool in = index < candidates;
-        held[i] = in ? chunk_values[row * candidates + index] : -INFINITY; at[i] = in ? chunk_indices[row * candidates + index] : ~0u;
-    }
     float* out = result + row * 2 * top;
-    top_rounds(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
+    top_block(chunk_values + row * candidates, chunk_indices + row * candidates, 0, candidates, top, out,
+              reinterpret_cast<uint32_t*>(out + top));
 }
-// The two halves' `top` pairs of each row (the peer's rows [0, split), this device's from split on) as one row's.
-__global__ void __launch_bounds__(256) head_top_merge(const float* own, const float* peer, uint32_t split, unsigned top, float* result) {
+// The two halves' `top` pairs of each row (the peer's rows [0, split), this device's from split on) as one row's: one wave.
+__global__ void __launch_bounds__(32) head_top_merge(const float* own, const float* peer, uint32_t split, unsigned top, float* result) {
     const size_t row = blockIdx.x;
     const float* low = peer + row * 2 * top; const float* high = own + row * 2 * top;
     float held[head_top_held]; uint32_t at[head_top_held];
     #pragma unroll
     for (unsigned i = 0; i < head_top_held; ++i) {
-        const size_t index = threadIdx.x + size_t(i) * blockDim.x;
+        const size_t index = threadIdx.x + size_t(i) * 32;
         held[i] = -INFINITY; at[i] = ~0u;
         if (index < top) { held[i] = low[index]; at[i] = __float_as_uint(low[top + index]); }
         else if (index < 2 * size_t(top)) { held[i] = high[index - top]; at[i] = __float_as_uint(high[index]) + split; }
     }
     float* out = result + row * 2 * top;
-    top_rounds(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
+    top_wave(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
 }
 // Each row's `top` pairs into result: `top` values, then `top` indices (bits); scratch: rows x argmax_chunks x top x 2 words.
 void row_top(Device& d, const float* values, size_t rows, size_t count, size_t stride, unsigned top, float* scratch, float* result) {
     if (!top || top > head_top_max || (count + argmax_chunks - 1) / argmax_chunks > 256 * head_top_held)
         throw std::runtime_error("invalid Straydog row top");
+    // (a block's waves hand on at most 8 x top pairs, which the first wave holds: top at most 64)
     auto* indices = reinterpret_cast<uint32_t*>(scratch + rows * argmax_chunks * top);
     row_top_chunks<<<dim3(argmax_chunks, unsigned(rows)), 256, 0, d.stream>>>(values, count, stride, top, scratch, indices);
     row_top_finish<<<unsigned(rows), 256, 0, d.stream>>>(scratch, indices, top, result);
@@ -560,7 +575,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     float* merged = ranked + head_top_floats;
     if (top_count) {
         row_top(d, d.output, steps, vocabulary - split, vocabulary - split, top_count, ranked + verify_max * 2 * head_top_max, ranked);
-        head_top_merge<<<unsigned(steps), 256, 0, d.stream>>>(ranked, received + 64, uint32_t(split), top_count, merged);
+        head_top_merge<<<unsigned(steps), 32, 0, d.stream>>>(ranked, received + 64, uint32_t(split), top_count, merged);
     }
     check(hipGetLastError());
     finish_with_helper(d);

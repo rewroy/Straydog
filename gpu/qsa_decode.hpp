@@ -33,7 +33,7 @@ void qsa_decode_attend(Device& d,void* const* pointers,void* kv,void* index,void
     qsa_pool_one<<<1,128,0,d.stream>>>(ik,static_cast<const float*>(pointers[9]),pool,position,blocks,blocks+pool*128);
     qsa_block_scores<<<dim3(unsigned((pool+255)/256),1),256,0,d.stream>>>(iq,blocks,pool,0,1,static_cast<float*>(scratch),position);
     constexpr size_t selected=2052;
-    qsa_select<<<1,256,0,d.stream>>>(static_cast<float*>(scratch),pool,0,1,selected,d.input,position);
+    qsa_select_rows<1024><<<1,1024,0,d.stream>>>(static_cast<float*>(scratch),pool,0,1,selected,d.input,position);
     const KvView view=kv_decode_view(d,kv,context);
     write_attention_kv<<<2,256,0,d.stream>>>(static_cast<float*>(kv),context,0,1,d.input,position,value,
                                            view.mirror,view.mirror_rows);
@@ -109,7 +109,7 @@ void qsa_decode_attend_rows(Device& d,void* const* pointers,void* kv,void* index
                                         blocks,blocks+pool*128);
     qsa_block_scores<<<dim3(unsigned((pool+255)/256),unsigned(steps)),256,0,d.stream>>>(projections+13312,blocks,pool,0,steps,
         static_cast<float*>(scratch),positions,stride);
-    qsa_select<<<unsigned(steps),256,0,d.stream>>>(static_cast<float*>(scratch),pool,0,steps,selected,d.input,positions);
+    qsa_select_rows<1024><<<unsigned(steps),1024,0,d.stream>>>(static_cast<float*>(scratch),pool,0,steps,selected,d.input,positions);
     const KvView view=kv_decode_view(d,kv,context);
     write_attention_kv_rows<<<unsigned((steps*512+255)/256),256,0,d.stream>>>(static_cast<float*>(kv),context,steps,
         d.input+steps*6144,projections+12800,stride,positions,view.mirror,view.mirror_rows);

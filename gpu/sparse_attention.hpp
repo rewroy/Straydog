@@ -249,11 +249,13 @@ __device__ inline unsigned qsa_ballot(bool predicate) {
 // it in registers, block i * threads + thread as the thread's value i (at most 64: 1024 threads
 // cover a 262144-token context, 256 threads 65536 tokens). The same radix passes find the 512th
 // value; ballots count the greater and equal values per wave in block order, so the earliest
-// equal blocks are taken, in block order, as qsa_select takes them.
+// equal blocks are taken, in block order, as qsa_select takes them. (A decode or verification pass's few rows, a block each: 1024
+// threads; qsa_select's 256 reread a 20K row four times in 41 us.)
 constexpr unsigned qsa_select_run = 64;
 template <unsigned threads>
 __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, size_t pool, size_t base, size_t steps,
-                                                          size_t selected, float* packed) {
+                                                          size_t selected, float* packed, const uint32_t* dynamic_position = nullptr) {
+    if (dynamic_position) base = *dynamic_position;
     constexpr unsigned waves = threads / 32;
     const size_t token = blockIdx.x, position = base + token, complete = (position + 1) / 4;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
