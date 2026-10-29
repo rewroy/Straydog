@@ -45,10 +45,12 @@ __device__ __forceinline__ void hc_load8(const uint8_t* row, size_t unit, float 
 // V tokens share each weight read: token v reads x + v*10240 and keeps its
 // partial sums at scratch + v*hc_decode_scratch, with the one-token arithmetic.
 constexpr size_t hc_decode_scratch = 4 * 324 + 4;
-// One or two tokens: a block of 32 rows (1024 threads, a row a wave) and one stream, the stream's x * norm of the V tokens
-// staged in LDS once: the same products, sums and scale as hc_decode_partial_pairs'.
+// One or two tokens: a block of 24 rows (768 threads, a row a wave) and one stream, the stream's x * norm of the V tokens
+// staged in LDS once: the same products, sums and scale as hc_decode_partial_pairs'. Two blocks share a WGP, so all 56 of a
+// launch run at once (32-row blocks of 1024 threads, one a WGP, took two rounds for 44).
+constexpr unsigned hc_partial_rows = 24;
 template<int down_kind, int inject_kind, int V>
-__global__ void __launch_bounds__(1024) hc_decode_partial(Matrix down, Matrix inject, bool has_inject, const float* x,
+__global__ void __launch_bounds__(hc_partial_rows * 32) hc_decode_partial(Matrix down, Matrix inject, bool has_inject, const float* x,
                                                           const float* norm, float* partial, float* inverse) {
     const size_t stream = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     __shared__ float reduce[V][8];
@@ -57,7 +59,7 @@ __global__ void __launch_bounds__(1024) hc_decode_partial(Matrix down, Matrix in
     #pragma unroll
     for (int v = 0; v < V; ++v) {
         const float* xs = x + v * 10240 + stream * 2560;
-        for (size_t c = threadIdx.x * 4; c < 2560; c += 4096) {
+        for (size_t c = threadIdx.x * 4; c < 2560; c += 4 * hc_partial_rows * 32) {
             const float4 a = gemv_load4(xs + c), p = gemv_load4(ns + c);
             *reinterpret_cast<float4*>(&scaled[v][c]) = make_float4(a.x * p.x, a.y * p.y, a.z * p.z, a.w * p.w);
         }
@@ -82,7 +84,7 @@ __global__ void __launch_bounds__(1024) hc_decode_partial(Matrix down, Matrix in
         scale[v] = 1.0f / sqrtf(total / 2560.0f + 1e-6f);
         if (blockIdx.x == 0 && threadIdx.x == 0) inverse[v * hc_decode_scratch + stream] = scale[v];
     }
-    const size_t row = size_t(blockIdx.x) * 32 + wave, rows = 320 + (has_inject ? 4 : 0);
+    const size_t row = size_t(blockIdx.x) * hc_partial_rows + wave, rows = 320 + (has_inject ? 4 : 0);
     if (row >= rows) return;
     const bool injection = row >= 320;
     const Matrix& m = injection ? inject : down;
@@ -214,12 +216,23 @@ __global__ void __launch_bounds__(256) hc_decode_partial_pairs(Matrix down, Matr
         }
 }
 
+// A copy that rides in a HyperConnection's second launch (blocks from `first_block` on): a DeltaNet layer's convolution history
+// into the scratch its tokens read (gdn_history_snapshot's copy, a launch a layer less). count 0: none.
+struct HcCopy { const float4* from = nullptr; float4* to = nullptr; uint32_t count = 0, first_block = 0; };
+__device__ __forceinline__ bool hc_copy_block(const HcCopy& copy) {
+    if (blockIdx.x < copy.first_block) return false;
+    for (size_t i = size_t(blockIdx.x - copy.first_block) * blockDim.x + threadIdx.x; i < copy.count; i += size_t(gridDim.x - copy.first_block) * blockDim.x)
+        copy.to[i] = copy.from[i];
+    return true;
+}
 // Three or four tokens: hc_decode_finish with four columns a wave (32 a block, 80 blocks), so the activated low-rank vector is
 // rebuilt by a quarter as many blocks (at four tokens its partial sums, read by every block, are more bytes than the up rows).
 // Each column's products and sums are hc_decode_finish's.
 template<int up_kind, int V>
 __global__ void __launch_bounds__(256) hc_decode_finish_columns(Matrix up, bool has_inject, const float* partial, const float* inverse,
-                                                                const float* x, const float* norm, float* output, size_t output_stride) {
+                                                                const float* x, const float* norm, float* output, size_t output_stride,
+                                                                HcCopy copy) {
+    if (copy.count && hc_copy_block(copy)) return;
     __shared__ float low[V][320];
     #pragma unroll
     for (int v = 0; v < V; ++v) {
@@ -274,9 +287,11 @@ __global__ void __launch_bounds__(256) hc_decode_finish_columns(Matrix up, bool 
     }
 }
 
+
 template<int up_kind, int V>
 __global__ void hc_decode_finish(Matrix up, bool has_inject, const float* partial, const float* inverse,
-                                 const float* x, const float* norm, float* output, size_t output_stride) {
+                                 const float* x, const float* norm, float* output, size_t output_stride, HcCopy copy = {}) {
+    if (copy.count && hc_copy_block(copy)) return;
     __shared__ float low[V][320];
     #pragma unroll
     for (int v = 0; v < V; ++v) {
@@ -340,16 +355,20 @@ void hc_decode_stage_one(Device& d, const Matrix& down, const Matrix& inject, bo
         }
         return;
     }
-    const dim3 grid(has_inject ? 11 : 10, 4);
+    const dim3 grid((320 + (has_inject ? 4 : 0) + hc_partial_rows - 1) / hc_partial_rows, 4);
+    constexpr unsigned threads = hc_partial_rows * 32;
     switch (has_inject ? inject.kind : down_kind) {
-        case 0: hc_decode_partial<down_kind, 0, V><<<grid, 1024, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
-        case 1: hc_decode_partial<down_kind, 1, V><<<grid, 1024, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
-        default: hc_decode_partial<down_kind, 30, V><<<grid, 1024, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
+        case 0: hc_decode_partial<down_kind, 0, V><<<grid, threads, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
+        case 1: hc_decode_partial<down_kind, 1, V><<<grid, threads, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
+        default: hc_decode_partial<down_kind, 30, V><<<grid, threads, 0, d.stream>>>(down, inject, has_inject, x, norm, partial, inverse); break;
     }
 }
 template<int V>
 void hc_decode_vectors(Device& d, const Matrix* matrices, bool has_inject, const float* x, float* scratch, float* output,
-                       size_t output_stride) {
+                       size_t output_stride, const HcCopy& copy) {
+    const unsigned copy_blocks = copy.count ? 4 : 0;
+    HcCopy own = copy, own_wide = copy;
+    own.first_block = 80; own_wide.first_block = 320;
     const Matrix& down = matrices[1];
     const Matrix& up = matrices[2];
     const Matrix inject = has_inject ? matrices[3] : matrices[1];
@@ -364,30 +383,30 @@ void hc_decode_vectors(Device& d, const Matrix* matrices, bool has_inject, const
     }
     if (V >= 3) {
         switch (up.kind) {
-            case 0: hc_decode_finish_columns<0, V><<<80, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-            case 1: hc_decode_finish_columns<1, V><<<80, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-            case 8: hc_decode_finish_columns<8, V><<<80, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-            default: hc_decode_finish_columns<30, V><<<80, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
+            case 0: hc_decode_finish_columns<0, V><<<80 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own); break;
+            case 1: hc_decode_finish_columns<1, V><<<80 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own); break;
+            case 8: hc_decode_finish_columns<8, V><<<80 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own); break;
+            default: hc_decode_finish_columns<30, V><<<80 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own); break;
         }
         check(hipGetLastError());
         return;
     }
     switch (up.kind) {
-        case 0: hc_decode_finish<0, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-        case 1: hc_decode_finish<1, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-        case 8: hc_decode_finish<8, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
-        default: hc_decode_finish<30, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
+        case 0: hc_decode_finish<0, V><<<320 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own_wide); break;
+        case 1: hc_decode_finish<1, V><<<320 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own_wide); break;
+        case 8: hc_decode_finish<8, V><<<320 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own_wide); break;
+        default: hc_decode_finish<30, V><<<320 + copy_blocks, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride, own_wide); break;
     }
     check(hipGetLastError());
 }
 // x holds `vectors` rows of 10240; output rows are output_stride apart (2560 mixed + 4 injection).
 void hc_decode(Device& d, const Matrix* matrices, bool has_inject, const float* x, float* scratch, float* output,
-               size_t vectors=1, size_t output_stride=2564) {
+               size_t vectors=1, size_t output_stride=2564, const HcCopy& copy={}) {
     switch (vectors) {
-        case 1: hc_decode_vectors<1>(d, matrices, has_inject, x, scratch, output, output_stride); break;
-        case 2: hc_decode_vectors<2>(d, matrices, has_inject, x, scratch, output, output_stride); break;
-        case 3: hc_decode_vectors<3>(d, matrices, has_inject, x, scratch, output, output_stride); break;
-        case 4: hc_decode_vectors<4>(d, matrices, has_inject, x, scratch, output, output_stride); break;
+        case 1: hc_decode_vectors<1>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
+        case 2: hc_decode_vectors<2>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
+        case 3: hc_decode_vectors<3>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
+        case 4: hc_decode_vectors<4>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
         default: throw std::runtime_error("invalid Straydog HyperConnection vector count");
     }
 }

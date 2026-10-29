@@ -290,13 +290,19 @@ gdn_tokens(const float* state_in, const float* history_in, float* state, float* 
 // Keep every head's old convolution window immutable until all blocks have read
 // it. Reuse the input arena after the 6144-value projected output, so graphs keep
 // fixed pointers and no allocation or floating-point operation is added.
-const float* gdn_history_snapshot(Device& d, const float* history, size_t parts = 1) {
+// (queue: false, the copy rides in an earlier launch, gdn_history_copy's)
+const float* gdn_history_snapshot(Device& d, const float* history, size_t parts = 1, bool queue = true) {
     constexpr size_t offset = 4 * 48 * 128 + 6144;
     const size_t count = 4 * 10240 / parts;
     if (offset + count > d.input_capacity) throw std::runtime_error("DeltaNet history scratch exceeds capacity");
     float* snapshot = d.input + offset;
-    check(hipMemcpyAsync(snapshot, history, count * sizeof(float), hipMemcpyDeviceToDevice, d.stream));
+    if (queue) check(hipMemcpyAsync(snapshot, history, count * sizeof(float), hipMemcpyDeviceToDevice, d.stream));
     return snapshot;
+}
+// gdn_history_snapshot's copy for a HyperConnection's launch to carry (HcCopy).
+HcCopy gdn_history_copy(Device& d, const float* history, size_t parts) {
+    const float* snapshot = gdn_history_snapshot(d, history, parts, false);
+    return {reinterpret_cast<const float4*>(history), reinterpret_cast<float4*>(const_cast<float*>(snapshot)), uint32_t(4 * 10240 / parts / 4), 0};
 }
 
 // residual (one device-resident token): the output projection adds into the
