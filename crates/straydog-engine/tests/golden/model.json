@@ -4958,7 +4958,7 @@
       "decode_forward_tokens": 18,
       "speculative_passes": 6,
       "drafted_tokens": 17,
-      "accepted_tokens": 16
+      "accepted_tokens": 15
      },
      "logits": [
       "a6df4f72e0154803e5b06d5f8e15090dec1ad1ea67a90829876a699d1dde14c3"
@@ -9920,7 +9920,7 @@
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
       "drafted_tokens": 4,
-      "accepted_tokens": 4
+      "accepted_tokens": 3
      },
      "logits": [
       "48457b82160b02f909d9dff451e3f6e57464cbd27cd3c352dbd2ef48eff1f15c"
@@ -15170,8 +15170,8 @@
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
-      "drafted_tokens": 19,
-      "accepted_tokens": 19
+      "drafted_tokens": 21,
+      "accepted_tokens": 21
      },
      "logits": [
       "65363dd25bf3b7802b28f581b7f1cdb44a0f76a65d705ffcd5b149c6197fc2bb"
@@ -25416,8 +25416,8 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 3,
-      "accepted_tokens": 3
+      "drafted_tokens": 2,
+      "accepted_tokens": 2
      },
      "logits": [
       "33851dcc9aaecc88903f7d39591de467a7c6b7c3f0ffcce74c108f9cbaac8a04"
@@ -65930,7 +65930,7 @@
       "decode_forward_tokens": 10,
       "speculative_passes": 4,
       "drafted_tokens": 12,
-      "accepted_tokens": 10
+      "accepted_tokens": 9
      },
      "logits": [
       "ffc8ba3627aebecc7971a038a82d2f9a6754a3780dedebec2b8ea55150b808e2"
@@ -70892,7 +70892,7 @@
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
       "drafted_tokens": 4,
-      "accepted_tokens": 4
+      "accepted_tokens": 3
      },
      "logits": [
       "1f7e40870c172495e38a3c779ae92d6b1e55d258d7d003e5252296269086c47e"
@@ -76142,8 +76142,8 @@
       "generated_tokens": 25,
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
-      "drafted_tokens": 19,
-      "accepted_tokens": 19
+      "drafted_tokens": 21,
+      "accepted_tokens": 21
      },
      "logits": [
       "65c9942df8c979735c3a46bc427e5db25dd0598db95b63350e5f4979bf19e163"
@@ -86389,7 +86389,7 @@
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
       "drafted_tokens": 3,
-      "accepted_tokens": 3
+      "accepted_tokens": 2
      },
      "logits": [
       "265cfb18a8afb8059f41ac370d1f1bad207fcc89b4fe33e9065e0eb856105493"

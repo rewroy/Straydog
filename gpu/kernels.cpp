@@ -526,6 +526,12 @@ struct Device {
     // (QwenHeads<2>::kv); set as its layer registers.
     std::unordered_map<const void*,size_t> kv_planes;
     size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
+    // A draft's vocabulary on the device holding the head (sd_draft_vocabulary): the head's first `draft_rows` rows, and
+    // `draft_extra_count` rows of tokens past them, copied into `draft_extras` (their tokens in `draft_extra_tokens`).
+    // draft_rows 0: drafts read the whole head.
+    size_t draft_rows = 0, draft_extra_count = 0, draft_extra_capacity = 0, draft_extra_row_bytes = 0;
+    uint8_t* draft_extras = nullptr;
+    int32_t* draft_extra_tokens = nullptr;
     void* kv_stage_owner = nullptr;
     // A prefetch (kv_prefetch) fills the stage on kv_stream; device-stream work waits for
     // kv_prefetched before it touches the stage while kv_prefetching.
@@ -588,6 +594,8 @@ struct Device {
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (parts_read) cleanup(hipEventDestroy(parts_read));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
+        if (draft_extras) cleanup(hipFree(draft_extras));
+        if (draft_extra_tokens) cleanup(hipFree(draft_extra_tokens));
         if (copy_stream) cleanup(hipStreamDestroy(copy_stream));
         if (swapped) cleanup(hipEventDestroy(swapped));
         for (hipblasHandle_t handle : {blas, blas_f32})
@@ -1332,6 +1340,47 @@ int sd_ple_replay(void* handle,void* const* pointers,const int* kinds,void* hist
         ple_replay(device(handle),pointers,kinds,history,snapshot,kept,size_t(steps),embeddings);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+__global__ void draft_gather_rows(const uint8_t* head, size_t row_bytes, const int32_t* tokens, uint8_t* rows) {
+    const uint8_t* from = head + size_t(tokens[blockIdx.x]) * row_bytes;
+    uint8_t* to = rows + size_t(blockIdx.x) * row_bytes;
+    for (size_t i = threadIdx.x; i < row_bytes; i += blockDim.x) to[i] = from[i];
+}
+// A draft's vocabulary (draft_step with the head split, docs/DESIGN.md §8): the head's rows [0, rows) and those of `count` more
+// tokens (each at least `rows`), after the ones before unless `reset`. Its space (draft_vocabulary_capacity rows) is taken by the
+// first call. rows 0: drafts read the whole head.
+constexpr size_t draft_vocabulary_capacity = 16384;
+int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary, uint64_t rows, const int32_t* tokens,
+                        uint64_t count, int reset) {
+    try {
+        Device& d = device(handle);
+        const size_t row_bytes = matrix_row_bytes(kind, 2560);
+        auto found = d.allocations.find(head);
+        if (found == d.allocations.end() || found->second != vocabulary * row_bytes || rows > vocabulary || (count && !tokens) ||
+            (d.draft_extras && d.draft_extra_row_bytes != row_bytes))
+            throw std::runtime_error("invalid Straydog draft vocabulary");
+        for (uint64_t i = 0; i < count; ++i)
+            if (uint64_t(tokens[i]) < rows || uint64_t(tokens[i]) >= vocabulary) throw std::runtime_error("invalid Straydog draft token");
+        if (reset) d.draft_extra_count = 0;
+        d.draft_rows = size_t(rows);
+        if (rows && !d.draft_extras) {
+            const size_t bytes = draft_vocabulary_capacity * (row_bytes + 4);
+            if (bytes > d.budget - d.used) throw std::runtime_error("the Straydog draft vocabulary exceeds the VRAM budget");
+            check(hipMalloc(reinterpret_cast<void**>(&d.draft_extras), draft_vocabulary_capacity * row_bytes));
+            check(hipMalloc(reinterpret_cast<void**>(&d.draft_extra_tokens), draft_vocabulary_capacity * 4));
+            d.used += bytes;
+            d.draft_extra_capacity = draft_vocabulary_capacity; d.draft_extra_row_bytes = row_bytes;
+        }
+        if (!count) return 0;
+        if (d.draft_extra_count + count > d.draft_extra_capacity) throw std::runtime_error("the Straydog draft vocabulary is full");
+        upload(d, d.draft_extra_tokens + d.draft_extra_count, tokens, size_t(count) * 4);
+        draft_gather_rows<<<unsigned(count), 256, 0, d.stream>>>(static_cast<const uint8_t*>(head), row_bytes,
+                                                                  d.draft_extra_tokens + d.draft_extra_count,
+                                                                  d.draft_extras + d.draft_extra_count * row_bytes);
+        check(hipGetLastError());
+        d.draft_extra_count += size_t(count);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 // One drafting step (see draft_step): `head` null stops after the MTP layer, `split` 0 evaluates the whole head here.
 int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,

@@ -652,6 +652,25 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   side stream every pass of three or four rows took 7.5 ms longer.
 - **The MTP layer** stays whole on the second GPU, and its prompt pairs read the rows the first
   keeps (both have them).
+- **Fewer launches a layer.** The experts' part is formed by its sum's own block (the routes this
+  device holds, in route order, then the shared half: moe_part_partial's sum, a launch less); the
+  router and the shared expert's half read the same row in one launch (the scores after the decode
+  workspace, with the gate and up rows' stride); a HyperConnection's Q8_0 unit is one 8-byte read
+  where it was four of two bytes, and at three or four rows stage one takes 16-row blocks (x * norm
+  staged once, both of a wave's rows reading it, the wave's twenty weight reads in flight at once)
+  and stage two four columns a wave (the low-rank vector rebuilt by 80 blocks, not 320). All bit for
+  bit: a pass 18.38 to 17.84 ms at 20K, 19.03 to 18.52 at 60K (greedy in-process, the same passes).
+- **A draft's vocabulary.** A draft's head reads the head's first 100000 rows, split between the
+  GPUs, and the rows of the tokens past them that the sequence has held, copied on the second GPU
+  (`sd_draft_vocabulary`, at most 16384; 34 MB). The first 100000 tokens are English, code and the
+  common CJK characters (every token of the served cases' replies); past them are multi-character
+  CJK words and other scripts (a Japanese text's tokens: 82% below 100000, 97-99.6% with the tokens
+  of the text before it). A draft step reads 40% of the head's rows: the same drafts and 141.5 to
+  146.6 tok/s on English at 20K, 127.9 to 132.0 at 60K; on Japanese 125.9 to 126.8 (fewer drafts
+  accepted, 73.5 to 69.5%, outweighed by shorter passes). Verification reads the whole head.
+  `STRAYDOG_DRAFT_VOCABULARY=0` drafts over the whole head. With the launches above, served at real
+  use a pass of 1 / 2 / 3 / 4 rows at 20K 12.95 / 16.07 / 19.26 / 21.45 to 12.24 / 15.05 / 17.90 /
+  19.87 ms, at 60K 13.91 / 17.28 / 20.98 / 23.15 to 13.14 / 16.22 / 19.67 / 21.50.
 - **Measured** greedy in-process at IQ3_S, 20K tokens: a pass of 1 / 2 / 3 / 4 rows 14.83 / 17.28 /
   20.22 / 22.60 ms with whole layers, 12.54 / 15.61 / 18.59 / 21.05 in parts (a pass 19.95 to
   17.77 ms); at 60K a 4-row pass 30.28 to 23.37 ms (81 to 120 tok/s). A prompt: 20K tokens 6.07 to
@@ -664,7 +683,12 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   6% longer, and its first logits moved from F32, KL 4.4e-2 at 600 tokens: a fault in the prompt's
   experts not found); 16-byte plain stores for a pass's
   sums (no change); queueing a pass's span from two threads without the graphs of a few layers (the
-  wait only moved to the other device).
+  wait only moved to the other device); a HyperConnection's two stages in one launch, stage two's
+  blocks reading their up rows before they wait for stage one's (RDNA4 places a 1024-thread block on
+  a WGP, 32 at once: stage two's could not start beside stage one's); stage one's ten weight reads in
+  flight at one or two rows (a 2-row pass 0.3 ms longer); five routed units in flight per expert row
+  instead of two (a 4-row pass 0.2 ms longer: fewer waves resident); kernel arguments in device memory
+  (`HIP_FORCE_DEV_KERNARG=1`, no change); a draft's head over 65536 rows (fewer drafts accepted).
 
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).
