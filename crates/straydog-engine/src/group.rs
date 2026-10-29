@@ -390,6 +390,30 @@ impl Group {
         self.backends[owner].ple_rows(prefix, values, embeddings, operands)
     }
 
+    /// Whether a verification's first layer and the PLE layer after it can run in sequence on the device with no wait
+    /// between them: the same device owns both.
+    pub fn front_chained(&self) -> bool {
+        self.owner(0) == self.index("blk.1.")
+    }
+
+    /// The first layer of a verification queued on its owner, nothing waited for (see [`Group::ple_front`]).
+    pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
+        let owner = self.owner_of_span(begin, end)?;
+        self.backends[owner].verify_queue(begin, end, values, position)
+    }
+
+    /// The PLE layer over the rows [`Group::verify_queue`] left on its device: the first layer's rows and the PLE layer's.
+    pub fn ple_front(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let owner = self.index(prefix);
+        self.backends[owner].ple_front(prefix, 0, embeddings, operands)
+    }
+
+    /// The PLE layer replayed over the first rows [`Group::ple_front`] kept, after a partial acceptance (queued).
+    pub fn ple_replay(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
+        let owner = self.index(prefix);
+        self.backends[owner].ple_replay(prefix, embeddings, operands)
+    }
+
     pub fn copy_state(&mut self, target: &str, source: &str, owner: &str) -> Result<()> {
         let owner = self.index(owner);
         self.backends[owner].copy_state(target, source)
@@ -456,6 +480,16 @@ impl Group {
     pub fn mtp_prologue(&mut self, operands: &[Operand], embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {
         let last = self.backends.len() - 1;
         self.backends[last].mtp_prologue(operands, embeddings, hidden)
+    }
+
+    /// One drafting step on the MTP layer's device (see [`Backend::draft_step`]): the prologue's four operands, then the
+    /// head's four when a token is wanted. The head's lower half of the vocabulary runs on the first GPU, as in
+    /// [`Group::output_head`].
+    pub fn draft_step(&mut self, operands: &[Operand], position: u64, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64)
+                      -> Result<Option<(i32, f32)>> {
+        let last = self.backends.len() - 1;
+        let lower = if operands.len() == 8 { self.pin_head(&operands[7])? } else { None };
+        self.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, lower)
     }
 
     /// Pin dense operands, each on the device owning its layer.

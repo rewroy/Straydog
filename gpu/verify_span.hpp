@@ -86,8 +86,11 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
     moe_tokens(d, plan.moe, steps, v.mixed, 2564, v.hidden);
 }
 
-// input==nullptr continues from rows already in the span's workspace; output may be nullptr.
-void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
+// The span's layers queued on the device (and on its peer when the experts are in parts), with nothing waited for or
+// downloaded: the rows come from the host (`input`), from device memory (`source`), or are already in the span's workspace
+// (neither). `parts` tells the caller to finish_with_helper before it reads anything back. Returns the workspace's rows.
+float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input,
+                         const float* source, bool& parts) {
     if (!steps || steps > verify_max || begin >= end || end > 49) throw std::runtime_error("invalid verification span");
     float* workspace = nullptr;
     std::vector<void*> dependencies;
@@ -105,6 +108,7 @@ void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t st
     kv_prepare_span(d,begin,end,position,steps);
     const VerifyLayout v = verify_layout(workspace);
     if (input) upload(d, v.hidden, input, steps * 10240 * 4);
+    else if (source && source != v.hidden) check(hipMemcpyAsync(v.hidden, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     uint32_t positions[verify_max];
     for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
     upload(d, v.positions, positions, steps * 4);
@@ -112,15 +116,23 @@ void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t st
         for (size_t layer = begin; layer < end; ++layer) verify_layer(d, d.decoder.find(layer)->second, steps, v);
         check(hipGetLastError());
     };
-    if (span_has_parts(d, begin, end)) {
+    parts = span_has_parts(d, begin, end);
+    if (parts) {
         run_with_helper(d, begin, end, steps, [&]() {
             run_graph(d, "verify-span", dependencies.data(), dependencies.size(), (begin * 64 + end) * 8 + steps, submit);
         });
-        finish_with_helper(d);
     } else run_graph(d, "verify-span", dependencies.data(), dependencies.size(), (begin * 64 + end) * 8 + steps, submit);
-    if (output) download(d, output, v.hidden, steps * 10240 * 4);
-    else check(hipStreamSynchronize(d.stream));
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;
+    return v.hidden;
+}
+
+// input==nullptr continues from rows already in the span's workspace; output may be nullptr.
+void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
+    bool parts = false;
+    float* hidden = verify_span_queue(d, begin, end, position, steps, input, nullptr, parts);
+    if (parts) finish_with_helper(d);
+    if (output) download(d, output, hidden, steps * 10240 * 4);
+    else check(hipStreamSynchronize(d.stream));
 }
 
 // Keep the first `kept` verified tokens: DeltaNet layers restore their snapshot and
@@ -140,8 +152,8 @@ void verify_commit(Device& d, size_t begin, size_t end, size_t kept) {
             if (!decoder_linear(layer)) continue;
             gdn_verify(d, d.decoder.find(layer)->second, kept, true, d.output);
         }
+        // (queued, not waited for: the stream orders the replay before every later use of the state, and nothing reads it here)
         check(hipGetLastError());
-        check(hipStreamSynchronize(d.stream));
     }
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = 0;
 }
@@ -303,9 +315,10 @@ __global__ void head_confidence(const float* own, const float* other, size_t ste
 // HyperConnection mix (norm, down, up) and the vocabulary head for up to four rows,
 // each with the one-row arithmetic; returns the first maximum of every row and, when
 // asked, its probability (drafts stop at an unlikely one).
+// The rows come from the host (`input`) or, when that is null, from device memory (`source`).
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
-                 const float* input, int32_t* tokens, float* logits, float* confidence) {
-    if (!steps || steps > verify_max || !input || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
+                 const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr) {
+    if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max > d.input_capacity)
         throw std::runtime_error("invalid Straydog output head");
     Matrix hc[4];
@@ -320,7 +333,8 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     float* rows = d.input; float* mixed = rows + steps * 10240;
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
-    upload(d, rows, input, steps * 10240 * 4);
+    if (input) upload(d, rows, input, steps * 10240 * 4);
+    else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
     gemv(d, &head, 1, mixed, d.output, steps, 2564, vocabulary);
     row_argmax(d, d.output, steps, vocabulary, vocabulary, partial, chosen);
@@ -330,9 +344,11 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
         head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
     }
     check(hipGetLastError());
-    download(d, tokens, chosen, steps * 4);
-    if (confidence) download(d, confidence, top + 2 * verify_max, steps * 4);
-    if (logits) download(d, logits, d.output, steps * vocabulary * 4);
+    Piece pieces[3]; size_t count = 0;
+    pieces[count++] = {tokens, chosen, steps * 4};
+    if (confidence) pieces[count++] = {confidence, top + 2 * verify_max, steps * 4};
+    if (logits) pieces[count++] = {logits, d.output, steps * vocabulary * 4};
+    download_pieces(d, pieces, count);
 }
 
 // The vocabulary head split by rows across two linked GPUs: the peer evaluates
@@ -353,9 +369,10 @@ __global__ void head_choose(const float* logits, size_t width, size_t split, con
     tokens[row] = peer[2 * row] >= own ? __float_as_int(peer[2 * row + 1]) : int32_t(split) + chosen[row];
 }
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
-                       void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence) {
+                       void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence,
+                       const float* source = nullptr) {
     Device* peer = d.link.peer;
-    if (!peer || !steps || steps > verify_max || !input || !tokens || !split || split >= vocabulary ||
+    if (!peer || !steps || steps > verify_max || (!input && !source) || !tokens || !split || split >= vocabulary ||
         steps * vocabulary > d.output_capacity || steps * split > peer->output_capacity ||
         64 + steps * split > d.link.rows * 2560 || 2560 * steps > peer->link.rows * 2560 ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 5 * verify_max > d.input_capacity ||
@@ -377,7 +394,8 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
     int32_t* final_tokens = chosen + verify_max;
-    upload(d, rows, input, steps * 10240 * 4);
+    if (input) upload(d, rows, input, steps * 10240 * 4);
+    else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
     peer_send(d, mixed, steps, 2560, 2564, 0);
     float* received = peer_partials(d.link);
@@ -408,13 +426,15 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     }
     check(hipGetLastError());
     finish_with_helper(d);
-    download(d, tokens, final_tokens, steps * 4);
-    if (confidence) download(d, confidence, top + 2 * verify_max, steps * 4);
+    Piece pieces[2 + 2 * verify_max]; size_t count = 0;
+    pieces[count++] = {tokens, final_tokens, steps * 4};
+    if (confidence) pieces[count++] = {confidence, top + 2 * verify_max, steps * 4};
     if (logits)
         for (size_t row = 0; row < steps; ++row) {
-            download(d, logits + row * vocabulary, received + 64 + row * split, split * 4);
-            download(d, logits + row * vocabulary + split, d.output + row * (vocabulary - split), (vocabulary - split) * 4);
+            pieces[count++] = {logits + row * vocabulary, received + 64 + row * split, split * 4};
+            pieces[count++] = {logits + row * vocabulary + split, d.output + row * (vocabulary - split), (vocabulary - split) * 4};
         }
+    download_pieces(d, pieces, count);
 }
 
 __global__ void mtp_norm(const float* input, size_t width, const float* weight, float* output) {
@@ -480,4 +500,76 @@ void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t ste
     upload(d, mtp_prologue_hidden(d, steps), hidden, steps * 10240 * 4);
     mtp_prologue_device(d, pointers, kinds, steps);
     download(d, output, mtp_prologue_hidden(d, steps), steps * 10240 * 4);
+}
+
+// One drafting step with the host in none of its stages: the MTP layer's prologue over `embeddings` and the hidden rows,
+// the layer itself (`layer`), and when `head` is given the vocabulary head on the layer's last row, whose token and
+// probability come back. The hidden rows come from the host, or (`hidden` null, one row) are the last of the `previous`
+// rows the layer's last step left in its workspace: a chain of steps reads nothing back until its token.
+void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer, size_t position, size_t steps,
+                const float* embeddings, const float* hidden, size_t previous,
+                void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
+                int32_t* token, float* confidence) {
+    auto found = d.decoder.find(layer);
+    if (!embeddings || found == d.decoder.end() || (!hidden && (steps != 1 || !previous || previous > verify_max)) ||
+        (head && (!head_kinds || !token || !confidence)))
+        throw std::runtime_error("invalid drafting step");
+    mtp_prologue_check(d, mtp, mtp_kinds, steps);
+    upload(d, mtp_prologue_embeddings(d), embeddings, steps * 2560 * 4);
+    float* rows = mtp_prologue_hidden(d, steps);
+    if (hidden) upload(d, rows, hidden, steps * 10240 * 4);
+    else check(hipMemcpyAsync(rows, verify_layout(found->second.workspace).hidden + (previous - 1) * 10240, 10240 * 4,
+                              hipMemcpyDeviceToDevice, d.stream));
+    mtp_prologue_device(d, mtp, mtp_kinds, steps);
+    bool parts = false;
+    float* output = verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
+    if (!head) {
+        if (parts) finish_with_helper(d);
+        else check(hipStreamSynchronize(d.stream));
+        return;
+    }
+    const float* last = output + (steps - 1) * 10240;
+    int32_t token_row[verify_max];
+    float confidence_row[verify_max];
+    if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, confidence_row, last);
+    else {
+        output_head(d, head, head_kinds, 1, vocabulary, nullptr, token_row, nullptr, confidence_row, last);
+        if (parts) finish_with_helper(d);
+    }
+    *token = token_row[0]; *confidence = confidence_row[0];
+}
+
+// The PLE layer after a verification's first layer, with no wait between them: `layer`'s verified rows (still in its
+// workspace; see verify_span_queue) are copied to `kept` for a replay, the PLE state to `snapshot` for one, and the layer
+// runs on them in place. Both the PLE layer's rows and the first layer's are read back with one wait.
+float* verified_rows(Device& d, size_t layer, size_t steps) {
+    auto found = d.decoder.find(layer);
+    if (found == d.decoder.end() || !steps || steps > verify_max || found->second.verified != steps)
+        throw std::runtime_error("PLE layer has no verified rows");
+    return verify_layout(found->second.workspace).hidden;
+}
+void ple_state_check(Device& d, void* history, void* snapshot, void* kept) {
+    auto state = d.allocations.find(history), copy = d.allocations.find(snapshot), rows = d.allocations.find(kept);
+    if (state == d.allocations.end() || copy == d.allocations.end() || rows == d.allocations.end() ||
+        state->second != 10 * 10240 * 4 || copy->second != state->second || rows->second < verify_max * 10240 * 4)
+        throw std::runtime_error("invalid PLE state");
+}
+void ple_front(Device& d, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, size_t layer,
+               size_t steps, const float* embeddings, float* first, float* hidden) {
+    if (!first || !hidden) throw std::runtime_error("invalid PLE rows");
+    float* rows = verified_rows(d, layer, steps);
+    ple_state_check(d, history, snapshot, kept);
+    check(hipMemcpyAsync(snapshot, history, 10 * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+    check(hipMemcpyAsync(kept, rows, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+    ple(d, pointers, kinds, history, steps, embeddings, nullptr, nullptr, rows, true, false);
+    const Piece pieces[2] = {{hidden, rows, steps * 10240 * 4}, {first, kept, steps * 10240 * 4}};
+    download_pieces(d, pieces, 2);
+}
+// A partial acceptance: the PLE state back to the snapshot, then the layer over the first `steps` rows kept by ple_front
+// (their output is not wanted, only the state). Queued, not waited for: the stream orders it before what follows.
+void ple_replay(Device& d, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, size_t steps,
+                const float* embeddings) {
+    ple_state_check(d, history, snapshot, kept);
+    check(hipMemcpyAsync(history, snapshot, 10 * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+    ple(d, pointers, kinds, history, steps, embeddings, nullptr, nullptr, static_cast<float*>(kept), true, false);
 }
