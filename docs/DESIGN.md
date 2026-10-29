@@ -660,6 +660,12 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   staged once, both of a wave's rows reading it, the wave's twenty weight reads in flight at once)
   and stage two four columns a wave (the low-rank vector rebuilt by 80 blocks, not 320). All bit for
   bit: a pass 18.38 to 17.84 ms at 20K, 19.03 to 18.52 at 60K (greedy in-process, the same passes).
+  Then, also bit for bit: a part's routed gate and up and their product in one launch (a wave's lane
+  groups take rows j.. of a route's gate and the same rows of its up, the gate's lanes form
+  silu(gate) * up; then waves form the shared half's product), and an attention layer's pooling and
+  K/V writes in its normalization's launch and its output gate in the merge (three launches a layer
+  less). Served, a pass of 1 / 4 rows at 20K 12.24 / 19.87 to 12.00 / 19.55 ms, at 60K 13.14 / 21.50
+  to 12.94 / 21.15.
 - **A draft's vocabulary.** A draft's head reads the head's first 100000 rows, split between the
   GPUs, and the rows of the tokens past them that the sequence has held, copied on the second GPU
   (`sd_draft_vocabulary`, at most 16384; 34 MB). The first 100000 tokens are English, code and the
@@ -688,7 +694,14 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   a WGP, 32 at once: stage two's could not start beside stage one's); stage one's ten weight reads in
   flight at one or two rows (a 2-row pass 0.3 ms longer); five routed units in flight per expert row
   instead of two (a 4-row pass 0.2 ms longer: fewer waves resident); kernel arguments in device memory
-  (`HIP_FORCE_DEV_KERNARG=1`, no change); a draft's head over 65536 rows (fewer drafts accepted).
+  (`HIP_FORCE_DEV_KERNARG=1`, no change); a draft's head over 65536 rows (fewer drafts accepted); each
+  block of the gate and up launch routing its token itself (resident_route's top-10 in every one of
+  some 400 blocks: a pass 1.2 ms longer); DRAFT_CUT retuned for the cheaper drafts (a replay of 425
+  sampled passes drafting three each: 0.45-0.7 within 1% of the best, 0.6 kept); the part sums folded
+  into the kernels around them (with the sums' exchange skipped altogether, a pass is 0.65 ms shorter
+  at one row and 1.0 at four, and of that the folding would take only the launches: the rest is the
+  experts' share, which differs per token between the GPUs, 17.6 µs apart on average at an experts
+  sum against 4.9 at an attention one).
 
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).

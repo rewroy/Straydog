@@ -150,6 +150,43 @@ __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup*
     switch (matrix.kind) { SD_EXPERT_SHARED_DOWN(SD_EXPERT_DOWN) }
     #undef SD_EXPERT_DOWN
 }
+// A layer part's gate and up stage (qwen_parts.hpp) with moe_product's product formed in the same wave: a wave's lane groups take
+// rows j.. of a route's gate and the same rows of its up, each row summed as gemv_rows sums it, and the gate's lanes form
+// silu(gate) * up, a launch a layer less; then waves form the shared expert's product from the gate and up its router's launch
+// formed (moe_tokens_experts). The same sums and products as resident_expert_gemv_kind's and moe_product's.
+template<int routed>
+__global__ void __launch_bounds__(256) resident_expert_pairs(const MoeGroup* groups,const int32_t* selected,unsigned waves_per_route,
+                                                             unsigned lanes,const float* input,size_t input_stride,const float* gate_up,
+                                                             float* product,size_t shared_cols) {
+    const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32, token=blockIdx.y;
+    selected+=token*10; input+=token*input_stride;
+    const float* own=gate_up+token*11*1280; float* products=product+token*11*640;
+    const unsigned lane=threadIdx.x%32, group=lane/lanes, sub=lane%lanes, half=32/lanes/2;
+    if (wave>=10*size_t(waves_per_route)) {
+        const size_t i=(wave-10*size_t(waves_per_route))*32+lane;
+        if (i<shared_cols) {
+            const float gate=own[10*1280+i];
+            products[10*640+i]=gate*hc_sigmoid(gate)*own[10*1280+640+i];
+        }
+        return;
+    }
+    const size_t route=wave/waves_per_route, row=(wave%waves_per_route)*half+group%half;
+    const Matrix& matrix=groups[selected[route]].weights[group<half ? 0 : 1];
+    if (!matrix.data) return;
+    float sum=0;
+    const size_t units=matrix.cols/GemvFormat<routed>::elements;
+    #pragma unroll 2
+    for (size_t unit=sub;unit<units;unit+=lanes) {
+        if (row<matrix.rows) {
+            float r[1];
+            GemvFormat<routed>::template dots<1>(matrix.data+row*matrix.row_bytes,unit,input,0,r);
+            sum+=r[0];
+        }
+    }
+    for (unsigned offset=lanes/2;offset;offset/=2) sum+=__shfl_xor(sum,offset,32);
+    const float up=__shfl(sum,int((lane+half*lanes)%32),32);
+    if (group<half && sub==0 && row<matrix.rows) products[route*640+row]=sum*hc_sigmoid(sum)*up;
+}
 // Lanes for every routed expert of a bank: all slices share kind, shape and stride.
 // A stage runs ten routed experts per role (and the shared expert) side by side.
 unsigned resident_lanes(const std::vector<Matrix>& weights,size_t role,const float* input,size_t concurrent) {
@@ -522,8 +559,26 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
         resident_route<<<unsigned(tokens),256,0,d.stream>>>(d.output,d.output+experts,experts,moe.selected,moe.probabilities,
                                                             experts+1,experts+1);
     }
-    resident_expert_launch(d,plan,moe.groups,moe.selected,false,input,gate_up,tokens,input_stride,11*1280,together);
-    moe_product<<<unsigned((routes*640+255)/256),256,0,d.stream>>>(gate_up,routes,product);
+    // (with the shared expert's gate and up formed, the routed gate and up and the product in one launch; Q6_K's pairs spill)
+    const int routed=plan.weights[0].kind;
+    const unsigned lanes=together && plan.weights[1].kind==routed && routed!=14 && !plan.mapped[0] && d.q8_wide ?
+        resident_lanes(plan.weights,0,input,4) : 0;
+    const bool paired=lanes>=2 && lanes<=16 && lanes==resident_lanes(plan.weights,1,input,4);
+    if (paired) {
+        const unsigned per_route=unsigned((640+16/lanes-1)/(16/lanes)), shared_cols=unsigned(plan.weights[experts*3].rows);
+        const dim3 grid(unsigned((10*size_t(per_route)+(shared_cols+31)/32+7)/8),unsigned(tokens));
+        #define SD_EXPERT_PAIRS(format) case format: if (format==14) break; resident_expert_pairs<format><<<grid,256,0,d.stream>>>( \
+            moe.groups,moe.selected,per_route,lanes,input,input_stride,gate_up,product,shared_cols); break;
+        switch (routed) {
+            SD_EXPERT_ROUTED_FORMATS(SD_EXPERT_PAIRS)
+            default: throw std::runtime_error("invalid Straydog expert pairs");
+        }
+        #undef SD_EXPERT_PAIRS
+        check(hipGetLastError());
+    } else {
+        resident_expert_launch(d,plan,moe.groups,moe.selected,false,input,gate_up,tokens,input_stride,11*1280,together);
+        moe_product<<<unsigned((routes*640+255)/256),256,0,d.stream>>>(gate_up,routes,product);
+    }
     resident_expert_launch(d,plan,moe.groups,moe.selected,true,product,moe.outputs,tokens,11*640,11*2560);
 }
 void resident_moe_tokens(Device& d,void* handle,size_t tokens,const float* input,size_t input_stride,float* hidden) {

@@ -102,9 +102,10 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
 }
 // One block per query head; thread c owns chunk c's softmax statistics (at most
 // 256 chunks, checked on the host) and then column c of the weighted sum.
+// (gates: each value times the sigmoid of its query head's gate, qgate rows `gate_stride` apart, as qsa_gate did after it)
 template<int P=1>
 __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selected,const float* input,float* output,
-                                 size_t steps=1) {
+                                 size_t steps=1,const float* gates=nullptr,size_t gate_stride=0) {
     using H=QwenHeads<P>;
     const size_t head=blockIdx.x,row=blockIdx.y,column=threadIdx.x;
     const size_t count=size_t(input[steps*H::packed+steps*selected+row]);
@@ -130,7 +131,9 @@ __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selec
     float numerator=0;
     #pragma unroll 8
     for (size_t chunk=0;chunk<used;++chunk) numerator+=scale[chunk]*source[chunk*258+column];
-    output[(row*H::query+head)*256+column]=numerator/denominator;
+    float value=numerator/denominator;
+    if (gates) value*=hc_sigmoid(gates[row*gate_stride+head*512+256+column]);
+    output[(row*H::query+head)*256+column]=value;
 }
 
 
@@ -265,7 +268,7 @@ void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,si
 template<int P=1>
 void qsa_attention_rows(Device& d,void* kv,size_t context,size_t steps,size_t selected,
                         const float* input,float* output,const uint32_t* position,
-                        const float* mirror=nullptr,size_t mirror_rows=0) {
+                        const float* mirror=nullptr,size_t mirror_rows=0,const float* gates=nullptr,size_t gate_stride=0) {
     using H=QwenHeads<P>;
     const size_t chunks=(selected+qsa_decode_chunk-1)/qsa_decode_chunk;
     if (chunks>256 || steps*H::query*chunks*258*4>attention_score_bytes)
@@ -276,7 +279,8 @@ void qsa_attention_rows(Device& d,void* kv,size_t context,size_t steps,size_t se
     else
         qsa_decode_parts<false,P><<<dim3(unsigned(chunks),unsigned(H::kv),unsigned(steps)),256,0,d.stream>>>(
             static_cast<float*>(kv),context,0,selected,chunks,input,d.attention_scores,position,nullptr,0,steps);
-    qsa_decode_merge<P><<<dim3(unsigned(H::query),unsigned(steps)),256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output,steps);
+    qsa_decode_merge<P><<<dim3(unsigned(H::query),unsigned(steps)),256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output,steps,
+                                                                                   gates,gate_stride);
 }
 
 // Exclusive prefix sum over a block of `waves` waves of 32 lanes; `total` receives the sum.
