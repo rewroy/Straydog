@@ -117,11 +117,12 @@ __device__ unsigned qsa_block_scan(unsigned value, unsigned* waves) {
     return value+before;
 }
 
+template<int P=1>
 __global__ void qsa_select(const float* scores, size_t pool, size_t base, size_t steps,
                            size_t selected, float* packed, const uint32_t* dynamic_position=nullptr) {
     if (dynamic_position) base=*dynamic_position;
     const size_t token=blockIdx.x, position=base+token, complete=(position+1)/4, lane=threadIdx.x;
-    const size_t index_start=steps*(24*256+1024);
+    const size_t index_start=steps*QwenHeads<P>::packed;
     float* indices=packed+index_start+token*selected;
     const float* row=scores+token*pool;
     if (complete<=512) {
@@ -252,14 +253,14 @@ __device__ inline unsigned qsa_ballot(bool predicate) {
 // equal blocks are taken, in block order, as qsa_select takes them. (A decode or verification pass's few rows, a block each: 1024
 // threads; qsa_select's 256 reread a 20K row four times in 41 us.)
 constexpr unsigned qsa_select_run = 64;
-template <unsigned threads>
+template <unsigned threads, int P = 1>
 __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, size_t pool, size_t base, size_t steps,
                                                           size_t selected, float* packed, const uint32_t* dynamic_position = nullptr) {
     if (dynamic_position) base = *dynamic_position;
     constexpr unsigned waves = threads / 32;
     const size_t token = blockIdx.x, position = base + token, complete = (position + 1) / 4;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
-    const size_t index_start = steps * (24 * 256 + 1024);
+    const size_t index_start = steps * QwenHeads<P>::packed;
     float* indices = packed + index_start + token * selected;
     if (complete <= 512) {
         for (size_t i = t; i <= position; i += threads) indices[i] = float(i);
@@ -339,16 +340,17 @@ __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, 
 }
 // The block scores and selection of a prefill chunk. Rows of up to 6144 blocks select fastest
 // with qsa_select's rereads; longer ones in registers, 256 threads while a row fits them.
+template<int P = 1>
 void qsa_index_chunk(Device& d, const float* queries, const float* blocks, size_t pool, size_t base, size_t steps,
                      size_t selected, float* scores, float* packed) {
     const size_t complete = (base + steps) / 4;
     if (complete > 512)
         qsa_block_scores_tiled<<<dim3(unsigned((complete + 127) / 128), unsigned((steps + 31) / 32)), 256, 0, d.stream>>>(
             queries, blocks, pool, base, steps, scores);
-    if (complete <= 6144) qsa_select<<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+    if (complete <= 6144) qsa_select<P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
     else if (complete <= 256 * qsa_select_run)
-        qsa_select_rows<256><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
-    else qsa_select_rows<1024><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+        qsa_select_rows<256, P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+    else qsa_select_rows<1024, P><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
 }
 
 __global__ void qsa_gate(float* output, const float* query_gate, size_t count) {

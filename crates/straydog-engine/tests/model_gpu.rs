@@ -201,7 +201,8 @@ fn generations_equal_the_reference() {
             // expert runs on the GPU or the CPU (the same F32 weights, summed in another order)
             // depends on timing, and the reference does not reproduce its own decode bit for bit.
             // There only a request whose state comes from prefill alone (a new sequence, or the
-            // system-prompt checkpoint) is compared: its prompt logits and its tokens.
+            // system-prompt checkpoint) is compared: its prompt logits and the token they give
+            // (the tokens after it come from decode).
             let resumed = request["metrics"]["resumed_from"].as_str().unwrap();
             let fresh = request["metrics"]["cached_tokens"].as_u64() == Some(0);
             let comparable = !model.partial || fresh || resumed == "root";
@@ -223,7 +224,11 @@ fn generations_equal_the_reference() {
                 continue;
             }
             let expected_tokens: Vec<u32> = serde_json::from_value(request["tokens"].clone()).unwrap();
-            assert_eq!(tokens, expected_tokens, "{label}: tokens");
+            if model.partial {
+                assert_eq!(tokens.first(), expected_tokens.first(), "{label}: first token");
+            } else {
+                assert_eq!(tokens, expected_tokens, "{label}: tokens");
+            }
             for (key, value) in request["metrics"].as_object().unwrap() {
                 let actual = model.last_metrics.get(key).cloned().unwrap_or(Json::Null);
                 assert_eq!(actual.as_f64().or(actual.as_str().map(|_| 0.0)), value.as_f64().or(value.as_str().map(|_| 0.0)),

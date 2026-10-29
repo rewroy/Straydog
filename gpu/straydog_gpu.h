@@ -38,6 +38,8 @@ int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes);
 void* sd_filler_create(void* handle);
 void sd_filler_destroy(void* filler);
 int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint64_t bytes);
+/* sd_fill of `height` rows of `width` bytes, `host_pitch` apart in host memory, to rows `pitch` apart from `offset`. */
+int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, const void* host, uint64_t host_pitch, uint64_t width, uint64_t height);
 int sd_release(void* handle, void* pointer);
 int sd_zero(void* handle, void* pointer);
 int sd_download(void* handle, void* pointer, void* output, uint64_t bytes);
@@ -435,6 +437,19 @@ int sd_prefill_ple(void* handle, void* const* pointers, const int* kinds, void* 
 int sd_decoder_layer(void* handle, uint64_t layer, uint64_t context, void* const* pointers, const int* kinds, uint64_t count, void* const* states, void* workspace, void* moe);
 int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, const float* input, float* output);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
+/* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
+   layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a
+   whole layer, with the part's operands and states. */
+int sd_qwen_parts(void* handle, uint64_t parts);
+int sd_decoder_part(void* handle, uint64_t layer, uint64_t context, void* const* pointers, const int* kinds, uint64_t count, void* const* states, void* workspace, void* moe, uint64_t part);
+/* A layer part's resident MoE plan (sd_resident_moe_part, without the shared expert): its half of the shared expert's width,
+   rows [320p, +320) of gate and up (320 x 2560) and those columns of down (2560 x 320). */
+int sd_moe_shared_half(void* handle, void* plan, void* const* pointers, const int* kinds);
+/* A prompt batch through layers [begin, end) of parts on both devices (sd_prefill_span's arguments; the output rows from the second). */
+int sd_prefill_parts(void* first, void* second, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows);
+/* After a pass the host queued on both devices: both streams finished and any wait for a part that gave up reported (an error,
+   the counts started over). */
+int sd_parts_settle(void* first, void* second);
 /* Move the prompt rows a span left in `from`'s decoder workspace (of layer from_layer) into
    `to`'s (of layer to_layer), device to device, for the next span to continue from. */
 int sd_prefill_handoff(void* from, void* to, uint64_t from_layer, uint64_t to_layer, uint64_t steps);

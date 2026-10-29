@@ -185,6 +185,11 @@ struct ResidentMoe {
     // others have null data and are skipped) and computes a partial combination.
     bool part=false, shared=true;
     std::vector<std::chrono::steady_clock::time_point> prefetched;   // last read-ahead hint per expert
+    // A layer's part (qwen_parts.hpp): its half of the shared expert's width, rows [320p, +320) of gate and up and those
+    // columns of down (no data: none). Decode runs it as the shared expert (weights and table); a prompt's grouped experts
+    // run without it (batch_table: the table without the shared expert) and it beside them.
+    Matrix half[3]{};
+    void* batch_table=nullptr;
 };
 #if defined(__linux__)
 // Read-ahead hints off the compute thread. One MADV_WILLNEED reads at most the device's largest
@@ -243,6 +248,21 @@ struct DecoderLayer {
     float* snapshot=nullptr;      // speculative verification: DeltaNet states before the tokens
     float* projections=nullptr;   // and the tokens' DeltaNet projections for replay
     size_t verified=0;            // tokens of the last uncommitted verification
+    size_t parts=1,part=0;        // the layer split across GPUs: this device's part of `parts` (QwenHeads)
+};
+
+// A layer's share of Qwen3.8's heads: P = 1 the whole layer, 2 one GPU's half of it (docs/DESIGN.md §8). A half is the
+// same layer with half the heads: 8 DeltaNet key heads (value head h reads key head h % 8, as the whole layer's reads h % 16)
+// and 24 value heads; 12 attention query heads with one K/V head.
+template<int P> struct QwenHeads {
+    static_assert(P == 1 || P == 2, "Qwen3.8 layers split in two at most");
+    static constexpr size_t key = 16 / P, value = 48 / P;                  // DeltaNet heads
+    static constexpr size_t channels = 10240 / P, gate = 6144 / P;        // convolved columns (q | k | v); gate values
+    static constexpr size_t beta = channels + gate, alpha = beta + value;  // a token's projections: qkv | gate | beta | alpha
+    static constexpr size_t projection = alpha + value;
+    static constexpr size_t query = 24 / P, kv = 2 / P;                    // attention: query heads, K/V heads
+    static constexpr size_t qsa_projection = query * 512 + kv * 512 + 640; // qgate | key | value | index query | index key
+    static constexpr size_t packed = query * 256 + kv * 512;               // a row's normalized queries, keys, values
 };
 constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1024 * 1024;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
@@ -501,7 +521,11 @@ struct Device {
     // VRAM rows that multi-token prefill uses for host-resident K/V (sd_kv_stage): the copy holds
     // rows [0, kv_stage_valid) of kv_stage_owner's K/V in a kv_stage_rows-row layout.
     float* kv_stage = nullptr;
-    size_t kv_stage_rows = 0, kv_stage_valid = 0;
+    size_t kv_stage_floats = 0, kv_stage_valid = 0;
+    // Planes of a host K/V state (each K/V head's keys, then each one's values): 4 for a whole layer, 2 for a part
+    // (QwenHeads<2>::kv); set as its layer registers.
+    std::unordered_map<const void*,size_t> kv_planes;
+    size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
     void* kv_stage_owner = nullptr;
     // A prefetch (kv_prefetch) fills the stage on kv_stream; device-stream work waits for
     // kv_prefetched before it touches the stage while kv_prefetching.
@@ -852,22 +876,25 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
     if (index < count) output[index] = __float2half(input[index]);
 }
 
-// values (optional) holds the rows' values instead of the packed input.
+// values (optional) holds the rows' values instead of the packed input. A layer's K/V is
+// 2 * QwenHeads<P>::kv planes of `context` rows: each K/V head's keys, then each one's values.
+template<int P=1>
 __global__ void write_attention_kv(float* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
                                    float* mirror=nullptr, size_t mirror_rows=0) {
+    constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
     if (position) base=*position;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= steps * 512) return;
-    const size_t step = index / 512, head = (index % 512) / 256, column = index % 256;
-    const size_t keys_start = steps * 24 * 256;
+    if (index >= steps * width) return;
+    const size_t step = index / width, head = (index % width) / 256, column = index % 256;
+    const size_t keys_start = steps * QwenHeads<P>::query * 256;
     state[(head * context + base + step) * 256 + column] = input[keys_start + index];
-    state[context * 512 + (head * context + base + step) * 256 + column] =
-        values ? values[index] : input[keys_start + steps * 512 + index];
+    state[context * width + (head * context + base + step) * 256 + column] =
+        values ? values[index] : input[keys_start + steps * width + index];
     if (base+step<mirror_rows) {
         mirror[(head*mirror_rows+base+step)*256+column]=input[keys_start+index];
-        mirror[((2+head)*mirror_rows+base+step)*256+column]=
-            values ? values[index] : input[keys_start+steps*512+index];
+        mirror[((K+head)*mirror_rows+base+step)*256+column]=
+            values ? values[index] : input[keys_start+steps*width+index];
     }
 }
 
@@ -995,20 +1022,22 @@ __global__ void delta_register_sequence(float* state, size_t heads, size_t steps
 
 // Split each recurrent column across eight lanes. More independent threads
 // keep the fixed 48-head scan occupied without changing the delta-rule equation.
+template<int P=1>
 __global__ void delta_split_sequence(float* state,size_t steps,const float* packed,float* output) {
-    const size_t head=blockIdx.x,col=threadIdx.x/8,split=threadIdx.x%8,elements=steps*48*128;
+    constexpr size_t heads=48/P;
+    const size_t head=blockIdx.x,col=threadIdx.x/8,split=threadIdx.x%8,elements=steps*heads*128;
     float memory[16];
     #pragma unroll
     for (size_t i=0;i<16;++i) memory[i]=state[(head*128+split+i*8)*128+col];
     __shared__ float query[128],keys[128];
     for (size_t step=0;step<steps;++step) {
-        const size_t offset=(step*48+head)*128;
+        const size_t offset=(step*heads+head)*128;
         if (threadIdx.x<128) {
             query[threadIdx.x]=packed[offset+threadIdx.x];
             keys[threadIdx.x]=packed[elements+offset+threadIdx.x];
         }
         __syncthreads();
-        const float factor=packed[3*elements+step*48+head],beta=packed[3*elements+steps*48+step*48+head];
+        const float factor=packed[3*elements+step*heads+head],beta=packed[3*elements+steps*heads+step*heads+head];
         float prediction=0;
         #pragma unroll
         for (size_t i=0;i<16;++i) prediction+=(memory[i]*factor)*keys[split+i*8];
@@ -2013,6 +2042,25 @@ int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, const void* host, uint64_t host_pitch, uint64_t width,
+                 uint64_t height) {
+    try {
+        if (!filler) throw std::runtime_error("invalid Straydog fill");
+        auto& copier = *static_cast<Filler*>(filler);
+        const auto& value = *copier.device;
+        auto found = value.allocations.find(pointer);
+        if (!host || !width || !height || width > pitch || width > host_pitch || found == value.allocations.end() ||
+            offset > found->second || (height - 1) * pitch + width > found->second - offset)
+            throw std::runtime_error("invalid Straydog fill");
+        check(hipSetDevice(value.ordinal));
+        check(hipMemcpy2DAsync(static_cast<uint8_t*>(pointer) + offset, size_t(pitch), host, size_t(host_pitch), size_t(width),
+                               size_t(height), hipMemcpyHostToDevice, value.stream));
+        check(hipEventRecord(copier.done, value.stream));
+        check(hipEventSynchronize(copier.done));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_release(void* handle, void* pointer) {
     try {
         auto& value = device(handle);
@@ -2046,7 +2094,7 @@ int sd_release(void* handle, void* pointer) {
         value.kv_mirrors.erase(pointer);
         if (value.kv_stage == pointer) {
             kv_clear_graphs(value);
-            value.kv_stage = nullptr; value.kv_stage_rows = 0;
+            value.kv_stage = nullptr; value.kv_stage_floats = 0;
             value.kv_stage_owner = nullptr; value.kv_stage_valid = 0;
             value.kv_mirrors.clear(); value.kv_mirror_rows = 0;
         }
@@ -2198,17 +2246,8 @@ int sd_kv_stage(void* handle, void* pointer, uint64_t rows) {
             throw std::runtime_error("invalid Straydog K/V stage");
         if (value.kv_prefetching) { check(hipStreamSynchronize(value.kv_stream)); value.kv_prefetching = false; }
         kv_clear_graphs(value);
-        value.kv_mirrors.clear(); value.kv_mirror_rows = 0;
-        value.kv_stage = static_cast<float*>(pointer); value.kv_stage_rows = size_t(rows);
-        value.kv_stage_owner = nullptr; value.kv_stage_valid = 0;
-        if (!value.host_states.empty()) {
-            value.kv_mirror_rows = size_t(rows)/value.host_states.size();
-            size_t slot=0;
-            if (value.kv_mirror_rows) for (const auto& state : value.host_states) {
-                value.kv_mirrors.emplace(state.first,KvMirror{value.kv_stage+slot*value.kv_mirror_rows*1024,0});
-                ++slot;
-            }
-        }
+        value.kv_stage = static_cast<float*>(pointer); value.kv_stage_floats = size_t(rows) * 1024;
+        kv_layout(value);
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -3819,6 +3858,7 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 } // extern C
 #include "token_mixing.hpp"
 #include "device_link.hpp"
+#include "qwen_parts.hpp"
 #include "gemv_fused.hpp"
 #include "dspark.hpp"
 #include "dspark_inject.hpp"

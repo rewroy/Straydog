@@ -595,8 +595,8 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 (`STRAYDOG_GOLDEN_UPDATE=1`).
 
 **Placement.**
-- **Two R9700s:** they hold the weights of every bundle, each layer's experts split between them,
-  with the K/V in host memory at 262144 tokens.
+- **Two R9700s:** they hold the weights of every bundle with every layer but the MTP layer in parts
+  (below), with the K/V in host memory at 262144 tokens.
 - **Smaller budgets:** host K/V and a smaller prefill batch come first, then partial residency.
 - **Partial residency:** the CPU computes experts beyond VRAM in F32 from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
@@ -612,12 +612,67 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
+**Layers in parts** (`gpu/qwen_parts.hpp`, `Group::enable_parts`). Two GPUs run every layer of a
+pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenHeads<2>`):
+- **Split:**
+  - a DeltaNet layer's key heads 8p..8p+7 with the 24 value heads that read them (16c + 8p.., c = 0,
+    1, 2): in the part, value head j reads key head j % 8 as the whole layer's reads h % 16, so the
+    kernels are the whole layer's with the head counts halved (templates on the parts);
+  - an attention layer's query heads 12p..12p+11 with K/V head p: a part's K/V is two planes, so its
+    host state, its mirror and the positions a mirror covers are halves (a 60K decode's attention
+    reads its mirrors on both GPUs at `--vram 30`);
+  - half the routed experts, as with the layers whole, and half the shared expert's width: rows
+    [320p, +320) of gate and up, those columns of down. A pass runs the half as the shared expert; a
+    prompt's grouped experts run without it and the half beside them as FP16 GEMMs;
+  - their rows of the projections and columns of the output projection (`Model::part_operands`,
+    gathered at load: a piece of the mapped matrix a run of rows, or a run of every row's columns).
+- **Whole on both:** the residual streams, the HyperConnections, the router and the attention's
+  indexer, so both select the same experts and K/V blocks. The PLE layer runs on both as well.
+- **Sums.** A layer's attention output and its experts' are each a part of a sum (the SumLink of
+  `gpu/device_link.hpp`): a pass's rows in one single-block kernel that sends this device's part,
+  raises the other's flag, waits for its own and adds the two parts into the four streams (both add
+  the same two values, so the streams stay equal). The pins are the parts' own; speculation equals
+  decoding as for whole layers.
+- **A prompt batch's rows** are split between the devices for what both compute: each runs the
+  HyperConnections and the residual updates of its half of the rows. A HyperConnection's mixed rows go
+  to the other device (all-gather) and a layer's output parts are added only for each device's rows
+  (reduce-scatter), both in FP16 (each device rounds its own as the other's arrive, so both read the
+  same values): the bus carries what an all-reduce of F32 halves would, and the HyperConnections, run
+  by both on every row, had been a fifth of a 60K prompt. Both hold every row after the first layer
+  (the PLE layer's input) and the last. Against the F32 reference a prompt's first logits are as far
+  as with whole layers (KL 1.3e-3, 5.8e-5, 2.4e-3 at 600, 2500, 5000 tokens; whole: 3.7e-4, 1.3e-3,
+  2.9e-3).
+- **A prompt's batches** follow each other with no host wait, the MTP layer's pairs read from rows the
+  second GPU keeps (the deferred prefill of layers split, §8 above), and a DeltaNet's causal convolution
+  runs over runs of 32 rows at once (bit for bit the rows' one after the other).
+- **The host queues** both devices' work at once: a pass's span on two threads, as graphs of a few
+  layers (both devices start the span together, and a 47-layer graph had one catch up with its
+  submission at the second layer and wait 0.6-0.8 ms); a batch layer by layer, both devices, with no
+  host wait until its last span. The shared expert's gate and up run on the device's stream: on the
+  side stream every pass of three or four rows took 7.5 ms longer.
+- **The MTP layer** stays whole on the second GPU, and its prompt pairs read the rows the first
+  keeps (both have them).
+- **Measured** greedy in-process at IQ3_S, 20K tokens: a pass of 1 / 2 / 3 / 4 rows 14.83 / 17.28 /
+  20.22 / 22.60 ms with whole layers, 12.54 / 15.61 / 18.59 / 21.05 in parts (a pass 19.95 to
+  17.77 ms); at 60K a 4-row pass 30.28 to 23.37 ms (81 to 120 tok/s). A prompt: 20K tokens 6.07 to
+  5.84 s, 60K 16.3 to 16.7 s. Served at real use, a pass of 1 / 2 / 3 / 4 rows at 20K 14.40 / 17.96 /
+  20.25 / 22.48 to 12.95 / 16.07 / 19.26 / 21.45 ms, at 60K 14.87 / 18.06 / 21.57 / 23.60 to 13.91 /
+  17.28 / 20.98 / 23.15; the first token at 20K 5.67 to 5.43 s, at 60K 15.6 to 16.7 s.
+  `STRAYDOG_PARTS=0` keeps the layers whole.
+- **What did not pay:** every routed expert's half of its width on each GPU (both run every route, so
+  neither waits for the other's share; a pass 0.3 ms shorter, but a prompt's 320-wide grouped tiles ran
+  6% longer, and its first logits moved from F32, KL 4.4e-2 at 600 tokens: a fault in the prompt's
+  experts not found); 16-byte plain stores for a pass's
+  sums (no change); queueing a pass's span from two threads without the graphs of a few layers (the
+  wait only moved to the other device).
+
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).
-- **Placement of a pass.** The first GPU owns the layers up to the 25th, the second the rest, the
-  head and the MTP layer. A layer's routed experts are split in halves between the GPUs, so the
-  one that does not own the layer computes its half of the experts and otherwise waits: a third of
-  each GPU's pass is spent in the kernels that wait for the other.
+- **Placement of a pass** with the layers whole (`STRAYDOG_PARTS=0`). The first GPU owns the
+  layers up to the 25th, the second the rest, the head and the MTP layer. A layer's routed experts
+  are split in halves between the GPUs, so the one that does not own the layer computes its half of
+  the experts and otherwise waits: a third of each GPU's pass is spent in the kernels that wait for
+  the other.
 - **A verification's attention** runs its rows side by side, one launch of each kernel for all of
   them (`qsa_decode_attend_rows`): each row has the arithmetic of one token's decode, so the
   rows' state and logits equal token-by-token decode bit for bit, but a row costs the layer no

@@ -3,6 +3,8 @@
 //! Each device owns a contiguous range of decoder layers, executed in sequence. With two
 //! GPUs holding the whole model, every layer's routed experts are split between them
 //! instead (expert parallelism): both evaluate their half of each layer's routes at once.
+//! With their layers in parts (Group::enable_parts, gpu/qwen_parts.hpp), both run every layer but
+//! the MTP layer, each its half of the heads and experts.
 
 use crate::gpu::{Backend, Head, Operand, Result, StatePart, WIDTH};
 use crate::weights::layer_of;
@@ -26,6 +28,33 @@ pub struct Group {
     baseline: Vec<u64>,
     split_mode: SplitMode,
     linked: bool,
+    /// Every layer but the MTP layer split across the two devices (see [`Group::enable_parts`]).
+    parts: bool,
+}
+
+/// Where a layer tensor goes when the layers are in parts: halves (rows or columns of its heads, of the shared expert's width), or
+/// whole on both devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Share {
+    Halves,
+    Both,
+}
+
+impl Share {
+    /// The share of a layer's tensor `name` (blk.L.suffix).
+    pub fn of(name: &str) -> Share {
+        const HALVES: [&str; 12] = ["attn_qkv.", "attn_gate.", "ssm_beta.", "ssm_alpha.", "ssm_out.", "ssm_conv1d.", "ssm_dt.", "ssm_a",
+                                    "attn_q.", "attn_k.", "attn_v.", "attn_output."];
+        let suffix = name.splitn(3, '.').nth(2).unwrap_or("");
+        if HALVES.iter().any(|prefix| suffix.starts_with(prefix)) {
+            Share::Halves
+        } else if suffix.contains("_shexp.weight") && !suffix.starts_with("ffn_gate_inp") {
+            // (the shared expert by width: gpu/qwen_parts.hpp, ResidentMoe::half)
+            Share::Halves
+        } else {
+            Share::Both
+        }
+    }
 }
 
 impl Group {
@@ -50,7 +79,7 @@ impl Group {
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
-        let mut group = Group { backends, starts, baseline, split_mode, linked: false };
+        let mut group = Group { backends, starts, baseline, split_mode, linked: false, parts: false };
         group.assign_roles()?;
         Ok(group)
     }
@@ -80,6 +109,38 @@ impl Group {
             }
         }
         Ok(true)
+    }
+
+    /// Split every layer but the MTP layer across the two devices (gpu/qwen_parts.hpp): both run each layer, each its half
+    /// of the heads and routed experts. Under expert parallelism of two RDNA4 GPUs that write each other's VRAM; before
+    /// anything is placed. `STRAYDOG_PARTS=0` keeps the layers whole.
+    pub fn enable_parts(&mut self) -> Result<bool> {
+        if !self.expert_parallel()? || std::env::var("STRAYDOG_PARTS").is_ok_and(|value| value == "0") {
+            return Ok(false);
+        }
+        for part in 0..self.backends.len() {
+            if self.backends[part].set_parts(2, part as u64).is_err() {
+                // (a build without them: the layers stay whole)
+                self.disable_parts()?;
+                return Ok(false);
+            }
+        }
+        self.parts = true;
+        Ok(true)
+    }
+
+    /// The layers whole again (before anything is placed).
+    pub fn disable_parts(&mut self) -> Result<()> {
+        for backend in &mut self.backends {
+            backend.set_parts(1, 0)?;
+        }
+        self.parts = false;
+        Ok(())
+    }
+
+    /// Whether the layers are in parts (see [`Group::enable_parts`]).
+    pub fn parts(&self) -> bool {
+        self.parts
     }
 
     /// Routed experts [first, first + count) device `index` holds under expert parallelism.
@@ -205,6 +266,13 @@ impl Group {
                 }
                 continue;
             }
+            if self.parts && layer < 48 {
+                match Share::of(key) {
+                    Share::Halves => groups.iter_mut().for_each(|group| *group += size / 2),
+                    Share::Both => groups.iter_mut().for_each(|group| *group += size),
+                }
+                continue;
+            }
             groups[self.index(key)] += size;
             if parallel && key == "output.weight" {
                 groups[0] += size / 2;   // the lower vocabulary half the first GPU evaluates
@@ -230,6 +298,8 @@ impl Group {
         }
         for index in 0..self.backends.len() {
             let (first, count) = Self::expert_half(index, experts);
+            // (parts: each device half the shared expert's width, below; no helper)
+            let (shared, helper) = if self.parts { (false, false) } else { (index == owner, index != owner) };
             let mut parts: Vec<Operand> = operands[..3]
                 .iter()
                 .map(|bank| {
@@ -247,15 +317,54 @@ impl Group {
                 })
                 .collect();
             parts.extend(operands[3..].iter().cloned());
-            self.backends[index].register_resident_moe(prefix, &parts, experts, first, count, index == owner,
-                                                       index != owner)?;
+            self.backends[index].register_resident_moe(prefix, &parts, experts, first, count, shared, helper)?;
+            if self.parts {
+                self.backends[index].attach_shared_half(prefix, &Self::shared_half(&operands[3..6], index as u64)?)?;
+            }
         }
         Ok(())
+    }
+
+    /// Part `part`'s half of a shared expert's width (gate, up, down): rows [320 part, +320) of gate and up, those columns of
+    /// down.
+    fn shared_half<'a>(operands: &[Operand<'a>], part: u64) -> Result<Vec<Operand<'a>>> {
+        let mut half = Vec::with_capacity(3);
+        for (role, operand) in operands.iter().enumerate() {
+            let crate::gpu::Data::Bytes(bytes) = operand.data else { return Err("invalid Straydog shared expert".into()) };
+            let pitch = bytes.len() as u64 / operand.rows;
+            let key = format!("{}:half{part}", operand.key);
+            if role < 2 {
+                if operand.rows != 640 {
+                    return Err("invalid Straydog shared expert".into());
+                }
+                let rows = &bytes[(320 * part * pitch) as usize..(320 * (part + 1) * pitch) as usize];
+                half.push(Operand::bytes(key, rows, operand.kind, 320, operand.cols));
+            } else {
+                let width = crate::formats::matrix_bytes(operand.kind, 1, 320).ok_or("Straydog shared expert columns do not fill blocks")? as u64;
+                if operand.cols != 640 || pitch != 2 * width {
+                    return Err("invalid Straydog shared expert".into());
+                }
+                let columns = crate::gpu::Columns { pitch, first: part * width, width, to_pitch: width };
+                half.push(Operand { key, data: crate::gpu::Data::Gather(vec![crate::gpu::Piece { source: bytes, at: 0, columns: Some(columns) }]),
+                                    kind: operand.kind, rows: operand.rows, cols: 320 });
+            }
+        }
+        Ok(half)
     }
 
     pub fn register_decoder_layer(&mut self, layer: usize, operands: &[Operand], context: u64) -> Result<()> {
         let owner = self.owner(layer);
         self.backends[owner].register_decoder_layer(layer, operands, context)
+    }
+
+    /// A layer's part on device `part` (its operands: Model's parts), when the layers are in parts.
+    pub fn register_decoder_part(&mut self, layer: usize, part: usize, operands: &[Operand], context: u64) -> Result<()> {
+        self.backends[part].register_decoder_layer(layer, operands, context)
+    }
+
+    /// Pin a layer part's operands on its device ahead of [`Group::register_decoder_part`].
+    pub fn pin_part(&mut self, part: usize, operands: &[Operand]) -> Result<()> {
+        self.backends[part].pin(operands)
     }
 
     /// Pin a decoder layer's operands on its owner ahead of [`Group::register_decoder_layer`].
@@ -266,6 +375,9 @@ impl Group {
 
     /// The remaining layers partitioned at the device boundaries.
     pub fn decoder_spans(&self, start: usize) -> Vec<(usize, usize)> {
+        if self.parts {
+            return vec![(start, 48)];
+        }
         let mut spans = Vec::new();
         let mut begin = start;
         for layer in start + 1..48 {
@@ -278,28 +390,72 @@ impl Group {
         spans
     }
 
+    /// Whether [begin, end) are layers in parts, run on both devices.
+    fn in_parts(&self, begin: usize, end: usize) -> bool {
+        self.parts && begin < end && end <= 48
+    }
+
+    /// `first` on the first device and `second` on the second at once, from two threads: queueing a pass's span takes the host
+    /// up to a millisecond a device (graph launch, K/V mirror copies), which the other device's first sum would otherwise
+    /// wait (a pass at 20K took ~1 ms longer queued one device after the other).
+    fn on_both<T: Send>(&mut self, first: impl FnOnce(&mut Backend) -> Result<()> + Send,
+                        second: impl FnOnce(&mut Backend) -> Result<T> + Send) -> Result<T> {
+        let (low, high) = self.backends.split_at_mut(1);
+        std::thread::scope(|scope| {
+            let queued = scope.spawn(|| first(&mut low[0]));
+            let result = second(&mut high[0]);
+            queued.join().map_err(|_| "a Straydog queueing thread panicked".to_string())??;
+            result
+        })
+    }
+
     pub fn decode_span(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<Vec<f32>> {
+        if self.in_parts(begin, end) {
+            // A verification of the one row, kept.
+            let hidden = self.verify_span(begin, end, values, position)?;
+            self.verify_commit(begin, end, 1)?;
+            return Ok(hidden);
+        }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].decode_span(begin, end, values, position)
     }
 
     pub fn verify_span(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<Vec<f32>> {
+        if self.in_parts(begin, end) {
+            // (the first queued while the second waits: each one's sums wait for the other's parts)
+            let hidden = self.on_both(|backend| backend.verify_queue(begin, end, values, position),
+                                      |backend| backend.verify_span(begin, end, values, position))?;
+            crate::gpu::parts_settle(&self.backends[0], &self.backends[1])?;
+            return Ok(hidden);
+        }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].verify_span(begin, end, values, position)
     }
 
     pub fn verify_commit(&mut self, begin: usize, end: usize, kept: u64) -> Result<()> {
+        if self.in_parts(begin, end) {
+            return self.backends.iter_mut().try_for_each(|backend| backend.verify_commit(begin, end, kept));
+        }
         let owner = self.owner(begin);
         self.backends[owner].verify_commit(begin, end, kept)
     }
 
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
+        if self.in_parts(begin, end) {
+            if values.is_some() || !(2..=4096).contains(&steps) {
+                return Err("invalid Straydog prefill span of parts".into());
+            }
+            return crate::gpu::prefill_parts(&self.backends[0], &self.backends[1], begin, end, position, steps, output_rows);
+        }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].prefill_layers(begin, end, values, position, steps, output_rows)
     }
 
     pub fn prefill_embed(&mut self, layer: usize, embeddings: &[f32]) -> Result<()> {
+        if self.in_parts(layer, layer + 1) {
+            return self.backends.iter_mut().try_for_each(|backend| backend.prefill_embed(layer, embeddings));
+        }
         let owner = self.owner(layer);
         self.backends[owner].prefill_embed(layer, embeddings)
     }
@@ -327,6 +483,11 @@ impl Group {
     /// Move prompt rows from the device of layer `from` to the device of layer `to`, GPU to GPU;
     /// false when both layers are on one device (nothing to move).
     pub fn prefill_handoff(&mut self, from: usize, to: usize, steps: u64) -> Result<bool> {
+        // (layers in parts leave their rows on both devices: those of the last layer are already where the first's are,
+        // the MTP layer's stash)
+        if self.parts && from < 48 && to < 48 {
+            return Ok(from == 47 && to == 0);
+        }
         let (source, target) = (self.owner(from), self.owner(to));
         if source == target {
             return Ok(false);
@@ -380,55 +541,81 @@ impl Group {
         result
     }
 
+    /// The devices running the PLE layer `prefix`: its owner's, or with the layers in parts both (each has the rows).
+    fn ple_devices(&self, prefix: &str) -> std::ops::Range<usize> {
+        if self.parts { 0..self.backends.len() } else { let owner = self.index(prefix); owner..owner + 1 }
+    }
+
     pub fn prefill_ple(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
-        let owner = self.index(prefix);
-        self.backends[owner].prefill_ple(prefix, embeddings, operands, 1)
+        for index in self.ple_devices(prefix) {
+            self.backends[index].prefill_ple(prefix, embeddings, operands, 1)?;
+        }
+        Ok(())
     }
 
     pub fn ple(&mut self, prefix: &str, values: &[f32], embeddings: &[f32], operands: &[Operand]) -> Result<Vec<f32>> {
-        let owner = self.index(prefix);
-        self.backends[owner].ple(prefix, values, embeddings, operands)
+        let mut output = Vec::new();
+        for index in self.ple_devices(prefix) {
+            output = self.backends[index].ple(prefix, values, embeddings, operands)?;
+        }
+        Ok(output)
     }
 
     pub fn ple_rows(&mut self, prefix: &str, values: &[f32], embeddings: &[f32], operands: &[Operand])
                     -> Result<Vec<f32>> {
-        let owner = self.index(prefix);
-        self.backends[owner].ple_rows(prefix, values, embeddings, operands)
+        let mut output = Vec::new();
+        for index in self.ple_devices(prefix) {
+            output = self.backends[index].ple_rows(prefix, values, embeddings, operands)?;
+        }
+        Ok(output)
     }
 
     /// Whether a verification's first layer and the PLE layer after it can run in sequence on the device with no wait
-    /// between them: the same device owns both.
+    /// between them: the same device owns both (or, the layers in parts, both run both).
     pub fn front_chained(&self) -> bool {
-        self.owner(0) == self.index("blk.1.")
+        self.parts || self.owner(0) == self.index("blk.1.")
     }
 
     /// The first layer of a verification queued on its owner, nothing waited for (see [`Group::ple_front`]).
     pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
+        if self.in_parts(begin, end) {
+            return self.on_both(|backend| backend.verify_queue(begin, end, values, position),
+                                |backend| backend.verify_queue(begin, end, values, position));
+        }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].verify_queue(begin, end, values, position)
     }
 
     /// The PLE layer over the rows [`Group::verify_queue`] left on its device: the first layer's rows and the PLE layer's.
     pub fn ple_front(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<(Vec<f32>, Vec<f32>)> {
-        let owner = self.index(prefix);
-        self.backends[owner].ple_front(prefix, 0, embeddings, operands)
+        let devices = self.ple_devices(prefix);
+        for index in devices.start..devices.end - 1 {
+            self.backends[index].ple_front_queue(prefix, 0, embeddings, operands)?;
+        }
+        self.backends[devices.end - 1].ple_front(prefix, 0, embeddings, operands)
     }
 
     /// [`Group::ple_front`] queued, nothing read back: the next span continues from its device's workspace.
     pub fn ple_front_queue(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
-        let owner = self.index(prefix);
-        self.backends[owner].ple_front_queue(prefix, 0, embeddings, operands)
+        for index in self.ple_devices(prefix) {
+            self.backends[index].ple_front_queue(prefix, 0, embeddings, operands)?;
+        }
+        Ok(())
     }
 
     /// Whether a verification's spans and head can follow each other on the devices with no wait on the host: the
     /// first layer and the PLE layer on one device, the last layer on the head's.
     pub fn chains_verification(&self) -> bool {
-        self.front_chained() && self.owner(47) == self.backends.len() - 1
+        self.front_chained() && (self.parts || self.owner(47) == self.backends.len() - 1)
     }
 
     /// Span [begin, end) of a chained verification, queued over the rows the span before it (ending at `after`) left: moved
     /// GPU to GPU first when that span ran on another device.
     pub fn verify_chain(&mut self, after: usize, begin: usize, end: usize, steps: usize, position: u64) -> Result<()> {
+        if self.in_parts(begin, end) {
+            return self.on_both(|backend| backend.verify_queue_rows(begin, end, None, steps, position),
+                                |backend| backend.verify_queue_rows(begin, end, None, steps, position));
+        }
         self.prefill_handoff(after - 1, begin, steps as u64)?;
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].verify_queue_rows(begin, end, None, steps, position)
@@ -440,22 +627,31 @@ impl Group {
     pub fn output_head_chained(&mut self, operands: &[Operand], layer: usize, steps: usize, logits: bool, top: usize,
                                confidence: bool) -> Result<(Head, Vec<f32>)> {
         let last = self.backends.len() - 1;
-        if self.owner(layer) != last {
+        if self.owner(layer) != last && !self.parts {
             return Err("Straydog chained head is not on the last layer's device".into());
         }
         let lower = self.pin_head(&operands[3])?;
-        self.backends[last].output_head_rows(operands, crate::gpu::Rows::Layer(layer), steps, logits, top, confidence, lower)
+        let head = self.backends[last].output_head_rows(operands, crate::gpu::Rows::Layer(layer), steps, logits, top, confidence, lower)?;
+        if self.parts {
+            // (the head waited for both devices: a wait for a part that gave up voids the pass)
+            crate::gpu::parts_settle(&self.backends[0], &self.backends[1])?;
+        }
+        Ok(head)
     }
 
     /// The PLE layer replayed over the first rows [`Group::ple_front`] kept, after a partial acceptance (queued).
     pub fn ple_replay(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
-        let owner = self.index(prefix);
-        self.backends[owner].ple_replay(prefix, embeddings, operands)
+        for index in self.ple_devices(prefix) {
+            self.backends[index].ple_replay(prefix, embeddings, operands)?;
+        }
+        Ok(())
     }
 
     pub fn copy_state(&mut self, target: &str, source: &str, owner: &str) -> Result<()> {
-        let owner = self.index(owner);
-        self.backends[owner].copy_state(target, source)
+        for index in self.ple_devices(owner) {
+            self.backends[index].copy_state(target, source)?;
+        }
+        Ok(())
     }
 
     pub fn hyperconnection(&mut self, prefix: &str, values: &[f32], norm: Operand, matrices: &[Operand])
@@ -585,7 +781,7 @@ impl Group {
     }
 
     fn owned_layers(&self, index: usize, drafter: bool) -> Vec<usize> {
-        (0..if drafter { 49 } else { 48 }).filter(|layer| self.owner(*layer) == index).collect()
+        (0..if drafter { 49 } else { 48 }).filter(|layer| self.owner(*layer) == index || (self.parts && *layer < 48)).collect()
     }
 
     /// Reserve each layer's state on its owner (and the MTP layer's) before accepting
@@ -598,6 +794,10 @@ impl Group {
         if self.expert_parallel()? && !self.linked {
             let (first, second) = self.backends.split_at_mut(1);
             first[0].link_peer(&mut second[0], context.min(prefill))?;
+            if self.parts {
+                // The parts' sums: a prefill batch's rows.
+                Backend::link_sums(&mut first[0], &mut second[0], context.min(prefill) * WIDTH as u64 / 4)?;
+            }
             self.linked = true;
         }
         Ok(())
@@ -616,8 +816,12 @@ impl Group {
     /// Per device, the VRAM a placement would still allocate.
     pub fn planned_state_bytes(&self, context: u64, prefill: u64, drafter: bool, host_attention: bool)
                                -> Result<Vec<u64>> {
-        // Expert parallelism links the GPUs with inboxes of two prefill batches each (peer VRAM).
-        let inbox = if self.expert_parallel()? { context.min(prefill) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
+        // Expert parallelism links the GPUs with inboxes of two prefill batches each (peer VRAM); the parts' sums with two
+        // slots of a batch's rows more.
+        let mut inbox = if self.expert_parallel()? { context.min(prefill) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
+        if self.parts {
+            inbox += context.min(prefill) * 2560 * 2 * 4 + 256;
+        }
         (0..self.backends.len())
             .map(|index| {
                 let layers = self.owned_layers(index, drafter);

@@ -79,6 +79,18 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_fill_rows(
+        filler: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        offset: u64,
+        pitch: u64,
+        host: *const ::std::os::raw::c_void,
+        host_pitch: u64,
+        width: u64,
+        height: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_release(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,
@@ -1565,6 +1577,50 @@ unsafe extern "C" {
         output: *mut f32,
         output_rows: u64,
         timings: *mut f64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_qwen_parts(handle: *mut ::std::os::raw::c_void, parts: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_decoder_part(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        context: u64,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        count: u64,
+        states: *const *mut ::std::os::raw::c_void,
+        workspace: *mut ::std::os::raw::c_void,
+        moe: *mut ::std::os::raw::c_void,
+        part: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_moe_shared_half(
+        handle: *mut ::std::os::raw::c_void,
+        plan: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_parts(
+        first: *mut ::std::os::raw::c_void,
+        second: *mut ::std::os::raw::c_void,
+        begin: u64,
+        end: u64,
+        position: u64,
+        steps: u64,
+        input: *const f32,
+        output: *mut f32,
+        output_rows: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_parts_settle(
+        first: *mut ::std::os::raw::c_void,
+        second: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

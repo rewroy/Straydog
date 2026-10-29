@@ -27,15 +27,20 @@ void hc_operands(void* const* pointers, const int* kinds, Matrix (&matrices)[4])
         matrices[i] = {static_cast<const uint8_t*>(pointers[i]),matrix_row_bytes(kinds[i],cols[i]),rows[i],cols[i],0,0,0,kinds[i]};
 }
 
+// A DeltaNet layer's snapshot and saved projections; a part's are its heads' (QwenHeads<2>).
+size_t verify_snapshot_floats(const DecoderLayer& plan) { return verify_snapshot / plan.parts; }
+size_t verify_projection_floats(const DecoderLayer& plan) {
+    return plan.parts == 2 ? QwenHeads<2>::projection : QwenHeads<1>::projection;
+}
 void verify_buffers(Device& d, DecoderLayer& plan) {
     if (plan.snapshot) return;
-    const size_t bytes = (verify_snapshot + verify_max * verify_projection) * 4;
+    const size_t bytes = (verify_snapshot_floats(plan) + verify_max * verify_projection_floats(plan)) * 4;
     if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes)
         throw std::runtime_error("speculative verification state exceeds the Straydog VRAM budget");
     float* buffer = nullptr;
     check(hipMalloc(reinterpret_cast<void**>(&buffer), bytes + allocation_tail));
     d.allocations.emplace(buffer, bytes); d.used += bytes + allocation_tail;
-    plan.snapshot = buffer; plan.projections = buffer + verify_snapshot;
+    plan.snapshot = buffer; plan.projections = buffer + verify_snapshot_floats(plan);
 }
 
 // steps tokens of a DeltaNet layer; a replay reads the states from the snapshot.
@@ -47,6 +52,9 @@ void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, 
         recurrent, conv, static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
         static_cast<const float*>(p[8]), plan.projections, verify_projection, steps, replay ? nullptr : plan.snapshot, post);
 }
+
+// A layer's part on a device of two (qwen_parts.hpp).
+void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v);
 
 void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
     void* const* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
@@ -113,7 +121,11 @@ float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, s
     for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
     upload(d, v.positions, positions, steps * 4);
     auto submit = [&]() {
-        for (size_t layer = begin; layer < end; ++layer) verify_layer(d, d.decoder.find(layer)->second, steps, v);
+        for (size_t layer = begin; layer < end; ++layer) {
+            DecoderLayer& plan = d.decoder.find(layer)->second;
+            if (plan.parts == 2) verify_layer_part(d, plan, steps, v);
+            else verify_layer(d, plan, steps, v);
+        }
         check(hipGetLastError());
     };
     parts = span_has_parts(d, begin, end);
@@ -121,6 +133,24 @@ float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, s
         run_with_helper(d, begin, end, steps, [&]() {
             run_graph(d, "verify-span", dependencies.data(), dependencies.size(), (begin * 64 + end) * 8 + steps, submit);
         });
+    } else if (d.decoder.find(begin)->second.parts == 2) {
+        // Layers in parts run as graphs of a few layers: the host submits a graph's ~20 nodes a layer at ~1 us each, and both
+        // devices start the span at once (qwen_parts.hpp), so a 47-layer graph had the device catch up with its submission at
+        // the second layer and wait there 0.6-0.8 ms. The first graph is two layers, the device's start; the host submits the
+        // rest while it runs.
+        for (size_t first = begin; first < end;) {
+            const size_t last = std::min(end, first + (first == begin ? 2 : 6));
+            std::vector<void*> chunk;
+            for (size_t layer = first; layer < last; ++layer) {
+                const auto& plan = d.decoder.find(layer)->second;
+                chunk.insert(chunk.end(), plan.dependencies.begin(), plan.dependencies.end());
+            }
+            run_graph(d, "verify-span", chunk.data(), chunk.size(), (first * 64 + last) * 8 + steps, [&]() {
+                for (size_t layer = first; layer < last; ++layer) verify_layer_part(d, d.decoder.find(layer)->second, steps, v);
+                check(hipGetLastError());
+            });
+            first = last;
+        }
     } else run_graph(d, "verify-span", dependencies.data(), dependencies.size(), (begin * 64 + end) * 8 + steps, submit);
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;
     return v.hidden;
@@ -142,16 +172,20 @@ struct GdnReplay {
     const float* snapshot; float* state; float* history;
     const float* coefficients; const float* bias; const float* decay; const float* norm; const float* projections;
 };
+template<int P = 1>
 __global__ void __launch_bounds__(gdn_threads) gdn_replay_layers(const GdnReplay* layers, size_t tokens) {
     const GdnReplay& l = layers[blockIdx.y];
-    gdn_tokens_head(blockIdx.x, l.snapshot + 4 * 10240, l.snapshot, l.state, l.history, l.coefficients, l.bias, l.decay, l.norm,
-                    l.projections, verify_projection, tokens, nullptr, nullptr);
+    gdn_tokens_head<P>(blockIdx.x, l.snapshot + 4 * QwenHeads<P>::channels, l.snapshot, l.state, l.history, l.coefficients, l.bias,
+                       l.decay, l.norm, l.projections, QwenHeads<P>::projection, tokens, nullptr, nullptr);
 }
 void gdn_replay_span(Device& d, size_t begin, size_t end, size_t kept) {
     std::vector<GdnReplay> layers;
+    size_t parts = 0;
     for (size_t layer = begin; layer < end; ++layer) {
         if (!decoder_linear(layer)) continue;
         const DecoderLayer& plan = d.decoder.find(layer)->second;
+        if (parts && plan.parts != parts) throw std::runtime_error("a replay span mixes whole and partial layers");
+        parts = plan.parts;
         void* const* p = plan.pointers.data() + 4;
         layers.push_back({plan.snapshot, static_cast<float*>(plan.states[1]), static_cast<float*>(plan.states[0]),
                           static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
@@ -168,7 +202,10 @@ void gdn_replay_span(Device& d, size_t begin, size_t end, size_t kept) {
         upload(d, cached.second, host.data(), host.size());
         cached.first = host;
     }
-    gdn_replay_layers<<<dim3(48, unsigned(layers.size())), gdn_threads, 0, d.stream>>>(static_cast<const GdnReplay*>(cached.second), kept);
+    if (parts == 2)
+        gdn_replay_layers<2><<<dim3(unsigned(QwenHeads<2>::value), unsigned(layers.size())), gdn_threads, 0, d.stream>>>(
+            static_cast<const GdnReplay*>(cached.second), kept);
+    else gdn_replay_layers<<<dim3(48, unsigned(layers.size())), gdn_threads, 0, d.stream>>>(static_cast<const GdnReplay*>(cached.second), kept);
 }
 
 // Keep the first `kept` verified tokens: DeltaNet layers restore their snapshot and

@@ -65,7 +65,37 @@ pub enum Data<'a> {
     Decode(&'a [u8], u32),
     /// Weights of a GGML kind uploaded quantized to Q8_0 (the operand's kind 8).
     Quantize(&'a [u8], u32),
+    /// A part of a matrix (a layer split across GPUs): pieces of the matrix's mapped bytes, each placed in the part's bytes.
+    Gather(Vec<Piece<'a>>),
     Described,
+}
+
+/// Bytes of a weight placed in an upload at `at`: whole, or with `columns` row by row.
+#[derive(Debug, Clone, Copy)]
+pub struct Piece<'a> {
+    pub source: &'a [u8],
+    pub at: u64,
+    pub columns: Option<Columns>,
+}
+
+/// A run of every row's bytes: [first, first + width) of each source row of `pitch` bytes, rows
+/// `to_pitch` apart where they go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Columns {
+    pub pitch: u64,
+    pub first: u64,
+    pub width: u64,
+    pub to_pitch: u64,
+}
+
+impl Columns {
+    /// The bytes the run takes out of `source` (whole rows of it), packed.
+    fn gather(&self, source: &[u8], into: &mut [u8]) {
+        for (row, chunk) in source.chunks_exact(self.pitch as usize).enumerate() {
+            let to = row * self.to_pitch as usize;
+            into[to..to + self.width as usize].copy_from_slice(&chunk[self.first as usize..(self.first + self.width) as usize]);
+        }
+    }
 }
 
 /// An upload placed before its weights were read: the allocation and the mapped bytes that
@@ -78,6 +108,10 @@ pub struct Pending {
     pub decode: Option<u32>,
     /// With `decode`: the decoded values quantized to Q8_0 rather than uploaded as F32.
     pub quantize: bool,
+    /// Where the source's bytes go in the allocation (a piece of a part, Data::Gather): from `offset`, or with `columns`
+    /// a run of each row.
+    pub offset: u64,
+    pub columns: Option<Columns>,
 }
 
 // The source is only an address into the weights' mappings, never read through.
@@ -115,11 +149,41 @@ pub struct Filler<'a> {
 unsafe impl Send for Filler<'_> {}
 
 impl Filler<'_> {
-    /// Copy page-locked host bytes to `offset` of a pending upload; returns once they landed.
+    /// Copy page-locked host bytes, those at `offset` of a pending upload's source, where they go; returns once they landed.
     pub fn fill(&self, upload: &Pending, offset: u64, host: &[u8]) -> Result<()> {
-        // SAFETY: a live filler; the library checks the range against the allocation.
-        check(unsafe { ffi::sd_fill(self.handle, upload.pointer, offset, host.as_ptr().cast(), host.len() as u64) })
-            .map(drop)
+        let one = |to: u64, bytes: &[u8]| {
+            // SAFETY: a live filler; the library checks the range against the allocation.
+            check(unsafe { ffi::sd_fill(self.handle, upload.pointer, to, bytes.as_ptr().cast(), bytes.len() as u64) }).map(drop)
+        };
+        let Some(columns) = upload.columns else { return one(upload.offset + offset, host) };
+        // The run of each source row in [offset, end): rows cut by the range's ends one by one, the rows between at once.
+        let (end, Columns { pitch, first, width, to_pitch }) = (offset + host.len() as u64, columns);
+        let run = |row: u64| (row * pitch + first, row * pitch + first + width);
+        let target = |row: u64, from: u64| upload.offset + row * to_pitch + (from - run(row).0);
+        let (mut row, last) = (offset / pitch, (end - 1) / pitch);
+        let part = |row: u64| -> Result<()> {
+            let (low, high) = run(row);
+            let (low, high) = (low.max(offset), high.min(end));
+            if low < high { one(target(row, low), &host[(low - offset) as usize..(high - offset) as usize]) } else { Ok(()) }
+        };
+        if run(row).0 < offset {
+            part(row)?;
+            row += 1;
+        }
+        let full = (row..=last).take_while(|&row| run(row).1 <= end).count() as u64;
+        if full > 0 {
+            let from = run(row).0;
+            // SAFETY: as sd_fill; `full` rows of the run lie within `host`.
+            check(unsafe {
+                ffi::sd_fill_rows(self.handle, upload.pointer, target(row, from), to_pitch, host[(from - offset) as usize..].as_ptr().cast(),
+                                  pitch, width, full)
+            })?;
+            row += full;
+        }
+        if row <= last {
+            part(row)?;
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +281,9 @@ pub struct Backend {
     /// One of two devices that split every layer's experts: its help for the peer's batches
     /// runs in a workspace of its own (`@moe:helper`), beside its own batch.
     pub expert_parallel: bool,
+    /// Qwen3.8's layers split across this many devices (1, or 2: gpu/qwen_parts.hpp), this one running part `part` of each.
+    pub parts: u64,
+    pub part: u64,
     /// Host states page-locking beside the weight upload, created by `finish_model_state`.
     pending_host: Vec<(String, u64, u64)>,
     /// While placing before the weights are read: uploads allocated but not yet filled.
@@ -229,6 +296,26 @@ pub fn prefill_handoff(from: &Backend, to: &Backend, from_layer: usize, to_layer
     // SAFETY: two live devices; the native side checks both workspaces against `steps`.
     check(unsafe { ffi::sd_prefill_handoff(from.handle, to.handle, from_layer as u64, to_layer as u64, steps) })?;
     Ok(())
+}
+
+/// A prompt batch through layers [begin, end) of two devices' parts (see [`Backend::set_parts`]); the last `output_rows` rows
+/// from the second.
+pub fn prefill_parts(first: &Backend, second: &Backend, begin: usize, end: usize, position: u64, steps: u64,
+                     output_rows: u64) -> Result<Vec<f32>> {
+    let mut output = vec![0f32; output_rows as usize * WIDTH];
+    let target = if output_rows > 0 { output.as_mut_ptr() } else { std::ptr::null_mut() };
+    // SAFETY: two live devices; the output holds `output_rows` rows.
+    check(unsafe {
+        ffi::sd_prefill_parts(first.handle, second.handle, begin as u64, end as u64, position, steps, std::ptr::null(), target,
+                              output_rows)
+    })?;
+    Ok(output)
+}
+
+/// Wait for a pass queued on both devices' parts; an error if a part's wait for the other gave up.
+pub fn parts_settle(first: &Backend, second: &Backend) -> Result<()> {
+    // SAFETY: two live devices.
+    check(unsafe { ffi::sd_parts_settle(first.handle, second.handle) }).map(drop)
 }
 
 /// The sequence state carried from token to token (DeltaNet, its convolution, PLE history),
@@ -271,6 +358,8 @@ impl Backend {
             output_capacity,
             keeps_mtp_rows: false,
             expert_parallel: false,
+            parts: 1,
+            part: 0,
             pending_host: Vec::new(),
             deferred: None,
         })
@@ -355,9 +444,13 @@ impl Backend {
         }
         let size = formats::matrix_bytes(operand.kind, operand.rows as usize, operand.cols as usize)
             .ok_or("unsupported Straydog GPU weight format")?;
+        if let Data::Gather(pieces) = &operand.data {
+            return self.prepare_gather(operand, pieces, size);
+        }
         let (decoded, quantized);
         let (data, decode): (&[u8], Option<u32>) = match &operand.data {
             Data::Bytes(bytes) => (bytes, None),
+            Data::Gather(_) => unreachable!(),
             Data::Decode(bytes, kind) | Data::Quantize(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
             Data::Decode(bytes, kind) => {
                 decoded = decode_vector(bytes, *kind, size / 4, &operand.key)?;
@@ -381,11 +474,54 @@ impl Backend {
                 // SAFETY: a plain size; the bytes arrive through `fill` or `write`.
                 let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
                 let quantize = matches!(operand.data, Data::Quantize(..));
-                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode, quantize });
+                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode, quantize, offset: 0,
+                                       columns: None });
                 device
             }
             // SAFETY: the bytes are valid for their length; the library copies them.
             _ => pointer(unsafe { ffi::sd_upload(self.handle, data.as_ptr().cast(), data.len() as u64) })?,
+        };
+        let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
+        self.cache.insert(operand.key.clone(), entry);
+        Ok(entry)
+    }
+
+    /// A part's upload (Data::Gather): its pieces pending, or gathered and uploaded at once.
+    fn prepare_gather(&mut self, operand: &Operand, pieces: &[Piece], size: usize) -> Result<Entry> {
+        let placed: u64 = pieces.iter().map(|piece| match piece.columns {
+            None => piece.source.len() as u64,
+            Some(columns) => piece.source.len() as u64 / columns.pitch * columns.width,
+        }).sum();
+        let fits = pieces.iter().all(|piece| match piece.columns {
+            None => piece.at + piece.source.len() as u64 <= size as u64,
+            Some(c) => c.first + c.width <= c.pitch && (piece.source.len() as u64).is_multiple_of(c.pitch) && c.width <= c.to_pitch
+                       && piece.at + (piece.source.len() as u64 / c.pitch - 1) * c.to_pitch + c.width <= size as u64,
+        });
+        if placed != size as u64 || !fits {
+            return Err(format!("Straydog part pieces do not fill {}", operand.key));
+        }
+        let (used, budget) = self.memory()?;
+        if used + size as u64 > budget {
+            return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
+        }
+        let device = if let Some(pending) = &mut self.deferred {
+            // SAFETY: a plain size; the pieces arrive through `fill`.
+            let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
+            for piece in pieces {
+                pending.push(Pending { pointer: device, source: piece.source.as_ptr(), bytes: piece.source.len(), decode: None,
+                                       quantize: false, offset: piece.at, columns: piece.columns });
+            }
+            device
+        } else {
+            let mut bytes = vec![0u8; size];
+            for piece in pieces {
+                match piece.columns {
+                    None => bytes[piece.at as usize..piece.at as usize + piece.source.len()].copy_from_slice(piece.source),
+                    Some(columns) => columns.gather(piece.source, &mut bytes[piece.at as usize..]),
+                }
+            }
+            // SAFETY: the bytes are valid for their length; the library copies them.
+            pointer(unsafe { ffi::sd_upload(self.handle, bytes.as_ptr().cast(), bytes.len() as u64) })?
         };
         let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
         self.cache.insert(operand.key.clone(), entry);
@@ -482,8 +618,8 @@ impl Backend {
         let mut plan = Vec::new();
         if self.batch_capacity == 256 {
             plan.push(("@moe:workspace".into(), context.min(prefill) * MOE_ROW + 65536, 1, false));
-            if self.expert_parallel {
-                // Help for batches up to 2048 rows at once, longer ones in pieces.
+            if self.expert_parallel && self.parts == 1 {
+                // Help for batches up to 2048 rows at once, longer ones in pieces (layers in parts have no helper).
                 plan.push(("@moe:helper".into(), context.min(prefill).min(HELP_ROWS) * MOE_ROW + 65536, 1, false));
             }
             plan.push(("@scratch:qsa".into(), 256 * (context / 4 + 1), 1, false));
@@ -492,17 +628,20 @@ impl Backend {
             if layer == 1 && self.output_capacity >= 256 * 33280 {
                 plan.push(("@ple:blk.1.".into(), 10, WIDTH as u64, false));
             }
+            // (a part's: its heads' recurrence and convolution, its K/V head's planes)
+            let parts = if layer < 48 { self.parts } else { 1 };
             if layer % 4 != 3 && layer < 48 {
-                plan.push((format!("@delta:blk.{layer}."), 48 * 128, 128, false));
+                plan.push((format!("@delta:blk.{layer}."), 48 * 128 / parts, 128, false));
                 if self.batch_capacity == 256 {
-                    plan.push((format!("@conv:blk.{layer}."), 4, WIDTH as u64, false));
+                    plan.push((format!("@conv:blk.{layer}."), 4, WIDTH as u64 / parts, false));
                 }
             } else {
-                plan.push((format!("@qsa:blk.{layer}."), context * 4, 256, host_attention));
+                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, 256, host_attention));
                 plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + INDEX_HISTORY, 1, false));
             }
         }
-        if self.keeps_mtp_rows && self.batch_capacity == 256 && layers.contains(&48) && !layers.contains(&0) {
+        // (the MTP layer's device: with the layers in parts it runs the first layer too)
+        if self.keeps_mtp_rows && self.batch_capacity == 256 && layers.contains(&48) && (self.parts == 2 || !layers.contains(&0)) {
             // A batch's rows after the row before it, and the embeddings of the tokens they pair with.
             plan.push(("@mtp:rows".into(), context.min(prefill) + 1, WIDTH as u64, false));
             plan.push(("@mtp:embeddings".into(), context.min(prefill), HIDDEN as u64, false));
@@ -565,10 +704,11 @@ impl Backend {
     /// 4 to 8 ms a four-row pass where the sixteenth of the budget mirrors 37K to 43K of them).
     pub fn grow_kv_stage(&mut self, context: u64) -> Result<()> {
         let Some(stage) = self.states.get("@kv:stage").copied() else { return Ok(()) };
-        let layers = self.states.keys().filter(|key| key.starts_with("@qsa:")).count() as u64;
+        // (rows of a whole layer's four planes: a part's position takes its two)
+        let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:")).map(|key| self.kv_planes(key) * context / 4).sum();
         let (used, budget) = self.memory()?;
         let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
-        let rows = (stage.rows / 4 + free / 4096).min(layers * context);
+        let rows = (stage.rows / 4 + free / 4096).min(needed);
         if rows < stage.rows / 4 + 256 {
             return Ok(());
         }
@@ -643,8 +783,9 @@ impl Backend {
         let shapes = [(count * 640, 2560), (count * 640, 2560), (count * 2560, 640), (640, 2560), (640, 2560),
                       (2560, 640), (experts, 2560), (1, 2560)];
         let plans = if helper { &self.helper_plans } else { &self.plans };
+        // (a layer part's experts have no helper: every other one holds the shared expert)
         if !(10..=512).contains(&experts) || operands.len() != 8 || plans.contains_key(prefix)
-            || count == 0 || first + count > experts || helper == shared
+            || count == 0 || first + count > experts || (helper == shared && (helper || self.parts == 1))
             || operands.iter().zip(shapes).any(|(operand, shape)| (operand.rows, operand.cols) != shape)
         {
             return Err("invalid Straydog resident MoE geometry".into());
@@ -684,6 +825,14 @@ impl Backend {
         Ok(())
     }
 
+    /// A layer part's half of its shared expert's width (gate, up, down: Group::shared_half) beside its routed experts' plan.
+    pub fn attach_shared_half(&mut self, prefix: &str, operands: &[Operand]) -> Result<()> {
+        let plan = *self.plans.get(prefix).ok_or("Straydog shared expert half without its MoE plan")?;
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: a plan and three operands of this device.
+        check(unsafe { ffi::sd_moe_shared_half(self.handle, plan, pointers.as_ptr(), kinds.as_ptr()) }).map(drop)
+    }
+
     /// Link this device and `peer` for expert parallelism; whether they write each other's VRAM.
     pub fn link_peer(&mut self, peer: &mut Backend, rows: u64) -> Result<bool> {
         // SAFETY: two live handles of distinct devices.
@@ -711,8 +860,13 @@ impl Backend {
         let (pointers, kinds) = self.operands(operands)?;
         // SAFETY: operands, states and workspace all belong to this device.
         check(unsafe {
-            ffi::sd_decoder_layer(self.handle, layer as u64, context, pointers.as_ptr(), kinds.as_ptr(),
-                                  pointers.len() as u64, states.as_ptr(), workspace.pointer, plan)
+            if self.parts == 2 && layer < 48 {
+                ffi::sd_decoder_part(self.handle, layer as u64, context, pointers.as_ptr(), kinds.as_ptr(), pointers.len() as u64,
+                                     states.as_ptr(), workspace.pointer, plan, self.part)
+            } else {
+                ffi::sd_decoder_layer(self.handle, layer as u64, context, pointers.as_ptr(), kinds.as_ptr(),
+                                      pointers.len() as u64, states.as_ptr(), workspace.pointer, plan)
+            }
         })?;
         self.decoder_layers.insert(layer);
         Ok(())
@@ -1261,7 +1415,26 @@ impl Backend {
 
     /// Bytes [`save_positions`](Self::save_positions) copies per position.
     pub fn position_bytes(&self) -> u64 {
-        self.states.keys().map(|key| if key.starts_with("@qsa:") { 4096 } else if key.starts_with("@indexer:") { 128 } else { 0 }).sum()
+        self.states.keys().map(|key| {
+            if key.starts_with("@qsa:") { self.kv_planes(key) * 1024 } else if key.starts_with("@indexer:") { 128 } else { 0 }
+        }).sum()
+    }
+
+    /// The planes of a layer's K/V (each K/V head's keys, then each one's values): a part's two, a whole layer's four.
+    fn kv_planes(&self, key: &str) -> u64 {
+        if key.ends_with(":blk.48.") || self.parts == 1 { 4 } else { 4 / self.parts }
+    }
+
+    /// This device's part of every Qwen3.8 layer but the MTP layer, of `parts` (sd_qwen_parts): before any of its layer
+    /// states are planned.
+    pub fn set_parts(&mut self, parts: u64, part: u64) -> Result<()> {
+        if !self.states.is_empty() || !(1..=2).contains(&parts) || part >= parts {
+            return Err("invalid Straydog layer parts".into());
+        }
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_qwen_parts(self.handle, parts) })?;
+        (self.parts, self.part) = (parts, part);
+        Ok(())
     }
 
     /// What a later sequence overwrites from position `from` up to `to`, copied out: each
@@ -1276,10 +1449,11 @@ impl Backend {
         for (key, entry) in &self.states {
             let floats = entry.rows * entry.cols;
             if key.starts_with("@qsa:") {
-                // Four planes (each head's keys, then each head's values), a position's 256 values a row.
-                let context = entry.rows / 4;
+                // Four planes (each head's keys, then each head's values; a part's two), a position's 256 values a row.
+                let planes = self.kv_planes(key);
+                let context = entry.rows / planes;
                 parts.push(StatePart { key: key.clone(), offset: from * 256, pitch: context * 256, width: (to - from) * 256,
-                                       height: 4, first: from, data: Vec::new(), device: None });
+                                       height: planes, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
                 let (first, last) = (from / 4, to.div_ceil(4));
@@ -1375,13 +1549,15 @@ impl Backend {
             let part = |offset, pitch, width, height| StatePart { key: key.clone(), offset, pitch, width, height, first: 0,
                                                                data: Vec::new(), device: None };
             if key.starts_with("@qsa:") {
+                let planes = self.kv_planes(key);
                 for low in (0..to).step_by(RUN as usize) {
                     let high = (low + RUN).min(to);
-                    parts.push((format!("{key} rows {low}..{high}"), part(low * 256, entry.rows / 4 * 256, (high - low) * 256, 4)));
+                    parts.push((format!("{key} rows {low}..{high}"),
+                                part(low * 256, entry.rows / planes * 256, (high - low) * 256, planes)));
                 }
                 // (and the last few one by one: where a sequence's writes end)
                 for row in to.saturating_sub(8)..to {
-                    parts.push((format!("{key} row {row}"), part(row * 256, entry.rows / 4 * 256, 256, 4)));
+                    parts.push((format!("{key} row {row}"), part(row * 256, entry.rows / planes * 256, 256, planes)));
                 }
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
