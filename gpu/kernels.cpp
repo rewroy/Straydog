@@ -2193,7 +2193,7 @@ int sd_kv_stage(void* handle, void* pointer, uint64_t rows) {
     try {
         auto& value = device(handle);
         auto found = value.allocations.find(pointer);
-        if (!rows || rows > 262144 || found == value.allocations.end() || found->second != size_t(rows) * 1024 * 4 ||
+        if (!rows || rows > (uint64_t(1) << 22) || found == value.allocations.end() || found->second != size_t(rows) * 1024 * 4 ||
             value.host_states.count(pointer))
             throw std::runtime_error("invalid Straydog K/V stage");
         if (value.kv_prefetching) { check(hipStreamSynchronize(value.kv_stream)); value.kv_prefetching = false; }

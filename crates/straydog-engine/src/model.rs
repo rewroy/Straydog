@@ -391,6 +391,8 @@ impl Model {
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
+        // The K/V stages take the VRAM left after the decoder and any expert slots.
+        model.group.grow_kv_stages(context64)?;
         let row_cache = match settings.row_cache_bytes {
             Some(bytes) => bytes,
             None => {
