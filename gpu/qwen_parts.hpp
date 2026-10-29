@@ -268,7 +268,9 @@ void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const Verify
     const size_t attention = linear ? 9 : 10;
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
-    hc_decode(d, hc, true, v.hidden, d.output, v.mixed, steps, 2564);
+    // (a DeltaNet layer's history copy for its tokens rides in the HyperConnection's second launch)
+    const HcCopy copy = linear ? gdn_history_copy(d, static_cast<float*>(plan.states[0]), 2) : HcCopy{};
+    hc_decode(d, hc, true, v.hidden, d.output, v.mixed, steps, 2564, copy);
     Matrix m[6];
     qwen_part_matrices(plan, linear, m);
     if (linear) {
@@ -277,7 +279,7 @@ void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const Verify
         gemv(d, m, 4, v.mixed, plan.projections, steps, 2564, H::projection);
         void* const* p = pointers + 4;
         auto* conv = static_cast<float*>(plan.states[0]); auto* recurrent = static_cast<float*>(plan.states[1]);
-        gdn_tokens<2><<<unsigned(H::value), gdn_threads, 0, d.stream>>>(recurrent, gdn_history_snapshot(d, conv, 2), recurrent, conv,
+        gdn_tokens<2><<<unsigned(H::value), gdn_threads, 0, d.stream>>>(recurrent, gdn_history_snapshot(d, conv, 2, false), recurrent, conv,
             static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
             static_cast<const float*>(p[8]), plan.projections, H::projection, steps, plan.snapshot, v.post);
         gemv(d, &m[4], 1, v.post, v.branch, steps, H::gate, 2560);

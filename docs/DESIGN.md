@@ -665,7 +665,10 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   silu(gate) * up; then waves form the shared half's product), and an attention layer's pooling and
   K/V writes in its normalization's launch and its output gate in the merge (three launches a layer
   less). Served, a pass of 1 / 4 rows at 20K 12.24 / 19.87 to 12.00 / 19.55 ms, at 60K 13.14 / 21.50
-  to 12.94 / 21.15.
+  to 12.94 / 21.15. A DeltaNet layer's history copy for its tokens rides in its first HyperConnection's
+  second launch (four more blocks), and at one or two rows stage one takes 24-row blocks of 768 threads
+  (two a WGP: all 56 run at once, where 44 blocks of 1024 threads took two rounds of 32): a pass 1-2%
+  shorter, bit for bit.
 - **A draft's vocabulary.** A draft's head reads the head's first 100000 rows, split between the
   GPUs, and the rows of the tokens past them that the sequence has held, copied on the second GPU
   (`sd_draft_vocabulary`, at most 16384; 34 MB). The first 100000 tokens are English, code and the
@@ -701,7 +704,13 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   into the kernels around them (with the sums' exchange skipped altogether, a pass is 0.65 ms shorter
   at one row and 1.0 at four, and of that the folding would take only the launches: the rest is the
   experts' share, which differs per token between the GPUs, 17.6 µs apart on average at an experts
-  sum against 4.9 at an attention one).
+  sum against 4.9 at an attention one); the attention sum added by the experts' HyperConnection as it
+  reads the streams, its part sent by the projection's last block (every block read the inbox at system
+  scope: a pass 0.2 ms longer); a HyperConnection's stages in one launch of resident blocks with a grid
+  wait (a wait costs 1.7 µs less than a launch boundary here, and passes of one or two rows were 0.25 ms
+  shorter, but served, kernels on other streams left fewer blocks room than the launch's and one-row
+  passes took 16.5 ms); a split of the routed experts by co-routing (the larger share a token 6.22 to
+  5.98 of 5, held out: worth about 1%).
 
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).
