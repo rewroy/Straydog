@@ -91,32 +91,64 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
     const uint32_t share=min(plan.assist,(5*absent+4)/12);
     return earlier<share ? plan.mapped[role]+expert*plan.bytes[role] : nullptr;
 }
+// A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
+__device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGemv& plan,size_t& route,size_t& role,size_t& local,
+                                            unsigned& lanes) {
+    const size_t roles=down ? 1 : 2;
+    for (size_t r=0;r<roles;++r) {
+        const size_t span=10*size_t(plan.routed_waves[r]);
+        if (wave<span) { route=wave/plan.routed_waves[r]; local=wave%plan.routed_waves[r]; role=down ? 2 : r; lanes=plan.routed_lanes[r]; return true; }
+        wave-=span;
+    }
+    for (size_t r=0;r<roles;++r) {
+        if (wave<plan.shared_waves[r]) { route=10; local=wave; role=down ? 2 : r; lanes=plan.shared_lanes[r]; return true; }
+        wave-=plan.shared_waves[r];
+    }
+    return false;
+}
+// The wave's matrix (null data: a partially resident expert the host evaluates) at its input and output places.
+__device__ __forceinline__ Matrix expert_matrix(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
+                                                const ExpertGemv& plan,size_t route,size_t role) {
+    const size_t expert=route<10 ? size_t(selected[route]) : experts;
+    Matrix matrix=groups[expert].weights[role];
+    if (route<10) matrix.data=expert_source(groups,selected,route,role,plan);
+    matrix.input_offset=down ? route*640 : 0;
+    matrix.output_offset=down ? route*2560 : route*1280+role*640;
+    return matrix;
+}
 // blockIdx.y selects a token: its routes, its input row and its output block.
 __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
                                      ExpertGemv plan,const float* input,float* output,
                                      size_t input_stride=0,size_t output_stride=0) {
-    size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
+    const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
-    const size_t roles=down ? 1 : 2;
-    size_t route=0,role=0,local=0; unsigned lanes=0; bool found=false;
-    for (size_t r=0;r<roles && !found;++r) {
-        const size_t span=10*size_t(plan.routed_waves[r]);
-        if (wave<span) { route=wave/plan.routed_waves[r]; local=wave%plan.routed_waves[r]; role=r; lanes=plan.routed_lanes[r]; found=true; }
-        else wave-=span;
-    }
-    for (size_t r=0;r<roles && !found;++r) {
-        if (wave<plan.shared_waves[r]) { route=10; local=wave; role=r; lanes=plan.shared_lanes[r]; found=true; }
-        else wave-=plan.shared_waves[r];
-    }
-    if (!found) return;
-    if (down) role=2;
-    const size_t expert=route<10 ? size_t(selected[route]) : experts;
-    Matrix matrix=groups[expert].weights[role];
-    if (route<10) matrix.data=expert_source(groups,selected,route,role,plan);
-    if (!matrix.data) return;   // a partially resident expert evaluated on the host
-    matrix.input_offset=down ? route*640 : 0;
-    matrix.output_offset=down ? route*2560 : route*1280+role*640;
+    size_t route=0,role=0,local=0; unsigned lanes=0;
+    if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    if (!matrix.data) return;
     gemv_wave<1>(matrix,local,lanes,input,0,output,0);
+}
+// resident_expert_gemv of a stage whose routed slices take one format, `routed` (gate and up alike): only that format's F32
+// rows are compiled, and the shared expert's down rows of a light format, so the kernel keeps few registers (the kernel of
+// every format took 186 VGPRs, eight waves a SIMD) and a gate or up row takes more lanes (its 80 units walked by 8 lanes at
+// 10 each, not 4 at 20). The shared expert's gate and up go beside it (resident_expert_launch); their Q8 units here took 204.
+#define SD_EXPERT_ROUTED_FORMATS(X) X(12) X(13) X(14) X(18) X(20) X(21) X(22) X(23) X(42)
+#define SD_EXPERT_SHARED_DOWN(X) X(8) X(20)
+template<int routed>
+__global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
+                                                                 ExpertGemv plan,const float* input,float* output,
+                                                                 size_t input_stride,size_t output_stride) {
+    const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
+    selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
+    size_t route=0,role=0,local=0; unsigned lanes=0;
+    if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    if (!matrix.data) return;
+    const size_t first=local*(32/lanes);
+    if (route<10) { gemv_rows<routed,1>(matrix,first,lanes,input,0,output,0,{}); return; }
+    #define SD_EXPERT_DOWN(format) case format: gemv_rows<format,1>(matrix,first,lanes,input,0,output,0,{}); break;
+    switch (matrix.kind) { SD_EXPERT_SHARED_DOWN(SD_EXPERT_DOWN) }
+    #undef SD_EXPERT_DOWN
 }
 // Lanes for every routed expert of a bank: all slices share kind, shape and stride.
 // A stage runs ten routed experts per role (and the shared expert) side by side.
@@ -132,20 +164,55 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     ExpertGemv geometry{};
     for (size_t role=0;role<3;++role) { geometry.mapped[role]=plan.mapped[role]; geometry.bytes[role]=plan.host_bytes[role]; }
     geometry.assist=plan.mapped[0] ? d.assist : 0;
+    // The kernel of the stage's routed format (resident_expert_gemv_kind) when it has one: its shared down rows of a light
+    // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
+    const int routed=weights[down ? 2 : 0].kind;
+    const auto in=[](int kind,std::initializer_list<int> kinds) { return std::find(kinds.begin(),kinds.end(),kind)!=kinds.end(); };
+    bool kind=in(routed,{12,13,14,18,20,21,22,23,42}) && (down || weights[1].kind==routed) && (!down || !plan.shared ||
+              in(weights[shared+2].kind,{8,20})) && (down || d.q8_wide);
     size_t waves=0;
     for (size_t r=0;r<roles;++r) {
         const size_t role=down ? 2 : r;
-        geometry.routed_lanes[r]=resident_lanes(weights,role,input,10*roles);
+        geometry.routed_lanes[r]=resident_lanes(weights,role,input,kind && !down ? 4 : 10*roles);
         geometry.routed_waves[r]=uint32_t(gemv_waves(weights[role],geometry.routed_lanes[r]));
         Matrix matrix=weights[shared+role];
         if (down) matrix.input_offset=10*640;
         geometry.shared_lanes[r]=gemv_lanes(matrix,input,10*roles);
-        geometry.shared_waves[r]=uint32_t(gemv_waves(matrix,geometry.shared_lanes[r]));
+        // (a part without the shared expert has none of its waves; nor a gate and up stage that runs it beside)
+        geometry.shared_waves[r]=plan.shared && !(kind && !down) ? uint32_t(gemv_waves(matrix,geometry.shared_lanes[r])) : 0;
         waves+=10*size_t(geometry.routed_waves[r])+geometry.shared_waves[r];
+        kind&=geometry.routed_lanes[r]!=0;
     }
-    resident_expert_gemv<<<dim3(unsigned((waves+7)/8),unsigned(tokens)),256,0,d.stream>>>(
-        groups,selected,plan.experts,down,geometry,input,output,input_stride,output_stride);
+    const bool beside=kind && !down && plan.shared;
+    if (beside) {
+        if (!d.side_stream) {
+            check(hipStreamCreate(&d.side_stream));
+            check(hipEventCreateWithFlags(&d.side_fork,hipEventDisableTiming));
+            check(hipEventCreateWithFlags(&d.side_join,hipEventDisableTiming));
+        }
+        check(hipEventRecord(d.side_fork,d.stream));
+        check(hipStreamWaitEvent(d.side_stream,d.side_fork,0));
+        {
+            StreamScope side(d,d.side_stream);
+            Matrix pair[2]={weights[shared],weights[shared+1]};
+            pair[1].output_offset=640;
+            gemv(d,pair,2,input,output+10*1280,tokens,input_stride ? input_stride : 2560,output_stride ? output_stride : 11*1280);
+        }
+        check(hipEventRecord(d.side_join,d.side_stream));
+    }
+    const dim3 grid(unsigned((waves+7)/8),unsigned(tokens));
+    #define SD_EXPERT_ROUTED(format) \
+        case format: resident_expert_gemv_kind<format><<<grid,256,0,d.stream>>>(groups,selected,plan.experts,down,geometry,input,output, \
+                                                                                  input_stride,output_stride); break;
+    switch (kind ? routed : -1) {
+        SD_EXPERT_ROUTED_FORMATS(SD_EXPERT_ROUTED)
+        default:
+            resident_expert_gemv<<<grid,256,0,d.stream>>>(groups,selected,plan.experts,down,geometry,input,output,input_stride,
+                                                          output_stride);
+    }
+    #undef SD_EXPERT_ROUTED
     check(hipGetLastError());
+    if (beside) check(hipStreamWaitEvent(d.stream,d.side_join,0));
 }
 
 __global__ void resident_clear(MoeGroup* groups,unsigned* cursors,size_t count) {

@@ -506,6 +506,9 @@ struct Device {
     // A prefetch (kv_prefetch) fills the stage on kv_stream; device-stream work waits for
     // kv_prefetched before it touches the stage while kv_prefetching.
     hipStream_t kv_stream = nullptr;
+    // A stage's work beside the device stream's (the shared expert's gate and up, resident_expert_launch), forked and joined by events.
+    hipStream_t side_stream = nullptr;
+    hipEvent_t side_fork = nullptr, side_join = nullptr;
     hipEvent_t kv_released = nullptr, kv_prefetched = nullptr;
     bool kv_prefetching = false;
     // Decode partitions the same stage into fixed per-host-state F32 prefixes.
@@ -546,6 +549,7 @@ struct Device {
         if (stream) cleanup(hipStreamSynchronize(stream));
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         if (kv_stream) cleanup(hipStreamSynchronize(kv_stream));
+        if (side_stream) cleanup(hipStreamSynchronize(side_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -595,7 +599,8 @@ struct Device {
         if (stream) cleanup(hipStreamDestroy(stream));
         if (helper_stream) cleanup(hipStreamDestroy(helper_stream));
         if (kv_stream) cleanup(hipStreamDestroy(kv_stream));
-        for (auto event : {kv_released, kv_prefetched}) if (event) cleanup(hipEventDestroy(event));
+        if (side_stream) cleanup(hipStreamDestroy(side_stream));
+        for (auto event : {kv_released, kv_prefetched, side_fork, side_join}) if (event) cleanup(hipEventDestroy(event));
     }
 };
 
