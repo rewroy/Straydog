@@ -686,6 +686,14 @@ layer (§6.2).
   launch (a launch a layer was ~330 us ahead of the drafting). The drafter's dense projections but its
   router (BF16, a fifth of a draft step) go up as Q8_0, as the HyperConnections do; only the drafts
   depend on them. A pass at 20K: 1 row 16.1 to 15.4 ms, 4 rows 26.5 to 24.3.
+- **One wait a verification.** The first layer, the PLE layer and both spans are queued one after the other,
+  the rows handed GPU to GPU (sd_prefill_handoff), and the head reads them where the last span left them and
+  hands them back with its tokens: one host wait where there were four. With a cut that keeps at most 64
+  (the card's top_k 20, no penalty), the head picks each row's top_k on the GPU (value first, the lower token
+  on a tie, as the host's scan orders them) and the host draws among those: the same distributions and
+  draws, at a seed the same tokens, without 2 MB of logits a pass. The PLE key and value projections go up
+  as Q8_0 too, a row read thread is woken a job (all 128 for a decode row's 16 rows cost the pass ~0.1 ms),
+  and two waves share an HC row's units. A pass at 20K: 1 row 15.4 to 15.2 ms, 4 rows 24.3 to 23.8.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 

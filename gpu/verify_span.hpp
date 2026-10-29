@@ -333,6 +333,89 @@ void row_exp_sum(Device& d, const float* values, size_t rows, size_t count, size
     row_exp_sum_chunks<<<dim3(argmax_chunks, unsigned(rows)),256,0,d.stream>>>(values, count, stride, chosen, scratch);
     row_exp_sum_finish<<<unsigned(rows),32,0,d.stream>>>(values, stride, chosen, scratch, result);
 }
+// The `top` greatest of each row of `count` values, the lower index first on a tie (the order of sampling's candidates: a draw
+// among them is the draw among the whole row's when its cut keeps at most `top`), as (value, index) pairs most likely
+// first: every chunk's `top` (argmax_chunks blocks a row), then one block a row the chunks'. Each round takes the block's
+// best not yet taken: a thread's best of the values it holds, then the block's of the threads'.
+constexpr unsigned head_top_max = 64, head_top_held = 16;
+__device__ __forceinline__ bool top_better(float a, uint32_t ia, float b, uint32_t ib) { return a > b || (a == b && ia < ib); }
+// The block's `top` of the values each thread holds (`held` of them, some not set: -inf at index ~0u); thread 0 writes them.
+__device__ void top_rounds(float (&values)[head_top_held], uint32_t (&indices)[head_top_held], unsigned top, float* out_values,
+                           uint32_t* out_indices) {
+    __shared__ float wave_values[32];
+    __shared__ uint32_t wave_indices[32];
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32, waves = blockDim.x / 32;
+    for (unsigned round = 0; round < top; ++round) {
+        float value = -INFINITY; uint32_t index = ~0u;
+        #pragma unroll
+        for (unsigned i = 0; i < head_top_held; ++i)
+            if (top_better(values[i], indices[i], value, index)) { value = values[i]; index = indices[i]; }
+        for (unsigned offset = 16; offset; offset /= 2) {
+            const float other = __shfl_xor(value, offset, 32); const uint32_t at = __shfl_xor(index, offset, 32);
+            if (top_better(other, at, value, index)) { value = other; index = at; }
+        }
+        if (!lane) { wave_values[wave] = value; wave_indices[wave] = index; }
+        __syncthreads();
+        value = wave_values[0]; index = wave_indices[0];
+        for (unsigned w = 1; w < waves; ++w)
+            if (top_better(wave_values[w], wave_indices[w], value, index)) { value = wave_values[w]; index = wave_indices[w]; }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned i = 0; i < head_top_held; ++i)
+            if (indices[i] == index) { values[i] = -INFINITY; indices[i] = ~0u; }
+        if (!threadIdx.x) { out_values[round] = value; out_indices[round] = index; }
+    }
+}
+__global__ void __launch_bounds__(256) row_top_chunks(const float* values, size_t count, size_t stride, unsigned top,
+                                                      float* chunk_values, uint32_t* chunk_indices) {
+    const size_t row = blockIdx.y, per = (count + argmax_chunks - 1) / argmax_chunks;
+    const size_t first = size_t(blockIdx.x) * per, last = std::min(count, first + per);
+    float held[head_top_held]; uint32_t at[head_top_held];
+    #pragma unroll
+    for (unsigned i = 0; i < head_top_held; ++i) {
+        const size_t index = first + threadIdx.x + size_t(i) * blockDim.x;
+        const bool in = index < last;
+        held[i] = in ? values[row * stride + index] : -INFINITY; at[i] = in ? uint32_t(index) : ~0u;
+    }
+    const size_t slot = (row * argmax_chunks + blockIdx.x) * top;
+    top_rounds(held, at, top, chunk_values + slot, chunk_indices + slot);
+}
+__global__ void __launch_bounds__(256) row_top_finish(const float* chunk_values, const uint32_t* chunk_indices, unsigned top,
+                                                      float* result) {
+    const size_t row = blockIdx.x, candidates = size_t(argmax_chunks) * top;
+    float held[head_top_held]; uint32_t at[head_top_held];
+    #pragma unroll
+    for (unsigned i = 0; i < head_top_held; ++i) {
+        const size_t index = threadIdx.x + size_t(i) * blockDim.x;
+        const bool in = index < candidates;
+        held[i] = in ? chunk_values[row * candidates + index] : -INFINITY; at[i] = in ? chunk_indices[row * candidates + index] : ~0u;
+    }
+    float* out = result + row * 2 * top;
+    top_rounds(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
+}
+// The two halves' `top` pairs of each row (the peer's rows [0, split), this device's from split on) as one row's.
+__global__ void __launch_bounds__(256) head_top_merge(const float* own, const float* peer, uint32_t split, unsigned top, float* result) {
+    const size_t row = blockIdx.x;
+    const float* low = peer + row * 2 * top; const float* high = own + row * 2 * top;
+    float held[head_top_held]; uint32_t at[head_top_held];
+    #pragma unroll
+    for (unsigned i = 0; i < head_top_held; ++i) {
+        const size_t index = threadIdx.x + size_t(i) * blockDim.x;
+        held[i] = -INFINITY; at[i] = ~0u;
+        if (index < top) { held[i] = low[index]; at[i] = __float_as_uint(low[top + index]); }
+        else if (index < 2 * size_t(top)) { held[i] = high[index - top]; at[i] = __float_as_uint(high[index]) + split; }
+    }
+    float* out = result + row * 2 * top;
+    top_rounds(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
+}
+// Each row's `top` pairs into result: `top` values, then `top` indices (bits); scratch: rows x argmax_chunks x top x 2 words.
+void row_top(Device& d, const float* values, size_t rows, size_t count, size_t stride, unsigned top, float* scratch, float* result) {
+    if (!top || top > head_top_max || (count + argmax_chunks - 1) / argmax_chunks > 256 * head_top_held)
+        throw std::runtime_error("invalid Straydog row top");
+    auto* indices = reinterpret_cast<uint32_t*>(scratch + rows * argmax_chunks * top);
+    row_top_chunks<<<dim3(argmax_chunks, unsigned(rows)), 256, 0, d.stream>>>(values, count, stride, top, scratch, indices);
+    row_top_finish<<<unsigned(rows), 256, 0, d.stream>>>(scratch, indices, top, result);
+}
 // The top token's probability from the (logit, sum) pairs of the head, or of both halves.
 __global__ void head_confidence(const float* own, const float* other, size_t steps, float* result) {
     const size_t row = threadIdx.x;
@@ -349,10 +432,15 @@ __global__ void head_confidence(const float* own, const float* other, size_t ste
 // each with the one-row arithmetic; returns the first maximum of every row and, when
 // asked, its probability (drafts stop at an unlikely one).
 // The rows come from the host (`input`) or, when that is null, from device memory (`source`).
+// With `top` (at most head_top_max), each row's `top` greatest logits and their tokens (row_top) come back in `best`.
+constexpr size_t head_top_floats = verify_max * 2 * head_top_max + verify_max * argmax_chunks * head_top_max * 2;
+// `source` rows on the device (rather than `input`'s on the host) come back in `rows` when asked, with the tokens.
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
-                 const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr) {
+                 const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr,
+                 unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr) {
     if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
-        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max > d.input_capacity)
+        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max + head_top_floats > d.input_capacity ||
+        top_count > head_top_max || (top_count && !best))
         throw std::runtime_error("invalid Straydog output head");
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
@@ -376,11 +464,15 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
         row_exp_sum(d, d.output, steps, vocabulary, vocabulary, chosen, partial, top);
         head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
     }
+    float* ranked = top + 4 * verify_max;
+    if (top_count) row_top(d, d.output, steps, vocabulary, vocabulary, top_count, ranked + verify_max * 2 * head_top_max, ranked);
     check(hipGetLastError());
-    Piece pieces[3]; size_t count = 0;
+    Piece pieces[5]; size_t count = 0;
+    if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
     pieces[count++] = {tokens, chosen, steps * 4};
     if (confidence) pieces[count++] = {confidence, top + 2 * verify_max, steps * 4};
     if (logits) pieces[count++] = {logits, d.output, steps * vocabulary * 4};
+    if (top_count) pieces[count++] = {best, ranked, steps * 2 * top_count * 4};
     download_pieces(d, pieces, count);
 }
 
@@ -403,13 +495,14 @@ __global__ void head_choose(const float* logits, size_t width, size_t split, con
 }
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
                        void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence,
-                       const float* source = nullptr) {
+                       const float* source = nullptr, unsigned top_count = 0, float* best_out = nullptr, float* rows_out = nullptr) {
     Device* peer = d.link.peer;
     if (!peer || !steps || steps > verify_max || (!input && !source) || !tokens || !split || split >= vocabulary ||
         steps * vocabulary > d.output_capacity || steps * split > peer->output_capacity ||
         64 + steps * split > d.link.rows * 2560 || 2560 * steps > peer->link.rows * 2560 ||
-        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 5 * verify_max > d.input_capacity ||
-        2 * verify_max * argmax_chunks + verify_max > peer->input_capacity)
+        steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 5 * verify_max + 2 * head_top_floats > d.input_capacity ||
+        2 * verify_max * argmax_chunks + verify_max + head_top_floats > peer->input_capacity ||
+        top_count > head_top_max || (top_count && (!best_out || logits)))
         throw std::runtime_error("invalid Straydog split output head");
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
@@ -444,6 +537,12 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         // The lower half's (logit, sum) pairs follow its choices, before the logits at 64.
         if (confidence) row_exp_sum(h, h.output, steps, split, split, best, scratch, peer_remote_partials(h.link) + 16);
         if (logits) peer_copy<<<1024, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, h.output, steps, split, split);
+        // (its rows' tops at 64 instead of its logits: a few pairs a row over the link)
+        if (top_count) {
+            float* ranked = scratch + 2 * verify_max * argmax_chunks + verify_max;
+            row_top(h, h.output, steps, split, split, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+            peer_copy<<<1, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, ranked, 1, steps * 2 * top_count, 0);
+        }
         peer_signal_peer(h);
         check(hipGetLastError());
     });
@@ -457,11 +556,19 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         row_exp_sum(d, d.output, steps, vocabulary - split, vocabulary - split, chosen, partial, top);
         head_confidence<<<1, 32, 0, d.stream>>>(top, received + 16, steps, top + 2 * verify_max);
     }
+    float* ranked = top + 4 * verify_max;
+    float* merged = ranked + head_top_floats;
+    if (top_count) {
+        row_top(d, d.output, steps, vocabulary - split, vocabulary - split, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+        head_top_merge<<<unsigned(steps), 256, 0, d.stream>>>(ranked, received + 64, uint32_t(split), top_count, merged);
+    }
     check(hipGetLastError());
     finish_with_helper(d);
-    Piece pieces[2 + 2 * verify_max]; size_t count = 0;
+    Piece pieces[4 + 2 * verify_max]; size_t count = 0;
+    if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
     pieces[count++] = {tokens, final_tokens, steps * 4};
     if (confidence) pieces[count++] = {confidence, top + 2 * verify_max, steps * 4};
+    if (top_count) pieces[count++] = {best_out, merged, steps * 2 * top_count * 4};
     if (logits)
         for (size_t row = 0; row < steps; ++row) {
             pieces[count++] = {logits + row * vocabulary, received + 64 + row * split, split * 4};
@@ -589,12 +696,14 @@ void ple_state_check(Device& d, void* history, void* snapshot, void* kept) {
 }
 void ple_front(Device& d, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, size_t layer,
                size_t steps, const float* embeddings, float* first, float* hidden) {
-    if (!first || !hidden) throw std::runtime_error("invalid PLE rows");
+    if (!first != !hidden) throw std::runtime_error("invalid PLE rows");
     float* rows = verified_rows(d, layer, steps);
     ple_state_check(d, history, snapshot, kept);
     check(hipMemcpyAsync(snapshot, history, 10 * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     check(hipMemcpyAsync(kept, rows, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     ple(d, pointers, kinds, history, steps, embeddings, nullptr, nullptr, rows, true, false);
+    // (no rows asked for: the layers after it continue from the workspace, nothing waited for)
+    if (!first) return;
     const Piece pieces[2] = {{hidden, rows, steps * 10240 * 4}, {first, kept, steps * 10240 * 4}};
     download_pieces(d, pieces, 2);
 }

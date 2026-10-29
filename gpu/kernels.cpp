@@ -1237,21 +1237,33 @@ int sd_verify_commit(void* handle,uint64_t begin,uint64_t end,uint64_t kept) {
     try { verify_commit(device(handle),size_t(begin),size_t(end),size_t(kept)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// input null: the rows of layer `layer`'s workspace (the last span's), handed back in `rows`.
+const float* head_source(Device& d,const float* input,uint64_t layer) {
+    if (input) return nullptr;
+    auto found=d.decoder.find(size_t(layer));
+    if (found==d.decoder.end()) throw std::runtime_error("invalid Straydog output head rows");
+    return verify_layout(found->second.workspace).hidden;
+}
 int sd_output_head(void* handle,void* const* pointers,const int* kinds,uint64_t steps,uint64_t vocabulary,
-                   const float* input,int32_t* tokens,float* logits,float* confidence) {
+                   const float* input,int32_t* tokens,float* logits,float* confidence,uint64_t top,float* best,uint64_t layer,
+                   float* rows) {
     try {
-        if (!pointers || !kinds) throw std::runtime_error("invalid Straydog output head");
-        output_head(device(handle),pointers,kinds,size_t(steps),size_t(vocabulary),input,tokens,logits,confidence); return 0;
+        if (!pointers || !kinds || top > head_top_max || (!input && !rows)) throw std::runtime_error("invalid Straydog output head");
+        Device& d=device(handle);
+        output_head(d,pointers,kinds,size_t(steps),size_t(vocabulary),input,tokens,logits,confidence,head_source(d,input,layer),
+                    unsigned(top),best,input ? nullptr : rows);
+        return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // The head with rows [0, split) evaluated by the linked peer from its copy `peer_head`.
 int sd_output_head_split(void* handle,void* const* pointers,const int* kinds,uint64_t steps,uint64_t vocabulary,
                          uint64_t split,void* peer_head,const float* input,int32_t* tokens,float* logits,
-                         float* confidence) {
+                         float* confidence,uint64_t top,float* best,uint64_t layer,float* rows) {
     try {
-        if (!pointers || !kinds) throw std::runtime_error("invalid Straydog output head");
-        output_head_split(device(handle),pointers,kinds,size_t(steps),size_t(vocabulary),size_t(split),peer_head,input,
-                          tokens,logits,confidence);
+        if (!pointers || !kinds || top > head_top_max || (!input && !rows)) throw std::runtime_error("invalid Straydog output head");
+        Device& d=device(handle);
+        output_head_split(d,pointers,kinds,size_t(steps),size_t(vocabulary),size_t(split),peer_head,input,
+                          tokens,logits,confidence,head_source(d,input,layer),unsigned(top),best,input ? nullptr : rows);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1263,10 +1275,10 @@ int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Layers [begin, end) queued with nothing waited for: their rows stay in the workspace for sd_ple_front.
+// input null: the rows are in the span's workspace already (the layers before it, or sd_prefill_handoff, left them there).
 int sd_verify_queue(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,const float* input) {
     try {
         bool parts=false;
-        if (!input) throw std::runtime_error("invalid verification span");
         verify_span_queue(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,nullptr,parts);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
