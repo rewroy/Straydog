@@ -508,7 +508,8 @@ impl Backend {
             plan.push(("@mtp:embeddings".into(), context.min(prefill), HIDDEN as u64, false));
         }
         if host_attention && self.batch_capacity == 256 {
-            // Up to a sixteenth of the budget: one layer's rows in prefill, per-layer prefix mirrors in decode.
+            // Up to a sixteenth of the budget: one layer's rows in prefill, per-layer prefix mirrors in decode (grown into
+            // the VRAM the placement leaves: Backend::grow_kv_stage).
             let rows = context.min(self.memory()?.1 / 16 / 4096);
             if rows >= 256 {
                 plan.push(("@kv:stage".into(), rows * 4, 256, false));
@@ -559,6 +560,31 @@ impl Backend {
         self.register_kv_stage()
     }
 
+    /// Grow the K/V stage into the VRAM the placement left beside its slack (see [`Backend::can_pin`]), up to every host
+    /// state's `context` positions: decode attention reads the positions past a layer's mirror over the bus (at 60K some
+    /// 4 to 8 ms a four-row pass where the sixteenth of the budget mirrors 37K to 43K of them).
+    pub fn grow_kv_stage(&mut self, context: u64) -> Result<()> {
+        let Some(stage) = self.states.get("@kv:stage").copied() else { return Ok(()) };
+        let layers = self.states.keys().filter(|key| key.starts_with("@qsa:")).count() as u64;
+        let (used, budget) = self.memory()?;
+        let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
+        let rows = (stage.rows / 4 + free / 4096).min(layers * context);
+        if rows < stage.rows / 4 + 256 {
+            return Ok(());
+        }
+        self.states.shift_remove("@kv:stage");
+        self.cache.remove("@kv:stage");
+        // SAFETY: the stage allocation of this device; it is registered anew below before any work reads it.
+        check(unsafe { ffi::sd_release(self.handle, stage.pointer) })?;
+        self.state("@kv:stage", rows * 4, 256, false)?;
+        self.register_kv_stage()
+    }
+
+    /// VRAM a placement leaves free for what it allocates later.
+    fn slack(budget: u64) -> u64 {
+        (512u64 << 20).max(budget * 3 / 100)
+    }
+
     /// The VRAM stage mirrors every registered host state's prefix (see sd_kv_stage).
     fn register_kv_stage(&mut self) -> Result<()> {
         if let Some(stage) = self.states.get("@kv:stage").copied() {
@@ -590,7 +616,7 @@ impl Backend {
         } else {
             decoder_workspace_bytes(self.prefill_capacity)
         });
-        let slack = (512u64 << 20).max(budget * 3 / 100);
+        let slack = Self::slack(budget);
         Ok(self.batch_capacity == 256
             && i128::from(required) + i128::from(reserved) <= i128::from(budget) - i128::from(used) - i128::from(slack))
     }

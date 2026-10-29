@@ -506,6 +506,11 @@ impl Group {
         Ok(Some((split, self.backends[0].prepare(&lower)?.pointer)))
     }
 
+    /// Each device's K/V stage grown into the VRAM its placement left (see [`Backend::grow_kv_stage`]).
+    pub fn grow_kv_stages(&mut self, context: u64) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.grow_kv_stage(context))
+    }
+
     /// Allocate mapped weights instead of uploading them (see [`Backend::defer_uploads`]).
     pub fn defer_uploads(&mut self) {
         self.backends.iter_mut().for_each(Backend::defer_uploads);

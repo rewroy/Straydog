@@ -707,6 +707,12 @@ layer (§6.2).
   1 row 26.9 to 19.9 us. The shared expert's gate and up (whose F32 or Q8 rows in that kernel took 204) run on
   the Q8 GEMV on a side stream, forked and joined by events (graph branches). A pass: 20K 1 row 14.8 to 14.3
   ms, 4 rows 23.3 to 22.5; 60K 4 rows 27.2 to 26.4.
+- **K/V stage grown after loading.** The stage that mirrors every host K/V state's prefix in decode was a
+  sixteenth of the budget, 37K to 43K positions a layer (split over six or seven states), so a 60K decode's
+  attention read the positions past them over the bus. After loading (and any expert slots) it takes the VRAM
+  left beside the placement's slack, up to every state's whole context: at `--vram 30` 87K positions on the
+  first GPU and 51K on the second. A pass at 60K: 1 row 15.7 to 14.9 ms, 4 rows 26.4 to 23.6 (62K: 31.1 to
+  26.4); 20K and the first tokens unchanged.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
