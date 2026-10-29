@@ -459,6 +459,10 @@ int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
 int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits, float* confidence);
 int sd_output_head_split(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, uint64_t split, void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence);
 int sd_mtp_prologue(void* handle, void* const* pointers, const int* kinds, uint64_t steps, const float* embeddings, const float* hidden, float* output);
+int sd_verify_queue(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input);
+int sd_ple_front(void* handle, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, uint64_t layer, uint64_t steps, const float* embeddings, float* first, float* hidden);
+int sd_ple_replay(void* handle, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, uint64_t steps, const float* embeddings);
+int sd_draft_step(void* handle, void* const* mtp, const int* mtp_kinds, uint64_t layer, uint64_t position, uint64_t steps, const float* embeddings, const float* hidden, uint64_t previous, void* const* head, const int* head_kinds, uint64_t vocabulary, uint64_t split, void* peer_head, int32_t* token, float* confidence);
 int sd_execution_counts(void* handle, uint64_t* graphs, uint64_t* replays, uint64_t* resident);
 
 /* Resident experts and two-GPU links */

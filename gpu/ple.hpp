@@ -41,7 +41,7 @@ __global__ void ple_convolve(float* hidden,const float* gated,const float* norma
 // exact (at most four rows) projects every row with the one-row GEMV arithmetic,
 // so speculative rows match token-by-token decode bitwise.
 void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t steps,
-          const float* embeddings,const float* hidden,float* output,float* resident=nullptr,bool exact=false) {
+          const float* embeddings,const float* hidden,float* output,float* resident=nullptr,bool exact=false,bool wait=true) {
     if (!pointers || !kinds || (!resident && (!hidden || !output)) || !embeddings || !steps || steps>256 ||
         steps*33280>d.output_capacity || steps*10240>d.input_capacity)
         throw std::runtime_error("invalid PLE geometry");
@@ -76,5 +76,5 @@ void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t s
         static_cast<float*>(pointers[5]),steps);
     check(hipGetLastError());
     if (!resident) download(d,output,residual,steps*10240*4);
-    else check(hipStreamSynchronize(d.stream));
+    else if (wait) check(hipStreamSynchronize(d.stream));
 }

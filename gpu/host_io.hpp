@@ -16,7 +16,23 @@ public:
         if (bytes < (size_t(4) << 20)) { std::memcpy(to, from, bytes); return; }
         std::lock_guard<std::mutex> turn(caller_);
         std::unique_lock<std::mutex> lock(mutex_);
-        to_ = static_cast<uint8_t*>(to); from_ = static_cast<const uint8_t*>(from); bytes_ = bytes;
+        to_ = static_cast<uint8_t*>(to); from_ = static_cast<const uint8_t*>(from); bytes_ = bytes; items_ = nullptr;
+        pending_ = workers_; ++generation_;
+        lock.unlock();
+        wake_.notify_all();
+        slice(0);
+        lock.lock();
+        done_.wait(lock, [&]() { return pending_ == 0; });
+    }
+    // Several copies (to, from, bytes), each taken whole by one of the threads in turn: the pieces of a read-back.
+    struct Item { void* to; const void* from; size_t bytes; };
+    void copy_items(const Item* items, size_t count) {
+        size_t total = 0;
+        for (size_t i = 0; i < count; ++i) total += items[i].bytes;
+        if (count < 2 || total < (size_t(1) << 20)) { for (size_t i = 0; i < count; ++i) std::memcpy(items[i].to, items[i].from, items[i].bytes); return; }
+        std::lock_guard<std::mutex> turn(caller_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        items_ = items; count_ = count;
         pending_ = workers_; ++generation_;
         lock.unlock();
         wake_.notify_all();
@@ -33,6 +49,10 @@ private:
     static constexpr size_t workers_ = 3;
     StagingCopier() { for (size_t i = 1; i <= workers_; ++i) threads_.emplace_back([this, i]() { run(i); }); }
     void slice(size_t index) {
+        if (items_) {
+            for (size_t i = index; i < count_; i += workers_ + 1) std::memcpy(items_[i].to, items_[i].from, items_[i].bytes);
+            return;
+        }
         const size_t each = (bytes_ / (workers_ + 1) + 63) & ~size_t(63), first = std::min(bytes_, index * each);
         std::memcpy(to_ + first, from_ + first, std::min(bytes_, first + each) - first);
     }
@@ -53,6 +73,7 @@ private:
     std::condition_variable wake_, done_;
     std::vector<std::thread> threads_;
     uint8_t* to_ = nullptr; const uint8_t* from_ = nullptr; size_t bytes_ = 0, pending_ = 0;
+    const Item* items_ = nullptr; size_t count_ = 0;
     uint64_t generation_ = 0; bool stopping_ = false;
 };
 
@@ -96,6 +117,24 @@ void download(Device& d, void* host, const void* device, size_t bytes) {
         d.io_used = 0;   // the stream is idle, so every staged upload has landed
         done += part;
     }
+}
+// Several device ranges read back with one wait (`download` waits for each): the copies are queued into the staging arena
+// together, and the pieces are copied out to the caller's memory on the copier's threads when they add up to enough.
+struct Piece { void* host; const void* device; size_t bytes; };
+void download_pieces(Device& d, const Piece* pieces, size_t count) {
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) total += (pieces[i].bytes + 255) & ~size_t(255);
+    if (total > io_arena_bytes) { for (size_t i = 0; i < count; ++i) download(d, pieces[i].host, pieces[i].device, pieces[i].bytes); return; }
+    if (total > io_arena_bytes - d.io_used) { check(hipStreamSynchronize(d.stream)); d.io_used = 0; }
+    std::vector<StagingCopier::Item> items(count);
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t* slot = io_slot(d, pieces[i].bytes);
+        check(hipMemcpyAsync(slot, pieces[i].device, pieces[i].bytes, hipMemcpyDeviceToHost, d.stream));
+        items[i] = {pieces[i].host, slot, pieces[i].bytes};
+    }
+    check(hipStreamSynchronize(d.stream));
+    StagingCopier::instance().copy_items(items.data(), count);
+    d.io_used = 0;   // the stream is idle, so every staged upload has landed
 }
 // A tracked allocation within the budget; only its tail padding is zeroed.
 void* allocate(Device& value, uint64_t bytes) {

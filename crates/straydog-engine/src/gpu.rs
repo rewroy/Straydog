@@ -928,6 +928,54 @@ impl Backend {
         Ok(output)
     }
 
+    /// Up to four tokens through resident layers [begin, end) with nothing waited for or read back: their rows stay in the
+    /// workspace for [`Backend::ple_front`] to continue from.
+    pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
+        let steps = Self::rows(values, WIDTH)?;
+        if begin >= end || end > 49 || position > 262144 - steps as u64 {
+            return Err("invalid Straydog verification span".into());
+        }
+        // SAFETY: `steps` rows in.
+        check(unsafe { ffi::sd_verify_queue(self.handle, begin as u64, end as u64, position, steps as u64, values.as_ptr()) })
+            .map(drop)
+    }
+
+    /// The PLE layer over the rows [`Backend::verify_queue`] left in `layer`'s workspace, in one wait: the PLE state is
+    /// snapshotted first (for [`Backend::ple_replay`]); returns the first layer's rows (kept on the device too) and the
+    /// PLE layer's.
+    pub fn ple_front(&mut self, prefix: &str, layer: usize, embeddings: &[f32], operands: &[Operand])
+                     -> Result<(Vec<f32>, Vec<f32>)> {
+        let steps = Self::rows(embeddings, HIDDEN)?;
+        let state = self.state(&format!("@ple:{prefix}"), 10, WIDTH as u64, false)?;
+        let snapshot = self.state(&format!("@ple-snapshot:{prefix}"), 10, WIDTH as u64, false)?;
+        let kept = self.state(&format!("@ple-rows:{prefix}"), VERIFY_MAX as u64, WIDTH as u64, false)?;
+        let (pointers, kinds) = self.operands(operands)?;
+        let (mut first, mut hidden) = (vec![0f32; steps * WIDTH], vec![0f32; steps * WIDTH]);
+        // SAFETY: `steps` rows of each array; the states are this device's.
+        check(unsafe {
+            ffi::sd_ple_front(self.handle, pointers.as_ptr(), kinds.as_ptr(), state.pointer, snapshot.pointer, kept.pointer,
+                              layer as u64, steps as u64, embeddings.as_ptr(), first.as_mut_ptr(), hidden.as_mut_ptr())
+        })?;
+        Self::finite(&hidden, "decoder state")?;
+        Ok((first, hidden))
+    }
+
+    /// After a partial acceptance: the PLE state back as [`Backend::ple_front`] snapshotted it, then the layer over the
+    /// first rows' first `kept` rows (queued, not waited for).
+    pub fn ple_replay(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
+        let steps = Self::rows(embeddings, HIDDEN)?;
+        let state = self.state_entry(&format!("@ple:{prefix}"))?;
+        let snapshot = self.state_entry(&format!("@ple-snapshot:{prefix}"))?;
+        let kept = self.state_entry(&format!("@ple-rows:{prefix}"))?;
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: `steps` rows of the embeddings; the states are this device's.
+        check(unsafe {
+            ffi::sd_ple_replay(self.handle, pointers.as_ptr(), kinds.as_ptr(), state.pointer, snapshot.pointer, kept.pointer,
+                               steps as u64, embeddings.as_ptr())
+        })
+        .map(drop)
+    }
+
     /// Keep the first `kept` tokens of the last verification of this span.
     pub fn verify_commit(&mut self, begin: usize, end: usize, kept: u64) -> Result<()> {
         // SAFETY: a live handle.
@@ -981,6 +1029,43 @@ impl Backend {
                                  hidden.as_ptr(), output.as_mut_ptr())
         })?;
         Ok(output)
+    }
+
+    /// One drafting step on this device: the MTP layer's prologue over `embeddings` and the hidden rows, the layer, and
+    /// (with the head's four operands after the prologue's four) the vocabulary head on the layer's last row, in one
+    /// call with no wait on the host between them. The hidden rows are `hidden`, or (`None`) the last of the
+    /// `previous` rows the layer's last step left in its workspace. The head's token and its probability come back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_step(&mut self, operands: &[Operand], layer: usize, position: u64, embeddings: &[f32], hidden: Option<&[f32]>,
+                      previous: u64, split: Option<(u64, *mut c_void)>) -> Result<Option<(i32, f32)>> {
+        let steps = hidden.map_or(1, |hidden| hidden.len() / WIDTH);
+        let head = operands.len() == 8;
+        let vocabulary = operands.get(7).map_or(0, |operand| operand.rows);
+        if (operands.len() != 4 && !head) || hidden.is_some_and(|hidden| !hidden.len().is_multiple_of(WIDTH))
+            || !(1..=VERIFY_MAX).contains(&steps) || embeddings.len() != steps * HIDDEN
+            || position > 262144 - steps as u64 || hidden.is_none() && !(1..=VERIFY_MAX as u64).contains(&previous)
+            || hidden.is_some_and(|hidden| !hidden.iter().all(|value| value.is_finite()))
+            || head && (operands[7].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
+                        || split.is_some_and(|(split, _)| split == 0 || split >= vocabulary))
+        {
+            return Err("invalid Straydog drafting step".into());
+        }
+        let (pointers, kinds) = self.operands(operands)?;
+        let (mut token, mut confidence) = (0i32, 0f32);
+        let (split, peer) = split.map_or((0, std::ptr::null_mut()), |(split, peer)| (split, peer));
+        // SAFETY: four operands of the prologue and, with a head, four of the head; `steps` rows of each array.
+        check(unsafe {
+            ffi::sd_draft_step(self.handle, pointers.as_ptr(), kinds.as_ptr(), layer as u64, position, steps as u64,
+                               embeddings.as_ptr(), hidden.map_or(std::ptr::null(), <[f32]>::as_ptr), previous,
+                               if head { pointers[4..].as_ptr() } else { std::ptr::null() },
+                               if head { kinds[4..].as_ptr() } else { std::ptr::null() }, vocabulary, split, peer,
+                               &mut token, &mut confidence)
+        })?;
+        if !head {
+            return Ok(None);
+        }
+        Self::finite(&[confidence], "draft probability")?;
+        Ok(Some((token, confidence)))
     }
 
     /// Feed the MTP layer one batch of prompt pairs, the hidden rows coming from `stash`'s

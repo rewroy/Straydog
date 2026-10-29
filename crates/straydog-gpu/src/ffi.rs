@@ -1699,6 +1699,63 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_verify_queue(
+        handle: *mut ::std::os::raw::c_void,
+        begin: u64,
+        end: u64,
+        position: u64,
+        steps: u64,
+        input: *const f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_ple_front(
+        handle: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        history: *mut ::std::os::raw::c_void,
+        snapshot: *mut ::std::os::raw::c_void,
+        kept: *mut ::std::os::raw::c_void,
+        layer: u64,
+        steps: u64,
+        embeddings: *const f32,
+        first: *mut f32,
+        hidden: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_ple_replay(
+        handle: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        history: *mut ::std::os::raw::c_void,
+        snapshot: *mut ::std::os::raw::c_void,
+        kept: *mut ::std::os::raw::c_void,
+        steps: u64,
+        embeddings: *const f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_draft_step(
+        handle: *mut ::std::os::raw::c_void,
+        mtp: *const *mut ::std::os::raw::c_void,
+        mtp_kinds: *const ::std::os::raw::c_int,
+        layer: u64,
+        position: u64,
+        steps: u64,
+        embeddings: *const f32,
+        hidden: *const f32,
+        previous: u64,
+        head: *const *mut ::std::os::raw::c_void,
+        head_kinds: *const ::std::os::raw::c_int,
+        vocabulary: u64,
+        split: u64,
+        peer_head: *mut ::std::os::raw::c_void,
+        token: *mut i32,
+        confidence: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_execution_counts(
         handle: *mut ::std::os::raw::c_void,
         graphs: *mut u64,

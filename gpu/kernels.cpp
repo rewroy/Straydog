@@ -1259,6 +1259,42 @@ int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t
         mtp_prologue(device(handle),pointers,kinds,size_t(steps),embeddings,hidden,output); return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// Layers [begin, end) queued with nothing waited for: their rows stay in the workspace for sd_ple_front.
+int sd_verify_queue(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,const float* input) {
+    try {
+        bool parts=false;
+        if (!input) throw std::runtime_error("invalid verification span");
+        verify_span_queue(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,nullptr,parts);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_ple_front(void* handle,void* const* pointers,const int* kinds,void* history,void* snapshot,void* kept,uint64_t layer,
+                 uint64_t steps,const float* embeddings,float* first,float* hidden) {
+    try {
+        if (!pointers || !kinds || !embeddings) throw std::runtime_error("invalid PLE rows");
+        ple_front(device(handle),pointers,kinds,history,snapshot,kept,size_t(layer),size_t(steps),embeddings,first,hidden);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_ple_replay(void* handle,void* const* pointers,const int* kinds,void* history,void* snapshot,void* kept,uint64_t steps,
+                  const float* embeddings) {
+    try {
+        if (!pointers || !kinds || !embeddings || !steps || steps > verify_max) throw std::runtime_error("invalid PLE replay");
+        ple_replay(device(handle),pointers,kinds,history,snapshot,kept,size_t(steps),embeddings);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// One drafting step (see draft_step): `head` null stops after the MTP layer, `split` 0 evaluates the whole head here.
+int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
+                  const float* embeddings,const float* hidden,uint64_t previous,void* const* head,const int* head_kinds,
+                  uint64_t vocabulary,uint64_t split,void* peer_head,int32_t* token,float* confidence) {
+    try {
+        if (!mtp || !mtp_kinds) throw std::runtime_error("invalid drafting step");
+        draft_step(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,
+                   size_t(previous),head,head_kinds,size_t(vocabulary),size_t(split),peer_head,token,confidence);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // A deferred prompt's MTP pairs stay on the MTP layer's device (sd_mtp_keep, sd_mtp_embed,
 // sd_mtp_prompt_kept): nothing waits on the host between the prompt's batches.
 float* mtp_allocation(Device& d,void* base,size_t floats) {

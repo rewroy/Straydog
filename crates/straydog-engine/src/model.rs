@@ -1213,14 +1213,25 @@ impl Model {
         self.with_operands(Model::mtp_operands, |group, operands| group.mtp_prologue(operands, embeddings, hidden))
     }
 
-    /// The drafter's token for the last row, through the MTP layer's own mixer and the shared
-    /// vocabulary head, and its probability under the drafter.
-    fn mtp_head(&mut self, values: &[f32]) -> Result<(u32, f32)> {
-        let (tokens, _, top) = self.with_operands(Model::mtp_head_operands, |group, operands| {
-            group.output_head(operands, values, false, true)
+    /// A drafting step's operands: the MTP layer's prologue, then the head's mixer and the shared vocabulary head.
+    fn draft_operands(&self, head: bool) -> Result<Vec<Operand<'_>>> {
+        let mut operands = self.mtp_operands()?;
+        if head {
+            operands.extend(self.mtp_head_operands()?);
+        }
+        Ok(operands)
+    }
+
+    /// One drafting step with the host out of its middle: the prologue over `embeddings` and `hidden` (`None`: the last row
+    /// the layer's last step left on the device, of `previous` rows), the MTP layer, and the drafter's token for the last
+    /// row through the layer's own mixer and the shared vocabulary head with its probability under the drafter.
+    fn draft_step(&mut self, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, position: u64, head: bool)
+                  -> Result<Option<(u32, f32)>> {
+        let step = self.with_operands(|model| model.draft_operands(head), |group, operands| {
+            group.draft_step(operands, position, embeddings, hidden, previous)
         })?;
-        let top = top.ok_or("Straydog drafter head returned no probability")?;
-        Ok((*tokens.last().ok_or("Straydog drafter head returned no token")? as u32, top[top.len() - 1]))
+        step.map(|(token, probability)| u32::try_from(token).map(|token| (token, probability))
+            .map_err(|_| "Straydog drafter head returned no token".to_string())).transpose()
     }
 
     /// [`Model::mtp_prompt`] with the prompt's rows kept on the GPUs (see [`Group::mtp_stash`]):
@@ -1294,41 +1305,33 @@ impl Model {
 
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
     /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
+    /// Each step is one call: a draft's row stays on the device for the next step to read.
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
         let mut clock = Instant::now();
         self.protect(position as usize, position as usize + tokens.len() + limit)?;
         let embedded = self.token_embeddings(tokens)?;
         self.phase("draft: embeddings", &mut clock);
-        let rows = self.mtp_prologue(&embedded, hidden)?;
-        self.phase("draft: prologue", &mut clock);
-        let output = self.group.verify_span(48, 49, &rows, position)?;
-        self.phase("draft: MTP layer", &mut clock);
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let (token, mut chain) = self.mtp_head(last_row(&output))?;
-        self.phase("draft: head", &mut clock);
+        let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0)?;
+        self.phase("draft: catch-up and first draft", &mut clock);
+        let Some((token, mut chain)) = step else { return Ok(Vec::new()) };
         if chain < DRAFT_CUT {
             return Ok(Vec::new());
         }
         let mut drafts = vec![token];
-        let (mut multi, mut position) = (last_row(&output).to_vec(), position + tokens.len() as u64);
+        let (mut rows, mut position) = (tokens.len() as u64, position + tokens.len() as u64);
         while drafts.len() < limit {
             let embedded = self.token_embeddings(&drafts[drafts.len() - 1..])?;
             self.phase("draft: embeddings", &mut clock);
-            let rows = self.mtp_prologue(&embedded, &multi)?;
-            self.phase("draft: prologue", &mut clock);
-            let output = self.group.verify_span(48, 49, &rows, position)?;
-            self.phase("draft: MTP layer", &mut clock);
-            let (token, probability) = self.mtp_head(&output)?;
-            self.phase("draft: head", &mut clock);
+            let (token, probability) = self.draft_step(&embedded, None, rows, position, true)?
+                .ok_or("Straydog drafter head returned no probability")?;
+            self.phase("draft: next draft", &mut clock);
             chain *= probability;
             if chain < DRAFT_CUT {
                 break;
             }
             drafts.push(token);
-            (multi, position) = (output, position + 1);
+            (rows, position) = (1, position + 1);
         }
         Ok(drafts)
     }
@@ -1408,15 +1411,30 @@ impl Model {
         self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
         self.phase("verify: protect, PLE prefetch, embeddings", &mut clock);
-        let first = self.group.verify_span(0, 1, &hidden, position)?;
-        self.phase("verify: first layer", &mut clock);
-        let embeddings = self.ple_embeddings(tokens)?;
-        self.phase("verify: PLE rows wait", &mut clock);
-        self.group.copy_state("@ple-snapshot:blk.1.", "@ple:blk.1.", "blk.1.")?;
-        let mut hidden = self.with_operands(Model::ple_operands, |group, operands| {
-            group.ple_rows("blk.1.", &first, &embeddings, operands)
-        })?;
-        self.phase("verify: PLE layer", &mut clock);
+        let (first, embeddings, mut hidden) = if self.group.front_chained() {
+            // The first layer runs on the device while the host waits for the PLE rows; the PLE layer then follows it
+            // there, and one wait reads back both layers' rows.
+            self.group.verify_queue(0, 1, &hidden, position)?;
+            self.phase("verify: first layer", &mut clock);
+            let embeddings = self.ple_embeddings(tokens)?;
+            self.phase("verify: PLE rows wait", &mut clock);
+            let (first, hidden) = self.with_operands(Model::ple_operands, |group, operands| {
+                group.ple_front("blk.1.", &embeddings, operands)
+            })?;
+            self.phase("verify: PLE layer", &mut clock);
+            (first, embeddings, hidden)
+        } else {
+            let first = self.group.verify_span(0, 1, &hidden, position)?;
+            self.phase("verify: first layer", &mut clock);
+            let embeddings = self.ple_embeddings(tokens)?;
+            self.phase("verify: PLE rows wait", &mut clock);
+            self.group.copy_state("@ple-snapshot:blk.1.", "@ple:blk.1.", "blk.1.")?;
+            let hidden = self.with_operands(Model::ple_operands, |group, operands| {
+                group.ple_rows("blk.1.", &first, &embeddings, operands)
+            })?;
+            self.phase("verify: PLE layer", &mut clock);
+            (first, embeddings, hidden)
+        };
         for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
             hidden = self.group.verify_span(begin, end, &hidden, position)?;
             self.phase(["verify: layers (first device)", "verify: layers (second device)"][index.min(1)], &mut clock);
@@ -1432,11 +1450,16 @@ impl Model {
         }
         self.phase("commit: DeltaNet replay", &mut clock);
         if kept < tokens.len() {
-            self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;
-            let (first, embeddings) = (&first[..kept * WIDTH], &embeddings[..kept * HIDDEN]);
-            self.with_operands(Model::ple_operands, |group, operands| {
-                group.ple_rows("blk.1.", first, embeddings, operands)
-            })?;
+            let embeddings = &embeddings[..kept * HIDDEN];
+            if self.group.front_chained() {
+                self.with_operands(Model::ple_operands, |group, operands| group.ple_replay("blk.1.", embeddings, operands))?;
+            } else {
+                self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;
+                let first = &first[..kept * WIDTH];
+                self.with_operands(Model::ple_operands, |group, operands| {
+                    group.ple_rows("blk.1.", first, embeddings, operands)
+                })?;
+            }
             self.phase("commit: PLE replay", &mut clock);
         }
         self.history.extend_from_slice(&tokens[..kept]);

@@ -639,6 +639,31 @@ layer (§6.2).
   and attention 2.0, routed experts 1.0, the head 0.5, shared experts, routers and PLE 0.4). A
   layer takes 300 µs against 130 µs of bandwidth: some 17 kernels, each followed by 3.2 µs of
   graph dispatch, and the projections reach 300-400 GB/s.
+- **Host waits of a pass** (2026-10-29). A host-device round trip costs 20 µs (a kernel and a
+  stream synchronize, or a 4 KB copy) in every wait mode the runtime has (spin, yield, blocking,
+  interrupts off), so what a wait costs is the host's work around it and the device idle meanwhile,
+  and the pass drops them where it can:
+  - the first layer is queued and the PLE rows are waited for beside it; the PLE layer then runs on
+    the first layer's rows where they are, with the PLE state snapshotted and the first layer's rows
+    kept on the device, and one wait reads both layers' rows back (0.99 to 0.79 ms a 4-row pass);
+  - a partial acceptance replays the DeltaNet states and the PLE layer without a wait: the stream
+    orders the replay before everything that reads the state (the commit 0.41 to 0.03 ms);
+  - a drafting step is one call: the MTP layer's prologue, the layer and the head on its last row
+    run on the device, and a chain of steps keeps the rows there (the token and its probability are
+    all that comes back): 0.2 ms a 4-row pass;
+  - the heads' read-back of logits and tokens is queued together, with one wait and the copy-out on
+    the copier's threads (0.1 ms).
+  Together a pass takes 0.15-0.25 ms less at one row and 0.8 ms less at four (30.9 to 30.0 ms at 20K,
+  35.2 to 34.4 ms at 60K); the exactness tests are unchanged. What did not pay: launching the
+  helper's and the owner's span graphs from two threads (a launch takes the host 0.22 and 0.5 ms, but
+  the spans took no less), and splitting the MTP layer's experts across the GPUs (from the trace, its
+  experts are 60 µs of a 530 µs layer, and the peer exchange would cost about half of what the split
+  saves; it would also change the drafter's sums, hence the pins).
+- **What is left in a drafting step** (1 row, 1.25 ms; kernel times from the trace): the prologue 0.1 ms, the MTP layer 0.53 ms
+  (its projections 0.22 ms at 460 GB/s, the experts 0.06, the HyperConnections and attention the
+  rest) and the head 0.56 ms (0.43 of it the half vocabulary's GEMV at 590 GB/s), all device time;
+  the host turnaround between steps (the token to its embedding and back, about 0.15 ms) is what
+  chaining cannot take away without the embedding table on the device.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
