@@ -74,8 +74,8 @@ impl Tensor {
     fn device_bytes(&self, name: &str) -> u64 {
         if self.dims.len() == 1 || name.ends_with("ssm_conv1d.weight") {
             self.bytes.max(self.elements() * 4)
-        } else if hc_quantized(name) && self.elements().is_multiple_of(32) {
-            // (a HyperConnection's down and up projections go up as Q8_0: see Model::hc_projection)
+        } else if (hc_quantized(name) || drafter_quantized(name) && matches!(self.kind, 0 | 1 | 30)) && self.elements().is_multiple_of(32) {
+            // (a HyperConnection's down and up projections and the drafter's dense ones go up as Q8_0: see Model::q8_projection)
             self.elements() / 32 * 34
         } else {
             self.bytes
@@ -712,8 +712,20 @@ impl Weights {
 /// Whether a tensor is a HyperConnection's down or up projection, uploaded quantized to Q8_0 (`STRAYDOG_HC_Q8=0`: as it is).
 pub fn hc_quantized(name: &str) -> bool {
     (name.ends_with("hc_attn_down.weight") || name.ends_with("hc_attn_up.weight") || name.ends_with("hc_ffn_down.weight")
-     || name.ends_with("hc_ffn_up.weight") || name.ends_with("output_hc_down.weight") || name.ends_with("output_hc_up.weight"))
+     || name.ends_with("hc_ffn_up.weight") || name.ends_with("output_hc_down.weight") || name.ends_with("output_hc_up.weight")
+     || name.ends_with("hc_out_down.weight") || name.ends_with("hc_out_up.weight"))
         && std::env::var("STRAYDOG_HC_Q8").map_or(true, |value| value != "0")
+}
+
+/// Whether a tensor is one of the MTP drafter's dense projections but its router, uploaded quantized to Q8_0 when it is
+/// a float matrix: a draft step reads them all for one row (BF16, they were a fifth of a step), and only the drafts
+/// depend on them.
+pub fn drafter_quantized(name: &str) -> bool {
+    matches!(name, "mtp.fc_embedding.weight" | "mtp.fc_hidden.weight")
+        || name.strip_prefix("blk.48.").is_some_and(|rest| {
+            matches!(rest, "attn_q.weight" | "attn_k.weight" | "attn_v.weight" | "attn_output.weight" | "indexer.q_proj.weight"
+                     | "indexer.k_proj.weight" | "ffn_gate_shexp.weight" | "ffn_up_shexp.weight" | "ffn_down_shexp.weight")
+        })
 }
 
 /// The decoder layer a tensor belongs to; 48 for the rest (head, embeddings, MTP).

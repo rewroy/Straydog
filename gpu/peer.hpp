@@ -84,9 +84,38 @@ struct StreamScope {
 inline float* peer_inputs(PeerLink& link) { return link.inbox; }
 inline float* peer_partials(PeerLink& link) { return link.inbox + link.rows * 2560; }
 inline float* peer_remote_partials(PeerLink& link) { return link.peer_inbox + link.rows * 2560; }
+// peer_copy and peer_signal in one block, for a decode pass's few rows: each value stored at system scope, the stores
+// waited for (an agent-scope release, as link_tail.hpp's sums wait for theirs) before one thread raises the flag.
+__global__ void __launch_bounds__(1024) peer_copy_signal(float* to, const float* from, size_t rows, size_t width, size_t stride,
+                                                         uint32_t* counters, uint32_t* peer_flag) {
+    for (size_t i = threadIdx.x; i < rows * width; i += blockDim.x) {
+        const float value = from[(i / width) * stride + i % width];
+#if defined(__HIPCC__)
+        __hip_atomic_store(to + i, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        *static_cast<volatile float*>(to + i) = value;
+#endif
+    }
+#if defined(__HIPCC__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+    __threadfence();
+#endif
+    __syncthreads();
+    if (threadIdx.x) return;
+    __threadfence_system();
+    const uint32_t sent = counters[0] + 1;
+    counters[0] = sent;
+    peer_store(peer_flag, sent);
+}
 // `count` rows of `width` floats (`stride` apart) into the peer's input area at `offset` floats.
 void peer_send(Device& d, const float* rows, size_t count, size_t width, size_t stride, size_t offset) {
     if (!d.link.peer || offset + count * width > d.link.rows * 2560) throw std::runtime_error("invalid Straydog peer transfer");
+    if (count * width <= 4 * 2560) {
+        peer_copy_signal<<<1, 1024, 0, d.stream>>>(d.link.peer_inbox + offset, rows, count, width, stride, d.link.counters,
+                                                   d.link.peer_flag);
+        return;
+    }
     peer_copy<<<unsigned(std::min<size_t>((count * width + 255) / 256, 1024)), 256, 0, d.stream>>>(
         d.link.peer_inbox + offset, rows, count, width, stride);
     peer_signal<<<1, 32, 0, d.stream>>>(d.link.counters, d.link.peer_flag);

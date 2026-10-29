@@ -138,11 +138,12 @@ __global__ void delta_post_one(float* state, const float* packed, const float* g
 constexpr unsigned gdn_threads = 256;
 // Q/K convolution columns are shared by heads h, h+16 and h+32. history_in
 // must not alias history: an owner block can finish before another block reads.
-__global__ void __launch_bounds__(gdn_threads)
-gdn_tokens(const float* state_in, const float* history_in, float* state, float* history,
-           const float* coefficients, const float* bias, const float* decay, const float* norm,
-           const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
-    const size_t head = blockIdx.x, t = threadIdx.x % 128, qk = head % 16;
+// (output null: the tokens' outputs are not kept, a replay's)
+__device__ __forceinline__ void
+gdn_tokens_head(size_t head, const float* state_in, const float* history_in, float* state, float* history,
+                const float* coefficients, const float* bias, const float* decay, const float* norm,
+                const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
+    const size_t t = threadIdx.x % 128, qk = head % 16;
     const bool low = threadIdx.x < 128;
     const unsigned first = low ? 0 : 64;
     const size_t columns[3] = {qk * 128 + t, 2048 + qk * 128 + t, 4096 + head * 128 + t};
@@ -224,7 +225,7 @@ gdn_tokens(const float* state_in, const float* history_in, float* state, float* 
             __syncthreads();
         }
         const size_t index = head * 128 + t;
-        if (low) output[token * 6144 + index] = result / sqrtf(sums[0] / 128.0f + 1e-6f) * norm[t] * hc_sigmoid(p[10240 + index]);
+        if (low && output) output[token * 6144 + index] = result / sqrtf(sums[0] / 128.0f + 1e-6f) * norm[t] * hc_sigmoid(p[10240 + index]);
         __syncthreads();
     }
     #pragma unroll
@@ -235,6 +236,13 @@ gdn_tokens(const float* state_in, const float* history_in, float* state, float* 
             if (c == 2 || head < 16)
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) history[i * 10240 + columns[c]] = window[c][i];
+}
+__global__ void __launch_bounds__(gdn_threads)
+gdn_tokens(const float* state_in, const float* history_in, float* state, float* history,
+           const float* coefficients, const float* bias, const float* decay, const float* norm,
+           const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
+    gdn_tokens_head(blockIdx.x, state_in, history_in, state, history, coefficients, bias, decay, norm, projections, stride, tokens,
+                    snapshot, output);
 }
 
 // Keep every head's old convolution window immutable until all blocks have read
