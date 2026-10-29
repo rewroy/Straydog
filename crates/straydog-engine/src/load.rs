@@ -113,8 +113,9 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
             return Err(format!("Straydog vector upload is not a whole tensor: {name}"));
         }
         let values = gpu::decode_vector(bytes, kind, weights.tensor(&name)?.elements() as usize, &name)?;
-        let floats: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-        group.backends[device].write(&upload, &floats)?;
+        let converted: Vec<u8> = if upload.quantize { crate::formats::quantize_q8_0(&values) }
+                                 else { values.iter().flat_map(|value| value.to_le_bytes()).collect() };
+        group.backends[device].write(&upload, &converted)?;
     }
     Ok(())
 }

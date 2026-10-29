@@ -38,7 +38,7 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
         if (i<4 || i>=4+attention) {
             const size_t slot=i<4 ? i : i-4-attention;
             rows=hc_rows[slot]; cols=hc_cols[slot];
-            if ((slot==0 && kinds[i]!=0) || (kinds[i]!=0 && kinds[i]!=1 && kinds[i]!=30))
+            if ((slot==0 && kinds[i]!=0) || (kinds[i]!=0 && kinds[i]!=1 && kinds[i]!=30 && !(kinds[i]==8 && (slot==1 || slot==2))))
                 throw std::runtime_error("invalid decoder HC type");
         } else {
             const size_t slot=i-4;

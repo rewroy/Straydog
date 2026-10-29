@@ -425,6 +425,17 @@ impl Model {
         Ok(Operand::bytes(format!("{name}:None"), data, kind, rows, cols))
     }
 
+    /// A HyperConnection's down or up projection: BF16 in the bundle, uploaded quantized to Q8_0 (half the bytes a decode
+    /// pass reads, a quarter of a row's; `STRAYDOG_HC_Q8=0` keeps it BF16).
+    fn hc_projection(&self, name: &str) -> Result<Operand<'_>> {
+        let operand = self.projection(name)?;
+        if !crate::weights::hc_quantized(name) || !operand.cols.is_multiple_of(32) {
+            return Ok(operand);
+        }
+        let Data::Bytes(bytes) = operand.data else { return Ok(operand) };
+        Ok(Operand { key: format!("{name}:q8"), data: Data::Quantize(bytes, operand.kind), kind: 8, rows: operand.rows, cols: operand.cols })
+    }
+
     /// A vector, uploaded decoded to F32.
     fn vector(&self, name: &str, key: Option<&str>) -> Result<Operand<'_>> {
         let key = key.map_or_else(|| format!("@vector:{name}"), str::to_string);
@@ -436,9 +447,10 @@ impl Model {
     /// A HyperConnection's norm (keyed by its prefix) and its down, up and inject projections.
     fn hc_operands(&self, prefix: &str) -> Result<Vec<Operand<'_>>> {
         let mut operands = vec![self.vector(&format!("{prefix}_norm.weight"), Some(&format!("@norm:{prefix}")))?];
-        for suffix in ["_down.weight", "_up.weight", "_inject.weight"] {
-            operands.push(self.projection(&format!("{prefix}{suffix}"))?);
+        for suffix in ["_down.weight", "_up.weight"] {
+            operands.push(self.hc_projection(&format!("{prefix}{suffix}"))?);
         }
+        operands.push(self.projection(&format!("{prefix}_inject.weight"))?);
         Ok(operands)
     }
 
@@ -451,8 +463,8 @@ impl Model {
     }
 
     fn head_operands(&self) -> Result<Vec<Operand<'_>>> {
-        Ok(vec![self.vector("output_hc_norm.weight", None)?, self.projection("output_hc_down.weight")?,
-                self.projection("output_hc_up.weight")?, self.projection("output.weight")?])
+        Ok(vec![self.vector("output_hc_norm.weight", None)?, self.hc_projection("output_hc_down.weight")?,
+                self.hc_projection("output_hc_up.weight")?, self.projection("output.weight")?])
     }
 
     /// The drafter's mixer before the shared vocabulary head.
@@ -472,7 +484,7 @@ impl Model {
         }
         let mut names = vec!["token_embd.weight".to_string()];
         for operand in &operands {
-            if let Data::Bytes(bytes) | Data::Decode(bytes, _) = operand.data {
+            if let Data::Bytes(bytes) | Data::Decode(bytes, _) | Data::Quantize(bytes, _) = operand.data {
                 let (file, offset) =
                     self.weights.locate(bytes.as_ptr(), bytes.len()).ok_or("Straydog operand is not mapped")?;
                 names.push(self.weights.tensor_at(file, offset)?.to_string());
@@ -553,8 +565,8 @@ impl Model {
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
-            std::mem::transmute(vec![self.projection("output.weight")?, self.projection("output_hc_down.weight")?,
-                                     self.projection("output_hc_up.weight")?])
+            std::mem::transmute(vec![self.projection("output.weight")?, self.hc_projection("output_hc_down.weight")?,
+                                     self.hc_projection("output_hc_up.weight")?])
         };
         self.group.pin(&head)?;
         self.cpu = Some(cpu);

@@ -458,7 +458,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 8192)
         _ if deepseek => None,
         _ if on_demand => Some(4096),
-        Some(total) => Some(if total >= 48 << 30 { 4096 } else { 1024 }),
+        // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048, 2026-10-29)
+        Some(total) => Some(if total >= 48 << 30 { 2048 } else { 1024 }),
         None => None,
     });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
@@ -706,7 +707,7 @@ mod tests {
         let settings = resolve(options).unwrap();
         assert_eq!((settings.vram.clone(), settings.port, settings.gpu.clone()), (Vram::Gib(vec![30.0]), 9100, vec![0, 1]));
         assert_eq!(settings.quant, "IQ3_S");
-        assert_eq!(settings.batch_size, Some(4096));   // 2 x 30 GiB of GPU budget
+        assert_eq!(settings.batch_size, Some(2048));   // 2 x 30 GiB of GPU budget
         assert_eq!(settings.ctx_size, 32768);
         assert_eq!(settings.state_ram, 2.0);     // what 32768 tokens of state need, rounded up
         assert_eq!(settings.alias, "Qwen3.8-Flash-Next-IQ3_S");

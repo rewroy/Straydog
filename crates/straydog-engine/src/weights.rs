@@ -74,6 +74,9 @@ impl Tensor {
     fn device_bytes(&self, name: &str) -> u64 {
         if self.dims.len() == 1 || name.ends_with("ssm_conv1d.weight") {
             self.bytes.max(self.elements() * 4)
+        } else if hc_quantized(name) && self.elements().is_multiple_of(32) {
+            // (a HyperConnection's down and up projections go up as Q8_0: see Model::hc_projection)
+            self.elements() / 32 * 34
         } else {
             self.bytes
         }
@@ -704,6 +707,13 @@ impl Weights {
         let kind = |role: &str| self.tensor(&format!("blk.{layer}.ffn_{role}_exps.weight")).map(|tensor| tensor.kind);
         Ok([kind("gate")?, kind("up")?, kind("down")?])
     }
+}
+
+/// Whether a tensor is a HyperConnection's down or up projection, uploaded quantized to Q8_0 (`STRAYDOG_HC_Q8=0`: as it is).
+pub fn hc_quantized(name: &str) -> bool {
+    (name.ends_with("hc_attn_down.weight") || name.ends_with("hc_attn_up.weight") || name.ends_with("hc_ffn_down.weight")
+     || name.ends_with("hc_ffn_up.weight") || name.ends_with("output_hc_down.weight") || name.ends_with("output_hc_up.weight"))
+        && std::env::var("STRAYDOG_HC_Q8").map_or(true, |value| value != "0")
 }
 
 /// The decoder layer a tensor belongs to; 48 for the rest (head, embeddings, MTP).
