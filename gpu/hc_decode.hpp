@@ -9,7 +9,17 @@ __device__ float hc_sigmoid(float x) {
 
 template<int kind>
 __device__ __forceinline__ void hc_load8(const uint8_t* row, size_t unit, float (&w)[8]) {
-    if (kind == 0) {
+    if constexpr (kind == 8) {
+        // Q8_0 (the weights quantized at load): a unit is a quarter of a 34-byte block, its scale the block's
+        const uint8_t* block = row + (unit / 4) * 34;
+        const float d = gemv_half(*reinterpret_cast<const uint16_t*>(block));
+        const uint16_t* q = reinterpret_cast<const uint16_t*>(block + 2 + (unit % 4) * 8);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint16_t pair = q[i];
+            w[2 * i] = d * float(int8_t(uint8_t(pair))); w[2 * i + 1] = d * float(int8_t(uint8_t(pair >> 8)));
+        }
+    } else if (kind == 0) {
         const float4 a = reinterpret_cast<const float4*>(row)[2 * unit], b = reinterpret_cast<const float4*>(row)[2 * unit + 1];
         w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
     } else {
@@ -137,7 +147,7 @@ __global__ void hc_decode_finish(Matrix up, bool has_inject, const float* partia
     }
 }
 
-// Supported weight kinds are F32, F16 and BF16 (validated by the caller).
+// Supported weight kinds are F32, F16, BF16 and (down and up) Q8_0 (validated by the caller).
 template<int down_kind, int V>
 void hc_decode_stage_one(Device& d, const Matrix& down, const Matrix& inject, bool has_inject,
                          const float* x, const float* norm, float* partial, float* inverse) {
@@ -160,11 +170,13 @@ void hc_decode_vectors(Device& d, const Matrix* matrices, bool has_inject, const
     switch (down.kind) {
         case 0: hc_decode_stage_one<0, V>(d, down, inject, has_inject, x, norm, partial, inverse); break;
         case 1: hc_decode_stage_one<1, V>(d, down, inject, has_inject, x, norm, partial, inverse); break;
+        case 8: hc_decode_stage_one<8, V>(d, down, inject, has_inject, x, norm, partial, inverse); break;
         default: hc_decode_stage_one<30, V>(d, down, inject, has_inject, x, norm, partial, inverse); break;
     }
     switch (up.kind) {
         case 0: hc_decode_finish<0, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
         case 1: hc_decode_finish<1, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
+        case 8: hc_decode_finish<8, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
         default: hc_decode_finish<30, V><<<320, 256, 0, d.stream>>>(up, has_inject, partial, inverse, x, norm, output, output_stride); break;
     }
     check(hipGetLastError());

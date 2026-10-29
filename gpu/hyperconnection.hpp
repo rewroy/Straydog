@@ -86,7 +86,7 @@ void hyperconnection(Device& d, void* const* pointers, const int* kinds, size_t 
     const size_t rows[4] = {1,320,10240,4}, cols[4] = {10240,10240,320,10240};
     Matrix matrices[4]{};
     for (size_t i = 0; i < (inject ? 4 : 3); ++i) {
-        if ((i == 0 && kinds[i] != 0) || (kinds[i] != 0 && kinds[i] != 1 && kinds[i] != 30))
+        if ((i == 0 && kinds[i] != 0) || (kinds[i] != 0 && kinds[i] != 1 && kinds[i] != 30 && !(kinds[i] == 8 && (i == 1 || i == 2))))
             throw std::runtime_error("invalid Straydog HyperConnection weight type");
         const size_t bytes = matrix_row_bytes(kinds[i], cols[i]);
         auto found = d.allocations.find(pointers[i]);

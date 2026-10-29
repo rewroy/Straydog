@@ -669,6 +669,15 @@ layer (§6.2).
   scale, staged once per block, and a unit's dots are exact in INT32 before scaling. A layer's
   qkv, gate, beta and alpha stay one launch: a block owns one matrix, and the BF16 ones read the
   F32 input. `STRAYDOG_Q8=0` keeps every projection on F32.
+- **HyperConnections in Q8_0.** The HyperConnections' down and up projections (BF16 in the bundle,
+  1.26 GB of the 5.2 GB a row reads) go up quantized to Q8_0 at load, as llama.cpp quantizes:
+  each 32 values' scale max |x| / 127. A decode pass reads half their bytes (plain decode
+  64.5 to 67.3 tok/s; a 1-row pass 16.8 to 16.2 ms at 20K, a 4-row one 27.2 to 26.5 ms), greedy
+  tokens part from the F32 run about as early as before, and 0.6 GB of VRAM comes free.
+  `STRAYDOG_HC_Q8=0` keeps them BF16.
+- **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 2048:
+  4096 rows took the first token of a 20K and a 60K prompt 7-12% longer (5.7 to 6.5 s, 15.8 to
+  17.2 s), so the derived batch for the resident models is 2048 where it was 4096.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 

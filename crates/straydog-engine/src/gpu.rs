@@ -49,6 +49,8 @@ fn pointer(result: *mut c_void) -> Result<*mut c_void> {
 pub enum Data<'a> {
     Bytes(&'a [u8]),
     Decode(&'a [u8], u32),
+    /// Weights of a GGML kind uploaded quantized to Q8_0 (the operand's kind 8).
+    Quantize(&'a [u8], u32),
     Described,
 }
 
@@ -60,6 +62,8 @@ pub struct Pending {
     pub source: *const u8,
     pub bytes: usize,
     pub decode: Option<u32>,
+    /// With `decode`: the decoded values quantized to Q8_0 rather than uploaded as F32.
+    pub quantize: bool,
 }
 
 // The source is only an address into the weights' mappings, never read through.
@@ -337,13 +341,17 @@ impl Backend {
         }
         let size = formats::matrix_bytes(operand.kind, operand.rows as usize, operand.cols as usize)
             .ok_or("unsupported Straydog GPU weight format")?;
-        let decoded;
+        let (decoded, quantized);
         let (data, decode): (&[u8], Option<u32>) = match &operand.data {
             Data::Bytes(bytes) => (bytes, None),
-            Data::Decode(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
+            Data::Decode(bytes, kind) | Data::Quantize(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
             Data::Decode(bytes, kind) => {
                 decoded = decode_vector(bytes, *kind, size / 4, &operand.key)?;
                 (float_bytes(&decoded), None)
+            }
+            Data::Quantize(bytes, kind) => {
+                quantized = formats::quantize_q8_0(&decode_vector(bytes, *kind, (operand.rows * operand.cols) as usize, &operand.key)?);
+                (&quantized[..], None)
             }
             Data::Described => return Err("Straydog operand has no data".into()),
         };
@@ -355,10 +363,11 @@ impl Backend {
             return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
         }
         let device = match (&mut self.deferred, &operand.data) {
-            (Some(pending), Data::Bytes(_) | Data::Decode(..)) => {
+            (Some(pending), Data::Bytes(_) | Data::Decode(..) | Data::Quantize(..)) => {
                 // SAFETY: a plain size; the bytes arrive through `fill` or `write`.
                 let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
-                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode });
+                let quantize = matches!(operand.data, Data::Quantize(..));
+                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode, quantize });
                 device
             }
             // SAFETY: the bytes are valid for their length; the library copies them.

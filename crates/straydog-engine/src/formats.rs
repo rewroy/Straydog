@@ -76,6 +76,44 @@ pub fn f16_to_f32(half: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// The nearest F16 (round to nearest even) of a finite F32 in F16's range.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if exponent <= 0 {
+        // subnormal (or zero): the implicit one shifted in, rounded to nearest even
+        if exponent < -10 {
+            return sign;
+        }
+        let full = mantissa | 0x80_0000;
+        let shift = (14 - exponent) as u32;
+        let (kept, rest, half) = (full >> shift, full & ((1 << shift) - 1), 1 << (shift - 1));
+        return sign | (kept + u32::from(rest > half || (rest == half && kept & 1 == 1))) as u16;
+    }
+    let (kept, rest) = (mantissa >> 13, mantissa & 0x1fff);
+    let rounded = ((exponent as u32) << 10 | kept) + u32::from(rest > 0x1000 || (rest == 0x1000 && kept & 1 == 1));
+    sign | rounded as u16
+}
+
+/// Q8_0 blocks of `values` (a multiple of 32), as llama.cpp's quantize_row_q8_0_ref makes them: each
+/// 32 values' scale d = max |x| / 127 (as F16), and round(x / d).
+pub fn quantize_q8_0(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() / 32 * 34);
+    for group in values.chunks_exact(32) {
+        let top = group.iter().fold(0f32, |top, value| top.max(value.abs()));
+        let d = top / 127.0;
+        let inverse = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend(group.iter().map(|value| (value * inverse).round() as i8 as u8));
+    }
+    out
+}
+
 fn half(data: &[u8], at: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([data[at], data[at + 1]]))
 }
