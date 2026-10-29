@@ -425,11 +425,13 @@ impl Model {
         Ok(Operand::bytes(format!("{name}:None"), data, kind, rows, cols))
     }
 
-    /// A HyperConnection's down or up projection: BF16 in the bundle, uploaded quantized to Q8_0 (half the bytes a decode
-    /// pass reads, a quarter of a row's; `STRAYDOG_HC_Q8=0` keeps it BF16).
-    fn hc_projection(&self, name: &str) -> Result<Operand<'_>> {
+    /// A projection uploaded quantized to Q8_0 when it is a HyperConnection's down or up (BF16 in the bundle: half the bytes a
+    /// decode pass reads, a quarter of a row's; `STRAYDOG_HC_Q8=0` keeps it BF16) or a float matrix of the drafter's
+    /// (crate::weights::drafter_quantized); as it is otherwise.
+    fn q8_projection(&self, name: &str) -> Result<Operand<'_>> {
         let operand = self.projection(name)?;
-        if !crate::weights::hc_quantized(name) || !operand.cols.is_multiple_of(32) {
+        let float = matches!(operand.kind, 0 | 1 | 30);
+        if !(crate::weights::hc_quantized(name) || crate::weights::drafter_quantized(name) && float) || !operand.cols.is_multiple_of(32) {
             return Ok(operand);
         }
         let Data::Bytes(bytes) = operand.data else { return Ok(operand) };
@@ -444,11 +446,22 @@ impl Model {
         Ok(Operand { key, data: Data::Decode(data, kind), kind: 0, rows: rows as u64, cols: cols as u64 })
     }
 
+    /// A MoE's shared-expert mix as a one-row matrix of its own bytes (BF16): a decode row's router and mix are then one launch of
+    /// one kind, where an F32 mix took a launch of its own.
+    fn mix_row(&self, name: &str) -> Result<Operand<'_>> {
+        let (rows, cols) = self.weights.vector_shape(name)?;
+        let (data, kind) = self.weights.raw(name, 0, None)?;
+        if rows != 1 || kind != 30 {
+            return self.vector(name, Some(&format!("{name}:vector")));
+        }
+        Ok(Operand::bytes(format!("{name}:row"), data, kind, 1, cols as u64))
+    }
+
     /// A HyperConnection's norm (keyed by its prefix) and its down, up and inject projections.
     fn hc_operands(&self, prefix: &str) -> Result<Vec<Operand<'_>>> {
         let mut operands = vec![self.vector(&format!("{prefix}_norm.weight"), Some(&format!("@norm:{prefix}")))?];
         for suffix in ["_down.weight", "_up.weight"] {
-            operands.push(self.hc_projection(&format!("{prefix}{suffix}"))?);
+            operands.push(self.q8_projection(&format!("{prefix}{suffix}"))?);
         }
         operands.push(self.projection(&format!("{prefix}_inject.weight"))?);
         Ok(operands)
@@ -463,14 +476,14 @@ impl Model {
     }
 
     fn head_operands(&self) -> Result<Vec<Operand<'_>>> {
-        Ok(vec![self.vector("output_hc_norm.weight", None)?, self.hc_projection("output_hc_down.weight")?,
-                self.hc_projection("output_hc_up.weight")?, self.projection("output.weight")?])
+        Ok(vec![self.vector("output_hc_norm.weight", None)?, self.q8_projection("output_hc_down.weight")?,
+                self.q8_projection("output_hc_up.weight")?, self.projection("output.weight")?])
     }
 
     /// The drafter's mixer before the shared vocabulary head.
     fn mtp_head_operands(&self) -> Result<Vec<Operand<'_>>> {
-        Ok(vec![self.vector("mtp.hc_out_norm.weight", None)?, self.projection("mtp.hc_out_down.weight")?,
-                self.projection("mtp.hc_out_up.weight")?, self.projection("output.weight")?])
+        Ok(vec![self.vector("mtp.hc_out_norm.weight", None)?, self.q8_projection("mtp.hc_out_down.weight")?,
+                self.q8_projection("mtp.hc_out_up.weight")?, self.projection("output.weight")?])
     }
 
     /// The tensors behind operands the passes upload at first use (the PLE, the head's mixers,
@@ -519,11 +532,10 @@ impl Model {
                 operands.push(Operand::bytes(format!("{name}:bank"), data, kind, rows * experts, cols));
             }
             for role in ["gate", "up", "down"] {
-                operands.push(self.projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
+                operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
             }
             operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
-            let name = format!("{prefix}ffn_gate_inp_shexp.weight");
-            operands.push(self.vector(&name, Some(&format!("{name}:vector")))?);
+            operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
             // SAFETY of the borrow: operands point into the weights, which outlive the group.
             let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(operands) };
             self.group.register_resident_moe(&prefix, &operands, 512)?;
@@ -565,8 +577,8 @@ impl Model {
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
-            std::mem::transmute(vec![self.projection("output.weight")?, self.hc_projection("output_hc_down.weight")?,
-                                     self.hc_projection("output_hc_up.weight")?])
+            std::mem::transmute(vec![self.projection("output.weight")?, self.q8_projection("output_hc_down.weight")?,
+                                     self.q8_projection("output_hc_up.weight")?])
         };
         self.group.pin(&head)?;
         self.cpu = Some(cpu);
@@ -655,7 +667,7 @@ impl Model {
                  &["attn_q_norm.weight", "attn_k_norm.weight", "indexer.q_norm.weight", "indexer.k_norm.weight"])
             };
             for name in names {
-                operands.push(self.projection(&format!("{prefix}{name}"))?);
+                operands.push(self.q8_projection(&format!("{prefix}{name}"))?);
             }
             for name in norms {
                 operands.push(self.vector(&format!("{prefix}{name}"), None)?);
@@ -1217,8 +1229,8 @@ impl Model {
     }
 
     fn mtp_operands(&self) -> Result<Vec<Operand<'_>>> {
-        Ok(vec![self.vector("mtp.embed_norm.weight", None)?, self.projection("mtp.fc_embedding.weight")?,
-                self.vector("mtp.hidden_norm.weight", None)?, self.projection("mtp.fc_hidden.weight")?])
+        Ok(vec![self.vector("mtp.embed_norm.weight", None)?, self.q8_projection("mtp.fc_embedding.weight")?,
+                self.vector("mtp.hidden_norm.weight", None)?, self.q8_projection("mtp.fc_hidden.weight")?])
     }
 
     fn mtp_prologue(&mut self, embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {

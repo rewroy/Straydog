@@ -515,6 +515,8 @@ struct Device {
     std::unordered_map<std::string,CachedGraph> graphs;
     std::unordered_map<void*,std::unique_ptr<ResidentMoe>> resident;
     std::unordered_map<size_t,DecoderLayer> decoder;
+    // A span's DeltaNet replay list (verify_span.hpp's GdnReplay entries) by (begin, end): its host bytes and its device copy.
+    std::map<std::pair<size_t,size_t>,std::pair<std::vector<uint8_t>,void*>> gdn_replays;
     std::unordered_map<void*,ExchangeArea> exchanges;   // host exchanges by host address (sd_exchange)
     uint64_t graph_replays=0;
     ExpertSlots slots;

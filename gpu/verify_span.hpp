@@ -135,6 +135,42 @@ void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t st
     else check(hipStreamSynchronize(d.stream));
 }
 
+// A verification's replay of the kept tokens for every DeltaNet layer of a span in one launch (blockIdx.y a layer): each
+// from its snapshot over its saved projections into its states, gdn_tokens' arithmetic. (A launch a layer cost the
+// span ~18 us a layer, ahead of the drafting on the device that runs the MTP layer.)
+struct GdnReplay {
+    const float* snapshot; float* state; float* history;
+    const float* coefficients; const float* bias; const float* decay; const float* norm; const float* projections;
+};
+__global__ void __launch_bounds__(gdn_threads) gdn_replay_layers(const GdnReplay* layers, size_t tokens) {
+    const GdnReplay& l = layers[blockIdx.y];
+    gdn_tokens_head(blockIdx.x, l.snapshot + 4 * 10240, l.snapshot, l.state, l.history, l.coefficients, l.bias, l.decay, l.norm,
+                    l.projections, verify_projection, tokens, nullptr, nullptr);
+}
+void gdn_replay_span(Device& d, size_t begin, size_t end, size_t kept) {
+    std::vector<GdnReplay> layers;
+    for (size_t layer = begin; layer < end; ++layer) {
+        if (!decoder_linear(layer)) continue;
+        const DecoderLayer& plan = d.decoder.find(layer)->second;
+        void* const* p = plan.pointers.data() + 4;
+        layers.push_back({plan.snapshot, static_cast<float*>(plan.states[1]), static_cast<float*>(plan.states[0]),
+                          static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
+                          static_cast<const float*>(p[8]), plan.projections});
+    }
+    if (layers.empty()) return;
+    // (the list is the same pointers at every commit of the span: uploaded once, again only if a layer was registered anew)
+    const auto* bytes = reinterpret_cast<const uint8_t*>(layers.data());
+    const std::vector<uint8_t> host(bytes, bytes + layers.size() * sizeof(GdnReplay));
+    auto& cached = d.gdn_replays[{begin, end}];
+    if (cached.first != host) {
+        if (cached.second && cached.first.size() < host.size()) cached.second = nullptr;
+        if (!cached.second) cached.second = allocate(d, host.size());
+        upload(d, cached.second, host.data(), host.size());
+        cached.first = host;
+    }
+    gdn_replay_layers<<<dim3(48, unsigned(layers.size())), gdn_threads, 0, d.stream>>>(static_cast<const GdnReplay*>(cached.second), kept);
+}
+
 // Keep the first `kept` verified tokens: DeltaNet layers restore their snapshot and
 // replay those tokens; everything else already holds causal state.
 void verify_commit(Device& d, size_t begin, size_t end, size_t kept) {
@@ -148,10 +184,7 @@ void verify_commit(Device& d, size_t begin, size_t end, size_t kept) {
     }
     if (kept > steps) throw std::runtime_error("invalid speculative commit");
     if (kept < steps) {
-        for (size_t layer = begin; layer < end; ++layer) {
-            if (!decoder_linear(layer)) continue;
-            gdn_verify(d, d.decoder.find(layer)->second, kept, true, d.output);
-        }
+        gdn_replay_span(d, begin, end, kept);
         // (queued, not waited for: the stream orders the replay before every later use of the state, and nothing reads it here)
         check(hipGetLastError());
     }

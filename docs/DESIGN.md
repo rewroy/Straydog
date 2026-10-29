@@ -678,6 +678,14 @@ layer (§6.2).
 - **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 2048:
   4096 rows took the first token of a 20K and a 60K prompt 7-12% longer (5.7 to 6.5 s, 15.8 to
   17.2 s), so the derived batch for the resident models is 2048 where it was 4096.
+- **Fewer, fuller launches in a pass** (from a kernel trace at 20K). Every Q8 unit of Q4_K, Q6_K and IQ4_XS is
+  staged with Q5_K's pad: a row's lanes read its units 128 or 64 bytes apart, on the same LDS banks, so four
+  vectors took twice one's time (a 2560 x 6144 Q6_K out projection 50 to 29 us at four rows). The shared
+  expert's mix goes up as the BF16 row it is, one launch with the router. The rows to the helper and its
+  flag are one single-block kernel. A partial acceptance replays every DeltaNet layer of a span in one
+  launch (a launch a layer was ~330 us ahead of the drafting). The drafter's dense projections but its
+  router (BF16, a fifth of a draft step) go up as Q8_0, as the HyperConnections do; only the drafts
+  depend on them. A pass at 20K: 1 row 16.1 to 15.4 ms, 4 rows 26.5 to 24.3.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
