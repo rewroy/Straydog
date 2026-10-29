@@ -46,86 +46,83 @@ void qsa_decode_attend(Device& d,void* const* pointers,void* kv,void* index,void
 // token's. Row r's projections are at projections + r * stride (qgate | key | value | index query |
 // index key), its attended values go to attended + r * 6144; the normalized queries, keys and the
 // selections are in d.input in the layout of `steps` rows.
-template<int P=1>
-__global__ void qsa_normalize_rows(float* projections,size_t stride,const float* qnorm,const float* knorm,const float* iqnorm,
-                                   float* target,size_t steps,const uint32_t* positions) {
-    using H=QwenHeads<P>;
-    constexpr size_t keys=H::query*512, index=keys+H::kv*512;
-    const size_t block=blockIdx.x,row=blockIdx.y,pos=positions[row];
-    float* own=projections+row*stride;
-    if (block<H::query) qsa_normalize_block(own,qnorm,block,256,512,pos,target+row*H::query*256,256);
-    else if (block<H::query+H::kv)
-        qsa_normalize_block(own+keys,knorm,block-H::query,256,256,pos,target+steps*H::query*256+row*H::kv*256,256);
-    else qsa_normalize_block(own+index,iqnorm,block-H::query-H::kv,128,128,pos,own+index,128);
-}
-// qsa_pool_one for each row in turn (a row completes a block from the history the rows before it wrote).
-__global__ void qsa_pool_rows(const float* incoming,size_t stride,const float* norm,size_t pool,const uint32_t* positions,
-                              size_t steps,float* blocks,float* history) {
+// qsa_pool_one for each row in turn (a row completes a block from the history the rows before it wrote), by a block of 256 threads
+// (columns 0..127 work; every thread passes the barriers).
+__device__ void qsa_pool_rows_block(const float* incoming,size_t stride,const float* norm,size_t pool,const uint32_t* positions,
+                                    size_t steps,float* blocks,float* history) {
     const size_t column=threadIdx.x;
+    const bool own=column<128;
     __shared__ float values[128],sums[128];
     for (size_t row=0;row<steps;++row) {
         const size_t pos=positions[row];
-        history[(pos%qsa_history)*128+column]=incoming[row*stride+column];
+        if (own) history[(pos%qsa_history)*128+column]=incoming[row*stride+column];
         if ((pos+1)%4==0) {
             float x=0;
-            for (size_t tap=0;tap<4;++tap) x+=history[((pos-3+tap)%qsa_history)*128+column];
-            x/=4.0f;
-            values[column]=x*norm[column]; sums[column]=x*x;
+            if (own) {
+                for (size_t tap=0;tap<4;++tap) x+=history[((pos-3+tap)%qsa_history)*128+column];
+                x/=4.0f;
+                values[column]=x*norm[column]; sums[column]=x*x;
+            }
             __syncthreads();
             for (unsigned offset=64;offset;offset/=2) {
                 if (column<offset) sums[column]+=sums[column+offset];
                 __syncthreads();
             }
-            const float denominator=sqrtf(sums[0]/128.0f+1e-6f);
-            const float own=values[column]/denominator;
-            const float partner=column<64 ? values[(column+32)%64]/denominator : 0;
-            blocks[column*pool+pos/4]=qsa_rope(own,partner,column,pos-3);
+            if (own) {
+                const float denominator=sqrtf(sums[0]/128.0f+1e-6f);
+                const float value=values[column]/denominator;
+                const float partner=column<64 ? values[(column+32)%64]/denominator : 0;
+                blocks[column*pool+pos/4]=qsa_rope(value,partner,column,pos-3);
+            }
         }
         __syncthreads();
     }
 }
-// write_attention_kv for each row: its key from the normalized keys, its value from the projections.
+// A verification's rows' normalization (queries, keys and index queries, a block a head and row), their keys and values written to
+// the K/V (and its mirror) by the keys' blocks as write_attention_kv did, and the index keys pooled (qsa_pool_one for each row in
+// turn) by one more block: three launches in one, the same values.
 template<int P=1>
-__global__ void write_attention_kv_rows(float* state,size_t context,size_t steps,const float* keys,const float* values,
-                                        size_t value_stride,const uint32_t* positions,float* mirror,size_t mirror_rows) {
-    constexpr size_t K=QwenHeads<P>::kv,width=K*256;
-    const size_t index=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    if (index>=steps*width) return;
-    const size_t step=index/width,head=(index%width)/256,column=index%256,pos=positions[step];
-    const float value=values[step*value_stride+index%width];
-    state[(head*context+pos)*256+column]=keys[index];
-    state[context*width+(head*context+pos)*256+column]=value;
-    if (pos<mirror_rows) {
-        mirror[(head*mirror_rows+pos)*256+column]=keys[index];
-        mirror[((K+head)*mirror_rows+pos)*256+column]=value;
+__global__ void qsa_normalize_rows(float* projections,size_t stride,const float* qnorm,const float* knorm,const float* iqnorm,
+                                   float* target,size_t steps,const uint32_t* positions,float* state,size_t context,float* mirror,
+                                   size_t mirror_rows,const float* pool_norm,size_t pool,float* blocks,float* history) {
+    using H=QwenHeads<P>;
+    constexpr size_t keys=H::query*512, values=keys+H::kv*256, index=keys+H::kv*512;
+    const size_t block=blockIdx.x,row=blockIdx.y,pos=positions[row];
+    float* own=projections+row*stride;
+    if (block<H::query) qsa_normalize_block(own,qnorm,block,256,512,pos,target+row*H::query*256,256);
+    else if (block<H::query+H::kv) {
+        const size_t head=block-H::query,column=threadIdx.x;
+        float* normalized=target+steps*H::query*256+row*H::kv*256;
+        qsa_normalize_block(own+keys,knorm,head,256,256,pos,normalized,256);
+        constexpr size_t width=H::kv*256;
+        const float key=normalized[head*256+column], value=own[values+head*256+column];
+        state[(head*context+pos)*256+column]=key;
+        state[context*width+(head*context+pos)*256+column]=value;
+        if (pos<mirror_rows) {
+            mirror[(head*mirror_rows+pos)*256+column]=key;
+            mirror[((H::kv+head)*mirror_rows+pos)*256+column]=value;
+        }
     }
-}
-// (gridDim.x * 256 values a row: QwenHeads<P>::query heads)
-__global__ void qsa_gate_rows(float* attended,const float* query_gates,size_t stride) {
-    const size_t row=blockIdx.y,i=size_t(blockIdx.x)*256+threadIdx.x,width=size_t(gridDim.x)*256;
-    attended[row*width+i]*=hc_sigmoid(query_gates[row*stride+(i/256)*512+256+i%256]);
+    else if (block<H::query+H::kv+4) qsa_normalize_block(own+index,iqnorm,block-H::query-H::kv,128,128,pos,own+index,128);
+    else if (row==0) qsa_pool_rows_block(projections+index+512,stride,pool_norm,pool,positions,steps,blocks,history);
 }
 // P: the layer's part's heads (QwenHeads), its projections a row (qgate | key | value | index query | index key) and K/V.
 template<int P=1>
 void qsa_decode_attend_rows(Device& d,void* const* pointers,void* kv,void* index,void* scratch,size_t context,
                             const uint32_t* positions,float* projections,size_t stride,float* attended,size_t steps) {
     using H=QwenHeads<P>;
-    constexpr size_t selected=2052,values=H::query*512+H::kv*256,queries=values+H::kv*256;
-    qsa_normalize_rows<P><<<dim3(unsigned(H::query+H::kv+4),unsigned(steps)),256,0,d.stream>>>(projections,stride,
-        static_cast<const float*>(pointers[6]),static_cast<const float*>(pointers[7]),static_cast<const float*>(pointers[8]),d.input,
-        steps,positions);
+    constexpr size_t selected=2052,queries=H::query*512+H::kv*512;
     const size_t pool=context/4+1;
     auto* blocks=static_cast<float*>(index);
-    qsa_pool_rows<<<1,128,0,d.stream>>>(projections+queries+512,stride,static_cast<const float*>(pointers[9]),pool,positions,steps,
-                                        blocks,blocks+pool*128);
+    const KvView view=kv_decode_view(d,kv,context);
+    qsa_normalize_rows<P><<<dim3(unsigned(H::query+H::kv+5),unsigned(steps)),256,0,d.stream>>>(projections,stride,
+        static_cast<const float*>(pointers[6]),static_cast<const float*>(pointers[7]),static_cast<const float*>(pointers[8]),d.input,
+        steps,positions,static_cast<float*>(kv),context,view.mirror,view.mirror_rows,static_cast<const float*>(pointers[9]),pool,
+        blocks,blocks+pool*128);
     qsa_block_scores<<<dim3(unsigned((pool+255)/256),unsigned(steps)),256,0,d.stream>>>(projections+queries,blocks,pool,0,steps,
         static_cast<float*>(scratch),positions,stride);
     qsa_select_rows<1024,P><<<unsigned(steps),1024,0,d.stream>>>(static_cast<float*>(scratch),pool,0,steps,selected,d.input,positions);
-    const KvView view=kv_decode_view(d,kv,context);
-    write_attention_kv_rows<P><<<unsigned((steps*H::kv*256+255)/256),256,0,d.stream>>>(static_cast<float*>(kv),context,steps,
-        d.input+steps*H::query*256,projections+values,stride,positions,view.mirror,view.mirror_rows);
-    qsa_attention_rows<P>(d,kv,context,steps,selected,d.input,attended,positions,view.mirror,view.mirror_rows);
-    qsa_gate_rows<<<dim3(unsigned(H::query),unsigned(steps)),256,0,d.stream>>>(attended,projections,stride);
+    qsa_attention_rows<P>(d,kv,context,steps,selected,d.input,attended,positions,view.mirror,view.mirror_rows,projections,stride);
 }
 void qsa_operands(void* const* pointers,const int* kinds,Matrix (&matrices)[6]) {
     const size_t rows[6]={12288,512,512,512,128,2560},cols[6]={2560,2560,2560,2560,2560,6144};
