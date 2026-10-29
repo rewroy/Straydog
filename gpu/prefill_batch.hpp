@@ -64,19 +64,21 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
     check(hipGetLastError());
 }
 
-// Scratch: qkv 10240 + gate 6144 + beta 48 + alpha 48 + post 6144 + half 3072 floats per row.
+// Scratch: qkv 10240 + gate 6144 + beta 48 + alpha 48 + post 6144 + half 3072 floats per row (a part's, QwenHeads<P>, fewer).
 constexpr size_t gdn_batch_floats = 10240 + 6144 + 96 + 6144 + 3072;
+template<int P = 1>
 void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv, void* recurrent, size_t steps,
                  size_t chunk, const float* mixed, float* branch, float* scratch) {
-    const Matrix qkv_weights = batch_matrix(pointers, kinds, 0, 10240, 2560), gate_weights = batch_matrix(pointers, kinds, 1, 6144, 2560);
-    const Matrix beta_weights = batch_matrix(pointers, kinds, 2, 48, 2560), alpha_weights = batch_matrix(pointers, kinds, 3, 48, 2560);
-    const Matrix output_weights = batch_matrix(pointers, kinds, 4, 2560, 6144);
+    using H = QwenHeads<P>;
+    const Matrix qkv_weights = batch_matrix(pointers, kinds, 0, H::channels, 2560), gate_weights = batch_matrix(pointers, kinds, 1, H::gate, 2560);
+    const Matrix beta_weights = batch_matrix(pointers, kinds, 2, H::value, 2560), alpha_weights = batch_matrix(pointers, kinds, 3, H::value, 2560);
+    const Matrix output_weights = batch_matrix(pointers, kinds, 4, 2560, H::gate);
     float* qkv = scratch;
-    float* gate = qkv + steps * 10240;
-    float* beta = gate + steps * 6144;
-    float* alpha = beta + steps * 48;
-    float* post = alpha + steps * 48;
-    auto* half = reinterpret_cast<__half*>(post + steps * 6144);
+    float* gate = qkv + steps * H::channels;
+    float* beta = gate + steps * H::gate;
+    float* alpha = beta + steps * H::value;
+    float* post = alpha + steps * H::value;
+    auto* half = reinterpret_cast<__half*>(post + steps * H::gate);
     const bool cast = batch_half(d, steps);
     if (cast) batch_cast(d, mixed, half, steps * 2560);
     batch_project(d, qkv_weights, steps, mixed, half, qkv);
@@ -85,37 +87,43 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     batch_project(d, alpha_weights, steps, mixed, half, alpha);
     for (size_t first = 0; first < steps; first += chunk) {
         const size_t count = std::min(chunk, steps - first);
-        float* rows = qkv + first * 10240;
-        gdn_conv<<<40, 256, 0, d.stream>>>(rows, static_cast<float*>(conv), static_cast<const float*>(pointers[5]), count);
-        gdn_normalize_qk<<<unsigned(count * 16), 128, 0, d.stream>>>(rows, count, d.input);
-        gdn_pack_values<<<unsigned((count * 6144 + 255) / 256), 256, 0, d.stream>>>(rows, beta + first * 48, alpha + first * 48,
-            static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
+        float* rows = qkv + first * H::channels;
+        // (the runs' edges in the packed values' scratch, d.input, before the chunk's values are packed there)
+        const unsigned columns = unsigned((H::channels + 255) / 256), runs = unsigned((count + gdn_conv_run - 1) / gdn_conv_run);
+        gdn_conv_edges<P><<<columns, 256, 0, d.stream>>>(rows, static_cast<float*>(conv), count, d.input);
+        gdn_conv_runs<P><<<dim3(columns, runs), 256, 0, d.stream>>>(rows, d.input, static_cast<const float*>(pointers[5]), count);
+        gdn_normalize_qk<P><<<unsigned(count * H::key), 128, 0, d.stream>>>(rows, count, d.input);
+        gdn_pack_values<P><<<unsigned((count * H::gate + 255) / 256), 256, 0, d.stream>>>(rows, beta + first * H::value,
+            alpha + first * H::value, static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
         // Every qkv row of this chunk is packed before the recurrence overwrites the chunk's rows.
         if (d.rdna4 && count > 1)
-            delta_split_sequence<<<48, 1024, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
-        else delta_register_sequence<<<48, 128, 0, d.stream>>>(static_cast<float*>(recurrent), 48, count, d.input, rows);
-        gdn_post<<<unsigned(count * 48), 128, 0, d.stream>>>(rows, gate + first * 6144, static_cast<const float*>(pointers[8]),
-            post + first * 6144);
+            delta_split_sequence<P><<<unsigned(H::value), 1024, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
+        else delta_register_sequence<<<unsigned(H::value), 128, 0, d.stream>>>(static_cast<float*>(recurrent), H::value, count, d.input, rows);
+        gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
+            post + first * H::gate);
     }
-    if (cast) batch_cast(d, post, half, steps * 6144);
+    if (cast) batch_cast(d, post, half, steps * H::gate);
     batch_project(d, output_weights, steps, post, half, branch);
     check(hipGetLastError());
 }
 
-// Scratch: q/gate 12288 + k/v/index-q 1536 + index-k 128 + attended 6144 + half 3072 floats per row.
+// Scratch: q/gate 12288 + k/v/index-q 1536 + index-k 128 + attended 6144 + half 3072 floats per row (a part's fewer).
 constexpr size_t qsa_batch_floats = 12288 + 1536 + 128 + 6144 + 3072;
+template<int P = 1>
 void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_state, void* index_state, void* scores,
                  size_t context, size_t base, size_t steps, const float* mixed, float* branch, float* scratch) {
-    const size_t rows[6] = {12288, 512, 512, 512, 128, 2560}, cols[6] = {2560, 2560, 2560, 2560, 2560, 6144};
+    using H = QwenHeads<P>;
+    constexpr size_t Q = H::query * 256, K = H::kv * 256;   // a row's attended values (and query rows), its keys
+    const size_t rows[6] = {2 * Q, K, K, 512, 128, 2560}, cols[6] = {2560, 2560, 2560, 2560, 2560, Q};
     Matrix matrices[6];
     for (size_t i = 0; i < 6; ++i) matrices[i] = batch_matrix(pointers, kinds, i, rows[i], cols[i]);
     float* qgate = scratch;
-    float* key = qgate + steps * 12288;
-    float* value = key + steps * 512;
-    float* iq = value + steps * 512;
+    float* key = qgate + steps * 2 * Q;
+    float* value = key + steps * K;
+    float* iq = value + steps * K;
     float* ik = iq + steps * 512;
     float* attended = ik + steps * 128;
-    auto* half = reinterpret_cast<__half*>(attended + steps * 6144);
+    auto* half = reinterpret_cast<__half*>(attended + steps * Q);
     float* targets[5] = {qgate, key, value, iq, ik};
     const bool cast = batch_half(d, steps);
     if (cast) batch_cast(d, mixed, half, steps * 2560);
@@ -143,36 +151,39 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         for (size_t first = span; first < span + span_rows; first += 256) {
             const size_t count = std::min<size_t>(256, span + span_rows - first), position = base + first;
             const size_t selected = std::min(position + count, size_t(2052));
-            float* chunk_q = qgate + first * 12288;
+            float* chunk_q = qgate + first * 2 * Q;
             float* chunk_iq = iq + first * 512;
             float* chunk_ik = ik + first * 128;
-            qsa_normalize<<<unsigned(count * 24), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), 24, 256, 512, position, d.input);
-            qsa_normalize<<<unsigned(count * 2), 256, 0, d.stream>>>(key + first * 512, static_cast<const float*>(pointers[7]), 2, 256, 256, position,
-                d.input + count * 6144);
-            check(hipMemcpyAsync(d.input + count * (6144 + 512), value + first * 512, count * 512 * 4, hipMemcpyDeviceToDevice, d.stream));
+            qsa_normalize<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
+                512, position, d.input);
+            qsa_normalize<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
+                256, 256, position, d.input + count * Q);
+            check(hipMemcpyAsync(d.input + count * (Q + K), value + first * K, count * K * 4, hipMemcpyDeviceToDevice, d.stream));
             qsa_normalize<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, position, chunk_iq);
             const size_t completed = (position + count) / 4 - position / 4;
             if (completed)
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
-            qsa_index_chunk(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
-            write_attention_kv<<<unsigned((count * 512 + 255) / 256), 256, 0, d.stream>>>(kv.kv, kv.capacity, position, count, d.input, nullptr, nullptr, kv.mirror, kv.mirror_rows);
+            qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
+            write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(kv.kv, kv.capacity, position, count, d.input,
+                nullptr, nullptr, kv.mirror, kv.mirror_rows);
             if (batched) {
-                cast_half<<<unsigned((count * 6144 + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * 6144, count * 6144);
-                qsa_mark_blocks<<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
-            } else qsa_attention(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * 6144, nullptr, kv.mirror, kv.mirror_rows);
+                cast_half<<<unsigned((count * Q + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * Q, count * Q);
+                qsa_mark_blocks<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
+            } else qsa_attention<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q, nullptr, kv.mirror,
+                                    kv.mirror_rows);
         }
 #if defined(__HIPCC__)
         if (batched) {
             qsa_union_blocks<<<unsigned(groups), 256, 0, d.stream>>>(marks, stride, base + span, span_rows, union_blocks, union_masks, union_counts);
-            qsa_flash_wmma<<<dim3(unsigned(groups), 2), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity, base + span, span_rows,
-                half + span * 6144, union_blocks, union_masks, union_counts, attended + span * 6144);
+            qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
+                base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
         }
 #endif
         kv_after_prefill(d, kv, kv_state, context, base + span, span_rows);
     }
-    qsa_gate<<<unsigned((steps * 6144 + 255) / 256), 256, 0, d.stream>>>(attended, qgate, steps * 6144);
-    if (cast) batch_cast(d, attended, half, steps * 6144);
+    qsa_gate<<<unsigned((steps * Q + 255) / 256), 256, 0, d.stream>>>(attended, qgate, steps * Q);
+    if (cast) batch_cast(d, attended, half, steps * Q);
     batch_project(d, matrices[5], steps, attended, half, branch);
     check(hipGetLastError());
 }

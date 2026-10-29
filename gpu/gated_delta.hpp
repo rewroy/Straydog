@@ -1,22 +1,58 @@
 // Independently authored Qwen Gated DeltaNet: fixed geometry, persistent state.
+template<int P = 1>
 __global__ void gdn_conv(float* qkv, float* history, const float* coefficients, size_t steps) {
+    constexpr size_t C = QwenHeads<P>::channels;
     const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x;
-    if (column >= 10240) return;
-    float a = history[column], b = history[10240+column];
-    float c = history[20480+column], d = history[30720+column];
+    if (column >= C) return;
+    float a = history[column], b = history[C+column];
+    float c = history[2*C+column], d = history[3*C+column];
     for (size_t token = 0; token < steps; ++token) {
-        a=b; b=c; c=d; d=qkv[token*10240+column];
+        a=b; b=c; c=d; d=qkv[token*C+column];
         float value = a*coefficients[column*4] + b*coefficients[column*4+1];
         value += c*coefficients[column*4+2]; value += d*coefficients[column*4+3];
-        qkv[token*10240+column] = value * hc_sigmoid(value);
+        qkv[token*C+column] = value * hc_sigmoid(value);
     }
-    history[column]=a; history[10240+column]=b; history[20480+column]=c; history[30720+column]=d;
+    history[column]=a; history[C+column]=b; history[2*C+column]=c; history[3*C+column]=d;
 }
 
+// gdn_conv over runs of a chunk's rows at once (its arithmetic, the same windows): first the inputs before each run of
+// gdn_conv_run rows (the history's for the first) set aside in `edges` and the history moved on to the chunk's last inputs,
+// then a thread a column and run. (gdn_conv walked a chunk's rows one after the other: 20 or 40 blocks, 0.65 s of a 60K prompt.)
+constexpr size_t gdn_conv_run = 32;
+template<int P = 1>
+__global__ void gdn_conv_edges(const float* qkv, float* history, size_t steps, float* edges) {
+    constexpr size_t C = QwenHeads<P>::channels;
+    const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (column >= C) return;
+    const float old[4] = {history[column], history[C + column], history[2 * C + column], history[3 * C + column]};
+    // input i of the chunk with the history before it: i < 0 the history's (old[4 + i])
+    auto at = [&](long i) { return i < 0 ? old[4 + i] : qkv[size_t(i) * C + column]; };
+    for (size_t run = 0; run * gdn_conv_run < steps; ++run)
+        for (int tap = 0; tap < 3; ++tap) edges[(run * 3 + tap) * C + column] = at(long(run * gdn_conv_run) - 3 + tap);
+    for (int row = 0; row < 4; ++row) history[row * C + column] = at(long(steps) - 4 + row);
+}
+template<int P = 1>
+__global__ void gdn_conv_runs(float* qkv, const float* edges, const float* coefficients, size_t steps) {
+    constexpr size_t C = QwenHeads<P>::channels;
+    const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x, run = blockIdx.y;
+    if (column >= C) return;
+    float b = edges[(run * 3) * C + column], c = edges[(run * 3 + 1) * C + column], d = edges[(run * 3 + 2) * C + column];
+    const size_t last = std::min(steps, (run + 1) * gdn_conv_run);
+    for (size_t token = run * gdn_conv_run; token < last; ++token) {
+        const float a = b;
+        b = c; c = d; d = qkv[token * C + column];
+        float value = a*coefficients[column*4] + b*coefficients[column*4+1];
+        value += c*coefficients[column*4+2]; value += d*coefficients[column*4+3];
+        qkv[token * C + column] = value * hc_sigmoid(value);
+    }
+}
+
+template<int P = 1>
 __global__ void gdn_normalize_qk(const float* qkv, size_t steps, float* packed) {
-    const size_t token = blockIdx.x / 16, head = blockIdx.x % 16, col = threadIdx.x;
-    const size_t source = token*10240+head*128+col, elements = steps*48*128;
-    const float q = qkv[source], k = qkv[source+2048];
+    using H = QwenHeads<P>;
+    const size_t token = blockIdx.x / H::key, head = blockIdx.x % H::key, col = threadIdx.x;
+    const size_t source = token*H::channels+head*128+col, elements = steps*H::value*128;
+    const float q = qkv[source], k = qkv[source+H::key*128];
     __shared__ float sums[2][128];
     sums[0][col]=q*q; sums[1][col]=k*k;
     __syncthreads();
@@ -27,23 +63,25 @@ __global__ void gdn_normalize_qk(const float* qkv, size_t steps, float* packed) 
     const float query = q / sqrtf(sums[0][0]+1e-6f) / sqrtf(128.0f);
     const float key = k / sqrtf(sums[1][0]+1e-6f);
     for (size_t tile=0; tile<3; ++tile) {
-        const size_t target = (token*48+head+tile*16)*128+col;
+        const size_t target = (token*H::value+head+tile*H::key)*128+col;
         packed[target]=query; packed[elements+target]=key;
     }
 }
 
+template<int P = 1>
 __global__ void gdn_pack_values(const float* qkv, const float* beta, const float* alpha,
                                const float* bias, const float* decay, size_t steps, float* packed) {
-    const size_t index = size_t(blockIdx.x)*256+threadIdx.x, elements=steps*48*128;
+    using H = QwenHeads<P>;
+    const size_t index = size_t(blockIdx.x)*256+threadIdx.x, elements=steps*H::value*128;
     if (index >= elements) return;
-    const size_t token=index/6144, head=(index%6144)/128, col=index%128;
-    packed[2*elements+index]=qkv[token*10240+4096+head*128+col];
+    const size_t token=index/H::gate, head=(index%H::gate)/128, col=index%128;
+    packed[2*elements+index]=qkv[token*H::channels+H::key*256+head*128+col];
     if (col == 0) {
-        const size_t scalar=token*48+head;
+        const size_t scalar=token*H::value+head;
         const float value=alpha[scalar]+bias[head];
         const float softplus=fmaxf(value,0.0f)+log1pf(expf(-fabsf(value)));
         packed[3*elements+scalar]=expf(decay[head]*softplus);
-        packed[3*elements+steps*48+scalar]=hc_sigmoid(beta[scalar]);
+        packed[3*elements+steps*H::value+scalar]=hc_sigmoid(beta[scalar]);
     }
 }
 
@@ -139,20 +177,23 @@ constexpr unsigned gdn_threads = 256;
 // Q/K convolution columns are shared by heads h, h+16 and h+32. history_in
 // must not alias history: an owner block can finish before another block reads.
 // (output null: the tokens' outputs are not kept, a replay's)
+template<int P = 1>
 __device__ __forceinline__ void
 gdn_tokens_head(size_t head, const float* state_in, const float* history_in, float* state, float* history,
                 const float* coefficients, const float* bias, const float* decay, const float* norm,
                 const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
-    const size_t t = threadIdx.x % 128, qk = head % 16;
+    using H = QwenHeads<P>;
+    constexpr size_t C = H::channels;
+    const size_t t = threadIdx.x % 128, qk = head % H::key;
     const bool low = threadIdx.x < 128;
     const unsigned first = low ? 0 : 64;
-    const size_t columns[3] = {qk * 128 + t, 2048 + qk * 128 + t, 4096 + head * 128 + t};
+    const size_t columns[3] = {qk * 128 + t, H::key * 128 + qk * 128 + t, H::key * 256 + head * 128 + t};
     float window[3][4] = {};
     if (low)
         #pragma unroll
         for (int c = 0; c < 3; ++c)
             #pragma unroll
-            for (int i = 0; i < 4; ++i) window[c][i] = history_in[i * 10240 + columns[c]];
+            for (int i = 0; i < 4; ++i) window[c][i] = history_in[i * C + columns[c]];
     float memory[64];
     #pragma unroll
     for (unsigned key = 0; key < 64; ++key) memory[key] = state_in[(head * 128 + first + key) * 128 + t];
@@ -160,11 +201,11 @@ gdn_tokens_head(size_t head, const float* state_in, const float* history_in, flo
         if (low)
             #pragma unroll
             for (int c = 0; c < 3; ++c)
-                if (c == 2 || head < 16)
+                if (c == 2 || head < H::key)
                     #pragma unroll
-                    for (int i = 0; i < 4; ++i) snapshot[i * 10240 + columns[c]] = window[c][i];
+                    for (int i = 0; i < 4; ++i) snapshot[i * C + columns[c]] = window[c][i];
         #pragma unroll
-        for (unsigned key = 0; key < 64; ++key) snapshot[4 * 10240 + (head * 128 + first + key) * 128 + t] = memory[key];
+        for (unsigned key = 0; key < 64; ++key) snapshot[4 * C + (head * 128 + first + key) * 128 + t] = memory[key];
     }
     __shared__ float query[128], keys[128], sums[128], high[128], scalars[2];
     for (size_t token = 0; token < tokens; ++token) {
@@ -194,10 +235,10 @@ gdn_tokens_head(size_t head, const float* state_in, const float* history_in, flo
             __syncthreads();
         }
         if (threadIdx.x == 0) {
-            const float raw = p[16432 + head] + bias[head];
+            const float raw = p[H::alpha + head] + bias[head];
             const float softplus = fmaxf(raw, 0.0f) + log1pf(expf(-fabsf(raw)));
             scalars[0] = expf(decay[head] * softplus);
-            scalars[1] = hc_sigmoid(p[16384 + head]);
+            scalars[1] = hc_sigmoid(p[H::beta + head]);
         }
         __syncthreads();
         const float factor = scalars[0], beta = scalars[1];
@@ -225,7 +266,7 @@ gdn_tokens_head(size_t head, const float* state_in, const float* history_in, flo
             __syncthreads();
         }
         const size_t index = head * 128 + t;
-        if (low && output) output[token * 6144 + index] = result / sqrtf(sums[0] / 128.0f + 1e-6f) * norm[t] * hc_sigmoid(p[10240 + index]);
+        if (low && output) output[token * H::gate + index] = result / sqrtf(sums[0] / 128.0f + 1e-6f) * norm[t] * hc_sigmoid(p[C + index]);
         __syncthreads();
     }
     #pragma unroll
@@ -233,23 +274,25 @@ gdn_tokens_head(size_t head, const float* state_in, const float* history_in, flo
     if (low)
         #pragma unroll
         for (int c = 0; c < 3; ++c)
-            if (c == 2 || head < 16)
+            if (c == 2 || head < H::key)
                 #pragma unroll
-                for (int i = 0; i < 4; ++i) history[i * 10240 + columns[c]] = window[c][i];
+                for (int i = 0; i < 4; ++i) history[i * C + columns[c]] = window[c][i];
 }
+template<int P = 1>
 __global__ void __launch_bounds__(gdn_threads)
 gdn_tokens(const float* state_in, const float* history_in, float* state, float* history,
            const float* coefficients, const float* bias, const float* decay, const float* norm,
            const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
-    gdn_tokens_head(blockIdx.x, state_in, history_in, state, history, coefficients, bias, decay, norm, projections, stride, tokens,
+    gdn_tokens_head<P>(blockIdx.x, state_in, history_in, state, history, coefficients, bias, decay, norm, projections, stride, tokens,
                     snapshot, output);
 }
 
 // Keep every head's old convolution window immutable until all blocks have read
 // it. Reuse the input arena after the 6144-value projected output, so graphs keep
 // fixed pointers and no allocation or floating-point operation is added.
-const float* gdn_history_snapshot(Device& d, const float* history) {
-    constexpr size_t offset = 4 * 48 * 128 + 6144, count = 4 * 10240;
+const float* gdn_history_snapshot(Device& d, const float* history, size_t parts = 1) {
+    constexpr size_t offset = 4 * 48 * 128 + 6144;
+    const size_t count = 4 * 10240 / parts;
     if (offset + count > d.input_capacity) throw std::runtime_error("DeltaNet history scratch exceeds capacity");
     float* snapshot = d.input + offset;
     check(hipMemcpyAsync(snapshot, history, count * sizeof(float), hipMemcpyDeviceToDevice, d.stream));

@@ -184,7 +184,14 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
         kind&=geometry.routed_lanes[r]!=0;
     }
     const bool beside=kind && !down && plan.shared;
-    if (beside) {
+    // (Layers in parts, qwen_parts.hpp, run it first on the device's stream: on the side stream, every pass of three or
+    // four rows took 7.5 ms more at 20K.)
+    const bool aside=beside && d.qwen_parts==1;
+    if (beside && !aside) {
+        Matrix pair[2]={weights[shared],weights[shared+1]};
+        pair[1].output_offset=640;
+        gemv(d,pair,2,input,output+10*1280,tokens,input_stride ? input_stride : 2560,output_stride ? output_stride : 11*1280);
+    } else if (aside) {
         if (!d.side_stream) {
             check(hipStreamCreate(&d.side_stream));
             check(hipEventCreateWithFlags(&d.side_fork,hipEventDisableTiming));
@@ -212,7 +219,7 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     }
     #undef SD_EXPERT_ROUTED
     check(hipGetLastError());
-    if (beside) check(hipStreamWaitEvent(d.stream,d.side_join,0));
+    if (aside) check(hipStreamWaitEvent(d.stream,d.side_join,0));
 }
 
 __global__ void resident_clear(MoeGroup* groups,unsigned* cursors,size_t count) {
@@ -365,7 +372,8 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         moe_device_tiles<<<1,moe_tile_threads,0,d.stream>>>(groups,groups_count,counts,firsts,tiles,tile_count);
         moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
         resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
-        const unsigned shared=plan.weights[experts*3].data ? unsigned((steps+moe_block_m-1)/moe_block_m) : 0;
+        // (a layer part's half of the shared expert runs beside the grouped experts: qwen_parts.hpp)
+        const unsigned shared=plan.weights[experts*3].data && !plan.batch_table ? unsigned((steps+moe_block_m-1)/moe_block_m) : 0;
         // FP16 products (routes*1280 bytes), then the FP16 token inputs (steps*5120), within the gate/up scratch.
         auto* product=reinterpret_cast<_Float16*>(scratch);
         auto* half_input=product+routes*640;
@@ -386,6 +394,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     std::vector<bool> absent(groups_count,false);
     if (plan.part)
         for (size_t group=0;group<groups_count;++group) absent[group]=plan.weights[group*3].data==nullptr;
+    if (plan.batch_table) absent[experts]=true;
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
         for (size_t expert=0;expert<experts;++expert)
@@ -598,13 +607,14 @@ void helper_span(Device& h,size_t begin,size_t end,size_t tokens) {
             if (h.helper_moe.count(layer)) helper_moe_tokens(h,layer,tokens);
     });
 }
-// Whether the owner runs [begin, end) with its peer helping: every layer's MoE is a part.
+// Whether the owner runs [begin, end) with its peer helping: every layer's MoE is a part. (A layer split
+// across both devices, DecoderLayer::parts, has no helper: each device runs its part and they add them.)
 bool span_has_parts(Device& d,size_t begin,size_t end) {
     bool parts=false;
     for (size_t layer=begin;layer<end;++layer) {
         auto found=d.decoder.find(layer);
         if (found==d.decoder.end()) return false;
-        const bool part=d.resident.find(found->second.moe)->second->part;
+        const bool part=d.resident.find(found->second.moe)->second->part && found->second.parts==1;
         if (layer>begin && part!=parts) throw std::runtime_error("a decoder span mixes whole and partial experts");
         parts=part;
     }
@@ -642,7 +652,7 @@ StepMoe step_moe(Device& d,void* handle,size_t steps) {
         throw std::runtime_error("a resident MoE part needs the grouped FP16 prefill path");
     const size_t experts=plan.experts,routes=steps*11;
     StepMoe moe{};
-    moe.plan=&plan; moe.groups=static_cast<MoeGroup*>(plan.table);
+    moe.plan=&plan; moe.groups=static_cast<MoeGroup*>(plan.batch_table ? plan.batch_table : plan.table);
     moe.gate_up=plan.workspace; float* product=moe.gate_up+routes*1280;
     moe.outputs=product+routes*640; moe.probabilities=moe.outputs+routes*2560;
     moe.positions=reinterpret_cast<int32_t*>(moe.probabilities+steps*11);

@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::constraint::{self, Constraint};
-use crate::gpu::{expert_bytes, CpuExperts, Data, Operand, Result, Scores, HIDDEN, WIDTH};
+use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::sampling::{self, Generated, Sampling};
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
@@ -317,9 +317,18 @@ impl Model {
         // GPU kernels read over the bus.
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
-            if let Some((_, resident_host, resident_batch)) =
-                working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?
-            {
+            // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
+            let mut placed = None;
+            if group.enable_parts()? {
+                placed = resident_placement(&weights, &group, context64, settings.prefill_batch_size, drafting, fits)?;
+                if placed.is_none() {
+                    group.disable_parts()?;
+                }
+            }
+            if placed.is_none() {
+                placed = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+            }
+            if let Some((_, resident_host, resident_batch)) = placed {
                 (host, batch) = (resident_host, resident_batch);
             }
         }
@@ -466,6 +475,94 @@ impl Model {
             operands.push(self.q8_projection(&format!("{prefix}{suffix}"))?);
         }
         operands.push(self.projection(&format!("{prefix}_inject.weight"))?);
+        Ok(operands)
+    }
+
+    /// Rows of a matrix (or a vector's values) as runs: (first, count) of `name`'s rows (values), placed one after the other.
+    fn part_rows(&self, name: &str, part: usize, runs: &[(u64, u64)], rows: u64, cols: u64) -> Result<Operand<'_>> {
+        let tensor = self.weights.tensor(name)?;
+        let (bytes, kind) = self.weights.raw(name, 0, None)?;
+        let row_bytes = crate::formats::matrix_bytes(kind, 1, cols as usize).ok_or("unsupported Straydog weight format")? as u64;
+        let mut pieces = Vec::with_capacity(runs.len());
+        let mut at = 0;
+        for &(first, count) in runs {
+            pieces.push(Piece { source: &bytes[(first * row_bytes) as usize..((first + count) * row_bytes) as usize], at, columns: None });
+            at += count * row_bytes;
+        }
+        if at != rows * row_bytes || tensor.bytes % row_bytes != 0 {
+            return Err(format!("Straydog part rows do not fit {name}"));
+        }
+        Ok(Operand { key: format!("{name}:part{part}"), data: Data::Gather(pieces), kind, rows, cols })
+    }
+
+    /// Runs (first, count) of an F32 vector's values, as one row.
+    fn part_values(&self, name: &str, part: usize, runs: &[(u64, u64)]) -> Result<Operand<'_>> {
+        let (bytes, kind) = self.weights.raw(name, 0, None)?;
+        if kind != 0 {
+            return Err(format!("Straydog part values of {name} are not F32"));
+        }
+        let mut pieces = Vec::with_capacity(runs.len());
+        let mut at = 0;
+        for &(first, count) in runs {
+            pieces.push(Piece { source: &bytes[(first * 4) as usize..((first + count) * 4) as usize], at, columns: None });
+            at += count * 4;
+        }
+        Ok(Operand { key: format!("{name}:part{part}"), data: Data::Gather(pieces), kind, rows: 1, cols: at / 4 })
+    }
+
+    /// Column runs (first, count) of every row of matrix `name` (`rows` x `cols`), placed one after the other in each row.
+    fn part_columns(&self, name: &str, part: usize, runs: &[(u64, u64)], rows: u64, cols: u64) -> Result<Operand<'_>> {
+        let (bytes, kind) = self.weights.raw(name, 0, None)?;
+        let span = |count: u64| crate::formats::matrix_bytes(kind, 1, count as usize).map(|bytes| bytes as u64);
+        let (pitch, width) = (span(cols).ok_or("unsupported Straydog weight format")?,
+                              span(runs.iter().map(|run| run.1).sum()).ok_or("Straydog part columns do not fill blocks")?);
+        let mut pieces = Vec::with_capacity(runs.len());
+        let mut at = 0;
+        for &(first, count) in runs {
+            let (Some(first_bytes), Some(run)) = (span(first), span(count)) else { return Err("Straydog part columns do not fill blocks".into()) };
+            pieces.push(Piece { source: bytes, at, columns: Some(Columns { pitch, first: first_bytes, width: run, to_pitch: width }) });
+            at += run;
+        }
+        if bytes.len() as u64 != rows * pitch || at != width {
+            return Err(format!("Straydog part columns do not fit {name}"));
+        }
+        let columns = runs.iter().map(|run| run.1).sum();
+        Ok(Operand { key: format!("{name}:part{part}"), data: Data::Gather(pieces), kind, rows, cols: columns })
+    }
+
+    /// A layer's operands as decoder registration takes them for device `part`'s half of the heads (gpu/qwen_parts.hpp): a
+    /// DeltaNet's key heads 8p..8p+7 with the value heads that read them (16c + 8p.., c = 0, 1, 2), an attention layer's query
+    /// heads 12p..12p+11 with K/V head p; their rows of the projections and columns of the output projection.
+    fn part_operands(&self, layer: usize, part: usize) -> Result<Vec<Operand<'_>>> {
+        let prefix = format!("blk.{layer}.");
+        let name = |suffix: &str| format!("{prefix}{suffix}");
+        let p = part as u64;
+        let mut operands = self.hc_operands(&name("hc_attn"))?;
+        if layer % 4 != 3 {
+            let values = |width: u64| -> Vec<(u64, u64)> { (0..3).map(|c| ((16 * c + 8 * p) * width, 8 * width)).collect() };
+            let mut qkv = vec![(1024 * p, 1024), (2048 + 1024 * p, 1024)];
+            qkv.extend(values(128).into_iter().map(|(first, count)| (4096 + first, count)));
+            operands.push(self.part_rows(&name("attn_qkv.weight"), part, &qkv, 5120, 2560)?);
+            operands.push(self.part_rows(&name("attn_gate.weight"), part, &values(128), 3072, 2560)?);
+            operands.push(self.part_rows(&name("ssm_beta.weight"), part, &values(1), 24, 2560)?);
+            operands.push(self.part_rows(&name("ssm_alpha.weight"), part, &values(1), 24, 2560)?);
+            operands.push(self.part_columns(&name("ssm_out.weight"), part, &values(128), 2560, 6144)?);
+            operands.push(self.part_rows(&name("ssm_conv1d.weight"), part, &qkv, 5120, 4)?);
+            operands.push(self.part_values(&name("ssm_dt.bias"), part, &values(1))?);
+            operands.push(self.part_values(&name("ssm_a"), part, &values(1))?);
+            operands.push(self.vector(&name("ssm_norm.weight"), None)?);
+        } else {
+            operands.push(self.part_rows(&name("attn_q.weight"), part, &[(6144 * p, 6144)], 6144, 2560)?);
+            operands.push(self.part_rows(&name("attn_k.weight"), part, &[(256 * p, 256)], 256, 2560)?);
+            operands.push(self.part_rows(&name("attn_v.weight"), part, &[(256 * p, 256)], 256, 2560)?);
+            operands.push(self.q8_projection(&name("indexer.q_proj.weight"))?);
+            operands.push(self.q8_projection(&name("indexer.k_proj.weight"))?);
+            operands.push(self.part_columns(&name("attn_output.weight"), part, &[(3072 * p, 3072)], 2560, 6144)?);
+            for norm in ["attn_q_norm.weight", "attn_k_norm.weight", "indexer.q_norm.weight", "indexer.k_norm.weight"] {
+                operands.push(self.vector(&name(norm), None)?);
+            }
+        }
+        operands.extend(self.hc_operands(&name("hc_ffn"))?);
         Ok(operands)
     }
 
@@ -658,6 +755,18 @@ impl Model {
     /// `register`, once the sequence state exists, also create the layers' native plans.
     fn prepare_decoder(&mut self, context: u64, register: bool) -> Result<()> {
         for layer in self.weights.layers() {
+            if self.group.parts() && layer < 48 {
+                for part in 0..2 {
+                    // SAFETY of the borrow: operands point into the weights, which outlive the group.
+                    let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(self.part_operands(layer, part)?) };
+                    if register {
+                        self.group.register_decoder_part(layer, part, &operands, context)?;
+                    } else {
+                        self.group.pin_part(part, &operands)?;
+                    }
+                }
+                continue;
+            }
             let prefix = format!("blk.{layer}.");
             let mut operands = self.hc_operands(&format!("{prefix}hc_attn"))?;
             let (names, norms): (&[&str], &[&str]) = if layer % 4 != 3 && layer < 48 {

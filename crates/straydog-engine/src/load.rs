@@ -71,7 +71,8 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
     let mut ranges: Vec<Vec<Range>> = vec![Vec::new(); weights.file_count()];
     let uploaded = |name: &String| {
         let tensor = weights.tensor(name).ok();
-        pending.iter().flatten().filter(|upload| upload.decode.is_none()).any(|upload| {
+        // (whole: a part's pieces, Data::Gather, are not a copy of the tensor)
+        pending.iter().flatten().filter(|upload| upload.decode.is_none() && upload.offset == 0 && upload.columns.is_none()).any(|upload| {
             tensor.is_some_and(|tensor| {
                 weights.locate(upload.source, upload.bytes) == Some((tensor.file, tensor.offset))
                     && upload.bytes as u64 == tensor.bytes

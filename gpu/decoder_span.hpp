@@ -8,11 +8,14 @@ __global__ void decoder_residual(float* hidden,const float* mixed,const float* b
 // Layer 48 is the MTP draft layer: full (QSA) attention like every fourth layer.
 bool decoder_linear(size_t layer) { return layer % 4 != 3 && layer < 48; }
 
+// parts: 2 registers this device's part `part` of a layer split across two GPUs (QwenHeads<2>: its rows of the projections,
+// its columns of the output projection, its heads' states), which needs Device::qwen_parts set (sd_qwen_parts).
 void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* pointers,const int* kinds,
-                             size_t count,void* const* states,void* workspace,void* moe) {
+                             size_t count,void* const* states,void* workspace,void* moe,size_t parts=1,size_t part=0) {
     const bool linear=decoder_linear(layer);
     if (layer>48 || !context || context>262144 || !pointers || !kinds || !states ||
-        count!=(linear ? 17 : 18) || d.decoder.find(layer)!=d.decoder.end() || d.resident.find(moe)==d.resident.end())
+        count!=(linear ? 17 : 18) || d.decoder.find(layer)!=d.decoder.end() || d.resident.find(moe)==d.resident.end() ||
+        (parts!=1 && parts!=2) || part>=parts || (parts==2 && (layer>=48 || d.qwen_parts!=2 || !d.sums.peer)))
         throw std::runtime_error("invalid decoder layer registration");
     auto allocation=[&](void* pointer,size_t bytes) {
         auto found=d.allocations.find(pointer);
@@ -28,10 +31,10 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     if (capacity>4096 || capacity>d.resident.find(moe)->second->capacity)
         throw std::runtime_error("invalid decoder workspace capacity");
     const size_t hc_rows[4]={1,320,10240,4},hc_cols[4]={10240,10240,320,10240};
-    const size_t gd_rows[9]={10240,6144,48,48,2560,10240,1,1,1};
-    const size_t gd_cols[9]={2560,2560,2560,2560,6144,4,48,48,128};
-    const size_t qs_rows[10]={12288,512,512,512,128,2560,1,1,1,1};
-    const size_t qs_cols[10]={2560,2560,2560,2560,2560,6144,256,256,128,128};
+    const size_t gd_rows[9]={10240/parts,6144/parts,48/parts,48/parts,2560,10240/parts,1,1,1};
+    const size_t gd_cols[9]={2560,2560,2560,2560,6144/parts,4,48/parts,48/parts,128};
+    const size_t qs_rows[10]={12288/parts,512/parts,512/parts,512,128,2560,1,1,1,1};
+    const size_t qs_cols[10]={2560,2560,2560,2560,2560,6144/parts,256,256,128,128};
     const size_t attention=linear ? 9 : 10;
     for (size_t i=0;i<count;++i) {
         size_t rows,cols;
@@ -48,18 +51,24 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
         }
         allocation(pointers[i],rows*matrix_row_bytes(kinds[i],cols));
     }
-    if (linear) { allocation(states[0],4*10240*4); allocation(states[1],48*128*128*4); }
+    if (linear) { allocation(states[0],4*10240/parts*4); allocation(states[1],48/parts*128*128*4); }
     else {
-        allocation(states[0],context*1024*4); allocation(states[1],((context/4+1)*128+qsa_history*128)*4);
+        allocation(states[0],context*1024/parts*4); allocation(states[1],((context/4+1)*128+qsa_history*128)*4);
         allocation(states[2],256*(context/4+1)*4);
     }
     DecoderLayer plan{}; plan.index=layer; plan.context=context; plan.capacity=capacity; plan.moe=moe;
+    plan.parts=parts; plan.part=part;
     plan.workspace=static_cast<float*>(workspace);
     plan.pointers.assign(pointers,pointers+count); plan.kinds.assign(kinds,kinds+count);
     std::copy(states,states+3,plan.states);
     plan.dependencies=plan.pointers;
     plan.dependencies.push_back(workspace);
     for (size_t i=0;i<(linear ? 2 : 3);++i) plan.dependencies.push_back(states[i]);
+    if (!linear && parts==2) {
+        // (a part's K/V has its head's two planes: the decode mirrors are laid out anew)
+        d.kv_planes[states[0]]=2;
+        if (d.kv_stage) { kv_clear_graphs(d); kv_layout(d); }
+    }
     const auto& expert=*d.resident.find(moe)->second;
     plan.dependencies.insert(plan.dependencies.end(),expert.dependencies.begin(),expert.dependencies.end());
     plan.dependencies.push_back(expert.table); plan.dependencies.push_back(expert.workspace);
