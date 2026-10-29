@@ -319,6 +319,13 @@ impl Backend {
         check(unsafe { ffi::sd_decode_options(self.handle, c_int::from(q8) | c_int::from(half) << 1) }).map(drop)
     }
 
+    /// A decode row's Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 GEMVs on the Q8 kernels (INT8 activations, a scale per 32 values),
+    /// a list mixing them with BF16 rows in one launch (RDNA4; Qwen3.8's projections). Replaces the other decode options.
+    pub fn wide_q8_decode(&self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_decode_options(self.handle, 4) }).map(drop)
+    }
+
     /// Upload an operand once; later uses of its key reuse the device copy. While uploads are
     /// deferred, mapped bytes are only allocated for (see [`Backend::defer_uploads`]).
     pub fn prepare(&mut self, operand: &Operand) -> Result<Entry> {

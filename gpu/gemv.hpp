@@ -1127,7 +1127,138 @@ template<> struct GemvQ8<8> {   // Q8_0: a unit is one 34-byte block of 32 value
         }
     }
 };
+// The wide kinds (Device::q8_wide: Qwen3.8's projections) read the staged input end to end, a group's 8 words at 8 * group, its
+// scale and sum at group (PAD 0).
+template<> struct GemvQ8<12> {   // Q4_K: GemvQ8<13>'s unit without the high bits, in a 144-byte block
+    static constexpr size_t elements = 64;
+    template<int V, uint32_t PAD = 0>
+    __device__ static void dots(const uint8_t* row, size_t unit, const GemvQ8Input& in, float (&r)[V]) {
+        static_assert(PAD == 0, "Q4_K units are staged end to end");
+        const uint8_t* block = row + (unit / 4) * 144;
+        const int pair = int(unit % 4);
+        const uint4 header = *reinterpret_cast<const uint4*>(block);
+        const uint4* packed = reinterpret_cast<const uint4*>(block + 16 + 32 * pair);
+        const uint4 q0 = packed[0], q1 = packed[1];
+        uint32_t scales, mins;
+        gemv_pair_scale_min(pair, header.y, header.z, header.w, scales, mins);
+        const unsigned scale0 = scales & 255, scale1 = scales >> 8, min0 = mins & 255, min1 = mins >> 8;
+        const uint32_t codes[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        int s0[V] = {}, s1[V] = {};
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const uint32_t c0 = codes[m] & 0x0F0F0F0Fu, c1 = (codes[m] >> 4) & 0x0F0F0F0Fu;
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                const uint32_t* x = in.xq + v * in.stride + unit * 16;
+                s0[v] = __builtin_amdgcn_sudot4(false, int(c0), true, int(x[m]), s0[v], false);
+                s1[v] = __builtin_amdgcn_sudot4(false, int(c1), true, int(x[8 + m]), s1[v], false);
+            }
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float* xd = in.xd + v * in.stride + 2 * unit;
+            const float* xs = in.xs + v * in.stride + 2 * unit;
+            r[v] = gemv_half(header.x) * (float(scale0) * xd[0] * float(s0[v]) + float(scale1) * xd[1] * float(s1[v]))
+                 - gemv_half(header.x >> 16) * (float(min0) * xs[0] + float(min1) * xs[1]);
+        }
+    }
+};
+// The signed bytes code - 32 of four 6-bit codes (no borrow crosses a byte: each is code + 96 before the top bit flips back)
+__device__ __forceinline__ uint32_t gemv_q6_signed(uint32_t codes) { return ((codes | 0x80808080u) - 0x20202020u) ^ 0x80808080u; }
+template<> struct GemvQ8<14> {   // Q6_K: GemvFormat<14>'s unit, half of a 210-byte block (four groups, eight 16-value scales)
+    static constexpr size_t elements = 128;
+    template<int V, uint32_t PAD = 0>
+    __device__ static void dots(const uint8_t* row, size_t unit, const GemvQ8Input& in, float (&r)[V]) {
+        static_assert(PAD == 0, "Q6_K units are staged end to end");
+        const uintptr_t address = reinterpret_cast<uintptr_t>(row + (unit / 2) * 210);
+        const int half = int(unit % 2);
+        const uint32_t* base = reinterpret_cast<const uint32_t*>(address & ~uintptr_t(3));
+        const uint32_t shift = uint32_t(address & 3);
+        uint32_t low[16], high[8];
+        {
+            uint32_t t[17];
+            #pragma unroll
+            for (int i = 0; i < 17; ++i) t[i] = base[16 * half + i];
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) low[i] = gemv_realign(t[i], t[i + 1], shift);
+        }
+        {
+            uint32_t t[9];
+            #pragma unroll
+            for (int i = 0; i < 9; ++i) t[i] = base[32 + 8 * half + i];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) high[i] = gemv_realign(t[i], t[i + 1], shift);
+        }
+        const uint32_t w0 = base[48 + 2 * half], w1 = base[49 + 2 * half], w2 = base[50 + 2 * half];
+        const uint32_t scales[2] = {gemv_realign(w0, w1, shift), gemv_realign(w1, w2, shift)};
+        const float d = gemv_half(gemv_realign(base[52], base[53], shift));
+        float result[V] = {};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            // value i = 32k + 4m of the half: its low nibble in low[(i % 64) / 4] (the high nibble from 64 on), its two high bits in
+            // high[(i % 32) / 4] at 2 * (i / 32); a 16-value scale for m below 4 and one for the rest
+            int lo[V] = {}, hi[V] = {};
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                const uint32_t l = (low[8 * (k % 2) + m] >> (4 * (k / 2))) & 0x0F0F0F0Fu;
+                const uint32_t h = (high[m] >> (2 * k)) & 0x03030303u;
+                const uint32_t q = gemv_q6_signed(l | (h << 4));
+                #pragma unroll
+                for (int v = 0; v < V; ++v) {
+                    const uint32_t x = in.xq[v * in.stride + unit * 32 + 8 * k + m];
+                    if (m < 4) lo[v] = __builtin_amdgcn_sudot4(true, int(q), true, int(x), lo[v], false);
+                    else hi[v] = __builtin_amdgcn_sudot4(true, int(q), true, int(x), hi[v], false);
+                }
+            }
+            const int scale_lo = int(int8_t(uint8_t(scales[k / 2] >> (16 * (k % 2))))),
+                      scale_hi = int(int8_t(uint8_t(scales[k / 2] >> (16 * (k % 2) + 8))));
+            #pragma unroll
+            for (int v = 0; v < V; ++v)
+                result[v] = fmaf(in.xd[v * in.stride + unit * 4 + k], float(scale_lo * lo[v] + scale_hi * hi[v]), result[v]);
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) r[v] = d * result[v];
+    }
+};
+template<> struct GemvQ8<23> {   // IQ4_XS: GemvFormat<23>'s unit, two groups of a 136-byte block, the values as signed bytes
+    static constexpr size_t elements = 64;
+    template<int V, uint32_t PAD = 0>
+    __device__ static void dots(const uint8_t* row, size_t unit, const GemvQ8Input& in, float (&r)[V]) {
+        static_assert(PAD == 0, "IQ4_XS units are staged end to end");
+        const uint8_t* block = row + (unit / 4) * 136;
+        const int pair = int(unit % 4);
+        const uint2 header = *reinterpret_cast<const uint2*>(block);
+        const uint2* packed = reinterpret_cast<const uint2*>(block + 8 + 32 * pair);
+        const uint2 qa = packed[0], qb = packed[1], qc = packed[2], qd = packed[3];
+        const uint32_t high = header.x >> 16, low = header.y;
+        const int g0 = 2 * pair, g1 = 2 * pair + 1;
+        const int scale0 = int(((low >> (4 * g0)) & 15) | (((high >> (2 * g0)) & 3) << 4)) - 32;
+        const int scale1 = int(((low >> (4 * g1)) & 15) | (((high >> (2 * g1)) & 3) << 4)) - 32;
+        const uint32_t first[4] = {qa.x, qa.y, qb.x, qb.y}, second[4] = {qc.x, qc.y, qd.x, qd.y};
+        int s0[V] = {}, s1[V] = {};
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            // (gemv_iq4's bytes are the values + 128: the top bit flipped, the signed values)
+            const uint32_t w0 = gemv_iq4(first[m] & 0x0F0F0F0Fu) ^ 0x80808080u, w1 = gemv_iq4((first[m] >> 4) & 0x0F0F0F0Fu) ^ 0x80808080u;
+            const uint32_t w2 = gemv_iq4(second[m] & 0x0F0F0F0Fu) ^ 0x80808080u, w3 = gemv_iq4((second[m] >> 4) & 0x0F0F0F0Fu) ^ 0x80808080u;
+            #pragma unroll
+            for (int v = 0; v < V; ++v) {
+                const uint32_t* x = in.xq + v * in.stride + unit * 16;
+                s0[v] = __builtin_amdgcn_sudot4(true, int(w0), true, int(x[m]), s0[v], false);
+                s0[v] = __builtin_amdgcn_sudot4(true, int(w1), true, int(x[4 + m]), s0[v], false);
+                s1[v] = __builtin_amdgcn_sudot4(true, int(w2), true, int(x[8 + m]), s1[v], false);
+                s1[v] = __builtin_amdgcn_sudot4(true, int(w3), true, int(x[12 + m]), s1[v], false);
+            }
+        }
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float* xd = in.xd + v * in.stride + 2 * unit;
+            r[v] = gemv_half(header.x) * (float(scale0) * xd[0] * float(s0[v]) + float(scale1) * xd[1] * float(s1[v]));
+        }
+    }
+};
 __host__ __device__ constexpr bool gemv_q8_kind_taken(int kind) { return kind == 13 || kind == 8; }
+__host__ __device__ constexpr bool gemv_q8_wide_kind(int kind) { return kind == 12 || kind == 13 || kind == 14 || kind == 23 || kind == 8; }
 // gemv_rows on the staged input: the same rows, lanes, units and reduction for every vector.
 template<int kind, int V, uint32_t PAD = 0>
 __device__ __forceinline__ void gemv_q8_rows(const Matrix& m, size_t first_row, unsigned lanes, const GemvQ8Input& in, float* output,
@@ -1283,7 +1414,8 @@ __global__ void __launch_bounds__(256) gemv_q8_rows_wave(FixedGemv list, const f
 size_t gemv_q8_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors) {
     const Matrix& first = list.items[0].matrix;
     const size_t bytes = vectors * gemv_q8_vector_words(first.cols, first.kind) * 4;
-    if (!d.q8_decode || !list.count || !gemv_q8_kind_taken(first.kind) || first.cols % 256 || bytes > 65536 ||
+    const bool taken = (d.q8_decode && gemv_q8_kind_taken(first.kind)) || (d.q8_wide && gemv_q8_wide_kind(first.kind));
+    if (!taken || !list.count || first.cols % 256 || bytes > 65536 ||
         reinterpret_cast<uintptr_t>(input + first.input_offset) % 16 || (vectors > 1 && list.input_stride % 4))
         return 0;
     for (unsigned i = 0; i < list.count; ++i) {
@@ -1315,8 +1447,77 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
     #define SD_Q8_LAUNCH(format) \
         if (tail) gemv_q8_kind<format, V, true><<<blocks, 256, lds, d.stream>>>(list, input, output, *tail); \
         else gemv_q8_kind<format, V, false><<<blocks, 256, lds, d.stream>>>(list, input, output, LinkTail{});
-    if (list.items[0].matrix.kind == 13) { SD_Q8_LAUNCH(13) } else { SD_Q8_LAUNCH(8) }
+    switch (list.items[0].matrix.kind) {
+        case 13: SD_Q8_LAUNCH(13) break;
+        case 12: SD_Q8_LAUNCH(12) break;
+        case 14: SD_Q8_LAUNCH(14) break;
+        case 23: SD_Q8_LAUNCH(23) break;
+        default: SD_Q8_LAUNCH(8) break;
+    }
     #undef SD_Q8_LAUNCH
+    check(hipGetLastError());
+    return true;
+}
+// A list of the wide kinds and BF16 (Device::q8_wide: Qwen3.8's projections, a layer's qkv, gate, beta and alpha in one launch; a
+// matrix once a token, hc_project's): every block owns one matrix (its waves padded to the block) and stages that matrix's input of
+// the V vectors, end to end; a wide kind's rows run on it as gemv_q8_kind's, a BF16 row on the F32 input as gemv_fixed_kind's. A
+// row's sum is the same whatever shares its launch, so one token's decode and a verification's rows agree.
+template<int V>
+__global__ void __launch_bounds__(256) gemv_q8_mixed(FixedGemv list, const float* input, float* output) {
+    extern __shared__ __align__(16) uint32_t gemv_lds[];
+    const size_t first_wave = size_t(blockIdx.x) * (blockDim.x / 32);
+    const GemvItem& item = gemv_q8_item(list, first_wave);
+    const size_t cols = item.matrix.cols, groups = cols / 32, stride = gemv_q8_vector_words(cols, 0);
+    float* xd = reinterpret_cast<float*>(gemv_lds + gemv_q8_value_words(cols, 0));
+    if (item.matrix.kind != 30) {
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float* from = input + item.matrix.input_offset + v * list.input_stride;
+            for (size_t group = threadIdx.x; group < groups; group += blockDim.x)
+                gemv_q8_group(from + group * 32, gemv_lds + v * stride + group * 8, xd + v * stride + group, xd + v * stride + groups + group);
+        }
+    }
+    __syncthreads();
+    Matrix matrix = item.matrix;
+    const GemvQ8Input in{gemv_lds, xd, xd + groups, stride};
+    const size_t row = (first_wave - item.first_wave + threadIdx.x / 32) * (32 / item.lanes);
+    #define SD_Q8_MIXED(format) case format: \
+        matrix.input_offset = 0; gemv_q8_rows<format, V, 0>(matrix, row, item.lanes, in, output, list.output_stride, list.residual); break;
+    switch (matrix.kind) {
+        SD_Q8_MIXED(8) SD_Q8_MIXED(12) SD_Q8_MIXED(13) SD_Q8_MIXED(14) SD_Q8_MIXED(23)
+        case 30: gemv_rows<30, V>(matrix, row, item.lanes, input, list.input_stride, output, list.output_stride, list.residual); break;
+    }
+    #undef SD_Q8_MIXED
+}
+// gemv_q8_mixed for a list it takes (its waves padded to whole blocks); false (nothing launched) otherwise.
+// Its LDS bytes for `vectors`, else 0.
+size_t gemv_q8_mixed_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors) {
+    if (!d.q8_wide || !list.count || (vectors > 1 && list.input_stride % 4)) return 0;
+    bool wide = false;
+    size_t words = 0;
+    for (unsigned i = 0; i < list.count; ++i) {
+        const Matrix& m = list.items[i].matrix;
+        if (!list.items[i].lanes || (!gemv_q8_wide_kind(m.kind) && m.kind != 30)) return 0;
+        if (m.kind != 30) {
+            if (m.cols % 256 || reinterpret_cast<uintptr_t>(input + m.input_offset) % 16) return 0;
+            words = std::max(words, gemv_q8_vector_words(m.cols, 0));
+            wide = true;
+        }
+    }
+    const size_t lds = vectors * words * 4;
+    return wide && lds <= 65536 ? lds : 0;
+}
+template<int V>
+bool gemv_q8_mixed_launch(Device& d, const FixedGemv& list, const float* input, float* output) {
+    const size_t lds = gemv_q8_mixed_input(d, list, input, V);
+    if (!lds) return false;
+    FixedGemv padded = list;
+    size_t waves = 0;
+    for (unsigned i = 0; i < list.count; ++i) {
+        padded.items[i].first_wave = uint32_t(waves);
+        waves += (gemv_waves(list.items[i].matrix, list.items[i].lanes) + 7) / 8 * 8;
+    }
+    gemv_q8_mixed<V><<<unsigned(waves / 8), 256, lds, d.stream>>>(padded, input, output);
     check(hipGetLastError());
     return true;
 }
@@ -1324,6 +1525,10 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
 bool gemv_shared_input_launch(Device& d, const FixedGemv& list, const float* input, float* output);   // gemv_fused.hpp
 template<int V>
 void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform, const float* input, float* output) {
+#if defined(__HIPCC__)
+    // (the wide kinds take the Q8 kernels ahead of the F32 kernels' special shapes)
+    if (d.q8_wide && ((uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) || gemv_q8_mixed_launch<V>(d, list, input, output))) return;
+#endif
 #if !defined(__HIPCC__)
     if constexpr (V == 1) {
         if (!uniform && list.count >= 3) {
@@ -1448,7 +1653,14 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
     bool uniform = true;
     for (size_t i = 0; i < count; ++i)
         uniform &= list.items[i].lanes != 0 && list.items[i].matrix.kind == list.items[0].matrix.kind;
-    if (!uniform && vectors > 1) {
+#if defined(__HIPCC__)
+    const bool mixed_q8 = !uniform && gemv_q8_mixed_input(d, list, input, vectors);
+#else
+    const bool mixed_q8 = false;
+#endif
+    // (with the wide Q8 kernels, a list they cannot take whole is split for one vector too: a row then
+    // takes the kernel of its kind whatever shares its launch, as a verification's rows do)
+    if (!uniform && (vectors > 1 || d.q8_wide) && !mixed_q8) {
         // The generic multi-vector kernel spills; one launch per kind runs the same dots.
         bool aligned = true;
         for (size_t i = 0; i < count; ++i) aligned &= list.items[i].lanes != 0;

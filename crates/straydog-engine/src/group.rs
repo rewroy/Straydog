@@ -41,6 +41,12 @@ impl Group {
             return Err("Straydog needs one VRAM budget per GPU".into());
         }
         let backends = devices.iter().zip(budgets).map(|(&device, &budget)| Backend::new(device, budget)).collect::<Result<Vec<_>>>()?;
+        // A decode row's projections take INT8 activations (STRAYDOG_Q8=0 keeps them F32)
+        if std::env::var("STRAYDOG_Q8").map_or(true, |value| value != "0") {
+            for backend in &backends {
+                backend.wide_q8_decode()?;
+            }
+        }
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
