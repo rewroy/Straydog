@@ -741,6 +741,36 @@ impl Backend {
         Ok(())
     }
 
+    /// Plan the host K/V for `capacity` positions of the context reserved (its indexers keep their whole allocation):
+    /// [`Backend::grow_kv`] adds the rest as a sequence reaches it.
+    pub fn start_kv(&mut self, capacity: u64) {
+        for (_, rows, _) in &mut self.pending_host {
+            *rows = capacity * 4;
+        }
+        for (key, entry) in &mut self.states {
+            if key.starts_with("@indexer:") {
+                entry.rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
+            }
+        }
+    }
+
+    /// Every layer's host K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`).
+    pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
+        let layers: Vec<(String, u64)> = self.states.keys()
+            .filter_map(|key| Some((key.clone(), key.strip_prefix("@qsa:blk.")?.strip_suffix('.')?.parse().ok()?)))
+            .collect();
+        for (key, layer) in layers {
+            let mut state = std::ptr::null_mut();
+            // SAFETY: a live handle and an out-parameter; the layer's states are the native side's.
+            check(unsafe { ffi::sd_kv_grow(self.handle, layer, capacity, valid, &mut state) })?;
+            let entry = self.states.get_mut(&key).ok_or("no such Straydog state")?;
+            (entry.pointer, entry.rows) = (state, capacity * 4);
+            let index = key.replace("@qsa:", "@indexer:");
+            self.states.get_mut(&index).ok_or("no such Straydog state")?.rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
+        }
+        Ok(())
+    }
+
     /// Take the host states [`Backend::reserve_model_state`] started, then register the K/V stage.
     pub fn finish_model_state(&mut self) -> Result<()> {
         if self.pending_host.is_empty() {

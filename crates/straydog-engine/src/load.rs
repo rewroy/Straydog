@@ -96,6 +96,13 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
             }
         }
     }
+    // Files larger than the memory fill it as they are read, and page-locking beside them can then
+    // fail (the GPU runtime's out of memory: two starts in seven at 32 GiB): the host K/V comes first.
+    let total = weights.files_to_read().iter().map(|(_, _, map, _)| map.len() as u64).sum();
+    if bypass_cache(total, weights.host_memory_bytes) {
+        group.prefetch_host_states()?;
+        group.finish_model_state()?;
+    }
     let copies = read(weights, ranges, &kept, progress, |workers| {
         let workers = (0..workers)
             .map(|_| {

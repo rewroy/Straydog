@@ -23,6 +23,27 @@ pub fn host_memory_bytes() -> u64 {
     }
 }
 
+/// Ask the system to leave this process what its share of `memory` holds beside `pinned` bytes of
+/// page-locked state: pages it trims from the working set come back one fault at a time under the
+/// CPU's expert threads (Windows at 32 GiB: 800K faults/s and 3 tokens/s at the worst, with no
+/// more read from the drive). Best effort: only speed depends on it.
+pub fn keep_resident(memory: u64, pinned: u64) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use crate::arch::served::{HOST_OTHER, HOST_SHARE};
+        let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER);
+        // SAFETY: the pseudo handle of this process and plain values.
+        let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), share as usize, memory as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) };
+        if done == 0 {
+            eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (memory, pinned);
+}
+
 /// `physical` bounded by the memory limits of this process's cgroup and every one above it, up
 /// to and including the root of the hierarchy as mounted at `cgroup_root`. In a container (a
 /// cgroup namespace) that root is the container's own cgroup, which holds its limit; the host's

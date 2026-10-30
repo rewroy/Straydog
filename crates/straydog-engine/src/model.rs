@@ -78,6 +78,11 @@ fn attention_layers(drafting: bool) -> u64 {
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
 /// memory twice their size; with at least 1.25 times, half the memory less the page-locked
 /// sequence state; else none (the unlocked layers and the PLE table would thrash).
+const SCARCE_ROW_CACHE: u64 = 1 << 30;
+/// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
+/// whole context take from a small machine what the expert banks need, and few sequences reach it.
+const STARTING_KV: usize = 32768;
+
 pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
     if memory == 0 || 4 * memory < 5 * banks {
         return 0;
@@ -291,6 +296,10 @@ pub struct Model {
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
     profile: Option<Profile>,
+    /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
+    kv_capacity: usize,
+    /// Page-locked host bytes besides the K/V.
+    pinned_other: u64,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -387,6 +396,8 @@ impl Model {
             draft_pending: Vec::new(),
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
+            kv_capacity: context,
+            pinned_other: checkpoint_bytes,
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -401,6 +412,10 @@ impl Model {
             return Err("the GPU budget cannot hold the model's dense weights; raise --vram".into());
         }
         model.prepare_decoder(context64, false)?;
+        if model.partial && host && !model.group.parts() && context > STARTING_KV {
+            model.kv_capacity = STARTING_KV;
+            model.group.start_kv(STARTING_KV as u64);
+        }
         // SAFETY of the borrow: the operand points into the weights, which outlive the group.
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;
@@ -412,9 +427,9 @@ impl Model {
         // Host K/V page-locked on a thread of its own meanwhile (see `Backend::prefetch_host_states`).
         model.group.finish_model_state()?;
         load_seconds.push(("host_state", lap(&mut clock)));
-        model.prepare_decoder(context64, true)?;
+        model.prepare_decoder(model.kv_capacity as u64, true)?;
         if model.partial {
-            let pinned = checkpoint_bytes + if host { kv_bytes } else { 0 };
+            let pinned = checkpoint_bytes + if host { attention_layers(drafting) * model.kv_capacity as u64 * 4096 } else { 0 };
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
@@ -430,7 +445,14 @@ impl Model {
             None => {
                 let [_, rows] = model.weights.tensor(PLE_TABLE)?.dims[..] else { return Err("Straydog PLE table is not rows".into()) };
                 let width = model.weights.tensor(PLE_TABLE)?.bytes / rows;
-                crate::rows::auto_budget(rows, width, model.weights.host_memory_bytes, model.state_bytes)
+                let budget = crate::rows::auto_budget(rows, width, model.weights.host_memory_bytes, model.state_bytes);
+                // Partially resident with less memory than the banks want: a token's rows are few, and what
+                // the cache would hold serves the banks the CPU reads hundreds of experts from a token.
+                let scarce = model.partial && {
+                    let banks = (0..48).try_fold(0, |sum, layer| Self::host_banks(&model.weights, layer).map(|banks| sum + banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))?;
+                    model.weights.host_memory_bytes < 2 * banks
+                };
+                if scarce { budget.min(SCARCE_ROW_CACHE) } else { budget }
             }
         };
         if row_cache > 0 {
@@ -776,6 +798,7 @@ impl Model {
                 }
             }
         }
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state);
         if registered > 0 {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the
             // rest; both read host DRAM, so one route per layer.
@@ -1171,6 +1194,23 @@ impl Model {
         run(&mut self.group, &operands)
     }
 
+    /// Room in the K/V for `positions`. A parked sequence's copies have the old pitches and go; the
+    /// live sequence and the checkpoints below it stay.
+    fn ensure_kv(&mut self, positions: usize) -> Result<()> {
+        if positions <= self.kv_capacity {
+            return Ok(());
+        }
+        if let Some(parked) = self.parked.take() {
+            self.discard(parked)?;
+        }
+        let capacity = (positions + 4096).next_power_of_two().min(self.context);
+        let pinned = self.pinned_other + 12 * capacity as u64 * 4096;
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned);
+        self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
+        self.kv_capacity = capacity;
+        Ok(())
+    }
+
     /// Advance the model over `tokens`; the logits after the last one when asked (None on cancellation).
     fn forward(&mut self, tokens: &[u32], logits: bool, cancelled: &dyn Fn() -> bool) -> Result<Option<Option<Vec<f32>>>> {
         if self.history.len() + tokens.len() > self.context || tokens.iter().any(|token| *token as usize >= VOCABULARY) {
@@ -1181,6 +1221,7 @@ impl Model {
         // prefill, a resident or pipelined one with the MTP rows on the host, stashed or kept, a
         // decode step), all from here.
         let start = self.history.len();
+        self.ensure_kv(start + tokens.len())?;
         self.protect(start.saturating_sub(usize::from(self.speculative > 0)), start + tokens.len())?;
         self.prefetch_ple(&self.history, tokens)?;
         let embeddings = self.token_embeddings(tokens)?;

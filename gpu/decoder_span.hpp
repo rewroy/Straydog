@@ -53,8 +53,14 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     }
     if (linear) { allocation(states[0],4*10240/parts*4); allocation(states[1],48/parts*128*128*4); }
     else {
-        allocation(states[0],context*1024/parts*4); allocation(states[1],((context/4+1)*128+qsa_history*128)*4);
-        allocation(states[2],256*(context/4+1)*4);
+        // (a K/V that grows: its indexer and scratch hold the whole context from the start)
+        auto room=[&](void* pointer,size_t bytes) {
+            auto found=d.allocations.find(pointer);
+            if (found==d.allocations.end() || found->second<bytes)
+                throw std::runtime_error("invalid decoder layer allocation");
+        };
+        allocation(states[0],context*1024/parts*4); room(states[1],((context/4+1)*128+qsa_history*128)*4);
+        room(states[2],256*(context/4+1)*4);
     }
     DecoderLayer plan{}; plan.index=layer; plan.context=context; plan.capacity=capacity; plan.moe=moe;
     plan.parts=parts; plan.part=part;

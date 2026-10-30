@@ -608,6 +608,19 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - **Smaller budgets:** host K/V and a smaller prefill batch come first, then partial residency.
 - **Partial residency:** the CPU computes experts beyond VRAM in F32 from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
+  - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
+    page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
+    indexers hold the whole context from the start and are laid out anew in place. A parked
+    sequence does not survive a growth; the live one and its checkpoints do.
+  - With less host memory than twice the banks, the PLE table's row cache is 1 GiB: a token reads
+    few rows and hundreds of experts.
+  - On Windows the worker asks for a working set of what its share of host memory leaves
+    (`host::keep_resident`): pages trimmed from it come back one fault at a time under the CPU's
+    expert threads.
+  - Measured at --vram 5, 262144 tokens, 32 GiB of RAM simulated (26 GiB free) on an RTX 5070 Ti and
+    a Ryzen 7 9700X (2026-10-31): 30-33 tokens/s on one topic once warm, about 60 us a CPU route
+    (AVX-512, eight threads) and 310 routes a token. A change of topic reads the experts it finds
+    missing from the drive, which holds it near 15-25 tokens/s until they are in memory.
 
 **Long-context prefill.**
 - Every fourth layer attends sparsely: an indexer scores the prompt's 4-token blocks, and each

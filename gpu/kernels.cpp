@@ -2313,6 +2313,52 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state) {
+    try {
+        auto& d = device(handle);
+        auto found = d.decoder.find(size_t(layer));
+        if (found == d.decoder.end() || decoder_linear(size_t(layer)) || !state) throw std::runtime_error("invalid Straydog K/V growth");
+        DecoderLayer& plan = found->second;
+        const size_t from = plan.context, to = size_t(capacity);
+        auto host = d.host_states.find(plan.states[0]);
+        auto index = d.allocations.find(plan.states[1]);
+        const size_t old_pool = from / 4 + 1, pool = to / 4 + 1, history = qsa_history * 128;
+        if (host == d.host_states.end() || index == d.allocations.end() || plan.parts != 1 || to <= from || to > 262144 || valid > from ||
+            index->second < (pool * 128 + history) * 4)
+            throw std::runtime_error("invalid Straydog K/V growth");
+        check(hipStreamSynchronize(d.stream));
+        if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
+        void* grown = nullptr;
+        check(hipHostMalloc(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped));
+        void* pointer = nullptr;
+        try {
+            std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
+            for (size_t plane = 0; plane < 4; ++plane)
+                std::memcpy(static_cast<float*>(grown) + plane * to * 256, static_cast<const float*>(host->second) + plane * from * 256, valid * 1024);
+            check(hipHostGetDevicePointer(&pointer, grown, 0));
+            // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
+            std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
+            check(hipMemcpy(before.data(), plan.states[1], before.size() * 4, hipMemcpyDeviceToHost));
+            for (size_t column = 0; column < 128; ++column)
+                std::copy_n(before.data() + column * old_pool, std::min(old_pool, valid / 4 + 1), after.data() + column * pool);
+            std::copy_n(before.data() + 128 * old_pool, history, after.data() + 128 * pool);
+            check(hipMemcpy(plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
+        } catch (...) { cleanup(hipHostFree(grown)); throw; }
+        // Every captured graph holds the old K/V or the old pitches.
+        kv_clear_graphs(d);
+        check(hipHostFree(host->second));
+        d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
+        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * 4);
+        std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
+        plan.states[0] = pointer; plan.context = to;
+        // (a DeltaNet layer holds no positions: its context is only what spans are checked against)
+        for (auto& entry : d.decoder) if (decoder_linear(entry.first)) entry.second.context = std::max(entry.second.context, to);
+        kv_layout(d);
+        *state = pointer;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 // Register the existing VRAM stage: one layer for prefill, all host-state prefixes for decode.
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows) {
     try {
