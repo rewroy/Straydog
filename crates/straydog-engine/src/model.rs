@@ -813,7 +813,7 @@ impl Model {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
             // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
             // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the
-            // layers up (7 in 12: 33.7). CUDA keeps none (sd_hybrid_assist).
+            // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist).
             self.group.enable_assist(4)?;
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
