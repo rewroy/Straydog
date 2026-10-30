@@ -305,6 +305,8 @@ pub struct Model {
     kv_capacity: usize,
     /// Page-locked host bytes besides the K/V.
     pinned_other: u64,
+    /// The expert banks a partially resident model reads from host memory.
+    banks_bytes: u64,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -403,6 +405,7 @@ impl Model {
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
             kv_capacity: context,
             pinned_other: checkpoint_bytes,
+            banks_bytes: 0,
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -804,7 +807,8 @@ impl Model {
                 }
             }
         }
-        crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state);
+        self.banks_bytes = banks_total;
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state, banks_total);
         if registered > 0 {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
             // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
@@ -1213,7 +1217,7 @@ impl Model {
         }
         let capacity = (positions + 4096).next_power_of_two().min(self.context);
         let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
-        crate::host::keep_resident(self.weights.host_memory_bytes, pinned);
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
         self.kv_capacity = capacity;
         Ok(())
