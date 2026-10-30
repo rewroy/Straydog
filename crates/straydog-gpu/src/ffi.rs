@@ -127,6 +127,15 @@ unsafe extern "C" {
     pub fn sd_host_unregister(pointer: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_kv_grow(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        capacity: u64,
+        valid: u64,
+        state: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_host_state(
         handle: *mut ::std::os::raw::c_void,
         bytes: u64,

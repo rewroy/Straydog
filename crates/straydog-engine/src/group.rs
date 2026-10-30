@@ -752,6 +752,16 @@ impl Group {
         Ok(Some((split, self.backends[0].prepare(&lower)?.pointer)))
     }
 
+    /// Each device's host K/V planned for `capacity` positions (see [`Backend::start_kv`]).
+    pub fn start_kv(&mut self, capacity: u64) {
+        self.backends.iter_mut().for_each(|backend| backend.start_kv(capacity));
+    }
+
+    /// Each device's host K/V grown to `capacity` positions, `valid` kept (see [`Backend::grow_kv`]).
+    pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.grow_kv(capacity, valid))
+    }
+
     /// Each device's K/V stage grown into the VRAM its placement left (see [`Backend::grow_kv_stage`]).
     pub fn grow_kv_stages(&mut self, context: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv_stage(context))
