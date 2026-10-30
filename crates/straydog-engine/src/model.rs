@@ -806,9 +806,11 @@ impl Model {
         }
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state);
         if registered > 0 {
-            // The GPU reads a few absent experts per layer over PCIe while the CPU computes the
-            // rest; both read host DRAM, so one route per layer.
-            self.group.enable_assist(1)?;
+            // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
+            // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
+            // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the
+            // layers up (7 in 12: 33.7). CUDA keeps none (sd_hybrid_assist).
+            self.group.enable_assist(4)?;
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
         self.group.attach_cpu(cpu)
