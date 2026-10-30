@@ -137,7 +137,7 @@ void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float
 }
 #if !defined(__HIPCC__)
 // The experts a layer's GPU takes over the bus, copied into VRAM's staging slots by every thread at once. A kernel reads host
-// memory as fast as it has loads in flight: 43 GB/s here, against some 7 for a GEMV's lanes walking a row a load at a time.
+// memory as fast as it has loads in flight: 43 GB/s with all of these, 7 with few (a GEMV's lanes are taken to be the latter: unmeasured).
 __global__ void hybrid_stage_assist(const MoeGroup* groups, const int32_t* selected, ExpertGemv plan) {
     const size_t step = size_t(gridDim.x) * blockDim.x, thread = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     uint32_t absent = 0, slot = 0;
