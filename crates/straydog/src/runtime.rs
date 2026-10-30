@@ -128,7 +128,8 @@ impl Activity {
         let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |time| time.as_secs_f64());
         let mut entry = json!({"time": time, "finish_reason": event["finish_reason"], "prompt_tokens": usage["prompt_tokens"],
                                "cached_tokens": usage["cached_tokens"], "completion_tokens": usage["completion_tokens"]});
-        for key in ["prefill_tokens_per_second", "decode_tokens_per_second", "ttft_seconds", "request_seconds", "resumed_from"] {
+        for key in ["prefill_tokens", "prefill_seconds", "prefill_tokens_per_second", "decode_tokens_per_second", "ttft_seconds",
+                    "request_seconds", "resumed_from"] {
             entry[key] = timings[key].clone();
         }
         let (drafted, accepted, drafters) = speculation(timings);
@@ -343,13 +344,32 @@ fn stage_name(stage: &str, total: u64) -> String {
     }
 }
 
+/// New prompt tokens from which a prefill's rate is shown: a few tokens' time is the request's fixed cost (the checkpoint
+/// plan, the last row's head, the MTP layer's pairs), and their rate says nothing of how fast a prompt is read.
+pub const PREFILL_RATE_TOKENS: u64 = 256;
+
+/// What a request's prompt read: its new tokens and their time, and their rate from PREFILL_RATE_TOKENS on.
+fn prefill_summary(usage: &Value, timings: &Value) -> String {
+    let fresh = timings["prefill_tokens"].as_u64().or_else(|| {
+        Some(usage["prompt_tokens"].as_u64()?.saturating_sub(usage["cached_tokens"].as_u64().unwrap_or(0)))
+    });
+    match (fresh, timings["prefill_seconds"].as_f64()) {
+        (Some(fresh), Some(seconds)) => {
+            let rate = if fresh >= PREFILL_RATE_TOKENS && seconds > 0.0 { format!(" ({:.0} tok/s)", fresh as f64 / seconds) } else { String::new() };
+            format!("new {fresh} in {:.0} ms{rate}", seconds * 1e3)
+        }
+        (Some(fresh), None) => format!("new {fresh}"),
+        _ => "new -".into(),
+    }
+}
+
 /// One line per finished generation: what was read, what was reused, how fast.
 pub fn request_summary(event: &Value) -> String {
     let (usage, timings) = (&event["usage"], &event["timings"]);
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}){}, prefill {} tok/s, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -364,7 +384,7 @@ pub fn request_summary(event: &Value) -> String {
                                     timings["image_seconds"].as_f64().unwrap_or(0.0)),
             None => String::new(),
         },
-        number(&timings["prefill_tokens_per_second"], 0),
+        prefill_summary(usage, timings),
         number(&timings["ttft_seconds"], 2),
         // (of which restoring a checkpoint and saving the request's: copies of the whole state)
         match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
@@ -1251,6 +1271,18 @@ mod tests {
         let mut plain = ready.clone();
         plain["placement"]["dspark"] = Value::Null;
         assert!(!ready_summary(&plain).contains("DSpark"));
+    }
+
+    /// A request's prompt reads as its new tokens and their time, with a rate only for a prompt worth one.
+    #[test]
+    fn the_summary_gives_a_prompts_new_tokens_and_their_time() {
+        let short = json!({"event": "done", "usage": {"prompt_tokens": 997, "cached_tokens": 968},
+                           "timings": {"prefill_tokens": 29, "prefill_seconds": 0.108, "ttft_seconds": 0.11}});
+        let summary = request_summary(&short);
+        assert!(summary.contains("(reused 968 from -), new 29 in 108 ms, first token 0.11 s"), "{summary}");
+        let long = json!({"event": "done", "usage": {"prompt_tokens": 20028, "cached_tokens": 0},
+                          "timings": {"prefill_tokens": 20028, "prefill_seconds": 5.84, "ttft_seconds": 5.86}});
+        assert!(request_summary(&long).contains("new 20028 in 5840 ms (3429 tok/s), first token 5.86 s"), "{}", request_summary(&long));
     }
 
     /// A request that verified drafts says how many were kept, and how many of them DSpark's.

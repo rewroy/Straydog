@@ -17,7 +17,7 @@ const STRINGS = {
     lastRequest: "last request", cached: "from cache", off: "off", throughput: "Speed", idle: "Idle",
     prefilling: "Prefilling", decoding: "Generating", preparing: "Starting", queued: "{0} waiting",
     lastAt: "last request at {0}", requests: "Requests", decodePerRequest: "Decode tok/s",
-    prefillPerRequest: "Prefill tok/s", peak: "peak {0}", noRequests: "No requests yet. Open the chat and ask something.",
+    prefillPerRequest: "Prefill tok/s (256+ new tokens)", newTokens: "{0} new tokens", peak: "peak {0}", noRequests: "No requests yet. Open the chat and ask something.",
     chat: "Chat", effort: "Reasoning", effortNone: "none", effortLow: "low", effortMedium: "medium", effortHigh: "high",
     temperature: "Temp", maxTokens: "Max", auto: "auto", clear: "Clear", send: "Send", stop: "Stop",
     expand: "Expand", close: "Close",
@@ -57,7 +57,7 @@ const STRINGS = {
     lastRequest: "直近のリクエスト", cached: "キャッシュ", off: "オフ", throughput: "処理速度", idle: "待機中",
     prefilling: "プレフィル中", decoding: "生成中", preparing: "開始中", queued: "{0} 件待ち",
     lastAt: "直近 {0}", requests: "リクエスト", decodePerRequest: "デコード tok/s",
-    prefillPerRequest: "プレフィル tok/s", peak: "最大 {0}", noRequests: "まだリクエストがありません。チャットを開いて話しかけてみてください。",
+    prefillPerRequest: "プレフィル tok/s（新256トークン以上）", newTokens: "新 {0} トークン", peak: "最大 {0}", noRequests: "まだリクエストがありません。チャットを開いて話しかけてみてください。",
     chat: "チャット", effort: "思考", effortNone: "なし", effortLow: "低", effortMedium: "中", effortHigh: "高",
     temperature: "温度", maxTokens: "上限", auto: "自動", clear: "消去", send: "送信", stop: "停止",
     expand: "広げる", close: "閉じる",
@@ -637,7 +637,23 @@ speedChart.onAxes = (maxima) => {
 
 // A request that generated at most one token has no decode rate.
 const decodeRate = (entry) => (entry.completion_tokens > 1 ? entry.decode_tokens_per_second : null);
-const prefillRate = (entry) => (entry.prompt_tokens > entry.cached_tokens ? entry.prefill_tokens_per_second : null);
+// A prompt's new tokens and their time; their rate only from 256 on (a few tokens' time is the request's fixed cost).
+const PREFILL_RATE_TOKENS = 256;
+const prefillFresh = (entry) => entry.prefill_tokens ?? Math.max(0, entry.prompt_tokens - entry.cached_tokens);
+const prefillMs = (entry) => (Number.isFinite(entry.prefill_seconds) ? entry.prefill_seconds * 1000 : null);
+const prefillRate = (entry) => {
+  const fresh = prefillFresh(entry);
+  if (fresh < PREFILL_RATE_TOKENS) return null;
+  return entry.prefill_seconds > 0 ? fresh / entry.prefill_seconds : entry.prefill_tokens_per_second ?? null;
+};
+// "新 29 トークン · 108 ms" (with the rate from 256 tokens on), or "cached".
+const prefillText = (entry) => {
+  const fresh = prefillFresh(entry);
+  if (!fresh) return t("cached");
+  const ms = prefillMs(entry), rate = prefillRate(entry);
+  return [t("newTokens", number(fresh)), ms === null ? null : `${number(ms)} ms`, rate === null ? null : `${number(rate)} tok/s`]
+    .filter(Boolean).join(" · ");
+};
 // Speculative acceptance: the drafts kept of the drafts verified, whichever drafters made them.
 const acceptance = (entry) => (entry.drafted_tokens > 0 ? percent(entry.accepted_tokens, entry.drafted_tokens) : null);
 const drafterName = (kind) => ({ dspark: t("dspark"), lookup: t("lookup"), mtp: t("mtpName") })[kind] || kind;
@@ -689,9 +705,8 @@ function renderSpeed(activity, ready, queued, sample) {
   const last = activity.recent.at(-1);
   $("decode-value").textContent = number(decodeNow ?? (last ? decodeRate(last) : null), 1);
   $("decode-note").textContent = decodeNow !== null ? t("live") : last ? t("lastRequest") : "";
-  const prefill = last ? prefillRate(last) : null;
-  $("prefill-value").textContent = number(prefill);
-  $("prefill-note").textContent = last ? (prefill === null ? t("cached") : t("lastRequest")) : "";
+  $("prefill-value").textContent = number(last && prefillFresh(last) ? prefillMs(last) : null);
+  $("prefill-note").textContent = last ? prefillText(last) : "";
   $("ttft-value").textContent = number(last?.ttft_seconds, 2);
   $("ttft-note").textContent = last ? t("lastRequest") : "";
   $("speculative-value").textContent = number(last ? acceptance(last) : null);
@@ -776,7 +791,7 @@ function showTooltip(event) {
   facts(list, [
     [t("prompt"), `${number(entry.prompt_tokens)} (${t("cached")} ${number(entry.cached_tokens)})`],
     [t("completion"), number(entry.completion_tokens)],
-    [t("prefill"), prefillRate(entry) === null ? t("cached") : `${number(prefillRate(entry))} tok/s`],
+    [t("prefill"), prefillText(entry)],
     [t("decode"), decodeRate(entry) === null ? "—" : `${number(decodeRate(entry), 1)} tok/s`],
     [t("ttft"), `${number(entry.ttft_seconds, 2)} s`],
     accepted === null ? null : [t("acceptance"), `${number(accepted)}% (${drafterShares(entry)})`],
