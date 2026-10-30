@@ -342,11 +342,12 @@ A constrained reply takes no drafts.
   - Greedy decoding loops with Qwen3.8, so it is never the default.
 - **Qwen's tool calls read back** (`reply.rs`). Well-formed markup is read as the template writes it. Otherwise
   `ToolCallSplitter::repair` keeps what the model meant, since calls left in the answer end an agent's run: prose
-  after or between calls goes to the answer, a close left out is supplied when the model ended the reply (never when a
-  token limit or stop string did: a write of half a file must not run), an unreadable block among others is dropped,
+  after or between calls goes to the answer, a close left out is supplied, an unreadable block among others is dropped,
   and a block of JSON (`{"name", "arguments"}`) is a call. A value may hold `</parameter>`: it ends at the first one the
   markup goes on from. A closing tag left outside a block, or a block open where another opens, may be a value quoting
-  markup: the whole is released as text, visibly, not run cut short. The log counts repairs and text released.
+  markup: the whole is released as text, visibly, not run cut short. A reply a token limit or stop string ended is not
+  repaired at all (it may stop inside a value quoting closes: a write of half a file must not run). The log counts repairs
+  and text released.
 - **Constrained decoding** (`constraint.rs`). After the reasoning (`</think>`):
   - a JSON `response_format` holds the answer to a JSON value the schema allows, racing a tool
     call's opening when tools may be called;

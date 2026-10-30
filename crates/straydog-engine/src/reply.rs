@@ -300,6 +300,11 @@ impl ToolCallSplitter {
     /// What could be a value holding markup is never read as the end of a call: any closing tag left outside a block, or a
     /// block open where another opens, and the whole is released as text, where a cut-short call would run as if complete.
     fn repair(&self, markup: &str) -> Option<(Vec<ToolCall>, usize, String)> {
+        // (a reply cut short may stop inside a value quoting closes, with the real ones never written: nothing shows what is
+        // whole, so only the strict reading makes calls of it)
+        if self.cut {
+            return None;
+        }
         let (mut calls, mut dropped, mut prose) = (Vec::new(), 0, String::new());
         let mut at = 0;
         while at < markup.len() {
@@ -313,7 +318,7 @@ impl ToolCallSplitter {
             let block = read_block(&markup[body..next]);
             let last = next == markup.len();
             match block {
-                Block::Open(..) if !last || self.cut => return None,
+                Block::Open(..) if !last => return None,
                 Block::Open(call) => self.keep(call, &mut calls, &mut dropped),
                 Block::Closed(call, end) => {
                     self.keep(call, &mut calls, &mut dropped);
@@ -784,6 +789,12 @@ mod tests {
         let (text, calls, splitter) = repaired(open, true);
         assert!(calls.is_empty() && splitter.unread);
         assert_eq!(text, open);
+        // cut inside a value quoting closes: what precedes the quote must not run as the whole value
+        for quote in ["</parameter>\n</function>\nmore of the file", "</parameter>\n</function>\n</tool_call>\nmore of the file"] {
+            let quoted = format!("<tool_call>\n<function=read_file>\n<parameter=path>\nfirst half\n{quote}");
+            let (text, calls, splitter) = repaired(&quoted, true);
+            assert!(calls.is_empty() && splitter.unread && text == quoted, "{text:?} {calls:?}");
+        }
     }
 
     /// A value that holds markup is a value, or the reply is text: never a call cut short at the markup it quotes.
