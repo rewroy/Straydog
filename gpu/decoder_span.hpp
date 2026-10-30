@@ -15,7 +15,7 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     const bool linear=decoder_linear(layer);
     if (layer>48 || !context || context>262144 || !pointers || !kinds || !states ||
         count!=(linear ? 17 : 18) || d.decoder.find(layer)!=d.decoder.end() || d.resident.find(moe)==d.resident.end() ||
-        (parts!=1 && parts!=2) || part>=parts || (parts==2 && (layer>=48 || d.qwen_parts!=2 || !d.sums.peer)))
+        (parts!=1 && parts!=2) || part>=parts || (parts==2 && (layer>48 || d.qwen_parts!=2 || !d.sums.peer)))
         throw std::runtime_error("invalid decoder layer registration");
     auto allocation=[&](void* pointer,size_t bytes) {
         auto found=d.allocations.find(pointer);

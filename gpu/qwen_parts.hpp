@@ -342,7 +342,7 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
 // them waits for both devices (a batch's spans then run with no host round trip between them).
 void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t position, size_t steps, const float* input,
                         float* output, size_t output_rows) {
-    if (begin >= end || end > 48 || !steps || steps > 4096 || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
+    if (begin >= end || end > 49 || !steps || steps > 4096 || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
         a.sums.peer != &b || b.sums.peer != &a)
         throw std::runtime_error("invalid prefill span of parts");
     Device* sides[2] = {&a, &b};

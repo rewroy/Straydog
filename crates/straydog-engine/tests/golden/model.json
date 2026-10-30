@@ -15,10 +15,10 @@
    },
    "resident": true,
    "partial": false,
-   "host_kv": true,
+   "host_kv": false,
    "prefill_batch_size": 4096,
    "speculative": 3,
-   "state_bytes": 1805724160,
+   "state_bytes": 60893696,
    "requests": [
     {
      "name": "root",
@@ -25416,7 +25416,7 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 2,
+      "drafted_tokens": 3,
       "accepted_tokens": 2
      },
      "logits": [

@@ -558,7 +558,18 @@ impl Model {
         let name = |suffix: &str| format!("{prefix}{suffix}");
         let p = part as u64;
         let mut operands = self.hc_operands(&name("hc_attn"))?;
-        if layer % 4 != 3 {
+        // (the MTP layer's float projections go up as Q8_0, as whole: crate::weights::drafter_quantized)
+        fn q8(operand: Operand<'_>) -> Operand<'_> {
+            let float = matches!(operand.kind, 0 | 1 | 30);
+            match operand.data {
+                Data::Gather(pieces) if float && crate::weights::drafter_quantized(operand.key.split(':').next().unwrap_or(""))
+                    && operand.cols.is_multiple_of(32) =>
+                    Operand { key: format!("{}:q8", operand.key), data: Data::QuantizeGather(pieces, operand.kind), kind: 8,
+                              rows: operand.rows, cols: operand.cols },
+                data => Operand { data, ..operand },
+            }
+        }
+        if layer % 4 != 3 && layer < 48 {
             let values = |width: u64| -> Vec<(u64, u64)> { (0..3).map(|c| ((16 * c + 8 * p) * width, 8 * width)).collect() };
             let mut qkv = vec![(1024 * p, 1024), (2048 + 1024 * p, 1024)];
             qkv.extend(values(128).into_iter().map(|(first, count)| (4096 + first, count)));
@@ -572,12 +583,12 @@ impl Model {
             operands.push(self.part_values(&name("ssm_a"), part, &values(1))?);
             operands.push(self.vector(&name("ssm_norm.weight"), None)?);
         } else {
-            operands.push(self.part_rows(&name("attn_q.weight"), part, &[(6144 * p, 6144)], 6144, 2560)?);
-            operands.push(self.part_rows(&name("attn_k.weight"), part, &[(256 * p, 256)], 256, 2560)?);
-            operands.push(self.part_rows(&name("attn_v.weight"), part, &[(256 * p, 256)], 256, 2560)?);
+            operands.push(q8(self.part_rows(&name("attn_q.weight"), part, &[(6144 * p, 6144)], 6144, 2560)?));
+            operands.push(q8(self.part_rows(&name("attn_k.weight"), part, &[(256 * p, 256)], 256, 2560)?));
+            operands.push(q8(self.part_rows(&name("attn_v.weight"), part, &[(256 * p, 256)], 256, 2560)?));
             operands.push(self.q8_projection(&name("indexer.q_proj.weight"))?);
             operands.push(self.q8_projection(&name("indexer.k_proj.weight"))?);
-            operands.push(self.part_columns(&name("attn_output.weight"), part, &[(3072 * p, 3072)], 2560, 6144)?);
+            operands.push(q8(self.part_columns(&name("attn_output.weight"), part, &[(3072 * p, 3072)], 2560, 6144)?));
             for norm in ["attn_q_norm.weight", "attn_k_norm.weight", "indexer.q_norm.weight", "indexer.k_norm.weight"] {
                 operands.push(self.vector(&name(norm), None)?);
             }
@@ -775,7 +786,7 @@ impl Model {
     /// `register`, once the sequence state exists, also create the layers' native plans.
     fn prepare_decoder(&mut self, context: u64, register: bool) -> Result<()> {
         for layer in self.weights.layers() {
-            if self.group.parts() && layer < 48 {
+            if self.group.parts() && (layer < 48 || self.group.mtp_parts()) {
                 for part in 0..2 {
                     // SAFETY of the borrow: operands point into the weights, which outlive the group.
                     let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(self.part_operands(layer, part)?) };
@@ -1200,8 +1211,12 @@ impl Model {
                 return Ok(None);
             };
             if self.speculative > 0 {
-                if self.deferred {
+                if self.deferred || self.group.mtp_parts() {
+                    // (the MTP layer in parts reads the rows both devices kept, deferred or not)
                     self.mtp_prompt_kept(tokens, previous)?;
+                    if !self.deferred {
+                        self.mtp_kept = 0;
+                    }
                 } else if stash {
                     self.mtp_prompt_resident(tokens, previous)?;
                 } else {
@@ -1337,7 +1352,7 @@ impl Model {
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
             let rows = match last {
                 48 if !keep_rows => 0,
-                48 => if self.speculative > 0 && !stash && !self.deferred { steps } else { 1 },
+                48 => if self.speculative > 0 && !stash && !self.deferred && !self.group.mtp_parts() { steps } else { 1 },
                 _ => 0,
             };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;

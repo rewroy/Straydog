@@ -630,8 +630,17 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         head_top_merge<<<unsigned(steps), 32, 0, d.stream>>>(ranked, received + 64, uint32_t(split), top_count, merged);
     }
     check(hipGetLastError());
-    finish_with_helper(d);
-    Piece pieces[4 + 2 * verify_max]; size_t count = 0;
+    // (finish_with_helper's waits with the read-back's: both links' counters ride along, the peer's queued after its part, where
+    // peer_settle read each with a blocking copy after the streams' waits: a draft step's head ended 0.13 ms after its last
+    // kernel, now 0.06)
+    uint32_t counters[2][8] = {};
+    uint8_t* peer_counters = nullptr;
+    on_device(peer->ordinal, [&]() {
+        peer_counters = io_slot(*peer, 32);
+        check(hipMemcpyAsync(peer_counters, peer->link.counters, 32, hipMemcpyDeviceToHost, peer->stream));
+    });
+    Piece pieces[5 + 2 * verify_max]; size_t count = 0;
+    pieces[count++] = {counters[0], d.link.counters, 32};
     if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
     pieces[count++] = {tokens, final_tokens, steps * 4};
     if (confidence) pieces[count++] = {confidence, top + 2 * verify_max, steps * 4};
@@ -642,6 +651,13 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
             pieces[count++] = {logits + row * vocabulary + split, d.output + row * (vocabulary - split), (vocabulary - split) * 4};
         }
     download_pieces(d, pieces, count);
+    check(hipStreamSynchronize(d.helper_stream));
+    on_device(peer->ordinal, [&]() {
+        check(hipStreamSynchronize(peer->stream)); check(hipStreamSynchronize(peer->helper_stream));
+        std::memcpy(counters[1], peer_counters, 32);
+        peer->io_used = 0;   // (its stream is idle: download's)
+    });
+    peer_counters_check(d, counters);
 }
 
 __global__ void mtp_norm(const float* input, size_t width, const float* weight, float* output) {
@@ -709,17 +725,14 @@ void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t ste
     download(d, output, mtp_prologue_hidden(d, steps), steps * 10240 * 4);
 }
 
-// One drafting step with the host in none of its stages: the MTP layer's prologue over `embeddings` and the hidden rows,
-// the layer itself (`layer`), and when `head` is given the vocabulary head on the layer's last row, whose token and
-// probability come back. The hidden rows come from the host, or (`hidden` null, one row) are the last of the `previous`
-// rows the layer's last step left in its workspace: a chain of steps reads nothing back until its token.
-void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer, size_t position, size_t steps,
-                const float* embeddings, const float* hidden, size_t previous,
-                void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
-                int32_t* token, float* confidence) {
+// A drafting step's MTP layer with nothing waited for: the prologue over `embeddings` and the hidden rows, then the layer
+// (`layer`) on them. The hidden rows come from the host, or (`hidden` null, one row) are the last of the `previous` rows the
+// layer's last step left in its workspace. A layer in parts is queued on this device alone: the host queues the other's too.
+// Returns the layer's rows; `parts` as verify_span_queue's.
+float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer, size_t position, size_t steps,
+                   const float* embeddings, const float* hidden, size_t previous, bool& parts) {
     auto found = d.decoder.find(layer);
-    if (!embeddings || found == d.decoder.end() || (!hidden && (steps != 1 || !previous || previous > verify_max)) ||
-        (head && (!head_kinds || !token || !confidence)))
+    if (!embeddings || found == d.decoder.end() || (!hidden && (steps != 1 || !previous || previous > verify_max)))
         throw std::runtime_error("invalid drafting step");
     mtp_prologue_check(d, mtp, mtp_kinds, steps);
     upload(d, mtp_prologue_embeddings(d), embeddings, steps * 2560 * 4);
@@ -728,14 +741,12 @@ void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer,
     else check(hipMemcpyAsync(rows, verify_layout(found->second.workspace).hidden + (previous - 1) * 10240, 10240 * 4,
                               hipMemcpyDeviceToDevice, d.stream));
     mtp_prologue_device(d, mtp, mtp_kinds, steps);
-    bool parts = false;
-    float* output = verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
-    if (!head) {
-        if (parts) finish_with_helper(d);
-        else check(hipStreamSynchronize(d.stream));
-        return;
-    }
-    const float* last = output + (steps - 1) * 10240;
+    return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
+}
+// The vocabulary head on a draft's row `last` (on this device), its token and probability back.
+void draft_head(Device& d, void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
+                const float* last, bool parts, int32_t* token, float* confidence) {
+    if (!head || !head_kinds || !token || !confidence) throw std::runtime_error("invalid drafting step");
     int32_t token_row[verify_max];
     float confidence_row[verify_max];
     // (a draft's vocabulary, sd_draft_vocabulary: the extra tokens' rows here, the head's first rows split so that both devices
@@ -752,6 +763,22 @@ void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer,
         if (parts) finish_with_helper(d);
     }
     *token = token_row[0]; *confidence = confidence_row[0];
+}
+// One drafting step with the host in none of its stages: draft_queue, and when `head` is given the vocabulary head on the
+// layer's last row, whose token and probability come back. A chain of steps reads nothing back until its token.
+void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer, size_t position, size_t steps,
+                const float* embeddings, const float* hidden, size_t previous,
+                void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
+                int32_t* token, float* confidence) {
+    if (head && (!head_kinds || !token || !confidence)) throw std::runtime_error("invalid drafting step");
+    bool parts = false;
+    float* output = draft_queue(d, mtp, mtp_kinds, layer, position, steps, embeddings, hidden, previous, parts);
+    if (!head) {
+        if (parts) finish_with_helper(d);
+        else check(hipStreamSynchronize(d.stream));
+        return;
+    }
+    draft_head(d, head, head_kinds, vocabulary, split, peer_head, output + (steps - 1) * 10240, parts, token, confidence);
 }
 
 // The PLE layer after a verification's first layer, with no wait between them: `layer`'s verified rows (still in its

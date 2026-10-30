@@ -30,6 +30,8 @@ pub struct Group {
     linked: bool,
     /// Every layer but the MTP layer split across the two devices (see [`Group::enable_parts`]).
     parts: bool,
+    /// The MTP layer split as well: a draft step on both devices.
+    mtp_parts: bool,
 }
 
 /// Where a layer tensor goes when the layers are in parts: halves (rows or columns of its heads, of the shared expert's width), or
@@ -79,7 +81,7 @@ impl Group {
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
-        let mut group = Group { backends, starts, baseline, split_mode, linked: false, parts: false };
+        let mut group = Group { backends, starts, baseline, split_mode, linked: false, parts: false, mtp_parts: false };
         group.assign_roles()?;
         Ok(group)
     }
@@ -111,9 +113,9 @@ impl Group {
         Ok(true)
     }
 
-    /// Split every layer but the MTP layer across the two devices (gpu/qwen_parts.hpp): both run each layer, each its half
-    /// of the heads and routed experts. Under expert parallelism of two RDNA4 GPUs that write each other's VRAM; before
-    /// anything is placed. `STRAYDOG_PARTS=0` keeps the layers whole.
+    /// Split every layer across the two devices (gpu/qwen_parts.hpp): both run each layer, each its half of the heads and
+    /// routed experts. Under expert parallelism of two RDNA4 GPUs that write each other's VRAM; before anything is placed.
+    /// `STRAYDOG_PARTS=0` keeps the layers whole, `STRAYDOG_MTP_PARTS=0` the MTP layer (on the second device).
     pub fn enable_parts(&mut self) -> Result<bool> {
         if !self.expert_parallel()? || std::env::var("STRAYDOG_PARTS").is_ok_and(|value| value == "0") {
             return Ok(false);
@@ -126,6 +128,12 @@ impl Group {
             }
         }
         self.parts = true;
+        self.mtp_parts = std::env::var("STRAYDOG_MTP_PARTS").map_or(true, |value| value != "0");
+        for backend in &mut self.backends {
+            backend.mtp_parts = self.mtp_parts;
+        }
+        // (each device then keeps a deferred prompt's MTP rows: both run its pairs)
+        self.backends[0].keeps_mtp_rows = self.mtp_parts;
         Ok(true)
     }
 
@@ -133,14 +141,27 @@ impl Group {
     pub fn disable_parts(&mut self) -> Result<()> {
         for backend in &mut self.backends {
             backend.set_parts(1, 0)?;
+            backend.mtp_parts = false;
         }
+        self.backends[0].keeps_mtp_rows = false;
         self.parts = false;
+        self.mtp_parts = false;
         Ok(())
     }
 
     /// Whether the layers are in parts (see [`Group::enable_parts`]).
     pub fn parts(&self) -> bool {
         self.parts
+    }
+
+    /// Whether the MTP layer is in parts as well (see [`Group::enable_parts`]).
+    pub fn mtp_parts(&self) -> bool {
+        self.mtp_parts
+    }
+
+    /// Whether `key`'s tensor belongs to a layer in parts.
+    fn parted(&self, key: &str) -> bool {
+        self.parts && (layer_of(key) < 48 || (self.mtp_parts && key.starts_with("blk.48.")))
     }
 
     /// Routed experts [first, first + count) device `index` holds under expert parallelism.
@@ -260,13 +281,13 @@ impl Group {
         let parallel = self.expert_parallel()?;
         for (key, size) in requirements {
             let layer = layer_of(key);
-            if parallel && layer < 48 && key.ends_with("_exps.weight") {
+            if parallel && (layer < 48 || self.parted(key)) && key.ends_with("_exps.weight") {
                 for (index, group) in groups.iter_mut().enumerate() {
                     *group += size * Self::expert_half(index, 512).1 / 512;
                 }
                 continue;
             }
-            if self.parts && layer < 48 {
+            if self.parted(key) {
                 match Share::of(key) {
                     Share::Halves => groups.iter_mut().for_each(|group| *group += size / 2),
                     Share::Both => groups.iter_mut().for_each(|group| *group += size),
@@ -287,10 +308,10 @@ impl Group {
     }
 
     /// Pin each layer's expert banks on its owner, or half of them on each GPU. The MTP
-    /// layer keeps its experts whole: it drafts one row at a time.
+    /// layer keeps its experts whole unless it is in parts.
     pub fn register_resident_moe(&mut self, prefix: &str, operands: &[Operand], experts: u64) -> Result<()> {
         let owner = self.index(prefix);
-        if !self.expert_parallel()? || layer_of(prefix) >= 48 {
+        if !self.expert_parallel()? || (layer_of(prefix) >= 48 && !self.parted(prefix)) {
             return self.backends[owner].register_resident_moe(prefix, operands, experts, 0, experts, true, false);
         }
         if !self.linked {
@@ -330,7 +351,13 @@ impl Group {
     fn shared_half<'a>(operands: &[Operand<'a>], part: u64) -> Result<Vec<Operand<'a>>> {
         let mut half = Vec::with_capacity(3);
         for (role, operand) in operands.iter().enumerate() {
-            let crate::gpu::Data::Bytes(bytes) = operand.data else { return Err("invalid Straydog shared expert".into()) };
+            // (the MTP layer's float matrices quantized as they upload, Model::q8_projection: halves of their own bytes)
+            let (bytes, source) = match operand.data {
+                crate::gpu::Data::Bytes(bytes) => (bytes, None),
+                crate::gpu::Data::Quantize(bytes, kind) => (bytes, Some(kind)),
+                _ => return Err("invalid Straydog shared expert".into()),
+            };
+            let kind = source.unwrap_or(operand.kind);
             let pitch = bytes.len() as u64 / operand.rows;
             let key = format!("{}:half{part}", operand.key);
             if role < 2 {
@@ -338,15 +365,20 @@ impl Group {
                     return Err("invalid Straydog shared expert".into());
                 }
                 let rows = &bytes[(320 * part * pitch) as usize..(320 * (part + 1) * pitch) as usize];
-                half.push(Operand::bytes(key, rows, operand.kind, 320, operand.cols));
+                let data = source.map_or(crate::gpu::Data::Bytes(rows), |kind| crate::gpu::Data::Quantize(rows, kind));
+                half.push(Operand { key, data, kind: operand.kind, rows: 320, cols: operand.cols });
             } else {
-                let width = crate::formats::matrix_bytes(operand.kind, 1, 320).ok_or("Straydog shared expert columns do not fill blocks")? as u64;
+                let width = crate::formats::matrix_bytes(kind, 1, 320).ok_or("Straydog shared expert columns do not fill blocks")? as u64;
                 if operand.cols != 640 || pitch != 2 * width {
                     return Err("invalid Straydog shared expert".into());
                 }
                 let columns = crate::gpu::Columns { pitch, first: part * width, width, to_pitch: width };
-                half.push(Operand { key, data: crate::gpu::Data::Gather(vec![crate::gpu::Piece { source: bytes, at: 0, columns: Some(columns) }]),
-                                    kind: operand.kind, rows: operand.rows, cols: 320 });
+                let pieces = vec![crate::gpu::Piece { source: bytes, at: 0, columns: Some(columns) }];
+                let data = match source {
+                    None => crate::gpu::Data::Gather(pieces),
+                    Some(kind) => crate::gpu::Data::QuantizeGather(pieces, kind),
+                };
+                half.push(Operand { key, data, kind: operand.kind, rows: operand.rows, cols: 320 });
             }
         }
         Ok(half)
@@ -392,7 +424,7 @@ impl Group {
 
     /// Whether [begin, end) are layers in parts, run on both devices.
     fn in_parts(&self, begin: usize, end: usize) -> bool {
-        self.parts && begin < end && end <= 48
+        self.parts && begin < end && (end <= 48 || (self.mtp_parts && (begin, end) == (48, 49)))
     }
 
     /// `first` on the first device and `second` on the second at once, from two threads: queueing a pass's span takes the host
@@ -443,10 +475,10 @@ impl Group {
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
         if self.in_parts(begin, end) {
-            if values.is_some() || !(2..=4096).contains(&steps) {
+            if !(2..=4096).contains(&steps) {
                 return Err("invalid Straydog prefill span of parts".into());
             }
-            return crate::gpu::prefill_parts(&self.backends[0], &self.backends[1], begin, end, position, steps, output_rows);
+            return crate::gpu::prefill_parts(&self.backends[0], &self.backends[1], begin, end, position, steps, values, output_rows);
         }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].prefill_layers(begin, end, values, position, steps, output_rows)
@@ -465,7 +497,7 @@ impl Group {
     /// layer's being the last.
     pub fn mtp_stash(&self) -> bool {
         let mtp = self.owner(48);
-        mtp == self.backends.len() - 1 && self.owner(0) != mtp
+        !self.mtp_parts && mtp == self.backends.len() - 1 && self.owner(0) != mtp
     }
 
     /// One batch of prompt pairs for the MTP layer, the rows waiting in the first layer's
@@ -503,6 +535,9 @@ impl Group {
     }
 
     pub fn mtp_keep(&mut self, steps: u64, previous: u64, host: Option<&[f32]>) -> Result<()> {
+        if self.mtp_parts {
+            return self.backends.iter_mut().try_for_each(|backend| backend.mtp_keep(steps, previous, host));
+        }
         let mtp = self.owner(48);
         self.backends[mtp].mtp_keep(steps, previous, host)
     }
@@ -514,12 +549,27 @@ impl Group {
     }
 
     pub fn mtp_embed(&mut self, embeddings: &[f32]) -> Result<()> {
+        if self.mtp_parts {
+            return self.backends.iter_mut().try_for_each(|backend| backend.mtp_embed(embeddings));
+        }
         let mtp = self.owner(48);
         self.backends[mtp].mtp_embed(embeddings)
     }
 
     pub fn mtp_prompt_kept(&mut self, operands: &[Operand], row: u64, offset: u64, count: u64, position: u64)
                            -> Result<()> {
+        if self.mtp_parts {
+            // (each device's prologue leaves the pairs in its part's workspace; the layer then runs on both)
+            for backend in &mut self.backends {
+                backend.mtp_prompt_kept(operands, row, offset, count, position)?;
+            }
+            if count > 1 {
+                return self.prefill_layers(48, 49, None, position, count, 0).map(drop);
+            }
+            self.on_both(|backend| backend.verify_queue_rows(48, 49, None, 1, position),
+                         |backend| backend.verify_queue_rows(48, 49, None, 1, position))?;
+            return crate::gpu::parts_settle(&self.backends[0], &self.backends[1]);
+        }
         let mtp = self.owner(48);
         self.backends[mtp].mtp_prompt_kept(operands, row, offset, count, position)
     }
@@ -722,13 +772,25 @@ impl Group {
         self.backends[last].mtp_prologue(operands, embeddings, hidden)
     }
 
-    /// One drafting step on the MTP layer's device (see [`Backend::draft_step`]): the prologue's four operands, then the
-    /// head's four when a token is wanted. The head's lower half of the vocabulary runs on the first GPU, as in
-    /// [`Group::output_head`].
+    /// One drafting step on the MTP layer's device, or on both when it is in parts (see [`Backend::draft_step`],
+    /// [`Backend::draft_queue`]): the prologue's four operands, then the head's four when a token is wanted. The head's lower
+    /// half of the vocabulary runs on the first GPU, as in [`Group::output_head`].
     pub fn draft_step(&mut self, operands: &[Operand], position: u64, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64)
                       -> Result<Option<(i32, f32)>> {
         let last = self.backends.len() - 1;
         let lower = if operands.len() == 8 { self.pin_head(&operands[7])? } else { None };
+        if self.mtp_parts {
+            // The layer's parts queued on both, then the head on the second's rows.
+            let prologue = &operands[..4];
+            self.on_both(|backend| backend.draft_queue(prologue, 48, position, embeddings, hidden, previous),
+                         |backend| backend.draft_queue(prologue, 48, position, embeddings, hidden, previous))?;
+            if operands.len() == 8 {
+                let steps = hidden.map_or(1, |hidden| hidden.len() / crate::gpu::WIDTH) as u64;
+                return self.backends[last].draft_head(&operands[4..], 48, steps - 1, lower).map(Some);
+            }
+            crate::gpu::parts_settle(&self.backends[0], &self.backends[1])?;
+            return Ok(None);
+        }
         self.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, lower)
     }
 
@@ -792,7 +854,7 @@ impl Group {
     }
 
     fn owned_layers(&self, index: usize, drafter: bool) -> Vec<usize> {
-        (0..if drafter { 49 } else { 48 }).filter(|layer| self.owner(*layer) == index || (self.parts && *layer < 48)).collect()
+        (0..if drafter { 49 } else { 48 }).filter(|layer| self.owner(*layer) == index || self.parted(&format!("blk.{layer}."))).collect()
     }
 
     /// Reserve each layer's state on its owner (and the MTP layer's) before accepting
