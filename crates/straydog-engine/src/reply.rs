@@ -181,8 +181,14 @@ pub struct ToolCallSplitter {
     markup: Option<String>,
     line_start: bool,
     format: Markup,
-    /// Malformed tool calls [`ToolCallSplitter::finish`] dropped (DSML's: see `parse_dsml`).
+    /// Malformed tool calls [`ToolCallSplitter::finish`] dropped (see `parse_dsml`, `ToolCallSplitter::repair`).
     pub dropped: usize,
+    /// The text ended before the model did (a token limit, a stop string): a call left open is not a call.
+    pub cut: bool,
+    /// [`ToolCallSplitter::finish`] read Qwen's calls only by repairing their markup.
+    pub repaired: bool,
+    /// [`ToolCallSplitter::finish`] released markup that held no call it could read, as text.
+    pub unread: bool,
 }
 
 fn is_string_schema(schema: Option<&Value>) -> bool {
@@ -227,6 +233,9 @@ impl ToolCallSplitter {
             line_start: true,
             format,
             dropped: 0,
+            cut: false,
+            repaired: false,
+            unread: false,
         }
     }
 
@@ -263,16 +272,85 @@ impl ToolCallSplitter {
         let carry = std::mem::take(&mut self.carry);
         let Some(markup) = self.markup.take() else { return (carry, Vec::new()) };
         let parsed = match self.format {
-            Markup::Qwen => self.parse(&markup).map(|calls| (calls, 0)),
-            Markup::Dsml => parse_dsml(&markup),
+            Markup::Qwen => match self.parse(&markup) {
+                Some(calls) => Some((calls, 0, String::new())),
+                None => {
+                    let repaired = self.repair(&markup);
+                    self.repaired = repaired.is_some();
+                    repaired
+                }
+            },
+            Markup::Dsml => parse_dsml(&markup).map(|(calls, dropped)| (calls, dropped, String::new())),
         };
         match parsed {
-            Some((calls, dropped)) => {
+            Some((calls, dropped, prose)) => {
                 self.dropped = dropped;
-                (carry, calls)
+                (carry + &prose, calls)
             }
-            None => (carry + &markup, Vec::new()),
+            None => {
+                self.unread = true;
+                (carry + &markup, Vec::new())
+            }
         }
+    }
+
+    /// Qwen's calls from markup [`ToolCallSplitter::parse`] refuses, the model's slips the reference reads as no call at all
+    /// (its calls then reach the client as answer text, which ends an agent's run): prose after or between the calls (the
+    /// answer's), a close left out, a block it cannot read among others (dropped), a block of JSON. (calls, dropped, prose).
+    /// What could be a value holding markup is never read as the end of a call: any closing tag left outside a block, or a
+    /// block open where another opens, and the whole is released as text, where a cut-short call would run as if complete.
+    fn repair(&self, markup: &str) -> Option<(Vec<ToolCall>, usize, String)> {
+        let (mut calls, mut dropped, mut prose) = (Vec::new(), 0, String::new());
+        let mut at = 0;
+        while at < markup.len() {
+            let Some(open) = line_tag(&markup[at..], TOOL_CALL_OPEN, at == 0 || markup.as_bytes()[at - 1] == b'\n') else {
+                prose.push_str(&markup[at..]);
+                break;
+            };
+            prose.push_str(&markup[at..at + open]);
+            let body = at + open + TOOL_CALL_OPEN.len();
+            let next = line_tag(&markup[body..], TOOL_CALL_OPEN, false).map_or(markup.len(), |found| body + found);
+            let block = read_block(&markup[body..next]);
+            let last = next == markup.len();
+            match block {
+                Block::Open(..) if !last || self.cut => return None,
+                Block::Open(call) => self.keep(call, &mut calls, &mut dropped),
+                Block::Closed(call, end) => {
+                    self.keep(call, &mut calls, &mut dropped);
+                    prose.push_str(&markup[body + end..next]);
+                }
+            }
+            at = next;
+        }
+        if calls.is_empty() || ["</tool_call>", "</function>", "</parameter>"].iter().any(|close| prose.contains(close)) {
+            return None;
+        }
+        // (the blank between the answer's last line and the markup, or what the calls left)
+        let prose = if python_strip(&prose).is_empty() { String::new() } else { python_strip(&prose).to_string() };
+        Some((calls, dropped, prose))
+    }
+
+    /// A block's call among `calls`; `dropped` counts one it cannot read, or whose key comes twice.
+    fn keep(&self, call: Option<BlockCall>, calls: &mut Vec<ToolCall>, dropped: &mut usize) {
+        let Some((name, arguments)) = call else {
+            *dropped += 1;
+            return;
+        };
+        if arguments.iter().enumerate().any(|(at, (key, _))| arguments[..at].iter().any(|(earlier, _)| earlier == key)) {
+            *dropped += 1;
+            return;
+        }
+        let strings = self.string_parameters.iter().rev().find(|(tool, _)| *tool == name).map(|(_, keys)| keys.as_slice());
+        let arguments = arguments.into_iter().map(|(key, value)| {
+            let value = match value {
+                Value::Str(text) if !strings.is_some_and(|keys| keys.contains(&key)) =>
+                    pyjson::parse(&text).unwrap_or(Value::Str(text)),
+                value => value,
+            };
+            (key, value)
+        }).collect();
+        calls.push(ToolCall { index: calls.len(), id: format!("call_{}", random_hex(24)), name,
+                              arguments: pyjson::dumps(&Value::Object(arguments)), namespace: None });
     }
 
     fn parse(&self, markup: &str) -> Option<Vec<ToolCall>> {
@@ -312,6 +390,138 @@ impl ToolCallSplitter {
         }
         Some(calls)
     }
+}
+
+/// A `<tool_call>` block as [`ToolCallSplitter::repair`] reads it, past its opener: its call (None: one that cannot be read) and
+/// whether its close was written.
+enum Block {
+    /// Closed; the text after its close begins at the index.
+    Closed(Option<BlockCall>, usize),
+    /// Its text ended first.
+    Open(Option<BlockCall>),
+}
+
+/// A block's tool and its parameters in order, a key perhaps twice.
+type BlockCall = (String, Vec<(String, Value)>);
+
+/// The block in `text`, which runs up to the next opener or the end of the markup.
+fn read_block(text: &str) -> Block {
+    let start = text.len() - python_strip_start(text).len();
+    let inner = &text[start..];
+    if inner.starts_with('{') {
+        return read_json_block(text, start);
+    }
+    let Some(rest) = inner.strip_prefix("<function=") else {
+        return match text.find("</tool_call>") {
+            Some(close) => Block::Closed(None, close + "</tool_call>".len()),
+            None => Block::Open(None),
+        };
+    };
+    let Some(name_end) = rest.find('>') else { return Block::Open(None) };
+    let name = &rest[..name_end];
+    if name.is_empty() || name.chars().any(python_space) {
+        return match text.find("</tool_call>") {
+            Some(close) => Block::Closed(None, close + "</tool_call>".len()),
+            None => Block::Open(None),
+        };
+    }
+    let body_start = start + "<function=".len() + name_end + 1;
+    let (arguments, read, closed) = read_parameters(&text[body_start..]);
+    let after = body_start + read;
+    let call = arguments.map(|arguments| (name.to_string(), arguments));
+    if !closed {
+        return Block::Open(call);
+    }
+    let tail = &text[after..];
+    let spaced = tail.len() - python_strip_start(tail).len();
+    match tail[spaced..].strip_prefix("</tool_call>") {
+        Some(_) => Block::Closed(call, after + spaced + "</tool_call>".len()),
+        // (its own close left out: the call is whole, and what follows is the answer's)
+        None => Block::Closed(call, after),
+    }
+}
+
+/// The parameters of a function's body, up to and past `</function>`: their values (None: text no parameter holds), the bytes
+/// read and whether the close was there. A value ends at the first `</parameter>` the markup goes on from; at the text's
+/// end without one, the value is the rest.
+fn read_parameters(body: &str) -> (Option<Vec<(String, Value)>>, usize, bool) {
+    let mut arguments = Vec::new();
+    let mut at = 0;
+    loop {
+        let spaced = at + (body[at..].len() - python_strip_start(&body[at..]).len());
+        let rest = &body[spaced..];
+        if rest.is_empty() {
+            return (Some(arguments), body.len(), false);
+        }
+        if let Some(after) = rest.strip_prefix("</function>") {
+            return (Some(arguments), body.len() - after.len(), true);
+        }
+        if rest.starts_with("</tool_call>") {
+            // (the function's close left out)
+            return (Some(arguments), spaced, true);
+        }
+        let Some(open) = rest.strip_prefix("<parameter=") else {
+            return match rest.find("</function>") {
+                Some(close) => (None, spaced + close + "</function>".len(), true),
+                None => (None, body.len(), false),
+            };
+        };
+        let Some(key_end) = open.find('>') else { return (None, body.len(), false) };
+        let key = &open[..key_end];
+        if key.is_empty() || key.chars().any(python_space) {
+            return (None, body.len(), false);
+        }
+        let value_start = spaced + "<parameter=".len() + key_end + 1;
+        let mut from = value_start;
+        let end = loop {
+            let Some(close) = body[from..].find("</parameter>") else { break None };
+            let close = from + close;
+            let past = close + "</parameter>".len();
+            let next = python_strip_start(&body[past..]);
+            if next.is_empty() || ["<parameter=", "</function>", "</tool_call>"].iter().any(|tag| next.starts_with(tag)) {
+                break Some((close, past));
+            }
+            from = past;
+        };
+        let Some((close, past)) = end else {
+            let value = template_value(&body[value_start..]);
+            arguments.push((key.to_string(), Value::Str(value.to_string())));
+            return (Some(arguments), body.len(), false);
+        };
+        arguments.push((key.to_string(), Value::Str(template_value(&body[value_start..close]).to_string())));
+        at = past;
+    }
+}
+
+/// A block holding `{"name": ..., "arguments": {...}}` (arguments as an object, or a string of one), as Hermes-style chat
+/// templates write it.
+fn read_json_block(text: &str, start: usize) -> Block {
+    let close = text.find("</tool_call>");
+    let json = python_strip(&text[start..close.unwrap_or(text.len())]);
+    let call = pyjson::parse(json).ok().and_then(|value| {
+        let name = value.get("name")?.as_str().filter(|name| !name.is_empty() && !name.contains('>') && !name.chars().any(python_space))?;
+        let arguments = match value.get("arguments").or_else(|| value.get("parameters"))? {
+            Value::Object(fields) => fields.clone(),
+            Value::Str(encoded) => match pyjson::parse(encoded).ok()? {
+                Value::Object(fields) => fields,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((name.to_string(), arguments))
+    });
+    match close {
+        Some(close) => Block::Closed(call, close + "</tool_call>".len()),
+        None => Block::Open(call),
+    }
+}
+
+fn python_space(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
+fn python_strip_start(text: &str) -> &str {
+    text.trim_start_matches(python_space)
 }
 
 /// The text from `at` to the first of `stops`: (index after the stop, text before it, the stop).
@@ -525,6 +735,94 @@ mod tests {
         let markup = "<tool_call>\n<function=read_file>\n</function>\n</tool_call>";
         let (_, answer, calls) = split(&[markup], false, None);
         assert_eq!((answer.as_str(), calls.len()), (markup, 0));
+    }
+
+    /// Finish a reply's markup: (answer text, calls, the splitter).
+    fn repaired(markup: &str, cut: bool) -> (String, Vec<ToolCall>, ToolCallSplitter) {
+        let tools = read_file();
+        let mut splitter = ToolCallSplitter::new(Some(&tools));
+        splitter.cut = cut;
+        assert_eq!(splitter.feed(markup), "");
+        let (text, calls) = splitter.finish();
+        (text, calls, splitter)
+    }
+
+    const CALL: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=limit>\n5\n</parameter>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_well_formed_call_needs_no_repair() {
+        let (text, calls, splitter) = repaired(&format!("{CALL}\n{CALL}\n"), false);
+        assert!(text.is_empty() && calls.len() == 2 && !splitter.repaired && !splitter.unread);
+    }
+
+    #[test]
+    fn prose_after_or_between_the_calls_is_the_answers() {
+        let (text, calls, splitter) = repaired(&format!("{CALL}\nI will now read it."), false);
+        assert_eq!((text.as_str(), calls.len()), ("I will now read it.", 1));
+        assert_eq!(calls[0].arguments, r#"{"path": "a.rs", "limit": 5}"#);
+        assert!(splitter.repaired);
+        let (text, calls, _) = repaired(&format!("{CALL}\nThen:\n{CALL}"), false);
+        assert_eq!((text.as_str(), calls.len(), calls[1].index), ("Then:", 2, 1));
+    }
+
+    #[test]
+    fn a_close_left_out_is_read_when_the_model_ended_the_reply() {
+        let open = "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n";
+        for markup in [format!("{open}</function>\n"), format!("{open}</tool_call>"), open.to_string(),
+                       "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n".to_string()] {
+            let (text, calls, _) = repaired(&markup, false);
+            assert!(text.is_empty() && calls.len() == 1 && calls[0].arguments == r#"{"path": "a.rs"}"#, "{markup:?} {text:?} {calls:?}");
+        }
+        let (_, calls, _) = repaired(&format!("{open}</function>\n{CALL}"), false);
+        assert_eq!(calls.len(), 2);
+    }
+
+    /// A call the token limit cut short must not run as if it were whole: a write of half a file.
+    #[test]
+    fn a_call_cut_short_stays_text() {
+        let open = "<tool_call>\n<function=read_file>\n<parameter=path>\nhalf of a";
+        let (text, calls, splitter) = repaired(open, true);
+        assert!(calls.is_empty() && splitter.unread);
+        assert_eq!(text, open);
+    }
+
+    /// A value that holds markup is a value, or the reply is text: never a call cut short at the markup it quotes.
+    #[test]
+    fn a_value_holding_markup_is_not_cut_at_it() {
+        let quoted = "<tool_call>\n<function=read_file>\n<parameter=path>\nthe </parameter> tag\n</parameter>\n</function>\n</tool_call>";
+        let (text, calls, _) = repaired(quoted, false);
+        assert!(text.is_empty() && calls[0].arguments == r#"{"path": "the </parameter> tag"}"#, "{text:?} {calls:?}");
+        // a whole example in a value: the strict reading ends at its close, and what is left closes nothing it opened
+        let example = "<tool_call>\n<function=read_file>\n<parameter=path>\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n</parameter>\n</function>\n</tool_call>";
+        let (text, calls, splitter) = repaired(example, false);
+        assert!(calls.is_empty() && splitter.unread && text == example, "{text:?} {calls:?}");
+        let tail = "<tool_call>\n<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>\nmore\n</parameter>";
+        let (text, calls, _) = repaired(tail, false);
+        assert!(calls.is_empty() && text == tail);
+    }
+
+    #[test]
+    fn an_unreadable_block_among_others_is_dropped() {
+        let bad = "<tool_call>\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=path>\nb\n</parameter>\n</function>\n</tool_call>";
+        let (text, calls, splitter) = repaired(&format!("{bad}\n{CALL}"), false);
+        assert!(text.is_empty() && calls.len() == 1 && splitter.dropped == 1, "{text:?} {calls:?}");
+        let junk = "<tool_call>\n<function=read_file>\nnot a parameter\n</function>\n</tool_call>";
+        let (_, calls, splitter) = repaired(&format!("{junk}\n{CALL}"), false);
+        assert!(calls.len() == 1 && calls[0].index == 0 && splitter.dropped == 1);
+        let (text, calls, splitter) = repaired(junk, false);
+        assert!(calls.is_empty() && splitter.unread && text == junk, "no call: the text as it was");
+    }
+
+    #[test]
+    fn a_json_block_is_a_call() {
+        let block = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\", \"limit\": 5}}\n</tool_call>";
+        let (text, calls, _) = repaired(block, false);
+        assert!(text.is_empty() && calls[0].name == "read_file" && calls[0].arguments == r#"{"path": "a.rs", "limit": 5}"#, "{calls:?}");
+        let encoded = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": \"{\\\"path\\\": \\\"a.rs\\\"}\"}\n</tool_call>";
+        let (_, calls, _) = repaired(encoded, false);
+        assert_eq!(calls[0].arguments, r#"{"path": "a.rs"}"#);
+        let (_, calls, splitter) = repaired("<tool_call>\n{\"nope\": 1}\n</tool_call>", false);
+        assert!(calls.is_empty() && splitter.unread);
     }
 
     fn split_dsml(deltas: &[&str], thinking: bool, tools: Option<&Value>) -> (String, String, Vec<ToolCall>) {

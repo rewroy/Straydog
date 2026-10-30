@@ -423,6 +423,17 @@ async fn non_streaming_answers() {
         {"id": "call", "type": "function", "function": {"name": "read_file", "arguments": r#"{"path": "a.rs"}"#}}]}));
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
 
+    // A close the model left out is read; the same text cut by the token limit is not a call.
+    let open = "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs";
+    let mock = Mock::new(vec![Script::Events(vec![delta(open), done("stop")])]);
+    let (_, body) = complete(&mock, ask(json!({"tools": read_file(), "reasoning_effort": "none"}))).await;
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], r#"{"path": "a.rs"}"#);
+    let mock = Mock::new(vec![Script::Events(vec![delta(open), done("length")])]);
+    let (_, body) = complete(&mock, ask(json!({"tools": read_file(), "reasoning_effort": "none"}))).await;
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(body["choices"][0]["message"]["content"], open);
+
     // With tool_choice none the tools leave the prompt, and markup stays text.
     let mock = Mock::new(vec![Script::Events(vec![delta(markup), done("stop")])]);
     let fields = json!({"tools": read_file(), "tool_choice": "none", "reasoning_effort": "none"});
