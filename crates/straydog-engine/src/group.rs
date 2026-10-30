@@ -752,6 +752,11 @@ impl Group {
         Ok(Some((split, self.backends[0].prepare(&lower)?.pointer)))
     }
 
+    /// The MTP layer's K/V and indexer gone with a dropped drafter (see [`Backend::drop_mtp_layer_state`]).
+    pub fn drop_mtp_layer_state(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::drop_mtp_layer_state)
+    }
+
     /// Each device's host K/V planned for `capacity` positions (see [`Backend::start_kv`]).
     pub fn start_kv(&mut self, capacity: u64) {
         self.backends.iter_mut().for_each(|backend| backend.start_kv(capacity));

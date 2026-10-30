@@ -421,8 +421,10 @@ pub(crate) fn refused(message: impl Into<String>) -> Failure {
 pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let message = message.into();
     // A void pass leaves the devices sound: the request fails and the engine resets, so the next
-    // request restores from the checkpoints instead of waiting for a server restart.
-    let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS);
+    // request restores from the checkpoints instead of waiting for a server restart. So does a
+    // K/V that found no memory to grow into: only sequences that long are refused.
+    let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
+        && !message.ends_with(straydog_engine::model::KV_NO_MEMORY);
     Failure { message: format!("{site}: {message}"), fatal }
 }
 
