@@ -105,8 +105,9 @@ impl Reply {
         deltas
     }
 
-    /// Everything still held back once the text has ended.
-    fn finish(&mut self) -> Vec<Delta> {
+    /// Everything still held back once the text has ended (`cut`: by a token limit, not the model).
+    fn finish(&mut self, cut: bool) -> Vec<Delta> {
+        self.tools.cut = cut || self.stop.stopped;
         let held = self.stop.finish();
         let mut deltas = self.split(&held);
         let thought = self.reasoning.finish();
@@ -116,6 +117,12 @@ impl Reply {
         let (late, calls) = self.tools.finish();
         if self.tools.dropped > 0 {
             eprintln!("WARN Straydog dropped {} malformed tool call(s) of a reply and kept {}", self.tools.dropped, calls.len());
+        }
+        if self.tools.repaired {
+            eprintln!("WARN Straydog repaired the tool-call markup of a reply: {} call(s)", calls.len());
+        }
+        if self.tools.unread {
+            eprintln!("WARN Straydog read no tool call in a reply's tool-call markup and released it as text");
         }
         if !late.is_empty() {
             deltas.push(Delta::Content(late));
@@ -175,7 +182,7 @@ impl Completion {
                 }
                 Some("progress") => return Ok(Step::Progress(count(&event["done"]), count(&event["total"]))),
                 Some("done") => {
-                    let deltas = self.reply.finish();
+                    let deltas = self.reply.finish(event["finish_reason"] == "length");
                     return Ok(Step::Done(deltas, self.end(&event)));
                 }
                 Some("error") => {
