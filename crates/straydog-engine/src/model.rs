@@ -291,6 +291,8 @@ pub struct Model {
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
     profile: Option<Profile>,
+    /// The group's counters when the request began (a request's partial residency counts).
+    hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
     ple_counts: (u64, u64, u64),
     ple_wait: f64,
@@ -385,6 +387,7 @@ impl Model {
             draft_pending: Vec::new(),
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
+            hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
         };
@@ -1858,6 +1861,9 @@ impl Model {
         }
         self.ple_counts = self.weights.row_counts(PLE_TABLE).unwrap_or_default();
         self.ple_wait = 0.0;
+        if self.partial && self.profile.is_some() {
+            self.hybrid_counts = self.group.info().unwrap_or_default();
+        }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
         result
@@ -1873,7 +1879,19 @@ impl Model {
                                                             "wait_seconds": self.ple_wait}));
         let generated = self.last_metrics.get("generated_tokens").and_then(Value::as_u64).unwrap_or(0).max(1) as f64;
         let Some(profile) = self.profile.as_ref() else { return };
-        let phases: Map<String, Value> = profile.phases.iter().map(|(name, seconds)| ((*name).to_string(), json!(1e3 * seconds / generated))).collect();
+        let mut phases: Map<String, Value> = profile.phases.iter().map(|(name, seconds)| ((*name).to_string(), json!(1e3 * seconds / generated))).collect();
+        if self.partial {
+            // A generated token's routes by where they ran and its swaps, the slots they ran in, and
+            // what of "step: layers" the host spent waiting for the routes and computing them.
+            let info = self.group.info().unwrap_or_default();
+            let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
+            for (name, key) in [("GPU routes", "gpu_experts"), ("CPU routes", "cpu_experts"), ("assisted routes", "assisted_experts"), ("swaps", "swapped_experts")] {
+                phases.insert(format!("hybrid: {name} (count)"), json!(spent(key) / generated));
+            }
+            phases.insert("hybrid: slots (count)".into(), info["cached_experts"].clone());
+            phases.insert("of step: layers: export wait".into(), json!(spent("wait_ns") / 1e6 / generated));
+            phases.insert("of step: layers: CPU".into(), json!(spent("cpu_ns") / 1e6 / generated));
+        }
         let rows: Map<String, Value> = profile.rows.iter().enumerate().filter(|(_, (passes, _, _))| *passes > 0)
             .map(|(rows, (passes, seconds, phases))| {
                 let phases: Map<String, Value> = phases.iter().map(|(name, spent)| ((*name).to_string(), json!(1e3 * spent / *passes as f64))).collect();

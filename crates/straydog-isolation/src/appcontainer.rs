@@ -29,8 +29,9 @@ pub const PROFILE_NAME: &str = "Straydog.Worker";
 /// what the system, the loader and the CUDA runtime read, and the profile paths. Creating an
 /// AppContainer process points LOCALAPPDATA and the user profile at the container's own
 /// folders, and fails with ERROR_ENVVAR_NOT_FOUND (203) when they are absent. Nothing else
-/// reaches it: no proxy, token, key or credential the server's environment may hold.
-pub const WORKER_VARIABLES: [&str; 17] = [
+/// reaches it: no proxy, token, key or credential the server's environment may hold. DS41_PROFILE
+/// is the engines' phase timing, as on Linux.
+pub const WORKER_VARIABLES: [&str; 18] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
@@ -48,6 +49,7 @@ pub const WORKER_VARIABLES: [&str; 17] = [
     "APPDATA",
     "CUDA_PATH",
     "LANG",
+    "DS41_PROFILE",
 ];
 
 /// Whether a file is a CUDA runtime DLL a CUDA build of the executable loads: cuBLAS
