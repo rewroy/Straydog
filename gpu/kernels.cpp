@@ -1754,10 +1754,10 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
 #if defined(__HIPCC__)
         d.assist=assist;
 #else
-        // CUDA: an assisted expert read over PCIe by the zero-copy GEMV outlasts the CPU experts
-        // on the measured RTX 5070 Ti, so each layer waits for it. Page-locked banks still serve
-        // the DMA copies; no route is assisted.
-        d.assist=0;
+        // CUDA: an assisted expert read over PCIe by the zero-copy GEMV outlasts the CPU experts on the
+        // measured RTX 5070 Ti, so each layer waits for it: a kernel copies it to a staging slot first
+        // (hybrid_stage_assist). Two a layer: four saved the CPU 1.7 ms a token and cost 1.8 of waiting.
+        d.assist=std::min(assist,2u);
 #endif
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }

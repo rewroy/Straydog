@@ -612,6 +612,11 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked
     sequence does not survive a growth; the live one and its checkpoints do.
+  - Page-locked banks let the GPU take some of a layer's absent experts over the bus (`assist`). On
+    CUDA a kernel first copies them into VRAM's staging slots with every thread at once
+    (`hybrid_stage_assist`), two a layer: read in place by a GEMV's lanes they outlast the CPU's. At
+    --vram 5 on 62 GiB with 41 layers locked (RTX 5070 Ti): 38.1 tokens/s with none, 35.2 with two
+    read in place, 42.2 with two staged.
   - With less host memory than twice the banks, the PLE table's row cache is 1 GiB: a token reads
     few rows and hundreds of experts.
   - On Windows the worker asks for a working set of what its share of host memory leaves

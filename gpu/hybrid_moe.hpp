@@ -135,12 +135,42 @@ void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float
                                              hybrid_assist(d, plan), exported);
     check(hipGetLastError());
 }
+#if !defined(__HIPCC__)
+// The experts a layer's GPU takes over the bus, copied into VRAM's staging slots by every thread at once. A kernel reads host
+// memory as fast as it has loads in flight: 43 GB/s here, against some 7 for a GEMV's lanes walking a row a load at a time.
+__global__ void hybrid_stage_assist(const MoeGroup* groups, const int32_t* selected, ExpertGemv plan) {
+    const size_t step = size_t(gridDim.x) * blockDim.x, thread = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint32_t absent = 0, slot = 0;
+    for (size_t r = 0; r < 10; ++r) absent += groups[selected[r]].weights[0].data == nullptr;
+    const uint32_t share = min(plan.assist, (5 * absent + 4) / 12);   // (expert_source's)
+    for (size_t r = 0; r < 10 && slot < share; ++r) {
+        if (groups[selected[r]].weights[0].data) continue;
+        const uint8_t* to = plan.stage + slot * plan.slot_bytes;
+        for (size_t role = 0; role < 3; ++role) {
+            const uint4* from = reinterpret_cast<const uint4*>(plan.mapped[role] + size_t(selected[r]) * plan.bytes[role]);
+            uint4* into = reinterpret_cast<uint4*>(const_cast<uint8_t*>(to));
+            for (size_t i = thread; i < plan.bytes[role] / 16; i += step) into[i] = from[i];
+            to += plan.bytes[role];
+        }
+        ++slot;
+    }
+}
+#endif
 void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, float* partial) {
     const HybridScratch s = hybrid_scratch(plan);
     auto* groups = static_cast<MoeGroup*>(plan.table);
-    resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up);
+    const uint8_t* stage = nullptr;
+#if !defined(__HIPCC__)
+    if (plan.mapped[0] && d.assist) {
+        stage = d.slots.base + d.slots.cache * d.slots.bytes;
+        ExpertGemv copy = hybrid_assist(d, plan);
+        copy.stage = stage; copy.slot_bytes = d.slots.bytes;
+        hybrid_stage_assist<<<64, 256, 0, d.stream>>>(groups, s.selected, copy);
+    }
+#endif
+    resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, 1, 0, 0, false, stage, d.slots.bytes);
     moe_product<<<unsigned((11 * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, 11, s.product);
-    resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs);
+    resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, 1, 0, 0, false, stage, d.slots.bytes);
     hybrid_combine<<<10, 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial);
     check(hipGetLastError());
 }
