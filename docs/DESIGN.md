@@ -726,7 +726,19 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   passes took 16.5 ms); a split of the routed experts by co-routing (the larger share a token 6.22 to
   5.98 of 5, held out: worth about 1%); a head's read-back written by a kernel into mapped coherent host
   memory, with no copies queued after it (6 µs a head, no change in a pass); the host's waits spinning
-  longer before they sleep (`ROC_ACTIVE_WAIT_TIMEOUT=50000`, no change: they wake as soon as it is).
+  longer before they sleep (`ROC_ACTIVE_WAIT_TIMEOUT=50000`, no change: they wake as soon as it is); a
+  verification's routes by expert, each expert its tokens share read once (four tokens' 40 routes reach
+  27.7 experts): with every token's sums 4-row passes took 2.7 ms longer, with only its routed tokens'
+  (a mask of active tokens in the units' dots) still 1.2-1.4 ms; the tokens' blocks of a route rank side
+  by side for L2 (no change), and every token reading one input row (no change: the experts are not held
+  by their inputs); the IQ2_S layers' routed gate and up on INT8 activations (0.06 / 0.15 ms at 1 / 4 rows
+  for 20 layers), and the HyperConnections on INT8 activations (slower than their F32 kernels at every
+  row count).
+- **Where a pass goes now** (launched twice in turn, 20K, ms a pass at 1 / 2 / 3 / 4 rows): each
+  HyperConnection 0.52 / 0.74 / 0.95 / 1.16 (two a layer; at one row its bandwidth floor), the
+  in-projections 0.61 / 0.77 / 0.81 / 0.91, the out-projections 0.34 / 0.41 / 0.44 / 0.46, the router
+  and its route 0.48 / 0.56 / 0.64 / 0.70, the routed gate and up 0.79 / 1.41 / 2.03 / 2.61 and down
+  0.57 / 0.89 / 1.24 / 1.52 (at one row some 360 GB/s: five routes a GPU are too few waves).
 
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).
