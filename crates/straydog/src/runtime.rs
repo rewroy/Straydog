@@ -444,12 +444,18 @@ pub fn request_summary(event: &Value) -> String {
                                                               number(&experts["drive"], 2)),
             _ => String::new(),
         },
-        // (with DS41_PROFILE: the decode's phases, longest first)
+        // (with DS41_PROFILE: the decode's phases, longest first; a "… (count)" phase has no unit
+        // and follows the timed ones)
         match &timings["decode_profile"] {
             Value::Object(phases) if !phases.is_empty() => {
+                let counter = |phase: &str| phase.ends_with(" (count)");
                 let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, ms)| (phase, ms.as_f64().unwrap_or(0.0))).collect();
-                phases.sort_by(|a, b| b.1.total_cmp(&a.1));
-                format!("; decode phases (ms a token): {}", phases.iter().map(|(phase, ms)| format!("{phase} {ms:.3}")).collect::<Vec<_>>().join(", "))
+                phases.sort_by(|a, b| counter(a.0).cmp(&counter(b.0)).then(b.1.total_cmp(&a.1)));
+                format!("; decode phases (ms a token): {}", phases.iter().map(|(phase, value)| if counter(phase) {
+                    format!("{phase} {value:.1}")
+                } else {
+                    format!("{phase} {value:.3}")
+                }).collect::<Vec<_>>().join(", "))
             }
             _ => String::new(),
         },
@@ -1255,8 +1261,10 @@ mod tests {
     #[test]
     fn a_counted_prefill_phase_has_no_unit() {
         let event = json!({"event": "done", "tokens": [], "timings": {"prefill_profile": {
-            "fills: waves (count)": 1420.0, "shared expert": 0.545, "attention": 0.021}}});
+            "fills: waves (count)": 1420.0, "shared expert": 0.545, "attention": 0.021},
+            "decode_profile": {"hybrid: CPU routes (count)": 307.0, "step: head": 1.25, "step: layers": 26.5}}});
         let summary = request_summary(&event);
+        assert!(summary.contains("decode phases (ms a token): step: layers 26.500, step: head 1.250, hybrid: CPU routes (count) 307.0"), "{summary}");
         assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
                 "{summary}");
     }
