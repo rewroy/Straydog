@@ -89,8 +89,12 @@ inline BatchRows batch_rows(size_t steps, size_t part) {
     return part ? BatchRows{half, steps - half} : BatchRows{0, half};
 }
 __device__ inline float qwen_inbox_half(const __half* at) {
+#if defined(__HIPCC__)
     return __half2float(__ushort_as_half(__hip_atomic_load(reinterpret_cast<const uint16_t*>(at), __ATOMIC_RELAXED,
                                                            __HIP_MEMORY_SCOPE_SYSTEM)));
+#else
+    return __half2float(__ushort_as_half(*reinterpret_cast<const volatile uint16_t*>(at)));
+#endif
 }
 // The other's rows [first, first + count) of this device's part, in FP16, into the other's inbox slot.
 __global__ void qwen_scatter_send(const float* part, size_t first, size_t count, __half* peer_inbox, const uint32_t* state,

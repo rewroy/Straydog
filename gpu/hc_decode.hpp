@@ -7,8 +7,22 @@ __device__ float hc_sigmoid(float x) {
     return x >= 0 ? 1.0f / (1.0f + e) : e / (1.0f + e);
 }
 
+// A Q8_0 unit's eight bytes, two-byte aligned in its block.
+#if defined(__HIPCC__)
 typedef uint32_t hc_word2 __attribute__((ext_vector_type(2)));
 typedef hc_word2 hc_word2_u __attribute__((aligned(2)));
+__device__ __forceinline__ hc_word2 hc_load_word2(const uint8_t* at) { return *reinterpret_cast<const hc_word2_u*>(at); }
+#else
+// (nvcc has no vector types, and PTX loads are naturally aligned: four loads of a pair each)
+struct hc_word2 {
+    uint32_t words[2];
+    __device__ __forceinline__ uint32_t operator[](int i) const { return words[i]; }
+};
+__device__ __forceinline__ hc_word2 hc_load_word2(const uint8_t* at) {
+    const uint16_t* q = reinterpret_cast<const uint16_t*>(at);
+    return {{uint32_t(q[0]) | uint32_t(q[1]) << 16, uint32_t(q[2]) | uint32_t(q[3]) << 16}};
+}
+#endif
 // A Q8_0 unit's eight values from its block's scale and its eight bytes.
 __device__ __forceinline__ void hc_q8_unit(uint16_t scale, hc_word2 q, float (&w)[8]) {
     const float d = gemv_half(scale);
@@ -19,7 +33,7 @@ __device__ __forceinline__ void hc_q8_unit(uint16_t scale, hc_word2 q, float (&w
 struct HcRaw8 { uint16_t scale; hc_word2 quants; };
 __device__ __forceinline__ HcRaw8 hc_raw8(const uint8_t* row, size_t unit) {
     const uint8_t* block = row + (unit / 4) * 34;
-    return {*reinterpret_cast<const uint16_t*>(block), *reinterpret_cast<const hc_word2_u*>(block + 2 + (unit % 4) * 8)};
+    return {*reinterpret_cast<const uint16_t*>(block), hc_load_word2(block + 2 + (unit % 4) * 8)};
 }
 template<int kind>
 __device__ __forceinline__ void hc_load8(const uint8_t* row, size_t unit, float (&w)[8]) {
@@ -27,7 +41,7 @@ __device__ __forceinline__ void hc_load8(const uint8_t* row, size_t unit, float 
         // Q8_0 (the weights quantized at load): a unit is a quarter of a 34-byte block, its scale the block's; its eight
         // bytes in one two-byte-aligned load (four loads of a pair each were a HyperConnection's issue limit)
         const uint8_t* block = row + (unit / 4) * 34;
-        hc_q8_unit(*reinterpret_cast<const uint16_t*>(block), *reinterpret_cast<const hc_word2_u*>(block + 2 + (unit % 4) * 8), w);
+        hc_q8_unit(*reinterpret_cast<const uint16_t*>(block), hc_load_word2(block + 2 + (unit % 4) * 8), w);
     } else if (kind == 0) {
         const float4 a = reinterpret_cast<const float4*>(row)[2 * unit], b = reinterpret_cast<const float4*>(row)[2 * unit + 1];
         w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
