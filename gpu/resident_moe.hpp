@@ -75,6 +75,7 @@ struct ExpertGemv {
     uint32_t routed_waves[2], routed_lanes[2], shared_waves[2], shared_lanes[2];
     // Zero-copy assist: the first `assist` absent routes read page-locked host banks.
     const uint8_t* mapped[3]; uint64_t bytes[3]; uint32_t assist;
+    const uint8_t* stage; uint64_t slot_bytes;   // CUDA: assisted experts are read from VRAM's staging slots (hybrid_stage_assist)
 };
 // Whether the GPU evaluates `route`: resident, or among the first assisted absent routes.
 __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
@@ -89,7 +90,9 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
         absent+=missing; earlier+=missing && r<route;
     }
     const uint32_t share=min(plan.assist,(5*absent+4)/12);
-    return earlier<share ? plan.mapped[role]+expert*plan.bytes[role] : nullptr;
+    if (earlier>=share) return nullptr;
+    if (plan.stage) return plan.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
+    return plan.mapped[role]+expert*plan.bytes[role];
 }
 // A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
 __device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGemv& plan,size_t& route,size_t& role,size_t& local,
@@ -196,13 +199,15 @@ unsigned resident_lanes(const std::vector<Matrix>& weights,size_t role,const flo
 // shared_done: the shared expert's gate and up are in `output` already (moe_tokens_experts' router launch).
 void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* groups,const int32_t* selected,
                             bool down,const float* input,float* output,
-                            size_t tokens=1,size_t input_stride=0,size_t output_stride=0,bool shared_done=false) {
+                            size_t tokens=1,size_t input_stride=0,size_t output_stride=0,bool shared_done=false,
+                            const uint8_t* assist_stage=nullptr,uint64_t assist_slot_bytes=0) {
     const auto& weights=plan.weights;
     const size_t shared=plan.experts*3, roles=down ? 1 : 2;
     const bool with_shared=plan.shared && !(shared_done && !down);
     ExpertGemv geometry{};
     for (size_t role=0;role<3;++role) { geometry.mapped[role]=plan.mapped[role]; geometry.bytes[role]=plan.host_bytes[role]; }
     geometry.assist=plan.mapped[0] ? d.assist : 0;
+    geometry.stage=assist_stage; geometry.slot_bytes=assist_slot_bytes;
     // The kernel of the stage's routed format (resident_expert_gemv_kind) when it has one: its shared down rows of a light
     // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
     const int routed=weights[down ? 2 : 0].kind;
