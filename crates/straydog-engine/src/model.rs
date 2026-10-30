@@ -75,14 +75,19 @@ fn attention_layers(drafting: bool) -> u64 {
     12 + u64::from(drafting)
 }
 
-/// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
-/// memory twice their size; with at least 1.25 times, half the memory less the page-locked
-/// sequence state; else none (the unlocked layers and the PLE table would thrash).
+/// The end of a K/V growth's error when page-locking found no memory (`sd_kv_grow`): every state
+/// is sound, and a shorter sequence can still run.
+pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this sequence";
+
+/// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 const SCARCE_ROW_CACHE: u64 = 1 << 30;
 /// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
 /// whole context take from a small machine what the expert banks need, and few sequences reach it.
 const STARTING_KV: usize = 32768;
 
+/// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
+/// memory twice their size; with at least 1.25 times, half the memory less the page-locked
+/// sequence state; else none (the unlocked layers and the PLE table would thrash).
 pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
     if memory == 0 || 4 * memory < 5 * banks {
         return 0;
@@ -429,7 +434,7 @@ impl Model {
         load_seconds.push(("host_state", lap(&mut clock)));
         model.prepare_decoder(model.kv_capacity as u64, true)?;
         if model.partial {
-            let pinned = checkpoint_bytes + if host { attention_layers(drafting) * model.kv_capacity as u64 * 4096 } else { 0 };
+            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
             model.lock_host_banks(pinned)?;
             model.group.create_expert_slots()?;
         }
@@ -705,6 +710,7 @@ impl Model {
             return Ok(false);
         }
         self.weights.drop_drafter();
+        self.group.drop_mtp_layer_state()?;
         let kinds = (0..48).map(|layer| self.weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
         let staging = 64 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (256 << 20);
         let mut requirements = self.weights.dense_requirements();
@@ -1204,7 +1210,7 @@ impl Model {
             self.discard(parked)?;
         }
         let capacity = (positions + 4096).next_power_of_two().min(self.context);
-        let pinned = self.pinned_other + 12 * capacity as u64 * 4096;
+        let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned);
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
         self.kv_capacity = capacity;

@@ -741,6 +741,20 @@ impl Backend {
         Ok(())
     }
 
+    /// The MTP layer's K/V and indexer, planned before the placement dropped the drafter: no plan
+    /// reads them, and the sequence's copies and a growing K/V would go on carrying them.
+    pub fn drop_mtp_layer_state(&mut self) -> Result<()> {
+        self.pending_host.retain(|(key, ..)| key != "@qsa:blk.48.");
+        for key in ["@qsa:blk.48.", "@indexer:blk.48."] {
+            if let Some(entry) = self.states.shift_remove(key) {
+                self.cache.remove(key);
+                // SAFETY: an allocation of this device that nothing has been given yet.
+                check(unsafe { ffi::sd_release(self.handle, entry.pointer) })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Plan the host K/V for `capacity` positions of the context reserved (its indexers keep their whole allocation):
     /// [`Backend::grow_kv`] adds the rest as a sequence reaches it.
     pub fn start_kv(&mut self, capacity: u64) {
@@ -760,6 +774,10 @@ impl Backend {
             .filter_map(|key| Some((key.clone(), key.strip_prefix("@qsa:blk.")?.strip_suffix('.')?.parse().ok()?)))
             .collect();
         for (key, layer) in layers {
+            // (a layer an earlier attempt grew before another's memory ran out)
+            if self.states.get(&key).is_some_and(|entry| entry.rows >= capacity * 4) {
+                continue;
+            }
             let mut state = std::ptr::null_mut();
             // SAFETY: a live handle and an out-parameter; the layer's states are the native side's.
             check(unsafe { ffi::sd_kv_grow(self.handle, layer, capacity, valid, &mut state) })?;

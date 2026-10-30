@@ -2313,6 +2313,8 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// The end of the message of a growth that found no memory (crates/straydog/src/worker.rs: not fatal).
+constexpr const char* kv_no_memory = "not enough host memory for the K/V of this sequence";
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state) {
     try {
         auto& d = device(handle);
@@ -2329,7 +2331,11 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         check(hipStreamSynchronize(d.stream));
         if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
         void* grown = nullptr;
-        check(hipHostMalloc(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped));
+        // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory).
+        if (hipHostMalloc(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+            (void)hipGetLastError();
+            throw std::runtime_error(kv_no_memory);
+        }
         void* pointer = nullptr;
         try {
             std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
