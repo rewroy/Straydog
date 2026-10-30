@@ -147,13 +147,10 @@ void on_device(int ordinal, Function&& work) {
 
 // After both streams are idle: a wait that gave up voids the results and leaves the
 // counters out of step, so both links restart from zero and the call fails.
-void peer_settle(Device& d) {
+// peer_settle's check of both links' counters as read back (this device's, then its peer's).
+void peer_counters_check(Device& d, const uint32_t (&failed)[2][8]) {
     Device* peer = d.link.peer;
-    if (!peer) return;
-    uint32_t failed[2][8] = {};
-    check(hipMemcpy(failed[0], d.link.counters, 32, hipMemcpyDeviceToHost));
-    on_device(peer->ordinal, [&]() { check(hipMemcpy(failed[1], peer->link.counters, 32, hipMemcpyDeviceToHost)); });
-    if (!failed[0][2] && !failed[0][6] && !failed[1][2] && !failed[1][6]) return;
+    if (!peer || (!failed[0][2] && !failed[0][6] && !failed[1][2] && !failed[1][6])) return;
     auto reset = [](Device& side) {
         on_device(side.ordinal, [&]() {
             check(hipMemset(side.link.counters, 0, 32));
@@ -163,6 +160,14 @@ void peer_settle(Device& d) {
     };
     reset(d); reset(*peer);
     throw std::runtime_error("a Straydog GPU waited too long for its peer");
+}
+void peer_settle(Device& d) {
+    Device* peer = d.link.peer;
+    if (!peer) return;
+    uint32_t failed[2][8] = {};
+    check(hipMemcpy(failed[0], d.link.counters, 32, hipMemcpyDeviceToHost));
+    on_device(peer->ordinal, [&]() { check(hipMemcpy(failed[1], peer->link.counters, 32, hipMemcpyDeviceToHost)); });
+    peer_counters_check(d, failed);
 }
 
 // Link two devices for expert parallelism with inboxes of `rows` rows each way.

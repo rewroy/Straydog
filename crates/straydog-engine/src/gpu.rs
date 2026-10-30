@@ -67,6 +67,8 @@ pub enum Data<'a> {
     Quantize(&'a [u8], u32),
     /// A part of a matrix (a layer split across GPUs): pieces of the matrix's mapped bytes, each placed in the part's bytes.
     Gather(Vec<Piece<'a>>),
+    /// Gather's part of a matrix of a GGML kind, uploaded quantized to Q8_0 (the operand's kind 8; the drafter's projections).
+    QuantizeGather(Vec<Piece<'a>>, u32),
     Described,
 }
 
@@ -90,7 +92,7 @@ pub struct Columns {
 
 impl Columns {
     /// The bytes the run takes out of `source` (whole rows of it), packed.
-    fn gather(&self, source: &[u8], into: &mut [u8]) {
+    pub(crate) fn gather(&self, source: &[u8], into: &mut [u8]) {
         for (row, chunk) in source.chunks_exact(self.pitch as usize).enumerate() {
             let to = row * self.to_pitch as usize;
             into[to..to + self.width as usize].copy_from_slice(&chunk[self.first as usize..(self.first + self.width) as usize]);
@@ -284,6 +286,8 @@ pub struct Backend {
     /// Qwen3.8's layers split across this many devices (1, or 2: gpu/qwen_parts.hpp), this one running part `part` of each.
     pub parts: u64,
     pub part: u64,
+    /// With parts: the MTP layer (48) in parts too.
+    pub mtp_parts: bool,
     /// Host states page-locking beside the weight upload, created by `finish_model_state`.
     pending_host: Vec<(String, u64, u64)>,
     /// While placing before the weights are read: uploads allocated but not yet filled.
@@ -300,14 +304,18 @@ pub fn prefill_handoff(from: &Backend, to: &Backend, from_layer: usize, to_layer
 
 /// A prompt batch through layers [begin, end) of two devices' parts (see [`Backend::set_parts`]); the last `output_rows` rows
 /// from the second.
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_parts(first: &Backend, second: &Backend, begin: usize, end: usize, position: u64, steps: u64,
-                     output_rows: u64) -> Result<Vec<f32>> {
+                     input: Option<&[f32]>, output_rows: u64) -> Result<Vec<f32>> {
+    if input.is_some_and(|rows| rows.len() as u64 != steps * WIDTH as u64) {
+        return Err("invalid Straydog prefill span of parts".into());
+    }
     let mut output = vec![0f32; output_rows as usize * WIDTH];
     let target = if output_rows > 0 { output.as_mut_ptr() } else { std::ptr::null_mut() };
-    // SAFETY: two live devices; the output holds `output_rows` rows.
+    // SAFETY: two live devices; `steps` rows in or none, the output holds `output_rows` rows.
     check(unsafe {
-        ffi::sd_prefill_parts(first.handle, second.handle, begin as u64, end as u64, position, steps, std::ptr::null(), target,
-                              output_rows)
+        ffi::sd_prefill_parts(first.handle, second.handle, begin as u64, end as u64, position, steps,
+                              input.map_or(std::ptr::null(), <[f32]>::as_ptr), target, output_rows)
     })?;
     Ok(output)
 }
@@ -360,6 +368,7 @@ impl Backend {
             expert_parallel: false,
             parts: 1,
             part: 0,
+            mtp_parts: false,
             pending_host: Vec::new(),
             deferred: None,
         })
@@ -447,10 +456,54 @@ impl Backend {
         if let Data::Gather(pieces) = &operand.data {
             return self.prepare_gather(operand, pieces, size);
         }
+        if let Data::QuantizeGather(pieces, kind) = &operand.data {
+            if self.deferred.is_some() {
+                // (one piece, quantized from its verified bytes as Data::Quantize's are: crate::load)
+                let [piece] = &pieces[..] else { return Err(format!("Straydog part pieces do not fill {}", operand.key)) };
+                if piece.at != 0 {
+                    return Err(format!("Straydog part pieces do not fill {}", operand.key));
+                }
+                let (used, budget) = self.memory()?;
+                if used + size as u64 > budget {
+                    return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
+                }
+                // SAFETY: a plain size; the bytes arrive through `write`.
+                let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
+                let pending = Pending { pointer: device, source: piece.source.as_ptr(), bytes: piece.source.len(), decode: Some(*kind),
+                                        quantize: true, offset: 0, columns: piece.columns };
+                self.deferred.as_mut().ok_or("Straydog uploads are not deferred")?.push(pending);
+                let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
+                self.cache.insert(operand.key.clone(), entry);
+                return Ok(entry);
+            }
+            // (gathered in the source kind and quantized on the host as Data::Quantize is, then uploaded at once)
+            let source = formats::matrix_bytes(*kind, operand.rows as usize, operand.cols as usize)
+                .ok_or("unsupported Straydog GPU weight format")?;
+            let mut bytes = vec![0u8; source];
+            for piece in pieces {
+                match piece.columns {
+                    None => bytes[piece.at as usize..piece.at as usize + piece.source.len()].copy_from_slice(piece.source),
+                    Some(columns) => columns.gather(piece.source, &mut bytes[piece.at as usize..]),
+                }
+            }
+            let quantized = formats::quantize_q8_0(&decode_vector(&bytes, *kind, (operand.rows * operand.cols) as usize, &operand.key)?);
+            if quantized.len() != size {
+                return Err(format!("Straydog GPU weight size mismatch: {}", operand.key));
+            }
+            let (used, budget) = self.memory()?;
+            if used + size as u64 > budget {
+                return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
+            }
+            // SAFETY: the bytes are valid for their length; the library copies them.
+            let device = pointer(unsafe { ffi::sd_upload(self.handle, quantized.as_ptr().cast(), quantized.len() as u64) })?;
+            let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
+            self.cache.insert(operand.key.clone(), entry);
+            return Ok(entry);
+        }
         let (decoded, quantized);
         let (data, decode): (&[u8], Option<u32>) = match &operand.data {
             Data::Bytes(bytes) => (bytes, None),
-            Data::Gather(_) => unreachable!(),
+            Data::Gather(_) | Data::QuantizeGather(..) => unreachable!(),
             Data::Decode(bytes, kind) | Data::Quantize(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
             Data::Decode(bytes, kind) => {
                 decoded = decode_vector(bytes, *kind, size / 4, &operand.key)?;
@@ -629,7 +682,7 @@ impl Backend {
                 plan.push(("@ple:blk.1.".into(), 10, WIDTH as u64, false));
             }
             // (a part's: its heads' recurrence and convolution, its K/V head's planes)
-            let parts = if layer < 48 { self.parts } else { 1 };
+            let parts = if layer < 48 || self.mtp_parts { self.parts } else { 1 };
             if layer % 4 != 3 && layer < 48 {
                 plan.push((format!("@delta:blk.{layer}."), 48 * 128 / parts, 128, false));
                 if self.batch_capacity == 256 {
@@ -860,7 +913,7 @@ impl Backend {
         let (pointers, kinds) = self.operands(operands)?;
         // SAFETY: operands, states and workspace all belong to this device.
         check(unsafe {
-            if self.parts == 2 && layer < 48 {
+            if self.parts == 2 && (layer < 48 || self.mtp_parts) {
                 ffi::sd_decoder_part(self.handle, layer as u64, context, pointers.as_ptr(), kinds.as_ptr(), pointers.len() as u64,
                                      states.as_ptr(), workspace.pointer, plan, self.part)
             } else {
@@ -1336,6 +1389,49 @@ impl Backend {
         Ok(Some((token, confidence)))
     }
 
+    /// [`Backend::draft_step`]'s prologue and MTP layer (`operands`: the prologue's four) queued with nothing waited for, on a
+    /// layer in parts: the group queues both devices' before [`Backend::draft_head`].
+    pub fn draft_queue(&mut self, operands: &[Operand], layer: usize, position: u64, embeddings: &[f32], hidden: Option<&[f32]>,
+                       previous: u64) -> Result<()> {
+        let steps = hidden.map_or(1, |hidden| hidden.len() / WIDTH);
+        if operands.len() != 4 || hidden.is_some_and(|hidden| !hidden.len().is_multiple_of(WIDTH))
+            || !(1..=VERIFY_MAX).contains(&steps) || embeddings.len() != steps * HIDDEN
+            || position > 262144 - steps as u64 || hidden.is_none() && !(1..=VERIFY_MAX as u64).contains(&previous)
+            || hidden.is_some_and(|hidden| !hidden.iter().all(|value| value.is_finite()))
+        {
+            return Err("invalid Straydog drafting step".into());
+        }
+        let (pointers, kinds) = self.operands(operands)?;
+        // SAFETY: the prologue's four operands; `steps` rows of each array.
+        check(unsafe {
+            ffi::sd_draft_queue(self.handle, pointers.as_ptr(), kinds.as_ptr(), layer as u64, position, steps as u64,
+                                embeddings.as_ptr(), hidden.map_or(std::ptr::null(), <[f32]>::as_ptr), previous)
+        })
+        .map(drop)
+    }
+
+    /// The head (`operands`: its four) on row `row` of the rows [`Backend::draft_queue`] left in `layer`'s workspace: the
+    /// draft's token and its probability.
+    pub fn draft_head(&mut self, operands: &[Operand], layer: usize, row: u64, split: Option<(u64, *mut c_void)>)
+                      -> Result<(i32, f32)> {
+        let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
+        if operands.len() != 4 || operands[3].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
+            || row >= VERIFY_MAX as u64 || split.is_some_and(|(split, _)| split == 0 || split >= vocabulary)
+        {
+            return Err("invalid Straydog drafting head".into());
+        }
+        let (pointers, kinds) = self.operands(operands)?;
+        let (mut token, mut confidence) = (0i32, 0f32);
+        let (split, peer) = split.map_or((0, std::ptr::null_mut()), |(split, peer)| (split, peer));
+        // SAFETY: the head's four operands; one token and probability out.
+        check(unsafe {
+            ffi::sd_draft_head(self.handle, pointers.as_ptr(), kinds.as_ptr(), layer as u64, row, vocabulary, split, peer,
+                               &mut token, &mut confidence)
+        })?;
+        Self::finite(&[confidence], "draft probability")?;
+        Ok((token, confidence))
+    }
+
     /// A draft's vocabulary when the head is split (see `sd_draft_vocabulary`): `head`'s rows [0, rows) and the rows of `tokens`
     /// (each at least `rows`), after the ones given before unless `reset`.
     pub fn draft_vocabulary(&mut self, head: &Operand, rows: u64, tokens: &[u32], reset: bool) -> Result<()> {
@@ -1435,11 +1531,11 @@ impl Backend {
 
     /// The planes of a layer's K/V (each K/V head's keys, then each one's values): a part's two, a whole layer's four.
     fn kv_planes(&self, key: &str) -> u64 {
-        if key.ends_with(":blk.48.") || self.parts == 1 { 4 } else { 4 / self.parts }
+        if (key.ends_with(":blk.48.") && !self.mtp_parts) || self.parts == 1 { 4 } else { 4 / self.parts }
     }
 
-    /// This device's part of every Qwen3.8 layer but the MTP layer, of `parts` (sd_qwen_parts): before any of its layer
-    /// states are planned.
+    /// This device's part of every Qwen3.8 layer (the MTP layer too with `mtp_parts`), of `parts` (sd_qwen_parts): before any
+    /// of its layer states are planned.
     pub fn set_parts(&mut self, parts: u64, part: u64) -> Result<()> {
         if !self.states.is_empty() || !(1..=2).contains(&parts) || part >= parts {
             return Err("invalid Straydog layer parts".into());

@@ -88,8 +88,9 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
             match upload.decode {
                 Some(kind) => {
                     let name = weights.tensor_at(file, offset)?.to_string();
+                    let within = offset - weights.tensor(&name)?.offset;
                     kept.insert(name.clone());
-                    decodes.push((device, *upload, kind, name));
+                    decodes.push((device, *upload, kind, name, within));
                 }
                 None => ranges[file].push((offset, upload.bytes as u64, Target::Device { device, upload: *upload, at: 0 })),
             }
@@ -108,12 +109,30 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
         workers
     })?;
     keep_copies(weights, copies);
-    for (device, upload, kind, name) in decodes {
+    for (device, upload, kind, name, within) in decodes {
+        // (the upload's bytes of the tensor, a part's rows or, with columns, a run of each row: whole blocks)
         let (bytes, _) = weights.raw(&name, 0, None)?;
-        if bytes.len() != upload.bytes {
-            return Err(format!("Straydog vector upload is not a whole tensor: {name}"));
+        let Some(source) = bytes.get(within as usize..within as usize + upload.bytes) else {
+            return Err(format!("Straydog upload is not within its tensor: {name}"));
+        };
+        let gathered;
+        let source = match upload.columns {
+            None => source,
+            Some(columns) if columns.pitch > 0 && (source.len() as u64).is_multiple_of(columns.pitch)
+                              && columns.first + columns.width <= columns.pitch => {
+                let mut packed = vec![0u8; (source.len() as u64 / columns.pitch * columns.width) as usize];
+                gpu::Columns { to_pitch: columns.width, ..columns }.gather(source, &mut packed);
+                gathered = packed;
+                &gathered[..]
+            }
+            Some(_) => return Err(format!("Straydog upload columns do not fit {name}")),
+        };
+        let tensor = weights.tensor(&name)?;
+        let elements = source.len() as u64 * tensor.elements() / tensor.bytes;
+        if elements * tensor.bytes != source.len() as u64 * tensor.elements() {
+            return Err(format!("Straydog upload is not whole blocks of {name}"));
         }
-        let values = gpu::decode_vector(bytes, kind, weights.tensor(&name)?.elements() as usize, &name)?;
+        let values = gpu::decode_vector(source, kind, elements as usize, &name)?;
         let converted: Vec<u8> = if upload.quantize { crate::formats::quantize_q8_0(&values) }
                                  else { values.iter().flat_map(|value| value.to_le_bytes()).collect() };
         group.backends[device].write(&upload, &converted)?;

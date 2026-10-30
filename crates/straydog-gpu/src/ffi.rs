@@ -1820,6 +1820,33 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_draft_queue(
+        handle: *mut ::std::os::raw::c_void,
+        mtp: *const *mut ::std::os::raw::c_void,
+        mtp_kinds: *const ::std::os::raw::c_int,
+        layer: u64,
+        position: u64,
+        steps: u64,
+        embeddings: *const f32,
+        hidden: *const f32,
+        previous: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_draft_head(
+        handle: *mut ::std::os::raw::c_void,
+        head: *const *mut ::std::os::raw::c_void,
+        head_kinds: *const ::std::os::raw::c_int,
+        layer: u64,
+        row: u64,
+        vocabulary: u64,
+        split: u64,
+        peer_head: *mut ::std::os::raw::c_void,
+        token: *mut i32,
+        confidence: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_draft_vocabulary(
         handle: *mut ::std::os::raw::c_void,
         head: *mut ::std::os::raw::c_void,

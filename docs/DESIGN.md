@@ -595,8 +595,8 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 (`STRAYDOG_GOLDEN_UPDATE=1`).
 
 **Placement.**
-- **Two R9700s:** they hold the weights of every bundle with every layer but the MTP layer in parts
-  (below), with the K/V in host memory at 262144 tokens.
+- **Two R9700s:** they hold the weights of every bundle with every layer in parts (below), with the
+  K/V in host memory at 262144 tokens.
 - **Smaller budgets:** host K/V and a smaller prefill batch come first, then partial residency.
 - **Partial residency:** the CPU computes experts beyond VRAM in F32 from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
@@ -650,8 +650,22 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   submission at the second layer and wait 0.6-0.8 ms); a batch layer by layer, both devices, with no
   host wait until its last span. The shared expert's gate and up run on the device's stream: on the
   side stream every pass of three or four rows took 7.5 ms longer.
-- **The MTP layer** stays whole on the second GPU, and its prompt pairs read the rows the first
-  keeps (both have them).
+- **The MTP layer** is in parts as well (`STRAYDOG_MTP_PARTS=0` keeps it whole on the second GPU). A
+  draft step queues the prologue (on both: its rows are both devices') and the layer's part on each
+  device from two threads, then the head on the second's rows (`sd_draft_queue`, `sd_draft_head`); a
+  prompt's pairs run the prologue on both, from the rows each keeps, and the layer in parts. Its float
+  projections go up as Q8_0 as when whole (Data::QuantizeGather: a deferred upload quantizes its piece
+  of the verified bytes in crate::load, as it does a whole tensor), its shared expert's half as the
+  other layers'. A part's K/V is two planes, so at 32768 tokens `two-gpu-experts-mtp`'s K/V now fits
+  VRAM. The same tokens and drafts (greedy in-process at 20K); served, a pass of 1 / 4 rows at 60K
+  12.83 / 20.98 to 11.93 / 19.37 ms (the layer's attention, which grows with the context, halved), at
+  20K 11.88 / 19.43 to 11.61 / 18.91 with the read-back below; 135.2 to 146.5 tok/s on the 60K
+  explanation, 135.0 to 151.4 on its code.
+- **A head's read-back** waits for each device's streams once: both links' failure counters ride along
+  with its tokens (the peer's copy queued after its part), where peer_settle read each with a blocking
+  copy after the waits. A draft step's head ended 0.13 ms after its last kernel, now 0.06 (device
+  spans of a draft step at 20K: the prologue and the layer 0.38 ms, the head 0.26); a pass at 20K
+  16.05 to 15.80 ms greedy in-process, bit for bit.
 - **Fewer launches a layer.** The experts' part is formed by its sum's own block (the routes this
   device holds, in route order, then the shared half: moe_part_partial's sum, a launch less); the
   router and the shared expert's half read the same row in one launch (the scores after the decode
@@ -710,7 +724,9 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   wait (a wait costs 1.7 µs less than a launch boundary here, and passes of one or two rows were 0.25 ms
   shorter, but served, kernels on other streams left fewer blocks room than the launch's and one-row
   passes took 16.5 ms); a split of the routed experts by co-routing (the larger share a token 6.22 to
-  5.98 of 5, held out: worth about 1%).
+  5.98 of 5, held out: worth about 1%); a head's read-back written by a kernel into mapped coherent host
+  memory, with no copies queued after it (6 µs a head, no change in a pass); the host's waits spinning
+  longer before they sleep (`ROC_ACTIVE_WAIT_TIMEOUT=50000`, no change: they wake as soon as it is).
 
 **Decode.** A pass runs a token and its MTP drafts as the rows of one verification through every
 layer (§6.2).

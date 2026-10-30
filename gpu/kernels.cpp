@@ -1393,6 +1393,28 @@ int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t la
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
+                   const float* embeddings,const float* hidden,uint64_t previous) {
+    try {
+        if (!mtp || !mtp_kinds) throw std::runtime_error("invalid drafting step");
+        bool parts=false;
+        draft_queue(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,size_t(previous),parts);
+        if (parts) throw std::runtime_error("a queued drafting step needs a layer in parts");
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_draft_head(void* handle,void* const* head,const int* head_kinds,uint64_t layer,uint64_t row,uint64_t vocabulary,
+                  uint64_t split,void* peer_head,int32_t* token,float* confidence) {
+    try {
+        Device& d=device(handle);
+        auto found=d.decoder.find(size_t(layer));
+        if (found==d.decoder.end() || row>=verify_max || found->second.verified<=row)
+            throw std::runtime_error("invalid drafting head row");
+        draft_head(d,head,head_kinds,size_t(vocabulary),size_t(split),peer_head,
+                   verify_layout(found->second.workspace).hidden+size_t(row)*10240,false,token,confidence);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // A deferred prompt's MTP pairs stay on the MTP layer's device (sd_mtp_keep, sd_mtp_embed,
 // sd_mtp_prompt_kept): nothing waits on the host between the prompt's batches.
 float* mtp_allocation(Device& d,void* base,size_t floats) {
@@ -1454,13 +1476,19 @@ int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void*
         check(hipMemcpyAsync(hidden,kept,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
         check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded,size_t(count)*2560*4,hipMemcpyDeviceToDevice,d.stream));
         mtp_prologue_device(d,pointers,kinds,size_t(count));
+        auto target=d.decoder.find(size_t(layer));
+        // (a layer in parts: its rows into the workspace, the host running the layer on both devices)
+        if (target!=d.decoder.end() && target->second.parts==2) {
+            if (count>target->second.capacity) throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
+            check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+            return 0;
+        }
         if (count==1) {
             std::vector<float> one(10240),output(10240);
             download(d,one.data(),hidden,10240*4);
             verify_span(d,size_t(layer),size_t(layer)+1,size_t(position),1,one.data(),output.data());
             return 0;
         }
-        auto target=d.decoder.find(size_t(layer));
         if (target==d.decoder.end() || count>target->second.capacity)
             throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
         check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
