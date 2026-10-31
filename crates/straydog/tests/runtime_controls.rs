@@ -3,7 +3,9 @@
 //! still reaches the worker at once, and the client then gets the generation's end; a worker
 //! that fails to start fails the runtime, which says so (the server then exits); closing the
 //! runtime returns only once every process of the worker's tree has exited, the one outside
-//! its process group too (as a sandbox's is); a request too large for the worker is refused alone.
+//! its process group too (as a sandbox's is); a request too large for the worker is refused alone;
+//! a client that leaves during a long prefill pass costs nothing but the pass, and only a worker
+//! that does not end a cancelled generation in time fails the runtime.
 //! No GPU or model.
 //!
 //! cargo test -p straydog --features hip --test runtime_controls
@@ -22,6 +24,8 @@ use straydog_engine::pyjson;
 
 const CONTEXT: u32 = 4096;
 const QUANT: &str = "IQ3_S";
+/// Longer than the 10 s a worker once had to end a cancelled generation, which a real pass exceeds.
+const PASS: Duration = Duration::from_secs(11);
 
 /// The worker's side of the protocol: ready, then for a chat a delta every millisecond (up to
 /// 20000) until a cancel arrives, which it records in MARKER before ending the generation.
@@ -66,10 +70,38 @@ fn stand_in(marker: &Path) {
     }
 }
 
-#[cfg(unix)]
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
                                       "model": straydog_engine::bundle::MODEL, "quantization": QUANT}));
+}
+
+/// A worker in a prefill pass that takes `PASS`: its first chat answers only once the pass has
+/// ended, whatever arrives meanwhile, and the next at once.
+fn in_a_pass() {
+    ready();
+    let mut pass = Some(PASS);
+    for line in std::io::stdin().lock().lines() {
+        let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        match frame["command"].as_str() {
+            Some("chat") => {
+                std::thread::sleep(pass.take().unwrap_or_default());
+                println!("{}", serde_json::json!({"id": frame["id"], "event": "done", "finish_reason": "stop",
+                                                  "usage": {"prompt_tokens": 1, "completion_tokens": 1}}));
+            }
+            Some("shutdown") => break,
+            _ => {}
+        }
+    }
+}
+
+/// A worker that never answers a chat.
+fn hung() {
+    ready();
+    for line in std::io::stdin().lock().lines() {
+        if line.unwrap().contains("shutdown") {
+            break;
+        }
+    }
 }
 
 /// A worker whose process (as a sandbox's) leaves the tree's process group and outlives the
@@ -111,6 +143,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("stand-in") => return stand_in(Path::new(&args[2])),
+        Some("in-a-pass") => return in_a_pass(),
+        Some("hung") => return hung(),
         // As a worker that finds its GPUs' memory held fails: its reason on stderr, status 1.
         Some("fails") => {
             eprintln!("Straydog VRAM budget is unavailable");
@@ -183,6 +217,41 @@ fn main() {
             }
         }
         println!("runtime_controls: a request past the frame limit refused alone; a 20 MiB one served");
+        engine.close().await;
+
+        // A client leaves during a long pass: the pass ends, and the worker serves the next request.
+        let wait_ready = |engine: Runtime| async move {
+            let started = Instant::now();
+            while !matches!(engine.state(), EngineState::Ready { .. }) {
+                assert!(started.elapsed() < Duration::from_secs(10), "the worker did not start: {:?}", engine.state());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            engine
+        };
+        let hi = || pyjson::parse(r#"{"messages": [{"role": "user", "content": "hi"}]}"#).unwrap();
+        let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["in-a-pass".into()]))).await;
+        let left = engine.generate(hi()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(left);
+        let started = Instant::now();
+        let mut next = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(PASS * 2, next.events.next()).await.unwrap().unwrap();
+        assert_eq!(event["event"].as_str(), Some("done"), "{event}");
+        assert!(started.elapsed() > PASS - Duration::from_secs(1), "the left generation's pass did not run: {:?}", started.elapsed());
+        assert!(matches!(engine.state(), EngineState::Ready { .. }), "{:?}", engine.state());
+        println!("runtime_controls: a client that left during a pass of {PASS:?} cost the pass alone, {:.1} s", started.elapsed().as_secs_f64());
+        engine.close().await;
+
+        // A worker that does not end a cancelled generation in time fails the runtime.
+        let patience = Duration::from_secs(1);
+        let engine = wait_ready(Runtime::start_with_cancel_patience(&settings, (std::env::current_exe().unwrap(), vec!["hung".into()]), patience)).await;
+        let left = engine.generate(hi()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(left);
+        let message = tokio::time::timeout(Duration::from_secs(10), engine.failed()).await
+            .expect("a hung worker did not fail the runtime");
+        assert!(message.contains("did not acknowledge cancellation"), "{message}");
+        assert!(matches!(engine.state(), EngineState::Failed(_)));
         engine.close().await;
 
         // A worker that fails to start: the runtime fails with its reason, at once.
