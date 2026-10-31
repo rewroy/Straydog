@@ -1696,6 +1696,15 @@ int sd_expert_slots(void* handle,uint64_t cache,uint64_t stage,uint64_t slot_byt
     try { create_expert_slots(device(handle),size_t(cache),size_t(stage),size_t(slot_bytes)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// A K/V growth takes the VRAM of the expert slots for its longer indexers and gives back what is left.
+int sd_expert_slots_release(void* handle) {
+    try { release_expert_slots(device(handle)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_expert_slots_restore(void* handle,uint64_t cache) {
+    try { restore_expert_slots(device(handle),size_t(cache)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_hybrid_supported(void* handle) {
     try { const Device& d=device(handle); return int(d.expert_prefill && d.half_gemm); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -2324,18 +2333,17 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
 
 // The end of the message of a growth that found no memory (crates/straydog/src/worker.rs: not fatal).
 constexpr const char* kv_no_memory = "not enough host memory for the K/V of this sequence";
-int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state) {
+int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state) {
     try {
         auto& d = device(handle);
         auto found = d.decoder.find(size_t(layer));
-        if (found == d.decoder.end() || decoder_linear(size_t(layer)) || !state) throw std::runtime_error("invalid Straydog K/V growth");
+        if (found == d.decoder.end() || decoder_linear(size_t(layer)) || !state || !index_state) throw std::runtime_error("invalid Straydog K/V growth");
         DecoderLayer& plan = found->second;
         const size_t from = plan.context, to = size_t(capacity);
         auto host = d.host_states.find(plan.states[0]);
         auto index = d.allocations.find(plan.states[1]);
         const size_t old_pool = from / 4 + 1, pool = to / 4 + 1, history = qsa_history * 128;
-        if (host == d.host_states.end() || index == d.allocations.end() || plan.parts != 1 || to <= from || to > 262144 || valid > from ||
-            index->second < (pool * 128 + history) * 4)
+        if (host == d.host_states.end() || index == d.allocations.end() || plan.parts != 1 || to <= from || to > 262144 || valid > from)
             throw std::runtime_error("invalid Straydog K/V growth");
         check(hipStreamSynchronize(d.stream));
         if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
@@ -2346,6 +2354,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             throw std::runtime_error(kv_no_memory);
         }
         void* pointer = nullptr;
+        void* grown_index = nullptr;
         try {
             std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
@@ -2357,7 +2366,8 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             for (size_t column = 0; column < 128; ++column)
                 std::copy_n(before.data() + column * old_pool, std::min(old_pool, valid / 4 + 1), after.data() + column * pool);
             std::copy_n(before.data() + 128 * old_pool, history, after.data() + 128 * pool);
-            check(hipMemcpy(plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
+            if (index->second < after.size() * 4) grown_index = allocate(d, after.size() * 4);
+            check(hipMemcpy(grown_index ? grown_index : plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
         } catch (...) { cleanup(hipHostFree(grown)); throw; }
         // Every captured graph holds the old K/V or the old pitches.
         kv_clear_graphs(d);
@@ -2366,10 +2376,17 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * 4);
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
         plan.states[0] = pointer; plan.context = to;
+        if (grown_index) {
+            void* old_index = plan.states[1];
+            std::replace(plan.dependencies.begin(), plan.dependencies.end(), old_index, grown_index);
+            plan.states[1] = grown_index;
+            if (sd_release(handle, old_index)) throw std::runtime_error(last_error);
+        }
         // (a DeltaNet layer holds no positions: its context is only what spans are checked against)
         for (auto& entry : d.decoder) if (decoder_linear(entry.first)) entry.second.context = std::max(entry.second.context, to);
         kv_layout(d);
         *state = pointer;
+        *index_state = plan.states[1];
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
