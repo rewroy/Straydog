@@ -58,8 +58,9 @@ struct Source<'a> {
     /// Per chunk: whether the engine reads some of it through the mapping later.
     mapped: Vec<bool>,
     pieces: Vec<Vec<(usize, usize, Target)>>,
-    /// Checked whole since it last changed (`Weights::file_checked`): the chunks nothing is placed from are not read.
-    authenticated: bool,
+    /// The file's verity tree when it was checked whole and has not changed since (`Weights::file_checked`): only what is
+    /// placed is read, block by block against the tree.
+    checked: Option<&'a crate::verity::Verifier>,
 }
 
 // The targets' uploads hold device addresses the fillers copy to; nothing dereferences them here.
@@ -172,9 +173,10 @@ fn read<W: Worker>(weights: &Weights, mut ranges: Vec<Vec<Range>>, kept: &BTreeS
     let sources = sources(weights, &ranges)?;
     let chunks: usize = sources.iter().map(|source| source.digests.len()).sum();
     let workers = workers(std::thread::available_parallelism().map_or(4, |count| count.get()).min(chunks).max(1))?;
-    let to_read: u64 = sources.iter().flat_map(|source| (0..source.digests.len()).map(move |chunk| (source, chunk)))
-        .filter(|(source, chunk)| !source.authenticated || !source.pieces[*chunk].is_empty())
-        .map(|(source, chunk)| CHUNK_BYTES.min(source.map.len() as u64 - chunk as u64 * CHUNK_BYTES)).sum();
+    let to_read: u64 = sources.iter().map(|source| match source.checked {
+        Some(_) => source.pieces.iter().flatten().map(|piece| piece.1 as u64).sum(),
+        None => source.map.len() as u64,
+    }).sum();
     progress("load", 0, to_read);
     stream(&sources, workers, &copies, to_read, progress)?;
     Ok(copies)
@@ -234,7 +236,7 @@ pub fn verify_file(name: &str, file: &File, digests: &[String]) -> Result<(), St
     }
     let direct = storage::direct(file);
     let source = Source { name, file, direct, map: &map, digests, mapped: vec![false; chunks],
-                          pieces: vec![Vec::new(); chunks], authenticated: false };
+                          pieces: vec![Vec::new(); chunks], checked: None };
     let workers = std::thread::available_parallelism().map_or(4, |count| count.get()).min(chunks).max(1);
     stream(std::slice::from_ref(&source), (0..workers).map(|_| Host).collect(), &[], map.len() as u64, &|_, _, _| {})
 }
@@ -248,7 +250,7 @@ fn sources<'a>(weights: &'a Weights, ranges: &[Vec<Range>]) -> Result<Vec<Source
     let total = files.iter().map(|(_, _, map, _)| map.len() as u64).sum();
     let bypass = bypass_cache(total, weights.host_memory_bytes);
     let mut sources = Vec::new();
-    let authenticated: Vec<bool> = (0..files.len()).map(|file| weights.file_checked(file)).collect();
+    let checked: Vec<_> = (0..files.len()).map(|file| weights.verifier_of(file).filter(|_| weights.file_checked(file))).collect();
     for (index, (name, file, map, digests)) in files.into_iter().enumerate() {
         let chunks = (map.len() as u64).div_ceil(CHUNK_BYTES) as usize;
         if digests.len() != chunks {
@@ -278,7 +280,7 @@ fn sources<'a>(weights: &'a Weights, ranges: &[Vec<Range>]) -> Result<Vec<Source
             }
         }
         let direct = if bypass { storage::direct(file) } else { None };
-        sources.push(Source { name, file, direct, map, digests, mapped, pieces, authenticated: authenticated[index] });
+        sources.push(Source { name, file, direct, map, digests, mapped, pieces, checked: checked[index].map(|verifier| &**verifier) });
     }
     Ok(sources)
 }
@@ -292,7 +294,7 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
         .iter()
         .enumerate()
         .flat_map(|(source, file)| (0..file.digests.len()).map(move |chunk| (source, chunk)))
-        .filter(|&(source, chunk)| !sources[source].authenticated || !sources[source].pieces[chunk].is_empty())
+        .filter(|&(source, chunk)| sources[source].checked.is_none() || !sources[source].pieces[chunk].is_empty())
         .collect();
     chunks.sort_by_key(|&(source, chunk)| {
         sources[source].pieces[chunk].iter().any(|piece| matches!(piece.2, Target::Device { .. }))
@@ -311,6 +313,22 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                             break;
                         }
                         let source = &sources[source];
+                        if let Some(verifier) = source.checked {
+                            let base = chunk as u64 * CHUNK_BYTES;
+                            for &(at, part, target) in &source.pieces[chunk] {
+                                crate::digest::will_need(source.file, &[(base + at as u64, part as u64)]);
+                                let read = crate::verity::read_verified(source.map, verifier, base + at as u64, part as u64)
+                                    .map_err(|error| format!("{}: {error}", source.name))?;
+                                slot.as_mut_slice()[..part].copy_from_slice(&read);
+                                count(part as u64);
+                                let bytes = &slot.as_slice()[..part];
+                                match target {
+                                    Target::Device { device, upload, at: offset } => worker.fill(device, &upload, offset, bytes)?,
+                                    Target::Host { copy, at: offset } => copies[copy].1.lock().unwrap()[offset..offset + part].copy_from_slice(bytes),
+                                }
+                            }
+                            continue;
+                        }
                         let length = read_chunk(source, chunk, &mut slot)?;
                         count(length as u64);
                         let bytes = &slot.as_slice()[..length];

@@ -320,7 +320,7 @@ impl Weights {
         self.tree_current.get(file).copied().unwrap_or(false)
     }
 
-    fn verifier_of(&self, file: usize) -> Option<&Arc<verity::Verifier>> {
+    pub(crate) fn verifier_of(&self, file: usize) -> Option<&Arc<verity::Verifier>> {
         self.verifiers.get(file).and_then(Option::as_ref)
     }
 
