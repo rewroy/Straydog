@@ -50,7 +50,7 @@ void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
 // A decoder layer's host K/V grown to `capacity` positions, its `valid` positions kept, and its indexer laid out for them in
 // its allocation; the new K/V's pointer in `state`. Its plans and captured graphs follow.
-int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state);
+int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state);
 int sd_host_state_supported(void* handle);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);

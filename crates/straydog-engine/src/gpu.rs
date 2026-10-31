@@ -273,6 +273,10 @@ pub struct Backend {
     checkpoint_states: Vec<*mut c_void>,
     prefill_capacity: u64,
     slot_bytes: u64,
+    /// `create_expert_slots`' arguments, for a K/V growth to make the pool again (0: no pool).
+    slot_stage: u64,
+    slot_margin: u64,
+    slot_size: u64,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
     pub logical_capacity: usize,
@@ -360,6 +364,9 @@ impl Backend {
             checkpoint_states: Vec::new(),
             prefill_capacity: 1024,
             slot_bytes: 0,
+            slot_stage: 0,
+            slot_margin: 0,
+            slot_size: 0,
             registered: Vec::new(),
             batch_capacity,
             logical_capacity: if budget >= 2 << 30 { 4096 } else { 1024 },
@@ -757,19 +764,44 @@ impl Backend {
 
     /// Plan the host K/V for `capacity` positions of the context reserved (its indexers keep their whole allocation):
     /// [`Backend::grow_kv`] adds the rest as a sequence reaches it.
-    pub fn start_kv(&mut self, capacity: u64) {
+    pub fn start_kv(&mut self, capacity: u64) -> Result<()> {
         for (_, rows, _) in &mut self.pending_host {
             *rows = capacity * 4;
         }
-        for (key, entry) in &mut self.states {
-            if key.starts_with("@indexer:") {
-                entry.rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
-            }
+        // The indexers start at that size too: on a small budget what they would hold for the whole context is a third of the slots.
+        let indexers: Vec<(String, *mut std::ffi::c_void)> = self.states.iter()
+            .filter(|(key, _)| key.starts_with("@indexer:"))
+            .map(|(key, entry)| (key.clone(), entry.pointer))
+            .collect();
+        for (key, pointer) in indexers {
+            // (in its place: a sequence's parts are read and restored in this order)
+            let at = self.states.get_index_of(&key).ok_or("no such Straydog state")?;
+            self.states.shift_remove(&key);
+            self.cache.remove(&key);
+            // SAFETY: an allocation of this device; no plan holds it yet.
+            check(unsafe { ffi::sd_release(self.handle, pointer) })?;
+            self.state(&key, (capacity / 4 + 1) * 128 + INDEX_HISTORY, 1, false)?;
+            self.states.move_index(self.states.len() - 1, at);
         }
+        Ok(())
     }
 
     /// Every layer's host K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`).
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
+        // The slots give up their VRAM for the longer indexers and take what is left, whether every layer grew or memory ran out.
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        let grown = self.grow_kv_layers(capacity, valid);
+        if self.slot_stage > 0 {
+            let cache = self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)?;
+            // SAFETY: a live handle; the pool was released above.
+            check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) })?;
+            self.rebalance(0)?;
+        }
+        grown
+    }
+
+    fn grow_kv_layers(&mut self, capacity: u64, valid: u64) -> Result<()> {
         let layers: Vec<(String, u64)> = self.states.keys()
             .filter_map(|key| Some((key.clone(), key.strip_prefix("@qsa:blk.")?.strip_suffix('.')?.parse().ok()?)))
             .collect();
@@ -778,13 +810,18 @@ impl Backend {
             if self.states.get(&key).is_some_and(|entry| entry.rows >= capacity * 4) {
                 continue;
             }
-            let mut state = std::ptr::null_mut();
-            // SAFETY: a live handle and an out-parameter; the layer's states are the native side's.
-            check(unsafe { ffi::sd_kv_grow(self.handle, layer, capacity, valid, &mut state) })?;
+            let (mut state, mut index_state) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: a live handle and out-parameters; the layer's states are the native side's.
+            check(unsafe { ffi::sd_kv_grow(self.handle, layer, capacity, valid, &mut state, &mut index_state) })?;
             let entry = self.states.get_mut(&key).ok_or("no such Straydog state")?;
             (entry.pointer, entry.rows) = (state, capacity * 4);
             let index = key.replace("@qsa:", "@indexer:");
-            self.states.get_mut(&index).ok_or("no such Straydog state")?.rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
+            let rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
+            let entry = self.states.get_mut(&index).ok_or("no such Straydog state")?;
+            (entry.pointer, entry.rows) = (index_state, rows);
+            if let Some(cached) = self.cache.get_mut(&index) {
+                (cached.pointer, cached.rows) = (index_state, rows);
+            }
         }
         Ok(())
     }
@@ -1822,12 +1859,17 @@ impl Backend {
     /// Give the remaining budget to expert cache slots; the cache slot count.
     pub fn create_expert_slots(&mut self, stage: u64, margin: u64) -> Result<u64> {
         let slot = (if self.slot_bytes > 0 { self.slot_bytes } else { expert_bytes([42, 42, 42]) }).div_ceil(256) * 256;
-        let (used, budget) = self.memory()?;
-        let free = i128::from(budget) - i128::from(used) - i128::from(margin) - i128::from(stage * slot) - 8192 * 4;
-        let cache = (free.max(0) as u64) / slot;
+        let cache = self.slots_that_fit(stage, margin, slot)?;
         // SAFETY: a live handle.
         check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot) })?;
+        (self.slot_stage, self.slot_margin, self.slot_size) = (stage, margin, slot);
         Ok(cache)
+    }
+
+    fn slots_that_fit(&self, stage: u64, margin: u64, slot: u64) -> Result<u64> {
+        let (used, budget) = self.memory()?;
+        let free = i128::from(budget) - i128::from(used) - i128::from(margin) - i128::from(stage * slot) - 8192 * 4;
+        Ok((free.max(0) as u64) / slot)
     }
 
     /// Delegate absent routed experts to `engine`, which must outlive this device.

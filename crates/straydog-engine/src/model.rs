@@ -422,7 +422,7 @@ impl Model {
         model.prepare_decoder(context64, false)?;
         if model.partial && host && !model.group.parts() && context > STARTING_KV {
             model.kv_capacity = STARTING_KV;
-            model.group.start_kv(STARTING_KV as u64);
+            model.group.start_kv(STARTING_KV as u64)?;
         }
         // SAFETY of the borrow: the operand points into the weights, which outlive the group.
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };

@@ -758,8 +758,8 @@ impl Group {
     }
 
     /// Each device's host K/V planned for `capacity` positions (see [`Backend::start_kv`]).
-    pub fn start_kv(&mut self, capacity: u64) {
-        self.backends.iter_mut().for_each(|backend| backend.start_kv(capacity));
+    pub fn start_kv(&mut self, capacity: u64) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.start_kv(capacity))
     }
 
     /// Each device's host K/V grown to `capacity` positions, `valid` kept (see [`Backend::grow_kv`]).
