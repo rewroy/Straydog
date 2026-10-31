@@ -19,10 +19,10 @@ pub const GIB: u64 = 1 << 30;
 pub const DEFAULT_CONTEXT: u64 = 262_144;
 
 /// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash's
-/// recommended build and its other two, Qwen3.8-Flash-Next from the most exact quantization to
-/// the smallest, then Qwen3.6-35B-A3B, the model for small VRAM.
-pub const ORDER: [&str; 8] =
-    ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "UD-Q8_K_XL"];
+/// recommended build and its other two, then Qwen3.8-Flash-Next from the most exact quantization to
+/// the smallest. Qwen3.6-35B-A3B is not supported: nothing offers it, and a bundle already on a disk still runs.
+pub const ORDER: [&str; 7] =
+    ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"];
 
 /// A file a model can do without, which `setup` offers to add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,11 +433,11 @@ pub(crate) mod tests {
     fn every_pinned_bundle_is_offered_once() {
         let mut named: Vec<&str> = ORDER.to_vec();
         named.sort_unstable();
-        let mut pinned: Vec<&str> = bundle::quantizations().collect();
+        let mut pinned: Vec<&str> = bundle::quantizations().filter(|quant| *quant != "UD-Q8_K_XL").collect();
         pinned.sort_unstable();
         assert_eq!(named, pinned);
         let entries = pinned_entries();
-        assert_eq!(models(&entries), ["DeepSeek-V4.1-Flash", "Qwen3.8-Flash-Next", "Qwen3.6-35B-A3B"]);
+        assert_eq!(models(&entries), ["DeepSeek-V4.1-Flash", "Qwen3.8-Flash-Next"]);
     }
 
     fn pinned_entries() -> Vec<Entry> {
@@ -546,17 +546,13 @@ pub(crate) mod tests {
         for quant in ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS"] {
             assert!(matches!(of(quant).1, Fit::TooLittleVram { .. }), "{quant}");
         }
-        // Qwen3.6's K/V alone is 10 GiB at the default context (it did not start at --vram 12): it is offered
-        // with less, and the experts that VRAM and RAM cannot hold are read from the drive
-        let (context, qwen36) = of("UD-Q8_K_XL");
-        assert!(context < DEFAULT_CONTEXT && matches!(qwen36, Fit::Drive(_)), "{context} {qwen36:?}");
-        // the other Qwen3.8 bundles run too, keeping the context they start with (the placement ran IQ3_S
+        // the Qwen3.8 bundles run, keeping the context they start with (the placement ran IQ3_S
         // partially resident at --vram 12, K/V in host memory), and read from the drive
         for quant in ["IQ3_S", "IQ2_XS", "Q2_0"] {
             assert!(matches!(of(quant), (DEFAULT_CONTEXT, Fit::Drive(_)) | (_, Fit::Drive(_))), "{quant}");
         }
         let recommended = recommend(&entries, &fits.iter().map(|(_, fit)| fit.clone()).collect::<Vec<_>>()).unwrap();
-        assert_eq!(entries[recommended].model, "Qwen3.6-35B-A3B");
+        assert_eq!(entries[recommended].quant, "Q2_0");
     }
 
     /// The context the rule gives is the largest at which a bundle starts: Qwen3.6 on one GPU, by the
