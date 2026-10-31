@@ -179,6 +179,7 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
 extern "C" int sd_cpu_experts_run(void*, const int*, const uint8_t* const*, const uint8_t* const*, const uint8_t* const*,
                                   const float*, uint32_t, uint64_t, uint64_t, const float*, float*);
 extern "C" const char* sd_cpu_error();
+extern "C" int sd_cpu_read_ahead(void*, const uint8_t* const*, const uint64_t*, uint32_t);
 void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
     const uint8_t* gate[10]; const uint8_t* up[10]; const uint8_t* down[10]; float weights[10];
     uint32_t count = 0;
@@ -199,6 +200,14 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
     if (count) {
         if (!d.cpu) throw std::runtime_error("hybrid experts need an attached CPU expert engine");
         const int kinds[3] = {plan.weights[0].kind, plan.weights[1].kind, plan.weights[2].kind};
+        if (d.hint_experts) {
+            const uint8_t* ranges[30]; uint64_t sizes[30];
+            for (uint32_t i = 0; i < count; ++i) {
+                ranges[3 * i] = gate[i]; ranges[3 * i + 1] = up[i]; ranges[3 * i + 2] = down[i];
+                for (size_t role = 0; role < 3; ++role) sizes[3 * i + role] = plan.host_bytes[role];
+            }
+            if (sd_cpu_read_ahead(d.cpu, ranges, sizes, 3 * count)) throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
+        }
         if (sd_cpu_experts_run(d.cpu, kinds, gate, up, down, weights, count, 2560, 640, exported + 32, result))
             throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
         d.cpu_experts += count;
