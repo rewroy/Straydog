@@ -63,6 +63,7 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
         throw std::runtime_error("invalid hybrid MoE workspace");
     auto plan = std::make_unique<ResidentMoe>();
     plan->experts = experts; plan->capacity = capacity; plan->hybrid = true;
+    plan->host_read.assign(experts, 0); plan->host_token = 65;   // every expert starts out old
     plan->workspace = static_cast<float*>(workspace); plan->dependencies.assign(pointers, pointers + 5);
     // Routed experts are slices of 640x2560, 640x2560 and 2560x640.
     const size_t rows[8] = {640, 640, 2560, 640, 640, 2560, experts, 1};
