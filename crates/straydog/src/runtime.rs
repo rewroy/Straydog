@@ -29,6 +29,11 @@ const RECENT: usize = 120;
 /// A client that takes none of its generation's events for this long has gone: the generation
 /// is cancelled (its events channel holds 64, so a reader that keeps up never waits this long).
 const SEND_PATIENCE: Duration = Duration::from_secs(30);
+/// How long the worker has to end a cancelled generation before it counts as hung, which ends the
+/// server. It ends one when the pass it is in ends, and a fresh prefill's pass of 8192 rows takes
+/// ~14 s on an NVMe drive (longer on a slower drive or with a larger model): a client that leaves
+/// during one must not cost the loaded model.
+const CANCEL_PATIENCE: Duration = Duration::from_secs(600);
 
 /// The program and arguments that start the worker (isolated, in production).
 pub type Command = (PathBuf, Vec<OsString>);
@@ -639,6 +644,16 @@ impl Runtime {
 
     /// [`Runtime::start`] once `prepare` has run (shown as loading) and given the command.
     pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE)
+    }
+
+    /// Tests only: [`Runtime::start`] with its worker given `patience` to end a cancelled generation.
+    #[doc(hidden)]
+    pub fn start_with_cancel_patience(settings: &Settings, command: Command, patience: Duration) -> Runtime {
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience)
+    }
+
+    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
             failure: watch::Sender::new(None),
@@ -655,6 +670,7 @@ impl Runtime {
             expected: (settings.ctx_size as u64, settings.quant.clone()),
             verbose: settings.verbose,
             warm_directory: Some(settings.data_dir.join("warm")),
+            cancel_patience,
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
@@ -713,6 +729,8 @@ struct Driver {
     verbose: bool,
     /// Where the expert store's contents are kept between runs (`<data-dir>/warm`), if anywhere.
     warm_directory: Option<PathBuf>,
+    /// [`CANCEL_PATIENCE`].
+    cancel_patience: Duration,
 }
 
 /// How often a changed warm-up state is saved while the server runs.
@@ -1131,7 +1149,7 @@ impl Driver {
                                 permit = job.events.reserve() => match permit {
                                     Ok(permit) => permit.send(event),
                                     // The client went away: end the generation, keep reading until it ends.
-                                    Err(_) => stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?,
+                                    Err(_) => stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline, self.cancel_patience).await?,
                                 },
                                 Some(control) = controls.recv() => {
                                     self.control(process, job, control, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?;
@@ -1142,7 +1160,7 @@ impl Driver {
                                 () = &mut patience => {
                                     tracing::warn!("Straydog client took no events for {} s: cancelling its generation",
                                                    SEND_PATIENCE.as_secs());
-                                    stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline).await?;
+                                    stop_forwarding(process, &cancel_frame, &mut forwarding, &mut cancel_deadline, self.cancel_patience).await?;
                                 }
                             }
                         }
@@ -1166,7 +1184,7 @@ impl Driver {
                      forwarding: &mut bool, cancel_deadline: &mut Option<Instant>) -> Result<(), String> {
         match control {
             Control::Interrupt(id) if id == job.id => process.send(cancel_frame).await?,
-            Control::Cancel(id) if id == job.id => stop_forwarding(process, cancel_frame, forwarding, cancel_deadline).await?,
+            Control::Cancel(id) if id == job.id => stop_forwarding(process, cancel_frame, forwarding, cancel_deadline, self.cancel_patience).await?,
             // A queued generation's client left: skip it when its turn comes.
             Control::Cancel(id) => {
                 self.shared.cancelled.lock().unwrap().insert(id);
@@ -1177,14 +1195,14 @@ impl Driver {
     }
 }
 
-/// Stop sending a generation's events and end it; the worker has 10 s to acknowledge.
+/// Stop sending a generation's events and end it; the worker has `patience` to acknowledge.
 async fn stop_forwarding(process: &mut Process, cancel_frame: &pyjson::Value, forwarding: &mut bool,
-                         cancel_deadline: &mut Option<Instant>) -> Result<(), String> {
+                         cancel_deadline: &mut Option<Instant>, patience: Duration) -> Result<(), String> {
     if *forwarding {
         *forwarding = false;
         process.send(cancel_frame).await?;
     }
-    cancel_deadline.get_or_insert(Instant::now() + Duration::from_secs(10));
+    cancel_deadline.get_or_insert(Instant::now() + patience);
     Ok(())
 }
 

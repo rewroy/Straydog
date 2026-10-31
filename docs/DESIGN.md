@@ -1055,7 +1055,8 @@ with a model of its own reads no file it was not given.
   - The server listens on 127.0.0.1 by default.
   - An API key is optional, and required once given.
   - One engine serializes generation behind a bounded queue, and a request whose client
-    disconnects is cancelled.
+    disconnects is cancelled. The worker ends it when its current pass ends. Only a worker that
+    has not ended it after 10 minutes counts as hung, which ends the server.
   - Every client that holds the key shares the engine and its cache, so whether a prompt prefix
     was seen before is observable. Users who must not see each other's prompts need separate
     servers.
