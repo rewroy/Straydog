@@ -10,3 +10,4 @@ dist/
 /build-stage-commit-push.bat
 /plan/
 /AGENTS.md
+.codegraph/
