@@ -64,18 +64,6 @@ required-features = ["gpu"]
 name = "prefill"
 required-features = ["gpu"]
 
-[[example]]
-name = "q35_chat"
-required-features = ["gpu"]
-
-[[example]]
-name = "q35_cpu_bench"
-required-features = ["gpu"]
-
-[[example]]
-name = "q35_hybrid"
-required-features = ["gpu"]
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

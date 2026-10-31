@@ -385,10 +385,10 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
 /// worker checks every block it uses against them. A model whose official repository gives its
 /// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
-pub const ON_DEMAND_MANIFESTS: [&str; 4] = [include_str!("assets_deepseek41.json"), include_str!("assets_qwen36.json"),
-                                            include_str!("assets_deepseek41_gsq.json"), include_str!("assets_deepseek41_gsq.json")];
+pub const ON_DEMAND_MANIFESTS: [&str; 3] = [include_str!("assets_deepseek41.json"), include_str!("assets_deepseek41_gsq.json"),
+                                            include_str!("assets_deepseek41_gsq.json")];
 /// Every on-demand quantization, with the manifest that pins it.
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 4] = ["UD-IQ2_XXS", "UD-Q8_K_XL", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 3] = ["UD-IQ2_XXS", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -563,11 +563,6 @@ mod tests {
             assert_eq!(sources.len(), pins.shards.len() + pins.resources.len() + pins.sidecars.len(), "{quantization}");
             assert!(is_on_demand(quantization) && !QUANTIZATIONS.contains(&quantization));
         }
-        assert_eq!((model_of("UD-Q8_K_XL").unwrap().as_str(), architecture_of("UD-Q8_K_XL").unwrap().as_str()),
-                   ("Qwen3.6-35B-A3B", "qwen35moe"));
-        let qwen = on_demand_sources("UD-Q8_K_XL").unwrap();
-        let tokenizer = qwen.iter().find(|source| source.asset.name == "tokenizer.json").unwrap();
-        assert_eq!((tokenizer.repository.as_str(), tokenizer.path.as_str()), ("Qwen/Qwen3.6-35B-A3B", "tokenizer.json"));
         assert!(on_demand("UD-IQ2_XXS").unwrap().resources.is_empty());
         // ISTA's GSQ-RCO DeepSeek-V4.1: four shards and the Engram tables beside them, apart from
         // Qwen3.8's IQ2_XS
@@ -609,16 +604,14 @@ mod tests {
             assert!(footprint.dense > 0 && footprint.experts > footprint.dense, "{quantization}");
         }
         // the state a token of context takes, which a model's bundles share: Qwen3.8's 13 GiB at 262144 (host
-        // memory), Qwen3.6's F32 K/V of ten attention layers, DeepSeek-V4.1's compressed rows
+        // memory), DeepSeek-V4.1's compressed rows
         assert_eq!(footprint("Q2_0").unwrap().state_per_token * 262_144 / (1 << 30), 13);
-        assert_eq!(footprint("UD-Q8_K_XL").unwrap().state_per_token, 10 * 2 * 256 * 2 * 4);
         assert!((3000..3500).contains(&footprint("GSQ-RCO-IQ2_XXS").unwrap().state_per_token));
         assert_eq!(footprint("GSQ-RCO-IQ2_XXS").unwrap().state_per_token, footprint("UD-IQ2_XXS").unwrap().state_per_token);
-        // the tables read from the drive: Engram (DeepSeek-V4.1's own file), the PLE table (Qwen3.8's), none (Qwen3.6)
+        // the tables read from the drive: Engram (DeepSeek-V4.1's own file), the PLE table (Qwen3.8's)
         let engram = on_demand("GSQ-RCO-IQ2_XXS").unwrap().shards[5].bytes;
         assert!(footprint("GSQ-RCO-IQ2_XXS").unwrap().tables > engram / 100 * 99 && footprint("GSQ-RCO-IQ2_XXS").unwrap().tables <= engram);
         assert_eq!(footprint("Q2_0").unwrap().tables, footprint("IQ3_S").unwrap().tables);
-        assert_eq!(footprint("UD-Q8_K_XL").unwrap().tables, 0);
         assert!(footprint("Q8_0").unwrap_err().contains("no footprint"));
     }
 

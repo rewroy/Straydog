@@ -37,12 +37,14 @@ pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
 /// which fill what the VRAM budget has left: 0.6 GiB on an RTX 5070 Ti at --vram 6 and 8.
+#[cfg(any(windows, test))]
 const COMMIT_AFTER_LOCKS: u64 = 1 << 30;
 
 /// Bytes of the expert banks that may be page-locked given the `available` physical memory, the `commit`
 /// left and the `vram_room` the slots will take. Windows charges commit for what is locked (1 to 1 over 29 GiB at 62 GiB with an 8 GiB
 /// page file, which left 0.5 GiB of commit with physical memory to spare), and a GPU budget has taken its
 /// commit by then.
+#[cfg(any(windows, test))]
 fn lockable_of(available: u64, commit: u64, vram_room: u64, memory: u64) -> u64 {
     within_free(u64::MAX, 0, available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)), memory)
 }
