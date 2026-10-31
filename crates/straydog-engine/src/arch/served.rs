@@ -408,6 +408,34 @@ fn draw_for(sampling: &Sampling, seeds: &mut Rng) -> Option<Draw> {
 /// asking the engines for a draft ([`Engines::draft`]).
 const LONG_MATCH: usize = 8;
 
+/// Feed `tokens` (any count) through `engines` in passes of at most `batch`, each added to `history`;
+/// the logits after the last. Cancelled before any pass (a pass can take many seconds): None, with
+/// the history at what was fed. A failure forgets the sequence.
+fn feed<E: Engines>(engines: &mut E, history: &mut Vec<u32>, batch: usize, tokens: &[u32], cancelled: &dyn Fn() -> bool,
+                    progress: &mut dyn FnMut(usize)) -> Result<Option<Vec<f32>>, String> {
+    let mut logits = None;
+    for (index, piece) in tokens.chunks(batch).enumerate() {
+        if cancelled() {
+            return Ok(None);
+        }
+        // (the next pass's drive reads start before this pass, to land while it runs)
+        let (first, ahead) = (index * batch, ((index + 2) * batch).min(tokens.len()));
+        let output = if ahead > first + piece.len() { engines.prefetch_ahead(&tokens[first..ahead]) } else { Ok(()) }
+            .and_then(|()| engines.forward(piece));
+        match output {
+            Ok(output) => logits = Some(output),
+            Err(error) => {
+                history.clear();
+                engines.reset();
+                return Err(error);
+            }
+        }
+        history.extend_from_slice(piece);
+        progress(history.len());
+    }
+    Ok(logits)
+}
+
 /// Sample from `logits` (after the held sequence, `history`) and continue it: up to `max_new`
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
 /// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
@@ -581,33 +609,9 @@ impl<E: Engines> Session<E> {
         Ok(info)
     }
 
-    /// Feed `tokens` (any count) through the engines in passes of at most the batch; the logits
-    /// after the last. Cancelled between passes: None, with the history at what was fed.
+    /// [`feed`] the held sequence.
     fn feed(&mut self, tokens: &[u32], cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize)) -> Result<Option<Vec<f32>>, String> {
-        let mut logits = None;
-        for (index, piece) in tokens.chunks(self.batch).enumerate() {
-            if index > 0 && cancelled() {
-                return Ok(None);
-            }
-            // (the next pass's drive reads start before this pass, to land while it runs)
-            let (first, ahead) = (index * self.batch, ((index + 2) * self.batch).min(tokens.len()));
-            if ahead > first + piece.len() {
-                if let Err(error) = self.engines.prefetch_ahead(&tokens[first..ahead]) {
-                    self.reset();
-                    return Err(error);
-                }
-            }
-            match self.engines.forward(piece) {
-                Ok(output) => logits = Some(output),
-                Err(error) => {
-                    self.reset();
-                    return Err(error);
-                }
-            }
-            self.history.extend_from_slice(piece);
-            progress(self.history.len());
-        }
-        Ok(logits)
+        feed(&mut self.engines, &mut self.history, self.batch, tokens, cancelled, progress)
     }
 
     /// Continue the held sequence over `tokens` (or start anew when they do not extend it) and
@@ -974,6 +978,25 @@ mod tests {
             self.held.truncate(from + keep);
             Ok(())
         }
+    }
+
+    /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
+    /// checkpoint) starts no pass for a client that has left.
+    #[test]
+    fn a_cancelled_feed_starts_no_further_pass() {
+        let feed_until = |passes: usize| {
+            let (mut toy, mut history) = (Toy { vocabulary: 8, rows: 1, ..Toy::default() }, Vec::new());
+            let (run, mut reported) = (std::cell::Cell::new(0), Vec::new());
+            let logits = feed(&mut toy, &mut history, 2, &[1, 2, 3, 4, 5], &|| run.get() >= passes, &mut |done| {
+                run.set(run.get() + 1);
+                reported.push(done);
+            }).unwrap();
+            assert_eq!(toy.held, history);
+            (logits.is_some(), history, reported)
+        };
+        assert_eq!(feed_until(0), (false, vec![], vec![]));
+        assert_eq!(feed_until(1), (false, vec![1, 2], vec![2]));
+        assert_eq!(feed_until(3), (true, vec![1, 2, 3, 4, 5], vec![2, 4, 5]));
     }
 
     fn run(rows: usize, prompt: &[u32], end: &[u32], max_new: usize, sampling: &Sampling, seed: u64) -> (Vec<u32>, Decoded) {
