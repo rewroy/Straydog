@@ -571,6 +571,7 @@ struct Device {
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
+    uint64_t hybrid_verify_balanced=0;   // hybrid_tokens at a verification's last swaps
     hipEvent_t swapped=nullptr;   // the pending swaps' copies have landed
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
     std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
@@ -1281,6 +1282,10 @@ int sd_decode_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,co
 int sd_verify_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,
                    const float* input,float* output) {
     try { verify_span(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,output); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_verify_reserve(void* handle) {
+    try { verify_reserve(device(handle)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_verify_commit(void* handle,uint64_t begin,uint64_t end,uint64_t kept) {

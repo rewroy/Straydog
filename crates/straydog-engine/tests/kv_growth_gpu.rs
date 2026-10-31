@@ -99,9 +99,9 @@ fn growth_keeps_the_sequence() {
     }
 }
 
-/// With the drafter given, which a partially resident model drops, past the first capacity.
+/// With the drafter given, which a partially resident model keeps where it fits, past the first capacity.
 #[test]
-fn growth_with_a_dropped_drafter() {
+fn growth_with_a_drafter() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the model bundle directory") else { return };
     let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the drafter directory") else { return };
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
@@ -115,8 +115,7 @@ fn growth_with_a_dropped_drafter() {
         text.push(text.len() as u32 % 200000);
     }
     let mut model = open_with(&root, Some(&drafter), golden["quantization"].as_str().unwrap());
-    assert!(model.partial && model.host_kv && model.speculative == 0, "partial {} host K/V {} speculative {}", model.partial, model.host_kv, model.speculative);
-    // (the dropped drafter's state goes with it: the same sequence as without it)
+    assert!(model.partial && model.host_kv, "partial {} host K/V {}", model.partial, model.host_kv);
     let mut out = String::new();
     for (name, end) in [("below", 32000), ("grown", 40000)] {
         let seen = go(&mut model, &text[..end], 1);

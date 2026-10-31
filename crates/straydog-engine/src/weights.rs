@@ -720,6 +720,14 @@ impl Weights {
             .collect()
     }
 
+    /// What the MTP drafter pins when kept beside a partially resident target.
+    pub fn drafter_requirements(&self) -> Vec<(String, u64)> {
+        self.device_tensors()
+            .filter(|(name, _)| self.drafter_names.contains(*name))
+            .map(|(name, tensor)| (name.clone(), tensor.device_bytes(name)))
+            .collect()
+    }
+
     /// GGML kinds of a layer's routed gate, up and down banks.
     pub fn expert_kinds(&self, layer: usize) -> Result<[u32; 3], String> {
         let kind = |role: &str| self.tensor(&format!("blk.{layer}.ffn_{role}_exps.weight")).map(|tensor| tensor.kind);
