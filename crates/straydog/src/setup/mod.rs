@@ -21,10 +21,10 @@ pub use settings::{write_settings, Settings, Written};
 /// The options of `straydog setup`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SetupArgs {
-    /// The model to set up (DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B): its best bundle for this machine
+    /// The model to set up (DeepSeek-V4.1-Flash or Qwen3.8-Flash-Next): its best bundle for this machine
     #[arg(long, value_name = "NAME")]
     pub model_name: Option<String>,
-    /// The bundle to set up (as `fetch --quant`: GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS, IQ3_S, IQ3_XXS, IQ2_XS, Q2_0 or UD-Q8_K_XL)
+    /// The bundle to set up (as `fetch --quant`: GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS, IQ3_S, IQ3_XXS, IQ2_XS or Q2_0)
     #[arg(long, value_name = "NAME")]
     pub quant: Option<String>,
     /// The folder for models: the bundle goes in DIR/<model>/<quant>, or is DIR when DIR holds it already [default: the platform's data folder]
@@ -582,7 +582,7 @@ mod tests {
         println!("{said}");
         assert!(said.contains("2 x GPU (31.9 GiB each)") || said.contains("GPUs (ROCm/HIP)"), "{said}");
         assert!(said.contains("1) DeepSeek-V4.1-Flash") && said.contains("GSQ-RCO-IQ2_XXS") && said.contains("recommended"), "{said}");
-        assert!(said.contains("Please give a number from 1 to 8."), "{said}");
+        assert!(said.contains("Please give a number from 1 to 7."), "{said}");
         assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
         assert_eq!(outcome.extras, [Extra::Vision]);
         assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash").join("GSQ-RCO-IQ2_XXS"));
@@ -618,8 +618,8 @@ mod tests {
         let recorder = Recorder::default();
         let ask = |args: SetupArgs, machine: &Machine| run_with(&SetupArgs { yes: true, dir: Some(root.join("models")), ..args }, machine, &entries, &defaults(&root), &recorder, "", false).0;
         // by model name, in any case: its best bundle for the machine
-        let outcome = ask(SetupArgs { model_name: Some("qwen3.6-35b-a3b".into()), ..SetupArgs::default() }, &small).unwrap();
-        assert_eq!(outcome.quant, "UD-Q8_K_XL");
+        let outcome = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &small).unwrap();
+        assert_eq!(outcome.quant, "Q2_0");
         let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &doggybox()).unwrap();
         assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
         // the extras left out by option
@@ -629,7 +629,9 @@ mod tests {
         let error = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XXS".into()), ..SetupArgs::default() }, &small).unwrap_err();
         assert!(error.contains("cannot run") && error.contains("12 GiB"), "{error}");
         assert!(ask(SetupArgs { quant: Some("Q8_0".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown bundle Q8_0"));
-        assert!(ask(SetupArgs { quant: Some("Q2_0".into()), model_name: Some("Qwen3.6-35B-A3B".into()), ..SetupArgs::default() }, &small).is_err());
+        assert!(ask(SetupArgs { quant: Some("Q2_0".into()), model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &small).is_err());
+        // a model that is not supported any more is not offered
+        assert!(ask(SetupArgs { model_name: Some("Qwen3.6-35B-A3B".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown model"));
         assert!(ask(SetupArgs::default(), &machine_of(0, 0, 32 << 30)).unwrap_err().contains("none of the models"));
         assert!(ask(SetupArgs { model_name: Some("Ornith-1.5-122B".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown model"));
     }

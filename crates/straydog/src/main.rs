@@ -43,7 +43,7 @@ enum Command {
         /// The bundle directory
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
-        /// Qwen3.8-Flash-Next: Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB); DeepSeek-V4.1-Flash: GSQ-RCO-IQ2_XXS (248.8 GB), GSQ-RCO-IQ2_XS (265.8 GB), UD-IQ2_XXS (300.5 GB); Qwen3.6-35B-A3B: UD-Q8_K_XL (38.5 GB). `straydog setup` chooses for you
+        /// Qwen3.8-Flash-Next: Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB); DeepSeek-V4.1-Flash: GSQ-RCO-IQ2_XXS (248.8 GB), GSQ-RCO-IQ2_XS (265.8 GB), UD-IQ2_XXS (300.5 GB). `straydog setup` chooses for you
         #[arg(long, value_name = "NAME")]
         quant: String,
         /// Authenticate what is there; download nothing
