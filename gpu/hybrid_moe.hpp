@@ -79,6 +79,13 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
         reinterpret_cast<float4*>(target)[i] = ready ? __ldcv(source + i) : make_float4(0, 0, 0, 0);
 #endif
 }
+#if !defined(__HIPCC__)
+// A later row's CPU result to device memory, once hybrid_await has seen them all published.
+__global__ void hybrid_stage(const volatile float* result, float* target) {
+    const float4* source = reinterpret_cast<const float4*>(const_cast<const float*>(result));
+    for (size_t i = threadIdx.x; i < 640; i += blockDim.x) reinterpret_cast<float4*>(target)[i] = __ldcv(source + i);
+}
+#endif
 // Host side of hybrid_await for one span. Counts restart from the GPU's awaited count
 // (the stream is idle between spans); a span that unwinds still publishes every
 // result its launched graphs await, then drains the stream.
@@ -110,10 +117,10 @@ struct HybridAwait {
 // Single-token GPU part, split so the host can start its experts as soon as the
 // routing and activation are exported while the GPU evaluates resident experts.
 struct HybridScratch { float *gate_up, *product, *outputs, *probabilities; int32_t* selected; };
-HybridScratch hybrid_scratch(ResidentMoe& plan) {
+HybridScratch hybrid_scratch(ResidentMoe& plan, size_t row = 0) {
     constexpr size_t routes = 11;
     HybridScratch s{};
-    s.gate_up = plan.workspace; s.product = s.gate_up + routes * 1280;
+    s.gate_up = plan.workspace + row * (routes * (1280 + 640 + 2560) + 64); s.product = s.gate_up + routes * 1280;
     s.outputs = s.product + routes * 640; s.probabilities = s.outputs + routes * 2560;
     s.selected = reinterpret_cast<int32_t*>(s.probabilities + 11) + routes;
     return s;
@@ -124,9 +131,9 @@ ExpertGemv hybrid_assist(const Device& d, const ResidentMoe& plan) {
     assist.assist = plan.mapped[0] ? d.assist : 0;
     return assist;
 }
-void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float* exported) {
+void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float* exported, size_t row = 0) {
     const size_t experts = plan.experts;
-    const HybridScratch s = hybrid_scratch(plan);
+    const HybridScratch s = hybrid_scratch(plan, row);
     Matrix projections[2] = {plan.weights[(experts + 1) * 3], plan.weights[(experts + 1) * 3 + 1]};
     projections[1].output_offset = experts;
     gemv(d, projections, 2, input, d.output);
@@ -156,8 +163,8 @@ __global__ void hybrid_stage_assist(const MoeGroup* groups, const int32_t* selec
     }
 }
 #endif
-void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, float* partial) {
-    const HybridScratch s = hybrid_scratch(plan);
+void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, float* partial, size_t row = 0) {
+    const HybridScratch s = hybrid_scratch(plan, row);
     auto* groups = static_cast<MoeGroup*>(plan.table);
     const uint8_t* stage = nullptr;
 #if !defined(__HIPCC__)
@@ -180,7 +187,7 @@ extern "C" int sd_cpu_experts_run(void*, const int*, const uint8_t* const*, cons
                                   const float*, uint32_t, uint64_t, uint64_t, const float*, float*);
 extern "C" const char* sd_cpu_error();
 extern "C" int sd_cpu_read_ahead(void*, const uint8_t* const*, const uint64_t*, uint32_t);
-void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
+void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported, float* result) {
     const uint8_t* gate[10]; const uint8_t* up[10]; const uint8_t* down[10]; float weights[10];
     uint32_t count = 0;
     size_t selected[10], taken[10];
@@ -197,7 +204,6 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
         weights[count++] = exported[16 + route];
     }
     hybrid_observe_token(plan, selected);
-    float* result = d.exchange + 4096;
     if (count) {
         if (!d.cpu) throw std::runtime_error("hybrid experts need an attached CPU expert engine");
         const int kinds[3] = {plan.weights[0].kind, plan.weights[1].kind, plan.weights[2].kind};

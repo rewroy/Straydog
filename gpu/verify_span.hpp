@@ -56,7 +56,8 @@ void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, 
 // A layer's part on a device of two (qwen_parts.hpp).
 void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v);
 
-void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
+// A layer up to its experts: the rows in v.mixed, the attention's residual in v.hidden.
+void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
     void* const* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
     const bool linear = decoder_linear(plan.index);
     const size_t attention = linear ? 9 : 10;
@@ -91,7 +92,114 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
     }
     hc_operands(pointers + 4 + attention, kinds + 4 + attention, hc);
     hc_decode(d, hc, true, v.hidden, d.output, v.mixed, steps, 2564);
+}
+
+void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
+    verify_layer_front(d, plan, steps, v);
     moe_tokens(d, plan.moe, steps, v.mixed, 2564, v.hidden);
+}
+
+// Rows of a verification through partially resident layers: verify_layer's arithmetic up to the experts, then each row's
+// routes as one token's (hybrid_moe.hpp), its CPU experts on the host. Under prelaunch a layer's graph awaits the last one's.
+void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
+    if (!input || !steps || steps > verify_max || steps > hybrid_rows) throw std::runtime_error("invalid hybrid verification");
+    float* workspace = nullptr;
+    for (size_t layer = begin; layer < end; ++layer) {
+        auto found = d.decoder.find(layer);
+        if (found == d.decoder.end() || position + steps > found->second.context || (workspace && workspace != found->second.workspace) ||
+            !d.resident.find(found->second.moe)->second->hybrid)
+            throw std::runtime_error("verification span has no compatible hybrid layer");
+        workspace = found->second.workspace;
+        if (decoder_linear(layer)) verify_buffers(d, found->second);
+    }
+    if (d.allocations.find(workspace)->second / 4 < verify_extent + verify_max * hybrid_row_export)
+        throw std::runtime_error("speculative verification needs a larger decoder workspace");
+    kv_prepare_span(d, begin, end, position, steps);
+    const VerifyLayout v = verify_layout(workspace);
+    float* exported = workspace + verify_extent;
+    upload(d, v.hidden, input, steps * 10240 * 4);
+    uint32_t positions[verify_max];
+    for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
+    upload(d, v.positions, positions, steps * 4);
+    if (position != d.hybrid_position) { d.hybrid_position = position; d.hybrid_tokens += steps; }
+    hybrid_settle(d, false);
+    const bool ahead = hybrid_ahead(d, begin, end);
+    HybridAwait await(d);
+    auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange_device + hybrid_sequence_slot);
+#if defined(__HIPCC__)
+    const bool stage = false;
+#else
+    const bool stage = ahead;
+#endif
+    auto cpu_result = [&](size_t row) -> const float* { return stage ? d.cpu_partial + row * 2560 : d.exchange_device + hybrid_result_at(row); };
+    auto finish_previous = [&]() {
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0), stage ? d.cpu_partial : nullptr, d.await_timeout);
+#if !defined(__HIPCC__)
+        if (stage) for (size_t row = 1; row < steps; ++row)
+            hybrid_stage<<<1,256,0,d.stream>>>(d.exchange_device + hybrid_result_at(row), d.cpu_partial + row * 2560);
+#endif
+        for (size_t row = 0; row < steps; ++row)
+            hybrid_finish<<<40,256,0,d.stream>>>(v.hidden + row * 10240, v.mixed + row * 2564, v.branch + row * 2560, cpu_result(row));
+    };
+    auto launch = [&](size_t layer) {
+        DecoderLayer& plan = d.decoder.find(layer)->second;
+        ResidentMoe& experts = *d.resident.find(plan.moe)->second;
+        const bool finish = layer > begin;
+        auto submit = [&]() {
+            if (finish) finish_previous();
+            verify_layer_front(d, plan, steps, v);
+            for (size_t row = 0; row < steps; ++row) {
+                hybrid_route_export(d, experts, v.mixed + row * 2564, exported + row * hybrid_row_export, row);
+                hybrid_publish<<<11,256,0,d.stream>>>(exported + row * hybrid_row_export, d.exchange_device + hybrid_export_at(row));
+            }
+            hybrid_tick<<<1,1,0,d.stream>>>(d.flags + 1, reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot));
+            for (size_t row = 0; row < steps; ++row)
+                hybrid_resident_experts(d, experts, v.mixed + row * 2564, v.branch + row * 2560, row);
+            check(hipGetLastError());
+        };
+        if (ahead && finish) ++await.launched;
+        run_graph(d, ahead ? "hybrid-verify-await" : "hybrid-verify", plan.dependencies.data(), plan.dependencies.size(),
+                  (layer * 2 + finish) * 8 + steps, submit);
+        flush_launches(d);
+    };
+    auto launch_after = [&](size_t layer) {
+        if (layer + 1 < end) launch(layer + 1);
+        else {
+            ++await.launched;
+            finish_previous();
+            check(hipGetLastError());
+            flush_launches(d);
+        }
+    };
+    if (ahead) launch(begin);
+    for (size_t layer = begin; layer < end; ++layer) {
+        const bool before = ahead && hybrid_early(d, layer);
+        if (!ahead) launch(layer);
+        else if (before) launch_after(layer);
+        ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
+        const auto waited = std::chrono::steady_clock::now();
+        hybrid_wait_export(d, ++d.hybrid_sequence);
+        if (ahead) await.check_failed();
+        const auto computed = std::chrono::steady_clock::now();
+        for (size_t row = 0; row < steps; ++row)
+            hybrid_host_experts(d, experts, d.exchange + hybrid_export_at(row), d.exchange + hybrid_result_at(row));
+        if (ahead) await.publish();
+        const auto finished = std::chrono::steady_clock::now();
+        d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
+        d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
+        if (ahead && !before) launch_after(layer);
+    }
+    if (!ahead) finish_previous();
+    check(hipGetLastError());
+    for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;
+    if (output) download(d, output, v.hidden, steps * 10240 * 4);
+    else check(hipStreamSynchronize(d.stream));
+    if (ahead) await.check_failed();
+    // (the MTP layer is no hybrid layer: this is the device's last with `end` at 48)
+    if ((end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4) {
+        d.hybrid_verify_balanced = d.hybrid_tokens;
+        hybrid_rebalance(d, 32, false);
+    }
 }
 
 // The span's layers queued on the device (and on its peer when the experts are in parts), with nothing waited for or
@@ -158,6 +266,11 @@ float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, s
 
 // input==nullptr continues from rows already in the span's workspace; output may be nullptr.
 void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
+    auto first = d.decoder.find(begin);
+    if (begin < end && first != d.decoder.end() && d.resident.find(first->second.moe)->second->hybrid) {
+        hybrid_verify_span(d, begin, end, position, steps, input, output);
+        return;
+    }
     bool parts = false;
     float* hidden = verify_span_queue(d, begin, end, position, steps, input, nullptr, parts);
     if (parts) finish_with_helper(d);
@@ -206,6 +319,11 @@ void gdn_replay_span(Device& d, size_t begin, size_t end, size_t kept) {
         gdn_replay_layers<2><<<dim3(unsigned(QwenHeads<2>::value), unsigned(layers.size())), gdn_threads, 0, d.stream>>>(
             static_cast<const GdnReplay*>(cached.second), kept);
     else gdn_replay_layers<<<dim3(48, unsigned(layers.size())), gdn_threads, 0, d.stream>>>(static_cast<const GdnReplay*>(cached.second), kept);
+}
+
+// A partially resident model's verification buffers before its expert slots take what VRAM is left.
+void verify_reserve(Device& d) {
+    for (auto& entry : d.decoder) if (decoder_linear(entry.first)) verify_buffers(d, entry.second);
 }
 
 // Keep the first `kept` verified tokens: DeltaNet layers restore their snapshot and

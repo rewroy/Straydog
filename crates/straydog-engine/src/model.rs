@@ -85,6 +85,11 @@ const SCARCE_ROW_CACHE: u64 = 1 << 30;
 /// whole context take from a small machine what the expert banks need, and few sequences reach it.
 const STARTING_KV: usize = 32768;
 
+/// A verification's buffers beside partially resident layers (`verify_reserve`), and the VRAM for expert slots a drafter must
+/// leave to stay: a pass of rows the CPU would mostly compute gains little.
+const VERIFY_BYTES: u64 = 130 << 20;
+const DRAFTER_SLOT_ROOM: u64 = 256 << 20;
+
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
 /// memory twice their size; with at least 1.25 times, half the memory less the page-locked
 /// sequence state; else none (the unlocked layers and the PLE table would thrash).
@@ -436,6 +441,9 @@ impl Model {
         model.group.finish_model_state()?;
         load_seconds.push(("host_state", lap(&mut clock)));
         model.prepare_decoder(model.kv_capacity as u64, true)?;
+        if model.partial && model.weights.drafter {
+            model.group.verify_reserve()?;
+        }
         if model.partial {
             let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
             model.lock_host_banks(pinned)?;
@@ -468,8 +476,10 @@ impl Model {
         }
         load_seconds.push(("plans", lap(&mut clock)));
         model.load_seconds = load_seconds;
-        // MTP drafting needs the fully resident decoder (exact multi-token verification).
-        model.speculative = if drafting && model.resident && model.weights.drafter { settings.speculative } else { 0 };
+        // A partially resident model drafts one token a pass: IQ2_XS --vram 12 on an R9700, 64 tok/s without drafts, 70 with one,
+        // 64 with two and 65 with three. The widest pass costs far more than the rest (16 ms for one row, 24 for two, 53 for four).
+        let drafts = if model.partial { settings.speculative.min(1) } else { settings.speculative };
+        model.speculative = if drafting && model.weights.drafter { drafts } else { 0 };
         Ok(model)
     }
 
@@ -678,32 +688,37 @@ impl Model {
     /// Full residency: pin every layer's banks, router and shared expert, once the whole
     /// weight footprint fits every GPU.
     fn prepare_resident_moe(&mut self) -> Result<bool> {
+        if !self.group.can_pin_model(&self.resident_requirements(false), None)? {
+            return Ok(false);
+        }
         if self.weights.drafter && !self.group.can_pin_model(&self.resident_requirements(true), None)? {
             self.weights.drop_drafter();
         }
-        if !self.group.can_pin_model(&self.resident_requirements(self.weights.drafter), None)? {
-            return Ok(false);
-        }
         for layer in self.weights.layers() {
-            let prefix = format!("blk.{layer}.");
-            let mut operands = Vec::new();
-            for role in ["gate", "up", "down"] {
-                let name = format!("{prefix}ffn_{role}_exps.weight");
-                let tensor = self.weights.tensor(&name)?;
-                let (cols, rows, experts) = (tensor.dims[0], tensor.dims[1], tensor.dims[2]);
-                let (data, kind) = self.weights.raw(&name, 0, None)?;
-                operands.push(Operand::bytes(format!("{name}:bank"), data, kind, rows * experts, cols));
-            }
-            for role in ["gate", "up", "down"] {
-                operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
-            }
-            operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
-            operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
-            // SAFETY of the borrow: operands point into the weights, which outlive the group.
-            let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(operands) };
-            self.group.register_resident_moe(&prefix, &operands, 512)?;
+            self.register_resident_layer(layer)?;
         }
         Ok(true)
+    }
+
+    /// A layer's banks, router and shared expert pinned.
+    fn register_resident_layer(&mut self, layer: usize) -> Result<()> {
+        let prefix = format!("blk.{layer}.");
+        let mut operands = Vec::new();
+        for role in ["gate", "up", "down"] {
+            let name = format!("{prefix}ffn_{role}_exps.weight");
+            let tensor = self.weights.tensor(&name)?;
+            let (cols, rows, experts) = (tensor.dims[0], tensor.dims[1], tensor.dims[2]);
+            let (data, kind) = self.weights.raw(&name, 0, None)?;
+            operands.push(Operand::bytes(format!("{name}:bank"), data, kind, rows * experts, cols));
+        }
+        for role in ["gate", "up", "down"] {
+            operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
+        }
+        operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
+        operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
+        // SAFETY of the borrow: operands point into the weights, which outlive the group.
+        let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(operands) };
+        self.group.register_resident_moe(&prefix, &operands, 512)
     }
 
     /// Partial residency: pin every dense operand and bind the host expert banks for the CPU
@@ -712,12 +727,19 @@ impl Model {
         if !self.group.hybrid_supported()? {
             return Ok(false);
         }
-        self.weights.drop_drafter();
-        self.group.drop_mtp_layer_state()?;
         let kinds = (0..48).map(|layer| self.weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
         let staging = 64 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (256 << 20);
         let mut requirements = self.weights.dense_requirements();
         requirements.push(("@hybrid:staging".into(), staging));
+        // The drafter when its layer and a verification's buffers leave the expert slots their share.
+        let mut with_drafter = requirements.clone();
+        with_drafter.extend(self.weights.drafter_requirements());
+        with_drafter.push(("@verify:buffers".into(), VERIFY_BYTES));
+        with_drafter.push(("@hybrid:slots".into(), DRAFTER_SLOT_ROOM));
+        if !self.weights.drafter || !self.group.can_pin_model(&with_drafter, None)? {
+            self.weights.drop_drafter();
+            self.group.drop_mtp_layer_state()?;
+        }
         if !self.group.can_pin_model(&requirements, None)? {
             return Ok(false);
         }
@@ -738,6 +760,9 @@ impl Model {
                  std::mem::transmute::<[&[u8]; 3], [&'static [u8]; 3]>(banks))
             };
             self.group.register_hybrid_moe(&prefix, &operands, banks, 512, *kinds)?;
+        }
+        if self.weights.drafter {
+            self.register_resident_layer(48)?;
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
@@ -1222,6 +1247,12 @@ impl Model {
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
         self.kv_capacity = capacity;
+        // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
+        for checkpoint in self.checkpoints.values_mut() {
+            if let Some(history) = checkpoint.history.as_mut() {
+                history.move_history(capacity as u64);
+            }
+        }
         Ok(())
     }
 
@@ -1576,6 +1607,7 @@ impl Model {
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
         let mut clock = Instant::now();
+        self.ensure_kv(position as usize + tokens.len() + limit + 1)?;
         self.protect(position as usize, position as usize + tokens.len() + limit)?;
         self.draft_vocabulary_update()?;
         let embedded = self.token_embeddings(tokens)?;
@@ -1653,7 +1685,7 @@ impl Model {
     /// The rows through every layer and the head: with `sampling`, each row's logits for the draw, or its `top` greatest
     /// when the draw reads only those (sampling::Sampling::top_candidates: the GPU picks them, the host reads a few pairs a row).
     fn verify(&mut self, tokens: &[u32], sampling: bool, top: usize) -> Result<Verified> {
-        if self.group.chains_verification() {
+        if !self.partial && self.group.chains_verification() {
             let embeddings = self.verify_chained(tokens)?;
             let mut clock = Instant::now();
             let ((targets, scores, _), hidden) = self.with_operands(Model::head_operands, |group, operands| {
@@ -1711,12 +1743,13 @@ impl Model {
     fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         // (every row verified is written, kept or not)
         let mut clock = Instant::now();
+        self.ensure_kv(self.history.len() + tokens.len())?;
         self.protect(self.history.len(), self.history.len() + tokens.len())?;
         let position = self.history.len() as u64;
         self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
         self.phase("verify: protect, PLE prefetch, embeddings", &mut clock);
-        let (first, embeddings, mut hidden) = if self.group.front_chained() {
+        let (first, embeddings, mut hidden) = if !self.partial && self.group.front_chained() {
             // The first layer runs on the device while the host waits for the PLE rows; the PLE layer then follows it
             // there, and one wait reads back both layers' rows.
             self.group.verify_queue(0, 1, &hidden, position)?;
@@ -1756,7 +1789,7 @@ impl Model {
         self.phase("commit: DeltaNet replay", &mut clock);
         if kept < tokens.len() {
             let embeddings = &embeddings[..kept * HIDDEN];
-            if self.group.front_chained() {
+            if !self.partial && self.group.front_chained() {
                 self.with_operands(Model::ple_operands, |group, operands| group.ple_replay("blk.1.", embeddings, operands))?;
             } else {
                 self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;

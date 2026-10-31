@@ -21,6 +21,13 @@ pub struct Positions {
     parts: Vec<Vec<StatePart>>,
 }
 
+impl Positions {
+    /// A saved history's place after the K/V grew to `capacity` positions (see [`Backend::move_history`]).
+    pub fn move_history(&mut self, capacity: u64) {
+        self.parts.iter_mut().for_each(|parts| Backend::move_history(parts, capacity));
+    }
+}
+
 pub struct Group {
     pub backends: Vec<Backend>,
     /// First layer owned by each device.
@@ -462,6 +469,10 @@ impl Group {
         }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].verify_span(begin, end, values, position)
+    }
+
+    pub fn verify_reserve(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::verify_reserve)
     }
 
     pub fn verify_commit(&mut self, begin: usize, end: usize, kept: u64) -> Result<()> {

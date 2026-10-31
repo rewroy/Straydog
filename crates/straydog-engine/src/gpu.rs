@@ -1276,6 +1276,12 @@ impl Backend {
         Ok(output)
     }
 
+    /// The verification buffers, ahead of what the expert slots and the K/V stage take of the VRAM left.
+    pub fn verify_reserve(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_verify_reserve(self.handle) }).map(drop)
+    }
+
     /// Up to four tokens through resident layers [begin, end) with nothing waited for or read back: their rows stay in the
     /// workspace for [`Backend::ple_front`] to continue from.
     pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
@@ -1660,6 +1666,13 @@ impl Backend {
             }
         }
         self.copy_out(parts)
+    }
+
+    /// A saved history's place after the K/V grew to `capacity` positions: the indexer keeps it after its blocks.
+    pub fn move_history(parts: &mut [StatePart], capacity: u64) {
+        for part in parts {
+            part.offset = 128 * (capacity / 4 + 1);
+        }
     }
 
     /// The indexers' rolling pooling history alone (their last eight inputs), copied out as
