@@ -270,9 +270,14 @@ constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
-void check(hipError_t error) {
-    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
+// The site and the code go with the message: the same words can mean memory that ran out or a device that was reset.
+void check_at(hipError_t error, const char* file, int line) {
+    if (error == hipSuccess) return;
+    const std::string path(file);
+    throw std::runtime_error(std::string(hipGetErrorString(error)) + " (" + path.substr(path.find_last_of("/\\") + 1) + ":" + std::to_string(line) +
+                             ", code " + std::to_string(int(error)) + ")");
 }
+#define check(error) check_at((error), __FILE__, __LINE__)
 
 void blas_check(hipblasStatus_t status) {
     if (status != HIPBLAS_STATUS_SUCCESS)

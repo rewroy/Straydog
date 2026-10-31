@@ -760,7 +760,9 @@ impl Model {
     fn lock_host_banks(&mut self, pinned_state: u64) -> Result<()> {
         let layer_banks = (0..48).map(|layer| Self::host_banks(&self.weights, layer)).collect::<Result<Vec<_>>>()?;
         let banks_total = layer_banks.iter().flatten().map(|bank| bank.len() as u64).sum();
-        let budget = lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state);
+        let (vram_used, vram_budget) = self.group.memory()?;
+        let vram_room = vram_budget.saturating_sub(vram_used);
+        let budget = lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state).min(crate::host::lockable(self.weights.host_memory_bytes, vram_room));
         // Whole layers from the last: reading went through those most recently, so they are the
         // likeliest to be cached; the rest of the locked range is read ahead meanwhile.
         let (mut layers, mut locked) = (Vec::new(), 0u64);
