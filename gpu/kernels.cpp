@@ -181,6 +181,8 @@ struct ResidentMoe {
     std::vector<int32_t> slot_of;
     std::vector<double> usage;
     const uint8_t* mapped[3]{};   // device view of page-locked host banks (zero-copy assist)
+    std::vector<uint32_t> host_read;   // the token each expert was last read on the host (hybrid_host_experts)
+    uint32_t host_token=0;
     // Expert parallelism: this device holds only some routed experts (the
     // others have null data and are skipped) and computes a partial combination.
     bool part=false, shared=true;
