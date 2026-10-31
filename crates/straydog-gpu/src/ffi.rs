@@ -133,6 +133,7 @@ unsafe extern "C" {
         capacity: u64,
         valid: u64,
         state: *mut *mut ::std::os::raw::c_void,
+        index_state: *mut *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1940,6 +1941,8 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {
+    pub fn sd_expert_slots_release(handle: *mut std::ffi::c_void) -> i32;
+    pub fn sd_expert_slots_restore(handle: *mut std::ffi::c_void, cache: u64) -> i32;
     pub fn sd_expert_slots(
         handle: *mut ::std::os::raw::c_void,
         cache: u64,

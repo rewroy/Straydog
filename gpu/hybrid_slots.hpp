@@ -299,6 +299,37 @@ bool hybrid_settle(Device& d, bool wait) {
     return true;
 }
 
+// Every expert leaves the slots and their VRAM goes; the table says so before the next kernel. Keeps the stage's size and
+// its host mirror; restore_expert_slots gives the pool its VRAM back at the size that then fits.
+void release_expert_slots(Device& d) {
+    if (!d.slots.base) return;
+    hybrid_settle(d, true);
+    for (auto& item : d.resident) {
+        if (!item.second->hybrid) continue;
+        ResidentMoe& plan = *item.second;
+        std::vector<std::pair<size_t, const uint8_t*>> absent;
+        for (size_t expert = 0; expert < plan.experts; ++expert)
+            if (plan.slot_of[expert] >= 0) { absent.emplace_back(expert, nullptr); plan.slot_of[expert] = -1; }
+        hybrid_point_list(d, plan, absent);
+    }
+    check(hipStreamSynchronize(d.stream));
+    if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+    check(hipFree(d.slots.base));
+    d.used -= (d.slots.cache + d.slots.stage) * d.slots.bytes;
+    d.slots.base = nullptr;
+    d.slots.cache = 0;
+    d.slots.owner.clear();
+}
+void restore_expert_slots(Device& d, size_t cache) {
+    if (d.slots.base || !d.slots.bytes) throw std::runtime_error("invalid Straydog expert slot pool");
+    const size_t bytes = (cache + d.slots.stage) * d.slots.bytes;
+    if (bytes > d.budget - d.used) throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
+    check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
+    d.used += bytes;
+    d.slots.cache = cache;
+    d.slots.owner.assign(cache, {nullptr, -1});
+}
+
 // Bounded swaps (max_swaps > 0) never block the compute stream: victims are
 // unmapped in stream order, the copy stream loads the new experts after that,
 // and hybrid_settle maps them once loaded. A refresh in flight skips the round.
