@@ -54,6 +54,9 @@ pub struct SetupArgs {
     /// Ask nothing: take the recommended answer to whatever the options leave open
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Print this machine and every bundle, with how it would run here and which is recommended, as JSON, and exit
+    #[arg(long)]
+    pub list: bool,
 }
 
 /// What the person has on this machine that setup defaults from.
@@ -373,9 +376,51 @@ fn quote(path: &Path) -> String {
 }
 
 /// The command: look at the machine, then `run` on the terminal.
+/// What `--list` prints, for a program that offers the models: the sizes are what setup fetches and
+/// keeps with every extra, as it does unless told to leave one out.
+fn listing(entries: &[Entry], machine: &Machine) -> serde_json::Value {
+    let fits: Vec<(u64, Fit)> = entries.iter().map(|entry| catalog::fit_at_best_context(entry, machine)).collect();
+    let verdicts: Vec<Fit> = fits.iter().map(|(_, fit)| fit.clone()).collect();
+    let recommended = catalog::recommend(entries, &verdicts);
+    let bundles: Vec<serde_json::Value> = entries.iter().zip(&fits).enumerate().map(|(index, (entry, (context, fit)))| {
+        let extras = entry.default_extras();
+        serde_json::json!({
+            "model": entry.model,
+            "quant": entry.quant,
+            "download_bytes": entry.download_bytes(&extras),
+            "disk_bytes": entry.disk_bytes(&extras),
+            "extras": entry.sidecars.iter().map(|sidecar| serde_json::json!({
+                "name": sidecar.kind.name(),
+                "purpose": sidecar.purpose,
+                "download_bytes": sidecar.download,
+            })).collect::<Vec<_>>(),
+            "context": context,
+            "fit": fit.class(),
+            "runs": fit.runs(),
+            "note": fit.note(entry),
+            "recommended": recommended == Some(index),
+        })
+    }).collect();
+    serde_json::json!({
+        "machine": {
+            "backend": machine.backend,
+            "gpus": machine.gpus.iter().map(|gpu| serde_json::json!({
+                "ordinal": gpu.ordinal, "name": gpu.name, "total_bytes": gpu.total, "free_bytes": gpu.free,
+            })).collect::<Vec<_>>(),
+            "gpu_error": machine.gpu_error,
+            "ram_bytes": machine.ram,
+        },
+        "bundles": bundles,
+    })
+}
+
 pub fn main(args: &SetupArgs) -> Result<(), String> {
     let entries = catalog::pinned()?;
     let machine = Machine::probe(args.gpu.as_deref());
+    if args.list {
+        println!("{}", listing(&entries, &machine));
+        return Ok(());
+    }
     let stdin = std::io::stdin();
     let interactive = stdin.is_terminal() && std::io::stdout().is_terminal();
     let (mut input, mut output) = (stdin.lock(), std::io::stdout());
@@ -597,5 +642,24 @@ mod tests {
         assert_eq!(bundle_directory(root, &entry), root.join("DeepSeek-V4.1-Flash").join("GSQ-RCO-IQ2_XXS"));
         std::fs::write(root.join(format!("{}.part", entry.files[0].name)), b"x").unwrap();
         assert_eq!(bundle_directory(root, &entry), root);
+    }
+
+    #[test]
+    fn the_listing_names_the_recommendation_and_what_cannot_run() {
+        let entries = catalog::pinned().unwrap();
+        let listed = listing(&entries, &doggybox());
+        let bundles = listed["bundles"].as_array().unwrap();
+        assert_eq!(bundles.len(), entries.len());
+        let recommended: Vec<_> = bundles.iter().filter(|bundle| bundle["recommended"] == true).collect();
+        assert_eq!(recommended.len(), 1);
+        assert_eq!(recommended[0]["quant"], "GSQ-RCO-IQ2_XXS");
+        assert_eq!(recommended[0]["fit"], "ram");
+        let q38 = bundles.iter().find(|bundle| bundle["quant"] == "IQ3_S").unwrap();
+        assert_eq!(q38["extras"][0]["name"], "mtp");
+        assert!(q38["disk_bytes"].as_u64().unwrap() > q38["download_bytes"].as_u64().unwrap() / 2);
+        let none = listing(&entries, &machine_of(0, 0, 32 << 30));
+        for bundle in none["bundles"].as_array().unwrap() {
+            assert_eq!((bundle["fit"].as_str(), bundle["runs"].as_bool(), bundle["recommended"].as_bool()), (Some("no_gpu"), Some(false), Some(false)));
+        }
     }
 }
