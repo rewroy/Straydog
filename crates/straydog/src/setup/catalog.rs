@@ -322,7 +322,7 @@ pub const CONTEXTS: [u64; 5] = [DEFAULT_CONTEXT, 131_072, 65_536, 32_768, 16_384
 
 /// The margin an automatic VRAM budget leaves of a GPU's memory.
 fn margin(total: u64) -> u64 {
-    (512u64 << 20).max(total / 100 * 3)
+    (if cfg!(windows) { 2u64 << 30 } else { 512u64 << 20 }).max(total / 100 * 3)
 }
 
 /// The VRAM the placement counts for a bundle that is not the experts, with `context` tokens: the
