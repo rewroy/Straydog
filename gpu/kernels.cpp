@@ -560,6 +560,7 @@ struct Device {
     float* exchange_device=nullptr;   // the pinned exchange as seen by kernels
     uint64_t cpu_experts=0, gpu_experts=0, assisted_experts=0, streamed_experts=0, swapped_experts=0, hybrid_tokens=0;
     uint32_t assist=0;
+    bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
@@ -1751,6 +1752,7 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
             for (size_t role=0;role<3;++role) plan.mapped[role]=ok ? static_cast<const uint8_t*>(views[role]) : nullptr;
             *mapped+=ok;
         }
+        d.hint_experts=*mapped==0;
 #if defined(__HIPCC__)
         d.assist=assist;
 #else

@@ -24,6 +24,7 @@
 #include <map>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #elif defined(_WIN32)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -881,6 +882,30 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
         });
         engine->down_ns += elapsed_ns(phase);
         ++engine->calls; engine->experts += count;
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+
+// Ask for the pages of `count` byte ranges on every worker, before a layer's experts read them: with less host memory than
+// the banks some are out, and the rows' faults read them a little at a time, each holding up every thread. Hints only.
+int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t* bytes, uint32_t count) {
+    try {
+        auto* engine = static_cast<Engine*>(handle);
+        if (!engine || !ranges || !bytes) throw std::runtime_error("invalid Straydog CPU read-ahead request");
+#if defined(__linux__)
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < count; ++i) total += bytes[i];
+        constexpr uint64_t unit = 128 * 1024;   // one MADV_WILLNEED reads at most the device's largest request
+        engine->workers->run_blocks(size_t((total + unit - 1) / unit), 1, [&](size_t first, size_t last) {
+            for (size_t at = first; at < last; ++at) {
+                uint64_t position = at * unit;
+                uint32_t i = 0;
+                while (position >= bytes[i]) position -= bytes[i++];
+                const uintptr_t begin = uintptr_t(ranges[i] + position), page = begin & ~uintptr_t(4095);
+                madvise(reinterpret_cast<void*>(page), size_t(begin - page + std::min(unit, bytes[i] - position)), MADV_WILLNEED);
+            }
+        });
+#endif
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
