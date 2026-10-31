@@ -183,7 +183,7 @@ extern "C" int sd_cpu_read_ahead(void*, const uint8_t* const*, const uint64_t*, 
 void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
     const uint8_t* gate[10]; const uint8_t* up[10]; const uint8_t* down[10]; float weights[10];
     uint32_t count = 0;
-    size_t selected[10];
+    size_t selected[10], taken[10];
     for (size_t route = 0; route < 10; ++route) {
         const float raw = exported[route];
         if (!(raw >= 0 && raw < float(plan.experts))) throw std::runtime_error("invalid hybrid expert route");
@@ -193,6 +193,7 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
         gate[count] = plan.host[0] + expert * plan.host_bytes[0];
         up[count] = plan.host[1] + expert * plan.host_bytes[1];
         down[count] = plan.host[2] + expert * plan.host_bytes[2];
+        taken[count] = expert;
         weights[count++] = exported[16 + route];
     }
     hybrid_observe_token(plan, selected);
@@ -201,12 +202,21 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported) {
         if (!d.cpu) throw std::runtime_error("hybrid experts need an attached CPU expert engine");
         const int kinds[3] = {plan.weights[0].kind, plan.weights[1].kind, plan.weights[2].kind};
         if (d.hint_experts) {
+            // Only experts unread for 64 tokens: 15% of the routes, and 98-100% of the misses of an LRU of 15 to 27 GiB in a
+            // 5592-token trace. Hinting every route costs 3% here and 5.4 ms a token on Windows with the pages in memory.
             const uint8_t* ranges[30]; uint64_t sizes[30];
+            uint32_t hinted = 0;
+            ++plan.host_token;
             for (uint32_t i = 0; i < count; ++i) {
-                ranges[3 * i] = gate[i]; ranges[3 * i + 1] = up[i]; ranges[3 * i + 2] = down[i];
-                for (size_t role = 0; role < 3; ++role) sizes[3 * i + role] = plan.host_bytes[role];
+                const bool old = plan.host_token - plan.host_read[taken[i]] > 64;
+                plan.host_read[taken[i]] = plan.host_token;
+                if (!old) continue;
+                ranges[hinted] = gate[i]; ranges[hinted + 1] = up[i]; ranges[hinted + 2] = down[i];
+                for (size_t role = 0; role < 3; ++role) sizes[hinted + role] = plan.host_bytes[role];
+                hinted += 3;
             }
-            if (sd_cpu_read_ahead(d.cpu, ranges, sizes, 3 * count)) throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
+            if (hinted && sd_cpu_read_ahead(d.cpu, ranges, sizes, hinted))
+                throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
         }
         if (sd_cpu_experts_run(d.cpu, kinds, gate, up, down, weights, count, 2560, 640, exported + 32, result))
             throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());

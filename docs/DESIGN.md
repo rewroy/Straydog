@@ -621,9 +621,11 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     few rows and hundreds of experts.
   - With no bank page-locked the workers hint a layer's absent experts as they learn its routes
     (`sd_cpu_read_ahead`), since a row's page fault holds up every thread. Touching the pages first
-    gains nothing. IQ3_S on 29 GiB of RAM, after a dozen requests: at 6 GiB of VRAM 18 -> 20.5
-    tokens/s, with 71% fewer major faults. Some 20 MB a token still comes from the drive. With the
-    pages in memory the hints cost 3% (60 GiB of RAM), so a machine that locks banks sends none.
+    gains nothing. Only experts unread for 64 tokens are hinted: 15% of the routes, and 98-100% of
+    the misses of an LRU of 15 to 27 GiB in a 5592-token trace. A fixed set of the hottest experts
+    would miss more than the LRU (47 misses a token against 18, at 23 GiB). IQ3_S on 29 GiB of RAM,
+    after a dozen requests: at 6 GiB of VRAM 18 -> 22 tokens/s. Some 20 MB a token still comes from
+    the drive. A machine that locks banks sends none.
   - On Windows the worker asks for a working set of what its share of host memory leaves
     (`host::keep_resident`): pages trimmed from it come back one fault at a time under the CPU's
     expert threads.
