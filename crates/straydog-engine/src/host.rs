@@ -23,12 +23,51 @@ pub fn host_memory_bytes() -> u64 {
     }
 }
 
+/// Physical memory a guaranteed working set and page locks leave to the rest of the system, which
+/// they otherwise take without looking at what the other applications and the kernel need.
+pub fn left_free(memory: u64) -> u64 {
+    (memory / 8).max(4 << 30)
+}
+
+/// `wanted` bytes held in memory by a process with `held` there already, at most what `available`
+/// physical memory gives while [`left_free`] stays free.
+pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
+    wanted.min(held.saturating_add(available.saturating_sub(left_free(memory))))
+}
+
+/// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
+/// which fill what the VRAM budget has left: 0.6 GiB on an RTX 5070 Ti at --vram 6 and 8.
+const COMMIT_AFTER_LOCKS: u64 = 1 << 30;
+
+/// Bytes of the expert banks that may be page-locked given the `available` physical memory, the `commit`
+/// left and the `vram_room` the slots will take. Windows charges commit for what is locked (1 to 1 over 29 GiB at 62 GiB with an 8 GiB
+/// page file, which left 0.5 GiB of commit with physical memory to spare), and a GPU budget has taken its
+/// commit by then.
+fn lockable_of(available: u64, commit: u64, vram_room: u64, memory: u64) -> u64 {
+    within_free(u64::MAX, 0, available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)), memory)
+}
+
+/// Bytes of the expert banks that may be page-locked now (no bound off Windows).
+pub fn lockable(memory: u64, vram_room: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        let (available, commit) = windows_available();
+        return lockable_of(available, commit, vram_room, memory);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (memory, vram_room);
+        u64::MAX
+    }
+}
+
 /// Ask the system to leave this process what its share of `memory` holds beside `pinned` bytes of
 /// page-locked state: pages it trims from the working set come back one fault at a time under the
 /// CPU's expert threads (Windows at 32 GiB: 800K faults/s and 3 tokens/s at the worst, with no
 /// more read from the drive). Never more than the `banks` and that state need, and less as the
 /// system refuses it (it refuses what the free memory cannot back, ERROR_NO_SYSTEM_RESOURCES, as
-/// with most banks page-locked at 62 GiB). Best effort: only speed depends on it.
+/// with most banks page-locked at 62 GiB), and never more than leaves [`left_free`] free: what it
+/// grants, it keeps from everything else. Best effort: only speed depends on it.
 pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
     #[cfg(windows)]
     {
@@ -36,6 +75,7 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
+        let share = within_free(share, windows_working_set(), windows_available().0, memory);
         let mut wanted = share;
         while wanted >= 1 << 30 {
             // SAFETY: the pseudo handle of this process and plain values.
@@ -96,6 +136,20 @@ pub fn linux_memory(physical: u64, proc_cgroup: &std::path::Path, cgroup_root: &
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[test]
+    fn what_is_held_leaves_an_eighth_of_the_memory_free() {
+        use super::{left_free, within_free};
+        const GIB: u64 = 1 << 30;
+        assert_eq!((left_free(32 * GIB), left_free(62 * GIB)), (4 * GIB, 62 * GIB / 8));
+        // 62 GiB with 30 free: the 47 GiB asked becomes what is held and what can go.
+        assert_eq!(within_free(47 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 2 * GIB + 30 * GIB - 62 * GIB / 8);
+        assert_eq!(within_free(20 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 20 * GIB);
+        assert_eq!(within_free(47 * GIB, 2 * GIB, GIB, 62 * GIB), 2 * GIB);
+        // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
+        assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
+        assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
+    }
+
     use super::linux_memory;
 
     const GIB: u64 = 1 << 30;
@@ -152,6 +206,25 @@ mod tests {
         assert_eq!(linux_memory(125 * GIB, &root.join("cgroup"), &root.join("fs")), 125 * GIB);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(windows)]
+fn windows_available() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: an initialized structure with its length set.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { (status.ullAvailPhys, status.ullAvailPageFile) } else { (0, 0) }
+}
+
+#[cfg(windows)]
+fn windows_working_set() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process and an initialized structure with its size set.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0 { counters.WorkingSetSize as u64 } else { 0 }
 }
 
 #[cfg(windows)]
