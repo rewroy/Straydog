@@ -93,6 +93,29 @@ inline void flush_launches(Device& d) {
 #endif
 }
 
+// With prelaunch, layer L+1's graph is launched before the host computes layer L's
+// CPU experts and starts by awaiting that result on the GPU, so no launch latency
+// sits between the host's result and the GPU's next layer.
+// Under a kernel run-time limit (Windows display GPUs) an await may last ~1 s at
+// most, so layer L+1 goes ahead of layer L's CPU experts only where those read
+// page-locked banks (they never wait for storage); otherwise it is launched once
+// L's result is published.
+bool hybrid_early(const Device& d,size_t layer) {
+    return !d.await_watchdog || d.resident.find(d.decoder.find(layer)->second.moe)->second->mapped[0]!=nullptr;
+}
+bool hybrid_ahead(const Device& d,size_t begin,size_t end) {
+    bool any_early=false;
+    for (size_t layer=begin;layer<end;++layer) any_early|=hybrid_early(d,layer);
+#if defined(__HIPCC__)
+    // With high residency, the CPU fits inside the resident GPU work and the
+    // extra wait dispatch loses. Use accumulated timings, not a VRAM cutoff:
+    // prelaunch when CPU work is at least half the time waiting for exports.
+    return d.hybrid_prelaunch && any_early && d.hybrid_cpu_ns>=d.hybrid_wait_ns/2;
+#else
+    return d.hybrid_prelaunch && any_early;
+#endif
+}
+
 // Partially resident layers alternate a captured GPU part with the host CPU experts.
 void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const float* input,float* output) {
     float* workspace=nullptr;
@@ -112,26 +135,8 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     upload(d,gpu_position,&current,sizeof(current));
     if (position!=d.hybrid_position) { d.hybrid_position=position; ++d.hybrid_tokens; }
     hybrid_settle(d,false);
-    // With prelaunch, layer L+1's graph is launched before the host computes layer L's
-    // CPU experts and starts by awaiting that result on the GPU, so no launch latency
-    // sits between the host's result and the GPU's next layer.
-    // Under a kernel run-time limit (Windows display GPUs) an await may last ~1 s at
-    // most, so layer L+1 goes ahead of layer L's CPU experts only where those read
-    // page-locked banks (they never wait for storage); otherwise it is launched once
-    // L's result is published.
-    auto early=[&](size_t layer) {
-        return !d.await_watchdog || d.resident.find(d.decoder.find(layer)->second.moe)->second->mapped[0]!=nullptr;
-    };
-    bool any_early=false;
-    for (size_t layer=begin;layer<end;++layer) any_early|=early(layer);
-#if defined(__HIPCC__)
-    // With high residency, the CPU fits inside the resident GPU work and the
-    // extra wait dispatch loses. Use accumulated timings, not a VRAM cutoff:
-    // prelaunch when CPU work is at least half the time waiting for exports.
-    const bool ahead=d.hybrid_prelaunch && any_early && d.hybrid_cpu_ns>=d.hybrid_wait_ns/2;
-#else
-    const bool ahead=d.hybrid_prelaunch && any_early;
-#endif
+    auto early=[&](size_t layer) { return hybrid_early(d,layer); };
+    const bool ahead=hybrid_ahead(d,begin,end);
     HybridAwait await(d);
     auto* counters=reinterpret_cast<volatile uint32_t*>(d.exchange_device+hybrid_sequence_slot);
 #if defined(__HIPCC__)
@@ -191,7 +196,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         hybrid_wait_export(d,++d.hybrid_sequence);
         if (ahead) await.check_failed();
         const auto computed=std::chrono::steady_clock::now();
-        hybrid_host_experts(d,experts,d.exchange);
+        hybrid_host_experts(d,experts,d.exchange,d.exchange+hybrid_result_at(0));
         if (ahead) await.publish();
         const auto finished=std::chrono::steady_clock::now();
         d.hybrid_wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed-waited).count());
@@ -204,7 +209,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     if (ahead) await.check_failed();
     // Follow decode routing: up to 32 swaps every four tokens, issued after this
     // device's last layer so the copies overlap the head and the next token's start.
-    if (d.decoder.find(end)==d.decoder.end() && d.hybrid_tokens%4==0) hybrid_rebalance(d,32,false);
+    if ((end==48 || d.decoder.find(end)==d.decoder.end()) && d.hybrid_tokens%4==0) hybrid_rebalance(d,32,false);
 }
 
 void decode_span(Device& d,size_t begin,size_t end,size_t position,const float* input,float* output) {

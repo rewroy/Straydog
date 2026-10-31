@@ -473,6 +473,7 @@ int sd_mtp_embed(void* handle, const float* embeddings, uint64_t count, void* ta
 int sd_mtp_prompt_kept(void* handle, void* const* pointers, const int* kinds, void* rows, uint64_t row, void* embeddings,
                        uint64_t offset, uint64_t count, uint64_t position, uint64_t layer);
 int sd_verify_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output);
+int sd_verify_reserve(void* handle);
 int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
 // top: each row's `top` (at most 64) greatest logits into best (top values, then top token indices as int32 bits), most likely first.
 // input null: the rows of layer `layer`'s decoder workspace, handed back in `rows`.
