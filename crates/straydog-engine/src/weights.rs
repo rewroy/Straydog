@@ -126,6 +126,9 @@ pub struct Weights {
     row_tables: HashMap<String, RowTable>,
     /// Per file: its verity tree, when opened ([`Weights::open_trees`]).
     verifiers: Vec<Option<Arc<verity::Verifier>>>,
+    /// Per file: its verity tree is younger than it. A tree is built from the whole file and checked against the pin (at download
+    /// or at the first start), so a file not changed since needs no reading through at a start.
+    tree_current: Vec<bool>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
     embeddings: Mutex<EmbeddingCache>,
 }
@@ -208,6 +211,12 @@ fn header(file: &File, name: &str, first: &str) -> Result<straydog_gguf::ModelHe
     straydog_gguf::inspect_header(snapshot, size).map_err(|exc| format!("Straydog GGUF preflight: {exc}"))
 }
 
+/// A file no younger than its verity tree (and its size unchanged is the tree's own check, at `Verifier::open`).
+fn tree_is_current(file: &File, tree: &Path) -> bool {
+    let modified = |metadata: std::io::Result<std::fs::Metadata>| metadata.and_then(|metadata| metadata.modified()).ok();
+    matches!((modified(file.metadata()), modified(std::fs::metadata(tree))), (Some(file), Some(tree)) if file <= tree)
+}
+
 impl Weights {
     /// Open the pinned bundle: resources and headers authenticated, tensors not yet read
     /// (placement may run; [`crate::load::load`] or [`Weights::authenticate`] reads them).
@@ -241,6 +250,7 @@ impl Weights {
             authenticated: false,
             row_tables: HashMap::new(),
             verifiers: Vec::new(),
+            tree_current: Vec::new(),
             vectors: Mutex::new(HashMap::new()),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
@@ -291,15 +301,23 @@ impl Weights {
     /// are read, and partial residency's page-locked expert banks once locked.
     pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
         let mut verifiers = vec![None; self.files.len()];
+        let mut current = vec![false; self.files.len()];
         for (asset, digest) in bundle::verity_pins(&self.quantization)? {
             let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
             let tree = bundle::tree_path(data_dir, &asset);
+            current[index] = tree_is_current(&self.files[index], &tree);
             let verifier = verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(&digest)?, TREE_CACHE_BYTES)
                 .map_err(|error| format!("Straydog verity tree of {}: {error}", asset.name))?;
             verifiers[index] = Some(Arc::new(verifier));
         }
         self.verifiers = verifiers;
+        self.tree_current = current;
         Ok(())
+    }
+
+    /// Whether a file was read through and checked against its pin, and not changed since.
+    pub fn file_checked(&self, file: usize) -> bool {
+        self.tree_current.get(file).copied().unwrap_or(false)
     }
 
     fn verifier_of(&self, file: usize) -> Option<&Arc<verity::Verifier>> {
