@@ -165,8 +165,14 @@ pub(crate) struct Plan {
     pub split: SplitMode,
 }
 
-/// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more.
+/// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more; on Windows, where the
+/// desktop and other programs share the GPU, 2 GiB at least.
 fn margin(total: u64) -> u64 {
+    #[cfg(windows)]
+    {
+        return (2u64 << 30).max(total / 100 * 3);
+    }
+    #[cfg(not(windows))]
     (512 << 20).max(total / 100 * 3)
 }
 
