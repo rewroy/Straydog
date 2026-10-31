@@ -80,6 +80,13 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()),
             drafter_clause(&settings),
         );
+        // The port before the worker: a server that cannot listen must not load a model beside the one that does.
+        let address = format!("{}:{}", settings.host, settings.port);
+        let listener = tokio::net::TcpListener::bind(&address).await.map_err(|exc| {
+            let message = format!("{address}: {exc}");
+            tracing::error!("Straydog cannot listen: {message}");
+            message
+        })?;
         let engine = Arc::new(match command {
             Some(command) => Runtime::start(&settings, command),
             None => {
@@ -119,8 +126,6 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         };
         let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
         let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor.clone()));
-        let address = format!("{}:{}", settings.host, settings.port);
-        let listener = tokio::net::TcpListener::bind(&address).await.map_err(|exc| format!("{address}: {exc}"))?;
         tracing::info!("Straydog listening on http://{address}");
         // A worker that fails (to start or later) leaves nothing to serve: the server ends with
         // its failure, so that whatever runs it can start it again.
