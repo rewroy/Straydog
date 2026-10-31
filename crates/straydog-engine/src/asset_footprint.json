@@ -31,12 +31,6 @@
       "tables": 135172021600,
       "state_per_token": 3200
     },
-    "UD-Q8_K_XL": {
-      "dense": 2704722432,
-      "experts": 35735470080,
-      "tables": 0,
-      "state_per_token": 40960
-    },
     "GSQ-RCO-IQ2_XS": {
       "dense": 6160185600,
       "experts": 149060321280,

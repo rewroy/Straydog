@@ -2,7 +2,6 @@
 //! from the GGUF metadata, so nothing about a model's shape is a constant of the engine.
 
 pub mod deepseek41;
-pub mod qwen35moe;
 pub mod served;
 mod warm;
 

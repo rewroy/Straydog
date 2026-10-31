@@ -480,7 +480,7 @@ mod tests {
             .map(|(name, data)| Asset { name: name.to_string(), bytes: data.len() as u64, sha256: format!("{:x}", Sha256::digest(data)) })
             .collect();
         let entry = Entry {
-            model: "Test-Model".into(), quant: "T-Q1".into(), architecture: "qwen35moe".into(),
+            model: "Test-Model".into(), quant: "T-Q1".into(), architecture: "qwen4exp".into(),
             files: assets.iter().map(|asset| File { name: asset.name.clone(), bytes: asset.bytes, tree: 0 }).collect(),
             footprint: Footprint { dense: 1 << 20, experts: 1 << 20, tables: 0, state_per_token: 1024 }, sidecars: Vec::new(),
         };
@@ -630,7 +630,7 @@ mod tests {
         assert!(error.contains("cannot run") && error.contains("12 GiB"), "{error}");
         assert!(ask(SetupArgs { quant: Some("Q8_0".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown bundle Q8_0"));
         assert!(ask(SetupArgs { quant: Some("Q2_0".into()), model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &small).is_err());
-        // a model that is not supported any more is not offered
+        // a model no longer supported
         assert!(ask(SetupArgs { model_name: Some("Qwen3.6-35B-A3B".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown model"));
         assert!(ask(SetupArgs::default(), &machine_of(0, 0, 32 << 30)).unwrap_err().contains("none of the models"));
         assert!(ask(SetupArgs { model_name: Some("Ornith-1.5-122B".into()), ..SetupArgs::default() }, &small).unwrap_err().contains("unknown model"));
