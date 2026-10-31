@@ -35,6 +35,17 @@ pub enum Extra {
     Mtp,
 }
 
+impl Extra {
+    /// As in `--no-dspark`, `--no-vision` and `--no-mtp`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Extra::Dspark => "dspark",
+            Extra::Vision => "vision",
+            Extra::Mtp => "mtp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sidecar {
     pub kind: Extra,
@@ -221,6 +232,17 @@ impl Fit {
             Fit::Ram(_) => Some(1),
             Fit::Drive(_) => Some(2),
             Fit::NoGpu | Fit::TooLittleVram { .. } => None,
+        }
+    }
+
+    /// The verdict's name, for a program.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Fit::Vram => "vram",
+            Fit::Ram(_) => "ram",
+            Fit::Drive(_) => "drive",
+            Fit::NoGpu => "no_gpu",
+            Fit::TooLittleVram { .. } => "too_little_vram",
         }
     }
 
