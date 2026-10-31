@@ -12,14 +12,14 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use serde_json::{json, Map};
-use straydog_engine::arch::{deepseek41, qwen35moe};
+use straydog_engine::arch::deepseek41;
 use straydog_engine::bundle;
 use straydog_engine::model::context_state_bytes;
 use straydog_engine::pinned::gathered;
 use straydog_gguf::ModelHeader;
 
 /// The bytes of sequence state one more token of context takes, as the placement counts them: the
-/// K/V of the attention layers (Qwen3.6, F32), the compressed rows and index keys of the layers that
+/// the compressed rows and index keys of the layers that
 /// hold them (DeepSeek-V4.1, BF16), Qwen3.8's state (host memory).
 fn state_per_token(architecture: &str, header: &ModelHeader) -> Result<u64, String> {
     match architecture {
@@ -29,11 +29,6 @@ fn state_per_token(architecture: &str, header: &ModelHeader) -> Result<u64, Stri
                 .filter_map(|(layer, plan)| plan.compressed.filter(|compressed| compressed.kv_source == layer))
                 .map(|compressed| 2 * (hp.head_dim + hp.index_dim) as u64 / compressed.ratio as u64)
                 .sum())
-        }
-        "qwen35moe" => {
-            let hp = qwen35moe::Hparams::from_header(header)?;
-            let attention = hp.mixers.iter().filter(|mixer| **mixer == qwen35moe::Mixer::Attention).count() as u64;
-            Ok(attention * (hp.kv_heads * hp.head_dim * 2 * 4) as u64)
         }
         _ => {
             const CONTEXT: u64 = 262_144;

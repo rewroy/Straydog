@@ -649,20 +649,6 @@ mod tests {
     }
 
     #[test]
-    fn the_qwen36_bundle_is_found_by_its_files() {
-        let (quant, alias) = ("UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL");
-        let model = bundle_directory(quant);
-        let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
-        assert_eq!((settings.quant.as_str(), settings.alias.as_str(), settings.batch_size), (quant, alias, Some(4096)));
-        // (a prefill batch above 4096 is DeepSeek-V4.1's)
-        let long = resolve(Options { model: Some(model.clone()), batch_size: Some(8192), ..Options::default() });
-        assert!(long.unwrap_err().contains("DeepSeek-V4.1 alone"));
-        let shard = model.join(&bundle::shards(quant).unwrap()[0].name);
-        assert_eq!(resolve(Options { model: Some(shard), ..Options::default() }).unwrap().quant, quant);
-        std::fs::remove_dir_all(model).unwrap();
-    }
-
-    #[test]
     fn verity_trees_in_the_data_directory_are_built_before_the_worker_reads_them() {
         let model = bundle_directory("IQ3_XXS");
         let data = std::env::temp_dir().join(format!("straydog-config-trees-{}", std::process::id()));

@@ -20,7 +20,7 @@ pub const DEFAULT_CONTEXT: u64 = 262_144;
 
 /// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash's
 /// recommended build and its other two, then Qwen3.8-Flash-Next from the most exact quantization to
-/// the smallest. Qwen3.6-35B-A3B is not supported: nothing offers it, and a bundle already on a disk still runs.
+/// the smallest.
 pub const ORDER: [&str; 7] =
     ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"];
 
@@ -267,8 +267,6 @@ impl Fit {
 enum State {
     /// In VRAM, a copy on every GPU (DeepSeek-V4.1: each holds the compressed rows of its part of the attention).
     EveryGpu,
-    /// In VRAM, shared among the GPUs (Qwen3.6).
-    Vram,
     /// In host memory (Qwen3.8).
     Host,
 }
@@ -301,9 +299,6 @@ fn working(architecture: &str) -> Working {
         // bytes a token, is 0.78 GiB. It started at --vram 14 and 15 and not at 13 (and 12, 10), 1.4
         // GiB more than it counted, for the rows of a prefill pass of 4096 tokens.
         "deepseek41" => Working { vram: gib_hundredths(234), per_gpu: gib_hundredths(162), state: State::EveryGpu, arena: gib_hundredths(140), host: CHECKPOINT_BYTES },
-        // Qwen3.6: the state (DeltaNets' and K/V: 40960 bytes a token) and a GPU's rows; it started
-        // on one GPU at --vram 6 and 12 with a context of 32768 and not at --vram 12 with 262144
-        "qwen35moe" => Working { vram: 0, per_gpu: gib_hundredths(25), state: State::Vram, arena: 0, host: 0 },
         // Qwen3.8 keeps its sequence state in host memory; the rows and buffers of its passes: 6.26
         // GiB on two GPUs with IQ3_S (57.3 GiB counted); Q2_0 started on one GPU at --vram 8
         _ => Working { vram: 0, per_gpu: gib_hundredths(290), state: State::Host, arena: 0, host: 0 },
@@ -313,7 +308,7 @@ fn working(architecture: &str) -> Working {
 impl Working {
     fn vram(&self, gpus: usize, state: u64) -> u64 {
         let gpus = gpus as u64;
-        self.vram + self.per_gpu * gpus + match self.state { State::EveryGpu => state * gpus, State::Vram => state, State::Host => 0 }
+        self.vram + self.per_gpu * gpus + match self.state { State::EveryGpu => state * gpus, State::Host => 0 }
     }
 
     fn host(&self, state: u64) -> u64 {
@@ -433,7 +428,7 @@ pub(crate) mod tests {
     fn every_pinned_bundle_is_offered_once() {
         let mut named: Vec<&str> = ORDER.to_vec();
         named.sort_unstable();
-        let mut pinned: Vec<&str> = bundle::quantizations().filter(|quant| *quant != "UD-Q8_K_XL").collect();
+        let mut pinned: Vec<&str> = bundle::quantizations().collect();
         pinned.sort_unstable();
         assert_eq!(named, pinned);
         let entries = pinned_entries();
@@ -464,10 +459,8 @@ pub(crate) mod tests {
         let with_dspark = xxs.disk_bytes(&[Extra::Dspark]);
         assert_eq!(with_dspark, xxs.disk_bytes(&[]) + dspark.kept + dspark.tree);
         assert_eq!(xxs.disk_bytes(&[Extra::Vision]), xxs.disk_bytes(&[]) + vision.kept + vision.tree + vision.scratch);
-        // Qwen3.8 has the MTP drafter and no DSpark or vision; Qwen3.6 has none of them
+        // Qwen3.8 has the MTP drafter and no DSpark or vision
         assert_eq!(entry("Q2_0").default_extras(), [Extra::Mtp]);
-        assert_eq!(entry("UD-Q8_K_XL").default_extras(), []);
-        assert_eq!(entry("UD-Q8_K_XL").files.len(), 4);
         assert_eq!(entry("UD-IQ2_XXS").default_extras(), [Extra::Vision]);
         // every bundle: its tokenizer files come with it and are small
         for quant in ORDER {
@@ -522,9 +515,9 @@ pub(crate) mod tests {
         }
         // UD-IQ2_XXS has 157 GB of experts: past VRAM and the tier, the drive serves the rest
         assert!(matches!(fit(&entry("UD-IQ2_XXS"), &machine, DEFAULT_CONTEXT), Fit::Drive(_)));
-        // Qwen3.8 and Qwen3.6 are in VRAM whole at the full context (the placement said "fully resident" and
+        // Qwen3.8 is in VRAM whole at the full context (the placement said "fully resident" and
         // "0.0 GiB host tier"), and keep it
-        for quant in ["Q2_0", "IQ3_S", "UD-Q8_K_XL"] {
+        for quant in ["Q2_0", "IQ3_S"] {
             assert_eq!(fit_at_best_context(&entry(quant), &machine), (DEFAULT_CONTEXT, Fit::Vram), "{quant}");
         }
         let entries = pinned_entries();
@@ -555,25 +548,11 @@ pub(crate) mod tests {
         assert_eq!(entries[recommended].quant, "Q2_0");
     }
 
-    /// The context the rule gives is the largest at which a bundle starts: Qwen3.6 on one GPU, by the
-    /// measurements (it started at --vram 6 and 12 with 32768 tokens and did not at --vram 12 with 262144).
     #[test]
-    fn a_bundle_that_does_not_fit_at_the_full_context_is_given_the_most_that_starts() {
-        let qwen36 = entry("UD-Q8_K_XL");
-        assert!(matches!(fit(&qwen36, &machine(1, 12 << 30, 32 << 30), DEFAULT_CONTEXT), Fit::TooLittleVram { .. }));
-        assert!(fit(&qwen36, &machine(1, 12 << 30, 32 << 30), 32_768).runs());
-        // 6 GB cards (a budget of 6 GiB less its margin): the measured --vram 6 start at 32768
-        assert_eq!(fit_at_best_context(&qwen36, &machine(1, (6 << 30) + (600 << 20), 32 << 30)).0, 32_768);
-        // each step of the ladder is the largest that runs
-        let (context, _) = fit_at_best_context(&qwen36, &machine(1, 12 << 30, 32 << 30));
-        assert!(fit(&qwen36, &machine(1, 12 << 30, 32 << 30), context).runs());
-        assert!(context == DEFAULT_CONTEXT || !fit(&qwen36, &machine(1, 12 << 30, 32 << 30), context * 2).runs());
-        // the state of DeepSeek-V4.1 is small: its needs barely move with the context
+    fn deepseeks_state_is_small_and_a_copy_on_each_gpu() {
         let ds = entry("GSQ-RCO-IQ2_XXS");
         assert!(min_vram(&ds, 1, DEFAULT_CONTEXT) - min_vram(&ds, 1, 16_384) < GIB);
-        // two GPUs: each keeps a copy of DeepSeek-V4.1's state, Qwen3.6's is shared
         assert!(min_vram(&ds, 2, DEFAULT_CONTEXT) - min_vram(&ds, 1, DEFAULT_CONTEXT) > GIB);
-        assert!(min_vram(&qwen36, 2, DEFAULT_CONTEXT) - min_vram(&qwen36, 1, DEFAULT_CONTEXT) < 3 * GIB);
     }
 
     #[test]

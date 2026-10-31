@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 use straydog_engine::arch::served::{Engines, Session, Settings, Warmed};
-use straydog_engine::arch::{deepseek41, qwen35moe};
+use straydog_engine::arch::deepseek41;
 use straydog_engine::bundle;
 use straydog_engine::chat::{self, ChatTemplate};
 use straydog_engine::constraint::Constraint;
@@ -92,7 +92,6 @@ impl Served for Handle {
 pub(crate) fn main(args: &WorkerArgs, plan: &Plan, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
     match bundle::architecture_of(&args.quant)?.as_str() {
         "deepseek41" => run::<deepseek41::serve::Engines>(args, plan, output, report, deepseek41::serve::place),
-        "qwen35moe" => run::<qwen35moe::serve::Engines>(args, plan, output, report, qwen35moe::serve::place),
         other => Err(format!("no engine for the {other} architecture")),
     }
 }

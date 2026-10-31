@@ -290,12 +290,6 @@ mod tests {
             ed59f92082b1e93c0e96d60a8b11aab089b52f09/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf");
         assert_eq!(entries[2].1, "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/\
             de4b8e4d43b917e7706784d8bb445c9af86a3540/tokenizer.json");
-        // A bundle read on demand: its GGUF from the GGUF repository, its resources from the official one.
-        let qwen = super::entries("UD-Q8_K_XL").unwrap();
-        assert_eq!(qwen[0].1, "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/\
-            a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf");
-        assert_eq!(qwen[1].1, "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/\
-            995ad96eacd98c81ed38be0c5b274b04031597b0/tokenizer.json");
         assert!(super::entries("Q4_K_M").unwrap_err().contains("unsupported"));
     }
 

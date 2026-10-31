@@ -36,7 +36,7 @@ impl Markup {
     /// The markup of a GGUF architecture's chat template.
     pub fn of_architecture(architecture: &str) -> Option<Markup> {
         match architecture {
-            "qwen4exp" | "qwen35moe" => Some(Markup::Qwen),
+            "qwen4exp" => Some(Markup::Qwen),
             "deepseek41" => Some(Markup::Dsml),
             _ => None,
         }
