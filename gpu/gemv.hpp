@@ -930,15 +930,19 @@ unsigned gemv_q8_lanes(const Device& d, const Matrix& m, unsigned lanes) {
 // A block owns only one matrix, so its waves can share the same activation
 // vector even when adjacent matrices have different kinds or input offsets.
 // Padding is in waves only; each row keeps its original lanes and reduction.
-template<bool compact>
+// Two vectors: the second's activations after the first's.
+template<bool compact, int V>
 __global__ void gemv_mixed_shared(FixedGemv list, const float* input, float* output) {
-    __shared__ __align__(16) float cached[2560];
+    __shared__ __align__(16) float cached[V * 2560];
     const size_t first_wave = size_t(blockIdx.x) * (blockDim.x / 32);
     unsigned selected = 0;
     for (unsigned i = 1; i < list.count; ++i) if (list.items[i].first_wave <= first_wave) selected = i;
     const GemvItem& item = list.items[selected];
     Matrix matrix = item.matrix;
-    for (unsigned i = threadIdx.x; i < 2560; i += blockDim.x) cached[i] = input[matrix.input_offset + i];
+    for (unsigned i = threadIdx.x; i < 2560; i += blockDim.x) {
+        #pragma unroll
+        for (int v = 0; v < V; ++v) cached[v * 2560 + i] = input[matrix.input_offset + v * list.input_stride + i];
+    }
     __syncthreads();
     matrix.input_offset = 0;
     // Eligibility excludes the reference decoder; keeping its code out of this
@@ -946,10 +950,29 @@ __global__ void gemv_mixed_shared(FixedGemv list, const float* input, float* out
     const size_t row = (first_wave - item.first_wave + threadIdx.x / 32) * (32 / item.lanes);
     #define SD_MIXED(format) case format: \
         if constexpr (!compact || format == 12 || format == 23 || format == 30) \
-            gemv_rows<format, 1>(matrix, row, item.lanes, cached, 0, output, 0, list.residual); \
+            gemv_rows<format, V>(matrix, row, item.lanes, cached, 2560, output, list.output_stride, list.residual); \
         break;
     switch (matrix.kind) { SD_FAST_FORMATS(SD_MIXED) }
     #undef SD_MIXED
+}
+// Which of gemv_mixed_shared's lists this is: 0 none, 1 compact, 2 Q3_K. Multiple tall projections amortize staging. Keep QSA,
+// router and Q2-only mixes on their original path: measured staging regressions.
+int gemv_mixed_shared_list(const FixedGemv& list, bool uniform) {
+    if (uniform || list.count < 3) return 0;
+    bool supported = true, compact = true, q3 = false;
+    unsigned tall = 0;
+    for (unsigned i = 0; i < list.count; ++i) {
+        const Matrix& matrix = list.items[i].matrix;
+        bool fast = false;
+        #define SD_ALIGNED(format) case format: fast = true; break;
+        switch (matrix.kind) { SD_FAST_FORMATS(SD_ALIGNED) }
+        #undef SD_ALIGNED
+        supported &= fast && list.items[i].lanes != 0 && matrix.cols == 2560;
+        compact &= matrix.kind == 12 || matrix.kind == 23 || matrix.kind == 30;
+        tall += matrix.rows >= 6144;
+        q3 |= matrix.kind == 11 && matrix.rows >= 6144;
+    }
+    return !supported || tall < 2 ? 0 : compact ? 1 : q3 ? 2 : 0;
 }
 
 // Wide single-token output projections reuse the same F32 input for every row.
@@ -1536,35 +1559,22 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
     if (d.q8_wide && ((uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) || gemv_q8_mixed_launch<V>(d, list, input, output))) return;
 #endif
 #if !defined(__HIPCC__)
-    if constexpr (V == 1) {
-        if (!uniform && list.count >= 3) {
-            bool supported = true, compact = true, q3 = false;
-            unsigned tall = 0;
+    if constexpr (V <= 2) {
+        const int mixed = gemv_mixed_shared_list(list, uniform);
+        // (two vectors: the compact lists, RTX 5070 Ti, Qwen3.8's 16480-row DeltaNet projection: 94 us to 82)
+        if (mixed == 1 || (V == 1 && mixed == 2)) {
+            FixedGemv padded = list;
+            size_t waves = 0;
             for (unsigned i = 0; i < list.count; ++i) {
-                const Matrix& matrix = list.items[i].matrix;
-                bool fast = false;
-                #define SD_ALIGNED(format) case format: fast = true; break;
-                switch (matrix.kind) { SD_FAST_FORMATS(SD_ALIGNED) }
-                #undef SD_ALIGNED
-                supported &= fast && list.items[i].lanes != 0 && matrix.cols == 2560;
-                compact &= matrix.kind == 12 || matrix.kind == 23 || matrix.kind == 30;
-                tall += matrix.rows >= 6144;
-                q3 |= matrix.kind == 11 && matrix.rows >= 6144;
+                padded.items[i].first_wave = uint32_t(waves);
+                waves += (gemv_waves(list.items[i].matrix, list.items[i].lanes) + 3) / 4 * 4;
             }
-            // Multiple tall projections amortize staging. Keep QSA, router and
-            // Q2-only mixes on their original path: measured staging regressions.
-            if (supported && tall >= 2 && (compact || q3)) {
-                FixedGemv padded = list;
-                size_t waves = 0;
-                for (unsigned i = 0; i < list.count; ++i) {
-                    padded.items[i].first_wave = uint32_t(waves);
-                    waves += (gemv_waves(list.items[i].matrix, list.items[i].lanes) + 3) / 4 * 4;
-                }
-                if (compact) gemv_mixed_shared<true><<<unsigned(waves / 4), 128, 0, d.stream>>>(padded, input, output);
-                else gemv_mixed_shared<false><<<unsigned(waves / 4), 128, 0, d.stream>>>(padded, input, output);
-                return;
-            }
+            if (mixed == 1) gemv_mixed_shared<true, V><<<unsigned(waves / 4), 128, 0, d.stream>>>(padded, input, output);
+            else if constexpr (V == 1) gemv_mixed_shared<false, 1><<<unsigned(waves / 4), 128, 0, d.stream>>>(padded, input, output);
+            return;
         }
+    }
+    if constexpr (V == 1) {
         const GemvItem& item = list.items[0];
         if (uniform && list.count == 1 && item.matrix.rows == 2560 && item.matrix.cols == 6144) {
             const unsigned shared_blocks = unsigned((gemv_waves(item.matrix, item.lanes) + 3) / 4);
@@ -1662,7 +1672,8 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
 #if defined(__HIPCC__)
     const bool mixed_q8 = !uniform && gemv_q8_mixed_input(d, list, input, vectors);
 #else
-    const bool mixed_q8 = false;
+    // (or it goes whole to gemv_mixed_shared)
+    const bool mixed_q8 = vectors == 2 && gemv_mixed_shared_list(list, uniform) == 1;
 #endif
     // (with the wide Q8 kernels, a list they cannot take whole is split for one vector too: a row then
     // takes the kernel of its kind whatever shares its launch, as a verification's rows do)
