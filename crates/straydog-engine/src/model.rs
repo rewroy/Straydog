@@ -1338,20 +1338,44 @@ impl Model {
         run(&mut self.group, &operands)
     }
 
-    /// The K/V's next size for `positions`: twice over where the commit has room for that, else what the sequence needs. The commit is read
+    /// A generated token counted; every so many, the working set's limit again.
+    fn token_made(&mut self) {
+        self.metric_count("generated_tokens", 1);
+        if self.last_metrics.get("generated_tokens").and_then(Value::as_u64).unwrap_or(0) % 256 == 0 {
+            self.hold_memory();
+        }
+    }
+
+    /// The working set's limit, from what is free now. It follows what a K/V growth has just locked and what other programs have taken or given
+    /// back: read once a request, a five-minute prompt took the machine to 0.47 GiB available.
+    fn hold_memory(&self) {
+        if self.partial {
+            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * 4096;
+            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        }
+    }
+
+    /// The K/V's next size for `positions`: twice over where the commit and the memory have room for that, else a quarter more, else what the
+    /// sequence needs, which only the commit can refuse: a sequence at 66K locked 6 GiB for 131072 positions. The commit is read
     /// with the slots' VRAM still charged to it: they give it up for the growth and take it back after, so what the growth takes of it
     /// beyond this they would not find (IQ3_XXS at auto: an hour's conversation past 65536 ended the worker).
     fn kv_capacity_for(&self, positions: usize) -> Result<usize> {
         let doubled = (positions + 4096).next_power_of_two().min(self.context);
-        let Some(left) = crate::host::commit_left() else { return Ok(doubled) };
+        let Some((free, left)) = crate::host::commit_left() else { return Ok(doubled) };
         let position = attention_layers(self.weights.drafter) * 4096;
         // (a layer's old K/V and new one are both held while it is copied)
         let cost = |capacity: usize| (capacity - self.kv_capacity) as u64 * position + capacity as u64 * 4096 + KV_COMMIT_MARGIN;
         let least = (positions + 4096).div_ceil(4096).saturating_mul(4096).min(self.context);
-        for capacity in [doubled, least] {
-            if cost(capacity) <= left {
+        let quarter = least.max((self.kv_capacity + self.kv_capacity / 4).div_ceil(4096) * 4096).min(self.context);
+        let spare = free.saturating_sub(crate::host::left_free(self.weights.host_memory_bytes));
+        for capacity in [doubled, quarter] {
+            let locked = (capacity - self.kv_capacity) as u64 * position;
+            if cost(capacity) <= left && locked <= spare {
                 return Ok(capacity);
             }
+        }
+        if cost(least) <= left {
+            return Ok(least);
         }
         Err(KV_NO_MEMORY.into())
     }
@@ -1379,6 +1403,7 @@ impl Model {
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
         self.kv_capacity = capacity;
+        self.hold_memory();
         // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
         for checkpoint in self.checkpoints.values_mut() {
             if let Some(history) = checkpoint.history.as_mut() {
@@ -1848,6 +1873,7 @@ impl Model {
                     return Ok(None);
                 }
                 position = end;
+                self.hold_memory();
                 progress(end, tokens.len());
             }
             if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
@@ -2111,7 +2137,7 @@ impl Model {
             }
             for value in &emitted {
                 produced += 1;
-                self.metric_count("generated_tokens", 1);
+                self.token_made();
                 self.metric_count("decode_forward_tokens", 1);
                 self.update_rate();
                 emit(*value);
@@ -2233,11 +2259,7 @@ impl Model {
         sampling.check()?;
         self.weights.check_unchanged()?;
         self.group.ensure_slots()?;
-        if self.partial {
-            // (the working set's limit follows what other programs have taken or given back since the last request)
-            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * 4096;
-            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
-        }
+        self.hold_memory();
         let parking = Instant::now();
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
@@ -2304,7 +2326,7 @@ impl Model {
             if self.last_metrics["ttft_seconds"].is_null() {
                 self.last_metrics.insert("ttft_seconds".into(), json!(started.elapsed().as_secs_f64()));
             }
-            self.metric_count("generated_tokens", 1);
+            self.token_made();
             emit(token);
             if index + 1 < max_new {
                 let decode_started = Instant::now();
