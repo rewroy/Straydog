@@ -60,8 +60,37 @@ pub fn left_free(memory: u64) -> u64 {
 /// `wanted` bytes held in memory by a process with `held` there already, at most what `available`
 /// physical memory gives while [`left_free`] stays free.
 pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
-    // (less than is held, when less than that is free: other programs' memory, a K/V grown)
-    wanted.min(held.saturating_add(available).saturating_sub(left_free(memory)))
+    wanted.min(held.saturating_add(available.saturating_sub(left_free(memory))))
+}
+
+/// The limit for a working set of `held` with `available` free, of what it wants and at least `least`. Under the lower mark it gives back, over the
+/// upper it may take more, and between them it stays. The marks are low because giving back is dear: IQ3_XXS on 62 GiB read a 33K prompt in 58 s with
+/// 6M page faults at a working set of 40 GiB (2 GiB available), in 93 s with 37M at 32 GiB (7 GiB available), and in 117 s with 63M at 28 GiB.
+#[cfg(any(windows, test))]
+fn working_set_limit(wanted: u64, least: u64, held: u64, available: u64, memory: u64) -> u64 {
+    let (low, high) = ((memory / 20).max(3 << 30), (memory / 13).max(4 << 30));
+    let limit = if available < low {
+        held.saturating_sub(low - available)
+    } else if available > high {
+        held + (available - high)
+    } else {
+        held
+    };
+    limit.min(wanted).max(least.min(wanted))
+}
+
+/// Keeps the working set's limit to what is free, four times a second, whatever the engine is doing: a wide batch reads a gigabyte a second, and
+/// read at each batch the limit came too late (0.47 GiB available). `pinned` follows the K/V.
+pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64) {
+    #[cfg(windows)]
+    {
+        let _ = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks);
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (memory, pinned, banks);
 }
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
@@ -109,8 +138,7 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
-        let least = share.min(memory / 8 * 3);
-        let share = within_free(share, windows_working_set(), windows_available().0, memory).max(least);
+        let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), windows_available().0, memory);
         let mut wanted = share;
         while wanted >= 1 << 30 {
             // SAFETY: the pseudo handle of this process and plain values.
@@ -179,8 +207,13 @@ mod tests {
         // 62 GiB with 30 free: the 47 GiB asked becomes what is held and what can go.
         assert_eq!(within_free(47 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 2 * GIB + 30 * GIB - 62 * GIB / 8);
         assert_eq!(within_free(20 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 20 * GIB);
-        assert_eq!(within_free(47 * GIB, 2 * GIB, GIB, 62 * GIB), 0);
-        assert_eq!(within_free(47 * GIB, 30 * GIB, GIB, 62 * GIB), 31 * GIB - 62 * GIB / 8);
+        assert_eq!(within_free(47 * GIB, 2 * GIB, GIB, 62 * GIB), 2 * GIB);
+        // Between the two marks it stays; under the lower it gives back, down to the least; over the upper it takes more, up to what it wants.
+        assert_eq!(super::working_set_limit(47 * GIB, 23 * GIB, 30 * GIB, 4 * GIB, 62 * GIB), 30 * GIB);
+        assert_eq!(super::working_set_limit(47 * GIB, 23 * GIB, 30 * GIB, 2 * GIB, 62 * GIB), 32 * GIB - 62 * GIB / 20);
+        assert_eq!(super::working_set_limit(47 * GIB, 23 * GIB, 24 * GIB, 0, 62 * GIB), 23 * GIB);
+        assert_eq!(super::working_set_limit(47 * GIB, 23 * GIB, 30 * GIB, 10 * GIB, 62 * GIB), 40 * GIB - 62 * GIB / 13);
+        assert_eq!(super::working_set_limit(35 * GIB, 23 * GIB, 30 * GIB, 30 * GIB, 62 * GIB), 35 * GIB);
         // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
         assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
         assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
