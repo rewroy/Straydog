@@ -239,7 +239,7 @@ struct Prepared {
     alignas(64) float scale[16];
     alignas(64) float delta[32];       // IQ1_M
     alignas(64) uint8_t sign[32];
-    const uint8_t* signs;              // the block's own sign bytes (IQ2_S, IQ3_S), else sign
+    const uint8_t* signs;              // the block's own sign bytes (IQ2_S, IQ3_S), or its qh bytes (IQ1_M), else sign
 };
 SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512i lanes16(int first = 0) { return _mm512_add_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(first)); }
@@ -332,25 +332,24 @@ void prepare(const uint8_t* b, Prepared& p) {
         const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
         iq2_scales(wide_half(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
         p.signs = p.sign;
-    } else if constexpr (kind == 29) {   // IQ1_M: qs[0..32) | 3 bits of a qh nibble; nibble bit 3 picks the delta
-        const __m512i lane = lanes16();
-        const __m512i qh = bytes16(b + 32);
-        for (int half = 0; half < 2; ++half) {
-            const __m512i g = lanes16(16 * half);
-            const __m512i nibble = field16(qh, _mm512_srli_epi32(g, 1), _mm512_slli_epi32(_mm512_and_si512(g, _mm512_set1_epi32(1)), 2), 15);
-            const __m512i index = _mm512_or_si512(bytes16(b + 16 * half), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(7)), 8));
-            store_offsets(p.offset + 16 * half, index, 5);
-            const __m512i delta = _mm512_or_si512(_mm512_set1_epi32(0x3E000000), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(8)), 28));
-            _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
-        }
+    } else if constexpr (kind == 29) {   // IQ1_M: qs[0..32) | 3 bits of a qh nibble; nibble bit 3 picks the delta, read per chunk
+        const __m128i qh = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 32)), mask = _mm_set1_epi8(7);
+        const __m128i low = _mm_and_si128(qh, mask), high = _mm_and_si128(_mm_srli_epi16(qh, 4), mask);
+        const __m256i nibbles = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi8(low, high)), _mm_unpackhi_epi8(low, high), 1);
+        const __m512i index = _mm512_or_si512(_mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b))),
+                                              _mm512_slli_epi16(_mm512_cvtepu8_epi16(nibbles), 8));
+        _mm512_store_si512(p.offset, _mm512_slli_epi16(index, 5));
         uint16_t words[4];
-        const float d = iq1m_scale(b, words);
+        std::memcpy(words, b + 48, 8);
+        const float d = SD_HALF_TO_FLOAT(uint16_t((words[0] >> 12) | ((words[1] >> 8) & 0xf0) | ((words[2] >> 4) & 0xf00) | (words[3] & 0xf000)));
         const __m512i word = _mm512_cvtepu16_epi32(_mm256_castsi128_si256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(words))));
+        const __m512i lane = lanes16();
         const __m512i ib = _mm512_srli_epi32(lane, 1);
         const __m512i shift = _mm512_add_epi32(_mm512_mullo_epi32(_mm512_and_si512(ib, _mm512_set1_epi32(1)), _mm512_set1_epi32(6)),
                                                _mm512_mullo_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), _mm512_set1_epi32(3)));
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(word, _mm512_srli_epi32(lane, 2), shift, 7), 1), _mm512_set1_epi32(1));
         _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(odd)));
+        p.signs = b + 32;
     } else if constexpr (kind == 19) {   // IQ1_S: qs[2..34) | 3 bits of the ib's 16-bit word at 34; its scale and delta sign
         const __m512i lane = lanes16();
         const __m512i qh = _mm512_cvtepu16_epi32(_mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 34))));
@@ -397,6 +396,14 @@ void prepare(const uint8_t* b, Prepared& p) {
         p.signs = b + 74;
     }
 }
+struct Iq1Deltas {
+    alignas(64) float value[4][16];
+    constexpr Iq1Deltas() : value() {
+        for (int k = 0; k < 4; ++k)
+            for (int lane = 0; lane < 16; ++lane) value[k][lane] = (k >> (lane / 8)) & 1 ? -0.125f : 0.125f;
+    }
+};
+constexpr Iq1Deltas iq1_deltas;
 template<int kind>
 SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
@@ -413,7 +420,12 @@ inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
         v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 2])), 2);
         v = _mm512_insertf32x4(v, _mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c + 3])), 3);
     }
-    if constexpr (kind == 29 || kind == 19) {
+    if constexpr (kind == 29) {
+        // The qh byte holds both rows' nibbles: bits 3 and 7 name one of four delta vectors.
+        const unsigned byte = p.signs[c];
+        const __m512 delta = _mm512_load_ps(iq1_deltas.value[((byte >> 3) & 1) | ((byte >> 6) & 2)]);
+        return _mm512_mul_ps(_mm512_set1_ps(p.scale[c]), _mm512_add_ps(v, delta));
+    } else if constexpr (kind == 19) {
         const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(p.delta[2 * c]), _mm512_set1_ps(p.delta[2 * c + 1]));
         return _mm512_mul_ps(_mm512_set1_ps(p.scale[c]), _mm512_add_ps(v, delta));
     } else {
