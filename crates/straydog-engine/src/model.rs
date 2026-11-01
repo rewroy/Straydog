@@ -322,6 +322,9 @@ pub struct Model {
     /// Running means of a decode pass's seconds with one row and with two (0: none yet), for [`Model::partial_drawn_cut`].
     pass_seconds: [f64; 2],
     passes_with_draft: u32,
+    /// This request's passes by rows, and this process's memory as it began, for its log line.
+    pass_counts: [u64; 2],
+    memory_before: Option<(u64, u64, u64)>,
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
     /// Page-locked host bytes besides the K/V.
@@ -428,6 +431,8 @@ impl Model {
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
             pass_seconds: [0.0; 2],
             passes_with_draft: 0,
+            pass_counts: [0; 2],
+            memory_before: None,
             kv_capacity: context,
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
@@ -2009,6 +2014,9 @@ impl Model {
                 *mean = if *mean > 0.0 { *mean + (seconds.min(3.0 * *mean) - *mean) / 16.0 } else { seconds };
             }
             self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
+            if let Some(count) = self.pass_counts.get_mut(rows.len().wrapping_sub(1)) {
+                *count += 1;
+            }
             let hybrid = if self.partial && self.profile.is_some() {
                 let info = self.group.info().unwrap_or_default();
                 Some((info["wait_ns"].as_u64().unwrap_or(0) as f64 / 1e9, info["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9))
@@ -2074,8 +2082,10 @@ impl Model {
         }
         self.ple_counts = self.weights.row_counts(PLE_TABLE).unwrap_or_default();
         self.ple_wait = 0.0;
-        if self.partial && self.profile.is_some() {
+        if self.partial {
             self.hybrid_counts = self.group.info().unwrap_or_default();
+            self.pass_counts = [0; 2];
+            self.memory_before = crate::host::memory_note();
         }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
@@ -2091,6 +2101,25 @@ impl Model {
         self.last_metrics.insert("ple_rows".into(), json!({"used": asked, "read": read, "blocks": blocks,
                                                             "wait_seconds": self.ple_wait}));
         let generated = self.last_metrics.get("generated_tokens").and_then(Value::as_u64).unwrap_or(0).max(1) as f64;
+        if self.partial {
+            // Where a partially resident model's request went, on every request: the log alone must say what held it up.
+            let info = self.group.info().unwrap_or_default();
+            let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
+            let memory = crate::host::memory_note();
+            let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
+            self.last_metrics.insert("partial_detail".into(), json!({
+                "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated,
+                "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
+                "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
+                "slots": info["cached_experts"], "streamed": spent("streamed_experts"),
+                "passes": self.pass_counts, "pass_ms": [1e3 * self.pass_seconds[0], 1e3 * self.pass_seconds[1]],
+                "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
+                "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
+                "page_faults": faults,
+                "graphs": info["devices"][0]["cached_graphs"], "replays": info["devices"][0]["graph_replays"].as_u64().unwrap_or(0)
+                    .saturating_sub(self.hybrid_counts["devices"][0]["graph_replays"].as_u64().unwrap_or(0)),
+            }));
+        }
         let Some(profile) = self.profile.as_ref() else { return };
         let mut phases: Map<String, Value> = profile.phases.iter().map(|(name, seconds)| ((*name).to_string(), json!(1e3 * seconds / generated))).collect();
         if self.partial {

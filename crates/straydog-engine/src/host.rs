@@ -23,6 +23,34 @@ pub fn host_memory_bytes() -> u64 {
     }
 }
 
+/// This process's memory for a request's log line: resident bytes, the bytes available on the machine, and its page faults so far.
+pub fn memory_note() -> Option<(u64, u64, u64)> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: the pseudo handle of this process and an initialized structure with its size set.
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } == 0 {
+            return None;
+        }
+        Some((counters.WorkingSetSize as u64, windows_available().0, u64::from(counters.PageFaultCount)))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // (past the command's closing parenthesis: state is field 3, minflt 10, majflt 12, rss 24 in pages)
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let number = |field: usize| fields.get(field - 3)?.parse::<u64>().ok();
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let available = meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:"))?.split_whitespace().next()?.parse::<u64>().ok()? * 1024;
+        Some((number(24)? * 4096, available, number(10)? + number(12)?))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    None
+}
+
 /// Physical memory a guaranteed working set and page locks leave to the rest of the system, which
 /// they otherwise take without looking at what the other applications and the kernel need.
 pub fn left_free(memory: u64) -> u64 {

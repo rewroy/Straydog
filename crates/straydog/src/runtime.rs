@@ -368,13 +368,30 @@ fn prefill_summary(usage: &Value, timings: &Value) -> String {
     }
 }
 
+/// A partially resident request's breakdown: a generated token's wait for the GPU and the CPU experts' time, where its routes ran, its passes,
+/// the experts its prompt streamed over the bus, and the memory it ended with.
+fn partial_summary(detail: &Value, timings: &Value) -> String {
+    let number = |key: &str| detail[key].as_f64().unwrap_or(0.0);
+    let decode = timings["decode_tokens_per_second"].as_f64().map_or(0.0, |rate| 1e3 / rate.max(1e-9));
+    let (wait, cpu) = (number("wait_ms"), number("cpu_ms"));
+    let passes = detail["passes"].as_array().map_or((0, 0), |counts| (counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
+    let pass_ms = detail["pass_ms"].as_array().map_or((0.0, 0.0), |ms| (ms[0].as_f64().unwrap_or(0.0), ms[1].as_f64().unwrap_or(0.0)));
+    let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
+        (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
+        _ => String::new(),
+    };
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){memory}",
+            (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
+            passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
+}
+
 /// One line per finished generation: what was read, what was reused, how fast.
 pub fn request_summary(event: &Value) -> String {
     let (usage, timings) = (&event["usage"], &event["timings"]);
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}",
+        "Straydog request: prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -440,6 +457,11 @@ pub fn request_summary(event: &Value) -> String {
                     format!("{phase} {value:.3} s")
                 }).collect::<Vec<_>>().join(", "))
             }
+            _ => String::new(),
+        },
+        // (a partially resident model says what held a token up, what a prompt streamed, and how the machine's memory stood)
+        match &timings["partial_detail"] {
+            detail if detail.is_object() => partial_summary(detail, timings),
             _ => String::new(),
         },
         // (an engine that streams experts says where a decoded token's came from)
