@@ -1644,13 +1644,14 @@ impl Model {
         Ok(())
     }
 
-    /// The cut of a partially resident model's drawn draft, from what a second row costs this machine at this budget, measured.
-    /// One pass with a draft costs c passes without, so a draft pays when its chance is about c - 1, and the drawn distribution's
-    /// greatest probability runs below that chance. IQ2_XS, tok/s by cut (0, 0.3, 0.45, 0.6): R9700 at --vram 8, c 1.36: 67.4, 67.1,
-    /// 65.6, 64.4; at --vram 5, c 1.5: 52.1, 53.4, 52.9, 52.2; RTX 5070 Ti at --vram 12, c 1.65: 66.6, 68.1 at 0.4, 69.1 at 0.6.
+    /// The cut of a partially resident model's drawn draft, from what a second row costs this machine at this budget, measured: one
+    /// pass with a draft costs c passes without. A draft is kept with the overlap of the two distributions, which 2319 rows of a served
+    /// run put near 0.45 + 0.4 * the drawn distribution's greatest probability (0.95 past 0.9). Weighing that overlap against c - 1 at the
+    /// rate a pass already earns gives the line below, and the sweeps agree, tok/s by cut (0, 0.3, 0.45, 0.6): R9700 at --vram 8, c 1.36:
+    /// 67.4, 67.1, 65.6, 64.4; at --vram 5, c 1.5: 52.1, 53.4, 52.9, 52.2; RTX 5070 Ti at --vram 12, c 1.65: 66.6, 68.1 at 0.4, 69.1 at 0.6.
     fn partial_drawn_cut(&self) -> f32 {
         match self.pass_seconds {
-            [one, two] if one > 0.0 && two > 0.0 => (0.85 * (two / one - 1.0)).clamp(0.0, 0.8) as f32,
+            [one, two] if one > 0.0 && two > 0.0 => (2.75 * (two / one - 1.0) - 1.125).clamp(0.0, 0.9) as f32,
             _ => PARTIAL_DRAFT_CUT,
         }
     }
