@@ -370,7 +370,7 @@ void sparse_attention(Device& d, void* const* pointers, const int* kinds, void* 
             throw std::runtime_error("invalid Straydog QSA state allocation");
     };
     check_state(kv_state,context*1024*4);
-    // (a K/V that grows: its indexer and scratch hold the whole context from the start)
+    // (a K/V that grows: its indexer and scratch may hold more than it does)
     auto check_room=[&](void* pointer,size_t bytes) {
         auto found=d.allocations.find(pointer);
         if (found==d.allocations.end() || found->second<bytes)
