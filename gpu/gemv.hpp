@@ -848,7 +848,7 @@ __global__ void gemv_fixed(FixedGemv list, const float* input, float* output) {
 }
 // Same kernel for one shared format: only that format's registers are allocated.
 template<int kind, int V>
-__global__ void gemv_fixed_kind(FixedGemv list, const float* input, float* output) {
+__global__ void gemv_fixed_kind(FixedGemv list, const float* input, float* output) { SD_KERNEL_ACQUIRE;
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     unsigned selected = 0;
     for (unsigned i = 1; i < list.count; ++i) if (list.items[i].first_wave <= wave) selected = i;
@@ -1349,7 +1349,7 @@ __device__ __forceinline__ const GemvItem& gemv_q8_item(const FixedGemv& list, s
 }
 // gemv_fixed_kind (LINKED, one vector: gemv_linked_kind) on the staged input.
 template<int kind, int V, bool LINKED>
-__global__ void __launch_bounds__(256) gemv_q8_kind(FixedGemv list, const float* input, float* output, LinkTail tail) {
+__global__ void __launch_bounds__(256) gemv_q8_kind(FixedGemv list, const float* input, float* output, LinkTail tail) { SD_KERNEL_ACQUIRE;
     const GemvQ8Input in = gemv_q8_stage_list<kind, V>(list, input);
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     const GemvItem& item = gemv_q8_item(list, wave);
@@ -1383,7 +1383,7 @@ __device__ __forceinline__ float gemv_reduce4(float p0, float p1, float p2, floa
 // and four rows' butterflies are one (gemv_reduce4): 33 us. Every row's sum is gemv_q8_rows': its unit's dot added to zero in the lane, the
 // lanes' sums butterflied.
 template<int V, int ROWS>
-__global__ void __launch_bounds__(256) gemv_q8_rows_wave(FixedGemv list, const float* input, float* output) {
+__global__ void __launch_bounds__(256) gemv_q8_rows_wave(FixedGemv list, const float* input, float* output) { SD_KERNEL_ACQUIRE;
     using Q5 = GemvQ8<13>;
     const GemvItem& last = list.items[list.count - 1];
     const size_t waves = last.first_wave + last.matrix.rows;
@@ -1489,7 +1489,7 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
 // the V vectors, end to end; a wide kind's rows run on it as gemv_q8_kind's, a BF16 row on the F32 input as gemv_fixed_kind's. A
 // row's sum is the same whatever shares its launch, so one token's decode and a verification's rows agree.
 template<int V>
-__global__ void __launch_bounds__(256) gemv_q8_mixed(FixedGemv list, const float* input, float* output) {
+__global__ void __launch_bounds__(256) gemv_q8_mixed(FixedGemv list, const float* input, float* output) { SD_KERNEL_ACQUIRE;
     extern __shared__ __align__(16) uint32_t gemv_lds[];
     const size_t first_wave = size_t(blockIdx.x) * (blockDim.x / 32);
     const GemvItem& item = gemv_q8_item(list, first_wave);

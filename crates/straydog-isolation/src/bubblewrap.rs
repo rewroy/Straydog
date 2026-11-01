@@ -26,7 +26,7 @@ const LOADER: [&str; 4] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.co
 /// override, and the DeepSeek-V4.1 engine's switches: its phase timing (DS41_PROFILE), its drafts
 /// (DS41_DRAFTS) and DSpark's (DS41_DSPARK, DS41_DSPARK_RESIDENT). Nothing else reaches it: no
 /// proxy, token, key or credential the server may hold.
-const VARIABLES: [&str; 11] = [
+const VARIABLES: [&str; 12] = [
     "PATH",
     "LANG",
     "TZ",
@@ -35,6 +35,7 @@ const VARIABLES: [&str; 11] = [
     "CUDA_VISIBLE_DEVICES",
     "HSA_OVERRIDE_GFX_VERSION",
     "DS41_PROFILE",
+    "STRAYDOG_DIRECT",
     "DS41_DRAFTS",
     "DS41_DSPARK",
     "DS41_DSPARK_RESIDENT",

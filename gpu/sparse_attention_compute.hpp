@@ -10,7 +10,7 @@ constexpr size_t qsa_decode_chunk=32;
 template<bool mirrored=false,int P=1>
 __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,size_t selected,size_t chunks,
                                  const float* input,float* partial,const uint32_t* position=nullptr,
-                                 const float* mirror=nullptr,size_t mirror_rows=0,size_t steps=1) {
+                                 const float* mirror=nullptr,size_t mirror_rows=0,size_t steps=1) { SD_KERNEL_ACQUIRE;
     using H=QwenHeads<P>;
     const size_t chunk=blockIdx.x,kv=blockIdx.y,row=blockIdx.z,t=threadIdx.x,lane=t%32,wave=t/32;
     const size_t index_start=steps*H::packed;
@@ -105,7 +105,7 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
 // (gates: each value times the sigmoid of its query head's gate, qgate rows `gate_stride` apart, as qsa_gate did after it)
 template<int P=1>
 __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selected,const float* input,float* output,
-                                 size_t steps=1,const float* gates=nullptr,size_t gate_stride=0) {
+                                 size_t steps=1,const float* gates=nullptr,size_t gate_stride=0) { SD_KERNEL_ACQUIRE;
     using H=QwenHeads<P>;
     const size_t head=blockIdx.x,row=blockIdx.y,column=threadIdx.x;
     const size_t count=size_t(input[steps*H::packed+steps*selected+row]);

@@ -24,7 +24,7 @@ struct QwenExpertPart {
 template<bool experts>
 __global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, QwenExpertPart moe, uint32_t steps, float* hidden,
                                                        const float* mixed, size_t mixed_stride, uint32_t* state, uint32_t* peer_flag,
-                                                       float* peer_inbox, const float* inbox, size_t capacity, uint64_t timeout) {
+                                                       float* peer_inbox, const float* inbox, size_t capacity, uint64_t timeout) { SD_KERNEL_ACQUIRE;
     const uint32_t count = steps * 2560, next = state[0] + 1;
     const size_t slot = size_t(next & 1) * capacity;
     __shared__ bool held[4][10];

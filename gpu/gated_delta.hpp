@@ -282,7 +282,7 @@ template<int P = 1>
 __global__ void __launch_bounds__(gdn_threads)
 gdn_tokens(const float* state_in, const float* history_in, float* state, float* history,
            const float* coefficients, const float* bias, const float* decay, const float* norm,
-           const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) {
+           const float* projections, size_t stride, size_t tokens, float* snapshot, float* output) { SD_KERNEL_ACQUIRE;
     gdn_tokens_head<P>(blockIdx.x, state_in, history_in, state, history, coefficients, bias, decay, norm, projections, stride, tokens,
                     snapshot, output);
 }

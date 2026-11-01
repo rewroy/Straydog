@@ -372,7 +372,7 @@ __global__ void row_argmax_chunks(const float* values, size_t count, size_t stri
         best_values[blockIdx.y * argmax_chunks + blockIdx.x] = best; best_indices[blockIdx.y * argmax_chunks + blockIdx.x] = index;
     }
 }
-__global__ void row_argmax_finish(const float* best_values, const uint32_t* best_indices, int32_t* result) {
+__global__ void row_argmax_finish(const float* best_values, const uint32_t* best_indices, int32_t* result) { SD_KERNEL_ACQUIRE;
     float best = -INFINITY; uint32_t index = UINT32_MAX;
     if (threadIdx.x < argmax_chunks) {
         best = best_values[blockIdx.x * argmax_chunks + threadIdx.x]; index = best_indices[blockIdx.x * argmax_chunks + threadIdx.x];
@@ -399,7 +399,7 @@ __device__ __forceinline__ float gumbel_noise(uint64_t seed, uint64_t salt, uint
 }
 // row_argmax_chunks over values * inverse_temperature + Gumbel noise: the argmax of that is a draw from softmax(values * inverse_temperature).
 // `sample_at` holds, as uint32, the inverse temperature's float bits (0: no sampling, the plain argmax) and a 64-bit seed (low word first).
-__global__ void row_sample_chunks(const float* values, size_t count, size_t stride, const uint32_t* sample_at, uint32_t salt, float* best_values, uint32_t* best_indices) {
+__global__ void row_sample_chunks(const float* values, size_t count, size_t stride, const uint32_t* sample_at, uint32_t salt, float* best_values, uint32_t* best_indices) { SD_KERNEL_ACQUIRE;
     const float inverse_temperature = __uint_as_float(sample_at[0]);
     const uint64_t seed = uint64_t(sample_at[1]) | uint64_t(sample_at[2]) << 32;
     const float* row = values + size_t(blockIdx.y) * stride;
@@ -426,7 +426,7 @@ void row_sample(Device& d, const float* values, size_t rows, size_t count, size_
 // exp((value - the token's value) * inverse temperature). `sample_at` holds the inverse temperature's float bits in word 0
 // (the draw's: see row_sample_chunks). A sum that overflows (a token drawn at a probability below e^-88: none is) or a token
 // outside the row gives 0.
-__global__ void row_draw_sum_chunks(const float* values, size_t count, const int32_t* chosen, const uint32_t* sample_at, float* sums) {
+__global__ void row_draw_sum_chunks(const float* values, size_t count, const int32_t* chosen, const uint32_t* sample_at, float* sums) { SD_KERNEL_ACQUIRE;
     const float inverse_temperature = __uint_as_float(sample_at[0]);
     const int32_t token = chosen[0];
     const float best = token >= 0 && size_t(token) < count ? values[token] : 0.0f;
@@ -442,7 +442,7 @@ __global__ void row_draw_sum_chunks(const float* values, size_t count, const int
     }
     if (threadIdx.x == 0) sums[blockIdx.x] = shared[0];
 }
-__global__ void row_draw_probability_finish(const float* sums, size_t count, const int32_t* chosen, float* result) {
+__global__ void row_draw_probability_finish(const float* sums, size_t count, const int32_t* chosen, float* result) { SD_KERNEL_ACQUIRE;
     if (threadIdx.x) return;
     float sum = 0.0f;
     for (unsigned i = 0; i < argmax_chunks; ++i) sum += sums[i];

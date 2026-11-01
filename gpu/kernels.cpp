@@ -4,6 +4,16 @@
 // decoded as scale * (code - 1).
 #include "straydog_gpu.h"
 #if defined(__HIPCC__)
+#define SD_KERNEL_ACQUIRE __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent")
+#else
+#define SD_KERNEL_ACQUIRE (void)0
+#endif
+#if defined(__HIPCC__)
+#include <dlfcn.h>
+#include <hsa/hsa.h>
+#include <hsa/hsa_ven_amd_loader.h>
+#endif
+#if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hipblas/hipblas.h>
@@ -163,10 +173,14 @@ struct GemvItem { Matrix matrix; uint32_t first_wave, lanes; };
 // Allocations carry a small tail so aligned word loads of two-byte-aligned
 // quant blocks never cross the end of an owned buffer.
 constexpr size_t allocation_tail = 64;
+struct DirectPacket { uint16_t header, setup, wx, wy, wz, pad0; uint32_t gx, gy, gz, priv, group; uint64_t object; uint64_t args; uint64_t pad1; uint64_t signal; };
+static_assert(sizeof(DirectPacket)==64);
 struct CachedGraph {
     hipGraph_t graph=nullptr;
     hipGraphExec_t executable=nullptr;
     std::vector<void*> dependencies;
+    std::vector<DirectPacket> direct;
+    int direct_state=0;
 };
 struct ResidentMoe {
     std::vector<Matrix> weights;
@@ -436,6 +450,9 @@ struct Device {
     bool expert_prefill = false;
     // Decode work is captured and replayed as graphs: RDNA4 (HIP) and every CUDA device.
     bool graph_capture = false;
+    void* direct_queue = nullptr;
+    int direct_mode = -1;
+    std::unordered_map<uint64_t,bool> direct_fenced;
     // Partially resident decode launches each layer's graph before the previous layer's
     // CPU result exists; the graph waits for it on the GPU (hybrid_await).
     bool hybrid_prelaunch = false;
@@ -903,7 +920,7 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
 template<int P=1>
 __global__ void write_attention_kv(float* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
-                                   float* mirror=nullptr, size_t mirror_rows=0) {
+                                   float* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
     constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
     if (position) base=*position;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2958,7 +2975,7 @@ int sd_graph_run(void* handle, uint64_t key) {
         auto& value = device(handle);
         const auto found = value.graphs.find(op_graph_key(key));
         if (found == value.graphs.end()) return 1;
-        check(hipGraphLaunch(found->second.executable, value.stream));
+        graph_launch(value, found->second);
         ++value.graph_replays;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

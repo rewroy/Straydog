@@ -26,7 +26,7 @@ __device__ __forceinline__ void route_best(float& value, int& index) {
 }
 // Token t reads scores + t*row_stride and mix[t*mix_stride] (defaults: packed rows).
 __global__ void resident_route(const float* scores,const float* mix,size_t experts,
-                               int32_t* selected,float* probabilities,size_t row_stride=0,size_t mix_stride=1) {
+                               int32_t* selected,float* probabilities,size_t row_stride=0,size_t mix_stride=1) { SD_KERNEL_ACQUIRE;
     const size_t token=blockIdx.x,lane=threadIdx.x%32,wave=threadIdx.x/32;
     if (!row_stride) row_stride=experts;
     __shared__ RouteCandidate candidates[8*10];
@@ -126,7 +126,7 @@ __device__ __forceinline__ Matrix expert_matrix(const MoeGroup* groups,const int
 // blockIdx.y selects a token: its routes, its input row and its output block.
 __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
                                      ExpertGemv plan,const float* input,float* output,
-                                     size_t input_stride=0,size_t output_stride=0) {
+                                     size_t input_stride=0,size_t output_stride=0) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
     expert_row_stage(plan);
@@ -146,7 +146,7 @@ __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selec
 template<int routed>
 __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
                                                                  ExpertGemv plan,const float* input,float* output,
-                                                                 size_t input_stride,size_t output_stride) {
+                                                                 size_t input_stride,size_t output_stride) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
     expert_row_stage(plan);
@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup*
 template<int routed>
 __global__ void __launch_bounds__(256) resident_expert_pairs(const MoeGroup* groups,const int32_t* selected,unsigned waves_per_route,
                                                              unsigned lanes,const float* input,size_t input_stride,const float* gate_up,
-                                                             float* product,size_t shared_cols) {
+                                                             float* product,size_t shared_cols) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32, token=blockIdx.y;
     selected+=token*10; input+=token*input_stride;
     const float* own=gate_up+token*11*1280; float* products=product+token*11*640;

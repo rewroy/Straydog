@@ -43,7 +43,7 @@ __device__ void qsa_normalize_block(const float* source, const float* norm, size
     target[head*width+column]=qsa_rope(own,partner,column,position);
 }
 __global__ void qsa_normalize_decode(const float* qgate, const float* key, float* iq, const float* qnorm, const float* knorm,
-                                     const float* iqnorm, float* target, const uint32_t* position) {
+                                     const float* iqnorm, float* target, const uint32_t* position) { SD_KERNEL_ACQUIRE;
     const size_t block=blockIdx.x, pos=*position;
     if (block<24) qsa_normalize_block(qgate,qnorm,block,256,512,pos,target,256);
     else if (block<26) qsa_normalize_block(key,knorm,block-24,256,256,pos,target+6144,256);
@@ -88,7 +88,7 @@ __global__ void qsa_save_history(const float* incoming, size_t base, size_t step
 
 __global__ void qsa_block_scores(const float* queries, const float* blocks, size_t pool,
                                  size_t base, size_t steps, float* scores, const uint32_t* dynamic_position=nullptr,
-                                 size_t query_stride=512) {
+                                 size_t query_stride=512) { SD_KERNEL_ACQUIRE;
     if (dynamic_position) base=*dynamic_position;
     const size_t token=blockIdx.y, block=size_t(blockIdx.x)*256+threadIdx.x;
     const size_t complete=(base+token+1)/4;
@@ -255,7 +255,7 @@ __device__ inline unsigned qsa_ballot(bool predicate) {
 constexpr unsigned qsa_select_run = 64;
 template <unsigned threads, int P = 1>
 __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, size_t pool, size_t base, size_t steps,
-                                                          size_t selected, float* packed, const uint32_t* dynamic_position = nullptr) {
+                                                          size_t selected, float* packed, const uint32_t* dynamic_position = nullptr) { SD_KERNEL_ACQUIRE;
     if (dynamic_position) base = *dynamic_position;
     constexpr unsigned waves = threads / 32;
     const size_t token = blockIdx.x, position = base + token, complete = (position + 1) / 4;
@@ -353,7 +353,7 @@ void qsa_index_chunk(Device& d, const float* queries, const float* blocks, size_
     else qsa_select_rows<1024, P><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
 }
 
-__global__ void qsa_gate(float* output, const float* query_gate, size_t count) {
+__global__ void qsa_gate(float* output, const float* query_gate, size_t count) { SD_KERNEL_ACQUIRE;
     const size_t i=size_t(blockIdx.x)*256+threadIdx.x;
     if (i<count) output[i]*=hc_sigmoid(query_gate[(i/256)*512+256+i%256]);
 }

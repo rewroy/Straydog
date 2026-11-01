@@ -472,7 +472,7 @@ __device__ __forceinline__ void slot_gate_up_rows(const SlotExperts& plan, const
 }
 template<int kind>
 __global__ void slot_gate_up(SlotExperts plan, const uint64_t* bases, const float* input, size_t input_stride,
-                             const float* weights, float* product) {
+                             const float* weights, float* product) { SD_KERNEL_ACQUIRE;
     slot_gate_up_rows<kind>(plan, bases, input, input_stride, weights, product, nullptr);
 }
 // slot_gate_up whose product is this device's part (its columns) of a part link's sum: each value
@@ -513,7 +513,7 @@ __device__ __forceinline__ void slot_down_rows(const SlotExperts& plan, const ui
     if (peer) link_send(peer + (target - out), value);
 }
 template<int kind>
-__global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) {
+__global__ void slot_down(SlotExperts plan, const uint64_t* bases, const float* product, float* out, size_t out_stride) { SD_KERNEL_ACQUIRE;
     slot_down_rows<kind>(plan, bases, product, out, out_stride, nullptr);
 }
 // slot_down of IQ1_M for several tokens, two rows to a lane group (`waves` of them): a lane's unit of both rows is dotted with the activations it

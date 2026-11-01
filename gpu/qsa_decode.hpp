@@ -1,7 +1,7 @@
 // Single-token QSA uses a GPU position scalar, so a replayed decoder graph
 // advances causal state without rebuilding host kernel arguments each token.
 __global__ void qsa_pool_one(const float* incoming,const float* norm,size_t pool,
-                             const uint32_t* position,float* blocks,float* history) {
+                             const uint32_t* position,float* blocks,float* history) { SD_KERNEL_ACQUIRE;
     const size_t column=threadIdx.x,pos=*position;
     history[(pos%qsa_history)*128+column]=incoming[column];
     if ((pos+1)%4) return;
@@ -84,7 +84,7 @@ __device__ void qsa_pool_rows_block(const float* incoming,size_t stride,const fl
 template<int P=1>
 __global__ void qsa_normalize_rows(float* projections,size_t stride,const float* qnorm,const float* knorm,const float* iqnorm,
                                    float* target,size_t steps,const uint32_t* positions,float* state,size_t context,float* mirror,
-                                   size_t mirror_rows,const float* pool_norm,size_t pool,float* blocks,float* history) {
+                                   size_t mirror_rows,const float* pool_norm,size_t pool,float* blocks,float* history) { SD_KERNEL_ACQUIRE;
     using H=QwenHeads<P>;
     constexpr size_t keys=H::query*512, values=keys+H::kv*256, index=keys+H::kv*512;
     const size_t block=blockIdx.x,row=blockIdx.y,pos=positions[row];

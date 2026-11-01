@@ -2,7 +2,7 @@
 namespace {
 __global__ void dspark_features(const float* hidden, const uint16_t* w1, const int32_t* tokens,
                                 size_t slot, size_t vocabulary, size_t rank, size_t width,
-                                uint32_t anchor, const int32_t* anchor_at, float* features) {
+                                uint32_t anchor, const int32_t* anchor_at, float* features) { SD_KERNEL_ACQUIRE;
     const size_t col = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col < width) features[col] = hidden[slot * width + col];
     else if (col < width + rank) {
@@ -14,12 +14,12 @@ __global__ void dspark_features(const float* hidden, const uint16_t* w1, const i
 }
 // out += the body's logits, which lie in two parts: the columns below `split` in `body`, the others in `tail`
 // (rows of count - split): the devices that computed the logits' columns apart each have their own rows.
-__global__ void dspark_add_kernel(const float* body, const float* tail, size_t split, size_t count, float* out) {
+__global__ void dspark_add_kernel(const float* body, const float* tail, size_t split, size_t count, float* out) { SD_KERNEL_ACQUIRE;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index < count) out[index] += index < split ? body[index] : tail[index - split];
 }
 __global__ void dspark_finish(const int32_t* tokens, float* confidences, size_t slots, size_t vocabulary,
-                              float threshold, size_t minimum, uint32_t* count) {
+                              float threshold, size_t minimum, uint32_t* count) { SD_KERNEL_ACQUIRE;
     if (threadIdx.x != 0) return;
     uint32_t kept = 0;
     bool live = true;

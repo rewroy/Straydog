@@ -94,7 +94,7 @@ __global__ void gemv_norm_tail_kind(FixedGemv list, const float* input, float* o
 #if defined(__HIPCC__)
 // gemv_norm_tail_kind on the Q8 kernels' rows (gemv_q8_input: one input staged once), the same tail.
 template<int kind>
-__global__ void __launch_bounds__(256) gemv_norm_tail_q8(FixedGemv list, const float* input, float* output, NormTail tail) {
+__global__ void __launch_bounds__(256) gemv_norm_tail_q8(FixedGemv list, const float* input, float* output, NormTail tail) { SD_KERNEL_ACQUIRE;
     __shared__ float sums[256];
     __shared__ bool last;
     const GemvQ8Input in = gemv_q8_stage_list<kind, 1>(list, input);
@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(256) gemv_norm_tail_q8(FixedGemv list, const f
 #endif
 
 template<int kind>
-__global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* output) {
+__global__ void gemv_prologue_kind(FixedGemv list, GemvPrologue pro, float* output) { SD_KERNEL_ACQUIRE;
     extern __shared__ __align__(16) float cached[];
     __shared__ float sums[256];
     __shared__ float total;

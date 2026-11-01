@@ -1,6 +1,6 @@
 // Decode spans keep the residual streams on device across contiguous layers.
 // PLE remains at its existing CPU/GPU boundary between layers zero and one.
-__global__ void decoder_residual(float* hidden,const float* mixed,const float* branch) {
+__global__ void decoder_residual(float* hidden,const float* mixed,const float* branch) { SD_KERNEL_ACQUIRE;
     const size_t index=size_t(blockIdx.x)*256+threadIdx.x;
     if (index<10240) hidden[index]+=mixed[2560+index/2560]*branch[index%2560];
 }

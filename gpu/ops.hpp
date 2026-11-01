@@ -53,7 +53,7 @@ __device__ inline void op_rms_norm_row(const float* row, const float* weight, si
     const float scale = rsqrtf(total / float(width) + eps);
     for (size_t col = threadIdx.x; col < width; col += blockDim.x) out[col] = row[col] * scale * weight[col];
 }
-__global__ void op_rms_norm_kernel(const float* input, const float* weight, size_t width, float eps, float* output) {
+__global__ void op_rms_norm_kernel(const float* input, const float* weight, size_t width, float eps, float* output) { SD_KERNEL_ACQUIRE;
     __shared__ float sums[256];
     op_rms_norm_row(input + size_t(blockIdx.x) * width, weight, width, eps, output + size_t(blockIdx.x) * width, sums);
 }
@@ -105,7 +105,7 @@ __global__ void op_norm_rope_kernel(const float* input, const float* weight, siz
 // Rotate the last 2 * pairs values of each vector (adjacent pairs) by position * frequency; the
 // angle is formed in double so long positions keep their precision.
 __global__ void op_rope_kernel(float* x, size_t count, size_t vectors, size_t width, size_t pairs, const int32_t* positions,
-                               const float* frequencies, int inverse) {
+                               const float* frequencies, int inverse) { SD_KERNEL_ACQUIRE;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
     const size_t row = index / (vectors * pairs), rest = index % (vectors * pairs);
@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
                                   float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
                                   float eps, float norm_eps, const float* collapse, const float* norm_weight, size_t width,
                                   unsigned* counters, float* partial, float* pre, float* post, float* comb, float* out,
-                                  PartRead link) {
+                                  PartRead link) { SD_KERNEL_ACQUIRE;
     constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
     const size_t row = blockIdx.y, block = blockIdx.x, blocks = gridDim.x;
     // A prvalue: std::min binds a reference, and CUDA device code cannot ODR-use the namespace constant.
@@ -612,7 +612,7 @@ size_t hc_step_row_values(size_t hc, size_t width) {
 // A DSpark target feature: each row's hc copies summed in order, ((x0 + x1) + x2) + x3, over hc, from
 // row `skip` on, row r (of `rows`) into out + (r - skip) * stride + offset.
 __global__ void op_hc_mean_kernel(const float* stream, size_t rows, size_t hc, size_t width, size_t skip, float* out, size_t stride,
-                                  size_t offset) {
+                                  size_t offset) { SD_KERNEL_ACQUIRE;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * width) return;
     const size_t row = index / width, col = index % width;
@@ -622,7 +622,7 @@ __global__ void op_hc_mean_kernel(const float* stream, size_t rows, size_t hc, s
     for (size_t copy = 1; copy < hc; ++copy) sum += at[copy * width];
     out[(row - skip) * stride + offset + col] = sum / float(hc);
 }
-__global__ void op_hc_collapse_kernel(const float* stream, const float* pre, size_t rows, size_t hc, size_t width, float* out) {
+__global__ void op_hc_collapse_kernel(const float* stream, const float* pre, size_t rows, size_t hc, size_t width, float* out) { SD_KERNEL_ACQUIRE;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * width) return;
     const size_t row = index / width, col = index % width;
@@ -633,7 +633,7 @@ __global__ void op_hc_collapse_kernel(const float* stream, const float* pre, siz
 
 // out[t][j][d] = post[t][j] x[t][d] + sum_i comb[t][i][j] residual[t][i][d]
 __global__ void op_hc_expand_kernel(const float* x, const float* residual, const float* post, const float* comb,
-                                    size_t rows, size_t hc, size_t width, float* out) {
+                                    size_t rows, size_t hc, size_t width, float* out) { SD_KERNEL_ACQUIRE;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * hc * width) return;
     const size_t row = index / (hc * width), j = (index / width) % hc, col = index % width;
@@ -938,7 +938,7 @@ __device__ void gemv_routed_f32_rows(const Matrix& m, size_t first_row, unsigned
     if (sub == 0 && row < m.rows) gemv_store(m, row, 0, total, output, output_stride, residual);
 }
 template<int kind, int V>
-__global__ void gemv_routed_kind(FixedGemv list, const float* input, float* output, RouteTail tail) {
+__global__ void gemv_routed_kind(FixedGemv list, const float* input, float* output, RouteTail tail) { SD_KERNEL_ACQUIRE;
     extern __shared__ float scores[];
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     const GemvItem& item = list.items[0];
@@ -1284,7 +1284,7 @@ __global__ void __launch_bounds__(256) op_attention_scores_kernel(
 __global__ void __launch_bounds__(256) op_attention_scores_half_kernel(
         const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
         const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const double2* forward,
-        size_t stride, float* scores, float2* partial) {
+        size_t stride, float* scores, float2* partial) { SD_KERNEL_ACQUIRE;
 #if defined(__gfx1200__) || defined(__gfx1201__)
     const size_t row = blockIdx.y, head0 = size_t(blockIdx.z) * attention_heads, chunks = gridDim.x;
     const int64_t p = positions[row];
@@ -1386,7 +1386,7 @@ __global__ void __launch_bounds__(128) op_attention_output_kernel(
         const float* scores, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
         size_t window, const float* compressed, const int32_t* selected, size_t selections, const float* sinks, size_t heads,
         size_t dim, size_t pairs, const double2* inverse, size_t stride, size_t shares, size_t share_keys, float* sums,
-        float* head_denominators, float* out, unsigned* tiles) {
+        float* head_denominators, float* out, unsigned* tiles) { SD_KERNEL_ACQUIRE;
     const size_t row = blockIdx.z / shares, share = blockIdx.z % shares;
     const size_t head0 = size_t(blockIdx.y) * attention_out_heads, d0 = size_t(blockIdx.x) * 64;
     const int64_t p = positions[row];

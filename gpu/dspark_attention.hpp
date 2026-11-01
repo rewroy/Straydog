@@ -8,7 +8,7 @@ namespace {
 constexpr size_t dspark_dim = 512, dspark_ring_rows = 128;
 __global__ void __launch_bounds__(256) dspark_attention_kernel(const float* q, const float* ring, const float* block,
                                                                const float* sinks, size_t heads, size_t slots, uint32_t anchor,
-                                                               const int32_t* anchor_at, size_t window, float scale, float* out) {
+                                                               const int32_t* anchor_at, size_t window, float scale, float* out) { SD_KERNEL_ACQUIRE;
     const size_t row = blockIdx.x / heads, head = blockIdx.x % heads;
     const int64_t p = int64_t(anchor_at ? anchor_at[0] : int32_t(anchor)) - 1;
     const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
