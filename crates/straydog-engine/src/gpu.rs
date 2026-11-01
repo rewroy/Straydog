@@ -12,6 +12,19 @@ use straydog_gpu::ffi;
 
 use crate::formats;
 
+/// What a drafter's head says of its row: its most likely token and that token's probability, or, asked for its `top`, those
+/// logits and tokens, most likely first (the probability then 1: the host draws the draft from them).
+pub struct Draft {
+    pub token: i32,
+    pub confidence: f32,
+    pub top: Vec<(f32, u32)>,
+}
+
+/// A row's `top` pairs as a head returns them: its `top` values, then their tokens as the bits of the same words.
+fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
+    row[..top].iter().zip(&row[top..]).map(|(&logit, &token)| (logit, token.to_bits())).collect()
+}
+
 pub type Result<T> = std::result::Result<T, String>;
 /// A head's rows: each row's first maximum, its logits and its probability when asked.
 /// A verification head's rows for drawing the next tokens: every logit, or (`Top`) each row's greatest logits with their
@@ -1412,10 +1425,7 @@ impl Backend {
             }
         })?;
         let scores = if top > 0 {
-            // (a row: its `top` values, then their tokens as the bits of the same words)
-            Some(Scores::Top(best.chunks_exact(2 * top)
-                .map(|row| row[..top].iter().zip(&row[top..]).map(|(&logit, &token)| (logit, token.to_bits())).collect())
-                .collect()))
+            Some(Scores::Top(best.chunks_exact(2 * top).map(|row| top_pairs(row, top)).collect()))
         } else {
             scores.map(Scores::Logits)
         };
@@ -1449,7 +1459,7 @@ impl Backend {
     /// `previous` rows the layer's last step left in its workspace. The head's token and its probability come back.
     #[allow(clippy::too_many_arguments)]
     pub fn draft_step(&mut self, operands: &[Operand], layer: usize, position: u64, embeddings: &[f32], hidden: Option<&[f32]>,
-                      previous: u64, split: Option<(u64, *mut c_void)>) -> Result<Option<(i32, f32)>> {
+                      previous: u64, split: Option<(u64, *mut c_void)>, top: usize) -> Result<Option<Draft>> {
         let steps = hidden.map_or(1, |hidden| hidden.len() / WIDTH);
         let head = operands.len() == 8;
         let vocabulary = operands.get(7).map_or(0, |operand| operand.rows);
@@ -1465,19 +1475,21 @@ impl Backend {
         let (pointers, kinds) = self.operands(operands)?;
         let (mut token, mut confidence) = (0i32, 0f32);
         let (split, peer) = split.map_or((0, std::ptr::null_mut()), |(split, peer)| (split, peer));
-        // SAFETY: four operands of the prologue and, with a head, four of the head; `steps` rows of each array.
+        let top = if head { top } else { 0 };
+        let mut best = vec![0f32; 2 * top];
+        // SAFETY: four operands of the prologue and, with a head, four of the head; `steps` rows of each array; `top` pairs.
         check(unsafe {
             ffi::sd_draft_step(self.handle, pointers.as_ptr(), kinds.as_ptr(), layer as u64, position, steps as u64,
                                embeddings.as_ptr(), hidden.map_or(std::ptr::null(), <[f32]>::as_ptr), previous,
                                if head { pointers[4..].as_ptr() } else { std::ptr::null() },
                                if head { kinds[4..].as_ptr() } else { std::ptr::null() }, vocabulary, split, peer,
-                               &mut token, &mut confidence)
+                               &mut token, &mut confidence, top as u64, best.as_mut_ptr())
         })?;
         if !head {
             return Ok(None);
         }
         Self::finite(&[confidence], "draft probability")?;
-        Ok(Some((token, confidence)))
+        Ok(Some(Draft { token, confidence, top: top_pairs(&best, top) }))
     }
 
     /// [`Backend::draft_step`]'s prologue and MTP layer (`operands`: the prologue's four) queued with nothing waited for, on a
@@ -1503,8 +1515,8 @@ impl Backend {
 
     /// The head (`operands`: its four) on row `row` of the rows [`Backend::draft_queue`] left in `layer`'s workspace: the
     /// draft's token and its probability.
-    pub fn draft_head(&mut self, operands: &[Operand], layer: usize, row: u64, split: Option<(u64, *mut c_void)>)
-                      -> Result<(i32, f32)> {
+    pub fn draft_head(&mut self, operands: &[Operand], layer: usize, row: u64, split: Option<(u64, *mut c_void)>, top: usize)
+                      -> Result<Draft> {
         let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
         if operands.len() != 4 || operands[3].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
             || row >= VERIFY_MAX as u64 || split.is_some_and(|(split, _)| split == 0 || split >= vocabulary)
@@ -1514,13 +1526,14 @@ impl Backend {
         let (pointers, kinds) = self.operands(operands)?;
         let (mut token, mut confidence) = (0i32, 0f32);
         let (split, peer) = split.map_or((0, std::ptr::null_mut()), |(split, peer)| (split, peer));
-        // SAFETY: the head's four operands; one token and probability out.
+        let mut best = vec![0f32; 2 * top];
+        // SAFETY: the head's four operands; one token and probability out, `top` pairs.
         check(unsafe {
             ffi::sd_draft_head(self.handle, pointers.as_ptr(), kinds.as_ptr(), layer as u64, row, vocabulary, split, peer,
-                               &mut token, &mut confidence)
+                               &mut token, &mut confidence, top as u64, best.as_mut_ptr())
         })?;
         Self::finite(&[confidence], "draft probability")?;
-        Ok((token, confidence))
+        Ok(Draft { token, confidence, top: top_pairs(&best, top) })
     }
 
     /// A draft's vocabulary when the head is split (see `sd_draft_vocabulary`): `head`'s rows [0, rows) and the rows of `tokens`

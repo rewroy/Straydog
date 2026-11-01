@@ -557,7 +557,9 @@ __global__ void __launch_bounds__(256) row_top_finish(const float* chunk_values,
               reinterpret_cast<uint32_t*>(out + top));
 }
 // The two halves' `top` pairs of each row (the peer's rows [0, split), this device's from split on) as one row's: one wave.
-__global__ void __launch_bounds__(32) head_top_merge(const float* own, const float* peer, uint32_t split, unsigned top, float* result) {
+// (this device's rows are the head's from `first`, then the tokens of `extra_tokens`, a draft's vocabulary)
+__global__ void __launch_bounds__(32) head_top_merge(const float* own, const float* peer, uint32_t first, uint32_t own_rows, const int32_t* extra_tokens,
+                                                     unsigned top, float* result) {
     const size_t row = blockIdx.x;
     const float* low = peer + row * 2 * top; const float* high = own + row * 2 * top;
     float held[head_top_held]; uint32_t at[head_top_held];
@@ -566,7 +568,10 @@ __global__ void __launch_bounds__(32) head_top_merge(const float* own, const flo
         const size_t index = threadIdx.x + size_t(i) * 32;
         held[i] = -INFINITY; at[i] = ~0u;
         if (index < top) { held[i] = low[index]; at[i] = __float_as_uint(low[top + index]); }
-        else if (index < 2 * size_t(top)) { held[i] = high[index - top]; at[i] = __float_as_uint(high[index]) + split; }
+        else if (index < 2 * size_t(top)) {
+            const uint32_t row_at = __float_as_uint(high[index]);
+            held[i] = high[index - top]; at[i] = row_at < own_rows ? row_at + first : uint32_t(extra_tokens[row_at - own_rows]);
+        }
     }
     float* out = result + row * 2 * top;
     top_wave(held, at, top, out, reinterpret_cast<uint32_t*>(out + top));
@@ -669,7 +674,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     Device* peer = d.link.peer;
     if (!rows_of.end) rows_of = {split, split, vocabulary};
     if (rows_of.low > split || !rows_of.low || rows_of.first >= rows_of.end || rows_of.end > vocabulary ||
-        ((logits || top_count) && (rows_of.low != split || rows_of.first != split || rows_of.end != vocabulary || rows_of.extra_count)) ||
+        (logits && (rows_of.low != split || rows_of.first != split || rows_of.end != vocabulary || rows_of.extra_count)) ||
         (rows_of.extra_count && (!rows_of.extras || !rows_of.extra_tokens)))
         throw std::runtime_error("invalid Straydog split output head rows");
     const size_t low_rows = rows_of.low, high_rows = rows_of.end - rows_of.first, own_rows = high_rows + rows_of.extra_count;
@@ -717,7 +722,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         // (its rows' tops at 64 instead of its logits: a few pairs a row over the link)
         if (top_count) {
             float* ranked = scratch + 2 * verify_max * argmax_chunks + verify_max;
-            row_top(h, h.output, steps, split, split, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+            row_top(h, h.output, steps, low_rows, low_rows, top_count, ranked + verify_max * 2 * head_top_max, ranked);
             peer_copy<<<1, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, ranked, 1, steps * 2 * top_count, 0);
         }
         peer_signal_peer(h);
@@ -738,8 +743,9 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     float* ranked = top + 4 * verify_max;
     float* merged = ranked + head_top_floats;
     if (top_count) {
-        row_top(d, d.output, steps, vocabulary - split, vocabulary - split, top_count, ranked + verify_max * 2 * head_top_max, ranked);
-        head_top_merge<<<unsigned(steps), 32, 0, d.stream>>>(ranked, received + 64, uint32_t(split), top_count, merged);
+        row_top(d, d.output, steps, own_rows, own_rows, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+        head_top_merge<<<unsigned(steps), 32, 0, d.stream>>>(ranked, received + 64, uint32_t(rows_of.first), uint32_t(high_rows), rows_of.extra_tokens,
+                                                             top_count, merged);
     }
     check(hipGetLastError());
     // (finish_with_helper's waits with the read-back's: both links' counters ride along, the peer's queued after its part, where
@@ -855,10 +861,11 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     mtp_prologue_device(d, mtp, mtp_kinds, steps);
     return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
 }
-// The vocabulary head on a draft's row `last` (on this device), its token and probability back.
+// The vocabulary head on a draft's row `last` (on this device), its token and probability back; with `top`, instead of the
+// probability, the row's `top` greatest logits and their tokens for the host to draw the draft from (sampling::accept_top_drawn).
 void draft_head(Device& d, void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
-                const float* last, bool parts, int32_t* token, float* confidence) {
-    if (!head || !head_kinds || !token || !confidence) throw std::runtime_error("invalid drafting step");
+                const float* last, bool parts, int32_t* token, float* confidence, unsigned top = 0, float* best = nullptr) {
+    if (!head || !head_kinds || !token || !confidence || (top && !best)) throw std::runtime_error("invalid drafting step");
     int32_t token_row[verify_max];
     float confidence_row[verify_max];
     // (a draft's vocabulary, sd_draft_vocabulary: the extra tokens' rows here, the head's first rows split so that both devices
@@ -868,10 +875,12 @@ void draft_head(Device& d, void* const* head, const int* head_kinds, size_t voca
         const size_t low = std::min({split, (d.draft_rows + d.draft_extra_count) / 2, d.draft_rows - 1});
         rows_of = {low, low, d.draft_rows, d.draft_extra_count, d.draft_extras, d.draft_extra_tokens};
     }
-    if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, confidence_row, last,
-                                 0, nullptr, nullptr, rows_of);
+    float* probability = top ? nullptr : confidence_row;
+    confidence_row[0] = 1;
+    if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, probability, last,
+                                 top, best, nullptr, rows_of);
     else {
-        output_head(d, head, head_kinds, 1, vocabulary, nullptr, token_row, nullptr, confidence_row, last);
+        output_head(d, head, head_kinds, 1, vocabulary, nullptr, token_row, nullptr, probability, last, top, best);
         if (parts) finish_with_helper(d);
     }
     *token = token_row[0]; *confidence = confidence_row[0];
@@ -881,7 +890,7 @@ void draft_head(Device& d, void* const* head, const int* head_kinds, size_t voca
 void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer, size_t position, size_t steps,
                 const float* embeddings, const float* hidden, size_t previous,
                 void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
-                int32_t* token, float* confidence) {
+                int32_t* token, float* confidence, unsigned top = 0, float* best = nullptr) {
     if (head && (!head_kinds || !token || !confidence)) throw std::runtime_error("invalid drafting step");
     bool parts = false;
     float* output = draft_queue(d, mtp, mtp_kinds, layer, position, steps, embeddings, hidden, previous, parts);
@@ -890,7 +899,7 @@ void draft_step(Device& d, void* const* mtp, const int* mtp_kinds, size_t layer,
         else check(hipStreamSynchronize(d.stream));
         return;
     }
-    draft_head(d, head, head_kinds, vocabulary, split, peer_head, output + (steps - 1) * 10240, parts, token, confidence);
+    draft_head(d, head, head_kinds, vocabulary, split, peer_head, output + (steps - 1) * 10240, parts, token, confidence, top, best);
 }
 
 // The PLE layer after a verification's first layer, with no wait between them: `layer`'s verified rows (still in its

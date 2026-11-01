@@ -801,8 +801,8 @@ impl Group {
     /// One drafting step on the MTP layer's device, or on both when it is in parts (see [`Backend::draft_step`],
     /// [`Backend::draft_queue`]): the prologue's four operands, then the head's four when a token is wanted. The head's lower
     /// half of the vocabulary runs on the first GPU, as in [`Group::output_head`].
-    pub fn draft_step(&mut self, operands: &[Operand], position: u64, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64)
-                      -> Result<Option<(i32, f32)>> {
+    pub fn draft_step(&mut self, operands: &[Operand], position: u64, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, top: usize)
+                      -> Result<Option<crate::gpu::Draft>> {
         let last = self.backends.len() - 1;
         let lower = if operands.len() == 8 { self.pin_head(&operands[7])? } else { None };
         if self.mtp_parts {
@@ -812,12 +812,12 @@ impl Group {
                          |backend| backend.draft_queue(prologue, 48, position, embeddings, hidden, previous))?;
             if operands.len() == 8 {
                 let steps = hidden.map_or(1, |hidden| hidden.len() / crate::gpu::WIDTH) as u64;
-                return self.backends[last].draft_head(&operands[4..], 48, steps - 1, lower).map(Some);
+                return self.backends[last].draft_head(&operands[4..], 48, steps - 1, lower, top).map(Some);
             }
             crate::gpu::parts_settle(&self.backends[0], &self.backends[1])?;
             return Ok(None);
         }
-        self.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, lower)
+        self.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, lower, top)
     }
 
     /// A draft's vocabulary on the MTP layer's device when the head is split across the GPUs (see
