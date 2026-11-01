@@ -179,6 +179,7 @@ struct ResidentMoe {
     const uint8_t* host[3]{};
     size_t host_bytes[3]{};
     std::vector<int32_t> slot_of;
+    uint8_t slot_group=0;   // the slots its experts take (expert_slots_carve)
     std::vector<double> usage;
     const uint8_t* mapped[3]{};   // device view of page-locked host banks (zero-copy assist)
     std::vector<uint32_t> host_read;   // the token each expert was last read on the host (hybrid_host_experts)
@@ -236,7 +237,10 @@ private:
 struct ExpertSlots {
     uint8_t* base=nullptr;
     uint8_t* host=nullptr;   // page-locked mirror of the staging slots: prefill gathers absent experts here
-    size_t cache=0, stage=0, bytes=0;
+    size_t cache=0, stage=0, bytes=0;   // slots, staging slots, a staging slot's bytes
+    size_t arena=0;                     // the slots' bytes, all before the staging slots
+    std::vector<size_t> at;             // a slot's offset from base: an expert takes its own layer's size
+    std::vector<uint8_t> group;         // and only a slot of its size group
     std::vector<std::pair<ResidentMoe*,int32_t>> owner;
     std::vector<size_t> pending;   // decode swaps still loading on the copy stream
 };
@@ -2448,6 +2452,42 @@ int sd_kv_scratch(void* handle, void** scratch) {
         if (!scratch) throw std::runtime_error("invalid Straydog K/V scratch request");
         *scratch = nullptr;
         for (const auto& entry : d.decoder) if (entry.second.states[2]) *scratch = entry.second.states[2];
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// A long prompt's batches: the experts' and the decoder's workspaces of `capacity` rows in place of what they were, every plan following.
+// Between requests' work: the caller has given the slots' VRAM up (release_expert_slots, restore at 0) and takes it back after.
+int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint64_t decoder_bytes, void** moe, void** decoder) {
+    try {
+        auto& d = device(handle);
+        if (!capacity || capacity > 4096 || !moe_bytes || !decoder_bytes || !moe || !decoder) throw std::runtime_error("invalid Straydog prefill buffers");
+        check(hipStreamSynchronize(d.stream));
+        if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
+        kv_clear_graphs(d);
+        void* old_moe = nullptr; void* old_decoder = nullptr;
+        for (const auto& entry : d.resident) {
+            if (!entry.second->hybrid) throw std::runtime_error("prefill buffers are for partially resident models");
+            old_moe = entry.second->workspace;
+        }
+        for (const auto& entry : d.decoder) old_decoder = entry.second.workspace;
+        if (!old_moe || !old_decoder) throw std::runtime_error("invalid Straydog prefill buffers");
+        const auto forget = [](std::vector<void*>& list, void* pointer) { list.erase(std::remove(list.begin(), list.end(), pointer), list.end()); };
+        for (auto& entry : d.resident) { forget(entry.second->dependencies, old_moe); entry.second->workspace = nullptr; }
+        for (auto& entry : d.decoder) { forget(entry.second.dependencies, old_moe); forget(entry.second.dependencies, old_decoder); entry.second.workspace = nullptr; }
+        if (sd_release(handle, old_moe) || sd_release(handle, old_decoder)) throw std::runtime_error(last_error);
+        void* new_moe = allocate(d, moe_bytes);
+        void* new_decoder = allocate(d, decoder_bytes);
+        for (auto& entry : d.resident) {
+            entry.second->workspace = static_cast<float*>(new_moe); entry.second->capacity = size_t(capacity);
+            entry.second->dependencies.push_back(new_moe);
+        }
+        for (auto& entry : d.decoder) {
+            entry.second.workspace = static_cast<float*>(new_decoder); entry.second.capacity = size_t(capacity);
+            entry.second.dependencies.push_back(new_decoder);
+            entry.second.dependencies.push_back(new_moe);
+        }
+        *moe = new_moe; *decoder = new_decoder;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

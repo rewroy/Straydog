@@ -774,6 +774,18 @@ impl Group {
     }
 
     /// Each device's host K/V grown to `capacity` positions, `valid` kept (see [`Backend::grow_kv`]).
+    /// One device's long prompt: the rows its batches may take (see [`Backend::begin_long_prefill`]), None with more devices than one.
+    pub fn begin_long_prefill(&mut self) -> Result<Option<u64>> {
+        match self.backends.as_mut_slice() {
+            [backend] => backend.begin_long_prefill().map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn end_long_prefill(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::end_long_prefill)
+    }
+
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv(capacity, valid))
     }

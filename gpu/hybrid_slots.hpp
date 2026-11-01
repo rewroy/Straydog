@@ -106,20 +106,51 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
     return handle;
 }
 
+// The pool in slots of the sizes its layers take. A mixed bundle's layers differ by as much as 1.8 times, and a slot of the largest size for
+// all of them holds a quarter fewer experts. Sizes within a tenth share a group, a group's slots are in proportion to its layers, and an
+// expert only replaces one of its own group, so the scores compare within a group: a layer's routes want about what another's do.
+void expert_slots_carve(Device& d, size_t arena) {
+    std::vector<std::pair<size_t, ResidentMoe*>> layers;
+    for (auto& item : d.resident) if (item.second->hybrid) layers.emplace_back(expert_slot_bytes(*item.second), item.second.get());
+    std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
+    struct Group { size_t bytes, layers; };
+    std::vector<Group> groups;
+    size_t floor_bytes = 0;
+    for (const auto& layer : layers) {
+        if (groups.empty() || layer.first > floor_bytes + floor_bytes / 10) { groups.push_back({layer.first, 0}); floor_bytes = layer.first; }
+        groups.back().bytes = (layer.first + 255) / 256 * 256;
+        ++groups.back().layers;
+        layer.second->slot_group = uint8_t(groups.size() - 1);
+    }
+    size_t weight = 0;
+    for (const Group& group : groups) weight += group.bytes * group.layers;
+    d.slots.at.clear(); d.slots.group.clear();
+    size_t at = 0;
+    for (size_t g = 0; g < groups.size() && weight; ++g) {
+        const size_t count = size_t(double(arena) * double(groups[g].layers) / double(weight));
+        for (size_t i = 0; i < count; ++i, at += groups[g].bytes) {
+            d.slots.at.push_back(at);
+            d.slots.group.push_back(uint8_t(g));
+        }
+    }
+    d.slots.arena = arena;
+    d.slots.cache = d.slots.at.size();
+    d.slots.owner.assign(d.slots.cache, {nullptr, -1});
+}
 void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_bytes) {
     if (d.slots.base || !slot_bytes || slot_bytes % 256 || stage < 2 || cache + stage > 65536)
         throw std::runtime_error("invalid Straydog expert slot pool");
     for (const auto& entry : d.resident)
         if (entry.second->hybrid && expert_slot_bytes(*entry.second) > slot_bytes)
             throw std::runtime_error("an expert does not fit the Straydog expert slot size");
-    const size_t bytes = (cache + stage) * slot_bytes;
+    const size_t bytes = (cache + stage) * slot_bytes;   // (`cache` slots of the largest size: expert_slots_carve makes more of it)
     const size_t extra = hybrid_exchange_floats * 4;
     if (bytes > d.budget - d.used || extra > d.budget - d.used - bytes)
         throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
     check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
     d.used += bytes;
-    d.slots.cache = cache; d.slots.stage = stage; d.slots.bytes = slot_bytes;
-    d.slots.owner.assign(cache, {nullptr, -1});
+    d.slots.stage = stage; d.slots.bytes = slot_bytes;
+    expert_slots_carve(d, cache * slot_bytes);
     check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
     d.used += extra;
     // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
@@ -293,7 +324,7 @@ bool hybrid_settle(Device& d, bool wait) {
     for (const size_t slot : d.slots.pending) {
         ResidentMoe* plan = d.slots.owner[slot].first;
         const size_t expert = size_t(d.slots.owner[slot].second);
-        uint8_t* base = d.slots.base + slot * d.slots.bytes;
+        uint8_t* base = d.slots.base + d.slots.at[slot];
         loaded[plan].emplace_back(expert, base);
         plan->slot_of[expert] = int32_t(slot);
         plan->weights[expert * 3].data = base;
@@ -319,9 +350,11 @@ void release_expert_slots(Device& d) {
     check(hipStreamSynchronize(d.stream));
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipFree(d.slots.base));
-    d.used -= (d.slots.cache + d.slots.stage) * d.slots.bytes;
+    d.used -= d.slots.arena + d.slots.stage * d.slots.bytes;
     d.slots.base = nullptr;
     d.slots.cache = 0;
+    d.slots.arena = 0;
+    d.slots.at.clear(); d.slots.group.clear();
     d.slots.owner.clear();
 }
 void restore_expert_slots(Device& d, size_t cache) {
@@ -330,8 +363,7 @@ void restore_expert_slots(Device& d, size_t cache) {
     if (bytes > d.budget - d.used) throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
     check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
     d.used += bytes;
-    d.slots.cache = cache;
-    d.slots.owner.assign(cache, {nullptr, -1});
+    expert_slots_carve(d, cache * d.slots.bytes);
 }
 
 // Bounded swaps (max_swaps > 0) never block the compute stream: victims are
@@ -340,40 +372,48 @@ void restore_expert_slots(Device& d, size_t cache) {
 void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     if (!d.slots.base || !hybrid_settle(d, wait)) return;
     struct Entry { ResidentMoe* plan; size_t expert; double score; };
-    std::vector<Entry> resident, candidates;
-    std::vector<size_t> free_slots;
+    const auto order = [](const Entry& a, const Entry& b) {
+        return a.score != b.score ? a.score > b.score : a.plan != b.plan ? a.plan < b.plan : a.expert < b.expert;
+    };
+    const auto weakest = [&](const Entry& a, const Entry& b) { return order(b, a); };
+    size_t group_count = 0;
+    for (const uint8_t group : d.slots.group) group_count = std::max(group_count, size_t(group) + 1);
+    std::vector<std::vector<Entry>> residents(group_count), waiting(group_count);
+    std::vector<std::vector<size_t>> free_slots(group_count);
     for (auto& item : d.resident) {
         if (!item.second->hybrid) continue;
         ResidentMoe& plan = *item.second;
         for (size_t expert = 0; expert < plan.experts; ++expert) {
-            if (plan.slot_of[expert] >= 0) resident.push_back({&plan, expert, plan.usage[expert]});
-            else if (plan.slot_of[expert] == -1 && plan.usage[expert] > 0) candidates.push_back({&plan, expert, plan.usage[expert]});
+            if (plan.slot_of[expert] >= 0) residents[plan.slot_group].push_back({&plan, expert, plan.usage[expert]});
+            else if (plan.slot_of[expert] == -1 && plan.usage[expert] > 0) waiting[plan.slot_group].push_back({&plan, expert, plan.usage[expert]});
         }
     }
-    for (size_t slot = 0; slot < d.slots.cache; ++slot) if (!d.slots.owner[slot].first) free_slots.push_back(slot);
-    auto order = [](const Entry& a, const Entry& b) {
-        return a.score != b.score ? a.score > b.score : a.plan != b.plan ? a.plan < b.plan : a.expert < b.expert;
-    };
-    // Bounded refreshes only need the strongest candidates and the weakest residents.
-    auto weakest = [&](const Entry& a, const Entry& b) { return order(b, a); };
-    if (max_swaps && candidates.size() > max_swaps) {
-        std::partial_sort(candidates.begin(), candidates.begin() + max_swaps, candidates.end(), order);
-        candidates.resize(max_swaps);
-    } else std::sort(candidates.begin(), candidates.end(), order);
-    if (max_swaps && resident.size() > max_swaps) {
-        std::partial_sort(resident.begin(), resident.begin() + max_swaps, resident.end(), weakest);
-        resident.resize(max_swaps);
-    } else std::sort(resident.begin(), resident.end(), weakest);
+    for (size_t slot = 0; slot < d.slots.cache; ++slot) if (!d.slots.owner[slot].first) free_slots[d.slots.group[slot]].push_back(slot);
+    // Bounded refreshes only need each group's strongest candidates and weakest residents.
+    std::vector<Entry> candidates;
+    for (size_t g = 0; g < group_count; ++g) {
+        if (max_swaps && waiting[g].size() > max_swaps) {
+            std::partial_sort(waiting[g].begin(), waiting[g].begin() + max_swaps, waiting[g].end(), order);
+            waiting[g].resize(max_swaps);
+        }
+        candidates.insert(candidates.end(), waiting[g].begin(), waiting[g].end());
+        if (max_swaps && residents[g].size() > max_swaps) {
+            std::partial_sort(residents[g].begin(), residents[g].begin() + max_swaps, residents[g].end(), weakest);
+            residents[g].resize(max_swaps);
+        } else std::sort(residents[g].begin(), residents[g].end(), weakest);
+    }
+    std::sort(candidates.begin(), candidates.end(), order);
     std::unordered_map<ResidentMoe*, std::vector<std::pair<size_t, const uint8_t*>>> released;
-    size_t victim = 0, next_free = 0;
+    std::vector<size_t> victim(group_count, 0), next_free(group_count, 0);
     for (const Entry& candidate : candidates) {
         if (max_swaps && d.slots.pending.size() == max_swaps) break;
+        const size_t g = candidate.plan->slot_group;
         size_t slot;
-        if (next_free < free_slots.size()) slot = free_slots[next_free++];
+        if (next_free[g] < free_slots[g].size()) slot = free_slots[g][next_free[g]++];
         else {
             // Hysteresis: replace only clearly weaker residents.
-            if (victim == resident.size() || candidate.score <= resident[victim].score * 1.25 + 0.05) break;
-            const Entry& old = resident[victim++];
+            if (victim[g] == residents[g].size() || candidate.score <= residents[g][victim[g]].score * 1.25 + 0.05) continue;
+            const Entry& old = residents[g][victim[g]++];
             slot = size_t(old.plan->slot_of[old.expert]);
             released[old.plan].emplace_back(old.expert, nullptr);
             old.plan->slot_of[old.expert] = -1;
@@ -395,7 +435,7 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     struct Copy { ResidentMoe* plan; size_t expert; uint8_t* base; };
     std::vector<Copy> copies;
     for (const size_t slot : d.slots.pending)
-        copies.push_back({d.slots.owner[slot].first, size_t(d.slots.owner[slot].second), d.slots.base + slot * d.slots.bytes});
+        copies.push_back({d.slots.owner[slot].first, size_t(d.slots.owner[slot].second), d.slots.base + d.slots.at[slot]});
     auto issue = [&d, copies]() {
         for (const Copy& copy : copies) prefetch_experts(d, *copy.plan, &copy.expert, 1);
         for (const Copy& copy : copies) copy_expert(d, *copy.plan, copy.expert, copy.base, d.copy_stream);
@@ -423,7 +463,7 @@ void hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<size_
     std::vector<uint8_t*> targets;
     for (size_t first = 0, chunk = 0; first < missing.size(); first += half, ++chunk) {
         const size_t count = std::min(half, missing.size() - first), buffer = chunk % 2;
-        uint8_t* base = d.slots.base + (d.slots.cache + buffer * half) * d.slots.bytes;
+        uint8_t* base = d.slots.base + d.slots.arena + buffer * half * d.slots.bytes;
         uint8_t* host = gather ? d.slots.host + buffer * half * d.slots.bytes : nullptr;
         if (gather) {
             // The DMA two chunks back read this mirror (its `loaded` event follows it on the copy stream).

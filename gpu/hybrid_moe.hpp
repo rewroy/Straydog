@@ -179,7 +179,7 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
     const uint8_t* stage = nullptr;
 #if !defined(__HIPCC__)
     if (plan.mapped[0] && d.assist) {
-        stage = d.slots.base + d.slots.cache * d.slots.bytes;
+        stage = d.slots.base + d.slots.arena;
         ExpertGemv copy = hybrid_assist(d, plan);
         copy.stage = stage; copy.slot_bytes = d.slots.bytes;
         hybrid_stage_assist<<<dim3(64, unsigned(rows)), 256, 0, d.stream>>>(groups, s.selected, copy);

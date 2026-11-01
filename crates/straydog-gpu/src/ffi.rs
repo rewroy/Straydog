@@ -128,6 +128,8 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_kv_scratch(handle: *mut ::std::os::raw::c_void, scratch: *mut *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+    pub fn sd_prefill_buffers(handle: *mut ::std::os::raw::c_void, capacity: u64, moe_bytes: u64, decoder_bytes: u64, moe: *mut *mut ::std::os::raw::c_void,
+                              decoder: *mut *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
     pub fn sd_kv_grow(
         handle: *mut ::std::os::raw::c_void,
         layer: u64,

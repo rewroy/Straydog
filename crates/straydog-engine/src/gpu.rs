@@ -290,6 +290,8 @@ pub struct Backend {
     slot_stage: u64,
     slot_margin: u64,
     slot_size: u64,
+    /// The prefill rows before a long prompt's batches took the slots' VRAM (see [`Backend::begin_long_prefill`]).
+    long_prefill: Option<u64>,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
     pub logical_capacity: usize,
@@ -379,6 +381,7 @@ impl Backend {
             slot_bytes: 0,
             slot_stage: 0,
             slot_margin: 0,
+            long_prefill: None,
             slot_size: 0,
             registered: Vec::new(),
             batch_capacity,
@@ -808,7 +811,7 @@ impl Backend {
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
         let grown = self.grow_kv_layers(capacity, valid);
         if self.slot_stage > 0 {
-            let cache = self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)?;
+            let cache = if self.long_prefill.is_some() { 0 } else { self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)? };
             // SAFETY: a live handle; the pool was released above.
             check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) })?;
             self.rebalance(0)?;
@@ -849,6 +852,59 @@ impl Backend {
                 (cached.pointer, cached.rows) = (scratch, rows);
             }
         }
+        Ok(())
+    }
+
+    /// A long prompt's batches take the slots' VRAM: a batch streams nearly every expert of every layer over the bus whatever its
+    /// rows, so the wider the batch the fewer bytes a token (IQ2_XS, --vram 8, a 20K prompt: 1024 rows a batch 30.6 s, 2048 21.0, 4096 16.0).
+    /// Wider for good would cost decode its slots. The rows a batch can take in what the slots give up; [`Backend::end_long_prefill`] returns it.
+    pub fn begin_long_prefill(&mut self) -> Result<u64> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() {
+            return Ok(self.prefill_capacity);
+        }
+        // SAFETY: a live handle, between batches.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        // SAFETY: a live handle; the pool was released above. (0: the staging slots alone)
+        check(unsafe { ffi::sd_expert_slots_restore(self.handle, 0) })?;
+        self.long_prefill = Some(self.prefill_capacity);
+        let (used, budget) = self.memory()?;
+        let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
+        let free = budget.saturating_sub(used + self.slot_margin) + bytes(self.prefill_capacity);
+        for capacity in [4096, 2048] {
+            if capacity > self.prefill_capacity && bytes(capacity) + 2 * ALLOCATION_TAIL <= free {
+                self.prefill_buffers(capacity)?;
+                break;
+            }
+        }
+        Ok(self.prefill_capacity)
+    }
+
+    pub fn end_long_prefill(&mut self) -> Result<()> {
+        let Some(capacity) = self.long_prefill.take() else { return Ok(()) };
+        if capacity != self.prefill_capacity {
+            self.prefill_buffers(capacity)?;
+        }
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        let cache = self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)?;
+        // SAFETY: a live handle; the pool was released above.
+        check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) })?;
+        self.rebalance(0)
+    }
+
+    fn prefill_buffers(&mut self, capacity: u64) -> Result<()> {
+        let (moe_rows, decoder_bytes) = (capacity * MOE_ROW + 65536, decoder_workspace_bytes(capacity));
+        let (mut moe, mut decoder) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: a live handle and out-parameters; every plan follows on the native side.
+        check(unsafe { ffi::sd_prefill_buffers(self.handle, capacity, moe_rows * 4, decoder_bytes, &mut moe, &mut decoder) })?;
+        for (key, pointer, rows) in [("@moe:workspace", moe, moe_rows), ("@scratch:decoder", decoder, decoder_bytes / 4)] {
+            let entry = self.states.get_mut(key).ok_or("no such Straydog state")?;
+            (entry.pointer, entry.rows) = (pointer, rows);
+            if let Some(cached) = self.cache.get_mut(key) {
+                (cached.pointer, cached.rows) = (pointer, rows);
+            }
+        }
+        self.prefill_capacity = capacity;
         Ok(())
     }
 

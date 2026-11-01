@@ -96,6 +96,8 @@ const STARTING_KV: usize = 32768;
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
 const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
+/// New tokens from which a partially resident model's batches take the slots' VRAM: putting the slots back costs a fraction of a second.
+const LONG_PREFILL: usize = 4096;
 /// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
@@ -1724,8 +1726,26 @@ impl Model {
     #[allow(clippy::type_complexity)]
     /// The prompt's batches from `position`, with the checkpoints of `plan`: the last batch's
     /// logits, or None when cancelled.
-    fn prefill(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)],
+    fn prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
+        // A long prompt's batches take the slots' VRAM until its end, however it ends.
+        let mut batch = self.prefill_batch_size;
+        let long = self.partial && tokens.len() - position >= LONG_PREFILL;
+        if long {
+            self.ensure_kv(tokens.len())?;
+            if let Some(rows) = self.group.begin_long_prefill()? {
+                batch = batch.max(rows as usize);
+            }
+        }
+        let output = self.prefill_batches(tokens, position, plan, batch, cancelled, progress);
+        if long {
+            self.group.end_long_prefill()?;
+        }
+        output
+    }
+
+    fn prefill_batches(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
+                       cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         let mut output = None;
         let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
         for stop in stops {
@@ -1733,9 +1753,9 @@ impl Model {
                 if cancelled() {
                     return Ok(None);
                 }
-                let end = (position + self.prefill_batch_size).min(stop);
+                let end = (position + batch).min(stop);
                 // The next batch's PLE rows arrive while this one runs.
-                let next = (end + self.prefill_batch_size).min(tokens.len());
+                let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
                 // A one-token batch runs whole, as decode does; a longer one checks between spans.
                 let check: &dyn Fn() -> bool = if self.prefill_batch_size == 1 { &|| false } else { cancelled };
