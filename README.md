@@ -10,7 +10,7 @@ backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next and DeepSeek-V4.1-F
   it has one. Speculative decoding never changes an answer.
 - **Isolated.** The engine runs in a worker without network access (bubblewrap on
   Linux, its own AppContainer on Windows). Every model and drafter file is pinned by
-  SHA-256 and authenticated before use.
+  SHA-256 and authenticated when it is downloaded.
 - **Fast on one or several GPUs.** Full residency when the model fits. When it does not,
   the experts VRAM lacks wait in host memory: the Qwen models compute them on the CPU, and
   DeepSeek-V4.1 uploads each one a token routes to into VRAM. Two GPUs of similar budgets
