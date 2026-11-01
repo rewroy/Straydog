@@ -32,6 +32,7 @@
 #define HIPBLAS_GEMM_DEFAULT CUBLAS_GEMM_DEFAULT
 #define hipError_t cudaError_t
 #define hipSuccess cudaSuccess
+#define hipErrorOutOfMemory cudaErrorMemoryAllocation
 #define hipGetErrorString cudaGetErrorString
 #define hipSetDevice cudaSetDevice
 #define hipGetDeviceCount cudaGetDeviceCount
@@ -2373,8 +2374,6 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
-// The end of the message of a growth that found no memory (crates/straydog/src/worker.rs: not fatal).
-constexpr const char* kv_no_memory = "not enough host memory for the K/V of this sequence";
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state) {
     try {
         auto& d = device(handle);
@@ -2458,6 +2457,7 @@ int sd_kv_scratch(void* handle, void** scratch) {
 
 // A long prompt's batches: the experts' and the decoder's workspaces of `capacity` rows in place of what they were, every plan following.
 // Between requests' work: the caller has given the slots' VRAM up (release_expert_slots, restore at 0) and takes it back after.
+// 1: the device refused these, and the plans have workspaces of the size they had.
 int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint64_t decoder_bytes, void** moe, void** decoder) {
     try {
         auto& d = device(handle);
@@ -2475,9 +2475,23 @@ int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint
         const auto forget = [](std::vector<void*>& list, void* pointer) { list.erase(std::remove(list.begin(), list.end(), pointer), list.end()); };
         for (auto& entry : d.resident) { forget(entry.second->dependencies, old_moe); entry.second->workspace = nullptr; }
         for (auto& entry : d.decoder) { forget(entry.second.dependencies, old_moe); forget(entry.second.dependencies, old_decoder); entry.second.workspace = nullptr; }
+        const size_t old_capacity = d.resident.begin()->second->capacity;
+        const size_t old_moe_bytes = d.allocations.at(old_moe), old_decoder_bytes = d.allocations.at(old_decoder);
         if (sd_release(handle, old_moe) || sd_release(handle, old_decoder)) throw std::runtime_error(last_error);
-        void* new_moe = allocate(d, moe_bytes);
-        void* new_decoder = allocate(d, decoder_bytes);
+        void* new_moe = nullptr;
+        void* new_decoder = nullptr;
+        bool refused = false;
+        try {
+            new_moe = allocate(d, moe_bytes);
+            new_decoder = allocate(d, decoder_bytes);
+        } catch (const std::exception&) {
+            refused = true;
+            (void)hipGetLastError();
+            if (new_moe && sd_release(handle, new_moe)) throw std::runtime_error(last_error);
+            new_moe = allocate(d, old_moe_bytes);
+            new_decoder = allocate(d, old_decoder_bytes);
+            capacity = old_capacity;
+        }
         for (auto& entry : d.resident) {
             entry.second->workspace = static_cast<float*>(new_moe); entry.second->capacity = size_t(capacity);
             entry.second->dependencies.push_back(new_moe);
@@ -2488,7 +2502,7 @@ int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint
             entry.second.dependencies.push_back(new_moe);
         }
         *moe = new_moe; *decoder = new_decoder;
-        return 0;
+        return refused ? 1 : 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 

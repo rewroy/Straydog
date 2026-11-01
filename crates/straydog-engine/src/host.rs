@@ -97,11 +97,13 @@ pub fn lockable(memory: u64, vram_room: u64) -> u64 {
 /// more read from the drive). Never more than the `banks` and that state need, and less as the
 /// system refuses it (it refuses what the free memory cannot back, ERROR_NO_SYSTEM_RESOURCES, as
 /// with most banks page-locked at 62 GiB), and never more than leaves [`left_free`] free: what it
-/// grants, it keeps from everything else. Best effort: only speed depends on it.
+/// grants, it keeps from everything else. It is also the most the working set takes: mapped bank pages touched later would otherwise
+/// go on joining it with no limit, past [`left_free`] (RTX 5070 Ti, 62 GiB of memory: 3.8 GiB available within a minute of serving, the
+/// desktop stalling); past the limit they wait in the standby list, a soft fault away. Best effort: only speed depends on it.
 pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
@@ -109,7 +111,7 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         let mut wanted = share;
         while wanted >= 1 << 30 {
             // SAFETY: the pseudo handle of this process and plain values.
-            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), wanted as usize, memory as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) };
+            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), (wanted / 8 * 7) as usize, wanted as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) };
             if done != 0 {
                 if wanted < share {
                     eprintln!("a working set of {} GiB was refused; {} GiB taken", share >> 30, wanted >> 30);
@@ -245,6 +247,18 @@ fn windows_available() -> (u64, u64) {
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: an initialized structure with its length set.
     if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { (status.ullAvailPhys, status.ullAvailPageFile) } else { (0, 0) }
+}
+
+/// The commit the system has left, where the engine can run out of it: Windows charges page-locked memory and device memory to it.
+pub fn commit_left() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        Some(windows_available().1).filter(|left| *left > 0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// With DS41_PROFILE set on Windows: the system's commit left beside this process's own private commit at a step of a start.

@@ -37,6 +37,12 @@ pub struct TokenBytes {
 }
 
 impl TokenBytes {
+    /// What a token spells; none for a special one.
+    pub fn text_of(&self, token: u32) -> Option<&[u8]> {
+        let at = token as usize;
+        (!*self.special.get(at)?).then(|| self.bytes[at].as_slice())
+    }
+
     pub fn new(bytes: Vec<Vec<u8>>, special: Vec<bool>) -> TokenBytes {
         assert_eq!(bytes.len(), special.len());
         TokenBytes { bytes, special, think_close: None }

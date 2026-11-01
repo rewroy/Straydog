@@ -782,6 +782,10 @@ impl Group {
         }
     }
 
+    pub fn ensure_slots(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::ensure_slots)
+    }
+
     pub fn end_long_prefill(&mut self) -> Result<()> {
         self.backends.iter_mut().try_for_each(Backend::end_long_prefill)
     }

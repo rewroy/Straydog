@@ -357,11 +357,26 @@ void release_expert_slots(Device& d) {
     d.slots.at.clear(); d.slots.group.clear();
     d.slots.owner.clear();
 }
+// The end of the message of a growth or a pool that found no memory (crates/straydog/src/worker.rs: not fatal).
+constexpr const char* kv_no_memory = "not enough host memory for the K/V of this sequence";
 void restore_expert_slots(Device& d, size_t cache) {
     if (d.slots.base || !d.slots.bytes) throw std::runtime_error("invalid Straydog expert slot pool");
-    const size_t bytes = (cache + d.slots.stage) * d.slots.bytes;
+    size_t bytes = (cache + d.slots.stage) * d.slots.bytes;
     if (bytes > d.budget - d.used) throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
-    check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
+    // The budget was measured at the start: other programs may hold what it counted by now, and a sequence must not die of that
+    // when the experts that find no slot can run on the CPU. A smaller pool, then, down to the stage alone.
+    while (true) {
+        const hipError_t error = hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes);
+        if (error == hipSuccess) break;
+        if (error != hipErrorOutOfMemory) check(error);
+        (void)hipGetLastError();
+        d.slots.base = nullptr;
+        std::fprintf(stderr, "Straydog: no VRAM for %zu MiB of expert slots\n", bytes >> 20);
+        // (not even the stage: the request fails, and the next one asks for the pool again)
+        if (!cache) throw std::runtime_error(kv_no_memory);
+        cache = cache < 16 ? 0 : cache / 8 * 7;
+        bytes = (cache + d.slots.stage) * d.slots.bytes;
+    }
     d.used += bytes;
     expert_slots_carve(d, cache * d.slots.bytes);
 }
