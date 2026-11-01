@@ -457,7 +457,10 @@ pub fn request_summary(event: &Value) -> String {
                 let mut phases: Vec<(&String, f64)> = phases.iter().map(|(phase, ms)| (phase, ms.as_f64().unwrap_or(0.0))).collect();
                 phases.sort_by(|a, b| counter(a.0).cmp(&counter(b.0)).then(b.1.total_cmp(&a.1)));
                 let rows = timings["decode_pass_rows"].as_object().map_or_else(String::new, |rows| format!("; passes by rows: {}",
-                    rows.iter().map(|(rows, pass)| format!("{rows}: {} at {:.2} ms", pass["passes"], pass["ms"].as_f64().unwrap_or(0.0))).collect::<Vec<_>>().join(", ")));
+                    rows.iter().map(|(rows, pass)| {
+                        let spent = |phase: &str| pass["phases"][phase].as_f64().map_or_else(String::new, |ms| format!(", {phase} {ms:.2}"));
+                        format!("{rows}: {} at {:.2} ms{}{}", pass["passes"], pass["ms"].as_f64().unwrap_or(0.0), spent("export wait"), spent("CPU"))
+                    }).collect::<Vec<_>>().join("; ")));
                 format!("; decode phases (ms a token): {}{rows}", phases.iter().map(|(phase, value)| if counter(phase) {
                     format!("{phase} {value:.1}")
                 } else {

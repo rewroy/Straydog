@@ -99,8 +99,8 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
     moe_tokens(d, plan.moe, steps, v.mixed, 2564, v.hidden);
 }
 
-// Rows of a verification through partially resident layers: verify_layer's arithmetic up to the experts, then each row's
-// routes as one token's (hybrid_moe.hpp), its CPU experts on the host. Under prelaunch a layer's graph awaits the last one's.
+// Rows of a verification through partially resident layers: verify_layer's arithmetic up to the experts, then the rows' routes
+// side by side (hybrid_moe.hpp), each row's CPU experts on the host. Under prelaunch a layer's graph awaits the last one's.
 void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
     if (!input || !steps || steps > verify_max || steps > hybrid_rows) throw std::runtime_error("invalid hybrid verification");
     float* workspace = nullptr;
@@ -112,11 +112,10 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         workspace = found->second.workspace;
         if (decoder_linear(layer)) verify_buffers(d, found->second);
     }
-    if (d.allocations.find(workspace)->second / 4 < verify_extent + verify_max * hybrid_row_export)
+    if (d.allocations.find(workspace)->second / 4 < verify_extent)
         throw std::runtime_error("speculative verification needs a larger decoder workspace");
     kv_prepare_span(d, begin, end, position, steps);
     const VerifyLayout v = verify_layout(workspace);
-    float* exported = workspace + verify_extent;
     upload(d, v.hidden, input, steps * 10240 * 4);
     uint32_t positions[verify_max];
     for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
@@ -131,15 +130,14 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
 #else
     const bool stage = ahead;
 #endif
-    auto cpu_result = [&](size_t row) -> const float* { return stage ? d.cpu_partial + row * 2560 : d.exchange_device + hybrid_result_at(row); };
     auto finish_previous = [&]() {
         if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0), stage ? d.cpu_partial : nullptr, d.await_timeout);
 #if !defined(__HIPCC__)
-        if (stage) for (size_t row = 1; row < steps; ++row)
-            hybrid_stage<<<1,256,0,d.stream>>>(d.exchange_device + hybrid_result_at(row), d.cpu_partial + row * 2560);
+        if (stage && steps > 1)
+            hybrid_stage<<<dim3(1,unsigned(steps - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1), d.cpu_partial + 2560);
 #endif
-        for (size_t row = 0; row < steps; ++row)
-            hybrid_finish<<<40,256,0,d.stream>>>(v.hidden + row * 10240, v.mixed + row * 2564, v.branch + row * 2560, cpu_result(row));
+        hybrid_finish<<<dim3(40,unsigned(steps)),256,0,d.stream>>>(v.hidden, v.mixed, 2564, v.branch, stage ? d.cpu_partial : d.exchange_device + hybrid_result_at(0),
+                                                                   stage ? 2560 : hybrid_row_floats);
     };
     auto launch = [&](size_t layer) {
         DecoderLayer& plan = d.decoder.find(layer)->second;
@@ -148,13 +146,9 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         auto submit = [&]() {
             if (finish) finish_previous();
             verify_layer_front(d, plan, steps, v);
-            for (size_t row = 0; row < steps; ++row) {
-                hybrid_route_export(d, experts, v.mixed + row * 2564, exported + row * hybrid_row_export, row);
-                hybrid_publish<<<11,256,0,d.stream>>>(exported + row * hybrid_row_export, d.exchange_device + hybrid_export_at(row));
-            }
+            hybrid_route_export(d, experts, v.mixed, steps);
             hybrid_tick<<<1,1,0,d.stream>>>(d.flags + 1, reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot));
-            for (size_t row = 0; row < steps; ++row)
-                hybrid_resident_experts(d, experts, v.mixed + row * 2564, v.branch + row * 2560, row);
+            hybrid_resident_experts(d, experts, v.mixed, v.branch, steps);
             check(hipGetLastError());
         };
         if (ahead && finish) ++await.launched;

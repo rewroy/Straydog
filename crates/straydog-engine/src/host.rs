@@ -219,6 +219,26 @@ fn windows_available() -> (u64, u64) {
     if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { (status.ullAvailPhys, status.ullAvailPageFile) } else { (0, 0) }
 }
 
+/// With DS41_PROFILE set on Windows: the system's commit left beside this process's own private commit at a step of a start.
+/// What the system loses beyond the process's own is charged elsewhere (the display driver's, for device memory).
+pub fn commit_note(step: &str) {
+    #[cfg(windows)]
+    if std::env::var_os("DS41_PROFILE").is_some() {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: the pseudo handle of this process and an initialized structure with its size set.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        let (physical, commit) = windows_available();
+        const GIB: f64 = (1u64 << 30) as f64;
+        eprintln!("commit at {step}: {:.2} GiB left, {:.2} private, {:.2} physical left", commit as f64 / GIB,
+                  counters.PagefileUsage as f64 / GIB, physical as f64 / GIB);
+    }
+    #[cfg(not(windows))]
+    let _ = step;
+}
+
 #[cfg(windows)]
 fn windows_working_set() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};

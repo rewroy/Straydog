@@ -1,18 +1,24 @@
 // Single-token hybrid MoE: GPU part and the host CPU-expert step (see hybrid_slots.hpp).
+// blockIdx.y a row, in every kernel of this file that takes one.
 __global__ void hybrid_combine(const float* outputs, const float* probabilities, const int32_t* selected,
                                const MoeGroup* groups, ExpertGemv plan, float* result) {
     const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x;
     if (column >= 2560) return;
+    outputs += size_t(blockIdx.y) * 11 * 2560; probabilities += size_t(blockIdx.y) * 11; selected += size_t(blockIdx.y) * 10;
+    result += size_t(blockIdx.y) * 2560;
     float sum = 0;
     for (size_t route = 0; route < 10; ++route)
         if (expert_source(groups, selected, route, 0, plan)) sum += probabilities[route] * outputs[route * 2560 + column];
     result[column] = sum + probabilities[10] * outputs[10 * 2560 + column];
 }
 // The GPU exports which routes it evaluates, so host decisions always follow the
-// table entries in effect for this token, even while slots are being swapped.
-__global__ void hybrid_export(const int32_t* selected, const float* probabilities, const float* input,
-                              const MoeGroup* groups, ExpertGemv plan, float* target) {
+// table entries in effect for this token, even while slots are being swapped. Written straight to mapped
+// pinned host memory (no memcpy graph node), a row at each hybrid_row_floats.
+__global__ void hybrid_export(const int32_t* selected, const float* probabilities, const float* input, size_t input_stride,
+                              const MoeGroup* groups, ExpertGemv plan, volatile float* target) {
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    selected += size_t(blockIdx.y) * 10; probabilities += size_t(blockIdx.y) * 11; input += size_t(blockIdx.y) * input_stride;
+    target += size_t(blockIdx.y) * hybrid_row_floats;
     if (i < 10) {
         target[i] = float(selected[i]);
         target[2592 + i] = groups[selected[i]].weights[0].data ? 1.0f : expert_source(groups, selected, i, 0, plan) ? 2.0f : 0.0f;
@@ -27,13 +33,10 @@ __global__ void hybrid_tick(uint32_t* counter, volatile uint32_t* published) {
     *published = ++*counter;
     __threadfence_system();
 }
-// Copy the device export into mapped pinned host memory (no memcpy graph node).
-__global__ void hybrid_publish(const float* exported, volatile float* host) {
+__global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_stride, const float* gpu, const float* cpu, size_t cpu_stride) {
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
-    if (i < 2602) host[i] = exported[i];
-}
-__global__ void hybrid_finish(float* hidden, const float* mixed, const float* gpu, const float* cpu) {
-    const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    hidden += size_t(blockIdx.y) * 10240; mixed += size_t(blockIdx.y) * mixed_stride; gpu += size_t(blockIdx.y) * 2560;
+    cpu += size_t(blockIdx.y) * cpu_stride;
     if (i < 10240) hidden[i] += mixed[2560 + i / 2560] * (gpu[i % 2560] + cpu[i % 2560]);
 }
 __device__ inline uint64_t await_clock() {
@@ -80,8 +83,9 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
 #endif
 }
 #if !defined(__HIPCC__)
-// A later row's CPU result to device memory, once hybrid_await has seen them all published.
+// The later rows' CPU results to device memory, once hybrid_await has seen them all published.
 __global__ void hybrid_stage(const volatile float* result, float* target) {
+    result += size_t(blockIdx.y) * hybrid_row_floats; target += size_t(blockIdx.y) * 2560;
     const float4* source = reinterpret_cast<const float4*>(const_cast<const float*>(result));
     for (size_t i = threadIdx.x; i < 640; i += blockDim.x) reinterpret_cast<float4*>(target)[i] = __ldcv(source + i);
 }
@@ -117,12 +121,13 @@ struct HybridAwait {
 // Single-token GPU part, split so the host can start its experts as soon as the
 // routing and activation are exported while the GPU evaluates resident experts.
 struct HybridScratch { float *gate_up, *product, *outputs, *probabilities; int32_t* selected; };
-HybridScratch hybrid_scratch(ResidentMoe& plan, size_t row = 0) {
-    constexpr size_t routes = 11;
+// (token_moe's layout)
+HybridScratch hybrid_scratch(ResidentMoe& plan, size_t rows) {
+    const size_t routes = rows * 11;
     HybridScratch s{};
-    s.gate_up = plan.workspace + row * (routes * (1280 + 640 + 2560) + 64); s.product = s.gate_up + routes * 1280;
+    s.gate_up = plan.workspace; s.product = s.gate_up + routes * 1280;
     s.outputs = s.product + routes * 640; s.probabilities = s.outputs + routes * 2560;
-    s.selected = reinterpret_cast<int32_t*>(s.probabilities + 11) + routes;
+    s.selected = reinterpret_cast<int32_t*>(s.probabilities + routes) + routes;
     return s;
 }
 ExpertGemv hybrid_assist(const Device& d, const ResidentMoe& plan) {
@@ -131,15 +136,17 @@ ExpertGemv hybrid_assist(const Device& d, const ResidentMoe& plan) {
     assist.assist = plan.mapped[0] ? d.assist : 0;
     return assist;
 }
-void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float* exported, size_t row = 0) {
+// The rows' routes and activations to the host: every row in one launch of each kernel, as moe_tokens_experts.
+void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, size_t rows = 1, size_t input_stride = 2564) {
     const size_t experts = plan.experts;
-    const HybridScratch s = hybrid_scratch(plan, row);
+    const HybridScratch s = hybrid_scratch(plan, rows);
     Matrix projections[2] = {plan.weights[(experts + 1) * 3], plan.weights[(experts + 1) * 3 + 1]};
     projections[1].output_offset = experts;
-    gemv(d, projections, 2, input, d.output);
-    resident_route<<<1, 256, 0, d.stream>>>(d.output, d.output + experts, experts, s.selected, s.probabilities);
-    hybrid_export<<<10, 256, 0, d.stream>>>(s.selected, s.probabilities, input, static_cast<const MoeGroup*>(plan.table),
-                                             hybrid_assist(d, plan), exported);
+    gemv(d, projections, 2, input, d.output, rows, input_stride, experts + 1);
+    resident_route<<<unsigned(rows), 256, 0, d.stream>>>(d.output, d.output + experts, experts, s.selected, s.probabilities, experts + 1, experts + 1);
+    hybrid_export<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.selected, s.probabilities, input, input_stride,
+                                                                 static_cast<const MoeGroup*>(plan.table), hybrid_assist(d, plan),
+                                                                 d.exchange_device);
     check(hipGetLastError());
 }
 #if !defined(__HIPCC__)
@@ -148,6 +155,7 @@ void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, float
 __global__ void hybrid_stage_assist(const MoeGroup* groups, const int32_t* selected, ExpertGemv plan) {
     const size_t step = size_t(gridDim.x) * blockDim.x, thread = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     uint32_t absent = 0, slot = 0;
+    selected += size_t(blockIdx.y) * 10; plan.stage += size_t(blockIdx.y) * plan.assist * plan.slot_bytes;
     for (size_t r = 0; r < 10; ++r) absent += groups[selected[r]].weights[0].data == nullptr;
     const uint32_t share = min(plan.assist, (5 * absent + 4) / 12);   // (expert_source's)
     for (size_t r = 0; r < 10 && slot < share; ++r) {
@@ -163,8 +171,10 @@ __global__ void hybrid_stage_assist(const MoeGroup* groups, const int32_t* selec
     }
 }
 #endif
-void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, float* partial, size_t row = 0) {
-    const HybridScratch s = hybrid_scratch(plan, row);
+// The experts the GPU evaluates of the rows hybrid_route_export routed, the rows side by side.
+void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, float* partial, size_t rows = 1, size_t input_stride = 2564) {
+    const HybridScratch s = hybrid_scratch(plan, rows);
+    const size_t routes = rows * 11;
     auto* groups = static_cast<MoeGroup*>(plan.table);
     const uint8_t* stage = nullptr;
 #if !defined(__HIPCC__)
@@ -172,13 +182,13 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
         stage = d.slots.base + d.slots.cache * d.slots.bytes;
         ExpertGemv copy = hybrid_assist(d, plan);
         copy.stage = stage; copy.slot_bytes = d.slots.bytes;
-        hybrid_stage_assist<<<64, 256, 0, d.stream>>>(groups, s.selected, copy);
+        hybrid_stage_assist<<<dim3(64, unsigned(rows)), 256, 0, d.stream>>>(groups, s.selected, copy);
     }
 #endif
-    resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, 1, 0, 0, false, stage, d.slots.bytes);
-    moe_product<<<unsigned((11 * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, 11, s.product);
-    resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, 1, 0, 0, false, stage, d.slots.bytes);
-    hybrid_combine<<<10, 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial);
+    resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes);
+    moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, routes, s.product);
+    resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, rows, 11 * 640, 11 * 2560, false, stage, d.slots.bytes);
+    hybrid_combine<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial);
     check(hipGetLastError());
 }
 
