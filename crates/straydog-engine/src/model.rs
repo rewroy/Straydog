@@ -778,14 +778,13 @@ impl Model {
         let staging = 32 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (128 << 20);
         let mut requirements = self.weights.dense_requirements();
         requirements.push(("@hybrid:staging".into(), staging));
-        // The drafter when its layer and a verification's buffers leave the expert slots their share. Not on CUDA, where a second
-        // row costs more (RTX 5070 Ti at --vram 12: 16.9 ms for one row, 29.6 for two) and drafts gain nothing: 57-60 tok/s either way.
+        // The drafter when its layer and a verification's buffers leave the expert slots their share.
         let mut with_drafter = requirements.clone();
         // (its routed experts take expert slots like any layer's: register_hybrid_drafter)
         with_drafter.extend(self.weights.drafter_requirements().into_iter().filter(|(name, _)| !name.ends_with("_exps.weight")));
         with_drafter.push(("@verify:buffers".into(), VERIFY_BYTES));
         with_drafter.push(("@hybrid:slots".into(), DRAFTER_SLOT_ROOM));
-        if cfg!(feature = "cuda") || !self.weights.drafter || !self.group.can_pin_model(&with_drafter, None)? {
+        if !self.weights.drafter || !self.group.can_pin_model(&with_drafter, None)? {
             self.weights.drop_drafter();
             self.group.drop_mtp_layer_state()?;
         }
