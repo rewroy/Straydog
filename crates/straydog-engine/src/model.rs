@@ -768,7 +768,7 @@ impl Model {
             return Ok(false);
         }
         let kinds = (0..48).map(|layer| self.weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
-        let staging = 64 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (256 << 20);
+        let staging = 32 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (128 << 20);
         let mut requirements = self.weights.dense_requirements();
         requirements.push(("@hybrid:staging".into(), staging));
         // The drafter when its layer and a verification's buffers leave the expert slots their share. Not on CUDA, where a second

@@ -850,7 +850,7 @@ impl Group {
     }
 
     pub fn create_expert_slots(&mut self) -> Result<u64> {
-        self.backends.iter_mut().map(|backend| backend.create_expert_slots(64, 192 << 20)).sum()
+        self.backends.iter_mut().map(|backend| backend.create_expert_slots(32, 64 << 20)).sum()
     }
 
     pub fn hybrid_supported(&self) -> Result<bool> {
