@@ -43,13 +43,16 @@ fn main() {
         .find_map(|(file, header)| header.tensors.iter().find(|tensor| tensor.name == name).map(|tensor| (file, tensor))).unwrap();
     // Four layers of the commonest format.
     let layers: Vec<usize> = (0..48).filter(|layer| find(&format!("blk.{layer}.ffn_gate_exps.weight")).1.quant_type == 22).take(4).collect();
-    let mut banks: Vec<[Vec<u8>; 3]> = Vec::new();
+    // Mapped as a served model's banks are, read through once so the pages are in memory: page size and page walks count.
+    // SAFETY: read-only mappings of files nothing changes during this run.
+    let maps: Vec<memmap2::Mmap> = files.iter().map(|file| unsafe { memmap2::Mmap::map(file) }.unwrap()).collect();
+    let mut banks: Vec<[&[u8]; 3]> = Vec::new();
     let mut kinds = [0i32; 3];
     for layer in &layers {
         banks.push(["gate", "up", "down"].map(|role| {
             let (file, tensor) = find(&format!("blk.{layer}.ffn_{role}_exps.weight"));
-            let mut bytes = vec![0u8; tensor.bytes as usize];
-            straydog_engine::storage::read_at(&files[file], tensor.offset, &mut bytes).unwrap();
+            let bytes = &maps[file][tensor.offset as usize..(tensor.offset + tensor.bytes) as usize];
+            std::hint::black_box(bytes.iter().step_by(4096).map(|byte| *byte as u64).sum::<u64>());
             bytes
         }));
         for (index, role) in ["gate", "up", "down"].iter().enumerate() {
