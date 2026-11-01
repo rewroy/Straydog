@@ -550,8 +550,9 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // without it and a reasoning_end event marks the place. The same text otherwise written (the
     // reasoning quoting a tag) stays the reasoning's.
     let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+    let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
     let result = engine.model.generate_constrained(
-        &ids, max_new, &sampling, seed, &cancelled,
+        &agreed, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
         turn, checkpoint,
         &mut |token| {

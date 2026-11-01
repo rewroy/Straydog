@@ -88,6 +88,8 @@ pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this seque
 
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 const SCARCE_ROW_CACHE: u64 = 1 << 30;
+/// The commit a K/V growth leaves the machine.
+const KV_COMMIT_MARGIN: u64 = 2 << 30;
 /// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
 /// whole context take from a small machine what the expert banks need, and few sequences reach it.
 const STARTING_KV: usize = 32768;
@@ -170,6 +172,52 @@ impl Parked {
     fn from(&self) -> usize {
         self.covered.map_or(self.tokens.len(), |(from, _)| from)
     }
+}
+
+/// `tokens` with `held`'s tokens over its text, as far as the two spell the same text: only the split into tokens differs there.
+fn same_text<'a>(tokens: &[u32], held: &[u32], bytes: &dyn Fn(u32) -> Option<&'a [u8]>) -> Vec<u32> {
+    /// Tokens on either side of a difference: past them the two are taken to have parted.
+    const REACH: usize = 32;
+    let mut agreed = Vec::with_capacity(tokens.len());
+    let (mut at, mut from) = (0, 0);
+    while at < held.len() && from < tokens.len() {
+        if held[at] == tokens[from] {
+            agreed.push(held[at]);
+            at += 1;
+            from += 1;
+            continue;
+        }
+        let (mut one, mut other) = (at, from);
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        let met = loop {
+            let of_held = first.len() <= second.len();
+            let token = if of_held { held.get(one) } else { tokens.get(other) };
+            // (a special token is itself, whatever other tokens spell the same)
+            let Some(piece) = token.and_then(|token| bytes(*token)) else { break false };
+            if of_held {
+                first.extend_from_slice(piece);
+                one += 1;
+            } else {
+                second.extend_from_slice(piece);
+                other += 1;
+            }
+            let shorter = first.len().min(second.len());
+            if first[..shorter] != second[..shorter] || one - at > REACH || other - from > REACH {
+                break false;
+            }
+            if first.len() == second.len() && !first.is_empty() {
+                break true;
+            }
+        };
+        if !met {
+            break;
+        }
+        agreed.extend_from_slice(&held[at..one]);
+        at = one;
+        from = other;
+    }
+    agreed.extend_from_slice(&tokens[from..]);
+    agreed
 }
 
 /// How many leading tokens two sequences share.
@@ -1290,6 +1338,33 @@ impl Model {
         run(&mut self.group, &operands)
     }
 
+    /// The K/V's next size for `positions`: twice over where the commit has room for that, else what the sequence needs. The commit is read
+    /// with the slots' VRAM still charged to it: they give it up for the growth and take it back after, so what the growth takes of it
+    /// beyond this they would not find (IQ3_XXS at auto: an hour's conversation past 65536 ended the worker).
+    fn kv_capacity_for(&self, positions: usize) -> Result<usize> {
+        let doubled = (positions + 4096).next_power_of_two().min(self.context);
+        let Some(left) = crate::host::commit_left() else { return Ok(doubled) };
+        let position = attention_layers(self.weights.drafter) * 4096;
+        // (a layer's old K/V and new one are both held while it is copied)
+        let cost = |capacity: usize| (capacity - self.kv_capacity) as u64 * position + capacity as u64 * 4096 + KV_COMMIT_MARGIN;
+        let least = (positions + 4096).div_ceil(4096).saturating_mul(4096).min(self.context);
+        for capacity in [doubled, least] {
+            if cost(capacity) <= left {
+                return Ok(capacity);
+            }
+        }
+        Err(KV_NO_MEMORY.into())
+    }
+
+    /// `tokens`, with the tokens of the sequence it goes on from wherever both spell the same text. A reply read back is tokenized anew, and a
+    /// model does not always write the tokens the tokenizer would: one such place in a long reply cost all of it, read again from the last
+    /// checkpoint (25000 tokens, 139 s, for a reply with two files in it).
+    pub fn agree_with_held(&self, tokens: &[u32], text: &crate::constraint::TokenBytes) -> Vec<u32> {
+        let parked = self.parked.as_ref().map_or(&[][..], |parked| &parked.tokens[..]);
+        let held = if shared(parked, tokens) > shared(&self.history, tokens) { parked } else { &self.history[..] };
+        same_text(tokens, held, &|token| text.text_of(token))
+    }
+
     /// Room in the K/V for `positions`. A parked sequence's copies have the old pitches and go; the
     /// live sequence and the checkpoints below it stay.
     fn ensure_kv(&mut self, positions: usize) -> Result<()> {
@@ -1299,7 +1374,7 @@ impl Model {
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
         }
-        let capacity = (positions + 4096).next_power_of_two().min(self.context);
+        let capacity = self.kv_capacity_for(positions)?;
         let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
@@ -2157,6 +2232,12 @@ impl Model {
         }
         sampling.check()?;
         self.weights.check_unchanged()?;
+        self.group.ensure_slots()?;
+        if self.partial {
+            // (the working set's limit follows what other programs have taken or given back since the last request)
+            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * 4096;
+            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        }
         let parking = Instant::now();
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
@@ -2334,4 +2415,40 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
         return Err("Straydog model PLE placement mismatch".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod same_text_tests {
+    use super::same_text;
+
+    fn spelled(token: u32) -> Option<&'static [u8]> {
+        match token {
+            1 => Some(b"ab"),
+            2 => Some(b"a"),
+            3 => Some(b"b"),
+            4 => Some(b"c"),
+            5 => Some(b"abc"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_reply_tokenized_anew_keeps_the_tokens_it_was_written_in() {
+        // (held "ab" where the prompt has "a" "b", and "a" "b" "c" where it has "abc")
+        assert_eq!(same_text(&[4, 2, 3, 4, 5, 4], &[4, 1, 4, 2, 3, 4], &spelled), [4, 1, 4, 2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn other_text_and_special_tokens_part_the_two() {
+        assert_eq!(same_text(&[4, 2, 4], &[4, 1, 4], &spelled), [4, 2, 4]);
+        // (9 spells nothing: it is a special token)
+        assert_eq!(same_text(&[9, 4], &[2, 4], &spelled), [9, 4]);
+        assert_eq!(same_text(&[4, 2], &[4, 1], &spelled), [4, 2]);
+    }
+
+    #[test]
+    fn what_follows_the_held_sequence_stays() {
+        assert_eq!(same_text(&[1, 4, 5], &[1], &spelled), [1, 4, 5]);
+        assert_eq!(same_text(&[2, 3, 5], &[1], &spelled), [1, 5]);
+    }
 }
