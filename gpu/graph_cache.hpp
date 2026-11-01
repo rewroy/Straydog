@@ -4,7 +4,8 @@
 // no acquire: its code and its kernel arguments, which do not change in a graph, stay cached, and the build has every uniform
 // read of global memory go through the vector path (-amdgpu-scalarize-global-loads=false), so nothing else it reads waits in the
 // scalar cache. A kernel without it keeps HIP's acquire: each packet's code is read to see which. HIP knows nothing of these
-// packets; a HIP kernel after them holds the stream's place, so what HIP then queues or waits for comes after them.
+// packets; a HIP kernel before them keeps them after what HIP has queued, and one after them holds the stream's place, so what HIP
+// then queues or waits for comes after them.
 #if defined(__HIPCC__)
 __global__ void direct_queue_of(uint64_t* out) {
     *out = reinterpret_cast<uint64_t>(__builtin_amdgcn_queue_ptr());
@@ -91,6 +92,9 @@ inline std::vector<DirectPacket> direct_window(Device& d, hipGraphExec_t exec) {
 inline void direct_replay(Device& d, const std::vector<DirectPacket>& packets) {
     auto* q = static_cast<DirectQueue*>(d.direct_queue);
     DirectApi& api = direct_api();
+    // (HIP's kernel first as well: it waits for a copy HIP has queued, which may be off this queue, and invalidates what a copy wrote
+    // past this GPU's L2, which the packets' own invalidation does not reach)
+    direct_tail<<<1, 1, 0, d.stream>>>();
     const uint64_t n = packets.size(), first = api.add_write(q, n);
     while (first + n - api.load_read(q) >= q->size) {}
     for (uint64_t k = 0; k < n; ++k)
