@@ -376,6 +376,9 @@ pub struct Model {
     memory_before: Option<(u64, u64, u64)>,
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
+    /// What is page-locked, for the thread that keeps the working set's limit.
+    pinned_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    watching_memory: bool,
     /// Page-locked host bytes besides the K/V.
     pinned_other: u64,
     /// The expert banks a partially resident model reads from host memory.
@@ -483,6 +486,8 @@ impl Model {
             pass_counts: [0; 2],
             memory_before: None,
             kv_capacity: context,
+            pinned_now: Default::default(),
+            watching_memory: false,
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
             hybrid_counts: Value::Null,
@@ -941,6 +946,11 @@ impl Model {
         }
         self.banks_bytes = banks_total;
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state, banks_total);
+        self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
+        if !self.watching_memory {
+            self.watching_memory = true;
+            crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), banks_total);
+        }
         if registered > 0 {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
             // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
@@ -1338,20 +1348,11 @@ impl Model {
         run(&mut self.group, &operands)
     }
 
-    /// A generated token counted; every so many, the working set's limit again.
-    fn token_made(&mut self) {
-        self.metric_count("generated_tokens", 1);
-        if self.last_metrics.get("generated_tokens").and_then(Value::as_u64).unwrap_or(0) % 256 == 0 {
-            self.hold_memory();
-        }
-    }
-
-    /// The working set's limit, from what is free now. It follows what a K/V growth has just locked and what other programs have taken or given
-    /// back: read once a request, a five-minute prompt took the machine to 0.47 GiB available.
+    /// The working set's limit, which follows what is free ([`crate::host::watch_working_set`]), after what a K/V growth has just locked.
     fn hold_memory(&self) {
         if self.partial {
             let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * 4096;
-            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+            self.pinned_now.store(pinned, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1873,7 +1874,6 @@ impl Model {
                     return Ok(None);
                 }
                 position = end;
-                self.hold_memory();
                 progress(end, tokens.len());
             }
             if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
@@ -2137,7 +2137,7 @@ impl Model {
             }
             for value in &emitted {
                 produced += 1;
-                self.token_made();
+                self.metric_count("generated_tokens", 1);
                 self.metric_count("decode_forward_tokens", 1);
                 self.update_rate();
                 emit(*value);
@@ -2259,7 +2259,6 @@ impl Model {
         sampling.check()?;
         self.weights.check_unchanged()?;
         self.group.ensure_slots()?;
-        self.hold_memory();
         let parking = Instant::now();
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
@@ -2326,7 +2325,7 @@ impl Model {
             if self.last_metrics["ttft_seconds"].is_null() {
                 self.last_metrics.insert("ttft_seconds".into(), json!(started.elapsed().as_secs_f64()));
             }
-            self.token_made();
+            self.metric_count("generated_tokens", 1);
             emit(token);
             if index + 1 < max_new {
                 let decode_started = Instant::now();
