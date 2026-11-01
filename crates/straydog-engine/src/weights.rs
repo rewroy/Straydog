@@ -211,10 +211,19 @@ fn header(file: &File, name: &str, first: &str) -> Result<straydog_gguf::ModelHe
     straydog_gguf::inspect_header(snapshot, size).map_err(|exc| format!("Straydog GGUF preflight: {exc}"))
 }
 
-/// A file no younger than its verity tree (and its size unchanged is the tree's own check, at `Verifier::open`).
+/// A file no younger than its verity tree (and its size unchanged is the tree's own check, at `Verifier::open`). This is what lets a start
+/// read the file unhashed, so on Unix it reads the change time, which no tool can set back as it can a modification time. It catches accidents
+/// and careless edits, not someone who can write the data directory too: they can make a tree look newer.
 fn tree_is_current(file: &File, tree: &Path) -> bool {
-    let modified = |metadata: std::io::Result<std::fs::Metadata>| metadata.and_then(|metadata| metadata.modified()).ok();
-    matches!((modified(file.metadata()), modified(std::fs::metadata(tree))), (Some(file), Some(tree)) if file <= tree)
+    let tree = std::fs::metadata(tree).and_then(|metadata| metadata.modified()).ok();
+    #[cfg(unix)]
+    let file = file.metadata().ok().map(|metadata| {
+        use std::os::unix::fs::MetadataExt;
+        std::time::UNIX_EPOCH + std::time::Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0) as u32)
+    });
+    #[cfg(not(unix))]
+    let file = file.metadata().and_then(|metadata| metadata.modified()).ok();
+    matches!((file, tree), (Some(file), Some(tree)) if file <= tree)
 }
 
 impl Weights {
