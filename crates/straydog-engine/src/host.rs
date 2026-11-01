@@ -60,7 +60,8 @@ pub fn left_free(memory: u64) -> u64 {
 /// `wanted` bytes held in memory by a process with `held` there already, at most what `available`
 /// physical memory gives while [`left_free`] stays free.
 pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
-    wanted.min(held.saturating_add(available.saturating_sub(left_free(memory))))
+    // (less than is held, when less than that is free: other programs' memory, a K/V grown)
+    wanted.min(held.saturating_add(available).saturating_sub(left_free(memory)))
 }
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
@@ -107,7 +108,9 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
-        let share = within_free(share, windows_working_set(), windows_available().0, memory);
+        // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
+        let least = share.min(memory / 8 * 3);
+        let share = within_free(share, windows_working_set(), windows_available().0, memory).max(least);
         let mut wanted = share;
         while wanted >= 1 << 30 {
             // SAFETY: the pseudo handle of this process and plain values.
@@ -176,7 +179,8 @@ mod tests {
         // 62 GiB with 30 free: the 47 GiB asked becomes what is held and what can go.
         assert_eq!(within_free(47 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 2 * GIB + 30 * GIB - 62 * GIB / 8);
         assert_eq!(within_free(20 * GIB, 2 * GIB, 30 * GIB, 62 * GIB), 20 * GIB);
-        assert_eq!(within_free(47 * GIB, 2 * GIB, GIB, 62 * GIB), 2 * GIB);
+        assert_eq!(within_free(47 * GIB, 2 * GIB, GIB, 62 * GIB), 0);
+        assert_eq!(within_free(47 * GIB, 30 * GIB, GIB, 62 * GIB), 31 * GIB - 62 * GIB / 8);
         // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
         assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
         assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
@@ -249,11 +253,12 @@ fn windows_available() -> (u64, u64) {
     if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { (status.ullAvailPhys, status.ullAvailPageFile) } else { (0, 0) }
 }
 
-/// The commit the system has left, where the engine can run out of it: Windows charges page-locked memory and device memory to it.
-pub fn commit_left() -> Option<u64> {
+/// The physical memory available and the commit the system has left, where the engine can run out of it: Windows charges page-locked memory
+/// and device memory to commit.
+pub fn commit_left() -> Option<(u64, u64)> {
     #[cfg(windows)]
     {
-        Some(windows_available().1).filter(|left| *left > 0)
+        Some(windows_available()).filter(|(_, commit)| *commit > 0)
     }
     #[cfg(not(windows))]
     {
