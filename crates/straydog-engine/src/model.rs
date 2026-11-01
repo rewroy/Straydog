@@ -96,8 +96,9 @@ const STARTING_KV: usize = 32768;
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
 const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
-/// New tokens from which a partially resident model's batches take the slots' VRAM: putting the slots back costs a fraction of a second.
-const LONG_PREFILL: usize = 4096;
+/// New tokens from which a partially resident model's batches take the slots' VRAM: past one batch, the second batch's streaming costs more
+/// than putting the slots back, a fraction of a second.
+const LONG_PREFILL: usize = 1536;
 /// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
