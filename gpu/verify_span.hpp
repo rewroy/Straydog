@@ -101,8 +101,11 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
 
 // Rows of a verification through partially resident layers: verify_layer's arithmetic up to the experts, then the rows' routes
 // side by side (hybrid_moe.hpp), each row's CPU experts on the host. Under prelaunch a layer's graph awaits the last one's.
-void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
-    if (!input || !steps || steps > verify_max || steps > hybrid_rows) throw std::runtime_error("invalid hybrid verification");
+// The rows come from the host (`input`) or from device memory (`source`). The MTP layer (begin 48), running ahead of the
+// model's layers in the same pass, counts no token and starts no swaps of its own.
+void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output,
+                        const float* source = nullptr) {
+    if ((!input && !source) || !steps || steps > verify_max || steps > hybrid_rows) throw std::runtime_error("invalid hybrid verification");
     float* workspace = nullptr;
     for (size_t layer = begin; layer < end; ++layer) {
         auto found = d.decoder.find(layer);
@@ -116,11 +119,12 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         throw std::runtime_error("speculative verification needs a larger decoder workspace");
     kv_prepare_span(d, begin, end, position, steps);
     const VerifyLayout v = verify_layout(workspace);
-    upload(d, v.hidden, input, steps * 10240 * 4);
+    if (input) upload(d, v.hidden, input, steps * 10240 * 4);
+    else if (source != v.hidden) check(hipMemcpyAsync(v.hidden, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     uint32_t positions[verify_max];
     for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
     upload(d, v.positions, positions, steps * 4);
-    if (position != d.hybrid_position) { d.hybrid_position = position; d.hybrid_tokens += steps; }
+    if (begin < 48 && position != d.hybrid_position) { d.hybrid_position = position; d.hybrid_tokens += steps; }
     hybrid_settle(d, false);
     const bool ahead = hybrid_ahead(d, begin, end);
     HybridAwait await(d);
@@ -189,8 +193,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     if (output) download(d, output, v.hidden, steps * 10240 * 4);
     else check(hipStreamSynchronize(d.stream));
     if (ahead) await.check_failed();
-    // (the MTP layer is no hybrid layer: this is the device's last with `end` at 48)
-    if ((end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4) {
+    if (begin < 48 && (end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4) {
         d.hybrid_verify_balanced = d.hybrid_tokens;
         hybrid_rebalance(d, 32, false);
     }
@@ -859,6 +862,10 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     else check(hipMemcpyAsync(rows, verify_layout(found->second.workspace).hidden + (previous - 1) * 10240, 10240 * 4,
                               hipMemcpyDeviceToDevice, d.stream));
     mtp_prologue_device(d, mtp, mtp_kinds, steps);
+    if (d.resident.find(found->second.moe)->second->hybrid) {
+        hybrid_verify_span(d, layer, layer + 1, position, steps, nullptr, nullptr, rows);
+        return verify_layout(found->second.workspace).hidden;
+    }
     return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
 }
 // The vocabulary head on a draft's row `last` (on this device), its token and probability back; with `top`, instead of the
