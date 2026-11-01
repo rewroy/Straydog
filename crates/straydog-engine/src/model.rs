@@ -2310,10 +2310,14 @@ impl Model {
                 let decode_started = Instant::now();
                 let Some(next) = self.forward(&[token], true, &|| false)? else { return Ok(()) };
                 logits = next.unwrap();
-                self.metric_add("decode_seconds", decode_started.elapsed().as_secs_f64());
+                let seconds = decode_started.elapsed().as_secs_f64();
+                self.metric_add("decode_seconds", seconds);
                 if let Some(profile) = self.profile.as_mut() {
-                    profile.rows[1].1 += decode_started.elapsed().as_secs_f64();
+                    profile.rows[1].1 += seconds;
                 }
+                // (for the request's line: a pass without drafts is a lone row)
+                self.pass_counts[0] += 1;
+                self.pass_seconds[0] = if self.pass_seconds[0] > 0.0 { self.pass_seconds[0] + (seconds.min(3.0 * self.pass_seconds[0]) - self.pass_seconds[0]) / 16.0 } else { seconds };
                 self.metric_count("decode_forward_tokens", 1);
                 self.update_rate();
             }
