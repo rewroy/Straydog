@@ -131,16 +131,16 @@ bool cpu_has(const char* feature) {
 #if defined(_MSC_VER) && !defined(__clang__)
     int info[4];
     __cpuidex(info, 7, 0);
-    const bool f = info[1] & (1 << 16), avx2 = info[1] & (1 << 5);
+    const bool f = info[1] & (1 << 16), bw = info[1] & (1 << 30), avx2 = info[1] & (1 << 5);
     __cpuid(info, 1);
     const bool fma = info[2] & (1 << 12), f16c = info[2] & (1 << 29), osxsave = info[2] & (1 << 27);
     const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
     const bool ymm = (xcr0 & 6) == 6, zmm = (xcr0 & 0xE6) == 0xE6;
-    if (!std::strcmp(feature, "avx512")) return f && f16c && zmm;
+    if (!std::strcmp(feature, "avx512")) return f && bw && f16c && zmm;
     return avx2 && fma && f16c && ymm;
 #else
     __builtin_cpu_init();
-    if (!std::strcmp(feature, "avx512")) return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("f16c");
+    if (!std::strcmp(feature, "avx512")) return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("f16c");
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
 }
@@ -165,11 +165,13 @@ const uint8_t* iq_table(int kind) {
     return iq_tables[index].data();
 }
 // The same grids as F32 values for the fused row kernels (IQ1: value - 1, as decoded).
-std::vector<float> iq_floats[6];
+// Aligned to a cache line: a 32-byte entry of a table at 16 mod 32 straddles lines every other time.
+std::vector<float> iq_float_storage[6];
+const float* iq_floats[6];
 const float* iq_float(int kind) {
     const int index = iq_index(kind);
-    if (index < 0 || iq_floats[index].empty()) throw std::runtime_error("IQ grid tables were not provided");
-    return iq_floats[index].data();
+    if (index < 0 || !iq_floats[index]) throw std::runtime_error("IQ grid tables were not provided");
+    return iq_floats[index];
 }
 constexpr int iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 // MXFP4: doubled E2M1 values; the E8M0 block scale is halved to match, 2^(e - 128).
@@ -717,8 +719,11 @@ int sd_iq_tables(const uint8_t* iq2_xxs, const uint8_t* iq2_xs, const uint8_t* i
         }
         for (int i = 0; i < 6; ++i) {
             iq_tables[i].assign(tables[i], tables[i] + iq_table_bytes[i]);
-            iq_floats[i].resize(iq_table_bytes[i]);
-            for (size_t j = 0; j < iq_table_bytes[i]; ++j) iq_floats[i][j] = float(tables[i][j]) - (i == 5 ? 1.0f : 0.0f);
+            if (iq_floats[i]) continue;
+            iq_float_storage[i].resize(iq_table_bytes[i] + 16);
+            float* grid = reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(iq_float_storage[i].data()) + 63) & ~uintptr_t(63));
+            for (size_t j = 0; j < iq_table_bytes[i]; ++j) grid[j] = float(tables[i][j]) - (i == 5 ? 1.0f : 0.0f);
+            iq_floats[i] = grid;
         }
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }

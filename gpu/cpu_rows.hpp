@@ -235,64 +235,75 @@ inline void prefetch_next(const uint8_t* row, size_t stride, size_t b) {
 // same expression and rounding as Block::chunk), the sign bytes and IQ1 deltas, so the
 // per-chunk work is loads, one multiply, a sign flip and the FMA.
 struct Prepared {
-    alignas(64) uint32_t offset[64];   // grid rows: 32 (IQ1, IQ2) or 64 (IQ3)
+    alignas(64) uint16_t offset[64];   // grid rows: 32 (IQ1, IQ2) or 64 (IQ3); the largest is 2047 * 32
     alignas(64) float scale[16];
     alignas(64) float delta[32];       // IQ1_M
     alignas(64) uint8_t sign[32];
     const uint8_t* signs;              // the block's own sign bytes (IQ2_S, IQ3_S), else sign
 };
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512i lanes16(int first = 0) { return _mm512_add_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(first)); }
 // Bytes at p (16 of them) widened to sixteen 32-bit lanes.
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512i bytes16(const uint8_t* p) { return _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))); }
 // Lane i takes (source[select_i] >> shift_i) & mask.
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512i field16(__m512i source, __m512i select, __m512i shift, int mask) {
     return _mm512_and_si512(_mm512_srlv_epi32(_mm512_permutexvar_epi32(select, source), shift), _mm512_set1_epi32(mask));
 }
 // Seven sign bits plus the parity bit, sixteen groups at a time (as iq_signs).
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512i signs16(__m512i bits) {
     __m512i parity = _mm512_xor_si512(bits, _mm512_srli_epi32(bits, 4));
     parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
     parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
     return _mm512_or_si512(bits, _mm512_slli_epi32(_mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
 }
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline void store_signs(uint8_t* out, __m512i low, __m512i high) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out), _mm512_cvtepi32_epi8(low));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16), _mm512_cvtepi32_epi8(high));
 }
+// Sixteen rows' grid indices as byte offsets in the table, an entry being 1 << shift bytes.
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline void store_offsets(uint16_t* out, __m512i index, int shift) {
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out), _mm512_cvtepi32_epi16(_mm512_slli_epi32(index, unsigned(shift))));
+}
 // IQ2 scale per sixteen values c: d * (0.5 + nibble) * 0.25.
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline void iq2_scales(float d, __m512i nibbles, float* out) {
     const __m512 sum = _mm512_add_ps(_mm512_set1_ps(0.5f), _mm512_cvtepi32_ps(nibbles));
     _mm512_store_ps(out, _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(d), sum), _mm512_set1_ps(0.25f)));
 }
 template<int kind>
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 void prepare(const uint8_t* b, Prepared& p) {
-    const __m512i lane = lanes16();
     if constexpr (kind == 22) {   // IQ2_S: qs[2..34) | 2 bits of qh[66 + ib]; scales nibbles at 74; signs at 34
-        const __m512i qh = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
-        for (int half = 0; half < 2; ++half) {
-            const __m512i g = lanes16(16 * half);
-            const __m512i high = field16(qh, _mm512_srli_epi32(g, 2), _mm512_slli_epi32(_mm512_and_si512(g, _mm512_set1_epi32(3)), 1), 3);
-            const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * half), _mm512_slli_epi32(high, 8));
-            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
-        }
-        const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 74)));
-        iq2_scales(half_at(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
+        // Word g takes qh[g / 4] in both bytes, then the shift brings its pair of bits to bits 8 and 9.
+        const __m512i qh = _mm512_broadcastq_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
+        const __m512i spread = _mm512_setr_epi32(0x00000000, 0x00000000, 0x01010101, 0x01010101, 0x02020202, 0x02020202, 0x03030303, 0x03030303,
+                                                 0x04040404, 0x04040404, 0x05050505, 0x05050505, 0x06060606, 0x06060606, 0x07070707, 0x07070707);
+        const __m512i shifts = _mm512_set1_epi64(0x0006000400020000);
+        const __m512i high = _mm512_srlv_epi16(_mm512_shuffle_epi8(qh, spread), shifts);
+        const __m512i index = _mm512_or_si512(_mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2))),
+                                              _mm512_and_si512(high, _mm512_set1_epi16(0x300)));
+        _mm512_store_si512(p.offset, _mm512_slli_epi16(index, 5));
+        // Scale = d * (0.5 + nibble) * 0.25: the half's 11 bits times the five of 0.5 + nibble are exact, so the order does not round.
+        const __m128i n = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 74)), low = _mm_set1_epi8(15);
+        const __m128i nibbles = _mm_unpacklo_epi8(_mm_and_si128(n, low), _mm_and_si128(_mm_srli_epi16(n, 4), low));
+        const __m512 levels = _mm512_setr_ps(0.125f, 0.375f, 0.625f, 0.875f, 1.125f, 1.375f, 1.625f, 1.875f,
+                                             2.125f, 2.375f, 2.625f, 2.875f, 3.125f, 3.375f, 3.625f, 3.875f);
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(nibbles), levels)));
         p.signs = b + 34;
     } else if constexpr (kind == 16) {   // IQ2_XXS: per ib, four index bytes then aux (signs, scale)
+        const __m512i lane = lanes16();
         const __m512i words = _mm512_loadu_si512(reinterpret_cast<const void*>(b + 2));   // 2ib: indices, 2ib + 1: aux
         __m512i sign_bits[2];
         for (int half = 0; half < 2; ++half) {
             const __m512i g = lanes16(16 * half), l = _mm512_and_si512(g, _mm512_set1_epi32(3));
             const __m512i word = _mm512_slli_epi32(_mm512_srli_epi32(g, 2), 1);
             const __m512i index = field16(words, word, _mm512_slli_epi32(l, 3), 255);
-            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            store_offsets(p.offset + 16 * half, index, 5);
             const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(word, _mm512_set1_epi32(1)), words);
             sign_bits[half] = signs16(_mm512_and_si512(_mm512_srlv_epi32(aux, _mm512_mullo_epi32(l, _mm512_set1_epi32(7))), _mm512_set1_epi32(127)));
         }
@@ -301,10 +312,11 @@ void prepare(const uint8_t* b, Prepared& p) {
         iq2_scales(half_at(b), _mm512_srli_epi32(aux, 28), p.scale);
         p.signs = p.sign;
     } else if constexpr (kind == 17) {   // IQ2_XS: 16-bit q per group (9-bit index, 7 sign bits); scales at 66
+        const __m512i lane = lanes16();
         __m512i sign_bits[2];
         for (int half = 0; half < 2; ++half) {
             const __m512i q = _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2 + 32 * half)));
-            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(_mm512_and_si512(q, _mm512_set1_epi32(511)), 5));
+            store_offsets(p.offset + 16 * half, _mm512_and_si512(q, _mm512_set1_epi32(511)), 5);
             sign_bits[half] = signs16(_mm512_srli_epi32(q, 9));
         }
         store_signs(p.sign, sign_bits[0], sign_bits[1]);
@@ -312,12 +324,13 @@ void prepare(const uint8_t* b, Prepared& p) {
         iq2_scales(half_at(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
         p.signs = p.sign;
     } else if constexpr (kind == 29) {   // IQ1_M: qs[0..32) | 3 bits of a qh nibble; nibble bit 3 picks the delta
+        const __m512i lane = lanes16();
         const __m512i qh = bytes16(b + 32);
         for (int half = 0; half < 2; ++half) {
             const __m512i g = lanes16(16 * half);
             const __m512i nibble = field16(qh, _mm512_srli_epi32(g, 1), _mm512_slli_epi32(_mm512_and_si512(g, _mm512_set1_epi32(1)), 2), 15);
             const __m512i index = _mm512_or_si512(bytes16(b + 16 * half), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(7)), 8));
-            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            store_offsets(p.offset + 16 * half, index, 5);
             const __m512i delta = _mm512_or_si512(_mm512_set1_epi32(0x3E000000), _mm512_slli_epi32(_mm512_and_si512(nibble, _mm512_set1_epi32(8)), 28));
             _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
         }
@@ -330,20 +343,22 @@ void prepare(const uint8_t* b, Prepared& p) {
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(word, _mm512_srli_epi32(lane, 2), shift, 7), 1), _mm512_set1_epi32(1));
         _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(odd)));
     } else if constexpr (kind == 19) {   // IQ1_S: qs[2..34) | 3 bits of the ib's 16-bit word at 34; its scale and delta sign
+        const __m512i lane = lanes16();
         const __m512i qh = _mm512_cvtepu16_epi32(_mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 34))));
         for (int half = 0; half < 2; ++half) {
             const __m512i g = lanes16(16 * half), ib = _mm512_srli_epi32(g, 2);
             const __m512i high = field16(qh, ib, _mm512_mullo_epi32(_mm512_and_si512(g, _mm512_set1_epi32(3)), _mm512_set1_epi32(3)), 7);
             const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * half), _mm512_slli_epi32(high, 8));
-            _mm512_store_si512(p.offset + 16 * half, _mm512_slli_epi32(index, 5));
+            store_offsets(p.offset + 16 * half, index, 5);
             const __m512i delta = _mm512_or_si512(_mm512_set1_epi32(0x3E000000), _mm512_slli_epi32(field16(qh, ib, _mm512_set1_epi32(15), 1), 31));
             _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
         }
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(qh, _mm512_srli_epi32(lane, 1), _mm512_set1_epi32(12), 7), 1), _mm512_set1_epi32(1));
         _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_cvtepi32_ps(odd)));
     } else if constexpr (kind == 18) {   // IQ3_XXS: 64 index bytes; per ib aux at 66 (signs, scale)
+        const __m512i lane = lanes16();
         for (int quarter = 0; quarter < 4; ++quarter)
-            _mm512_store_si512(p.offset + 16 * quarter, _mm512_slli_epi32(bytes16(b + 2 + 16 * quarter), 4));
+            store_offsets(p.offset + 16 * quarter, bytes16(b + 2 + 16 * quarter), 4);
         const __m512i aux = _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 66)));
         __m512i sign_bits[2];
         for (int half = 0; half < 2; ++half) {
@@ -357,12 +372,13 @@ void prepare(const uint8_t* b, Prepared& p) {
         p.signs = p.sign;
     } else {   // IQ3_S: qs[2..66) | bit r of qh[66 + ib]; signs at 74; scales nibbles at 106
         static_assert(kind == 21);
+        const __m512i lane = lanes16();
         const __m512i qh = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
         for (int quarter = 0; quarter < 4; ++quarter) {
             const __m512i t = lanes16(16 * quarter);
             const __m512i high = field16(qh, _mm512_srli_epi32(t, 3), _mm512_and_si512(t, _mm512_set1_epi32(7)), 1);
             const __m512i index = _mm512_or_si512(bytes16(b + 2 + 16 * quarter), _mm512_slli_epi32(high, 8));
-            _mm512_store_si512(p.offset + 16 * quarter, _mm512_slli_epi32(index, 4));
+            store_offsets(p.offset + 16 * quarter, index, 4);
         }
         const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 106)));
         const __m512i ib = _mm512_srli_epi32(lane, 1);
@@ -373,14 +389,14 @@ void prepare(const uint8_t* b, Prepared& p) {
     }
 }
 template<int kind>
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
     __m512 v;
     if constexpr (Block<kind>::width == 8) {
-        uint64_t both;
-        std::memcpy(&both, p.offset + 2 * c, 8);
-        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + uint32_t(both))));
-        const __m256d high = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + (both >> 32))));
+        uint32_t both;
+        std::memcpy(&both, p.offset + 2 * c, 4);
+        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + (both & 0xffff))));
+        const __m256d high = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + (both >> 16))));
         v = _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castpd256_pd512(low), high, 1));
     } else {
         v = _mm512_castps128_ps512(_mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c])));
@@ -399,21 +415,27 @@ inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
     }
 }
 template<int kind, int N>
-SD_TARGET("avx512f,avx2,f16c")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 void rows512(const uint8_t* row, size_t stride, const float* x, size_t cols, const float* table, float* out) {
     using B = Block<kind>;
     __m512 acc[N];
     for (int r = 0; r < N; ++r) acc[r] = _mm512_setzero_ps();
     if constexpr (B::grid > 0) {
-        Prepared prep[N];
+        // Each block is prepared while the one before it computes: reading a wide store still in the store queue costs more than the wait.
+        Prepared buffers[2][N];
+        Prepared* prep = buffers[0];
         const char* bytes = reinterpret_cast<const char*>(table);
-        for (size_t b = 0; b < cols / B::values; ++b) {
+        const size_t blocks = cols / B::values;
+        for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride, prep[r]);
+        for (size_t b = 0; b < blocks; ++b) {
             prefetch_next<B::bytes, N>(row, stride, b);
-            for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride + b * B::bytes, prep[r]);
+            Prepared* next = buffers[(b + 1) & 1];
+            if (b + 1 < blocks) for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride + (b + 1) * B::bytes, next[r]);
             for (unsigned c = 0; c < B::values / 16; ++c) {
                 const __m512 xv = _mm512_loadu_ps(x + b * B::values + 16 * c);
                 for (int r = 0; r < N; ++r) acc[r] = _mm512_fmadd_ps(prepared16<kind>(prep[r], c, bytes), xv, acc[r]);
             }
+            prep = next;
         }
     } else {
         B block[N];
