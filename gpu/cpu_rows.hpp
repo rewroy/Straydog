@@ -264,6 +264,13 @@ inline void store_signs(uint8_t* out, __m512i low, __m512i high) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out), _mm512_cvtepi32_epi8(low));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 16), _mm512_cvtepi32_epi8(high));
 }
+// A block's scale by the instruction: half_value's branches cost more than the rest of a scale.
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline float wide_half(const uint8_t* p) {
+    uint16_t bits;
+    std::memcpy(&bits, p, 2);
+    return SD_HALF_TO_FLOAT(bits);
+}
 // Sixteen rows' grid indices as byte offsets in the table, an entry being 1 << shift bytes.
 SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline void store_offsets(uint16_t* out, __m512i index, int shift) {
@@ -293,7 +300,7 @@ void prepare(const uint8_t* b, Prepared& p) {
         const __m128i nibbles = _mm_unpacklo_epi8(_mm_and_si128(n, low), _mm_and_si128(_mm_srli_epi16(n, 4), low));
         const __m512 levels = _mm512_setr_ps(0.125f, 0.375f, 0.625f, 0.875f, 1.125f, 1.375f, 1.625f, 1.875f,
                                              2.125f, 2.375f, 2.625f, 2.875f, 3.125f, 3.375f, 3.625f, 3.875f);
-        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(nibbles), levels)));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(nibbles), levels)));
         p.signs = b + 34;
     } else if constexpr (kind == 16) {   // IQ2_XXS: per ib, four index bytes then aux (signs, scale)
         const __m512i lane = lanes16();
@@ -309,7 +316,7 @@ void prepare(const uint8_t* b, Prepared& p) {
         }
         store_signs(p.sign, sign_bits[0], sign_bits[1]);
         const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(_mm512_slli_epi32(_mm512_srli_epi32(lane, 1), 1), _mm512_set1_epi32(1)), words);
-        iq2_scales(half_at(b), _mm512_srli_epi32(aux, 28), p.scale);
+        iq2_scales(wide_half(b), _mm512_srli_epi32(aux, 28), p.scale);
         p.signs = p.sign;
     } else if constexpr (kind == 17) {   // IQ2_XS: 16-bit q per group (9-bit index, 7 sign bits); scales at 66
         const __m512i lane = lanes16();
@@ -321,7 +328,7 @@ void prepare(const uint8_t* b, Prepared& p) {
         }
         store_signs(p.sign, sign_bits[0], sign_bits[1]);
         const __m512i scales = _mm512_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 66)));
-        iq2_scales(half_at(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
+        iq2_scales(wide_half(b), field16(scales, _mm512_srli_epi32(lane, 1), _mm512_slli_epi32(_mm512_and_si512(lane, _mm512_set1_epi32(1)), 2), 15), p.scale);
         p.signs = p.sign;
     } else if constexpr (kind == 29) {   // IQ1_M: qs[0..32) | 3 bits of a qh nibble; nibble bit 3 picks the delta
         const __m512i lane = lanes16();
@@ -354,7 +361,7 @@ void prepare(const uint8_t* b, Prepared& p) {
             _mm512_store_ps(p.delta + 16 * half, _mm512_castsi512_ps(delta));
         }
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(field16(qh, _mm512_srli_epi32(lane, 1), _mm512_set1_epi32(12), 7), 1), _mm512_set1_epi32(1));
-        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_cvtepi32_ps(odd)));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_cvtepi32_ps(odd)));
     } else if constexpr (kind == 18) {   // IQ3_XXS: 64 index bytes; per ib aux at 66 (signs, scale)
         const __m512i lane = lanes16();
         for (int quarter = 0; quarter < 4; ++quarter)
@@ -368,7 +375,7 @@ void prepare(const uint8_t* b, Prepared& p) {
         store_signs(p.sign, sign_bits[0], sign_bits[1]);
         const __m512i scale = _mm512_srli_epi32(_mm512_permutexvar_epi32(_mm512_srli_epi32(lane, 1), aux), 28);
         const __m512 sum = _mm512_add_ps(_mm512_set1_ps(0.5f), _mm512_cvtepi32_ps(scale));
-        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(half_at(b)), sum), _mm512_set1_ps(0.5f)));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(wide_half(b)), sum), _mm512_set1_ps(0.5f)));
         p.signs = p.sign;
     } else {   // IQ3_S: qs[2..66) | bit r of qh[66 + ib]; signs at 74; scales nibbles at 106
         static_assert(kind == 21);
@@ -384,7 +391,7 @@ void prepare(const uint8_t* b, Prepared& p) {
         const __m512i ib = _mm512_srli_epi32(lane, 1);
         const __m512i nibble = field16(scales, _mm512_srli_epi32(ib, 1), _mm512_slli_epi32(_mm512_and_si512(ib, _mm512_set1_epi32(1)), 2), 15);
         const __m512i odd = _mm512_or_si512(_mm512_slli_epi32(nibble, 1), _mm512_set1_epi32(1));
-        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(half_at(b)), _mm512_cvtepi32_ps(odd)));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_cvtepi32_ps(odd)));
         p.signs = b + 74;
     }
 }
@@ -414,26 +421,37 @@ inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
         return _mm512_castsi512_ps(_mm512_mask_xor_epi32(bits, __mmask16(signs), bits, _mm512_set1_epi32(int(0x80000000u))));
     }
 }
+// A row's total from its sixteen lanes.
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline float total512(__m512 acc) {
+    alignas(64) float lanes[16];
+    _mm512_store_ps(lanes, acc);
+    return reduce16(lanes);
+}
+// The accumulators are separate locals, not an array: cl.exe keeps an array of vectors in memory, a store and a reload through
+// every row's FMA each chunk.
 template<int kind, int N>
 SD_TARGET("avx512f,avx512bw,avx2,f16c")
 void rows512(const uint8_t* row, size_t stride, const float* x, size_t cols, const float* table, float* out) {
     using B = Block<kind>;
-    __m512 acc[N];
-    for (int r = 0; r < N; ++r) acc[r] = _mm512_setzero_ps();
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     if constexpr (B::grid > 0) {
         // Each block is prepared while the one before it computes: reading a wide store still in the store queue costs more than the wait.
         Prepared buffers[2][N];
-        Prepared* prep = buffers[0];
+        const Prepared* prep = buffers[0];
         const char* bytes = reinterpret_cast<const char*>(table);
         const size_t blocks = cols / B::values;
-        for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride, prep[r]);
+        for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride, buffers[0][r]);
         for (size_t b = 0; b < blocks; ++b) {
             prefetch_next<B::bytes, N>(row, stride, b);
             Prepared* next = buffers[(b + 1) & 1];
             if (b + 1 < blocks) for (int r = 0; r < N; ++r) prepare<kind>(row + size_t(r) * stride + (b + 1) * B::bytes, next[r]);
             for (unsigned c = 0; c < B::values / 16; ++c) {
                 const __m512 xv = _mm512_loadu_ps(x + b * B::values + 16 * c);
-                for (int r = 0; r < N; ++r) acc[r] = _mm512_fmadd_ps(prepared16<kind>(prep[r], c, bytes), xv, acc[r]);
+                acc0 = _mm512_fmadd_ps(prepared16<kind>(prep[0], c, bytes), xv, acc0);
+                if constexpr (N > 1) acc1 = _mm512_fmadd_ps(prepared16<kind>(prep[1], c, bytes), xv, acc1);
+                if constexpr (N > 2) acc2 = _mm512_fmadd_ps(prepared16<kind>(prep[2], c, bytes), xv, acc2);
+                if constexpr (N > 3) acc3 = _mm512_fmadd_ps(prepared16<kind>(prep[3], c, bytes), xv, acc3);
             }
             prep = next;
         }
@@ -444,15 +462,17 @@ void rows512(const uint8_t* row, size_t stride, const float* x, size_t cols, con
             for (int r = 0; r < N; ++r) block[r].load(row + size_t(r) * stride + b * B::bytes);
             for (unsigned c = 0; c < B::values / 16; ++c) {
                 const __m512 xv = _mm512_loadu_ps(x + b * B::values + 16 * c);
-                for (int r = 0; r < N; ++r) acc[r] = _mm512_fmadd_ps(values16(block[r], c, table), xv, acc[r]);
+                acc0 = _mm512_fmadd_ps(values16(block[0], c, table), xv, acc0);
+                if constexpr (N > 1) acc1 = _mm512_fmadd_ps(values16(block[1], c, table), xv, acc1);
+                if constexpr (N > 2) acc2 = _mm512_fmadd_ps(values16(block[2], c, table), xv, acc2);
+                if constexpr (N > 3) acc3 = _mm512_fmadd_ps(values16(block[3], c, table), xv, acc3);
             }
         }
     }
-    for (int r = 0; r < N; ++r) {
-        alignas(64) float lanes[16];
-        _mm512_store_ps(lanes, acc[r]);
-        out[r] = reduce16(lanes);
-    }
+    out[0] = total512(acc0);
+    if constexpr (N > 1) out[1] = total512(acc1);
+    if constexpr (N > 2) out[2] = total512(acc2);
+    if constexpr (N > 3) out[3] = total512(acc3);
 }
 
 // AVX2: the same sixteen values as two halves of eight.
@@ -514,31 +534,42 @@ inline Halves values8x2(const Block<kind>& block, unsigned c, const float* table
                 _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q, 8))))};
     }
 }
+SD_TARGET("avx2,fma,f16c")
+inline float total256(__m256 low, __m256 high) {
+    alignas(32) float lanes[16];
+    _mm256_store_ps(lanes, low);
+    _mm256_store_ps(lanes + 8, high);
+    return reduce16(lanes);
+}
+template<int kind>
+SD_TARGET("avx2,fma,f16c")
+inline void accumulate8x2(const Block<kind>& block, unsigned c, const float* table, __m256 xl, __m256 xh, __m256& low, __m256& high) {
+    const Halves v = values8x2(block, c, table);
+    low = _mm256_fmadd_ps(v.low, xl, low);
+    high = _mm256_fmadd_ps(v.high, xh, high);
+}
 template<int kind, int N>
 SD_TARGET("avx2,fma,f16c")
 void rows256(const uint8_t* row, size_t stride, const float* x, size_t cols, const float* table, float* out) {
     using B = Block<kind>;
-    __m256 low[N], high[N];
+    __m256 low0 = _mm256_setzero_ps(), low1 = low0, low2 = low0, low3 = low0, high0 = low0, high1 = low0, high2 = low0, high3 = low0;
     B block[N];
-    for (int r = 0; r < N; ++r) low[r] = high[r] = _mm256_setzero_ps();
     for (size_t b = 0; b < cols / B::values; ++b) {
         prefetch_next<B::bytes, N>(row, stride, b);
         for (int r = 0; r < N; ++r) block[r].load(row + size_t(r) * stride + b * B::bytes);
         for (unsigned c = 0; c < B::values / 16; ++c) {
             const float* values = x + b * B::values + 16 * c;
             const __m256 xl = _mm256_loadu_ps(values), xh = _mm256_loadu_ps(values + 8);
-            for (int r = 0; r < N; ++r) {
-                const Halves v = values8x2(block[r], c, table);
-                low[r] = _mm256_fmadd_ps(v.low, xl, low[r]);
-                high[r] = _mm256_fmadd_ps(v.high, xh, high[r]);
-            }
+            accumulate8x2(block[0], c, table, xl, xh, low0, high0);
+            if constexpr (N > 1) accumulate8x2(block[1], c, table, xl, xh, low1, high1);
+            if constexpr (N > 2) accumulate8x2(block[2], c, table, xl, xh, low2, high2);
+            if constexpr (N > 3) accumulate8x2(block[3], c, table, xl, xh, low3, high3);
         }
     }
-    for (int r = 0; r < N; ++r) {
-        alignas(32) float lanes[16];
-        _mm256_store_ps(lanes, low[r]); _mm256_store_ps(lanes + 8, high[r]);
-        out[r] = reduce16(lanes);
-    }
+    out[0] = total256(low0, high0);
+    if constexpr (N > 1) out[1] = total256(low1, high1);
+    if constexpr (N > 2) out[2] = total256(low2, high2);
+    if constexpr (N > 3) out[3] = total256(low3, high3);
 }
 
 // count rows of one bank (stride bytes apart) against x; level 2 = AVX-512, 1 = AVX2.
