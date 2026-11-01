@@ -288,6 +288,8 @@ pub struct Backend {
     slot_bytes: u64,
     /// `create_expert_slots`' arguments, for a K/V growth to make the pool again (0: no pool).
     slot_stage: u64,
+    /// The pool could not come back after giving up its VRAM.
+    slots_absent: bool,
     slot_margin: u64,
     slot_size: u64,
     /// The prefill rows before a long prompt's batches took the slots' VRAM (see [`Backend::begin_long_prefill`]).
@@ -380,6 +382,7 @@ impl Backend {
             prefill_capacity: 1024,
             slot_bytes: 0,
             slot_stage: 0,
+            slots_absent: false,
             slot_margin: 0,
             long_prefill: None,
             slot_size: 0,
@@ -807,13 +810,15 @@ impl Backend {
     /// Every layer's host K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`).
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
         // The slots give up their VRAM for the longer indexers and take what is left, whether every layer grew or memory ran out.
+        crate::host::commit_note("K/V growth");
         // SAFETY: a live handle, between requests.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        crate::host::commit_note("slots released");
         let grown = self.grow_kv_layers(capacity, valid);
+        crate::host::commit_note("K/V grown");
         if self.slot_stage > 0 {
             let cache = if self.long_prefill.is_some() { 0 } else { self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)? };
-            // SAFETY: a live handle; the pool was released above.
-            check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) })?;
+            self.restore_slots(cache)?;
             self.rebalance(0)?;
         }
         grown
@@ -864,8 +869,7 @@ impl Backend {
         }
         // SAFETY: a live handle, between batches.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
-        // SAFETY: a live handle; the pool was released above. (0: the staging slots alone)
-        check(unsafe { ffi::sd_expert_slots_restore(self.handle, 0) })?;
+        self.restore_slots(0)?;
         self.long_prefill = Some(self.prefill_capacity);
         let (used, budget) = self.memory()?;
         let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
@@ -886,17 +890,37 @@ impl Backend {
         }
         // SAFETY: a live handle, between requests.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.slots_back()
+    }
+
+    /// The pool at `cache` slots, or none: [`Backend::slots_back`] asks again at the next request's start.
+    fn restore_slots(&mut self, cache: u64) -> Result<()> {
+        // SAFETY: a live handle; the pool has been released.
+        let restored = check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) }).map(drop);
+        self.slots_absent = restored.is_err();
+        restored
+    }
+
+    /// The pool, at what fits, with the experts that use it most.
+    fn slots_back(&mut self) -> Result<()> {
         let cache = self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)?;
-        // SAFETY: a live handle; the pool was released above.
-        check(unsafe { ffi::sd_expert_slots_restore(self.handle, cache) })?;
+        self.restore_slots(cache)?;
         self.rebalance(0)
     }
 
+    /// Before a request: the pool a failed one could not get back, if it is to be had now.
+    pub fn ensure_slots(&mut self) -> Result<()> {
+        if self.slots_absent { self.slots_back() } else { Ok(()) }
+    }
+
+    /// The batches' workspaces at `capacity` rows; if the device refuses them, as they were.
     fn prefill_buffers(&mut self, capacity: u64) -> Result<()> {
         let (moe_rows, decoder_bytes) = (capacity * MOE_ROW + 65536, decoder_workspace_bytes(capacity));
         let (mut moe, mut decoder) = (std::ptr::null_mut(), std::ptr::null_mut());
         // SAFETY: a live handle and out-parameters; every plan follows on the native side.
-        check(unsafe { ffi::sd_prefill_buffers(self.handle, capacity, moe_rows * 4, decoder_bytes, &mut moe, &mut decoder) })?;
+        let refused = check(unsafe { ffi::sd_prefill_buffers(self.handle, capacity, moe_rows * 4, decoder_bytes, &mut moe, &mut decoder) })? == 1;
+        let capacity = if refused { self.prefill_capacity } else { capacity };
+        let (moe_rows, decoder_bytes) = (capacity * MOE_ROW + 65536, decoder_workspace_bytes(capacity));
         for (key, pointer, rows) in [("@moe:workspace", moe, moe_rows), ("@scratch:decoder", decoder, decoder_bytes / 4)] {
             let entry = self.states.get_mut(key).ok_or("no such Straydog state")?;
             (entry.pointer, entry.rows) = (pointer, rows);
