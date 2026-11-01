@@ -89,7 +89,19 @@ pub fn direct(file: &File) -> Option<File> {
         let (before, after) = (file.metadata().ok()?, reopened.metadata().ok()?);
         (before.dev() == after.dev() && before.ino() == after.ino()).then_some(reopened)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{ReOpenFile, FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+        // SAFETY: a live handle; the result is a new handle on the same file, or invalid.
+        let handle = unsafe {
+            ReOpenFile(file.as_raw_handle() as _, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING)
+        };
+        // SAFETY: a handle this call owns.
+        (handle != INVALID_HANDLE_VALUE).then(|| unsafe { File::from_raw_handle(handle as _) })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = file;
         None
