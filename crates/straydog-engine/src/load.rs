@@ -308,7 +308,7 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
     let failure: Mutex<Option<String>> = Mutex::new(None);
     let count = |bytes: u64| progress("load", done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
     // (a start of checked files reads a few GiB piece by piece: a chunk's slot a thread is 4 GiB of commit on sixteen threads)
-    let slot_bytes = if sources.iter().all(|source| source.checked.is_some()) { CHECKED_SLOT } else { CHUNK_BYTES as usize };
+    let slot_bytes = if sources.iter().all(|source| source.checked.is_some()) { CHECKED_SLOT + 2 * crate::verity::BLOCK } else { CHUNK_BYTES as usize };
     std::thread::scope(|scope| {
         for mut worker in workers {
             let (chunks, next, failed, failure, count) = (&chunks, &next, &failed, &failure, &count);
@@ -326,9 +326,8 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                                 crate::digest::will_need(source.file, &[(base + at as u64, part as u64)]);
                                 for from in (0..part).step_by(CHECKED_SLOT) {
                                     let piece = (part - from).min(CHECKED_SLOT);
-                                    let read = crate::verity::read_verified(source.map, verifier, base + (at + from) as u64, piece as u64)
+                                    crate::verity::read_verified_into(source.map, verifier, base + (at + from) as u64, piece as u64, slot.as_mut_slice())
                                         .map_err(|error| format!("{}: {error}", source.name))?;
-                                    slot.as_mut_slice()[..piece].copy_from_slice(&read);
                                     count(piece as u64);
                                     let bytes = &slot.as_slice()[..piece];
                                     match target {
