@@ -2360,6 +2360,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         }
         void* pointer = nullptr;
         void* grown_index = nullptr;
+        void* grown_scratch = nullptr;
         try {
             std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
@@ -2373,6 +2374,8 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             std::copy_n(before.data() + 128 * old_pool, history, after.data() + 128 * pool);
             if (index->second < after.size() * 4) grown_index = allocate(d, after.size() * 4);
             check(hipMemcpy(grown_index ? grown_index : plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
+            // The layers' one scratch, once: it holds nothing between uses.
+            if (plan.states[2] && d.allocations.at(plan.states[2]) < 256 * pool * 4) grown_scratch = allocate(d, 256 * pool * 4);
         } catch (...) { cleanup(hipHostFree(grown)); throw; }
         // Every captured graph holds the old K/V or the old pitches.
         kv_clear_graphs(d);
@@ -2387,11 +2390,31 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             plan.states[1] = grown_index;
             if (sd_release(handle, old_index)) throw std::runtime_error(last_error);
         }
+        if (grown_scratch) {
+            void* old_scratch = plan.states[2];
+            for (auto& entry : d.decoder) {
+                if (entry.second.states[2] != old_scratch) continue;
+                std::replace(entry.second.dependencies.begin(), entry.second.dependencies.end(), old_scratch, grown_scratch);
+                entry.second.states[2] = grown_scratch;
+            }
+            if (sd_release(handle, old_scratch)) throw std::runtime_error(last_error);
+        }
         // (a DeltaNet layer holds no positions: its context is only what spans are checked against)
         for (auto& entry : d.decoder) if (decoder_linear(entry.first)) entry.second.context = std::max(entry.second.context, to);
         kv_layout(d);
         *state = pointer;
         *index_state = plan.states[1];
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// The scratch the K/V layers share, as sd_kv_grow left it.
+int sd_kv_scratch(void* handle, void** scratch) {
+    try {
+        auto& d = device(handle);
+        if (!scratch) throw std::runtime_error("invalid Straydog K/V scratch request");
+        *scratch = nullptr;
+        for (const auto& entry : d.decoder) if (entry.second.states[2]) *scratch = entry.second.states[2];
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

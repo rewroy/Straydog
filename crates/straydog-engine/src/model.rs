@@ -437,6 +437,11 @@ impl Model {
         model.group.defer_uploads();
         model.resident = model.prepare_resident_moe()?;
         if !model.resident {
+            // (before the expert placement, whose gates read what the indexers hold: at the whole context, a third of the slots)
+            if model.group.batch_capacity() == 256 && host && !model.group.parts() && context > STARTING_KV {
+                model.kv_capacity = STARTING_KV;
+                model.group.start_kv(STARTING_KV as u64)?;
+            }
             model.partial = model.group.batch_capacity() == 256 && model.prepare_hybrid_moe(settings.cpu_threads)?;
         }
         if !model.resident && !model.partial {
@@ -445,10 +450,6 @@ impl Model {
         crate::host::commit_note("experts placed");
         model.prepare_decoder(context64, false)?;
         crate::host::commit_note("decoder placed");
-        if model.partial && host && !model.group.parts() && context > STARTING_KV {
-            model.kv_capacity = STARTING_KV;
-            model.group.start_kv(STARTING_KV as u64)?;
-        }
         // SAFETY of the borrow: the operand points into the weights, which outlive the group.
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;

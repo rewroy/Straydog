@@ -783,7 +783,7 @@ impl Backend {
         }
         // The indexers start at that size too: on a small budget what they would hold for the whole context is a third of the slots.
         let indexers: Vec<(String, *mut std::ffi::c_void)> = self.states.iter()
-            .filter(|(key, _)| key.starts_with("@indexer:"))
+            .filter(|(key, _)| key.starts_with("@indexer:") || *key == "@scratch:qsa")
             .map(|(key, entry)| (key.clone(), entry.pointer))
             .collect();
         for (key, pointer) in indexers {
@@ -793,7 +793,8 @@ impl Backend {
             self.cache.remove(&key);
             // SAFETY: an allocation of this device; no plan holds it yet.
             check(unsafe { ffi::sd_release(self.handle, pointer) })?;
-            self.state(&key, (capacity / 4 + 1) * 128 + INDEX_HISTORY, 1, false)?;
+            let rows = if key == "@scratch:qsa" { 256 * (capacity / 4 + 1) } else { (capacity / 4 + 1) * 128 + INDEX_HISTORY };
+            self.state(&key, rows, 1, false)?;
             self.states.move_index(self.states.len() - 1, at);
         }
         Ok(())
@@ -834,6 +835,17 @@ impl Backend {
             (entry.pointer, entry.rows) = (index_state, rows);
             if let Some(cached) = self.cache.get_mut(&index) {
                 (cached.pointer, cached.rows) = (index_state, rows);
+            }
+        }
+        let mut scratch = std::ptr::null_mut();
+        // SAFETY: a live handle and an out-parameter.
+        check(unsafe { ffi::sd_kv_scratch(self.handle, &mut scratch) })?;
+        if !scratch.is_null() {
+            let rows = 256 * (capacity / 4 + 1);
+            let entry = self.states.get_mut("@scratch:qsa").ok_or("no such Straydog state")?;
+            (entry.pointer, entry.rows) = (scratch, rows);
+            if let Some(cached) = self.cache.get_mut("@scratch:qsa") {
+                (cached.pointer, cached.rows) = (scratch, rows);
             }
         }
         Ok(())
