@@ -225,9 +225,6 @@ inline __m512 values16(const Block<kind>& block, unsigned c, const float* table)
         return _mm512_mul_ps(_mm512_set1_ps(block.d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q)));
     }
 }
-inline void prefetch_lines(const uint8_t* first, size_t bytes) {
-    for (size_t line = 0; line < bytes; line += 64) _mm_prefetch(reinterpret_cast<const char*>(first + line), _MM_HINT_T0);
-}
 // Rows of an expert are contiguous: ask for the next N rows' block b while this one computes.
 template<size_t bytes, int N>
 inline void prefetch_next(const uint8_t* row, size_t stride, size_t b) {
@@ -550,7 +547,6 @@ void q2_rows512(const uint8_t* row, size_t stride, const float* x, size_t blocks
     if constexpr (N > 3) out[3] = _mm512_reduce_add_ps(total3);
 }
 inline void q2_rows(const uint8_t* row, size_t stride, size_t count, const float* x, size_t blocks, float* out) {
-    prefetch_lines(row, std::min<size_t>(count, 4) * stride);
     size_t r = 0;
     for (; r + 4 <= count; r += 4) q2_rows512<4>(row + r * stride, stride, x, blocks, out + r);
     switch (count - r) {
@@ -725,7 +721,6 @@ void q2_rows256(const uint8_t* row, size_t stride, const float* x, size_t blocks
     if constexpr (N > 3) out[3] = q2_total8(total3);
 }
 inline void q2_rows_avx2(const uint8_t* row, size_t stride, size_t count, const float* x, size_t blocks, float* out) {
-    prefetch_lines(row, std::min<size_t>(count, 4) * stride);
     size_t r = 0;
     for (; r + 4 <= count; r += 4) q2_rows256<4>(row + r * stride, stride, x, blocks, out + r);
     switch (count - r) {
@@ -740,8 +735,6 @@ inline void q2_rows_avx2(const uint8_t* row, size_t stride, size_t count, const 
 template<int kind>
 void block_rows(int level, const uint8_t* row, size_t stride, size_t count, const float* x, size_t cols, float* out) {
     const float* table = Block<kind>::grid > 0 ? iq_float(Block<kind>::grid) : nullptr;
-    // A worker's rows start where its last ones did not end: nothing asked for the first group yet.
-    prefetch_lines(row, std::min<size_t>(count, 4) * stride);
     const auto run = [&](size_t first, auto rows) {
         constexpr int n = decltype(rows)::value;
         if (level == 2) rows512<kind, n>(row + first * stride, stride, x, cols, table, out + first);
