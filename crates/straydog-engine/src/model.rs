@@ -96,6 +96,8 @@ const STARTING_KV: usize = 32768;
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
 const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
+/// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
+const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
 /// memory twice their size; with at least 1.25 times, half the memory less the page-locked
@@ -317,6 +319,7 @@ pub struct Model {
     profile: Option<Profile>,
     /// Running means of a decode pass's seconds with one row and with two (0: none yet), for [`Model::partial_drawn_cut`].
     pass_seconds: [f64; 2],
+    passes_with_draft: u32,
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
     /// Page-locked host bytes besides the K/V.
@@ -422,6 +425,7 @@ impl Model {
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
             pass_seconds: [0.0; 2],
+            passes_with_draft: 0,
             kv_capacity: context,
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
@@ -1692,7 +1696,8 @@ impl Model {
             (false, true) => PARTIAL_DRAFT_CUT,
             (false, false) => DRAFT_CUT,
         };
-        if chain < cut {
+        // (at a cut of 0 no pass would run alone, and what a lone row costs would never be measured again)
+        if chain < cut || (self.partial && self.passes_with_draft >= PASSES_BETWEEN_LONE_ROWS) {
             return Ok((Vec::new(), Vec::new()));
         }
         let mut drafts = vec![token];
@@ -1980,8 +1985,10 @@ impl Model {
             self.metric_add("decode_seconds", pass_started.elapsed().as_secs_f64());
             let seconds = pass_started.elapsed().as_secs_f64();
             if let Some(mean) = self.pass_seconds.get_mut(rows.len().wrapping_sub(1)) {
-                *mean = if *mean > 0.0 { *mean + (seconds - *mean) / 64.0 } else { seconds };
+                // (a pass that waited for the drive says nothing of a row's cost)
+                *mean = if *mean > 0.0 { *mean + (seconds.min(3.0 * *mean) - *mean) / 16.0 } else { seconds };
             }
+            self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
             let hybrid = if self.partial && self.profile.is_some() {
                 let info = self.group.info().unwrap_or_default();
                 Some((info["wait_ns"].as_u64().unwrap_or(0) as f64 / 1e9, info["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9))
