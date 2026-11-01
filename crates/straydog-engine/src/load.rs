@@ -118,14 +118,17 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
         workers
     })?;
     keep_copies(weights, copies);
-    for (device, upload, kind, name, within) in decodes {
+    // Decoding and quantizing on every core, the uploads one after another: these bytes were most of a start's wait after the reads.
+    let threads = std::thread::available_parallelism().map_or(4, |count| count.get());
+    let weights = &*weights;
+    let convert = |upload_bytes: usize, columns: Option<gpu::Columns>, quantize: bool, kind: u32, name: &String, within: u64| -> Result<Vec<u8>, String> {
         // (the upload's bytes of the tensor, a part's rows or, with columns, a run of each row: whole blocks)
-        let (bytes, _) = weights.raw(&name, 0, None)?;
-        let Some(source) = bytes.get(within as usize..within as usize + upload.bytes) else {
+        let (bytes, _) = weights.raw(name, 0, None)?;
+        let Some(source) = bytes.get(within as usize..within as usize + upload_bytes) else {
             return Err(format!("Straydog upload is not within its tensor: {name}"));
         };
         let gathered;
-        let source = match upload.columns {
+        let source = match columns {
             None => source,
             Some(columns) if columns.pitch > 0 && (source.len() as u64).is_multiple_of(columns.pitch)
                               && columns.first + columns.width <= columns.pitch => {
@@ -136,15 +139,26 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
             }
             Some(_) => return Err(format!("Straydog upload columns do not fit {name}")),
         };
-        let tensor = weights.tensor(&name)?;
+        let tensor = weights.tensor(name)?;
         let elements = source.len() as u64 * tensor.elements() / tensor.bytes;
         if elements * tensor.bytes != source.len() as u64 * tensor.elements() {
             return Err(format!("Straydog upload is not whole blocks of {name}"));
         }
-        let values = gpu::decode_vector(source, kind, elements as usize, &name)?;
-        let converted: Vec<u8> = if upload.quantize { crate::formats::quantize_q8_0(&values) }
-                                 else { values.iter().flat_map(|value| value.to_le_bytes()).collect() };
-        group.backends[device].write(&upload, &converted)?;
+        let values = gpu::decode_vector(source, kind, elements as usize, name)?;
+        Ok(if quantize { crate::formats::quantize_q8_0(&values) }
+           else { values.iter().flat_map(|value| value.to_le_bytes()).collect() })
+    };
+    for batch in decodes.chunks(threads) {
+        let converted: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
+            let running: Vec<_> = batch.iter().map(|(_, upload, kind, name, within)| {
+                let (convert, upload_bytes, columns, quantize) = (&convert, upload.bytes, upload.columns, upload.quantize);
+                scope.spawn(move || convert(upload_bytes, columns, quantize, *kind, name, *within))
+            }).collect();
+            running.into_iter().map(|thread| thread.join().unwrap_or_else(|_| Err("a Straydog upload's conversion panicked".into()))).collect()
+        });
+        for ((device, upload, ..), bytes) in batch.iter().zip(converted) {
+            group.backends[*device].write(upload, &bytes?)?;
+        }
     }
     Ok(())
 }
