@@ -271,6 +271,11 @@ inline float wide_half(const uint8_t* p) {
     std::memcpy(&bits, p, 2);
     return SD_HALF_TO_FLOAT(bits);
 }
+// (0.5 + nibble) * 0.25: a half's 11 bits times these five are exact, so the order of the products does not round.
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline __m512 iq2_levels() {
+    return _mm512_setr_ps(0.125f, 0.375f, 0.625f, 0.875f, 1.125f, 1.375f, 1.625f, 1.875f, 2.125f, 2.375f, 2.625f, 2.875f, 3.125f, 3.375f, 3.625f, 3.875f);
+}
 // Sixteen rows' grid indices as byte offsets in the table, an entry being 1 << shift bytes.
 SD_TARGET("avx512f,avx512bw,avx2,f16c")
 inline void store_offsets(uint16_t* out, __m512i index, int shift) {
@@ -295,28 +300,25 @@ void prepare(const uint8_t* b, Prepared& p) {
         const __m512i index = _mm512_or_si512(_mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2))),
                                               _mm512_and_si512(high, _mm512_set1_epi16(0x300)));
         _mm512_store_si512(p.offset, _mm512_slli_epi16(index, 5));
-        // Scale = d * (0.5 + nibble) * 0.25: the half's 11 bits times the five of 0.5 + nibble are exact, so the order does not round.
         const __m128i n = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + 74)), low = _mm_set1_epi8(15);
         const __m128i nibbles = _mm_unpacklo_epi8(_mm_and_si128(n, low), _mm_and_si128(_mm_srli_epi16(n, 4), low));
-        const __m512 levels = _mm512_setr_ps(0.125f, 0.375f, 0.625f, 0.875f, 1.125f, 1.375f, 1.625f, 1.875f,
-                                             2.125f, 2.375f, 2.625f, 2.875f, 3.125f, 3.375f, 3.625f, 3.875f);
-        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(nibbles), levels)));
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(nibbles), iq2_levels())));
         p.signs = b + 34;
-    } else if constexpr (kind == 16) {   // IQ2_XXS: per ib, four index bytes then aux (signs, scale)
-        const __m512i lane = lanes16();
-        const __m512i words = _mm512_loadu_si512(reinterpret_cast<const void*>(b + 2));   // 2ib: indices, 2ib + 1: aux
-        __m512i sign_bits[2];
-        for (int half = 0; half < 2; ++half) {
-            const __m512i g = lanes16(16 * half), l = _mm512_and_si512(g, _mm512_set1_epi32(3));
-            const __m512i word = _mm512_slli_epi32(_mm512_srli_epi32(g, 2), 1);
-            const __m512i index = field16(words, word, _mm512_slli_epi32(l, 3), 255);
-            store_offsets(p.offset + 16 * half, index, 5);
-            const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(word, _mm512_set1_epi32(1)), words);
-            sign_bits[half] = signs16(_mm512_and_si512(_mm512_srlv_epi32(aux, _mm512_mullo_epi32(l, _mm512_set1_epi32(7))), _mm512_set1_epi32(127)));
-        }
-        store_signs(p.sign, sign_bits[0], sign_bits[1]);
-        const __m512i aux = _mm512_permutexvar_epi32(_mm512_add_epi32(_mm512_slli_epi32(_mm512_srli_epi32(lane, 1), 1), _mm512_set1_epi32(1)), words);
-        iq2_scales(wide_half(b), _mm512_srli_epi32(aux, 28), p.scale);
+    } else if constexpr (kind == 16) {   // IQ2_XXS: per ib, four index bytes then aux (four 7-bit signs, the scale's nibble)
+        const __m512i words = _mm512_loadu_si512(reinterpret_cast<const void*>(b + 2));
+        const __m512i split = _mm512_permutexvar_epi32(_mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15), words);
+        _mm512_store_si512(p.offset, _mm512_slli_epi16(_mm512_cvtepu8_epi16(_mm512_castsi512_si256(split)), 5));
+        // Each aux's four fields to four bytes; the sign byte's top bit is the parity of its seven, nibble by nibble.
+        const __m256i aux = _mm512_extracti64x4_epi64(split, 1);
+        const __m256i pairs = _mm256_or_si256(_mm256_and_si256(aux, _mm256_set1_epi32(0x3FFF)), _mm256_and_si256(_mm256_slli_epi32(aux, 2), _mm256_set1_epi32(0x3FFF0000)));
+        const __m256i fields = _mm256_or_si256(_mm256_and_si256(pairs, _mm256_set1_epi32(0x007F007F)), _mm256_and_si256(_mm256_slli_epi32(pairs, 1), _mm256_set1_epi32(0x7F007F00)));
+        const __m256i odd = _mm256_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0,
+                                             0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0);
+        const __m256i low = _mm256_and_si256(fields, _mm256_set1_epi8(15)), high = _mm256_and_si256(_mm256_srli_epi32(fields, 4), _mm256_set1_epi8(15));
+        const __m256i parity = _mm256_xor_si256(_mm256_shuffle_epi8(odd, low), _mm256_shuffle_epi8(odd, high));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(p.sign), _mm256_or_si256(fields, parity));
+        const __m512i nibbles = _mm512_shuffle_epi32(_mm512_srli_epi32(words, 28), _MM_PERM_DDBB);
+        _mm512_store_ps(p.scale, _mm512_mul_ps(_mm512_set1_ps(wide_half(b)), _mm512_permutexvar_ps(nibbles, iq2_levels())));
         p.signs = p.sign;
     } else if constexpr (kind == 17) {   // IQ2_XS: 16-bit q per group (9-bit index, 7 sign bits); scales at 66
         const __m512i lane = lanes16();
@@ -473,6 +475,57 @@ void rows512(const uint8_t* row, size_t stride, const float* x, size_t cols, con
     if constexpr (N > 1) out[1] = total512(acc1);
     if constexpr (N > 2) out[2] = total512(acc2);
     if constexpr (N > 3) out[3] = total512(acc3);
+}
+
+// Q2_0 rows together (row_avx512's values, order and rounding): alone, one row's chain of FMAs waits out the FMA latency at
+// every step whatever the width; beside other rows the same steps overlap, and the activations are read once.
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline __m512i q2_codes(const uint8_t* block) { return _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2))); }
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+inline __m512 q2_scale(const uint8_t* block) { return _mm512_set1_ps(wide_half(block)); }
+template<int N>
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
+void q2_rows512(const uint8_t* row, size_t stride, const float* x, size_t blocks, float* out) {
+    const __m512 table = _mm512_setr_ps(-1, 0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2);
+    __m512 total0 = _mm512_setzero_ps(), total1 = total0, total2 = total0, total3 = total0;
+    const uint8_t* row0 = row; const uint8_t* row1 = row + stride; const uint8_t* row2 = row + 2 * stride; const uint8_t* row3 = row + 3 * stride;
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<18, N>(row, stride, b);
+        const float* values = x + 64 * b;
+        const __m512 x0 = _mm512_loadu_ps(values), x1 = _mm512_loadu_ps(values + 16), x2 = _mm512_loadu_ps(values + 32), x3 = _mm512_loadu_ps(values + 48);
+        __m512i codes0 = q2_codes(row0 + 18 * b), codes1, codes2, codes3;
+        __m512 sum0 = _mm512_mul_ps(_mm512_permutevar_ps(table, codes0), x0), sum1, sum2, sum3;
+        if constexpr (N > 1) { codes1 = q2_codes(row1 + 18 * b); sum1 = _mm512_mul_ps(_mm512_permutevar_ps(table, codes1), x0); }
+        if constexpr (N > 2) { codes2 = q2_codes(row2 + 18 * b); sum2 = _mm512_mul_ps(_mm512_permutevar_ps(table, codes2), x0); }
+        if constexpr (N > 3) { codes3 = q2_codes(row3 + 18 * b); sum3 = _mm512_mul_ps(_mm512_permutevar_ps(table, codes3), x0); }
+#define SD_Q2_STEP(shift, xv) \
+        sum0 = _mm512_fmadd_ps(_mm512_permutevar_ps(table, _mm512_srli_epi32(codes0, shift)), xv, sum0); \
+        if constexpr (N > 1) sum1 = _mm512_fmadd_ps(_mm512_permutevar_ps(table, _mm512_srli_epi32(codes1, shift)), xv, sum1); \
+        if constexpr (N > 2) sum2 = _mm512_fmadd_ps(_mm512_permutevar_ps(table, _mm512_srli_epi32(codes2, shift)), xv, sum2); \
+        if constexpr (N > 3) sum3 = _mm512_fmadd_ps(_mm512_permutevar_ps(table, _mm512_srli_epi32(codes3, shift)), xv, sum3);
+        SD_Q2_STEP(2, x1)
+        SD_Q2_STEP(4, x2)
+        SD_Q2_STEP(6, x3)
+#undef SD_Q2_STEP
+        total0 = _mm512_fmadd_ps(q2_scale(row0 + 18 * b), sum0, total0);
+        if constexpr (N > 1) total1 = _mm512_fmadd_ps(q2_scale(row1 + 18 * b), sum1, total1);
+        if constexpr (N > 2) total2 = _mm512_fmadd_ps(q2_scale(row2 + 18 * b), sum2, total2);
+        if constexpr (N > 3) total3 = _mm512_fmadd_ps(q2_scale(row3 + 18 * b), sum3, total3);
+    }
+    out[0] = _mm512_reduce_add_ps(total0);
+    if constexpr (N > 1) out[1] = _mm512_reduce_add_ps(total1);
+    if constexpr (N > 2) out[2] = _mm512_reduce_add_ps(total2);
+    if constexpr (N > 3) out[3] = _mm512_reduce_add_ps(total3);
+}
+inline void q2_rows(const uint8_t* row, size_t stride, size_t count, const float* x, size_t blocks, float* out) {
+    size_t r = 0;
+    for (; r + 4 <= count; r += 4) q2_rows512<4>(row + r * stride, stride, x, blocks, out + r);
+    switch (count - r) {
+        case 3: q2_rows512<3>(row + r * stride, stride, x, blocks, out + r); break;
+        case 2: q2_rows512<2>(row + r * stride, stride, x, blocks, out + r); break;
+        case 1: q2_rows512<1>(row + r * stride, stride, x, blocks, out + r); break;
+        default: break;
+    }
 }
 
 // AVX2: the same sixteen values as two halves of eight.

@@ -842,6 +842,12 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
         const int level = engine->level;
         auto project_rows = [&](int role, const uint8_t* row, size_t count, const float* natural, const float* ordered,
                                 size_t cols, float* out) {
+#ifdef SD_X86
+            if (kinds[role] == 42 && lanes) {
+                q2_rows(row, bytes[role], count, ordered, cols / 64, out);
+                return;
+            }
+#endif
             if (kinds[role] != 42 && level && formats[role].rows) {
                 formats[role].rows(level, row, bytes[role], count, natural, cols, out);
                 return;
