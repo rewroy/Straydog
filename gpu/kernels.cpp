@@ -1928,6 +1928,35 @@ int sd_device_count() {
     catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+#if defined(_WIN32) && !defined(__HIPCC__)
+// The memory free on the whole GPU, as NVML has it; false where NVML cannot say. CUDA's own figure on Windows leaves out most of what
+// the desktop and other programs hold: RTX 5070 Ti, 14.68 GiB against NVML's 13.07, so `auto`'s margin came to 0.6 GiB, and at that
+// WDDM moves memory in and out under a kernel: the GPU at 100% and 65 W, the desktop stalled, a start 170 s in its warm-up.
+static bool nvml_free_bytes(const hipDeviceProp_t& prop, uint64_t& free_bytes) {
+    struct Memory { unsigned long long total, free, used; };
+    using Init = int (*)();
+    using Handle = int (*)(const char*, void**);
+    using Info = int (*)(void*, Memory*);
+    static Handle handle = nullptr;
+    static Info info = nullptr;
+    static const bool ready = []() {
+        const HMODULE library = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!library) return false;
+        const auto init = reinterpret_cast<Init>(GetProcAddress(library, "nvmlInit_v2"));
+        handle = reinterpret_cast<Handle>(GetProcAddress(library, "nvmlDeviceGetHandleByPciBusId_v2"));
+        info = reinterpret_cast<Info>(GetProcAddress(library, "nvmlDeviceGetMemoryInfo"));
+        return init && handle && info && init() == 0;
+    }();
+    if (!ready) return false;
+    char address[32];
+    std::snprintf(address, sizeof(address), "%08x:%02x:%02x.0", unsigned(prop.pciDomainID), unsigned(prop.pciBusID), unsigned(prop.pciDeviceID));
+    void* device = nullptr;
+    Memory memory{};
+    if (handle(address, &device) != 0 || info(device, &memory) != 0) return false;
+    free_bytes = memory.free;
+    return true;
+}
+#endif
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes) {
     try {
         if (!name || capacity < 2 || !free_bytes || !total_bytes) throw std::runtime_error("invalid info buffers");
@@ -1937,6 +1966,10 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
         std::strncpy(name, prop.name, capacity - 1); name[capacity - 1] = 0;
         size_t available, total; check(hipMemGetInfo(&available, &total));
         *free_bytes = available; *total_bytes = total;
+#if defined(_WIN32) && !defined(__HIPCC__)
+        uint64_t measured = 0;
+        if (nvml_free_bytes(prop, measured)) *free_bytes = std::min<uint64_t>(available, measured);
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
