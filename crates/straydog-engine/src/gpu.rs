@@ -720,9 +720,10 @@ impl Backend {
             plan.push(("@mtp:embeddings".into(), context.min(prefill), HIDDEN as u64, false));
         }
         if host_attention && self.batch_capacity == 256 {
-            // Up to a sixteenth of the budget: one layer's rows in prefill, per-layer prefix mirrors in decode (grown into
-            // the VRAM the placement leaves: Backend::grow_kv_stage).
-            let rows = context.min(self.memory()?.1 / 16 / 4096);
+            // A 64th of the budget: one layer's rows in prefill, per-layer prefix mirrors in decode (grown into the VRAM the placement
+            // leaves: Backend::grow_kv_stage). The slots earn more: IQ2_XS on an R9700, a 16th against a 64th, palindromes: --vram 5 52.2 ->
+            // 54.6 tok/s, 8 68.9 -> 69.8; a 20K prompt's first token unchanged, its decode unchanged at 5 and 2% slower at 8.
+            let rows = context.min(self.memory()?.1 / 64 / 4096);
             if rows >= 256 {
                 plan.push(("@kv:stage".into(), rows * 4, 256, false));
             }
