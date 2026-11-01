@@ -377,8 +377,10 @@ SD_TARGET("avx512f,avx2,f16c")
 inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
     __m512 v;
     if constexpr (Block<kind>::width == 8) {
-        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + p.offset[2 * c])));
-        const __m256d high = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + p.offset[2 * c + 1])));
+        uint64_t both;
+        std::memcpy(&both, p.offset + 2 * c, 8);
+        const __m256d low = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + uint32_t(both))));
+        const __m256d high = _mm256_castps_pd(_mm256_loadu_ps(reinterpret_cast<const float*>(table + (both >> 32))));
         v = _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castpd256_pd512(low), high, 1));
     } else {
         v = _mm512_castps128_ps512(_mm_loadu_ps(reinterpret_cast<const float*>(table + p.offset[4 * c])));
@@ -390,7 +392,8 @@ inline __m512 prepared16(const Prepared& p, unsigned c, const char* table) {
         const __m512 delta = _mm512_mask_blend_ps(__mmask16(0xff00), _mm512_set1_ps(p.delta[2 * c]), _mm512_set1_ps(p.delta[2 * c + 1]));
         return _mm512_mul_ps(_mm512_set1_ps(p.scale[c]), _mm512_add_ps(v, delta));
     } else {
-        const uint32_t signs = uint32_t(p.signs[2 * c]) | uint32_t(p.signs[2 * c + 1]) << 8;
+        uint16_t signs;
+        std::memcpy(&signs, p.signs + 2 * c, 2);
         const __m512i bits = _mm512_castps_si512(_mm512_mul_ps(v, _mm512_set1_ps(p.scale[c])));
         return _mm512_castsi512_ps(_mm512_mask_xor_epi32(bits, __mmask16(signs), bits, _mm512_set1_epi32(int(0x80000000u))));
     }
