@@ -208,6 +208,27 @@ pub fn read_verified(map: &[u8], verifier: &Verifier, offset: u64, length: u64) 
     Ok(blocks[from..from + length as usize].to_vec())
 }
 
+/// [`read_verified`] into `slot`, which holds `length` and a block on each side: the bytes checked, at its start. No allocation, one copy
+/// and a move: at 16 MiB a read, a fresh buffer's page faults and its release's TLB shootdowns stopped every reader in turn.
+pub fn read_verified_into(map: &[u8], verifier: &Verifier, offset: u64, length: u64, slot: &mut [u8]) -> Result<(), String> {
+    let size = map.len() as u64;
+    if offset.checked_add(length).is_none_or(|end| end > size) {
+        return Err("a verified read past the file's end".into());
+    }
+    let start = offset / BLOCK as u64 * BLOCK as u64;
+    let end = (offset + length).next_multiple_of(BLOCK as u64);
+    let blocks = (end - start) as usize;
+    let present = (end.min(size) - start) as usize;
+    slot[..present].copy_from_slice(&map[start as usize..start as usize + present]);
+    slot[present..blocks].fill(0);
+    verifier.verify(start, &slot[..blocks])?;
+    let from = (offset - start) as usize;
+    if from > 0 {
+        slot.copy_within(from..from + length as usize, 0);
+    }
+    Ok(())
+}
+
 /// Check bytes `offset .. offset + length` of a mapped file in place, as the whole blocks around
 /// them, in pieces on up to `threads` threads: for memory that cannot change under the check
 /// (page-locked, or used only after a copy). A last partial block is checked zero-padded.
