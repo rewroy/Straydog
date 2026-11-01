@@ -506,6 +506,14 @@ using RowsKernel = void (*)(int level, const uint8_t* row, size_t stride, size_t
 #ifdef SD_X86
 #include "cpu_rows.hpp"
 #endif
+// out[i] += weight * values[i], a product then a sum: the same bits at every width.
+void add_weighted(int level, float* out, const float* values, float weight, size_t count) {
+#ifdef SD_X86
+    if (level == 2) { add_weighted512(out, values, weight, count); return; }
+#endif
+    (void)level;
+    for (size_t i = 0; i < count; ++i) out[i] += weight * values[i];
+}
 struct CpuFormat {
     size_t values, bytes;
     void (*decode)(const uint8_t*, float*);
@@ -843,8 +851,8 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
         auto project_rows = [&](int role, const uint8_t* row, size_t count, const float* natural, const float* ordered,
                                 size_t cols, float* out) {
 #ifdef SD_X86
-            if (kinds[role] == 42 && lanes) {
-                q2_rows(row, bytes[role], count, ordered, cols / 64, out);
+            if (kinds[role] == 42 && level) {
+                (lanes ? q2_rows : q2_rows_avx2)(row, bytes[role], count, ordered, cols / 64, out);
                 return;
             }
 #endif
@@ -885,11 +893,9 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
                 const float* p = products + expert * inter;
                 project_rows(2, down[expert] + first * bytes[2], last - first, p, p, inter, down_rows + expert * hidden + first);
             }
-            for (size_t row = first; row < last; ++row) {
-                float sum = 0;
-                for (size_t expert = 0; expert < count; ++expert) sum += weights[expert] * down_rows[expert * hidden + row];
-                out[row] = sum;
-            }
+            // (each row's sum in the routes' order, as a loop over rows would make it)
+            std::fill(out + first, out + last, 0.0f);
+            for (size_t expert = 0; expert < count; ++expert) add_weighted(level, out + first, down_rows + expert * hidden + first, weights[expert], last - first);
         });
         engine->down_ns += elapsed_ns(phase);
         ++engine->calls; engine->experts += count;
