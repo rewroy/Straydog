@@ -44,6 +44,10 @@ const DRAFT_CUT: f32 = 0.6;
 /// [`DRAFT_CUT`] of a partially resident model: its pass costs 17 ms with a second row at 23, nearly all of it the row's CPU experts,
 /// so a draft pays from about 0.35. At 0.3 (IQ2_XS, 12 GiB) a token took 13.9 ms, against 14.3 at 0.6.
 const PARTIAL_DRAFT_CUT: f32 = 0.3;
+/// [`DRAFT_CUT`] of drafts drawn from the drafter's top, under the product of each drawn distribution's greatest probability: a draft
+/// is kept with the overlap of the two distributions, which a flat row lowers less than it lowers that. Served IQ3_S on two GPUs,
+/// tok/s of four requests: 132 with every pass at four rows, 137 at 0.3, 134 at 0.6 (the most likely token at 0.6: 130).
+const DRAWN_DRAFT_CUT: f32 = 0.3;
 /// A draft's vocabulary with the head split across two GPUs: the head's first 100000 rows (English, code and the common CJK
 /// characters: every token of the served cases' replies) and the rows of the tokens past them that the sequence has held (a
 /// Japanese text's words: 97-99.6% of its tokens with the text before it, 82% without). A draft step's head reads 40% of the
@@ -1503,13 +1507,11 @@ impl Model {
     /// One drafting step with the host out of its middle: the prologue over `embeddings` and `hidden` (`None`: the last row
     /// the layer's last step left on the device, of `previous` rows), the MTP layer, and the drafter's token for the last
     /// row through the layer's own mixer and the shared vocabulary head with its probability under the drafter.
-    fn draft_step(&mut self, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, position: u64, head: bool)
-                  -> Result<Option<(u32, f32)>> {
-        let step = self.with_operands(|model| model.draft_operands(head), |group, operands| {
-            group.draft_step(operands, position, embeddings, hidden, previous)
-        })?;
-        step.map(|(token, probability)| u32::try_from(token).map(|token| (token, probability))
-            .map_err(|_| "Straydog drafter head returned no token".to_string())).transpose()
+    fn draft_step(&mut self, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, position: u64, head: bool, top: usize)
+                  -> Result<Option<crate::gpu::Draft>> {
+        self.with_operands(|model| model.draft_operands(head), |group, operands| {
+            group.draft_step(operands, position, embeddings, hidden, previous, top)
+        })
     }
 
     /// [`Model::mtp_prompt`] with the prompt's rows kept on the GPUs (see [`Group::mtp_stash`]):
@@ -1620,7 +1622,12 @@ impl Model {
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
     /// while the product of their probabilities under the drafter stays at the cut.
     /// Each step is one call: a draft's row stays on the device for the next step to read.
-    fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
+    ///
+    /// A sampled request whose draw reads a row's greatest logits ([`Sampling::top_candidates`]) has its drafts drawn from the
+    /// drafter's own: they come back with those rows, for [`sampling::accept_top_drawn`], and the probability is that of the drawn
+    /// distribution's most likely token.
+    fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize, sampling: &Sampling, rng: &mut Rng)
+             -> Result<(Vec<u32>, Vec<Vec<(f32, u32)>>)> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
         let mut clock = Instant::now();
         self.ensure_kv(position as usize + tokens.len() + limit + 1)?;
@@ -1628,20 +1635,38 @@ impl Model {
         self.draft_vocabulary_update()?;
         let embedded = self.token_embeddings(tokens)?;
         self.phase("draft: embeddings", &mut clock);
-        let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0)?;
+        let top = sampling.top_candidates().unwrap_or(0);
+        let mut proposed = Vec::new();
+        let mut take = |draft: crate::gpu::Draft, rng: &mut Rng| -> Result<(u32, f32)> {
+            if top == 0 {
+                return Ok((u32::try_from(draft.token).map_err(|_| "Straydog drafter head returned no token")?, draft.confidence));
+            }
+            let drawn = sampling::draw_top(&draft.top, sampling, rng);
+            proposed.push(draft.top);
+            Ok(drawn)
+        };
+        let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0, top)?;
         self.phase("draft: catch-up and first draft", &mut clock);
-        let Some((token, mut chain)) = step else { return Ok(Vec::new()) };
-        let cut = if self.partial { PARTIAL_DRAFT_CUT } else { DRAFT_CUT };
+        let Some(step) = step else { return Ok((Vec::new(), Vec::new())) };
+        let (token, mut chain) = take(step, rng)?;
+        // (a partially resident model's one draft has no cut when drawn: IQ2_XS at 12 GiB, 76 tok/s against 71 for the most likely token)
+        let cut = match (top > 0, self.partial) {
+            (true, true) => 0.0,
+            (true, false) => DRAWN_DRAFT_CUT,
+            (false, true) => PARTIAL_DRAFT_CUT,
+            (false, false) => DRAFT_CUT,
+        };
         if chain < cut {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut drafts = vec![token];
         let (mut rows, mut position) = (tokens.len() as u64, position + tokens.len() as u64);
         while drafts.len() < limit {
             let embedded = self.token_embeddings(&drafts[drafts.len() - 1..])?;
             self.phase("draft: embeddings", &mut clock);
-            let (token, probability) = self.draft_step(&embedded, None, rows, position, true)?
+            let step = self.draft_step(&embedded, None, rows, position, true, top)?
                 .ok_or("Straydog drafter head returned no probability")?;
+            let (token, probability) = take(step, rng)?;
             self.phase("draft: next draft", &mut clock);
             chain *= probability;
             if chain < cut {
@@ -1650,7 +1675,8 @@ impl Model {
             drafts.push(token);
             (rows, position) = (1, position + 1);
         }
-        Ok(drafts)
+        proposed.truncate(drafts.len());
+        Ok((drafts, proposed))
     }
 
     /// The next token and its drafts through every layer with the one-token arithmetic.
@@ -1824,9 +1850,11 @@ impl Model {
 
     /// Accepted draft count and the next token: a match with the GPU's argmax when greedy,
     /// else decided on the rows' logits (see [`sampling::accept`]).
-    fn accept(drafts: &[u32], targets: &[i32], scores: Option<&Scores>, sampling: &Sampling, generated: &mut Generated,
+    #[allow(clippy::too_many_arguments)]
+    fn accept(drafts: &[u32], proposed: &[Vec<(f32, u32)>], targets: &[i32], scores: Option<&Scores>, sampling: &Sampling, generated: &mut Generated,
               rng: &mut Rng) -> (usize, u32) {
         let scores = match scores.filter(|_| sampling.needs_logits()) {
+            Some(Scores::Top(top)) if proposed.len() == drafts.len() => return sampling::accept_top_drawn(drafts, proposed, top, sampling, generated, rng),
             Some(Scores::Top(top)) => return sampling::accept_top(drafts, top, sampling, generated, rng),
             Some(Scores::Logits(logits)) => Some(logits.as_slice()),
             None => None,
@@ -1887,7 +1915,7 @@ impl Model {
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
-            let drafts = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit)?;
+            let (drafts, proposed) = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng)?;
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &rows)?;
@@ -1899,7 +1927,7 @@ impl Model {
             let top = sampling.top_candidates().unwrap_or(0);
             let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits(), top)?;
             let mut clock = Instant::now();
-            let (accepted, following) = Self::accept(&drafts, &targets, scores.as_ref(), sampling, &mut generated, rng);
+            let (accepted, following) = Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng);
             self.phase("accept", &mut clock);
             generated.insert(following);
             let mut emitted: Vec<u32> = drafts[..accepted].iter().copied().chain([following]).collect();
@@ -1953,7 +1981,7 @@ impl Model {
         // to the sequence's last would keep what was there before (another sequence's, or a
         // draft's), which every later draft attends to. (The draft does nothing more at 0.)
         if !mtp_tokens.is_empty() {
-            self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0)?;
+            self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng)?;
         }
         Ok(())
     }

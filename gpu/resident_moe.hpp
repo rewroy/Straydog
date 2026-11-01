@@ -142,6 +142,7 @@ __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selec
 // 10 each, not 4 at 20). The shared expert's gate and up go beside it (resident_expert_launch); their Q8 units here took 204.
 #define SD_EXPERT_ROUTED_FORMATS(X) X(12) X(13) X(14) X(18) X(20) X(21) X(22) X(23) X(42)
 #define SD_EXPERT_SHARED_DOWN(X) X(8) X(20)
+#define SD_EXPERT_LISTED(format) format,
 template<int routed>
 __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
                                                                  ExpertGemv plan,const float* input,float* output,
@@ -574,7 +575,10 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     const int routed=plan.weights[0].kind;
     const unsigned lanes=together && plan.weights[1].kind==routed && routed!=14 && !plan.mapped[0] && d.q8_wide ?
         resident_lanes(plan.weights,0,input,4) : 0;
-    const bool paired=lanes>=2 && lanes<=16 && lanes==resident_lanes(plan.weights,1,input,4);
+    // (only the formats it is compiled for: IQ2_XS's experts have others among them)
+    bool listed=false;
+    for (const int kind : {SD_EXPERT_ROUTED_FORMATS(SD_EXPERT_LISTED)}) listed|=kind==routed;
+    const bool paired=listed && lanes>=2 && lanes<=16 && lanes==resident_lanes(plan.weights,1,input,4);
     if (paired) {
         const unsigned per_route=unsigned((640+16/lanes-1)/(16/lanes)), shared_cols=unsigned(plan.weights[experts*3].rows);
         const dim3 grid(unsigned((10*size_t(per_route)+(shared_cols+31)/32+7)/8),unsigned(tokens));

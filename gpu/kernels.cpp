@@ -1398,11 +1398,11 @@ int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary,
 // One drafting step (see draft_step): `head` null stops after the MTP layer, `split` 0 evaluates the whole head here.
 int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
                   const float* embeddings,const float* hidden,uint64_t previous,void* const* head,const int* head_kinds,
-                  uint64_t vocabulary,uint64_t split,void* peer_head,int32_t* token,float* confidence) {
+                  uint64_t vocabulary,uint64_t split,void* peer_head,int32_t* token,float* confidence,uint64_t top,float* best) {
     try {
         if (!mtp || !mtp_kinds) throw std::runtime_error("invalid drafting step");
         draft_step(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,
-                   size_t(previous),head,head_kinds,size_t(vocabulary),size_t(split),peer_head,token,confidence);
+                   size_t(previous),head,head_kinds,size_t(vocabulary),size_t(split),peer_head,token,confidence,unsigned(top),best);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1417,14 +1417,14 @@ int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t l
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_draft_head(void* handle,void* const* head,const int* head_kinds,uint64_t layer,uint64_t row,uint64_t vocabulary,
-                  uint64_t split,void* peer_head,int32_t* token,float* confidence) {
+                  uint64_t split,void* peer_head,int32_t* token,float* confidence,uint64_t top,float* best) {
     try {
         Device& d=device(handle);
         auto found=d.decoder.find(size_t(layer));
         if (found==d.decoder.end() || row>=verify_max || found->second.verified<=row)
             throw std::runtime_error("invalid drafting head row");
         draft_head(d,head,head_kinds,size_t(vocabulary),size_t(split),peer_head,
-                   verify_layout(found->second.workspace).hidden+size_t(row)*10240,false,token,confidence);
+                   verify_layout(found->second.workspace).hidden+size_t(row)*10240,false,token,confidence,unsigned(top),best);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }

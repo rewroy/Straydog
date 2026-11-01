@@ -937,6 +937,31 @@ pub fn accept_top(drafts: &[u32], top: &[Vec<(f32, u32)>], sampling: &Sampling, 
     (drafts.len(), distribution(&top[drafts.len()]).draw(rng))
 }
 
+/// A draft drawn from a drafter's row of greatest logits (as [`accept_top`]'s `top`, at most [`Sampling::top_candidates`] of them),
+/// from the distribution the request's cuts leave of them, and the probability of that distribution's most likely token.
+pub fn draw_top(row: &[(f32, u32)], sampling: &Sampling, rng: &mut Rng) -> (u32, f32) {
+    let proposal = cut(row.iter().map(|&(logit, token)| (f64::from(logit), token)).collect(), sampling);
+    (proposal.draw(rng), proposal.probability(row[0].1) as f32)
+}
+
+/// [`accept_top`] of drafts [`draw_top`] drew from `proposed`: each kept with min(1, p / q), a rejected one's replacement drawn from
+/// norm(max(0, p - q)). The tokens committed follow the target's distribution whatever q is, a draft being kept with
+/// probability sum(min(p, q)) (see [`accept_drawn`]). Reading the drafter's top alone makes q as cheap as p here.
+pub fn accept_top_drawn(drafts: &[u32], proposed: &[Vec<(f32, u32)>], top: &[Vec<(f32, u32)>], sampling: &Sampling, generated: &mut Generated,
+                        rng: &mut Rng) -> (usize, u32) {
+    let keep = sampling.top_candidates().unwrap_or(SCANNED_TOP_K);
+    let distribution = |row: &[(f32, u32)]| cut(row.iter().take(keep).map(|&(logit, token)| (f64::from(logit), token)).collect(), sampling);
+    for (index, draft) in drafts.iter().enumerate() {
+        let (target, proposal) = (distribution(&top[index]), distribution(&proposed[index]));
+        if rng.random() >= (target.probability(*draft) / proposal.probability(*draft)).min(1.0) {
+            let instead = residual(&target, &proposal, 0).unwrap_or_else(|| target.without(*draft));
+            return (index, instead.draw(rng));
+        }
+        generated.insert(*draft);
+    }
+    (drafts.len(), distribution(&top[drafts.len()]).draw(rng))
+}
+
 /// Accepted draft count and the next token, given the target logits of every row of a
 /// verification (`vocabulary` wide): a greedy match, or exact speculative sampling. A
 /// deterministic draft is a point proposal, accepted with its target probability; after a
@@ -1346,6 +1371,34 @@ mod tests {
             assert_eq!(accepted, 0);
             assert!([3, 5].contains(&next));
         }
+    }
+
+    /// [`accept_top_drawn`] commits tokens from the target's cut distribution whatever the drafter's top says, over tokens only
+    /// one of them holds too, and keeps a draft with probability sum(min(p, q)).
+    #[test]
+    fn drafts_drawn_from_the_drafters_top_leave_the_targets_distribution_alone() {
+        let sampling = Sampling { temperature: 1.0, top_k: 4, top_p: 0.95, min_p: 0.0, presence_penalty: 0.0 };
+        let target: Vec<(f32, u32)> = vec![(3.0, 3), (2.5, 5), (2.0, 0), (1.0, 1)];
+        let drafter: Vec<(f32, u32)> = vec![(3.0, 5), (2.5, 3), (2.0, 1), (0.5, 7)];
+        let of = |row: &[(f32, u32)]| cut(row.iter().map(|&(logit, token)| (f64::from(logit), token)).collect(), &sampling);
+        let (p, q) = (of(&target), of(&drafter));
+        let overlap: f64 = (0..8).map(|token| p.probability(token).min(q.probability(token))).sum();
+        assert!(overlap > p.probability(5), "drawing keeps more than the drafter's most likely token");
+        let rounds = 400_000;
+        let mut rng = Rng::new(7);
+        let (mut counts, mut kept) = ([0u64; 8], 0u64);
+        for _ in 0..rounds {
+            let (draft, _) = draw_top(&drafter, &sampling, &mut rng);
+            let (accepted, next) = accept_top_drawn(&[draft], &[drafter.clone()], &[target.clone(), target.clone()], &sampling,
+                                                    &mut Generated::new(8), &mut rng);
+            kept += accepted as u64;
+            counts[if accepted == 1 { draft } else { next } as usize] += 1;
+        }
+        for token in 0..8u32 {
+            let seen = counts[token as usize] as f64 / rounds as f64;
+            assert!((seen - p.probability(token)).abs() < 0.004, "token {token}: {seen} against {}", p.probability(token));
+        }
+        assert!((kept as f64 / rounds as f64 - overlap).abs() < 0.004);
     }
 
     /// The token a round commits first and whether its draft was kept, drafting from `drafter` (logits) against `target`.

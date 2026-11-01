@@ -159,6 +159,9 @@ pub fn authenticate(weights: &mut Weights, keep: &[String], progress: Progress) 
     Ok(())
 }
 
+/// A reader's slot on a start that reads only placed pieces of checked files, and the most it reads at once.
+const CHECKED_SLOT: usize = 16 << 20;
+
 type Copies = Vec<(String, Mutex<Vec<u8>>)>;
 
 /// Read every chunk into `ranges` and fresh host copies of `kept`, a worker per core.
@@ -304,11 +307,13 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
     let (next, done, failed) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicBool::new(false));
     let failure: Mutex<Option<String>> = Mutex::new(None);
     let count = |bytes: u64| progress("load", done.fetch_add(bytes, Ordering::Relaxed) + bytes, total);
+    // (a start of checked files reads a few GiB piece by piece: a chunk's slot a thread is 4 GiB of commit on sixteen threads)
+    let slot_bytes = if sources.iter().all(|source| source.checked.is_some()) { CHECKED_SLOT } else { CHUNK_BYTES as usize };
     std::thread::scope(|scope| {
         for mut worker in workers {
             let (chunks, next, failed, failure, count) = (&chunks, &next, &failed, &failure, &count);
             scope.spawn(move || {
-                let mut slot = Buffer::new(CHUNK_BYTES as usize);
+                let mut slot = Buffer::new(slot_bytes);
                 let result = worker.start(&slot).and_then(|()| {
                     while let Some(&(source, chunk)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                         if failed.load(Ordering::Relaxed) {
@@ -319,14 +324,17 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                             let base = chunk as u64 * CHUNK_BYTES;
                             for &(at, part, target) in &source.pieces[chunk] {
                                 crate::digest::will_need(source.file, &[(base + at as u64, part as u64)]);
-                                let read = crate::verity::read_verified(source.map, verifier, base + at as u64, part as u64)
-                                    .map_err(|error| format!("{}: {error}", source.name))?;
-                                slot.as_mut_slice()[..part].copy_from_slice(&read);
-                                count(part as u64);
-                                let bytes = &slot.as_slice()[..part];
-                                match target {
-                                    Target::Device { device, upload, at: offset } => worker.fill(device, &upload, offset, bytes)?,
-                                    Target::Host { copy, at: offset } => copies[copy].1.lock().unwrap()[offset..offset + part].copy_from_slice(bytes),
+                                for from in (0..part).step_by(CHECKED_SLOT) {
+                                    let piece = (part - from).min(CHECKED_SLOT);
+                                    let read = crate::verity::read_verified(source.map, verifier, base + (at + from) as u64, piece as u64)
+                                        .map_err(|error| format!("{}: {error}", source.name))?;
+                                    slot.as_mut_slice()[..piece].copy_from_slice(&read);
+                                    count(piece as u64);
+                                    let bytes = &slot.as_slice()[..piece];
+                                    match target {
+                                        Target::Device { device, upload, at: offset } => worker.fill(device, &upload, offset + from as u64, bytes)?,
+                                        Target::Host { copy, at: offset } => copies[copy].1.lock().unwrap()[offset + from..offset + from + piece].copy_from_slice(bytes),
+                                    }
                                 }
                             }
                             continue;
