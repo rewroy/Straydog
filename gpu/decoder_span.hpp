@@ -129,7 +129,6 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     kv_prepare_span(d,begin,end,position);
     float* hidden=workspace; float* mixed=hidden+10240; float* branch=mixed+2564;
     auto* gpu_position=reinterpret_cast<uint32_t*>(branch+2560);
-    float* exported=branch+4096;
     const uint32_t current=uint32_t(position);
     upload(d,hidden,input,10240*4);
     upload(d,gpu_position,&current,sizeof(current));
@@ -146,10 +145,10 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
 #else
     const bool stage_cpu_result=ahead;
 #endif
-    const float* cpu_result=stage_cpu_result ? d.cpu_partial : d.exchange_device+4096;
+    const float* cpu_result=stage_cpu_result ? d.cpu_partial : d.exchange_device+hybrid_result_at(0);
     auto finish_previous=[&]() {
-        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+4096,stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout);
-        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,branch,cpu_result);
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout);
+        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,cpu_result,0);
     };
     // One captured graph per layer: the previous layer's residual (adding the CPU
     // result), this layer up to routing, the export to pinned memory and its
@@ -170,8 +169,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
                     plan.context,gpu_position,mixed,branch);
             decoder_residual<<<40,256,0,d.stream>>>(hidden,mixed,branch);
             hyperconnection(d,pointers+4+attention,kinds+4+attention,1,true,hidden,mixed,true);
-            hybrid_route_export(d,experts,mixed,exported);
-            hybrid_publish<<<11,256,0,d.stream>>>(exported,d.exchange_device);
+            hybrid_route_export(d,experts,mixed);
             hybrid_tick<<<1,1,0,d.stream>>>(d.flags+1,reinterpret_cast<uint32_t*>(d.exchange_device+hybrid_sequence_slot));
             hybrid_resident_experts(d,experts,mixed,branch);
             check(hipGetLastError());

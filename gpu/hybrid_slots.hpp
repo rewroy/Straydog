@@ -4,12 +4,12 @@
 // GPU and the rest on the host CPU engine in F32 from the authenticated mapping;
 // prefill streams every missing expert through staging slots, so prompt rows are
 // still computed by the GPU expert GEMM. Every routed expert always contributes.
-// Row 0: selected | probabilities | activation, its CPU result at 4096; a verification's later rows after 8192.
+// Each row: selected | probabilities | activation, then its CPU result (a kernel steps through the rows by hybrid_row_floats).
 constexpr size_t hybrid_row_export = 2608, hybrid_row_floats = hybrid_row_export + 2560, hybrid_rows = 4;
-constexpr size_t hybrid_exchange_floats = 8192 + (hybrid_rows - 1) * hybrid_row_floats;
-constexpr size_t hybrid_export_at(size_t row) { return row ? 8192 + (row - 1) * hybrid_row_floats : 0; }
-constexpr size_t hybrid_result_at(size_t row) { return row ? hybrid_export_at(row) + hybrid_row_export : 4096; }
-constexpr size_t hybrid_sequence_slot = 4000;     // export completion counter (uint32)
+constexpr size_t hybrid_export_at(size_t row) { return row * hybrid_row_floats; }
+constexpr size_t hybrid_result_at(size_t row) { return hybrid_export_at(row) + hybrid_row_export; }
+constexpr size_t hybrid_sequence_slot = hybrid_rows * hybrid_row_floats;     // export completion counter (uint32)
+constexpr size_t hybrid_exchange_floats = hybrid_sequence_slot + 16;
 // From hybrid_sequence_slot, as uint32: +1 CPU results published by the host, +2 results
 // awaited by the GPU (hybrid_await), +3 nonzero once an await gave up.
 constexpr size_t hybrid_published_slot = 1, hybrid_awaited_slot = 2, hybrid_await_failed_slot = 3;

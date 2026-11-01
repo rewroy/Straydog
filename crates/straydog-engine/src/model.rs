@@ -41,6 +41,9 @@ const IM_END: u32 = 248046;
 /// more tokens per second than an acceptance-rate estimate. A draft row costs about 3.5 ms of
 /// verification and 1.35 ms of drafting against a 15 ms pass.
 const DRAFT_CUT: f32 = 0.6;
+/// [`DRAFT_CUT`] of a partially resident model: its pass costs 17 ms with a second row at 23, nearly all of it the row's CPU experts,
+/// so a draft pays from about 0.35. At 0.3 (IQ2_XS, 12 GiB) a token took 13.9 ms, against 14.3 at 0.6.
+const PARTIAL_DRAFT_CUT: f32 = 0.3;
 /// A draft's vocabulary with the head split across two GPUs: the head's first 100000 rows (English, code and the common CJK
 /// characters: every token of the served cases' replies) and the rows of the tokens past them that the sequence has held (a
 /// Japanese text's words: 97-99.6% of its tokens with the text before it, 82% without). A draft step's head reads 40% of the
@@ -112,6 +115,8 @@ struct Profile {
     /// The phases of the pass under way, until its rows are known.
     pass: BTreeMap<&'static str, f64>,
     rows: [(u64, f64, BTreeMap<&'static str, f64>); VERIFY_ROWS + 1],
+    /// A partially resident model's export wait and CPU seconds so far, for what each pass adds.
+    hybrid: (f64, f64),
 }
 
 impl Profile {
@@ -334,6 +339,7 @@ impl Model {
         if settings.speculative > MAX_DRAFTS {
             return Err(format!("Straydog speculative drafts must be between 0 and {MAX_DRAFTS}"));
         }
+        crate::host::commit_note("start");
         let (layer_bytes, tail) = weights.placement_bytes(group.expert_parallel()?);
         group.balance_layers(&layer_bytes, tail)?;
         let drafting = settings.speculative > 0 && weights.drafter;
@@ -381,6 +387,7 @@ impl Model {
         group.reserve_model_state(context64, batch as u64, drafting, host)?;
         let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len() + PARK_SLOTS.len())?;
         let mut load_seconds = vec![("state", lap(&mut clock))];
+        crate::host::commit_note("states and checkpoints");
         let mut model = Model {
             group,
             cpu: None,
@@ -424,7 +431,9 @@ impl Model {
         if !model.resident && !model.partial {
             return Err("the GPU budget cannot hold the model's dense weights; raise --vram".into());
         }
+        crate::host::commit_note("experts placed");
         model.prepare_decoder(context64, false)?;
+        crate::host::commit_note("decoder placed");
         if model.partial && host && !model.group.parts() && context > STARTING_KV {
             model.kv_capacity = STARTING_KV;
             model.group.start_kv(STARTING_KV as u64)?;
@@ -434,12 +443,15 @@ impl Model {
         model.group.pin_head(&head)?;
         let keep = model.first_use_tensors()?;
         load_seconds.push(("place", lap(&mut clock)));
+        crate::host::commit_note("placed");
         let pending = model.group.take_pending();
         crate::load::load(&mut model.weights, &mut model.group, pending, &keep, progress)?;
         load_seconds.push(("read", lap(&mut clock)));
+        crate::host::commit_note("read");
         // Host K/V page-locked on a thread of its own meanwhile (see `Backend::prefetch_host_states`).
         model.group.finish_model_state()?;
         load_seconds.push(("host_state", lap(&mut clock)));
+        crate::host::commit_note("host K/V");
         model.prepare_decoder(model.kv_capacity as u64, true)?;
         if model.partial && model.weights.drafter {
             model.group.verify_reserve()?;
@@ -447,7 +459,9 @@ impl Model {
         if model.partial {
             let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
             model.lock_host_banks(pinned)?;
+            crate::host::commit_note("banks locked");
             model.group.create_expert_slots()?;
+            crate::host::commit_note("expert slots");
         }
         if drafting && model.resident && model.weights.drafter
             && std::env::var("STRAYDOG_DRAFT_VOCABULARY").map_or(true, |value| value != "0")
@@ -475,6 +489,7 @@ impl Model {
             model.weights.cache_rows(PLE_TABLE, row_cache)?;
         }
         load_seconds.push(("plans", lap(&mut clock)));
+        crate::host::commit_note("plans");
         model.load_seconds = load_seconds;
         // A partially resident model drafts one token a pass: IQ2_XS --vram 12 on an R9700, 64 tok/s without drafts, 70 with one,
         // 64 with two and 65 with three. The widest pass costs far more than the rest (16 ms for one row, 24 for two, 53 for four).
@@ -1603,7 +1618,7 @@ impl Model {
     }
 
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
-    /// while the product of their probabilities under the drafter stays at [`DRAFT_CUT`].
+    /// while the product of their probabilities under the drafter stays at the cut.
     /// Each step is one call: a draft's row stays on the device for the next step to read.
     fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize) -> Result<Vec<u32>> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
@@ -1616,7 +1631,8 @@ impl Model {
         let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0)?;
         self.phase("draft: catch-up and first draft", &mut clock);
         let Some((token, mut chain)) = step else { return Ok(Vec::new()) };
-        if chain < DRAFT_CUT {
+        let cut = if self.partial { PARTIAL_DRAFT_CUT } else { DRAFT_CUT };
+        if chain < cut {
             return Ok(Vec::new());
         }
         let mut drafts = vec![token];
@@ -1628,7 +1644,7 @@ impl Model {
                 .ok_or("Straydog drafter head returned no probability")?;
             self.phase("draft: next draft", &mut clock);
             chain *= probability;
-            if chain < DRAFT_CUT {
+            if chain < cut {
                 break;
             }
             drafts.push(token);
@@ -1898,8 +1914,22 @@ impl Model {
             self.metric_count("drafted_tokens", drafts.len() as u64);
             self.metric_count("accepted_tokens", accepted as u64);
             self.metric_add("decode_seconds", pass_started.elapsed().as_secs_f64());
+            let seconds = pass_started.elapsed().as_secs_f64();
+            let hybrid = if self.partial && self.profile.is_some() {
+                let info = self.group.info().unwrap_or_default();
+                Some((info["wait_ns"].as_u64().unwrap_or(0) as f64 / 1e9, info["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9))
+            } else {
+                None
+            };
             if let Some(profile) = self.profile.as_mut() {
-                profile.end_pass(rows.len(), pass_started.elapsed().as_secs_f64());
+                if let Some((wait, cpu)) = hybrid {
+                    let (last_wait, last_cpu) = std::mem::replace(&mut profile.hybrid, (wait, cpu));
+                    if last_wait > 0.0 {
+                        profile.pass.insert("export wait", wait - last_wait);
+                        profile.pass.insert("CPU", cpu - last_cpu);
+                    }
+                }
+                profile.end_pass(rows.len(), seconds);
             }
             for value in &emitted {
                 produced += 1;

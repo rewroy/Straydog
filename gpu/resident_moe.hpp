@@ -94,6 +94,10 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
     if (plan.stage) return plan.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
     return plan.mapped[role]+expert*plan.bytes[role];
 }
+// A row's assisted experts stage after the earlier rows' (hybrid_stage_assist).
+__device__ __forceinline__ void expert_row_stage(ExpertGemv& plan) {
+    if (plan.stage) plan.stage+=size_t(blockIdx.y)*plan.assist*plan.slot_bytes;
+}
 // A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
 __device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGemv& plan,size_t& route,size_t& role,size_t& local,
                                             unsigned& lanes) {
@@ -125,6 +129,7 @@ __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selec
                                      size_t input_stride=0,size_t output_stride=0) {
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
+    expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
     const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
@@ -143,6 +148,7 @@ __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup*
                                                                  size_t input_stride,size_t output_stride) {
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
+    expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
     const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
