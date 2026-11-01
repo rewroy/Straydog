@@ -873,7 +873,7 @@ impl Backend {
 
     /// VRAM a placement leaves free for what it allocates later.
     fn slack(budget: u64) -> u64 {
-        (512u64 << 20).max(budget * 3 / 100)
+        (128u64 << 20).max(budget * 3 / 100)
     }
 
     /// The VRAM stage mirrors every registered host state's prefix (see sd_kv_stage).
