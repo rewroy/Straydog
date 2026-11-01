@@ -43,7 +43,8 @@ Windows with CUDA; DeepSeek-V4.1 and `straydog setup` have not.
   - The engine runs in a worker process without network access: bubblewrap on Linux, an
     AppContainer of its own on Windows. The worker is the same executable.
   - Every model and drafter file is pinned by size, SHA-256 and fs-verity digest. The pins are
-    compiled into the executable, and every file is authenticated before use.
+    compiled into the executable, and every file is authenticated whole when it is downloaded. A later start
+    trusts a file whose verity tree is younger than it, and reads what it places without hashing it again.
   - Bytes read from the drive after loading (table rows, experts outside RAM, banks left to the
     page cache) are checked block by block against the file's Merkle tree before use.
   - The trees live in the data directory (`.straydog` in the model's by default). Only the
