@@ -22,6 +22,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(straydog_gpu PRIVATE Threads::Threads)
 if(STRAYDOG_BACKEND STREQUAL "HIP")
   target_link_libraries(straydog_gpu PRIVATE hip::host roc::hipblas)
+  target_compile_options(straydog_gpu PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-scalarize-global-loads=false>")
 else()
   target_link_libraries(straydog_gpu PRIVATE CUDA::cublas)
   # Device code calls constexpr std::min/std::max, as HIP allows.

@@ -1,7 +1,7 @@
 // Single-token hybrid MoE: GPU part and the host CPU-expert step (see hybrid_slots.hpp).
 // blockIdx.y a row, in every kernel of this file that takes one.
 __global__ void hybrid_combine(const float* outputs, const float* probabilities, const int32_t* selected,
-                               const MoeGroup* groups, ExpertGemv plan, float* result) {
+                               const MoeGroup* groups, ExpertGemv plan, float* result) { SD_KERNEL_ACQUIRE;
     const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x;
     if (column >= 2560) return;
     outputs += size_t(blockIdx.y) * 11 * 2560; probabilities += size_t(blockIdx.y) * 11; selected += size_t(blockIdx.y) * 10;
@@ -15,7 +15,7 @@ __global__ void hybrid_combine(const float* outputs, const float* probabilities,
 // table entries in effect for this token, even while slots are being swapped. Written straight to mapped
 // pinned host memory (no memcpy graph node), a row at each hybrid_row_floats.
 __global__ void hybrid_export(const int32_t* selected, const float* probabilities, const float* input, size_t input_stride,
-                              const MoeGroup* groups, ExpertGemv plan, volatile float* target) {
+                              const MoeGroup* groups, ExpertGemv plan, volatile float* target) { SD_KERNEL_ACQUIRE;
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
     selected += size_t(blockIdx.y) * 10; probabilities += size_t(blockIdx.y) * 11; input += size_t(blockIdx.y) * input_stride;
     target += size_t(blockIdx.y) * hybrid_row_floats;
@@ -28,12 +28,12 @@ __global__ void hybrid_export(const int32_t* selected, const float* probabilitie
 }
 // Graph-safe completion signal: each replay advances a device counter and copies
 // it after the exported data, so the host waits for exactly this layer's export.
-__global__ void hybrid_tick(uint32_t* counter, volatile uint32_t* published) {
+__global__ void hybrid_tick(uint32_t* counter, volatile uint32_t* published) { SD_KERNEL_ACQUIRE;
     __threadfence_system();
     *published = ++*counter;
     __threadfence_system();
 }
-__global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_stride, const float* gpu, const float* cpu, size_t cpu_stride) {
+__global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_stride, const float* gpu, const float* cpu, size_t cpu_stride) { SD_KERNEL_ACQUIRE;
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
     hidden += size_t(blockIdx.y) * 10240; mixed += size_t(blockIdx.y) * mixed_stride; gpu += size_t(blockIdx.y) * 2560;
     cpu += size_t(blockIdx.y) * cpu_stride;
@@ -52,7 +52,7 @@ __device__ inline uint64_t await_clock() {
 // `timeout` ticks (~1 s under Windows' 2 s kernel watchdog, 10 s elsewhere) it gives up
 // and marks the failure for the host instead of hanging the device; the layer's output is
 // then void.
-__global__ void hybrid_await(volatile uint32_t* counters, const volatile float* result, float* target, uint64_t timeout) {
+__global__ void hybrid_await(volatile uint32_t* counters, const volatile float* result, float* target, uint64_t timeout) { SD_KERNEL_ACQUIRE;
     __shared__ uint32_t ready;
     if (threadIdx.x == 0) {
         const uint32_t expected = counters[hybrid_awaited_slot] + 1;
