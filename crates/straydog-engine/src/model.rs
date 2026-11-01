@@ -95,7 +95,7 @@ const STARTING_KV: usize = 32768;
 /// A verification's buffers beside partially resident layers (`verify_reserve`), and the VRAM for expert slots a drafter must
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
-const DRAFTER_SLOT_ROOM: u64 = 256 << 20;
+const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
 
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
 /// memory twice their size; with at least 1.25 times, half the memory less the page-locked
