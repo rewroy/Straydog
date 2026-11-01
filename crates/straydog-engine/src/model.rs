@@ -315,6 +315,8 @@ pub struct Model {
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
     profile: Option<Profile>,
+    /// Running means of a decode pass's seconds with one row and with two (0: none yet), for [`Model::partial_drawn_cut`].
+    pass_seconds: [f64; 2],
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
     /// Page-locked host bytes besides the K/V.
@@ -419,6 +421,7 @@ impl Model {
             draft_pending: Vec::new(),
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
+            pass_seconds: [0.0; 2],
             kv_capacity: context,
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
@@ -1641,6 +1644,17 @@ impl Model {
         Ok(())
     }
 
+    /// The cut of a partially resident model's drawn draft, from what a second row costs this machine at this budget, measured.
+    /// One pass with a draft costs c passes without, so a draft pays when its chance is about c - 1, and the drawn distribution's
+    /// greatest probability runs below that chance. IQ2_XS, tok/s by cut (0, 0.3, 0.45, 0.6): R9700 at --vram 8, c 1.36: 67.4, 67.1,
+    /// 65.6, 64.4; at --vram 5, c 1.5: 52.1, 53.4, 52.9, 52.2; RTX 5070 Ti at --vram 12, c 1.65: 66.6, 68.1 at 0.4, 69.1 at 0.6.
+    fn partial_drawn_cut(&self) -> f32 {
+        match self.pass_seconds {
+            [one, two] if one > 0.0 && two > 0.0 => (0.85 * (two / one - 1.0)).clamp(0.0, 0.8) as f32,
+            _ => PARTIAL_DRAFT_CUT,
+        }
+    }
+
     /// Catch the MTP layer up on the accepted pairs, then chain up to `limit` greedy drafts
     /// while the product of their probabilities under the drafter stays at the cut.
     /// Each step is one call: a draft's row stays on the device for the next step to read.
@@ -1671,9 +1685,8 @@ impl Model {
         self.phase("draft: catch-up and first draft", &mut clock);
         let Some(step) = step else { return Ok((Vec::new(), Vec::new())) };
         let (token, mut chain) = take(step, rng)?;
-        // (a partially resident model's one draft has no cut when drawn: IQ2_XS at 12 GiB, 76 tok/s against 71 for the most likely token)
         let cut = match (top > 0, self.partial) {
-            (true, true) => 0.0,
+            (true, true) => self.partial_drawn_cut(),
             (true, false) => DRAWN_DRAFT_CUT,
             (false, true) => PARTIAL_DRAFT_CUT,
             (false, false) => DRAFT_CUT,
@@ -1965,6 +1978,9 @@ impl Model {
             self.metric_count("accepted_tokens", accepted as u64);
             self.metric_add("decode_seconds", pass_started.elapsed().as_secs_f64());
             let seconds = pass_started.elapsed().as_secs_f64();
+            if let Some(mean) = self.pass_seconds.get_mut(rows.len().wrapping_sub(1)) {
+                *mean = if *mean > 0.0 { *mean + (seconds - *mean) / 64.0 } else { seconds };
+            }
             let hybrid = if self.partial && self.profile.is_some() {
                 let info = self.group.info().unwrap_or_default();
                 Some((info["wait_ns"].as_u64().unwrap_or(0) as f64 / 1e9, info["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9))
