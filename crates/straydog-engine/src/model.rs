@@ -740,6 +740,27 @@ impl Model {
         self.group.register_resident_moe(&prefix, &operands, 512)
     }
 
+    /// The MTP layer as one more partially resident layer: its most used experts in the slots, by the same scores as every layer's,
+    /// the rest on the CPU. Which ones a draft routes to follows the text (the 256 most used of one set of prompts cover 78% of
+    /// another's routes), so no fixed list would do, and the whole bank cost the other layers 16% more CPU routes.
+    fn register_hybrid_drafter(&mut self) -> Result<()> {
+        let prefix = "blk.48.";
+        let mut operands = Vec::new();
+        for role in ["gate", "up", "down"] {
+            operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
+        }
+        operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
+        operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
+        let banks = Self::host_banks(&self.weights, 48)?;
+        let kinds = self.weights.expert_kinds(48)?;
+        // SAFETY of the borrows: banks and operands point into the weights, which outlive the group.
+        let (operands, banks): (Vec<Operand<'static>>, [&'static [u8]; 3]) = unsafe {
+            (std::mem::transmute::<Vec<Operand<'_>>, Vec<Operand<'static>>>(operands),
+             std::mem::transmute::<[&[u8]; 3], [&'static [u8]; 3]>(banks))
+        };
+        self.group.register_hybrid_moe(prefix, &operands, banks, 512, kinds)
+    }
+
     /// Partial residency: pin every dense operand and bind the host expert banks for the CPU
     /// engine and prefill streaming (page-locked once read, see [`Model::lock_host_banks`]).
     fn prepare_hybrid_moe(&mut self, cpu_threads: u32) -> Result<bool> {
@@ -753,7 +774,8 @@ impl Model {
         // The drafter when its layer and a verification's buffers leave the expert slots their share. Not on CUDA, where a second
         // row costs more (RTX 5070 Ti at --vram 12: 16.9 ms for one row, 29.6 for two) and drafts gain nothing: 57-60 tok/s either way.
         let mut with_drafter = requirements.clone();
-        with_drafter.extend(self.weights.drafter_requirements());
+        // (its routed experts take expert slots like any layer's: register_hybrid_drafter)
+        with_drafter.extend(self.weights.drafter_requirements().into_iter().filter(|(name, _)| !name.ends_with("_exps.weight")));
         with_drafter.push(("@verify:buffers".into(), VERIFY_BYTES));
         with_drafter.push(("@hybrid:slots".into(), DRAFTER_SLOT_ROOM));
         if cfg!(feature = "cuda") || !self.weights.drafter || !self.group.can_pin_model(&with_drafter, None)? {
@@ -782,7 +804,7 @@ impl Model {
             self.group.register_hybrid_moe(&prefix, &operands, banks, 512, *kinds)?;
         }
         if self.weights.drafter {
-            self.register_resident_layer(48)?;
+            self.register_hybrid_drafter()?;
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
