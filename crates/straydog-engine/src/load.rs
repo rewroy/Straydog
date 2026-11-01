@@ -170,6 +170,7 @@ fn read<W: Worker>(weights: &Weights, mut ranges: Vec<Vec<Range>>, kept: &BTreeS
         ranges[tensor.file].push((tensor.offset, tensor.bytes, Target::Host { copy: copies.len(), at: 0 }));
         copies.push((name.clone(), Mutex::new(vec![0u8; tensor.bytes as usize])));
     }
+    crate::host::commit_note("host copies");
     let sources = sources(weights, &ranges)?;
     let chunks: usize = sources.iter().map(|source| source.digests.len()).sum();
     let workers = workers(std::thread::available_parallelism().map_or(4, |count| count.get()).min(chunks).max(1))?;
@@ -177,6 +178,7 @@ fn read<W: Worker>(weights: &Weights, mut ranges: Vec<Vec<Range>>, kept: &BTreeS
         Some(_) => source.pieces.iter().flatten().map(|piece| piece.1 as u64).sum(),
         None => source.map.len() as u64,
     }).sum();
+    crate::host::commit_note("readers");
     progress("load", 0, to_read);
     stream(&sources, workers, &copies, to_read, progress)?;
     Ok(copies)
