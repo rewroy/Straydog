@@ -53,7 +53,7 @@ pub const WORKER_VARIABLES: [&str; 18] = [
 ];
 
 /// Whether a file is a CUDA runtime DLL a CUDA build of the executable loads: cuBLAS
-/// (`cublas64_12.dll`) and the cuBLASLt it imports. The CUDA runtime itself is linked
+/// (`cublas64_13.dll`) and the cuBLASLt it imports. The CUDA runtime itself is linked
 /// statically and the driver is a system DLL.
 fn runtime_library(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(OsStr::to_str) else { return false };

@@ -1075,7 +1075,7 @@ with a model of its own reads no file it was not given.
   `STRAYDOG_GPU_ARCHITECTURES` (`gfx1201`; `86-real;89-real;120`).
 - A GPU without code in the executable fails at startup, with its architecture named.
 - Release artifacts: `straydog-linux-x86_64-hip` (needs the ROCm 10 runtime) and
-  `straydog-windows-x86_64-cuda.exe` (needs the NVIDIA driver and `cublas64_12.dll`). The
+  `straydog-windows-x86_64-cuda.exe` (needs the NVIDIA driver and `cublas64_13.dll`). The
   executable's SHA-256 is published with each release. The model pins are compiled in, so a
   binary authenticates exactly the bundles it was tested with.
 

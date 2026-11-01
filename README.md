@@ -27,7 +27,7 @@ ROCM_PATH=/opt/rocm/core-10.0 cargo build --release --features hip
 # other AMD GPUs: STRAYDOG_GPU_ARCHITECTURES="gfx1100;gfx1201"
 ```
 
-Windows (CUDA 12, from an "x64 Native Tools Command Prompt" with Ninja and the CUDA
+Windows (CUDA 13, from an "x64 Native Tools Command Prompt" with Ninja and the CUDA
 Toolkit; RTX 30/40/50 by default):
 
 ```bat
@@ -36,7 +36,7 @@ rem other GPUs: set STRAYDOG_GPU_ARCHITECTURES=75-real;86-real
 ```
 
 The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm's
-`libamdhip64` and `libhipblas` on Linux, the NVIDIA driver and `cublas64_12.dll`
+`libamdhip64` and `libhipblas` on Linux, the NVIDIA driver and `cublas64_13.dll`
 (next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
 bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm only.
 

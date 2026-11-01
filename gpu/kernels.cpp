@@ -2048,7 +2048,12 @@ void* sd_create(int ordinal, uint64_t budget) {
         value->expert_prefill=prop.major>=7;
         value->graph_capture=true;
         value->hybrid_prelaunch=prop.major>=7;   // __nanosleep
+        // (CUDA 13 no longer says whether kernels have a run-time limit: the shorter wait is the safe one)
+        #if CUDART_VERSION >= 13000
+        value->await_watchdog=true;
+        #else
         value->await_watchdog=prop.kernelExecTimeoutEnabled!=0;
+        #endif
         value->await_timeout=value->await_watchdog ? 1000000000ull : 10000000000ull;   // %globaltimer: ns
         #endif
         size_t available, total; check(hipMemGetInfo(&available, &total));
