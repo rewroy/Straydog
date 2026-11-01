@@ -65,7 +65,7 @@ constexpr size_t hc_decode_scratch = 4 * 324 + 4;
 constexpr unsigned hc_partial_rows = 24;
 template<int down_kind, int inject_kind, int V>
 __global__ void __launch_bounds__(hc_partial_rows * 32) hc_decode_partial(Matrix down, Matrix inject, bool has_inject, const float* x,
-                                                          const float* norm, float* partial, float* inverse) {
+                                                          const float* norm, float* partial, float* inverse) { SD_KERNEL_ACQUIRE;
     const size_t stream = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     __shared__ float reduce[V][8];
     __shared__ __align__(16) float scaled[V][2560];
@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(hc_partial_rows * 32) hc_decode_partial(Matrix
 // (a 4-row pass 0.35 ms longer at 20K and 60K). Each row's products and sums are hc_decode_partial's.
 template<int down_kind, int inject_kind, int V>
 __global__ void __launch_bounds__(256) hc_decode_partial_pairs(Matrix down, Matrix inject, bool has_inject, const float* x,
-                                                               const float* norm, float* partial, float* inverse) {
+                                                               const float* norm, float* partial, float* inverse) { SD_KERNEL_ACQUIRE;
     const size_t stream = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     __shared__ float reduce[V][8];
     __shared__ __align__(16) float scaled[V][2560];
@@ -245,7 +245,7 @@ __device__ __forceinline__ bool hc_copy_block(const HcCopy& copy) {
 template<int up_kind, int V>
 __global__ void __launch_bounds__(256) hc_decode_finish_columns(Matrix up, bool has_inject, const float* partial, const float* inverse,
                                                                 const float* x, const float* norm, float* output, size_t output_stride,
-                                                                HcCopy copy) {
+                                                                HcCopy copy) { SD_KERNEL_ACQUIRE;
     if (copy.count && hc_copy_block(copy)) return;
     __shared__ float low[V][320];
     #pragma unroll
@@ -304,7 +304,7 @@ __global__ void __launch_bounds__(256) hc_decode_finish_columns(Matrix up, bool 
 
 template<int up_kind, int V>
 __global__ void hc_decode_finish(Matrix up, bool has_inject, const float* partial, const float* inverse,
-                                 const float* x, const float* norm, float* output, size_t output_stride, HcCopy copy = {}) {
+                                 const float* x, const float* norm, float* output, size_t output_stride, HcCopy copy = {}) { SD_KERNEL_ACQUIRE;
     if (copy.count && hc_copy_block(copy)) return;
     __shared__ float low[V][320];
     #pragma unroll

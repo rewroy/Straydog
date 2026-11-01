@@ -15,7 +15,7 @@ __global__ void moe_scatter(const float* source, const int32_t* positions, size_
         target[size_t(positions[index/columns])*stride+offset+index%columns]=source[index];
 }
 
-__global__ void moe_product(const float* gate_up, size_t routes, float* product) {
+__global__ void moe_product(const float* gate_up, size_t routes, float* product) { SD_KERNEL_ACQUIRE;
     const size_t index=size_t(blockIdx.x)*256+threadIdx.x;
     if (index>=routes*640) return;
     const size_t base=(index/640)*1280+index%640;
