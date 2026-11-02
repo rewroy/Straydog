@@ -1277,7 +1277,7 @@ template<> struct GemvQ8<23> {   // IQ4_XS: GemvFormat<23>'s unit, two groups of
         }
     }
 };
-__host__ __device__ constexpr bool gemv_q8_kind_taken(int kind) { return kind == 13 || kind == 8; }
+__host__ __device__ constexpr bool gemv_q8_kind_taken(int kind) { return kind == 13 || kind == 8 || kind == 12 || kind == 14 || kind == 23; }
 __host__ __device__ constexpr bool gemv_q8_wide_kind(int kind) { return kind == 12 || kind == 13 || kind == 14 || kind == 23 || kind == 8; }
 // gemv_rows on the staged input: the same rows, lanes, units and reduction for every vector.
 template<int kind, int V, uint32_t PAD = 0>

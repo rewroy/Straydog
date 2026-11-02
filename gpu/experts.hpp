@@ -683,13 +683,41 @@ template<> struct SlotQ8<29> {   // IQ1_M: 56-byte blocks; a unit's four grid by
         return d8 * float(2 * (s & 7) + 1) * float(part[0]) + d8 * float(2 * ((s >> 3) & 7) + 1) * float(part[1]);
     }
 };
-__host__ __device__ constexpr bool slot_q8_kind(int kind) { return kind == 16 || kind == 17 || kind == 22 || kind == 29; }
+template<> struct SlotQ8<19> {   // IQ1_S: 50-byte blocks; a unit's four grid bytes and its 16-bit word (four 3-bit grid highs, a scale, the delta's sign)
+    static constexpr int sign_entries = 0;
+    uint2 low;
+    uint32_t high, d;
+    __device__ void load(const uint8_t* row, size_t pair) {
+        const uint8_t* b = row + (pair / 4) * 50;
+        const unsigned j = unsigned(pair % 4);
+        low = moe_u64(b + 2 + 8 * j);
+        high = moe_u32(b + 34 + 4 * j);
+        d = moe_u16(b);
+    }
+    // As IQ1_M's: a grid row stores value + 1, so the group adds (delta - 1) * sum(x), eight times over in INT32. One scale and delta a unit.
+    __device__ float dot(int h, const uint2*, const uint32_t* x, float scale) const {
+        const uint2* grid = reinterpret_cast<const uint2*>(iq_grid1s);
+        const uint32_t g = h ? low.y : low.x, word = (high >> (16 * h)) & 0xffffu;
+        int sum = 0;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 row = grid[((g >> (8 * l)) & 255) | (((word >> (3 * l)) & 7) << 8)];
+            int dot = __builtin_amdgcn_sudot4(true, int(row.x), true, int(x[2 * l]), 0, false);
+            dot = __builtin_amdgcn_sudot4(true, int(row.y), true, int(x[2 * l + 1]), dot, false);
+            int all = __builtin_amdgcn_sudot4(true, 0x01010101, true, int(x[2 * l]), 0, false);
+            all = __builtin_amdgcn_sudot4(true, 0x01010101, true, int(x[2 * l + 1]), all, false);
+            sum += 8 * dot - (word & 0x8000u ? 9 : 7) * all;
+        }
+        return gemv_half(d) * 0.125f * scale * float(2 * ((word >> 12) & 7) + 1) * float(sum);
+    }
+};
+__host__ __device__ constexpr bool slot_q8_kind(int kind) { return kind == 16 || kind == 17 || kind == 19 || kind == 22 || kind == 29; }
 // Q5_K (DeepSeek-V4.1's shared expert) runs gemv.hpp's GemvQ8<13> units: no sign masks, and the activations staged with the group sums its
 // mins take.
 __host__ __device__ constexpr bool slot_q5k_kind(int kind) { return kind == 13; }
 // LDS bytes of a kind's launch: its sign masks, then the activations of `vectors` rows of `cols` (INT8, a scale every 32; Q5_K's a sum too).
 __host__ __device__ constexpr size_t slot_q8_lds(int kind, size_t cols, size_t vectors = 1) {
-    return (kind == 13 || kind == 29 ? 0 : kind == 22 ? 256 : 128) * 8 + vectors * (cols + cols / 32 * (kind == 13 ? 8 : 4));
+    return (kind == 13 || kind == 29 || kind == 19 ? 0 : kind == 22 ? 256 : 128) * 8 + vectors * (cols + cols / 32 * (kind == 13 ? 8 : 4));
 }
 // Byte j of mask x (y) is 0xff when sign bit j (4 + j) of a sign index's eight is set.
 __device__ __forceinline__ uint32_t slot_spread4(uint32_t bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xffu; }
@@ -959,14 +987,14 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
               reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
     down_lds = slot_q8_lds(down_kind, down.cols, plan.top_k);
     q8_down = d.q8_decode && down_kind >= 0 &&
-              (down_kind == 16 || down_kind == 17 || down_kind == 29 || slot_q5k_kind(down_kind)) &&
+              (down_kind == 16 || down_kind == 17 || down_kind == 19 || down_kind == 29 || slot_q5k_kind(down_kind)) &&
               down.cols % 256 == 0 && plan.top_k <= 16 && reinterpret_cast<uintptr_t>(product) % 16 == 0 && plan.product_stride % 4 == 0 &&
               down_lds <= 65536;
     // An IQ2 row of 4096 to 8191 values (DeepSeek-V4.1's gate and up, 5120) takes at most four lanes on the Q8 kernels: over eight a wave's loads
     // fan out to four rows each and a lane walks ten pairs (IQ2_XXS 44.5 us a layer's gate/up, 40.5 on four lanes; IQ2_XS 53.1 -> 46.5; IQ2_S
     // 53.1 -> 47.8); two lanes or sixteen lose. Decided by the matrix and the device alone (a row's sum is the same whatever shares its launch).
     // (IQ1_M's blocks are shorter: 2 lanes 26.42, 4 25.99, 8 25.80, 16 25.87 ms a DeepSeek-V4.1 3-row pass)
-    if (q8_gate && slot_q8_kind(gate_kind) && gate.cols >= 4096 && gate.cols < 8192) gate_lanes = std::min(gate_lanes, gate_kind == 29 ? 8u : 4u);
+    if (q8_gate && slot_q8_kind(gate_kind) && gate.cols >= 4096 && gate.cols < 8192) gate_lanes = std::min(gate_lanes, gate_kind == 29 || gate_kind == 19 ? 8u : 4u);
 #endif
     plan.lanes[0] = gate_kind < 0 ? 32 : gate_lanes;
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
@@ -987,7 +1015,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             const size_t lds = slot_q8_lds(gate_kind, gate.cols, tokens);
             #define SD_SLOT_GROUPS(format) case format: \
                 slot_gate_up_q8_groups<format><<<blocks, threads, lds, d.stream>>>(plan, input, input_stride, weights, product, uint32_t(tokens)); break;
-            switch (gate_kind) { SD_SLOT_GROUPS(16) SD_SLOT_GROUPS(17) SD_SLOT_GROUPS(22) SD_SLOT_GROUPS(29) }
+            switch (gate_kind) { SD_SLOT_GROUPS(16) SD_SLOT_GROUPS(17) SD_SLOT_GROUPS(19) SD_SLOT_GROUPS(22) SD_SLOT_GROUPS(29) }
             #undef SD_SLOT_GROUPS
             check(hipGetLastError());
             return;
@@ -1003,13 +1031,14 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
                                                                                        product, LinkTail{}, 0, 0); \
             break;
         switch (gate_kind) {
-            SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(22) SD_SLOT_GATE_Q8(29)
+            SD_SLOT_GATE_Q8(16) SD_SLOT_GATE_Q8(17) SD_SLOT_GATE_Q8(19) SD_SLOT_GATE_Q8(22) SD_SLOT_GATE_Q8(29)
             case 13:
                 if (sent) slot_gate_up_q5k<true><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, product, *tail,
                                                                                          send_at, raise);
                 else slot_gate_up_q5k<false><<<blocks, threads, gate_lds, d.stream>>>(plan, bases, input, input_stride, weights, product,
                                                                                     LinkTail{}, 0, 0);
                 break;
+
         }
         #undef SD_SLOT_GATE_Q8
         check(hipGetLastError());
@@ -1026,11 +1055,12 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             else slot_down_q8<format, false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{}); \
             break;
         switch (down_kind) {
-            SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17) SD_SLOT_DOWN_Q8(29)
+            SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17) SD_SLOT_DOWN_Q8(19) SD_SLOT_DOWN_Q8(29)
             case 13:
                 if (linked) slot_down_q5k<true><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, *tail);
                 else slot_down_q5k<false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{});
                 break;
+
         }
         #undef SD_SLOT_DOWN_Q8
         check(hipGetLastError());

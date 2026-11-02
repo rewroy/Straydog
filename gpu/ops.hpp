@@ -119,7 +119,6 @@ __global__ void op_rope_kernel(float* x, size_t count, size_t vectors, size_t wi
     v[1] = float(a * s + b * c);
 }
 
-// steps rows of cols values (stride apart) rounded to FP16, packed.
 // Each of `rows` rows of `width` values, `copies` times over, row after row.
 __global__ void op_repeat_rows_kernel(const float* input, size_t rows, size_t copies, size_t width, float* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -129,6 +128,7 @@ __global__ void op_repeat_rows_kernel(const float* input, size_t rows, size_t co
     for (size_t copy = 0; copy < copies; ++copy) out[(row * copies + copy) * width + column] = value;
 }
 
+// steps rows of cols values (stride apart) rounded to FP16, packed.
 __global__ void op_half_rows(const float* input, size_t stride, size_t cols, size_t steps, __half* out) {
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index < steps * cols) out[index] = __float2half(input[(index / cols) * stride + index % cols]);
