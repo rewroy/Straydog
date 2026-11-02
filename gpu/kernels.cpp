@@ -2975,7 +2975,8 @@ int sd_graph_run(void* handle, uint64_t key) {
         auto& value = device(handle);
         const auto found = value.graphs.find(op_graph_key(key));
         if (found == value.graphs.end()) return 1;
-        // (through HIP: DeepSeek-V4.1's rewind test finds a one-row pass's logits wrong after these graphs go straight to the queue)
+        // (the runtime's launch, CUDA's or HIP's. On RDNA4, DeepSeek-V4.1's rewind test finds a one-row pass's logits wrong when these
+        // graphs go straight to the queue as run_graph's do)
         check(hipGraphLaunch(found->second.executable, value.stream));
         ++value.graph_replays;
         return 0;
