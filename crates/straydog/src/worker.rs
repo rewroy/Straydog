@@ -183,17 +183,17 @@ pub(crate) struct Plan {
 }
 
 /// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more; on Windows, where the
-/// desktop and other programs share the GPU, an eighth of the card in whole 256 MiB (at least 512 MiB, and
-/// 2 GiB from a 16 GB card up): 768 MiB of 6 GB, 1 GiB of 8, 1.5 of 12.
+/// desktop and other programs share the GPU, an eighth of the card and 256 MiB, in whole 256 MiB, up to
+/// 2 GiB: 1 GiB of 6 GB, 1.25 of 8, 1.75 of 12, and 2 from a 16 GB card up as before.
 ///
 /// What it has to hold is the engine's own memory outside its budget and what the others come to want after
-/// `auto` has looked. Measured on an RTX 5070 Ti (15.9 GiB) only: others holding 2.85 GiB, 1.8 GiB left free
-/// served with the desktop fine, and 0.2-0.8 GiB left free stalled it (271d191). No small card has been tried: that
-/// the others' growth scales with the card is the reasoning, and at 6 GB a whole 2 GiB would leave no budget that
-/// starts Qwen3.8 at all (`catalog::min_vram`).
+/// `auto` has looked. On an RTX 5070 Ti (15.9 GiB) the first is 0.74-0.77 GiB at --vram 4.5 to 5.3; of the card, with
+/// others holding 2.85 GiB, 0.2-0.8 GiB left free stalled the desktop and 1.8 GiB did not (271d191). That leaves 0.25 GiB
+/// for the others at 6 GB, and more would leave no budget that starts Qwen3.8 beside a desktop (`catalog::min_vram`). No small
+/// card has been tried: that their engine's own memory is no larger and the others' growth smaller is the reasoning.
 pub(crate) fn margin_on(windows: bool, total: u64) -> u64 {
     let least = if windows {
-        (total.div_ceil(8).div_ceil(256 << 20) * (256 << 20)).clamp(512 << 20, 2 << 30)
+        ((total.div_ceil(8).div_ceil(256 << 20) + 1) * (256 << 20)).clamp(512 << 20, 2 << 30)
     } else {
         512 << 20
     };
@@ -773,8 +773,8 @@ mod tests {
 
     #[test]
     fn autos_margin_scales_on_small_cards_and_stays_from_16_gb() {
-        // Windows, as CUDA reports cards: an eighth of each in whole 256 MiB
-        for (total, margin) in [(4096, 512), (6144, 768), (6078, 768), (8188, 1024), (12288, 1536), (16303, 2048), (16376, 2048), (24564, 2048)] {
+        // Windows, as CUDA reports cards: an eighth of each and 256 MiB, in whole 256 MiB
+        for (total, margin) in [(2048, 512), (4096, 768), (6144, 1024), (6078, 1024), (8188, 1280), (12288, 1792), (16303, 2048), (16376, 2048), (24564, 2048)] {
             assert_eq!(margin_on(true, total * MIB), margin * MIB, "{total} MiB");
         }
         // what f6362a9 left from 16 GB up: 2 GiB or 3%
@@ -788,7 +788,7 @@ mod tests {
         // the budget: whole 256 MiB as before from a 12 GB card, off Windows on any; finer on a small one under Windows
         assert_eq!(auto_budget(true, 13_384 * MIB, 16303 * MIB), 11_264 * MIB);
         assert_eq!(auto_budget(false, 6000 * MIB, 6144 * MIB), 5376 * MIB);
-        assert_eq!(auto_budget(true, 5344 * MIB, 6144 * MIB), 4544 * MIB);
+        assert_eq!(auto_budget(true, 5344 * MIB, 6144 * MIB), 4288 * MIB);
         assert_eq!(auto_budget(true, 500 * MIB, 6144 * MIB), 0);
     }
 

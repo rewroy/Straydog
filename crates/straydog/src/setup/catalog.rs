@@ -346,14 +346,13 @@ fn counted(entry: &Entry, gpus: usize, context: u64) -> u64 {
 /// A Qwen3.8 prefill batch below 48 GiB of budgets (`worker::plan`).
 const PARTIAL_BATCH: u64 = 1024;
 
-/// What `Weights::dense_requirements` leaves out of a bundle's `dense` bytes: the HyperConnections' and the PLE layer's BF16
-/// matrices going up as Q8_0 (626442240 bytes less, in every bundle) and the token embeddings, kept on the host (273152000 bytes
-/// in IQ3_XXS; their 635699200 weights at 2 bits at the least, as here, for bundles whose headers are not at hand: too little by at most 0.11 GiB).
-const DENSE_NOT_PINNED: u64 = 626_442_240 + 635_699_200 / 4;
-
-/// What a partial placement pins of a bundle's `dense` bytes.
+/// What a partial placement pins of a bundle's `dense` bytes (`Weights::dense_requirements`): not the HyperConnections' and the PLE
+/// layer's BF16 matrices' 626442240 bytes they save going up as Q8_0, nor the token embeddings, kept on the host: 273152000 bytes
+/// in IQ3_XXS, whose 3216268800 bytes pinned were read from its header; for bundles whose headers were not at hand, their
+/// 635699200 weights at 2 bits at the least, which may count up to 0.11 GiB too much.
 fn pinned_dense(entry: &Entry) -> u64 {
-    entry.footprint.dense.saturating_sub(DENSE_NOT_PINNED)
+    let embeddings = if entry.quant == "IQ3_XXS" { 273_152_000 } else { 635_699_200 / 4 };
+    entry.footprint.dense.saturating_sub(626_442_240 + embeddings)
 }
 
 /// The largest expert of a bundle, which sizes the staging slots: a third over the average (IQ3_XXS: 2329600 bytes, 1746133 on average).
@@ -696,6 +695,14 @@ pub(crate) mod tests {
         assert!((4.0..4.5).contains(&least("IQ2_XS", DEFAULT_CONTEXT)), "{}", least("IQ2_XS", DEFAULT_CONTEXT));
         // Its state, 13 GiB at the whole context, is in host memory: only the indexers are in VRAM
         assert!(least("IQ2_XS", DEFAULT_CONTEXT) - least("IQ2_XS", 16_384) < 0.5);
+        // IQ3_XXS as measured on an RTX 5070 Ti: --vram 4.15 started and 4.1 was refused; the gate is the placement's at the K/V it starts with
+        let starts = |gib: f64| {
+            let budget = (gib * GIB_F) as u64;
+            let ours = entry("IQ3_XXS");
+            partial_slot_bytes(pinned_dense(&ours), 2_329_600, 32_768, PARTIAL_BATCH, budget).is_some()
+        };
+        assert!(starts(4.15) && !starts(4.1));
+        assert_eq!(pinned_dense(&entry("IQ3_XXS")), 3_216_268_800);
         // two GPUs each keep their workspaces, and share the weights
         let (one, two) = (min_vram(&entry("IQ2_XS"), 1, DEFAULT_CONTEXT), min_vram(&entry("IQ2_XS"), 2, DEFAULT_CONTEXT));
         assert!(two > one && two < 2 * one);
@@ -753,7 +760,7 @@ pub(crate) mod tests {
         let refused = fit_on(true, &ours, &busy, DEFAULT_CONTEXT);
         let Fit::TooLittleVram { needs, has } = refused else { panic!("{refused:?}") };
         assert_eq!(has, (6144 - 1500) << 20);
-        assert_eq!(needs, min_vram(&ours, 1, DEFAULT_CONTEXT) + (768 << 20));
+        assert_eq!(needs, min_vram(&ours, 1, DEFAULT_CONTEXT) + (1 << 30));
         let note = refused.note(&ours);
         assert!(note.contains("of VRAM free") && note.contains("4.5 GiB free"), "{note}");
         // holding more than a quarter of it is a job `auto` waits for: it says nothing of the card, as a running engine says nothing
@@ -790,7 +797,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_drafter_is_not_the_default_where_it_does_not_pay() {
-        // (the budgets depend on the platform's margin: 6 GB under Windows leaves about 4.4 GiB, elsewhere 4.7)
+        // (the budgets depend on the platform's margin: 6 GB under Windows leaves about 4.2 GiB, elsewhere 4.5)
         assert!(!drafter_pays(&windows_pc(6144, DESKTOP, RAM_32)));
         assert!(drafter_pays(&windows_pc(8188, DESKTOP, RAM_32)));
         assert!(drafter_pays(&doggybox()));
