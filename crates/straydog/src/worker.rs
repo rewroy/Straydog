@@ -429,8 +429,10 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     // A void pass leaves the devices sound: the request fails and the engine resets, so the next
     // request restores from the checkpoints instead of waiting for a server restart. So does a
     // K/V that found no memory to grow into: only sequences that long are refused.
+    // Nor does a prompt found too long before anything ran.
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
-        && !message.ends_with(straydog_engine::model::KV_NO_MEMORY);
+        && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
+        && !message.ends_with("exceeds the allocated context");
     Failure { message: format!("{site}: {message}"), fatal }
 }
 
@@ -550,7 +552,11 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // without it and a reasoning_end event marks the place. The same text otherwise written (the
     // reasoning quoting a tag) stays the reasoning's.
     let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+    // The held tokens can be more than the tokenizer's for the same text, and with no `max_tokens` the reply's room was all that `ids` left: a
+    // client that sends none, as Dogmind App does, ended the worker on "exceeds the allocated context" on the first such reply.
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
+    let agreed = if agreed.len() < context { agreed } else { ids.clone() };
+    let max_new = max_new.min(context - agreed.len());
     let result = engine.model.generate_constrained(
         &agreed, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -686,6 +692,8 @@ mod tests {
         assert!(!failed.fatal);
         assert_eq!(failed.message, format!("site: {void}"));
         assert!(engine_failed("an illegal memory access was encountered", "site").fatal);
+        // (a prompt found too long before anything ran leaves the engine as it was)
+        assert!(!engine_failed("Straydog prompt plus output exceeds the allocated context", "site").fatal);
     }
 
     #[test]
