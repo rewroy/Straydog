@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::constraint::{self, Constraint};
+use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::qwen_vision::{self, ImageSpan, IMAGE_PAD};
@@ -2176,6 +2177,11 @@ impl Model {
         let mut mtp_hidden = self.final_hidden.clone().ok_or("Straydog has no hidden state to draft from")?;
         let mut mtp_tokens = vec![token];
         let mut mtp_position = self.history.len() as u64 - 1;
+        // A long match with the sequence so far is copied rather than drafted (an edit repeats its source): those drafts are
+        // accepted nearly always, and the drafter's steps are saved. The MTP layer still takes the kept rows' pairs.
+        let mut ngrams = Ngrams::new();
+        ngrams.extend(&self.history);
+        let mut policy = Policy::new(self.speculative + 1);
         while produced < max_new {
             if cancelled() {
                 break;
@@ -2186,7 +2192,18 @@ impl Model {
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
-            let (drafts, proposed) = self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng)?;
+            ngrams.push(token);
+            let (copy, matched) = ngrams.propose(limit);
+            let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
+            let copied = width > 0;
+            let (drafts, proposed) = if copied {
+                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng)?;
+                self.ensure_kv(self.history.len() + 1 + width)?;
+                self.protect(self.history.len(), self.history.len() + 1 + width)?;
+                (copy[..width].to_vec(), Vec::new())
+            } else {
+                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng)?
+            };
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &rows)?;
@@ -2201,6 +2218,10 @@ impl Model {
             let (accepted, following) = Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng);
             self.phase("accept", &mut clock);
             generated.insert(following);
+            if copied {
+                policy.record(drafts.len(), accepted);
+            }
+            ngrams.extend(&drafts[..accepted]);
             let mut emitted: Vec<u32> = drafts[..accepted].iter().copied().chain([following]).collect();
             let mut kept = accepted + 1;
             if let Some(index) = emitted.iter().position(|value| END_TOKENS.contains(value)) {
