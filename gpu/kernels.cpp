@@ -451,6 +451,7 @@ struct Device {
     // Decode work is captured and replayed as graphs: RDNA4 (HIP) and every CUDA device.
     bool graph_capture = false;
     void* direct_queue = nullptr;
+    uint64_t direct_tail_object = 0;
     int direct_mode = -1;
     std::unordered_map<uint64_t,bool> direct_fenced;
     // Partially resident decode launches each layer's graph before the previous layer's
