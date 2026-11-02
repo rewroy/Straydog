@@ -100,9 +100,10 @@ __global__ void qsa_normalize_rows(float* projections,size_t stride,const float*
         const float key=normalized[head*256+column], value=own[values+head*256+column];
         state[(head*context+pos)*256+column]=key;
         state[context*width+(head*context+pos)*256+column]=value;
-        if (pos<mirror_rows) {
-            mirror[(head*mirror_rows+pos)*256+column]=key;
-            mirror[((H::kv+head)*mirror_rows+pos)*256+column]=value;
+        if (mirror_rows) {
+            const size_t slot=unsigned(pos)%unsigned(mirror_rows);
+            mirror[(head*mirror_rows+slot)*256+column]=key;
+            mirror[((H::kv+head)*mirror_rows+slot)*256+column]=value;
         }
     }
     else if (block<H::query+H::kv+4) qsa_normalize_block(own+index,iqnorm,block-H::query-H::kv,128,128,rope,own+index,128);

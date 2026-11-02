@@ -20,7 +20,7 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
     const size_t limit=position ? size_t(position[row]) : base;
     partial+=row*H::query*chunks*258;
     __shared__ float query[12*256],sums[8*12*32],probabilities[12*32];
-    __shared__ int tokens[qsa_decode_chunk];
+    __shared__ int tokens[qsa_decode_chunk],slots[qsa_decode_chunk];   // (a key's row in the mirror, or -1)
     #pragma unroll
     for (size_t i=t;i<12*256;i+=256) query[i]=input[(row*H::query+kv*12)*256+i];
     if (t<qsa_decode_chunk) {
@@ -31,6 +31,10 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
             if (raw>=0 && raw<=float(limit) && raw<float(context)) token=int(raw);
         }
         tokens[t]=token;
+        if constexpr (mirrored) {
+            const size_t last=position ? size_t(position[steps-1]) : base;
+            slots[t]=token>=0 && size_t(token)+mirror_rows>last+kv_mirror_margin ? int(unsigned(token)%unsigned(mirror_rows)) : -1;
+        }
     }
     __syncthreads();
     // Scores: lane owns one key, the wave owns 32 of its 256 dimensions.
@@ -38,10 +42,12 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
         const int token=tokens[lane];
         float accumulator[12]={};
         if (token>=0) {
-            const bool cached=mirrored && size_t(token)<mirror_rows;
+            int slot=-1;
+            if constexpr (mirrored) slot=slots[lane];
+            const bool cached=slot>=0;
             const float* source=cached ? mirror : state;
             const size_t capacity=cached ? mirror_rows : context;
-            const float4* keys=reinterpret_cast<const float4*>(source+(kv*capacity+size_t(token))*256+wave*32);
+            const float4* keys=reinterpret_cast<const float4*>(source+(kv*capacity+size_t(cached ? slot : token))*256+wave*32);
             float k[32];
             #pragma unroll
             for (size_t d=0;d<8;++d) {
@@ -88,7 +94,8 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
         const int token=tokens[key];
         if constexpr (mirrored) {
             const float* cached_values=mirror+(H::kv+kv)*mirror_rows*256+t;
-            v[key]=token<0 ? 0.0f : (size_t(token)<mirror_rows ? cached_values : values)[size_t(token)*256];
+            const int slot=slots[key];
+            v[key]=token<0 ? 0.0f : slot>=0 ? cached_values[size_t(slot)*256] : values[size_t(token)*256];
         } else
             v[key]=token<0 ? 0.0f : values[size_t(token)*256];
     }
