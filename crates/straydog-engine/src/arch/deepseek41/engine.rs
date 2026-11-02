@@ -2299,14 +2299,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let saves = n > 1 && self.rewindable(n);
         // (its rows all in one batch, from the first: rows_of)
         let link = self.link_pass;
-        // The Engram rows of every token, before the layer (each batch takes its own), in the
-        // buffer kept between passes.
+        // The Engram rows of every token, before the layer; each batch decodes its own into the
+        // buffer kept between passes (a whole long prompt's decoded at once: 800 MB of page faults, 3 s).
         let mut gathered = std::mem::take(&mut self.engram_values);
+        let mut raw_rows: Option<(Vec<u8>, u32, usize)> = None;
         let engram = match plan.engram {
             Some(module) => {
                 let began = std::time::Instant::now();
-                let waited = self.engram_rows(module, tokens, &mut gathered)?;
+                let (bytes, waited) = self.engram_rows(module, tokens, &mut gathered)?;
                 self.lap(&[("engram: row bytes", waited), ("engram: ids and decode", began.elapsed().as_secs_f64() - waited)]);
+                raw_rows = bytes;
                 true
             }
             None => false,
@@ -2318,6 +2320,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let mut expand = expand;
             if engram {
                 let expanding = std::mem::take(&mut expand);
+                let window = if let Some((bytes, kind, width)) = &raw_rows {
+                    gathered.clear();
+                    let columns = hp.engram_columns();
+                    formats::decode_into(*kind, &bytes[first * columns * width..end * columns * width], &mut gathered)?;
+                    (0, rows as usize * engram_values)
+                } else {
+                    (first * engram_values, end * engram_values)
+                };
                 for shard in &mut self.shards {
                     let work = shard.work.view(first);
                     if expanding {
@@ -2327,7 +2337,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                         shard.gpu.hc_expand(work.out.base(), work.stream2.base(), work.post_f.base(), work.comb_f.base(), rows, hc, w,
                                             work.stream.base())?;
                     }
-                    shard.gpu.write_buffer(&work.engram_rows, 0, &gathered[first * engram_values..end * engram_values])?;
+                    shard.gpu.write_buffer(&work.engram_rows, 0, &gathered[window.0..window.1])?;
                     shard.linear(&name(layer, "engram_kv"), work.engram_rows.base(), rows as usize, work.engram_kv.base())?;
                     let gate = shard.dense(&name(layer, "engram_gate"))?;
                     shard.gpu.engram_gate(work.stream.base(), work.engram_kv.base(), gate.buffer.base(), rows, hc, w, hp.norm_eps)?;
@@ -2531,7 +2541,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// The rows Engram module `module` gathers for `tokens`, decoded (a token's after another's)
     /// into `gathered`. The seconds the rows' bytes took to arrive.
-    fn engram_rows(&self, module: usize, tokens: &[u32], gathered: &mut Vec<f32>) -> Result<f64> {
+    fn engram_rows(&self, module: usize, tokens: &[u32], gathered: &mut Vec<f32>) -> Result<(Option<(Vec<u8>, u32, usize)>, f64)> {
         let engram = self.hp.engram.as_ref().ok_or("no Engram metadata")?;
         let name = &engram.tables[module];
         let table = self.tensors.tensor(name)?;
@@ -2549,6 +2559,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let bytes = self.tensors.rows(name, &rows)?;
         let waited = reading.elapsed().as_secs_f64();
         let values = self.hp.engram_columns() * engram.head_dim;
+        // (every position has its rows: a batch decodes its own)
+        if tokens.iter().all(|&token| token < IMAGE_TOKEN) {
+            return Ok((Some((bytes, kind, width)), waited));
+        }
         gathered.clear();
         gathered.reserve(tokens.len() * values);
         // An image position's values are zeros: its gate's key and value are then zero, and the
@@ -2563,7 +2577,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 formats::decode_into(kind, row, gathered)?;
             }
         }
-        Ok(waited)
+        Ok((None, waited))
     }
 
     /// The experts of `layer` over the rows `first..n` of a pass, after the router (see
