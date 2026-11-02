@@ -42,6 +42,8 @@ use std::ffi::c_void;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use super::{Gating, Hparams, Rope};
 use crate::arch::{Tensor, Tensors};
 use crate::experts::{select, taken_up_to, Counts, DeviceExperts, Layout, Reader, Role};
@@ -485,6 +487,9 @@ impl RowShape {
         self.floats(rows).iter().fold(0, |at: u64, &floats| at.next_multiple_of(256) + (floats.max(1) * 4) as u64)
     }
 }
+
+/// Rows from which a pass sends its embeddings once and repeats them on the devices.
+const REPEATED_ROWS: usize = 256;
 
 /// Checksums a pass queues at most (DS41_CHECK_SLOTS).
 const CHECKS: usize = 32768;
@@ -1982,7 +1987,36 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let bytes = row_bytes(embed.kind, embed.dims[0])?;
             let (kind, data) = (embed.kind, embed.data);
             let mut row = Vec::with_capacity(w);
-            for (slab, piece) in tokens.chunks(SLAB).enumerate() {
+            // A long pass sends one copy of each row and repeats them on the devices: the copies are a quarter of the bytes
+            // (7.5 GB over the two GPUs' buses for a 45K prompt's three batches, 3.6 s with the GPUs idle).
+            let repeated = tokens.len() >= REPEATED_ROWS;
+            for (slab, piece) in tokens.chunks(SLAB).enumerate().filter(|_| repeated) {
+                let (first_token, decode_began) = (slab * SLAB, std::time::Instant::now());
+                stream.resize(piece.len() * w, 0.0);
+                stream.par_chunks_mut(w).zip(piece.par_iter()).try_for_each(|(row, &token)| {
+                    if token >= vision::IMAGE_TOKEN {
+                        return Ok(());
+                    }
+                    formats::decode_slice(kind, &data[token as usize * bytes..(token as usize + 1) * bytes], row)
+                        .map_err(|error| format!("token {token}'s embedding: {error}"))
+                })?;
+                for (i, _) in piece.iter().enumerate().filter(|(_, &token)| token >= vision::IMAGE_TOKEN) {
+                    let row = self.image_row(self.position + first_token + i)?;
+                    stream[i * w..(i + 1) * w].copy_from_slice(row);
+                }
+                decoding += decode_began.elapsed().as_secs_f64();
+                for shard in &mut self.shards {
+                    shard.gpu.write_buffer(&shard.work.x, (first_token * w * 4) as u64, &stream)?;
+                }
+            }
+            if repeated {
+                for shard in &mut self.shards {
+                    let work = &shard.work;
+                    let (one, whole) = (work.x.base() as P, work.stream.base());
+                    shard.gpu.repeat_rows(one, tokens.len() as u64, hc as u64, w as u64, whole)?;
+                }
+            }
+            for (slab, piece) in tokens.chunks(SLAB).enumerate().filter(|_| !repeated) {
                 let (first_token, decode_began) = (slab * SLAB, std::time::Instant::now());
                 // (every value is written below: the slab's tokens' embeddings, or an image's rows)
                 stream.resize(piece.len() * hc * w, 0.0);

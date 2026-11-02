@@ -684,6 +684,12 @@ impl Backend {
         check(unsafe { ffi::sd_op_half_values(self.handle(), input.cast(), values, output.cast()) })
     }
 
+    /// `output` = each of `rows` rows of `input` (`width` values), `copies` times over, row after row.
+    pub fn repeat_rows(&mut self, input: P, rows: u64, copies: u64, width: u64, output: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_repeat_rows(self.handle(), input.cast(), rows, copies, width, output.cast()) })
+    }
+
 
     /// `x` (steps x channels) becomes SiLU of each channel's causal convolution with its `taps`
     /// (channels x kernel) over `history` (kernel - 1 rows, oldest first, left holding the last inputs).

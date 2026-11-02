@@ -844,6 +844,16 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_repeat_rows(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        rows: u64,
+        copies: u64,
+        width: u64,
+        output: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_half_values(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,

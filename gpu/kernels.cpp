@@ -3544,6 +3544,15 @@ int sd_op_slot_moe_down(void* handle, const uint64_t* bases, const uint32_t* fir
     SD_OP_END
 }
 
+int sd_op_repeat_rows(void* handle, const float* input, uint64_t rows, uint64_t copies, uint64_t width, float* output) {
+    SD_OP_BEGIN
+    if (!input || !output || !rows || !copies || !width) throw std::runtime_error("invalid Straydog row repeat");
+    op_span(value, input, size_t(rows * width) * 4, "rows to repeat");
+    op_span(value, output, size_t(rows * copies * width) * 4, "repeated rows");
+    op_repeat_rows_kernel<<<op_blocks(size_t(rows * width)), 256, 0, value.stream>>>(input, size_t(rows), size_t(copies), size_t(width), output);
+    SD_OP_END
+}
+
 int sd_op_half_values(void* handle, const float* input, uint64_t values, void* output) {
     SD_OP_BEGIN
 #if defined(__HIPCC__)
