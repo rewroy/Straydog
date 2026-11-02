@@ -1124,7 +1124,7 @@ with a model of its own reads no file it was not given.
 
 - `cargo build --release --features hip` (or `cuda`). `build.rs` runs CMake on `gpu/` with the
   vendor's compiler and links the result statically. The architectures come from
-  `STRAYDOG_GPU_ARCHITECTURES` (`gfx1201`; `86-real;89-real;120`).
+  `STRAYDOG_GPU_ARCHITECTURES` (`gfx1201`; `75-real;86-real;89-real;120`).
 - A GPU without code in the executable fails at startup, with its architecture named.
 - Release artifacts: `straydog-linux-x86_64-hip` (needs the ROCm 10 runtime) and
   `straydog-windows-x86_64-cuda.exe` (needs the NVIDIA driver and `cublas64_13.dll`). The

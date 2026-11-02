@@ -2012,10 +2012,32 @@ static bool nvml_free_bytes(const hipDeviceProp_t& prop, uint64_t& free_bytes) {
     return true;
 }
 #endif
+// A build holds code only for the GPU architectures it was compiled for. The device is current.
+static void require_code_for(int ordinal) {
+    hipFuncAttributes kernel{};
+    const hipError_t probe = hipFuncGetAttributes(&kernel, reinterpret_cast<const void*>(&cast_half));
+    #if !defined(__HIPCC__)
+    // Only missing code names the architecture: a context faulted by an earlier illegal
+    // access fails every call and is reported as such.
+    if (probe != cudaErrorInvalidDeviceFunction && probe != cudaErrorNoKernelImageForDevice) check(probe);
+    #endif
+    if (probe != hipSuccess) {
+        (void)hipGetLastError();
+        hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop, ordinal));
+        #if defined(__HIPCC__)
+        const std::string arch = prop.gcnArchName;
+        #else
+        const std::string arch = "sm_" + std::to_string(prop.major * 10 + prop.minor);
+        #endif
+        throw std::runtime_error("this Straydog build has no GPU code for " + arch + "; build it for this GPU");
+    }
+}
+
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes) {
     try {
         if (!name || capacity < 2 || !free_bytes || !total_bytes) throw std::runtime_error("invalid info buffers");
         check(hipSetDevice(ordinal));
+        require_code_for(ordinal);
         hipDeviceProp_t prop{};
         check(hipGetDeviceProperties(&prop, ordinal));
         std::strncpy(name, prop.name, capacity - 1); name[capacity - 1] = 0;
@@ -2043,24 +2065,7 @@ void* sd_create(int ordinal, uint64_t budget) {
     try {
         auto value = std::make_unique<Device>(ordinal);
         check(hipSetDevice(ordinal));
-        // A build holds code only for the GPU architectures it was compiled for.
-        hipFuncAttributes kernel{};
-        const hipError_t probe = hipFuncGetAttributes(&kernel, reinterpret_cast<const void*>(&cast_half));
-        #if !defined(__HIPCC__)
-        // Only missing code names the architecture: a context faulted by an earlier illegal
-        // access fails every call and is reported as such.
-        if (probe != cudaErrorInvalidDeviceFunction && probe != cudaErrorNoKernelImageForDevice) check(probe);
-        #endif
-        if (probe != hipSuccess) {
-            (void)hipGetLastError();
-            hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop, ordinal));
-            #if defined(__HIPCC__)
-            const std::string arch = prop.gcnArchName;
-            #else
-            const std::string arch = "sm_" + std::to_string(prop.major * 10 + prop.minor);
-            #endif
-            throw std::runtime_error("this Straydog build has no GPU code for " + arch + "; build it for this GPU");
-        }
+        require_code_for(ordinal);
         size_t grid_bytes[6]{};
         const uint8_t* grids[6];
         const int grid_kinds[6] = {16, 17, 22, 18, 21, 29};

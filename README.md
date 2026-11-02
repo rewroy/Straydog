@@ -32,7 +32,7 @@ Toolkit; RTX 30/40/50 by default):
 
 ```bat
 cargo build --release --features cuda
-rem other GPUs: set STRAYDOG_GPU_ARCHITECTURES=75-real;86-real
+rem other GPUs (the default is 75-real;86-real;89-real;120): set STRAYDOG_GPU_ARCHITECTURES=89-real
 ```
 
 The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm's
