@@ -1,5 +1,5 @@
 // One allocation, two layouts: prefill stages one layer; decode mirrors every
-// registered host state's prefix. All copies preserve the state's F32 planes (each K/V head's
+// registered host state's newest rows. All copies preserve the state's F32 planes (each K/V head's
 // keys, then each one's values: four for a whole layer, two for a GPU's part, Device::kv_planes).
 struct KvView {
     float* kv; size_t capacity; bool staged;
@@ -17,6 +17,15 @@ void kv_copy_rows(Device& d, float* to, size_t to_capacity, const float* from, s
         check(hipMemcpyAsync(to+(segment*to_capacity+first)*256,from+(segment*from_capacity+first)*256,count*256*4,
                              hipMemcpyDefault,stream ? stream : d.stream));
 }
+// Rows [first, first+count) of the K/V to their places in its ring of `rows` rows.
+void kv_copy_ring(Device& d, float* ring, size_t rows, const float* from, size_t context, size_t first, size_t count, size_t planes) {
+    while (count) {
+        const size_t slot=first%rows, run=std::min(count,rows-slot);
+        for (size_t segment=0;segment<planes;++segment)
+            check(hipMemcpyAsync(ring+(segment*rows+slot)*256,from+(segment*context+first)*256,run*256*4,hipMemcpyDefault,d.stream));
+        first+=run; count-=run;
+    }
+}
 // The decode layout: every host state's mirror, the same positions of each one's planes. (Before any graph reads it.)
 void kv_layout(Device& d) {
     d.kv_mirrors.clear(); d.kv_mirror_rows = 0;
@@ -25,7 +34,7 @@ void kv_layout(Device& d) {
     size_t planes = 0;
     for (const auto& state : d.host_states) planes += kv_planes_of(d,state.first);
     d.kv_mirror_rows = d.kv_stage_floats/(256*planes);
-    if (!d.kv_mirror_rows) return;
+    if (d.kv_mirror_rows<=2*kv_mirror_margin) { d.kv_mirror_rows=0; return; }
     size_t at = 0;
     for (const auto& state : d.host_states) {
         d.kv_mirrors.emplace(state.first,KvMirror{d.kv_stage+at,0});
@@ -98,17 +107,21 @@ KvView kv_decode_view(Device& d, void* state, size_t context) {
 // Called OUTSIDE capture, once per span (also on graph replay). The same stream
 // orders fills after old writes and before attention. Rewrites truncate validity;
 // the current token(s) are supplied by write_attention_kv's duplicate stores.
-KvView kv_prepare_decode(Device& d, void* state, size_t context, size_t base, size_t count=1) {
+// `prefix`: the batch reads its mirror by position, so the rows from the first on must be there (it fits).
+KvView kv_prepare_decode(Device& d, void* state, size_t context, size_t base, size_t count=1, bool prefix=false) {
     kv_stage_settle(d);
     const KvView view=kv_decode_view(d,state,context);
     kv_invalidate_write(d,state,base);
     if (!view.mirror) return view;
     d.kv_stage_owner=nullptr; d.kv_stage_valid=0;
     auto& mirror=d.kv_mirrors.find(state)->second;
-    const size_t end=std::min(base,view.mirror_rows);
-    const size_t valid=std::min(mirror.valid,end);
-    kv_copy_rows(d,view.mirror,view.mirror_rows,view.kv,context,valid,end-valid,kv_planes_of(d,state));
-    mirror.valid=std::min(base+count,view.mirror_rows);
+    const size_t rows=view.mirror_rows,planes=kv_planes_of(d,state),end=base+count;
+    const size_t want=prefix || end+kv_mirror_margin<=rows ? 0 : end+kv_mirror_margin-rows;
+    if (mirror.valid<=mirror.oldest || mirror.valid<=want) mirror.oldest=mirror.valid=want;
+    if (want<mirror.oldest) { kv_copy_ring(d,view.mirror,rows,view.kv,context,want,mirror.oldest-want,planes); mirror.oldest=want; }
+    kv_copy_ring(d,view.mirror,rows,view.kv,context,mirror.valid,base-mirror.valid,planes);
+    mirror.valid=end;
+    mirror.oldest=std::max(mirror.oldest,end>rows ? end-rows : size_t(0));
     return view;
 }
 // A batch that fits its layer's decode mirror runs there: the mirror stays valid for the
@@ -117,7 +130,7 @@ KvView kv_for_prefill(Device& d, void* state, size_t context, size_t base, size_
     kv_stage_settle(d);
     if (count==1) return kv_prepare_decode(d,state,context,base);
     if (d.kv_mirrors.count(state) && base+count<=d.kv_mirror_rows) {
-        const KvView view=kv_prepare_decode(d,state,context,base,count);
+        const KvView view=kv_prepare_decode(d,state,context,base,count,true);
         return {view.mirror,view.mirror_rows,true};
     }
     kv_invalidate_write(d,state,base);

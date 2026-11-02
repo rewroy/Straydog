@@ -286,6 +286,9 @@ template<int P> struct QwenHeads {
     static constexpr size_t packed = query * 256 + kv * 512;               // a row's normalized queries, keys, values
 };
 constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1024 * 1024;
+// A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
+// verify_max) leave what it reads in place, with nothing to copy again.
+constexpr size_t kv_mirror_margin = 4;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
@@ -386,7 +389,10 @@ private:
     std::thread thread_;   // last: starts once the members above exist
 };
 
-struct KvMirror { float* data; size_t valid; };
+// A K/V's newest rows in VRAM, a ring of Device::kv_mirror_rows rows (position % rows): rows [oldest, valid) are there. A token selects
+// recent rows: IQ3_XXS on an RTX 5070 Ti at --vram 8.5, a 15K-token conversation, a mirror of 2901 rows of the same VRAM held 3-10% of the
+// rows the 12 K/V layers selected when it was their first rows and holds 32-44% as their newest; a K/V layer 480 -> 350 us, 39 -> 44 tok/s.
+struct KvMirror { float* data; size_t valid; size_t oldest = 0; };
 // A host exchange (host_exchange.hpp): its page-locked host memory, the device's view of it, and the
 // device's count of exports (an allocation of the device).
 struct ExchangeArea {
@@ -937,9 +943,10 @@ __global__ void write_attention_kv(float* state, size_t context, size_t base, si
     state[(head * context + base + step) * 256 + column] = input[keys_start + index];
     state[context * width + (head * context + base + step) * 256 + column] =
         values ? values[index] : input[keys_start + steps * width + index];
-    if (base+step<mirror_rows) {
-        mirror[(head*mirror_rows+base+step)*256+column]=input[keys_start+index];
-        mirror[((K+head)*mirror_rows+base+step)*256+column]=
+    if (mirror_rows) {
+        const size_t slot=unsigned(base+step)%unsigned(mirror_rows);
+        mirror[(head*mirror_rows+slot)*256+column]=input[keys_start+index];
+        mirror[((K+head)*mirror_rows+slot)*256+column]=
             values ? values[index] : input[keys_start+steps*width+index];
     }
 }
