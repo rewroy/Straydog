@@ -465,6 +465,12 @@ impl Weights {
             .collect()
     }
 
+    /// Every mapping with its file.
+    #[cfg(windows)]
+    pub(crate) fn mapped_files(&self) -> impl Iterator<Item = (&[u8], &File)> {
+        self.maps.iter().map(|map| &map[..]).zip(&self.files)
+    }
+
     /// The file and offset of mapped bytes (an operand's address), if they are mapped.
     pub(crate) fn locate(&self, address: *const u8, bytes: usize) -> Option<(usize, u64)> {
         let address = address as usize;
