@@ -273,7 +273,7 @@ impl Fit {
             Fit::Drive(bytes) if *bytes < entry.footprint.experts / 20 => format!("{} of its experts are read from the drive: a little slower", if *bytes < GIB { "under 1 GiB".to_string() } else { gib(bytes) }),
             Fit::Drive(bytes) => format!("{} of its experts are read from the drive as tokens need them: slow", gib(bytes)),
             Fit::NoGpu => "needs a GPU".to_string(),
-            Fit::TooLittleVram { needs, has } => format!("needs {} of VRAM free, with what `auto` leaves for the desktop; this machine has {} free", tenths(*needs), tenths(*has)),
+            Fit::TooLittleVram { needs, has } => format!("needs {} of VRAM free, with what `auto` leaves for the desktop; this machine has {} for it", tenths(*needs), tenths(*has)),
         }
     }
 }
@@ -762,7 +762,7 @@ pub(crate) mod tests {
         assert_eq!(has, (6144 - 1500) << 20);
         assert_eq!(needs, min_vram(&ours, 1, DEFAULT_CONTEXT) + (1 << 30));
         let note = refused.note(&ours);
-        assert!(note.contains("of VRAM free") && note.contains("4.5 GiB free"), "{note}");
+        assert!(note.contains("of VRAM free") && note.contains("4.5 GiB for it"), "{note}");
         // holding more than a quarter of it is a job `auto` waits for: it says nothing of the card, as a running engine says nothing
         assert!(fit_on(true, &ours, &windows_pc(6144, 1600 << 20, RAM_32), DEFAULT_CONTEXT).runs());
         // 4 GB holds no Qwen3.8 at all
