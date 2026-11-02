@@ -2975,7 +2975,8 @@ int sd_graph_run(void* handle, uint64_t key) {
         auto& value = device(handle);
         const auto found = value.graphs.find(op_graph_key(key));
         if (found == value.graphs.end()) return 1;
-        graph_launch(value, found->second);
+        // (through HIP: DeepSeek-V4.1's rewind test finds a one-row pass's logits wrong after these graphs go straight to the queue)
+        check(hipGraphLaunch(found->second.executable, value.stream));
         ++value.graph_replays;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
