@@ -611,7 +611,35 @@ struct Engine {
     const char* isa = "scalar";
     std::vector<float> gate_up, products, x_lanes, down_rows;
     uint64_t calls = 0, experts = 0, projection_ns = 0, product_ns = 0, down_ns = 0;
+#if defined(_WIN32)
+    // The mapped files a gather reads (sd_cpu_gather_file), each with a handle for concurrent reads.
+    struct MappedFile { const uint8_t* base; uint64_t bytes; HANDLE file; };
+    std::vector<MappedFile> files;
+    ~Engine() { for (const MappedFile& mapped : files) CloseHandle(mapped.file); }
+#endif
 };
+#if defined(_WIN32)
+// `bytes` of a mapped file at `source` by a read of the file into `target`; false, with nothing to rely on in `target`, if that is not to be.
+bool read_mapped(const Engine& engine, uint8_t* target, const uint8_t* source, uint64_t bytes) {
+    struct Event {
+        HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~Event() { if (handle) CloseHandle(handle); }
+    };
+    thread_local Event event;
+    for (const Engine::MappedFile& mapped : engine.files) {
+        if (source < mapped.base || bytes > mapped.bytes || uint64_t(source - mapped.base) > mapped.bytes - bytes) continue;
+        const uint64_t offset = uint64_t(source - mapped.base);
+        OVERLAPPED overlapped{};
+        overlapped.Offset = DWORD(offset); overlapped.OffsetHigh = DWORD(offset >> 32);
+        overlapped.hEvent = event.handle;
+        DWORD done = 0;
+        if (!event.handle || bytes > MAXDWORD) return false;
+        if (!ReadFile(mapped.file, target, DWORD(bytes), nullptr, &overlapped) && GetLastError() != ERROR_IO_PENDING) return false;
+        return GetOverlappedResult(mapped.file, &overlapped, &done, TRUE) && done == bytes;
+    }
+    return false;
+}
+#endif
 uint64_t elapsed_ns(std::chrono::steady_clock::time_point since) {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
@@ -927,9 +955,28 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
+// The mapping of `bytes` at `base` is of this open file: a gather reads it rather than touch the mapping (Windows; elsewhere nothing).
+// The reads are of the file the mapping is of, through a handle made from the caller's, so what they give is what the mapping would.
+int sd_cpu_gather_file(void* handle, const uint8_t* base, uint64_t bytes, void* file) {
+    try {
+        auto* engine = static_cast<Engine*>(handle);
+        if (!engine || !base || !bytes || !file) throw std::runtime_error("invalid Straydog CPU gather file");
+#if defined(_WIN32)
+        HANDLE reads = ReOpenFile(static_cast<HANDLE>(file), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+        // (no handle: the gather copies from the mapping)
+        if (reads != INVALID_HANDLE_VALUE) engine->files.push_back({base, bytes, reads});
+#endif
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+
 // Copy `count` byte ranges (sources[i] -> targets[i], bytes[i]) on every worker: prefill gathers
 // absent experts from the read-only model mapping into page-locked staging this way, so cold
 // pages fault in concurrently and resident ones copy at memory bandwidth. Bytes only.
+// On Windows a read of the file takes the place of the copy where it can: a fault on the mapping joins a working set kept under what the
+// machine has free. IQ3_XXS at --vram 8.5 on 62 GiB, a 15K-token prompt: 21M faults, 8 GB/s, the working set at its limit and available
+// memory down to 1.6-2.4 GiB; read, 700 faults, 11 GB/s, the pages left in the standby list and 8.4 GiB available, first token 41 -> 36 s.
+// (Unbuffered reads go to the drive for pages that are in memory: 1.3 GB/s.)
 int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* targets, const uint64_t* bytes,
                   uint32_t count) {
     try {
@@ -949,7 +996,11 @@ int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* t
             uint64_t offset = 0;
             for (uint32_t i = 0; i < count && offset < last; offset += bytes[i], ++i) {
                 const uint64_t begin = std::max(first, offset), end = std::min(last, offset + bytes[i]);
-                if (begin < end) std::memcpy(targets[i] + (begin - offset), sources[i] + (begin - offset), size_t(end - begin));
+                if (begin >= end) continue;
+#if defined(_WIN32)
+                if (read_mapped(*engine, targets[i] + (begin - offset), sources[i] + (begin - offset), end - begin)) continue;
+#endif
+                std::memcpy(targets[i] + (begin - offset), sources[i] + (begin - offset), size_t(end - begin));
             }
         });
         return 0;

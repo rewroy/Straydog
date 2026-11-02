@@ -2049,6 +2049,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_cpu_gather_file(
+        handle: *mut ::std::os::raw::c_void,
+        base: *const u8,
+        bytes: u64,
+        file: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_cpu_gather(
         handle: *mut ::std::os::raw::c_void,
         sources: *const *const u8,

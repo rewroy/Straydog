@@ -2130,6 +2130,17 @@ impl CpuExperts {
         self.handle
     }
 
+    /// `map` is a mapping of `file`, which stay as long as this does: a gather may read the file instead (Windows).
+    #[cfg(windows)]
+    pub fn gather_file(&self, map: &[u8], file: &std::fs::File) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: a live engine, and a live mapping and file; the engine makes a handle of its own.
+        if unsafe { ffi::sd_cpu_gather_file(self.handle, map.as_ptr(), map.len() as u64, file.as_raw_handle() as *mut c_void) } != 0 {
+            return Err(format!("Straydog CPU experts: {}", cpu_error()));
+        }
+        Ok(())
+    }
+
     /// out = the sum over the experts of weight x down . (SiLU(gate . x) * (up . x)), each
     /// expert's three matrices (of `kinds`, `inter` x `hidden`, `hidden` x `inter`) in host memory.
     ///
