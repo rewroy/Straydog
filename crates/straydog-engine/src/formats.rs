@@ -452,6 +452,8 @@ fn iq4_xs(block: &[u8], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn half_precision_converts_exactly() {
         for bits in 0..=u16::MAX {
