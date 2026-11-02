@@ -2672,8 +2672,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.stamp(layer, rows, Stamp::RoutesTaken)?;
         self.mark("route readback")?;
         let predicted: Vec<usize> = routes.split_off(routed_rows).into_iter().take(self.prefetches).map(|expert| expert as usize).collect();
-        let experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect::<std::collections::BTreeSet<_>>()
-            .into_iter().collect();
+        let mut experts: Vec<usize> = routes.iter().map(|&expert| expert as usize).collect();
+        experts.sort_unstable();
+        experts.dedup();
         let wave = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
         let waves: Vec<&[usize]> = experts.chunks(wave).collect();
         if let Some(stamps) = self.stamps.as_mut().filter(|_| rows <= VERIFY_ROWS) {
