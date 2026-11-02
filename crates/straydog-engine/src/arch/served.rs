@@ -9,7 +9,7 @@ use std::time::Instant;
 use serde_json::{json, Map, Value};
 
 use crate::constraint::{pick, Constraint};
-use crate::drafts::{Ngrams, Policy};
+use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::experts::Contents;
 use crate::gpu::Backend;
 use crate::group::SplitMode;
@@ -403,10 +403,6 @@ struct Decoded {
 fn draw_for(sampling: &Sampling, seeds: &mut Rng) -> Option<Draw> {
     sampling.plain().then(|| Draw { inverse_temperature: (1.0 / sampling.temperature) as f32, seed: (seeds.random() * (1u64 << 53) as f64) as u64 })
 }
-
-/// A prompt-lookup match of this many tokens (the lookup policy's widest) is verified without
-/// asking the engines for a draft ([`Engines::draft`]).
-const LONG_MATCH: usize = 8;
 
 /// Feed `tokens` (any count) through `engines` in passes of at most `batch`, each added to `history`;
 /// the logits after the last. Cancelled before any pass (a pass can take many seconds): None, with

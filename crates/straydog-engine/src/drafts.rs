@@ -11,6 +11,9 @@ const SHORTEST: usize = 3;
 /// How far back a match is measured.
 const LONGEST: usize = 32;
 
+/// A match of this many tokens (the policy's widest) is verified without asking a drafter.
+pub const LONG_MATCH: usize = 8;
+
 /// The sequence's tokens and, for every three in a row, where they last ended and where before.
 #[derive(Default)]
 pub struct Ngrams {
