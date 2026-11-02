@@ -80,6 +80,48 @@ __global__ void link_sum_kernel(const float* part, size_t count, uint32_t* state
         out[i] = accumulate ? out[i] + sum : sum;
     }
 }
+
+// A decode sum too large for one block, in one kernel of up to link_grid_blocks blocks: link_sum_kernel's steps over the
+// grid, the last block in raising the other's flag and every block waiting for its own before it adds. Two launches fewer
+// than the three kernels below (a 3-row DeepSeek-V4.1 pass has 126 sums: 27.41 -> 27.11 ms, and a draft 2.50 -> 2.42). A
+// waiting block holds its unit and the last block must still start, so the grid stays within half the device's units.
+constexpr size_t link_grid_blocks = 32;
+constexpr size_t link_grid_floats = 64 * 1024;
+__global__ void link_sum_grid_kernel(const float* part, size_t count, uint32_t* state, uint32_t* peer_flag, float* peer_inbox,
+                                     const float* inbox, size_t capacity, uint64_t timeout, int accumulate, float* out) {
+    __shared__ uint32_t sent;
+    // (read before any block counts in: the last one moves the count on)
+    if (!threadIdx.x) sent = state[0] + 1;
+    __syncthreads();
+    const uint32_t next = sent;
+    const size_t slot = size_t(next & 1) * capacity, step = size_t(gridDim.x) * blockDim.x;
+    const size_t first = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (size_t i = first; i < count; i += step)
+        __hip_atomic_store(peer_inbox + slot + i, part[i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (!threadIdx.x) {
+        if (atomicAdd(state + 3, 1u) == gridDim.x - 1) {
+            state[3] = 0;
+            state[0] = next;
+            __threadfence_system();
+            peer_store(peer_flag, next);
+        }
+        // (no acquire in the loop: at system scope each would invalidate the block's caches; the inbox is read at system scope)
+        const uint64_t start = peer_clock();
+        while (int32_t(peer_flag_load(state + 1) - next) < 0) {
+            if (peer_clock() - start > timeout) { state[2] = next; break; }
+            __builtin_amdgcn_s_sleep(1);
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __syncthreads();
+    for (size_t i = first; i < count; i += step) {
+        const float theirs = link_load(inbox + slot + i);
+        const float sum = part[i] + theirs;
+        out[i] = accumulate ? out[i] + sum : sum;
+    }
+}
 #endif
 
 // Peer access both ways between two devices (once; an error without it).
@@ -132,6 +174,14 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
     if (count <= link_single_floats) {
         link_sum_kernel<<<1, 1024, 0, value.stream>>>(part, size_t(count), link.state, link.peer_flag, link.peer_inbox, link.inbox,
                                                       link.capacity, value.await_timeout, accumulate ? 1 : 0, out);
+        check(hipGetLastError());
+        return 0;
+    }
+    if (count <= link_grid_floats) {
+        const size_t room = std::max<size_t>(size_t(value.compute_units) / 2, 1);
+        const unsigned blocks = unsigned(std::min<size_t>({(size_t(count) + 255) / 256, link_grid_blocks, room}));
+        link_sum_grid_kernel<<<blocks, 256, 0, value.stream>>>(part, size_t(count), link.state, link.peer_flag, link.peer_inbox, link.inbox,
+                                                               link.capacity, value.await_timeout, accumulate ? 1 : 0, out);
         check(hipGetLastError());
         return 0;
     }
