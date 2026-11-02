@@ -143,7 +143,23 @@ pub fn decode_into(kind: u32, data: &[u8], out: &mut Vec<f32>) -> Result<(), Str
     }
     let start = out.len();
     out.resize(start + data.len() / size * values, 0.0);
-    let target = &mut out[start..];
+    decode_blocks(kind, data, size, &mut out[start..]);
+    Ok(())
+}
+
+/// A row's values into `target`, which has room for exactly them.
+pub fn decode_slice(kind: u32, data: &[u8], target: &mut [f32]) -> Result<(), String> {
+    let (values, size) = block(kind).filter(|_| host_decodes(kind)).ok_or(format!("unsupported host format {kind}"))?;
+    if !data.len().is_multiple_of(size) || data.len() / size * values != target.len() {
+        return Err("a row of the wrong size".into());
+    }
+    if !data.is_empty() {
+        decode_blocks(kind, data, size, target);
+    }
+    Ok(())
+}
+
+fn decode_blocks(kind: u32, data: &[u8], size: usize, target: &mut [f32]) {
     // Each format's loop is its own instance, its block decoder inlined.
     fn blocks(data: &[u8], target: &mut [f32], size: usize, decode: impl Fn(&[u8], &mut [f32])) {
         let values = target.len() / (data.len() / size);
@@ -175,7 +191,6 @@ pub fn decode_into(kind: u32, data: &[u8], out: &mut Vec<f32>) -> Result<(), Str
         42 => blocks(data, target, size, q2_0),
         _ => unreachable!(),
     }
-    Ok(())
 }
 
 /// Sixteen bytes of nibbles: low nibbles are values 0-15, high nibbles 16-31, each mapped by `value`.
@@ -437,8 +452,6 @@ fn iq4_xs(block: &[u8], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn half_precision_converts_exactly() {
         for bits in 0..=u16::MAX {
