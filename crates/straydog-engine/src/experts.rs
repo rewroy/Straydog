@@ -835,6 +835,8 @@ pub struct DeviceExperts {
     clock: u64,
     /// Slots acquired since the last release, kept from eviction until then.
     in_use: Vec<usize>,
+    /// Held slots and their places in the LRU order, not moved there yet ([`hold`](Self::hold)).
+    touched: Vec<(usize, u64)>,
     /// Experts [`request`](Self::request)ed for the next acquire: already counted.
     requested: Vec<Key>,
     /// Per layer: slots a prefetch filled and no acquire of that layer has taken yet.
@@ -968,7 +970,7 @@ impl DeviceExperts {
             unfilled: VecDeque::new(),
             unfilled_chunk: CHUNK,
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
-            done_tx, done_rx, clock: 0, in_use: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
+            done_tx, done_rx, clock: 0, in_use: Vec::new(), touched: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
             uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None,
         })
@@ -1429,6 +1431,7 @@ impl DeviceExperts {
         if !self.rest.is_empty() {
             return Err("experts released before their downs were waited for (await_rest)".into());
         }
+        self.settle_touches();
         if self.in_use.is_empty() {
             return Ok(());
         }
@@ -1577,6 +1580,19 @@ impl DeviceExperts {
     }
 
     /// Mark `slot` just used (its place in the LRU order).
+    /// The LRU order as [`hold`](Self::hold)s since the last call would have left it.
+    fn settle_touches(&mut self) {
+        for (slot, used) in std::mem::take(&mut self.touched) {
+            let entry = &mut self.slots[slot];
+            let lru = &mut self.classes[entry.class].lru;
+            if entry.key.is_some() {
+                lru.remove(&(entry.used, slot));
+                lru.insert((used, slot));
+            }
+            entry.used = used;
+        }
+    }
+
     fn touch(&mut self, slot: usize) {
         self.clock += 1;
         let entry = &mut self.slots[slot];
@@ -1588,9 +1604,12 @@ impl DeviceExperts {
         entry.used = self.clock;
     }
 
-    /// Keep `slot` until the next release, as just used.
+    /// Keep `slot` until the next release, as just used. Its place in the LRU order moves at the
+    /// release (a held slot is no victim meanwhile): every hit's tree update otherwise stands between
+    /// the routes and a device's launch, while the GPU waits.
     fn hold(&mut self, slot: usize) {
-        self.touch(slot);
+        self.clock += 1;
+        self.touched.push((slot, self.clock));
         let entry = &mut self.slots[slot];
         entry.speculative = false;
         entry.warmed = false;
