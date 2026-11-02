@@ -356,8 +356,9 @@ impl<E: Engines> Loaded<E> {
         let mut first_text: Option<f64> = None;
         let mut decode_error: Option<Failure> = None;
         let cancelled = || cancel.load(Ordering::SeqCst);
-        let mut constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(),
-                                                      self.model.end_tokens(), thinking).map_err(refused)?;
+        let constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(),
+                                                  self.model.end_tokens(), thinking).map_err(refused)?;
+        let mut constraint = Constraint::suppressing(constraint, body.get("suppress").unwrap_or(&Py::Null), text.token_bytes()).map_err(refused)?;
         // A reply that reasons ends it with the template's `</think>`, its one added token: the deltas
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.

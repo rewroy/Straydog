@@ -17,7 +17,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
-use crate::constraint::{self, Constraint};
+use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
@@ -1881,8 +1881,12 @@ impl Model {
     /// A sampled request whose draw reads a row's greatest logits ([`Sampling::top_candidates`]) has its drafts drawn from the
     /// drafter's own: they come back with those rows, for [`sampling::accept_top_drawn`], and the probability is that of the drawn
     /// distribution's most likely token.
-    fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize, sampling: &Sampling, rng: &mut Rng)
-             -> Result<(Vec<u32>, Vec<Vec<(f32, u32)>>)> {
+    ///
+    /// With `suppression` a drafter's row is that distribution without what it refuses, and a chain ends where nothing is left of
+    /// it, or where its most likely token is refused: a draft that could only be rejected takes no row.
+    #[allow(clippy::too_many_arguments)]
+    fn draft(&mut self, hidden: &[f32], tokens: &[u32], position: u64, limit: usize, sampling: &Sampling, rng: &mut Rng,
+             mut suppression: Option<Suppression>) -> Result<(Vec<u32>, Vec<Vec<(f32, u32)>>)> {
         // (the catch-up's pairs, then a row for each draft tried, a failed one too)
         let mut clock = Instant::now();
         self.ensure_kv(position as usize + tokens.len() + limit + 1)?;
@@ -1892,18 +1896,31 @@ impl Model {
         self.phase("draft: embeddings", &mut clock);
         let top = sampling.top_candidates().unwrap_or(0);
         let mut proposed = Vec::new();
-        let mut take = |draft: crate::gpu::Draft, rng: &mut Rng| -> Result<(u32, f32)> {
-            if top == 0 {
-                return Ok((u32::try_from(draft.token).map_err(|_| "Straydog drafter head returned no token")?, draft.confidence));
+        let mut take = |mut draft: crate::gpu::Draft, rng: &mut Rng| -> Result<Option<(u32, f32)>> {
+            if let Some(suppression) = &suppression {
+                draft.top.retain(|&(_, token)| suppression.allows(token));
             }
-            let drawn = sampling::draw_top(&draft.top, sampling, rng);
-            proposed.push(draft.top);
-            Ok(drawn)
+            let taken = if top == 0 {
+                (u32::try_from(draft.token).map_err(|_| "Straydog drafter head returned no token")?, draft.confidence)
+            } else if draft.top.is_empty() {
+                return Ok(None);
+            } else {
+                let drawn = sampling::draw_top(&draft.top, sampling, rng);
+                proposed.push(draft.top);
+                drawn
+            };
+            if let Some(suppression) = &mut suppression {
+                if !suppression.allows(taken.0) {
+                    return Ok(None);
+                }
+                suppression.advance(taken.0);
+            }
+            Ok(Some(taken))
         };
         let step = self.draft_step(&embedded, Some(hidden), 0, position, limit > 0, top)?;
         self.phase("draft: catch-up and first draft", &mut clock);
         let Some(step) = step else { return Ok((Vec::new(), Vec::new())) };
-        let (token, mut chain) = take(step, rng)?;
+        let Some((token, mut chain)) = take(step, rng)? else { return Ok((Vec::new(), Vec::new())) };
         let cut = match (top > 0, self.partial) {
             (true, true) => self.partial_drawn_cut(),
             (true, false) => DRAWN_DRAFT_CUT,
@@ -1921,7 +1938,7 @@ impl Model {
             self.phase("draft: embeddings", &mut clock);
             let step = self.draft_step(&embedded, None, rows, position, true, top)?
                 .ok_or("Straydog drafter head returned no probability")?;
-            let (token, probability) = take(step, rng)?;
+            let Some((token, probability)) = take(step, rng)? else { break };
             self.phase("draft: next draft", &mut clock);
             chain *= probability;
             if chain < cut {
@@ -2166,12 +2183,15 @@ impl Model {
         self.last_metrics.insert("decode_tokens_per_second".into(), json!(forwards / seconds));
     }
 
+    /// `held` (a constraint that only suppresses): the head gives every row's whole logits, even greedy, whatever the sampling
+    /// would otherwise read of them on the GPU (its argmax, its top k), for the mask on the host: 1 MB a row. (IQ3_XXS at --vram 8.5 with
+    /// the drafter on CUDA, each order once: 0.7 ms a token more at the card's sampling, 2.8%; 1.3 ms greedy, 5%.)
     #[allow(clippy::too_many_arguments)]
     fn generate_speculative(&mut self, logits: &[f32], max_new: usize, sampling: &Sampling, rng: &mut Rng,
-                            cancelled: &dyn Fn() -> bool, started: Instant, emit: &mut dyn FnMut(u32))
+                            cancelled: &dyn Fn() -> bool, started: Instant, emit: &mut dyn FnMut(u32), mut held: Option<&mut Constraint>)
                             -> Result<()> {
         let mut generated = Generated::new(VOCABULARY);
-        let mut token = sampling::choose(logits, sampling, &generated, rng);
+        let mut token = constraint::pick(logits, sampling, &generated, rng, &mut held)?;
         generated.insert(token);
         if END_TOKENS.contains(&token) {
             return Ok(());
@@ -2204,14 +2224,17 @@ impl Model {
             ngrams.push(token);
             let (copy, matched) = ngrams.propose(limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
+            // (a copied token the request refuses could only be rejected: no row is spent on it)
+            let width = held.as_deref().map_or(width, |held| held.allowed_prefix(&copy[..width]));
             let copied = width > 0;
+            let suppression = held.as_deref().and_then(Constraint::suppression).cloned();
             let (drafts, proposed) = if copied {
-                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng)?;
+                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng, suppression)?;
                 self.ensure_kv(self.history.len() + 1 + width)?;
                 self.protect(self.history.len(), self.history.len() + 1 + width)?;
                 (copy[..width].to_vec(), Vec::new())
             } else {
-                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng)?
+                self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng, suppression)?
             };
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
             let mut clock = Instant::now();
@@ -2221,10 +2244,13 @@ impl Model {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }
             let position = self.history.len() as u64;
-            let top = sampling.top_candidates().unwrap_or(0);
-            let (first, embeddings, hidden, targets, scores) = self.verify(&rows, sampling.needs_logits(), top)?;
+            let top = if held.is_some() { 0 } else { sampling.top_candidates().unwrap_or(0) };
+            let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some(), top)?;
             let mut clock = Instant::now();
-            let (accepted, following) = Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng);
+            let (accepted, following) = match (held.as_deref_mut(), scores.as_mut()) {
+                (Some(held), Some(Scores::Logits(logits))) => held.accept_rows(&drafts, &proposed, logits, VOCABULARY, sampling, &mut generated, rng)?,
+                _ => Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng),
+            };
             self.phase("accept", &mut clock);
             generated.insert(following);
             if copied {
@@ -2290,7 +2316,7 @@ impl Model {
         // to the sequence's last would keep what was there before (another sequence's, or a
         // draft's), which every later draft attends to. (The draft does nothing more at 0.)
         if !mtp_tokens.is_empty() {
-            self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng)?;
+            self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng, None)?;
         }
         Ok(())
     }
@@ -2306,7 +2332,7 @@ impl Model {
     }
 
     /// [`Model::generate`] with the reply held to `constraint` ([`crate::constraint`]): every token
-    /// chosen against it, so without MTP drafts.
+    /// chosen against it, so without MTP drafts, unless it only suppresses.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_constrained(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
                                 cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool,
@@ -2444,8 +2470,8 @@ impl Model {
         self.set_rope_delta(self.history.len())?;
         let mut rng = Rng::new(seed);
         let Some(mut logits) = output else { return Ok(()) };
-        if self.speculative > 0 && constraint.is_none() {
-            return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit);
+        if self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token) {
+            return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit, constraint);
         }
         let mut generated = Generated::new(VOCABULARY);
         for index in 0..max_new {

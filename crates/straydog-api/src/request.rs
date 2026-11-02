@@ -8,6 +8,7 @@
 
 use std::str::FromStr;
 
+use straydog_engine::constraint::NOT_CP932_HAN;
 use straydog_engine::pyjson::{self, Value};
 
 use crate::{ApiConfig, ApiError, Markup};
@@ -170,6 +171,11 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         },
     };
     let constraint = constraint(config.markup, json, tools.is_some(), forced);
+    let suppress = match given(payload, "suppress") {
+        None => None,
+        Some(Value::Str(kind)) if kind == NOT_CP932_HAN => Some(Value::Str(kind.clone())),
+        Some(_) => return Err(ApiError::invalid(format!("suppress must be {NOT_CP932_HAN}"))),
+    };
 
     let limit = ["max_completion_tokens", "max_tokens"].into_iter().find_map(|key| Some((key, given(payload, key)?)));
     let max_tokens = match limit {
@@ -285,7 +291,7 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
              float(top_p.or(set.top_p)), float(min_p.or(set.min_p)), float(presence_penalty.or(set.presence_penalty)))
         }
     };
-    let request = Value::Object(vec![
+    let mut fields = vec![
         ("messages".into(), Value::Array(messages)),
         ("tools".into(), tools.clone().unwrap_or(Value::Null)),
         ("max_tokens".into(), max_tokens),
@@ -299,8 +305,12 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         ("reasoning_effort".into(), Value::Str(level.into())),
         ("checkpoint".into(), Value::Bool(checkpoint)),
         ("constraint".into(), constraint),
-    ]);
-    Ok((request, Shape { thinking, markup, tools, stops, stream, include_usage }))
+    ];
+    // (a request that asks nothing is the worker's request it always was)
+    if let Some(kind) = suppress {
+        fields.push(("suppress".into(), kind));
+    }
+    Ok((Value::Object(fields), Shape { thinking, markup, tools, stops, stream, include_usage }))
 }
 
 /// What the worker holds the answer to ([`straydog_engine::constraint`]), as its request's

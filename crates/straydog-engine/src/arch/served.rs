@@ -437,7 +437,7 @@ fn feed<E: Engines>(engines: &mut E, history: &mut Vec<u32>, batch: usize, token
 /// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
 /// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
 /// emitted after it and kept, the rest rewound. A `constraint` chooses every token itself (no
-/// drafts).
+/// drafts); one that only suppresses keeps them, masking the rows they are accepted on.
 #[allow(clippy::too_many_arguments)]
 fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>, vocabulary: usize, end: &[u32], max_new: usize,
                       sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
@@ -448,7 +448,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     // drafter that draws nothing)
     let mut draws = Rng::new(seed ^ 0x6472_6177_5eed_d5a2);
     let mut generated = Generated::new(vocabulary);
-    let rows = if constraint.is_some() { 1 } else { engines.verify_rows() };
+    let rows = if constraint.as_deref().is_some_and(Constraint::chooses_every_token) { 1 } else { engines.verify_rows() };
     let mut ngrams = Ngrams::new();
     if rows > 1 {
         ngrams.extend(history);
@@ -467,7 +467,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             break;
         }
         let mut probabilities = Vec::new();
-        let (drafts, engine_draft) = if rows > 1 {
+        let (mut drafts, engine_draft) = if rows > 1 {
             ngrams.push(next);
             // A long match is verified as it is: those drafts are accepted nearly always (an edit
             // repeats its source), and an engine's draft costs milliseconds to be no better.
@@ -498,6 +498,11 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         } else {
             (Vec::new(), false)
         };
+        // A suppressed point proposal could only be rejected, and the draw after it is that row's all the same: no row is spent
+        // on it. (A drawn one is left for the accept rule, whose replacement of it makes the tokens follow the target's distribution.)
+        if let Some(held) = constraint.as_deref().filter(|_| probabilities.is_empty() && !drafts.is_empty()) {
+            drafts.truncate(held.allowed_prefix(&drafts));
+        }
         if drafts.is_empty() {
             let logits = engines.forward(&[next])?;
             history.push(next);
@@ -506,17 +511,24 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             continue;
         }
         let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
-        let rows_logits = engines.verify(&fed)?;
+        let mut rows_logits = engines.verify(&fed)?;
         if rows_logits.len() != fed.len() * vocabulary {
             return Err("Straydog engines verified the wrong number of logits".into());
         }
         (done.passes, done.fed, done.drafted) = (done.passes + 1, done.fed + fed.len(), done.drafted + drafts.len());
         if engine_draft { done.engine_drafted += drafts.len(); }
+        if let Some(held) = constraint.as_deref() {
+            held.mask_rows(&mut rows_logits, vocabulary, &drafts);
+        }
         let mut drawn = Drawn { engines: &mut *engines, probabilities: &probabilities, row: &mut row, failure: None };
         let (accepted, token) = sampling::accept_drawn(&drafts, &mut drawn, &rows_logits, vocabulary, sampling, &mut generated, &mut rng);
         if let Some(error) = drawn.failure {
             return Err(error);
         }
+        let token = match constraint.as_deref_mut() {
+            Some(held) => held.settle(&drafts[..accepted], token, &rows_logits[accepted * vocabulary..(accepted + 1) * vocabulary], sampling, &generated, &mut rng)?,
+            None => token,
+        };
         if !engine_draft { policy.record(drafts.len(), accepted); }
         // The accepted drafts go out in order: an end token among them ends the reply unsent, the
         // last token allowed ends it sent; either is left out of the state, as without drafts.
@@ -1033,6 +1045,58 @@ mod tests {
             assert!(json.feed_all(text.as_bytes()), "seed {seed}: {text}");
             assert!(done.emitted == 120 || json.complete(), "seed {seed}: {text}");
         }
+    }
+
+    /// A reply that only suppresses comes out of the same decode: no draft refused is kept, whichever way it was made, the tokens
+    /// otherwise as without the suppression where it refuses nothing.
+    #[test]
+    fn a_suppressed_reply_keeps_its_drafts_and_never_holds_a_refused_token() {
+        use std::sync::Arc;
+
+        use crate::constraint::{TokenBytes, NOT_CP932_HAN};
+        use crate::pyjson::Value;
+        fn held(pieces: &[&str]) -> Constraint {
+            let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; pieces.len()]));
+            Constraint::suppressing(None, &Value::Str(NOT_CP932_HAN.into()), tokens).unwrap().unwrap()
+        }
+        let decoding = |rows: usize, constraint: Option<&mut Constraint>, sampling: &Sampling, seed: u64, proposals: Vec<Result<Option<Vec<u32>>, String>>| {
+            let mut toy = Toy { vocabulary: 8, rows, proposals: proposals.into(), ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let mut out = Vec::new();
+            let done = decode(&mut toy, &mut history, logits, 8, &[], 200, sampling, seed, &|| false, &mut |token| out.push(token), constraint).unwrap();
+            assert_eq!(toy.held, history);
+            (out, done, toy)
+        };
+        let samplings = [Sampling::GREEDY, Sampling { temperature: 1.0, ..Sampling::GREEDY }, Sampling::recommended(true), Sampling::recommended(false)];
+        // Refusing nothing: the very tokens of a reply without it, drafts and all.
+        let clean = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for sampling in &samplings {
+            for rows in [1, 4] {
+                let (plain, plain_done, _) = decoding(rows, None, sampling, 3, Vec::new());
+                let (out, done, _) = decoding(rows, Some(&mut held(&clean)), sampling, 3, Vec::new());
+                assert_eq!(out, plain, "{sampling:?} {rows}");
+                assert_eq!(done, plain_done, "{sampling:?} {rows}");
+            }
+        }
+        // 4 and 5 (the toy's best after 1, and after 4) are refused.
+        let refusing = ["a", "b", "c", "d", "员", "约", "g", "h"];
+        let mut drafted = 0;
+        for sampling in &samplings {
+            for seed in 0..8 {
+                for rows in [1, 4] {
+                    let (out, done, _) = decoding(rows, Some(&mut held(&refusing)), sampling, seed, Vec::new());
+                    assert_eq!(out.len(), 200);
+                    assert!(out.iter().all(|&token| token != 4 && token != 5), "{sampling:?} {seed} {rows}: {out:?}");
+                    drafted += done.drafted;
+                }
+            }
+        }
+        assert!(drafted > 0, "the prompt's lookup still drafts");
+        // An engine's proposal refused: not verified from there on.
+        let (out, done, toy) = decoding(4, Some(&mut held(&refusing)), &Sampling::GREEDY, 1, vec![Ok(Some(vec![6, 4, 7]))]);
+        assert!(!out.contains(&4));
+        assert_eq!((done.engine_drafted, toy.verified[0].len()), (1, 2), "{:?}", toy.verified);
     }
 
     /// Whether the engines are asked to draw their drafts: when the request samples plainly (a temperature, nothing cut,
