@@ -421,6 +421,13 @@ void hc_decode(Device& d, const Matrix* matrices, bool has_inject, const float* 
         case 2: hc_decode_vectors<2>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
         case 3: hc_decode_vectors<3>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
         case 4: hc_decode_vectors<4>(d, matrices, has_inject, x, scratch, output, output_stride, copy); break;
+        case 5: case 6: case 7: case 8:
+            // Two launches, each row's sums as ever. One launch of stage two took 6 ms more a pass at eight rows (two launches of
+            // stage one, whose stream's staged rows of seven are past a block's 64 KiB of LDS, the same: 27.3 ms to 33.4), and stage
+            // one of five or six in one launch saved nothing.
+            hc_decode_vectors<4>(d, matrices, has_inject, x, scratch, output, output_stride, copy);
+            hc_decode(d, matrices, has_inject, x + 4 * 10240, scratch + 4 * hc_decode_scratch, output + 4 * output_stride, vectors - 4, output_stride);
+            break;
         default: throw std::runtime_error("invalid Straydog HyperConnection vector count");
     }
 }

@@ -48,7 +48,7 @@ pub const ALLOCATION_TAIL: u64 = 64;
 const MOE_ROW: u64 = 11 * 4480 + 22;
 /// Rows of the peer's batch one pass of expert-parallel help takes (see `@moe:helper`).
 const HELP_ROWS: u64 = 2048;
-pub const VERIFY_MAX: usize = 4;
+pub const VERIFY_MAX: usize = 8;
 pub const VOCABULARY: u64 = 248320;
 pub const WIDTH: usize = 10240;
 pub const HIDDEN: usize = 2560;
@@ -275,10 +275,11 @@ pub struct StatePart {
     device: Option<crate::ops::Buffer>,
 }
 
-/// Floats of an indexer's rolling history after its pooled blocks: its last eight inputs, a ring
-/// by position (gpu/sparse_attention.hpp, qsa_history), so that a rewind's rows never overwrite
-/// the inputs a block completed after it still pools.
-const INDEX_HISTORY: u64 = 8 * 128;
+/// An indexer's rolling history: its last inputs, a ring by position (gpu/sparse_attention.hpp, qsa_history), so that a rewind's
+/// rows never overwrite the inputs a block completed after it still pools. A pass of eight rows that keeps one needs ten.
+const INDEX_HISTORY_ROWS: u64 = 16;
+/// Its floats, after the pooled blocks.
+const INDEX_HISTORY: u64 = INDEX_HISTORY_ROWS * 128;
 
 /// Copies of states this small always go to host memory (see `copy_out`).
 const HOST_COPY_BYTES: u64 = 256 << 10;
@@ -1393,7 +1394,7 @@ impl Backend {
         Ok(count)
     }
 
-    /// Up to four consecutive tokens through resident layers [begin, end).
+    /// Up to [`VERIFY_MAX`] consecutive tokens through resident layers [begin, end).
     pub fn verify_span(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<Vec<f32>> {
         let steps = Self::rows(values, WIDTH)?;
         if begin >= end || end > 49 || position > 262144 - steps as u64 {
@@ -1415,7 +1416,7 @@ impl Backend {
         check(unsafe { ffi::sd_verify_reserve(self.handle) }).map(drop)
     }
 
-    /// Up to four tokens through resident layers [begin, end) with nothing waited for or read back: their rows stay in the
+    /// Up to [`VERIFY_MAX`] tokens through resident layers [begin, end) with nothing waited for or read back: their rows stay in the
     /// workspace for [`Backend::ple_front`] to continue from.
     pub fn verify_queue(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
         let steps = Self::rows(values, WIDTH)?;
@@ -1808,7 +1809,7 @@ impl Backend {
         }
     }
 
-    /// The indexers' rolling pooling history alone (their last eight inputs), copied out as
+    /// The indexers' rolling pooling history alone, copied out as
     /// [`save_positions`](Self::save_positions) copies a range's with `history` and restored the
     /// same way: a parked sequence's, taken when it departs, before a later prompt's prefill
     /// changes it.
@@ -1909,7 +1910,7 @@ impl Backend {
                     parts.push((format!("{key} block {block}"), part(block, pool, 1, 128)));
                 }
                 for position in to / 4 * 4..to {
-                    parts.push((format!("{key} history {position}"), part(128 * pool + position % 8 * 128, 128, 128, 1)));
+                    parts.push((format!("{key} history {position}"), part(128 * pool + position % INDEX_HISTORY_ROWS * 128, 128, 128, 1)));
                 }
             } else if RECURRENT.iter().any(|prefix| key.starts_with(prefix)) {
                 parts.push((key.clone(), part(0, floats, floats, 1)));

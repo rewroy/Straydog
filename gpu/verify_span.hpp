@@ -1,4 +1,4 @@
-// Speculative verification: up to four consecutive tokens pass each decoder layer
+// Speculative verification: up to eight consecutive tokens pass each decoder layer
 // with the one-token arithmetic, so their logits match token-by-token decode
 // bitwise. Weight reads are shared by the multi-vector GEMV and HyperConnection
 // kernels; recurrence, attention and experts advance token by token in causal
@@ -6,7 +6,8 @@
 // projections, so a partial acceptance restores the snapshot and replays only the
 // accepted tokens. QSA K/V needs no rollback: rejected positions are rewritten
 // before any later token can select them.
-constexpr size_t verify_max = 4, verify_projection = 16480, verify_qsa = 13952;
+constexpr size_t verify_max = 8, verify_projection = 16480, verify_qsa = 13952;
+static_assert(verify_max <= kv_mirror_margin && verify_max + 2 <= qsa_history, "a rejected row must leave what the kept rows read");
 constexpr size_t verify_snapshot = 4 * 10240 + 48 * 128 * 128;
 // The rows' positions, then at this distance their rope positions (the same numbers but past an image: Device::rope_delta).
 constexpr size_t verify_ropes = verify_max;
@@ -15,12 +16,14 @@ struct VerifyLayout {
     float* hidden; float* mixed; float* branch; uint32_t* positions;
     float* post; float* qsa; float* attended;
 };
-constexpr size_t verify_extent = 65536 + verify_max * (6144 + verify_qsa + 6144);
+constexpr size_t verify_front = 131072;
+static_assert(verify_max * (10240 + 2564 + 2560) + verify_max * 2 <= verify_front, "a verification's rows overlap what follows them");
+constexpr size_t verify_extent = verify_front + verify_max * (6144 + verify_qsa + 6144);
 VerifyLayout verify_layout(float* workspace) {
     VerifyLayout v{};
     v.hidden = workspace; v.mixed = v.hidden + verify_max * 10240; v.branch = v.mixed + verify_max * 2564;
     v.positions = reinterpret_cast<uint32_t*>(v.branch + verify_max * 2560);
-    v.post = workspace + 65536; v.qsa = v.post + verify_max * 6144; v.attended = v.qsa + verify_max * verify_qsa;
+    v.post = workspace + verify_front; v.qsa = v.post + verify_max * 6144; v.attended = v.qsa + verify_max * verify_qsa;
     return v;
 }
 void hc_operands(void* const* pointers, const int* kinds, Matrix (&matrices)[4]) {
@@ -36,7 +39,9 @@ size_t verify_projection_floats(const DecoderLayer& plan) {
 }
 void verify_buffers(Device& d, DecoderLayer& plan) {
     if (plan.snapshot) return;
-    const size_t bytes = (verify_snapshot_floats(plan) + verify_max * verify_projection_floats(plan)) * 4;
+    // (a partially resident layer's rows are at most hybrid_rows: a low VRAM budget's expert slots keep the rest)
+    const size_t rows = d.resident.find(plan.moe)->second->hybrid ? hybrid_rows : verify_max;
+    const size_t bytes = (verify_snapshot_floats(plan) + rows * verify_projection_floats(plan)) * 4;
     if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes)
         throw std::runtime_error("speculative verification state exceeds the Straydog VRAM budget");
     float* buffer = nullptr;
@@ -608,7 +613,7 @@ __global__ void head_confidence(const float* own, const float* other, size_t ste
     result[row] = 1.0f / sum;
 }
 
-// HyperConnection mix (norm, down, up) and the vocabulary head for up to four rows,
+// HyperConnection mix (norm, down, up) and the vocabulary head for up to eight rows,
 // each with the one-row arithmetic; returns the first maximum of every row and, when
 // asked, its probability (drafts stop at an unlikely one).
 // The rows come from the host (`input`) or, when that is null, from device memory (`source`).
@@ -823,8 +828,9 @@ void mtp_prologue_check(Device& d, void* const* pointers, const int* kinds, size
             throw std::runtime_error("invalid MTP operand");
     }
 }
-// The prologue over the rows already in the input area (see mtp_prologue_hidden).
-void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, size_t steps) {
+// The prologue over the rows already in the input area (see mtp_prologue_hidden). `exact`: every row on the one-row GEMV's
+// arithmetic (a drafting step); otherwise a prompt's rows past four take the batch projection.
+void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, size_t steps, bool exact = false) {
     mtp_prologue_check(d, pointers, kinds, steps);
     float* e = mtp_prologue_embeddings(d); float* h = mtp_prologue_hidden(d, steps);
     float* ne = h + steps * 10240; float* nh = ne + steps * 2560;
@@ -833,7 +839,7 @@ void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, siz
     const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
     const Matrix fh{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),2560,2560,0,0,0,kinds[3]};
     float* projected = d.output;   // steps x 10240 streams, then steps x 2560 embeddings
-    if (steps <= verify_max) {
+    if (exact || steps <= size_t(gemv_max_vectors)) {
         gemv(d, &fe, 1, ne, projected + steps * 10240, steps, 2560, 2560);
         for (size_t b = 0; b < steps; ++b) gemv(d, &fh, 1, nh + b * 10240, projected + b * 10240, 4, 2560, 2560);
     } else {   // prompt rows: drafter numerics never change verified tokens
@@ -869,7 +875,8 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     if (hidden) upload(d, rows, hidden, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, verify_layout(found->second.workspace).hidden + (previous - 1) * 10240, 10240 * 4,
                               hipMemcpyDeviceToDevice, d.stream));
-    mtp_prologue_device(d, mtp, mtp_kinds, steps);
+    if (steps > verify_max) throw std::runtime_error("invalid drafting step");
+    mtp_prologue_device(d, mtp, mtp_kinds, steps, true);
     if (d.resident.find(found->second.moe)->second->hybrid) {
         hybrid_verify_span(d, layer, layer + 1, position, steps, nullptr, nullptr, rows);
         return verify_layout(found->second.workspace).hidden;

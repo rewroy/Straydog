@@ -12,7 +12,7 @@
 
 namespace {
 
-// A part's sum for a pass's rows (at most four): this device's part of `steps` rows of 2560 goes into the other's inbox slot,
+// A part's sum for a pass's rows (at most ROWS, 4 or 8): this device's part of `steps` rows of 2560 goes into the other's inbox slot,
 // the other's flag is raised, and once this device's is, each row's two parts are added and go into the four residual streams
 // as a whole layer's residual update does (hidden[s] += mix[s] * sum, mix after the row's 2560 inputs, `mixed_stride` apart):
 // link_sum_kernel's steps.
@@ -21,21 +21,22 @@ namespace {
 struct QwenExpertPart {
     const float* outputs; const float* probabilities; const int32_t* selected; const MoeGroup* groups; bool shared;
 };
-template<bool experts>
+template<bool experts, int ROWS = 4>
 __global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, QwenExpertPart moe, uint32_t steps, float* hidden,
                                                        const float* mixed, size_t mixed_stride, uint32_t* state, uint32_t* peer_flag,
                                                        float* peer_inbox, const float* inbox, size_t capacity, uint64_t timeout) { SD_KERNEL_ACQUIRE;
     const uint32_t count = steps * 2560, next = state[0] + 1;
     const size_t slot = size_t(next & 1) * capacity;
-    __shared__ bool held[4][10];
+    constexpr uint32_t values = ROWS * 2560 / 1024;
+    __shared__ bool held[ROWS][10];
     if constexpr (experts) {
         if (threadIdx.x < steps * 10) held[threadIdx.x / 10][threadIdx.x % 10] = moe.groups[moe.selected[threadIdx.x]].weights[2].data != nullptr;
         __syncthreads();
     }
-    // (a pass's rows are at most four: ten values a thread)
-    float own[10];
+    // (ten values a thread a pass of four rows)
+    float own[values];
     #pragma unroll
-    for (uint32_t k = 0; k < 10; ++k) {
+    for (uint32_t k = 0; k < values; ++k) {
         const uint32_t i = threadIdx.x + k * 1024;
         if (i >= count) break;
         if constexpr (experts) {
@@ -66,7 +67,7 @@ __global__ void __launch_bounds__(1024) qwen_part_sum(const float* part, QwenExp
     }
     __syncthreads();
     #pragma unroll
-    for (uint32_t k = 0; k < 10; ++k) {
+    for (uint32_t k = 0; k < values; ++k) {
         const uint32_t i = threadIdx.x + k * 1024;
         if (i >= count) break;
         const uint32_t token = i / 2560, column = i % 2560;
@@ -145,17 +146,15 @@ __global__ void qwen_gather_receive(size_t steps, size_t first, size_t count, co
 void qwen_sum_rows(Device& d, const float* part, size_t steps, float* hidden, const float* mixed, size_t mixed_stride,
                    const TokenMoe* moe = nullptr) {
     SumLink& link = d.sums;
-    if (!link.peer || !steps || steps > 4 || steps * 2560 > link.capacity || (!part && !moe))
+    if (!link.peer || !steps || steps > size_t(gemv_wide_vectors) || steps * 2560 > link.capacity || (!part && !moe))
         throw std::runtime_error("invalid Straydog part sum");
 #if defined(__HIPCC__)
-    if (part) {
-        qwen_part_sum<false><<<1, 1024, 0, d.stream>>>(part, QwenExpertPart{}, uint32_t(steps), hidden, mixed, mixed_stride, link.state,
-                                                       link.peer_flag, link.peer_inbox, link.inbox, link.capacity, d.await_timeout);
-    } else {
-        const QwenExpertPart experts{moe->outputs, moe->probabilities, moe->selected, moe->groups, moe->plan->shared};
-        qwen_part_sum<true><<<1, 1024, 0, d.stream>>>(nullptr, experts, uint32_t(steps), hidden, mixed, mixed_stride, link.state,
-                                                      link.peer_flag, link.peer_inbox, link.inbox, link.capacity, d.await_timeout);
-    }
+    const QwenExpertPart experts = part ? QwenExpertPart{} : QwenExpertPart{moe->outputs, moe->probabilities, moe->selected, moe->groups, moe->plan->shared};
+    #define SD_PART_SUM(HOLDS, ROWS) qwen_part_sum<HOLDS, ROWS><<<1, 1024, 0, d.stream>>>(part, experts, uint32_t(steps), hidden, mixed, mixed_stride, link.state, \
+        link.peer_flag, link.peer_inbox, link.inbox, link.capacity, d.await_timeout)
+    if (steps <= 4) { if (part) SD_PART_SUM(false, 4); else SD_PART_SUM(true, 4); }
+    else { if (part) SD_PART_SUM(false, 8); else SD_PART_SUM(true, 8); }
+    #undef SD_PART_SUM
     check(hipGetLastError());
 #else
     (void)hidden; (void)mixed; (void)mixed_stride;

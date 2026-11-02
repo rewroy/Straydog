@@ -166,7 +166,7 @@ __global__ void delta_post_one(float* state, const float* packed, const float* g
     output[index] = result / sqrtf(sums[0] / 128.0f + 1e-6f) * norm[col] * hc_sigmoid(gate[index]);
 }
 
-// Up to four consecutive tokens with the single-token equations of
+// Up to eight consecutive tokens with the single-token equations of
 // gdn_prepare_one/delta_post_one. Block h owns value head h, recomputes its query/key
 // head (h % 16) from a private convolution window and keeps its recurrent state in
 // registers across the tokens: two threads per state column, each holding 64 keys

@@ -2,7 +2,7 @@
 //!
 //! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
 //!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer] [--row-cache MIB]
-//!     [--pause SECONDS] [--sampled] [--drafts N] [--chat]
+//!     [--pause SECONDS] [--sampled] [--drafts N] [--chat] [--force-rows W,W,... --force-tokens FILE [--force-logits] [--force-reject N]] [--copy-drafts N]
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, "+N"
@@ -13,7 +13,9 @@
 //! (0: plain decode, with the drafter loaded all the same); --sampled generates with the model
 //! card's thinking sampling (temperature 1.0, top_p 0.95, top_k 20) instead of greedily; --chat puts each
 //! fresh prompt in a user turn that asks for an explanation (a reply that runs to its length, where raw text
-//! ends in an end token after a few).
+//! ends in an end token after a few). --force-rows measures passes by their rows: FILE holds the greedy tokens of the run's
+//! reply (--dump's prompt-N.tokens), the passes verify them at the widths given in turn, with no drafter, and the milliseconds
+//! a pass by width and the digest of the kept rows (with --force-logits, of their logits too: every width's must be the same) are printed.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -36,6 +38,7 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         batch
     });
+    let force_logits = args.iter().position(|arg| arg == "--force-logits").map(|at| args.remove(at)).is_some();
     let chat = args.iter().position(|arg| arg == "--chat").map(|at| args.remove(at)).is_some();
     let sampled = args.iter().position(|arg| arg == "--sampled").map(|at| args.remove(at)).is_some();
     let mut option = |name: &str| args.iter().position(|arg| arg == name).map(|at| {
@@ -43,6 +46,11 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         value
     });
+    let force_rows: Option<Vec<usize>> = option("--force-rows").map(|widths| widths.split(',').map(|width| width.parse().unwrap()).collect());
+    let force_tokens = option("--force-tokens");
+    let copy_drafts: Option<usize> = option("--copy-drafts").map(|count| count.parse().unwrap());
+    // --force-reject N: every Nth pass a draft is wrong (the digests must not change).
+    let force_reject: usize = option("--force-reject").map_or(0, |count| count.parse().unwrap());
     // --dump DIR: each prompt's logits (f32, little-endian) and generated tokens land in DIR.
     let dump = option("--dump").map(PathBuf::from);
     let generate: usize = option("--generate").map_or(1, |count| count.parse().unwrap());
@@ -72,11 +80,15 @@ fn main() -> Result<(), String> {
     let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(4096),
-                              speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
+                              speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
-    if let Some(drafts) = drafts {
-        model.speculative = drafts.min(model.speculative);
+    if drafts == Some(0) {
+        model.speculative = 0;
+    }
+    // --copy-drafts N: the most drafts a long match's copy verifies.
+    if let Some(copies) = copy_drafts {
+        model.copy_drafts = copies.min(model.pass_rows() - 1);
     }
     let steps: Vec<String> =
         model.load_seconds.iter().map(|(step, seconds)| format!("{step} {seconds:.2} s")).collect();
@@ -146,6 +158,11 @@ fn main() -> Result<(), String> {
         model.logits_capture = Some(Vec::new());
         let mut tokens = Vec::new();
         let sampling = if sampled { Sampling::recommended(true) } else { Sampling::GREEDY };
+        if let (Some(widths), Some(file)) = (&force_rows, &force_tokens) {
+            let replies = std::fs::read_to_string(file).map_err(|exc| exc.to_string())?;
+            model.forced_rows = Some(straydog_engine::model::ForcedRows { tokens: serde_json::from_str(&replies).unwrap(), widths: widths.clone(),
+                                                                          read_logits: force_logits, reject: force_reject, ..Default::default() });
+        }
         model.generate(&prompt, generate, &sampling, run as u64 + 1, &|| false, &mut |_, _| {}, true, false,
                        &mut |token| tokens.push(token))?;
         let digest = model.logits_digests.take().unwrap_or_default().first().cloned().unwrap_or_default();
@@ -169,6 +186,27 @@ fn main() -> Result<(), String> {
                 if let Some(value) = model.last_metrics.get(key) {
                     println!("  {key}: {value}");
                 }
+            }
+        }
+        if let Some(forced) = model.forced_rows.take() {
+            // (each width's first passes capture its graphs)
+            let mut widths = forced.widths.clone();
+            widths.sort_unstable();
+            widths.dedup();
+            for width in widths {
+                let mut passes: Vec<f64> = forced.passes.iter().filter(|(rows, _)| *rows == width).map(|(_, ms)| *ms).skip(4).collect();
+                passes.sort_by(f64::total_cmp);
+                let mean = passes.iter().sum::<f64>() / passes.len().max(1) as f64;
+                let trimmed = &passes[passes.len() / 10..passes.len() - passes.len() / 10];
+                println!("rows {width}: {} passes, median {:.3} ms, trimmed mean {:.3}, mean {mean:.3}", passes.len(), passes.get(passes.len() / 2).copied().unwrap_or(0.0),
+                         trimmed.iter().sum::<f64>() / trimmed.len().max(1) as f64);
+            }
+            println!("forced digest {:x}, logits {:x}, rejected {}, tokens {}", sha2::Digest::finalize(forced.digest), sha2::Digest::finalize(forced.logits_digest),
+                     forced.rejected, tokens.len());
+        }
+        for &device in &devices {
+            if let Ok((_, free, _)) = straydog_gpu::device_info(device) {
+                println!("GPU {device}: {:.3} GiB free after the run", free as f64 / (1u64 << 30) as f64);
             }
         }
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,

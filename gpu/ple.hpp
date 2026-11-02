@@ -38,7 +38,7 @@ __global__ void ple_convolve(float* hidden,const float* gated,const float* norma
         history[row*10240+col]=steps+row<10 ? history[(steps+row)*10240+col] : normalized[(steps+row-10)*10240+col];
 }
 // resident!=nullptr updates those device rows in place instead of copying hidden/output.
-// exact (at most four rows) projects every row with the one-row GEMV arithmetic,
+// exact (at most gemv_wide_vectors rows) projects every row with the one-row GEMV arithmetic,
 // so speculative rows match token-by-token decode bitwise.
 void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t steps,
           const float* embeddings,const float* hidden,float* output,float* resident=nullptr,bool exact=false,bool wait=true) {
@@ -61,7 +61,7 @@ void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t s
     float* gated=value+steps*2560+steps*10240;
     Matrix descriptors[2][max_batch]{};
     if (exact) {
-        if (steps>gemv_max_vectors) throw std::runtime_error("invalid exact PLE rows");
+        if (steps>gemv_wide_vectors) throw std::runtime_error("invalid exact PLE rows");
         gemv(d,&matrices[0],1,d.input,key,steps,2560,10240);
         gemv(d,&matrices[1],1,d.input,value,steps,2560,2560);
     } else {
