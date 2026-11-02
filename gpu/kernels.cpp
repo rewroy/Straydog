@@ -4103,6 +4103,21 @@ int sd_op_experts(void* handle, const uint64_t* bases, uint64_t slot_bytes, cons
     if (!plan.uniform && value.inline_routes_count) {
         std::copy(value.inline_routes, value.inline_routes + value.inline_routes_count, plan.inline_bases);
         plan.inline_count = uint32_t(value.inline_routes_count);
+        // (a pass of a few rows: an expert's routes together)
+        if (bases && rows >= 2 && rows <= 4 && (part.stages & 1) && !part.send) {
+            uint32_t taken = 0;
+            for (size_t route = 0; route < routes; ++route) {
+                if (!bases[route] || (taken >> route) & 1) continue;
+                uint32_t list = 0xffffff00u | uint32_t(route);
+                for (size_t other = route + 1, n = 1; other < routes && n < 4; ++other)
+                    if (bases[other] == bases[route]) {
+                        list = (list & ~(0xffu << (8 * n))) | uint32_t(other) << (8 * n);
+                        taken |= 1u << other;
+                        ++n;
+                    }
+                plan.group_routes[plan.groups++] = list;
+            }
+        }
     }
     if (!part.send || !slot_experts(value, plan, part.stages, value.slot_routes, size_t(rows), input, size_t(input_stride), weights,
                                     product, out, size_t(out_stride), &tail, size_t(part.send_at), part.more ? 0 : 1)) {
