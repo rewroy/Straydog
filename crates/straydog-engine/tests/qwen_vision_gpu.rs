@@ -73,6 +73,15 @@ fn rope_positions_agree_on_every_path() {
     prompt.extend((0..64u32).map(|offset| IMAGE_TOKEN | (12345 + offset)));
     prompt.push(VISION_END);
     prompt.extend(tokenizer.encode("\nWrite a long poem about the sea, in plain words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n").unwrap());
+    // What a batch's logits and a decode's differ by anyway, on the same text with no image: on HIP (FP16 batches, INT8 decode) 0.35-0.71.
+    model.set_images(Vec::new());
+    let plain_prompt: Vec<u32> = prompt.iter().map(|token| if *token >= IMAGE_TOKEN { 2000 } else { *token }).collect();
+    let (plain_tokens, plain_logits) = reply(&mut model, &plain_prompt, 12);
+    let mut floor = 0.0f32;
+    for kept in [1, 4, 7, 11] {
+        let longer: Vec<u32> = plain_prompt.iter().chain(&plain_tokens[..kept]).copied().collect();
+        floor = floor.max(close(&reply(&mut model, &longer, 1).1[0], &plain_logits[kept]));
+    }
     let span = ImageSpan { start, grid, rows: Arc::new(rows) };
     model.set_images(vec![span.clone()]);
     let (tokens, logits) = reply(&mut model, &prompt, 12);
@@ -82,7 +91,7 @@ fn rope_positions_agree_on_every_path() {
         let (next, next_logits) = reply(&mut model, &longer, 1);
         println!("after {kept} tokens: the batch's logits apart from the decode's by {}", close(&next_logits[0], &logits[kept]));
         assert_eq!(next[0], tokens[kept], "after {kept} tokens read in a batch");
-        assert!(close(&next_logits[0], &logits[kept]) < 0.05, "after {kept}: logits apart by {}", close(&next_logits[0], &logits[kept]));
+        assert!(close(&next_logits[0], &logits[kept]) < 3.0 * floor, "after {kept}: logits apart by {} (plain text by {floor})", close(&next_logits[0], &logits[kept]));
     }
     // And the same text past the image is not what it is without its positions' delta: the rope position does something here.
     let without_delta: Vec<f32> = {
