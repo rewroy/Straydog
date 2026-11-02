@@ -95,12 +95,12 @@ pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this seque
 pub const IMAGE_REFUSED: &str = "(a request with an image, refused)";
 
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
-const SCARCE_ROW_CACHE: u64 = 1 << 30;
+pub const SCARCE_ROW_CACHE: u64 = 1 << 30;
 /// The commit a K/V growth leaves the machine.
 const KV_COMMIT_MARGIN: u64 = 2 << 30;
 /// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
 /// whole context take from a small machine what the expert banks need, and few sequences reach it.
-const STARTING_KV: usize = 32768;
+pub const STARTING_KV: usize = 32768;
 
 /// A verification's buffers beside partially resident layers (`verify_reserve`), and the VRAM for expert slots a drafter must
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
@@ -111,6 +111,32 @@ const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
 /// costs less CPU. Two drafts against one, same seeds, tok/s of a second and third request: `--vram 24` 69.5, 70.5 / 67.7, 61.4; 16 (17%) 58.7,
 /// 57.3 / 57.4, 56.6; 12 (under 15%) 50.1, 49.1 / 50.7, 48.0. HIP only: CUDA has not been measured.
 const TWO_DRAFTS_SHARE: f64 = 0.15;
+/// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
+/// asks beyond them (`Model::prepare_hybrid_moe`).
+pub(crate) const STAGING_SLOTS: u64 = 32;
+pub(crate) const SLOTS_MARGIN: u64 = 64 << 20;
+const STAGING_GATE: u64 = 128 << 20;
+
+/// The VRAM a partially resident Qwen3.8 without a drafter leaves its expert slots in a `budget` on one GPU, with `dense` bytes of pinned
+/// weights ([`crate::weights::Weights::dense_requirements`]), experts of up to `expert` bytes and a context of `context` tokens that its
+/// K/V may grow to; None if the placement would refuse it ([`Model::prepare_hybrid_moe`]'s gate at the K/V a model starts with), or a
+/// growth to the whole context find no room for the longer indexers. What `straydog setup` tells of a machine rests on this.
+pub fn partial_slot_bytes(dense: u64, expert: u64, context: u64, prefill: u64, budget: u64) -> Option<u64> {
+    let decoder = crate::gpu::decoder_workspace_bytes(context.min(prefill));
+    let kv = context.min(STARTING_KV as u64);
+    let starting = crate::gpu::partial_state_bytes(kv, context, prefill, budget);
+    let stage = STAGING_SLOTS * expert;
+    let gate = starting + dense + stage + STAGING_GATE + decoder + crate::gpu::Backend::slack(budget);
+    if gate > budget {
+        return None;
+    }
+    budget.checked_sub(crate::gpu::partial_state_bytes(context, context, prefill, budget) + dense + decoder + stage + SLOTS_MARGIN)
+}
+
+/// Page-locked host bytes of the recurrent state's copies: [`CHECKPOINTS`] and [`PARK_SLOTS`].
+pub fn checkpoint_bytes() -> u64 {
+    (CHECKPOINTS.len() + PARK_SLOTS.len()) as u64 * (36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4)
+}
 /// New tokens from which a partially resident model's batches take the slots' VRAM: past one batch, the second batch's streaming costs more
 /// than putting the slots back, a fraction of a second.
 const LONG_PREFILL: usize = 1536;
@@ -863,7 +889,7 @@ impl Model {
             return Ok(false);
         }
         let kinds = (0..48).map(|layer| self.weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
-        let staging = 32 * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + (128 << 20);
+        let staging = STAGING_SLOTS * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + STAGING_GATE;
         let mut requirements = self.weights.dense_requirements();
         requirements.push(("@hybrid:staging".into(), staging));
         // The drafter when its layer and a verification's buffers leave the expert slots their share.

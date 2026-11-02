@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use straydog_engine::arch::deepseek41::serve::CHECKPOINT_BYTES;
 use straydog_engine::arch::served::{HOST_OTHER, HOST_SHARE, RESERVE};
 use straydog_engine::bundle::{self, Asset, Footprint};
-use straydog_engine::rows::DEFAULT_CACHE_BYTES;
+use straydog_engine::model::{checkpoint_bytes, partial_slot_bytes, SCARCE_ROW_CACHE, STARTING_KV};
+use straydog_engine::rows::{auto_budget as row_cache_budget, DEFAULT_CACHE_BYTES};
 use straydog_engine::verity::Geometry;
 
-use super::machine::Machine;
+use super::machine::{Gpu, Machine};
+use crate::worker::{auto_budget, margin_on};
 
 pub const GIB: u64 = 1 << 30;
 
@@ -209,6 +211,12 @@ impl Entry {
     }
 }
 
+/// Bytes in GiB to a tenth: on a small card a tenth is what decides.
+pub fn tenths(bytes: u64) -> String {
+    let tenths = format!("{:.1}", bytes as f64 / GIB as f64);
+    format!("{} GiB", tenths.strip_suffix(".0").unwrap_or(&tenths))
+}
+
 /// How well a machine runs a bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fit {
@@ -220,7 +228,8 @@ pub enum Fit {
     Drive(u64),
     /// No GPU was found.
     NoGpu,
-    /// What every token reads, with the placement's working memory, is more than the VRAM.
+    /// `auto`'s budget would not hold what every token reads and the placement's working memory: the free
+    /// VRAM that would, its margin included, and the free VRAM there is.
     TooLittleVram { needs: u64, has: u64 },
 }
 
@@ -257,11 +266,14 @@ impl Fit {
             Fit::Vram => "all of it fits in VRAM".to_string(),
             Fit::Ram(bytes) if entry.architecture == "deepseek41" => format!("{} of its experts wait in RAM and move to the GPU as tokens need them", gib(bytes)),
             Fit::Ram(bytes) => format!("{} of its experts wait in RAM and the CPU computes them: slower", gib(bytes)),
+            // Qwen3.8's K/V grows from 32768 positions into the memory the banks had; what the working set cannot keep is a page's read away.
+            Fit::Drive(0) => "its experts wait in RAM and the CPU computes them: slower, and more so once a long conversation's K/V takes their room".to_string(),
+            Fit::Drive(bytes) if entry.architecture != "deepseek41" => format!("{} of its experts do not stay in RAM: the CPU computes them from the drive's copy, slower at first and on a change of topic", if *bytes < GIB { "under 1 GiB".to_string() } else { gib(bytes) }),
             // (a twentieth of the experts is read once and then stays in the page cache)
             Fit::Drive(bytes) if *bytes < entry.footprint.experts / 20 => format!("{} of its experts are read from the drive: a little slower", if *bytes < GIB { "under 1 GiB".to_string() } else { gib(bytes) }),
             Fit::Drive(bytes) => format!("{} of its experts are read from the drive as tokens need them: slow", gib(bytes)),
             Fit::NoGpu => "needs a GPU".to_string(),
-            Fit::TooLittleVram { needs, has } => format!("needs {} of VRAM; this machine has {}", gib(needs), gib(has)),
+            Fit::TooLittleVram { needs, has } => format!("needs {} of VRAM free, with what `auto` leaves for the desktop; this machine has {} free", tenths(*needs), tenths(*has)),
         }
     }
 }
@@ -303,8 +315,8 @@ fn working(architecture: &str) -> Working {
         // bytes a token, is 0.78 GiB. It started at --vram 14 and 15 and not at 13 (and 12, 10), 1.4
         // GiB more than it counted, for the rows of a prefill pass of 4096 tokens.
         "deepseek41" => Working { vram: gib_hundredths(234), per_gpu: gib_hundredths(162), state: State::EveryGpu, arena: gib_hundredths(140), host: CHECKPOINT_BYTES },
-        // Qwen3.8 keeps its sequence state in host memory; the rows and buffers of its passes: 6.26
-        // GiB on two GPUs with IQ3_S (57.3 GiB counted); Q2_0 started on one GPU at --vram 8
+        // Qwen3.8 with every expert resident (a partial placement counts otherwise: `partial_room`) keeps its sequence
+        // state in host memory; the rows and buffers of its passes: 6.26 GiB on two GPUs with IQ3_S (57.3 GiB counted)
         _ => Working { vram: 0, per_gpu: gib_hundredths(290), state: State::Host, arena: 0, host: 0 },
     }
 }
@@ -324,62 +336,147 @@ impl Working {
 /// the model starts, so that a model that does not fit at the default is given less context, not left out.
 pub const CONTEXTS: [u64; 5] = [DEFAULT_CONTEXT, 131_072, 65_536, 32_768, 16_384];
 
-/// The margin an automatic VRAM budget leaves of a GPU's memory.
-fn margin(total: u64) -> u64 {
-    (if cfg!(windows) { 2u64 << 30 } else { 512u64 << 20 }).max(total / 100 * 3)
-}
-
 /// The VRAM the placement counts for a bundle that is not the experts, with `context` tokens: the
 /// weights every token reads, the working memory, the state, and `RESERVE` on each of `gpus` GPUs.
+/// (Qwen3.8: with every expert resident.)
 fn counted(entry: &Entry, gpus: usize, context: u64) -> u64 {
     entry.footprint.dense + working(&entry.architecture).vram(gpus, entry.footprint.state_per_token * context) + gpus as u64 * RESERVE
 }
 
-/// The VRAM a bundle needs at the least to start with `context` tokens: what [`counted`] gives and
-/// the rows a pass needs beside it (the margin of an automatic budget not counted: the caller adds
-/// it for the GPUs it has).
-pub fn min_vram(entry: &Entry, gpus: usize, context: u64) -> u64 {
-    counted(entry, gpus, context) + gpus as u64 * working(&entry.architecture).arena
+/// A Qwen3.8 prefill batch below 48 GiB of budgets (`worker::plan`).
+const PARTIAL_BATCH: u64 = 1024;
+
+/// What `Weights::dense_requirements` leaves out of a bundle's `dense` bytes: the HyperConnections' and the PLE layer's BF16
+/// matrices going up as Q8_0 (626442240 bytes less, in every bundle) and the token embeddings, kept on the host (273152000 bytes
+/// in IQ3_XXS; their 635699200 weights at 2 bits at the least, as here, for bundles whose headers are not at hand: too little by at most 0.11 GiB).
+const DENSE_NOT_PINNED: u64 = 626_442_240 + 635_699_200 / 4;
+
+/// What a partial placement pins of a bundle's `dense` bytes.
+fn pinned_dense(entry: &Entry) -> u64 {
+    entry.footprint.dense.saturating_sub(DENSE_NOT_PINNED)
 }
 
-/// Whether `machine` runs `entry` with `context` tokens and how: the placement's own rules over the
-/// footprint. The weights every token reads, the working memory, the state and `RESERVE` must fit
-/// the GPUs' memory less the margin of an automatic budget (and the rows of a pass beside them); the
-/// experts take what VRAM has left of that, then the host tier (85% of the RAM less the row cache,
-/// 2 GiB and what the state and the checkpoints take of host memory); the rest is read from the drive.
+/// The largest expert of a bundle, which sizes the staging slots: a third over the average (IQ3_XXS: 2329600 bytes, 1746133 on average).
+fn largest_expert(entry: &Entry) -> u64 {
+    entry.footprint.experts / (48 * 512) / 3 * 4
+}
+
+/// The VRAM `budgets` leave a partially resident Qwen3.8's expert slots with `context` tokens, by the
+/// placement's own arithmetic (`straydog_engine::model::partial_slot_bytes`), the pinned weights shared out
+/// over the GPUs; None if it would not start, or could not grow its K/V to the context.
+fn partial_room(entry: &Entry, budgets: &[u64], context: u64) -> Option<u64> {
+    let dense = pinned_dense(entry) / budgets.len() as u64;
+    budgets.iter().map(|&budget| partial_slot_bytes(dense, largest_expert(entry), context, PARTIAL_BATCH, budget)).sum()
+}
+
+/// The VRAM a bundle needs at the least to start with `context` tokens, as `--vram` gives it (the margin of
+/// an automatic budget not counted). DeepSeek-V4.1: what [`counted`] gives and the rows a pass needs beside
+/// it. Qwen3.8: what a partial placement takes, its slots few. Its K/V, in host memory, costs VRAM only for
+/// the indexers, whose whole context a smaller budget cannot grow to: at 16384 tokens the least is 0.4 GiB
+/// under 262144's.
+pub fn min_vram(entry: &Entry, gpus: usize, context: u64) -> u64 {
+    if entry.architecture == "deepseek41" {
+        return counted(entry, gpus, context) + gpus as u64 * working(&entry.architecture).arena;
+    }
+    const STEP: u64 = 16 << 20;
+    let least = (1..(1 << 16)).map(|steps| steps * STEP).find(|&budget| partial_room(entry, &vec![budget; gpus], context).is_some());
+    gpus as u64 * least.unwrap_or(u64::MAX / 256)
+}
+
+/// A GPU's free memory as `auto` will find it: a share of up to a quarter that another program keeps is
+/// left to it, and a job holding more is waited for (`worker::budgets`), so that it says nothing of what will be free.
+fn free_for_auto(gpu: &Gpu) -> u64 {
+    if gpu.free >= gpu.total / 4 * 3 { gpu.free } else { gpu.total }
+}
+
+/// Whether `machine` runs `entry` with `context` tokens and how.
 pub fn fit(entry: &Entry, machine: &Machine, context: u64) -> Fit {
+    fit_on(cfg!(windows), entry, machine, context)
+}
+
+/// [`fit`] by the placement's own rules over the footprint, for the budgets `auto` takes on `machine`
+/// under Windows or elsewhere.
+///
+/// DeepSeek-V4.1: the weights every token reads, the working memory, the state and `RESERVE` must fit the
+/// budgets (and the rows of a pass beside them); the experts take what VRAM has left of that, then the host
+/// tier (85% of the RAM less the row cache, 2 GiB and what the state and the checkpoints take of host
+/// memory); the rest is read from the drive.
+///
+/// Qwen3.8: every expert resident as for DeepSeek-V4.1, else a partial placement: its slots hold what the budgets
+/// have left ([`partial_room`]), and the banks are mapped files the working set keeps as far as it may
+/// (`host::keep_resident`, 85% of the RAM less 2 GiB and what is page-locked, in which the row cache is). Its K/V
+/// starts at 32768 positions: the experts are in RAM whatever a conversation does if they fit beside the whole
+/// context's K/V, else what they lack beside the starting K/V is read from the drive.
+fn fit_on(windows: bool, entry: &Entry, machine: &Machine, context: u64) -> Fit {
     if machine.gpus.is_empty() {
         return Fit::NoGpu;
     }
     let work = working(&entry.architecture);
     let state = entry.footprint.state_per_token * context;
-    let total: u64 = machine.gpus.iter().map(|gpu| gpu.total).sum();
-    let margins: u64 = machine.gpus.iter().map(|gpu| margin(gpu.total)).sum();
-    let needs = min_vram(entry, machine.gpus.len(), context);
-    if total < needs + margins {
-        return Fit::TooLittleVram { needs: needs + margins, has: total };
-    }
+    let gpus = machine.gpus.len();
+    let budgets: Vec<u64> = machine.gpus.iter().map(|gpu| auto_budget(windows, free_for_auto(gpu), gpu.total)).collect();
+    let budget: u64 = budgets.iter().sum();
+    let has: u64 = machine.gpus.iter().map(free_for_auto).sum();
+    let needs = min_vram(entry, gpus, context) + machine.gpus.iter().map(|gpu| margin_on(windows, gpu.total)).sum::<u64>();
+    let share = (machine.ram as f64 * HOST_SHARE) as u64;
     // (the experts' slots take what the placement does not count: the rows' arena is lent to them)
-    let room = total - margins - counted(entry, machine.gpus.len(), context);
+    let whole = counted(entry, gpus, context);
+    if entry.architecture == "deepseek41" {
+        if budget < min_vram(entry, gpus, context) {
+            return Fit::TooLittleVram { needs, has };
+        }
+        let room = budget - whole;
+        if entry.footprint.experts <= room {
+            return Fit::Vram;
+        }
+        let beyond = entry.footprint.experts - room;
+        let host = share.saturating_sub(DEFAULT_CACHE_BYTES + HOST_OTHER + work.host(state));
+        return if beyond <= host { Fit::Ram(beyond) } else { Fit::Drive(beyond - host) };
+    }
+    if budget >= whole && entry.footprint.experts <= budget - whole {
+        return Fit::Vram;
+    }
+    let Some(room) = partial_room(entry, &budgets, context) else { return Fit::TooLittleVram { needs, has } };
     if entry.footprint.experts <= room {
         return Fit::Vram;
     }
     let beyond = entry.footprint.experts - room;
-    let host = ((machine.ram as f64 * HOST_SHARE) as u64).saturating_sub(DEFAULT_CACHE_BYTES + HOST_OTHER + work.host(state));
-    if beyond <= host { Fit::Ram(beyond) } else { Fit::Drive(beyond - host) }
+    let rows = row_cache(entry, machine.ram, state);
+    let keep = share.saturating_sub(HOST_OTHER + checkpoint_bytes() + rows);
+    if beyond <= keep.saturating_sub(state) {
+        return Fit::Ram(beyond);
+    }
+    let starting = entry.footprint.state_per_token * context.min(STARTING_KV as u64);
+    Fit::Drive(beyond.saturating_sub(keep.saturating_sub(starting)))
+}
+
+/// A partially resident Qwen3.8's row cache of the PLE table (rows of 90 bytes), as `Model::new` chooses it.
+fn row_cache(entry: &Entry, ram: u64, state: u64) -> u64 {
+    let budget = row_cache_budget(entry.footprint.tables / 90, 90, ram, state);
+    if ram < 2 * entry.footprint.experts { budget.min(SCARCE_ROW_CACHE) } else { budget }
+}
+
+/// Whether the budgets `auto` takes here leave a Qwen3.8 drafter worth having: at --vram 5 it cost 1.4% on an
+/// RTX 5070 Ti (IQ2_XS, 8 requests a side), at 6 it gained 3.4%, and below about 4.75 the placement drops it.
+pub fn drafter_pays(machine: &Machine) -> bool {
+    machine.gpus.iter().map(|gpu| auto_budget(cfg!(windows), free_for_auto(gpu), gpu.total)).sum::<u64>() >= (11 << 30) / 2
 }
 
 /// The largest context in [`CONTEXTS`] at which `entry` runs on `machine`, with how; when it runs at
 /// none, the verdict at the smallest (what the least it needs is).
 pub fn fit_at_best_context(entry: &Entry, machine: &Machine) -> (u64, Fit) {
+    best_context_on(cfg!(windows), entry, machine)
+}
+
+fn best_context_on(windows: bool, entry: &Entry, machine: &Machine) -> (u64, Fit) {
     for &context in &CONTEXTS {
-        let verdict = fit(entry, machine, context);
+        let verdict = fit_on(windows, entry, machine, context);
         if verdict.runs() {
             return (context, verdict);
         }
     }
     let smallest = CONTEXTS[CONTEXTS.len() - 1];
-    (smallest, fit(entry, machine, smallest))
+    (smallest, fit_on(windows, entry, machine, smallest))
 }
 
 /// The models of `entries`, in the order they first appear.
@@ -395,7 +492,9 @@ pub fn models(entries: &[Entry]) -> Vec<&str> {
 
 /// The bundle to start from, by index into `entries` and their `fits`: the best class (VRAM,
 /// RAM, drive) that the first model reaching VRAM or RAM has, its first bundle in that class; when
-/// no model does, the bundle reading the least from the drive.
+/// no model does, of the model of the bundle reading the least from the drive, the first bundle
+/// (the most exact) reading at most a twentieth of its experts more than that one. A twentieth is what
+/// separates Qwen3.8's IQ2_XS from Q2_0, 4% smaller and the least exact.
 pub fn recommend(entries: &[Entry], fits: &[Fit]) -> Option<usize> {
     let rank = |index: usize| fits[index].rank();
     for model in models(entries) {
@@ -405,7 +504,10 @@ pub fn recommend(entries: &[Entry], fits: &[Fit]) -> Option<usize> {
             return of_model.into_iter().find(|&index| rank(index) == Some(best));
         }
     }
-    (0..entries.len()).filter(|&index| rank(index).is_some()).min_by_key(|&index| match fits[index] { Fit::Drive(bytes) => bytes, _ => 0 })
+    let read = |index: usize| match fits[index] { Fit::Drive(bytes) => bytes, _ => 0 };
+    let least = (0..entries.len()).filter(|&index| rank(index).is_some()).min_by_key(|&index| read(index))?;
+    (0..entries.len()).find(|&index| rank(index).is_some() && entries[index].model == entries[least].model
+                                     && read(index) <= read(least) + entries[index].footprint.experts / 20)
 }
 
 #[cfg(test)]
@@ -508,25 +610,26 @@ pub(crate) mod tests {
     /// slots and the same tier; the experts' bytes per slot are the average.
     #[test]
     fn the_fit_rule_agrees_with_the_placement_on_two_r9700s() {
+        // (it runs Linux: under Windows' margin IQ3_S would not fit whole)
         let machine = doggybox();
         for (quant, slots) in [("GSQ-RCO-IQ2_XXS", 5832u64), ("GSQ-RCO-IQ2_XS", 5147)] {
             let entry = entry(quant);
             let in_vram = slots * entry.footprint.experts / 15360;
-            let Fit::Ram(beyond) = fit(&entry, &machine, DEFAULT_CONTEXT) else { panic!("{quant}: {:?}", fit(&entry, &machine, DEFAULT_CONTEXT)) };
+            let Fit::Ram(beyond) = fit_on(false, &entry, &machine, DEFAULT_CONTEXT) else { panic!("{quant}: {:?}", fit_on(false, &entry, &machine, DEFAULT_CONTEXT)) };
             let placed = entry.footprint.experts - in_vram;
             // within 5% of the experts the placement left outside VRAM, and inside the host tier it had (102.2 GiB)
             assert!(beyond.abs_diff(placed) < placed / 20, "{quant}: rule {beyond}, placement {placed}");
             assert!(beyond < (102.2 * GIB as f64) as u64);
         }
         // UD-IQ2_XXS has 157 GB of experts: past VRAM and the tier, the drive serves the rest
-        assert!(matches!(fit(&entry("UD-IQ2_XXS"), &machine, DEFAULT_CONTEXT), Fit::Drive(_)));
+        assert!(matches!(fit_on(false, &entry("UD-IQ2_XXS"), &machine, DEFAULT_CONTEXT), Fit::Drive(_)));
         // Qwen3.8 is in VRAM whole at the full context (the placement said "fully resident" and
         // "0.0 GiB host tier"), and keep it
         for quant in ["Q2_0", "IQ3_S"] {
-            assert_eq!(fit_at_best_context(&entry(quant), &machine), (DEFAULT_CONTEXT, Fit::Vram), "{quant}");
+            assert_eq!(best_context_on(false, &entry(quant), &machine), (DEFAULT_CONTEXT, Fit::Vram), "{quant}");
         }
         let entries = pinned_entries();
-        let fits: Vec<Fit> = entries.iter().map(|entry| fit(entry, &machine, DEFAULT_CONTEXT)).collect();
+        let fits: Vec<Fit> = entries.iter().map(|entry| fit_on(false, entry, &machine, DEFAULT_CONTEXT)).collect();
         assert_eq!(recommend(&entries, &fits).map(|index| entries[index].quant.as_str()), Some("GSQ-RCO-IQ2_XXS"));
     }
 
@@ -547,10 +650,150 @@ pub(crate) mod tests {
         // the Qwen3.8 bundles run, keeping the context they start with (the placement ran IQ3_S
         // partially resident at --vram 12, K/V in host memory), and read from the drive
         for quant in ["IQ3_S", "IQ2_XS", "Q2_0"] {
-            assert!(matches!(of(quant), (DEFAULT_CONTEXT, Fit::Drive(_)) | (_, Fit::Drive(_))), "{quant}");
+            assert!(matches!(of(quant), (DEFAULT_CONTEXT, Fit::Drive(_))), "{quant}: {:?}", of(quant));
         }
         let recommended = recommend(&entries, &fits.iter().map(|(_, fit)| fit.clone()).collect::<Vec<_>>()).unwrap();
-        assert_eq!(entries[recommended].quant, "Q2_0");
+        assert_eq!(entries[recommended].quant, "IQ2_XS");
+    }
+
+    /// `machine` with `others` bytes of each GPU held by the desktop and other programs, and a reported card of `mib`.
+    fn windows_pc(mib: u64, others: u64, ram: u64) -> Machine {
+        let total = mib << 20;
+        let gpus = vec![Gpu { ordinal: 0, name: "GPU".into(), total, free: total - others }];
+        Machine { backend: "CUDA", gpus, gpu_error: None, ram }
+    }
+
+    /// Every bundle's verdict and the recommended one's name, under Windows or elsewhere.
+    fn verdicts(on_windows: bool, pc: &Machine) -> (Vec<(String, u64, Fit)>, Option<String>) {
+        let entries = pinned_entries();
+        let fits: Vec<(u64, Fit)> = entries.iter().map(|entry| best_context_on(on_windows, entry, pc)).collect();
+        let classes: Vec<Fit> = fits.iter().map(|(_, fit)| fit.clone()).collect();
+        let named = recommend(&entries, &classes).map(|index| entries[index].quant.clone());
+        (entries.iter().zip(fits).map(|(entry, (context, fit))| (entry.quant.clone(), context, fit)).collect(), named)
+    }
+
+    fn verdict(verdicts: &[(String, u64, Fit)], quant: &str) -> (u64, Fit) {
+        verdicts.iter().find(|(name, ..)| name == quant).map(|(_, context, fit)| (*context, fit.clone())).unwrap()
+    }
+
+    const GIB_F: f64 = GIB as f64;
+    /// 32 GB of RAM as Windows reports it, and a desktop with little else on the GPU.
+    const RAM_32: u64 = 31_900 << 20;
+    const DESKTOP: u64 = 800 << 20;
+
+    /// What the placement takes, from its own arithmetic: a partial Qwen3.8 needs far less than the 10 GiB once claimed for IQ2_XS
+    /// (dense 3.5 + working 2.9 + RESERVE 1.6 + margin 2), and it starts within what `auto` leaves on a 6 GB card.
+    #[test]
+    fn a_partial_qwen_needs_what_the_placement_needs() {
+        let least = |quant: &str, context: u64| min_vram(&entry(quant), 1, context) as f64 / GIB_F;
+        for quant in ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"] {
+            eprintln!("{quant}: {:.2} GiB at 262144 tokens, {:.2} at 32768", least(quant, DEFAULT_CONTEXT), least(quant, 32_768));
+        }
+        // a bigger bundle takes more; a whole context takes the indexers' growth more than 32768 tokens
+        assert!(least("Q2_0", DEFAULT_CONTEXT) < least("IQ2_XS", DEFAULT_CONTEXT) && least("IQ2_XS", DEFAULT_CONTEXT) < least("IQ3_XXS", DEFAULT_CONTEXT));
+        assert!(least("IQ2_XS", 32_768) < least("IQ2_XS", DEFAULT_CONTEXT));
+        // IQ2_XS: under what R9700s started it at (--vram 4.5, 14ed46b), and nowhere near 10 GiB
+        assert!((4.0..4.5).contains(&least("IQ2_XS", DEFAULT_CONTEXT)), "{}", least("IQ2_XS", DEFAULT_CONTEXT));
+        // Its state, 13 GiB at the whole context, is in host memory: only the indexers are in VRAM
+        assert!(least("IQ2_XS", DEFAULT_CONTEXT) - least("IQ2_XS", 16_384) < 0.5);
+        // two GPUs each keep their workspaces, and share the weights
+        let (one, two) = (min_vram(&entry("IQ2_XS"), 1, DEFAULT_CONTEXT), min_vram(&entry("IQ2_XS"), 2, DEFAULT_CONTEXT));
+        assert!(two > one && two < 2 * one);
+    }
+
+    /// The machines of the goal: what is offered and what is recommended, for 6, 8, 12 and 16 GB cards, under Windows and elsewhere.
+    #[test]
+    fn the_cards_from_6_to_16_gb_run_qwen_and_recommend_what_they_can_hold() {
+        let cards = [(6144, "6 GB"), (8188, "8 GB"), (12288, "12 GB"), (16303, "16 GB")];
+        for on_windows in [true, false] {
+            for (mib, name) in cards {
+                let pc = windows_pc(mib, DESKTOP, RAM_32);
+                let (fits, named) = verdicts(on_windows, &pc);
+                eprintln!("{name} windows={on_windows}, 32 GB: recommended {named:?}");
+                for (quant, context, fit) in &fits {
+                    eprintln!("  {quant:<16} {context:>6} {fit:?}  {}", fit.note(&entry(quant)));
+                }
+                // the smaller Qwen3.8 bundles run on every card at the whole context, reading from the drive what RAM will not keep;
+                // from 8 GB the larger do too (at 6 GB they are short of budget, or of the context's indexers)
+                let bundles: &[&str] = if mib < 8000 { &["Q2_0", "IQ2_XS"] } else { &["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"] };
+                for quant in bundles {
+                    let (context, fit) = verdict(&fits, quant);
+                    assert_eq!(context, DEFAULT_CONTEXT, "{name}: {quant}");
+                    assert!(matches!(fit, Fit::Drive(_)), "{name}: {quant}: {fit:?}");
+                }
+                // and 32 GB holds none of them whole: the K/V's whole context would leave the banks 10 GiB of it
+                assert_eq!(named.as_deref(), Some("IQ2_XS"), "{name}");
+                // DeepSeek-V4.1 runs on none of these with the desktop's share gone, or when it does never well
+                let (_, deepseek) = verdict(&fits, "GSQ-RCO-IQ2_XXS");
+                assert!(matches!(deepseek, Fit::TooLittleVram { .. } | Fit::Drive(_)), "{name}: {deepseek:?}");
+            }
+        }
+    }
+
+    /// 6 GB and 32 GB, the owner's goal: IQ2_XS runs, what it misses in RAM is told as measured, and the messages say what `auto` takes.
+    #[test]
+    fn the_goal_machine_gets_iq2_xs_with_true_words() {
+        let pc = windows_pc(6144, DESKTOP, RAM_32);
+        let (fits, named) = verdicts(true, &pc);
+        assert_eq!(named.as_deref(), Some("IQ2_XS"));
+        let ours = entry("IQ2_XS");
+        let (context, fit) = verdict(&fits, "IQ2_XS");
+        assert_eq!(context, DEFAULT_CONTEXT);
+        // banks of 33 GiB, of which a working set of about 22 GiB beside the page-locked 2.3 GiB stays: about a third from the drive
+        let Fit::Drive(from_drive) = fit else { panic!("{fit:?}") };
+        let gib = from_drive as f64 / GIB_F;
+        assert!((9.0..13.0).contains(&gib), "{gib}");
+        let note = fit.note(&ours);
+        assert!(note.contains("do not stay in RAM") && note.contains("change of topic") && !note.contains("slow "), "{note}");
+        // Q2_0 reads less, but only by about the 4% it is smaller: the most exact within a twentieth stands
+        let Fit::Drive(q2) = verdict(&fits, "Q2_0").1 else { panic!() };
+        assert!(q2 < from_drive && from_drive - q2 < ours.footprint.experts / 20);
+        // a card whose desktop keeps it short of the least is told so, with what it would need
+        let busy = windows_pc(6144, 1500 << 20, RAM_32);
+        let refused = fit_on(true, &ours, &busy, DEFAULT_CONTEXT);
+        let Fit::TooLittleVram { needs, has } = refused else { panic!("{refused:?}") };
+        assert_eq!(has, (6144 - 1500) << 20);
+        assert_eq!(needs, min_vram(&ours, 1, DEFAULT_CONTEXT) + (768 << 20));
+        let note = refused.note(&ours);
+        assert!(note.contains("of VRAM free") && note.contains("4.5 GiB free"), "{note}");
+        // holding more than a quarter of it is a job `auto` waits for: it says nothing of the card, as a running engine says nothing
+        assert!(fit_on(true, &ours, &windows_pc(6144, 1600 << 20, RAM_32), DEFAULT_CONTEXT).runs());
+        // 4 GB holds no Qwen3.8 at all
+        assert!(matches!(fit_on(true, &ours, &windows_pc(4096, 0, RAM_32), DEFAULT_CONTEXT), Fit::TooLittleVram { .. }));
+    }
+
+    /// RAM's rules as the placement and the worker hold to them.
+    #[test]
+    fn rams_rules_follow_the_placements() {
+        let (ours, big) = (entry("IQ2_XS"), entry("IQ3_S"));
+        // the banks are more than half of 32, 62 and 64 GiB of memory: the row cache is 1 GiB, and it is not page-locked whole
+        assert_eq!(row_cache(&ours, RAM_32, ours.footprint.state_per_token * DEFAULT_CONTEXT), SCARCE_ROW_CACHE);
+        assert_eq!(row_cache(&ours, 64 << 30, ours.footprint.state_per_token * DEFAULT_CONTEXT), SCARCE_ROW_CACHE);
+        // no bank is page-locked at 32 GiB (under 1.25 times the banks), at 48 half the memory is
+        use straydog_engine::model::lock_budget;
+        assert_eq!(lock_budget(RAM_32, ours.footprint.experts, 2 << 30), 0);
+        assert_eq!(lock_budget(48 << 30, ours.footprint.experts, 2 << 30), 22 << 30);
+        // 96 GiB, more than twice these banks: half of what the K/V leaves, up to the table's rows
+        let wide = row_cache(&ours, 96 << 30, ours.footprint.state_per_token * DEFAULT_CONTEXT);
+        assert!(wide > 30 << 30 && wide < 40 << 30, "{wide}");
+        // the K/V's growth is what parts 16 GB's RAM class: the banks of IQ3_S do not keep beside it at 62 GiB, IQ3_XXS's do
+        let (pc, cases) = (windows_pc(16303, DESKTOP, 62 << 30), pinned_entries());
+        let (fits, named) = verdicts(true, &pc);
+        assert_eq!(named.as_deref(), Some("IQ3_XXS"));
+        assert!(matches!(fit_on(true, &big, &pc, DEFAULT_CONTEXT), Fit::Drive(0)), "{:?}", fit_on(true, &big, &pc, DEFAULT_CONTEXT));
+        assert!(matches!(verdict(&fits, "IQ3_XXS").1, Fit::Ram(_)));
+        assert_eq!(cases.len(), fits.len());
+        // no state of a Qwen3.8 is counted at the whole context for what a shorter one will take: a smaller context keeps more
+        let ram_only = |context| match fit_on(true, &big, &windows_pc(16303, DESKTOP, 64 << 30), context) { Fit::Ram(_) => true, Fit::Drive(_) => false, verdict => panic!("{verdict:?}") };
+        assert!(ram_only(131_072));
+    }
+
+    #[test]
+    fn a_drafter_is_not_the_default_where_it_does_not_pay() {
+        // (the budgets depend on the platform's margin: 6 GB under Windows leaves about 4.4 GiB, elsewhere 4.7)
+        assert!(!drafter_pays(&windows_pc(6144, DESKTOP, RAM_32)));
+        assert!(drafter_pays(&windows_pc(8188, DESKTOP, RAM_32)));
+        assert!(drafter_pays(&doggybox()));
     }
 
     #[test]
@@ -587,8 +830,15 @@ pub(crate) mod tests {
         fits[0] = Fit::Drive(1);
         fits[2] = Fit::Vram;
         assert_eq!(recommend(&entries, &fits), Some(2));
-        // nothing runs well: the one reading least from the drive
-        let slow: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(4), Fit::NoGpu, Fit::Drive(30), Fit::Drive(3), Fit::Drive(9), Fit::Drive(7), Fit::Drive(8)];
-        assert_eq!(recommend(&entries, &slow), Some(4));
+        // nothing runs well: of the model reading least from the drive, the first bundle within a twentieth of its experts of that
+        let bytes = |gib: u64| gib * GIB;
+        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &slow), Some(5));
+        // ... or the one reading least, past that
+        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &wide), Some(6));
+        // a model that reads least is chosen over the bundles of another, however near
+        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &other), Some(5));
     }
 }

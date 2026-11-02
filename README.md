@@ -77,8 +77,9 @@ server finds both there and runs without either. Qwen3.8 reads images with
 `mmproj-Qwen3.8-Flash-Next-BF16.gguf` from its GGUF repository (`straydog setup` fetches it): in
 the bundle's directory or the one above it, or named by `--mmproj`.
 
-Each GPU's VRAM budget is its free memory unless `--vram` gives one (`--vram 28`) or one per
-GPU (`--vram 30,10` for a 32 GB and a 12 GB card).
+Each GPU's VRAM budget is its free memory less a margin (512 MiB or 3%; on Windows, where the
+desktop shares the GPU, an eighth of a small card, and 2 GiB from 16 GB up) unless `--vram` gives
+one (`--vram 28`) or one per GPU (`--vram 30,10` for a 32 GB and a 12 GB card).
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
