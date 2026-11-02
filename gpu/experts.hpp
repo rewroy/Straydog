@@ -965,7 +965,8 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
     // An IQ2 row of 4096 to 8191 values (DeepSeek-V4.1's gate and up, 5120) takes at most four lanes on the Q8 kernels: over eight a wave's loads
     // fan out to four rows each and a lane walks ten pairs (IQ2_XXS 44.5 us a layer's gate/up, 40.5 on four lanes; IQ2_XS 53.1 -> 46.5; IQ2_S
     // 53.1 -> 47.8); two lanes or sixteen lose. Decided by the matrix and the device alone (a row's sum is the same whatever shares its launch).
-    if (q8_gate && slot_q8_kind(gate_kind) && gate.cols >= 4096 && gate.cols < 8192) gate_lanes = std::min(gate_lanes, 4u);
+    // (IQ1_M's blocks are shorter: 2 lanes 26.42, 4 25.99, 8 25.80, 16 25.87 ms a DeepSeek-V4.1 3-row pass)
+    if (q8_gate && slot_q8_kind(gate_kind) && gate.cols >= 4096 && gate.cols < 8192) gate_lanes = std::min(gate_lanes, gate_kind == 29 ? 8u : 4u);
 #endif
     plan.lanes[0] = gate_kind < 0 ? 32 : gate_lanes;
     plan.lanes[1] = down_kind < 0 ? 32 : down_lanes;
