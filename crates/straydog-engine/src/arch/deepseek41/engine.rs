@@ -625,6 +625,8 @@ pub struct Engine<'a, T: Tensors> {
     link_pass: bool,
     /// A pass using the part links did not complete: the next starts their counts over.
     link_dirty: bool,
+    /// A pass began and has not ended: its sums' counts may be out of step (a wait that gave up voids it).
+    sums_dirty: bool,
     /// The devices' GEMM policy as last set: FP16 operands (see [`Settings::half_gemm`]).
     half_policy: Option<bool>,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
@@ -1113,6 +1115,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             if linked {
                 // (a row's output, or a decode row's activations: every route's and the shared expert's)
                 Backend::link_parts(&mut first.gpu, &mut second.gpu, hp.width.max((hp.experts_used + 1) * hp.expert_ff) as u64)?;
+                // (a short pass's sums: over flags on the devices, which a graph may record, in place of the host's events)
+                Backend::link_sums(&mut first.gpu, &mut second.gpu, (VERIFY_ROWS * hp.width.max((hp.experts_used + 1) * hp.expert_ff)) as u64)?;
             }
         }
         let index_ratio = hp.layers.iter().enumerate()
@@ -1139,6 +1143,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             linked,
             link_pass: false,
             link_dirty: false,
+            sums_dirty: false,
             half_policy: None,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var("DS41_PROFILE").is_ok_and(|value| !value.starts_with("host")),
@@ -1937,6 +1942,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if self.link_pass && std::mem::replace(&mut self.link_dirty, true) {
             self.shards[0].gpu.part_reset()?;
         }
+        if self.linked && std::mem::replace(&mut self.sums_dirty, true) {
+            self.shards[0].gpu.link_reset()?;
+        }
         if let Some((since, _)) = self.profile.as_mut() {
             // another engine's pass ran since this one's last mark
             *since = std::time::Instant::now();
@@ -2056,6 +2064,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 if link {
                     // read with the logits, after them
                     shard.gpu.part_status(work.head.at(outputs * part_rows))?;
+                } else if self.linked {
+                    shard.gpu.link_status(work.head.at(outputs * part_rows))?;
                 }
             }
             self.stamp_pass(n, 1)?;
@@ -2063,7 +2073,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // One read outstanding per device (at most 1 MiB). Queue every device's copy
             // before waiting for any, so the second device's logits move while the first
             // wait runs. A longer read keeps the stream-synchronizing path.
-            let read = outputs * part_rows + usize::from(link);
+            let read = outputs * part_rows + usize::from(link || self.linked);
             let bytes = (read * std::mem::size_of::<f32>()) as u64;
             let parallel = bytes > 0 && bytes <= 1 << 20;
             if parallel {
@@ -2087,7 +2097,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let at = row * hp.vocabulary + part * part_rows;
                     logits[at..at + part_rows].copy_from_slice(&rows[row * part_rows..(row + 1) * part_rows]);
                 }
-                failed |= link && rows[outputs * part_rows].to_bits() != 0;
+                failed |= (link || self.linked) && rows[outputs * part_rows].to_bits() != 0;
             }
             if failed {
                 return Err(VOID_PASS.into());
@@ -2107,6 +2117,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         if self.link_pass {
             self.link_dirty = false;
         }
+        self.sums_dirty = false;
         self.history.extend_from_slice(tokens);
         self.position += n;
         self.rewind = rewind;
