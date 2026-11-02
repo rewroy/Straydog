@@ -141,7 +141,7 @@ pub struct QwenImage {
 
 /// Decode an image and size it for Qwen3.8's encoder.
 pub fn prepare_qwen(bytes: &[u8]) -> Result<QwenImage, String> {
-    let rgb = vision::decode(bytes)?;
+    let rgb = vision::decode_upright(bytes)?;
     Ok(QwenImage { digest: Sha256::digest(bytes).into(), prepared: qwen_vision::prepare(&rgb)? })
 }
 
@@ -167,6 +167,17 @@ pub fn qwen_ids(text: &Text, pieces: &[Piece<'_>], images: &[QwenImage]) -> Resu
         }
     }
     Ok((ids, spans))
+}
+
+/// Where each placed image's span of `ids` starts in `agreed`: the same ids where a reply read back has its held tokens over its
+/// text ([`straydog_engine::model::Model::agree_with_held`]), which may be more or fewer. None if a span is not there, in order.
+pub fn spans_in(spans: &[(usize, usize)], ids: &[u32], agreed: &[u32]) -> Option<Spans> {
+    let mut from = 0;
+    spans.iter().map(|&(index, start)| {
+        let at = from + agreed[from..].iter().position(|id| *id == ids[start])?;
+        from = at + 1;
+        Some((index, at))
+    }).collect()
 }
 
 /// A piece of a rendered prompt.
@@ -261,6 +272,21 @@ mod tests {
         assert!(ids[2..130].iter().all(|id| *id >= IMAGE_TOKEN));
         assert_eq!(ids[3], ids[2] + 1);
         assert_eq!(qwen_ids(&text, &pieces, &images).unwrap().0, ids);
+    }
+
+    /// A reply read back in other tokens than the tokenizer's moves what follows it, the images too.
+    #[test]
+    fn spans_follow_the_ids_that_agree_with_what_is_held() {
+        let image = |offset: u32| IMAGE_TOKEN | (900 + offset);
+        let ids = [1, 2, image(0), image(1), 3, 4, image(0), image(1), 5];
+        let spans = [(0, 2), (1, 6)];
+        assert_eq!(spans_in(&spans, &ids, &ids).unwrap(), spans);
+        // (a token before the first image became two; the same image twice stays apart)
+        let longer = [1, 7, 8, image(0), image(1), 3, 4, image(0), image(1), 5];
+        assert_eq!(spans_in(&spans, &ids, &longer).unwrap(), [(0, 3), (1, 7)]);
+        let shorter = [9, image(0), image(1), 3, image(0), image(1), 5];
+        assert_eq!(spans_in(&spans, &ids, &shorter).unwrap(), [(0, 1), (1, 4)]);
+        assert!(spans_in(&spans, &ids, &[1, 2, 3]).is_none());
     }
 
     #[test]
