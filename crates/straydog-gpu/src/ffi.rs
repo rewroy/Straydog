@@ -1646,6 +1646,17 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_rope_delta(handle: *mut ::std::os::raw::c_void, delta: u32) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rope_rows(
+        handle: *mut ::std::os::raw::c_void,
+        first: u64,
+        count: u64,
+        axes: *const u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_defer(
         handle: *mut ::std::os::raw::c_void,
         on: ::std::os::raw::c_int,

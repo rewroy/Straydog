@@ -1,15 +1,18 @@
-//! A request's images, for a model that reads them (DeepSeek-V4.1 beside its vision encoder).
+//! A request's images, for a model that reads them (DeepSeek-V4.1 and Qwen3.8 beside their vision encoders).
 //!
 //! Each image part of a message (`image_url` with a `data:` URL, or a base64 `image` source)
 //! leaves the messages as a text part holding a marker of its own. The template renders a text
 //! part where it would an image (joined to its neighbors alike), but it reorders tool results, so
 //! the markers say which image each place takes. The prompt's ids then come a piece at a time: the
 //! text between markers encoded, and in each marker's place its image's span of positions (each
-//! with its own id: [`straydog_engine::arch::deepseek41::engine::IMAGE_TOKEN`] and up).
+//! with its own id: [`straydog_engine::arch::deepseek41::engine::IMAGE_TOKEN`] and up). Qwen3.8's template
+//! writes `<|vision_start|><|image_pad|><|vision_end|>` where an image is: a marker's place takes those tokens,
+//! the pad grown to the image's merged grid.
 
 use sha2::{Digest, Sha256};
 use straydog_engine::arch::deepseek41::engine::IMAGE_TOKEN;
 use straydog_engine::pyjson::Value;
+use straydog_engine::qwen_vision::{self, Prepared, VISION_END, VISION_START};
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::vision::{self, Patches, VisionConfig};
 
@@ -29,8 +32,7 @@ pub struct Image {
 impl Image {
     /// The ids of its span: from its digest, consecutive.
     fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        let first = u32::from_le_bytes(self.digest[..4].try_into().unwrap());
-        (0..self.patches.plan.tokens() as u32).map(move |offset| IMAGE_TOKEN | (first.wrapping_add(offset) & !IMAGE_TOKEN))
+        span_ids(&self.digest, self.patches.plan.tokens())
     }
 }
 
@@ -131,6 +133,42 @@ pub fn prepare(bytes: &[u8]) -> Result<Image, String> {
     Ok(Image { digest: Sha256::digest(bytes).into(), patches: vision::patches(&rgb, &VisionConfig::DEEPSEEK41) })
 }
 
+/// A Qwen3.8 request's image: its encoded bytes' digest and what its encoder takes.
+pub struct QwenImage {
+    pub digest: [u8; 32],
+    pub prepared: Prepared,
+}
+
+/// Decode an image and size it for Qwen3.8's encoder.
+pub fn prepare_qwen(bytes: &[u8]) -> Result<QwenImage, String> {
+    let rgb = vision::decode(bytes)?;
+    Ok(QwenImage { digest: Sha256::digest(bytes).into(), prepared: qwen_vision::prepare(&rgb)? })
+}
+
+/// The ids of a span of `count` positions: from its image's digest, consecutive, past the vocabulary.
+fn span_ids(digest: &[u8; 32], count: usize) -> impl Iterator<Item = u32> {
+    let first = u32::from_le_bytes(digest[..4].try_into().unwrap());
+    (0..count as u32).map(move |offset| IMAGE_TOKEN | (first.wrapping_add(offset) & !IMAGE_TOKEN))
+}
+
+/// Qwen3.8's prompt ids, `<|vision_start|>`, an image's span and `<|vision_end|>` in each marker's place, and where each placed
+/// image's span starts.
+pub fn qwen_ids(text: &Text, pieces: &[Piece<'_>], images: &[QwenImage]) -> Result<(Vec<u32>, Spans), TextError> {
+    let (mut ids, mut spans) = (Vec::new(), Vec::new());
+    for piece in pieces {
+        match *piece {
+            Piece::Text(part) => ids.extend(text.encode(part)?),
+            Piece::Image(index) => {
+                ids.push(VISION_START);
+                spans.push((index, ids.len()));
+                ids.extend(span_ids(&images[index].digest, images[index].prepared.tokens()));
+                ids.push(VISION_END);
+            }
+        }
+    }
+    Ok((ids, spans))
+}
+
 /// A piece of a rendered prompt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Piece<'a> {
@@ -204,6 +242,25 @@ mod tests {
         let prompt = format!("a{}b{}", marker(1), marker(0));
         assert_eq!(pieces(&prompt, 2).unwrap(), [Piece::Text("a"), Piece::Image(1), Piece::Text("b"), Piece::Image(0)]);
         assert!(pieces(&format!("{}{}", marker(0), marker(0)), 1).is_err());
+    }
+
+    /// A marker's place takes `<|vision_start|>`, one id a merged token and `<|vision_end|>`, the same ids for the same bytes.
+    #[test]
+    fn a_qwen_image_is_its_span_between_the_vision_tokens() {
+        let text = Text::new(br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"a":0},"unk_token":"a"}}"#).unwrap();
+        // 512x256: 16 merged columns by 8 rows
+        let image = qwen_vision::prepare(&vision::Rgb { width: 512, height: 256, pixels: vec![9; 512 * 256 * 3] }).unwrap();
+        assert_eq!((image.grid(), image.tokens()), ((8, 16), 128));
+        let images = [QwenImage { digest: [7; 32], prepared: image }];
+        let prompt = format!("a{}a", marker(0));
+        let pieces = pieces(&prompt, 1).unwrap();
+        let (ids, spans) = qwen_ids(&text, &pieces, &images).unwrap();
+        assert_eq!(spans, [(0, 2)]);
+        assert_eq!(ids.len(), 1 + 1 + 128 + 1 + 1);
+        assert_eq!((ids[1], ids[130]), (VISION_START, VISION_END));
+        assert!(ids[2..130].iter().all(|id| *id >= IMAGE_TOKEN));
+        assert_eq!(ids[3], ids[2] + 1);
+        assert_eq!(qwen_ids(&text, &pieces, &images).unwrap().0, ids);
     }
 
     #[test]

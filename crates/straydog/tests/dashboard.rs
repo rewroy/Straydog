@@ -18,6 +18,7 @@ fn settings() -> Settings {
         model: PathBuf::from("/models/IQ3_S"),
         quant: "IQ3_S".into(),
         model_draft: None,
+        model_vision: None,
         draft_max: 0,
         ctx_size: 8192,
         batch_size: Some(1024),

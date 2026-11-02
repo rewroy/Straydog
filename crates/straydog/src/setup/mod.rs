@@ -39,7 +39,7 @@ pub struct SetupArgs {
     /// Leave out the DSpark drafter (DeepSeek-V4.1)
     #[arg(long)]
     pub no_dspark: bool,
-    /// Leave out the vision encoder (DeepSeek-V4.1)
+    /// Leave out the vision encoder
     #[arg(long)]
     pub no_vision: bool,
     /// Leave out the MTP drafter (Qwen3.8)
@@ -95,6 +95,13 @@ impl Provision for Pinned {
         if entry.sidecar(Extra::Mtp).is_some_and(|mtp| extras.contains(&Extra::Mtp) && (!offline || place.drafter.join(&mtp.file).is_file())) {
             let path = straydog_provision::fetch_drafter(&place.drafter, false, progress)?;
             println!("verified {}", path.display());
+        }
+        // (one file for every quantization, beside their directories: a server finds it there)
+        if !straydog_engine::bundle::is_on_demand(&entry.quant) && extras.contains(&Extra::Vision) {
+            let beside = place.bundle.parent().unwrap_or(&place.bundle);
+            if let Some(path) = straydog_provision::fetch_qwen_vision(beside, offline, progress)? {
+                println!("verified {}", path.display());
+            }
         }
         Ok(())
     }

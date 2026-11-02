@@ -483,6 +483,16 @@ impl Group {
         self.backends[owner].verify_commit(begin, end, kept)
     }
 
+    /// A sequence with images: its decode and verification rows' rope positions, on every device ([`Backend::rope_delta`]).
+    pub fn rope_delta(&mut self, delta: u32) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.rope_delta(delta))
+    }
+
+    /// A sequence with images: the rope positions of the next prefill spans, on every device ([`Backend::rope_rows`]).
+    pub fn rope_rows(&mut self, first: u64, axes: &[u32]) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.rope_rows(first, axes))
+    }
+
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
         if self.in_parts(begin, end) {
