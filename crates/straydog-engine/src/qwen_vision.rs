@@ -614,13 +614,13 @@ fn layer_norm_body(x: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32]) {
 }
 by_level!(layer_norm, layer_norm_wide, layer_norm_narrow, layer_norm_body, (x: &[f32], weight: &[f32], bias: &[f32], y: &mut [f32]));
 
-/// A query's probabilities from its products: `softmax(scores * scale)`, as torch writes it (less the greatest first).
+/// The greatest of `values` and `peak`.
 #[inline(always)]
-fn softmax_body(scores: &mut [f32], scale: f32) {
+fn peak_of(values: &[f32], peak: f32) -> f32 {
     const LANES: usize = 16;
-    let mut peaks = [f32::MIN; LANES];
-    let chunks = scores.chunks_exact(LANES);
-    let mut peak = chunks.remainder().iter().fold(f32::MIN, |peak, value| if *value > peak { *value } else { peak });
+    let mut peaks = [peak; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let mut peak = chunks.remainder().iter().fold(peak, |peak, value| if *value > peak { *value } else { peak });
     for chunk in chunks {
         for lane in 0..LANES {
             peaks[lane] = if chunk[lane] > peaks[lane] { chunk[lane] } else { peaks[lane] };
@@ -629,6 +629,13 @@ fn softmax_body(scores: &mut [f32], scale: f32) {
     for value in peaks {
         peak = peak.max(value);
     }
+    peak
+}
+
+/// A piece of a query's softmax, as torch writes it (less the greatest first): `exp((scores - peak) * scale)`, and their sum.
+#[inline(always)]
+fn exponentials(scores: &mut [f32], peak: f32, scale: f32) -> f32 {
+    const LANES: usize = 16;
     for value in scores.iter_mut() {
         *value = exp_negative((*value - peak) * scale);
     }
@@ -640,10 +647,7 @@ fn softmax_body(scores: &mut [f32], scale: f32) {
             totals[lane] += chunk[lane];
         }
     }
-    let inverse = 1.0 / (totals.iter().sum::<f32>() + rest);
-    for value in scores.iter_mut() {
-        *value *= inverse;
-    }
+    totals.iter().sum::<f32>() + rest
 }
 
 /// A patch's first row: its values through both temporal filters (a still image is two equal frames), plus the bias.
@@ -664,9 +668,15 @@ fn filter_patch_body(first: &[f32], second: &[f32], bias: &[f32], patch: &[f32],
 by_level!(filter_patch, filter_patch_wide, filter_patch_narrow, filter_patch_body,
           (first: &[f32], second: &[f32], bias: &[f32], patch: &[f32], target: &mut [f32]));
 
-/// Keys and values a thread goes through at once against [`QUERY_TILE`] queries: what its second-level cache holds.
-const KEY_TILE: usize = 1024;
+/// Keys and values a thread goes through at once against [`QUERY_TILE`] queries (a 1440x900 screen's attention took 8.5 s at 256 keys,
+/// 6.4 at 128, 5.7 at 64, 7.3 at 32).
+const KEY_TILE: usize = 64;
 const QUERY_TILE: usize = 32;
+
+/// The floats of a head's keys laid out by tile.
+fn keys_floats(count: usize) -> usize {
+    count.div_ceil(KEY_TILE) * HEAD * KEY_TILE
+}
 
 /// `target += factors[0] * columns[0] + ...`. Four columns to a store: what a core's two multiplies a cycle want.
 fn score4_plain(target: &mut [f32], columns: [&[f32]; 4], factors: [f32; 4]) {
@@ -770,40 +780,57 @@ unsafe fn gather4_narrow(target: &mut [f32; HEAD], rows: &[f32; 4 * HEAD], weigh
 }
 
 /// A tile of queries of one head: `out[q]` (a head's width each) from their query rows (`$queries`, `$query_stride` apart), the
-/// head's keys by column (`keys[d * count + j]`) and its values by row (`values[j * HEAD + d]`), through `$score` and `$gather`.
+/// head's keys by tile, each by column (`keys[t * HEAD * KEY_TILE + d * KEY_TILE + j]`, [`keys_floats`]), and its values by row
+/// (`values[j * HEAD + d]`), through `$score` and `$gather`. Everything of a tile lies together: spread by whole columns, the
+/// first-level translation buffer's entries went on 72 pages a tile, and a smaller tile took longer than a larger one.
 macro_rules! attend_body {
     ($score:expr, $gather:expr, $queries:ident, $query_stride:ident, $keys:ident, $values:ident, $count:ident, $scores:ident, $out:ident) => {{
-        let tiles = $queries.len().div_ceil($query_stride);
-        for first in (0..$count).step_by(KEY_TILE) {
-            let end = (first + KEY_TILE).min($count);
-            for query in 0..tiles {
-                let target = &mut $scores[query * $count + first..query * $count + end];
+        let queries_here = $queries.len().div_ceil($query_stride);
+        let (key_tiles, score_tile) = ($count.div_ceil(KEY_TILE), QUERY_TILE * KEY_TILE);
+        for tile in 0..key_tiles {
+            let length = KEY_TILE.min($count - tile * KEY_TILE);
+            let block = &$keys[tile * HEAD * KEY_TILE..(tile + 1) * HEAD * KEY_TILE];
+            for query in 0..queries_here {
+                let target = &mut $scores[tile * score_tile + query * KEY_TILE..][..length];
                 target.fill(0.0);
                 let vector = &$queries[query * $query_stride..query * $query_stride + HEAD];
                 for (group, factors) in vector.chunks_exact(4).enumerate() {
-                    let column = |at: usize| &$keys[(group * 4 + at) * $count + first..(group * 4 + at) * $count + end];
+                    let column = |at: usize| &block[(group * 4 + at) * KEY_TILE..][..length];
                     $score(&mut *target, [column(0), column(1), column(2), column(3)], [factors[0], factors[1], factors[2], factors[3]]);
                 }
             }
         }
+        // A query's softmax over its pieces, tile by tile.
         let scale = 1.0 / (HEAD as f32).sqrt();
-        for query in 0..tiles {
-            softmax_body(&mut $scores[query * $count..(query + 1) * $count], scale);
+        let mut peaks = [f32::MIN; QUERY_TILE];
+        let mut totals = [0f32; QUERY_TILE];
+        for tile in 0..key_tiles {
+            let length = KEY_TILE.min($count - tile * KEY_TILE);
+            for query in 0..queries_here {
+                peaks[query] = peak_of(&$scores[tile * score_tile + query * KEY_TILE..][..length], peaks[query]);
+            }
+        }
+        for tile in 0..key_tiles {
+            let length = KEY_TILE.min($count - tile * KEY_TILE);
+            for query in 0..queries_here {
+                totals[query] += exponentials(&mut $scores[tile * score_tile + query * KEY_TILE..][..length], peaks[query], scale);
+            }
         }
         $out.fill(0.0);
-        for first in (0..$count).step_by(KEY_TILE) {
-            let end = (first + KEY_TILE).min($count);
-            for query in 0..tiles {
-                let probabilities = &$scores[query * $count + first..query * $count + end];
+        for tile in 0..key_tiles {
+            let (first, length) = (tile * KEY_TILE, KEY_TILE.min($count - tile * KEY_TILE));
+            let rows = &$values[first * HEAD..(first + length) * HEAD];
+            let whole = length / 4 * 4;
+            for query in 0..queries_here {
+                let probabilities = &$scores[tile * score_tile + query * KEY_TILE..][..length];
+                let inverse = 1.0 / totals[query];
                 let target: &mut [f32; HEAD] = (&mut $out[query * HEAD..(query + 1) * HEAD]).try_into().unwrap();
-                let rows = &$values[first * HEAD..end * HEAD];
-                let whole = probabilities.len() / 4 * 4;
                 for (group, four) in probabilities.chunks_exact(4).zip(rows.chunks_exact(4 * HEAD)) {
-                    $gather(&mut *target, four.try_into().unwrap(), [group[0], group[1], group[2], group[3]]);
+                    $gather(&mut *target, four.try_into().unwrap(), [group[0] * inverse, group[1] * inverse, group[2] * inverse, group[3] * inverse]);
                 }
                 for (probability, row) in probabilities[whole..].iter().zip(rows[whole * HEAD..].chunks_exact(HEAD)) {
                     for (target, value) in target.iter_mut().zip(row) {
-                        *target += probability * value;
+                        *target += probability * inverse * value;
                     }
                 }
             }
@@ -946,7 +973,7 @@ impl<'a> Tower<'a> {
         self.embed(image, &order, &mut hidden);
         let mut norm = zeros(count * HIDDEN)?;
         let mut qkv = zeros(count * QKV)?;
-        let mut keys = zeros(count * HIDDEN)?;
+        let mut keys = zeros(HEADS * keys_floats(count))?;
         let mut values = zeros(count * HIDDEN)?;
         let mut attended = zeros(count * HIDDEN)?;
         let mut middle = zeros(count * FFN)?;
@@ -964,10 +991,13 @@ impl<'a> Tower<'a> {
                 rope(level, &mut row[..2 * HIDDEN], cosine, sine);
             });
             let qkv_view = &qkv;
-            keys.par_chunks_mut(HEAD * count).enumerate().for_each(|(head, target)| {
-                for (dimension, column) in target.chunks_exact_mut(count).enumerate() {
-                    for (token, value) in column.iter_mut().enumerate() {
-                        *value = qkv_view[token * QKV + HIDDEN + head * HEAD + dimension];
+            keys.par_chunks_mut(keys_floats(count)).enumerate().for_each(|(head, target)| {
+                for (tile, block) in target.chunks_exact_mut(HEAD * KEY_TILE).enumerate() {
+                    for (dimension, column) in block.chunks_exact_mut(KEY_TILE).enumerate() {
+                        let tokens = tile * KEY_TILE..((tile + 1) * KEY_TILE).min(count);
+                        for (value, token) in column.iter_mut().zip(tokens) {
+                            *value = qkv_view[token * QKV + HIDDEN + head * HEAD + dimension];
+                        }
                     }
                 }
             });
@@ -978,12 +1008,12 @@ impl<'a> Tower<'a> {
             });
             let (keys_view, values_view) = (&keys, &values);
             attended.par_chunks_mut(HIDDEN * QUERY_TILE).enumerate().for_each_init(
-                || (vec![0f32; QUERY_TILE * count], vec![0f32; QUERY_TILE * HEAD]),
+                || (vec![0f32; count.div_ceil(KEY_TILE) * QUERY_TILE * KEY_TILE], vec![0f32; QUERY_TILE * HEAD]),
                 |(scores, out), (tile, target)| {
                     let tokens = target.len() / HIDDEN;
                     for head in 0..HEADS {
                         let queries = &qkv_view[tile * QUERY_TILE * QKV + head * HEAD..(tile * QUERY_TILE + tokens - 1) * QKV + (head + 1) * HEAD];
-                        attend(level, queries, QKV, &keys_view[head * HEAD * count..(head + 1) * HEAD * count],
+                        attend(level, queries, QKV, &keys_view[head * keys_floats(count)..(head + 1) * keys_floats(count)],
                                &values_view[head * HEAD * count..(head + 1) * HEAD * count], count, scores, &mut out[..tokens * HEAD]);
                         for token in 0..tokens {
                             target[token * HIDDEN + head * HEAD..][..HEAD].copy_from_slice(&out[token * HEAD..(token + 1) * HEAD]);
@@ -1193,14 +1223,14 @@ mod tests {
         let query = noise(queries * QKV, 7);
         let keys_rows = noise(tokens * HEAD, 8);
         let values = noise(tokens * HEAD, 9);
-        let mut keys = vec![0f32; tokens * HEAD];
+        let mut keys = vec![0f32; keys_floats(tokens)];
         for token in 0..tokens {
             for dimension in 0..HEAD {
-                keys[dimension * tokens + token] = keys_rows[token * HEAD + dimension];
+                keys[token / KEY_TILE * HEAD * KEY_TILE + dimension * KEY_TILE + token % KEY_TILE] = keys_rows[token * HEAD + dimension];
             }
         }
         for level in levels() {
-            let mut scores = vec![0f32; queries * tokens];
+            let mut scores = vec![0f32; tokens.div_ceil(KEY_TILE) * QUERY_TILE * KEY_TILE];
             let mut out = vec![0f32; queries * HEAD];
             attend(level, &query[..(queries - 1) * QKV + HEAD], QKV, &keys, &values, tokens, &mut scores, &mut out);
             for q in 0..queries {
