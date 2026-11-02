@@ -43,7 +43,7 @@ void qsa_decode_attend(Device& d,void* const* pointers,void* kv,void* index,void
     qsa_gate<<<24,256,0,d.stream>>>(attended,qgate,6144);
 }
 
-// A verification's rows (up to four consecutive tokens, positions[0..steps), rope positions ropes[0..steps)): qsa_decode_attend's
+// A verification's rows (up to eight consecutive tokens, positions[0..steps), rope positions ropes[0..steps)): qsa_decode_attend's
 // kernels with a row to each block of a second grid dimension, every row's arithmetic the one
 // token's. Row r's projections are at projections + r * stride (qgate | key | value | index query |
 // index key), its attended values go to attended + r * 6144; the normalized queries, keys and the

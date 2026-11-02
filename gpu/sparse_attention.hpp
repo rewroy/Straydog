@@ -77,11 +77,12 @@ __global__ void qsa_normalize_decode(const float* qgate, const float* key, float
     else qsa_normalize_block(iq,iqnorm,block-26,128,128,pos,iq,128);
 }
 
-// The indexer's rolling history: its last eight inputs, a ring by position. A block pools the
+// The indexer's rolling history: its last sixteen inputs, a ring by position. A block pools the
 // inputs of its four positions; one completed after a rewind (a verification's rejected rows, a
-// draft's) still finds its earlier inputs there, which those rows, at most four positions on
-// from the last kept one, cannot have overwritten in a ring of two blocks.
-constexpr size_t qsa_history = 8;
+// draft's) still finds its earlier inputs there, which those rows, at most verify_max positions on
+// from the last kept one, cannot have overwritten in a ring of four blocks. (Two blocks would not do
+// at seven rows: a kept row's input three back lies one ring from the pass's last row.)
+constexpr size_t qsa_history = 16;
 
 __global__ void qsa_pool(const float* incoming, const float* history, const float* norm,
                          size_t pool, size_t base, float* blocks) {

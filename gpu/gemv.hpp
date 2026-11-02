@@ -753,6 +753,8 @@ constexpr size_t gemv_fixed_items = 24;
 // input + v*input_stride and writes output + v*output_stride. Each vector's sum is
 // formed exactly as in the one-vector kernel, so results are bitwise identical.
 constexpr int gemv_max_vectors = 4;
+// A verification's rows past four (gemv()): the rows' sums do not depend on what shares their launch.
+constexpr int gemv_wide_vectors = 8;
 // Optional epilogue of a 2560-row projection: instead of storing row r's result y,
 // add mix[2560 + s] * y to hidden[s * 2560 + r] for the four streams s -- the
 // decoder residual update, with vector v at hidden + v*hidden_stride, mix + v*mix_stride.
@@ -1463,15 +1465,19 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
     // A Q5_K row of one unit a lane (q_b: 16384 rows of 20 units) takes four rows to a wave (eight for three or four vectors) when that leaves every CU
     // four blocks or more
     constexpr size_t rows_per_wave = V >= 3 ? 8 : 4;
-    bool lone = !tail && list.items[0].matrix.kind == 13 && list.items[0].matrix.cols / 64 <= 32 && waves >= 8 * rows_per_wave * 4 * d.compute_units;
+    bool lone = V <= 4 && !tail && list.items[0].matrix.kind == 13 && list.items[0].matrix.cols / 64 <= 32 && waves >= 8 * rows_per_wave * 4 * d.compute_units;
     for (unsigned i = 0; i < list.count; ++i) lone &= list.items[i].lanes == 32;
-    if (lone) {
-        gemv_q8_rows_wave<V, rows_per_wave><<<unsigned((waves + 8 * rows_per_wave - 1) / (8 * rows_per_wave)), 256, lds, d.stream>>>(list, input, output);
-        check(hipGetLastError());
-        return true;
+    if constexpr (V <= 4) {
+        if (lone) {
+            gemv_q8_rows_wave<V, rows_per_wave><<<unsigned((waves + 8 * rows_per_wave - 1) / (8 * rows_per_wave)), 256, lds, d.stream>>>(list, input, output);
+            check(hipGetLastError());
+            return true;
+        }
     }
+    // (past four vectors, no tail)
     #define SD_Q8_LAUNCH(format) \
-        if (tail) gemv_q8_kind<format, V, true><<<blocks, 256, lds, d.stream>>>(list, input, output, *tail); \
+        if constexpr (V <= 4) { if (tail) gemv_q8_kind<format, V, true><<<blocks, 256, lds, d.stream>>>(list, input, output, *tail); \
+            else gemv_q8_kind<format, V, false><<<blocks, 256, lds, d.stream>>>(list, input, output, LinkTail{}); } \
         else gemv_q8_kind<format, V, false><<<blocks, 256, lds, d.stream>>>(list, input, output, LinkTail{});
     switch (list.items[0].matrix.kind) {
         case 13: SD_Q8_LAUNCH(13) break;
@@ -1618,6 +1624,22 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
     } else gemv_fixed<V><<<blocks, threads, 0, d.stream>>>(list, input, output);
     #undef SD_UNIFORM
 }
+// Five to eight vectors: the Q8 kernels, and the BF16 kernel a router's list takes; false (nothing launched) otherwise.
+template<int V>
+bool gemv_launch_wide(Device& d, const FixedGemv& list, bool uniform, const float* input, float* output) {
+#if defined(__HIPCC__)
+    if (d.q8_wide && ((uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) || gemv_q8_mixed_launch<V>(d, list, input, output))) return true;
+    if (d.rdna4 && uniform && list.items[0].matrix.kind == 30) {
+        const GemvItem& last = list.items[list.count - 1];
+        const unsigned blocks = unsigned((last.first_wave + gemv_waves(last.matrix, last.lanes) + 7) / 8);
+        gemv_fixed_kind<30, V><<<blocks, 256, 0, d.stream>>>(list, input, output);
+        check(hipGetLastError());
+        return true;
+    }
+#endif
+    (void)d; (void)list; (void)uniform; (void)input; (void)output;
+    return false;
+}
 // One vector through one matrix into `output`, this device's part of `tail`'s linked sum, in one
 // launch: gemv()'s rows, lanes and dots (min_lanes as given it) on the kernel it would take,
 // gemv_fixed_kind; false (nothing launched) where it would take another.
@@ -1642,13 +1664,13 @@ bool gemv_linked_launch(Device& d, const Matrix& matrix, const float* input, flo
     #undef SD_LINKED
     return false;
 }
-// Launch up to 24 independent row ranges in one dispatch, for up to four vectors. min_lanes (a
+// Launch up to 24 independent row ranges in one dispatch, for up to eight vectors (past four, gemv_launch_wide). min_lanes (a
 // power of two) widens a row that gemv_lanes splits over only two lanes, when it has at least 32
 // units: two lanes read short runs of many rows at once.
 void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, float* output,
           size_t vectors=1, size_t input_stride=0, size_t output_stride=0, const GemvResidual& residual={},
           unsigned min_lanes=0) {
-    if (!count || count > gemv_fixed_items || !vectors || vectors > gemv_max_vectors ||
+    if (!count || count > gemv_fixed_items || !vectors || vectors > size_t(gemv_wide_vectors) ||
         (vectors > 1 && (input_stride % 4 || !input_stride || (!output_stride && !residual.hidden) ||
                          input_stride > UINT32_MAX || output_stride > UINT32_MAX)) ||
         (residual.hidden && (count != 1 || matrices[0].rows != 2560 || !residual.mix)))
@@ -1699,7 +1721,23 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
         case 1: gemv_launch<1>(d, list, blocks, uniform, input, output); break;
         case 2: gemv_launch<2>(d, list, blocks, uniform, input, output); break;
         case 3: gemv_launch<3>(d, list, blocks, uniform, input, output); break;
-        default: gemv_launch<4>(d, list, blocks, uniform, input, output); break;
+        case 4: gemv_launch<4>(d, list, blocks, uniform, input, output); break;
+        default: {
+            // Past four vectors, the kernels that share their weights' reads for them; other lists in two launches.
+            const bool joined = (vectors == 5 ? gemv_launch_wide<5>(d, list, uniform, input, output) :
+                                                       vectors == 6 ? gemv_launch_wide<6>(d, list, uniform, input, output) :
+                                                       vectors == 7 ? gemv_launch_wide<7>(d, list, uniform, input, output) :
+                                                                      gemv_launch_wide<8>(d, list, uniform, input, output));
+            if (joined) break;
+            const size_t first = size_t(gemv_max_vectors);
+            gemv(d, matrices, count, input, output, first, input_stride, output_stride, residual, min_lanes);
+            GemvResidual rest = residual;
+            if (rest.hidden) { rest.hidden += first * rest.hidden_stride; rest.mix += first * rest.mix_stride; }
+            if (rest.gate) rest.gate += first;
+            gemv(d, matrices, count, input + first * input_stride, output ? output + first * output_stride : nullptr, vectors - first, input_stride,
+                 output_stride, rest, min_lanes);
+            return;
+        }
     }
     check(hipGetLastError());
 }

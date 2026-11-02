@@ -121,7 +121,10 @@ impl Policy {
         let wanted = match matched {
             0..=3 => 1,
             4..=7 => 2,
-            _ => 3,
+            8..=15 => 3,
+            // (a reply repeating its source, two R9700s, 20K, sampled: 210 tok/s at three from a match of eight, 234 at seven from
+            // eight, 247 from sixteen, 224 from 32; a reply of its own unchanged)
+            _ => 7,
         };
         wanted.min(self.rows - 1)
     }
@@ -194,6 +197,15 @@ mod tests {
     }
 
     #[test]
+    fn a_long_match_takes_the_rows_there_are() {
+        let mut policy = Policy::new(8);
+        assert_eq!([3, 7, 8, 15, 16, 32].map(|matched| policy.width(matched)), [1, 2, 3, 3, 7, 7]);
+        // (DeepSeek's four rows)
+        let mut policy = Policy::new(4);
+        assert_eq!(policy.width(32), 3);
+    }
+
+#[test]
     fn the_policy_widens_with_the_match_and_rests_after_rejections() {
         let mut policy = Policy::new(4);
         assert_eq!((policy.width(2), policy.width(3), policy.width(5), policy.width(12)), (0, 1, 2, 3));

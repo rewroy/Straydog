@@ -237,7 +237,8 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     const bool beside=kind && !down && with_shared;
     // (Layers in parts, qwen_parts.hpp, run it first on the device's stream: on the side stream, every pass of three or
     // four rows took 7.5 ms more at 20K.)
-    const bool aside=beside && d.qwen_parts==1;
+    // (Past four rows, not on it either: such a pass left every pass after it ~4.3 ms longer, whatever its rows.)
+    const bool aside=beside && d.qwen_parts==1 && tokens<=4;
     if (beside && !aside) {
         Matrix pair[2]={weights[shared],weights[shared+1]};
         pair[1].output_offset=640;
@@ -531,7 +532,7 @@ __global__ void moe_combine_residual(const float* outputs,const float* probabili
     const float combined=sum+probabilities[token*11+10]*outputs[(token*11+10)*2560+col];
     hidden[token*10240+index]+=mixed[token*stride+2560+index/2560]*combined;
 }
-// Up to four decode tokens (HyperConnection rows input_stride apart: 2560 inputs
+// Up to eight decode tokens (HyperConnection rows input_stride apart: 2560 inputs
 // then the four stream mixes) with the one-token arithmetic: every kernel takes
 // all tokens, the expert GEMVs per token, and the result is added to hidden rows.
 // Decode-token workspace: routes then per-route outputs, probabilities and the top ten.
@@ -540,7 +541,7 @@ struct TokenMoe {
 };
 TokenMoe token_moe(Device& d,void* handle,size_t tokens) {
     auto found=d.resident.find(handle);
-    if (found==d.resident.end() || !tokens || tokens>4 || tokens>found->second->capacity || found->second->hybrid)
+    if (found==d.resident.end() || !tokens || tokens>size_t(gemv_wide_vectors) || tokens>found->second->capacity || found->second->hybrid)
         throw std::runtime_error("invalid resident MoE token batch");
     ResidentMoe& plan=*found->second;
     const size_t routes=tokens*11;
@@ -557,8 +558,8 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     float* gate_up=plan.workspace; float* product=gate_up+routes*1280;
     // Layers in parts (qwen_parts.hpp): the shared expert's half, gate and up, runs in the router's launch (the same row read;
     // one launch a layer less), the scores after the decode workspace with the gate and up rows' stride.
-    constexpr size_t scores=4*11*4480+512;
-    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && plan.capacity*49302+65536>=scores+4*11*1280;
+    const size_t room=tokens<=4 ? 4 : size_t(gemv_wide_vectors), scores=room*11*4480+512;
+    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && plan.capacity*49302+65536>=scores+room*11*1280;
     if (together) {
         Matrix list[4]={projections[0],projections[1],plan.weights[experts*3],plan.weights[experts*3+1]};
         list[0].output_offset=scores; list[1].output_offset=scores+experts;
@@ -642,7 +643,7 @@ __global__ void moe_combine_parts(const float* outputs,const float* probabilitie
     if (hidden) hidden[token*10240+i]+=mixed[token*stride+2560+i/2560]*combined;
     else result[token*2560+col]=combined;
 }
-// The owner's MoE for up to four decode tokens: its peer evaluates the other experts
+// The owner's MoE for up to eight decode tokens: its peer evaluates the other experts
 // (helper_moe_tokens, in the peer's graph) at the same time.
 void resident_moe_tokens_parts(Device& d,void* handle,size_t tokens,const float* input,size_t input_stride,float* hidden) {
     const TokenMoe moe=token_moe(d,handle,tokens);
