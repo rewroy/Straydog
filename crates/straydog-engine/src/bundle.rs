@@ -380,6 +380,37 @@ pub fn drafter_source() -> Result<DrafterSource, String> {
     })
 }
 
+/// Qwen3.8-Flash-Next's vision encoder and projector, one file for every quantization: the GGUF repository's own, pinned by
+/// size and SHA-256 (its LFS oid). Optional: a model without the file reads no images.
+pub fn qwen_vision_source() -> Result<Source, String> {
+    let manifest: Value = serde_json::from_str(MANIFEST).map_err(|exc| exc.to_string())?;
+    let vision = &manifest["vision"];
+    if manifest["schema"] != 1 || manifest["model"] != MODEL || vision["kind"] != "mmproj" {
+        return Err("Straydog vision encoder is not pinned in the model manifest".into());
+    }
+    let text = |value: &Value| value.as_str().map(str::to_string).ok_or("manifest vision encoder incomplete");
+    Ok(Source { asset: asset(vision)?, repository: text(&vision["repository"])?, revision: text(&vision["revision"])?, path: text(&vision["source_path"])? })
+}
+
+/// Where a Qwen3.8 model in `root` keeps its projector, when nothing names it: the pinned file, else another
+/// `mmproj-*.gguf` (found to be the wrong one when it is opened, with a reason a request is told), in `root` or beside it.
+pub fn qwen_vision_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let pinned = qwen_vision_source().ok().map(|source| source.asset.name);
+    for directory in [Some(root), root.parent()].into_iter().flatten() {
+        if let Some(found) = pinned.as_ref().map(|name| directory.join(name)).filter(|path| path.is_file()) {
+            return Some(found);
+        }
+        let mut others: Vec<_> = std::fs::read_dir(directory).into_iter().flatten().flatten().map(|entry| entry.path())
+            .filter(|path| path.is_file() && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("mmproj-") && name.ends_with(".gguf")))
+            .collect();
+        others.sort();
+        if let Some(found) = others.into_iter().next() {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Bundles read on demand (docs/DESIGN.md §10): too large to hash whole at each start, each shard
 /// is pinned by size, SHA-256 and the fs-verity digest of its Merkle tree (`crate::verity`). The
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the

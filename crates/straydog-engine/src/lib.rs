@@ -19,6 +19,7 @@ pub mod moe;
 pub mod ops;
 pub mod pinned;
 pub mod pyjson;
+pub mod qwen_vision;
 pub mod reply;
 pub mod rows;
 pub mod sampling;

@@ -154,14 +154,24 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             float* chunk_q = qgate + first * 2 * Q;
             float* chunk_iq = iq + first * 512;
             float* chunk_ik = ik + first * 128;
-            qsa_normalize<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
+            // (a batch of a sequence with images has its rope positions from the table: sd_rope_rows)
+            const uint32_t* axes = d.rope_count ? d.rope_rows + (position - d.rope_first) * 3 : nullptr;
+            if (axes) qsa_normalize_axes<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
+                512, axes, d.input);
+            else qsa_normalize<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
                 512, position, d.input);
-            qsa_normalize<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
+            if (axes) qsa_normalize_axes<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
+                256, 256, axes, d.input + count * Q);
+            else qsa_normalize<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
                 256, 256, position, d.input + count * Q);
             check(hipMemcpyAsync(d.input + count * (Q + K), value + first * K, count * K * 4, hipMemcpyDeviceToDevice, d.stream));
-            qsa_normalize<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, position, chunk_iq);
+            if (axes) qsa_normalize_axes<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, axes, chunk_iq);
+            else qsa_normalize<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, position, chunk_iq);
             const size_t completed = (position + count) / 4 - position / 4;
-            if (completed)
+            if (completed && axes)
+                qsa_pool_axes<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position,
+                    d.rope_rows, d.rope_first, blocks);
+            else if (completed)
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
             qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);

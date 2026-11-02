@@ -1206,6 +1206,19 @@ impl Backend {
         .map(drop)
     }
 
+    /// A sequence with images: what a decode or verification row's position less its rope position is (0 otherwise).
+    pub fn rope_delta(&mut self, delta: u32) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_rope_delta(self.handle, delta) }).map(drop)
+    }
+
+    /// A sequence with images: the rope positions (t, h, w each) of the next prefill spans from position `first`;
+    /// none: their rows' own positions.
+    pub fn rope_rows(&mut self, first: u64, axes: &[u32]) -> Result<()> {
+        // SAFETY: a live handle, and axes.len() / 3 rows of three, copied before the call returns.
+        check(unsafe { ffi::sd_rope_rows(self.handle, first, axes.len() as u64 / 3, axes.as_ptr()) }).map(drop)
+    }
+
     /// While on, prefill spans that return no rows end without waiting for the device.
     pub fn prefill_defer(&mut self, on: bool) -> Result<()> {
         // SAFETY: a live handle.

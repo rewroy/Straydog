@@ -104,6 +104,9 @@ pub struct Options {
     /// Qwen3.8-Flash-Next's MTP drafter: its directory or its GGUF file (also -md). DeepSeek-V4.1's DSpark drafter takes no option: it drafts when its files sit beside the bundle (`straydog setup` puts them there; DS41_DSPARK=0 leaves it out)
     #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "PATH")]
     pub model_draft: Option<PathBuf>,
+    /// Qwen3.8-Flash-Next's vision encoder and projector, mmproj-Qwen3.8-Flash-Next-BF16.gguf: it reads images with it [default: a mmproj-*.gguf in the model's directory or the one above it]. DeepSeek-V4.1 keeps its own beside its shards
+    #[arg(long = "mmproj", env = "STRAYDOG_MODEL_VISION", value_name = "FILE")]
+    pub model_vision: Option<PathBuf>,
     /// MTP drafts per pass, 0 turns MTP speculation off [default: 3 with a drafter]
     #[arg(long, env = "STRAYDOG_DRAFT_MAX", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub draft_max: Option<u8>,
@@ -197,6 +200,8 @@ pub struct Settings {
     pub model: PathBuf,
     pub quant: String,
     pub model_draft: Option<PathBuf>,
+    /// Qwen3.8's projector, given or found: the worker checks it, and images are refused with the reason if it is not the pinned file.
+    pub model_vision: Option<PathBuf>,
     pub draft_max: u8,
     pub ctx_size: u32,
     /// None: chosen by the worker from the GPUs' budgets (`--vram auto`).
@@ -336,7 +341,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
             options
         }};
     }
-    let options = merge!(model, quant, model_draft, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
+    let options = merge!(model, quant, model_draft, model_vision, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose,
                          data_dir, expert_ram);
@@ -428,6 +433,14 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         None => None,
     };
     let draft_max = options.draft_max.unwrap_or(if model_draft.is_some() { 3 } else { 0 });
+    if on_demand && options.model_vision.is_some() {
+        return Err(format!("the {quant} bundle keeps its own vision encoder beside its shards: it takes no --mmproj"));
+    }
+    let model_vision = match options.model_vision {
+        Some(path) => Some(path.canonicalize().map_err(|exc| format!("vision encoder {}: {exc}", path.display()))?),
+        None if on_demand => None,
+        None => bundle::qwen_vision_in(&model),
+    };
     let gpu = options.gpu.unwrap_or_else(|| vec![0]);
     let mut distinct = gpu.clone();
     distinct.sort_unstable();
@@ -514,6 +527,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         model,
         quant,
         model_draft,
+        model_vision,
         draft_max,
         ctx_size,
         batch_size,
@@ -554,6 +568,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("model", settings.model.display().to_string()),
         ("quant", settings.quant.clone()),
         ("model_draft", path(&settings.model_draft)),
+        ("model_vision", path(&settings.model_vision)),
         ("draft_max", settings.draft_max.to_string()),
         ("ctx_size", settings.ctx_size.to_string()),
         ("batch_size", settings.batch_size.map_or_else(|| "(from the GPUs' budgets)".into(), |batch| batch.to_string())),

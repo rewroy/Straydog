@@ -20,7 +20,9 @@ use serde_json::{json, Map, Value};
 use crate::constraint::{self, Constraint};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
+use crate::qwen_vision::{self, ImageSpan, IMAGE_PAD};
 use crate::sampling::{self, Generated, Sampling};
+use crate::vision::IMAGE_TOKEN;
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
 
 pub const MAX_DRAFTS: usize = 3;
@@ -85,6 +87,10 @@ fn attention_layers(drafting: bool) -> u64 {
 /// The end of a K/V growth's error when page-locking found no memory (`sd_kv_grow`): every state
 /// is sound, and a shorter sequence can still run.
 pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this sequence";
+
+/// The end of the error of a prompt whose image rows would run in a pass of one row, which no pass of its kind takes: a prompt
+/// the chat template cannot render (its images are followed by text enough). Nothing has run.
+pub const IMAGE_ROWS: &str = "an image in a pass of one row";
 
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 const SCARCE_ROW_CACHE: u64 = 1 << 30;
@@ -388,6 +394,12 @@ pub struct Model {
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
     ple_counts: (u64, u64, u64),
     ple_wait: f64,
+    /// The request's images, by their first positions: their rows and what they do to the rope positions.
+    images: Vec<ImageSpan>,
+    /// What the devices hold for a sequence with images: the delta of its decode and verification rows (`sd_rope_delta`) and
+    /// whether a table of rope positions is up (`sd_rope_rows`). A sequence without any costs a test of these two.
+    rope_delta: u32,
+    rope_table: bool,
 }
 
 impl Model {
@@ -493,6 +505,9 @@ impl Model {
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
+            images: Vec::new(),
+            rope_delta: 0,
+            rope_table: false,
         };
         // Placement allocates every weight before any is read; reading then fills them.
         model.group.defer_uploads();
@@ -1302,10 +1317,12 @@ impl Model {
 
     // ---- forward ----
 
-    /// The PLE table rows of `tokens`, which follow `before` (its last two tokens count).
+    /// The PLE table rows of `tokens`, which follow `before` (its last two tokens count). An image's positions hash as
+    /// `<|image_pad|>`, as the reference's PLE reads the ids before their rows are put in.
     fn ple_indices(&self, before: &[u32], tokens: &[u32]) -> Result<Vec<i64>> {
-        let history: Vec<i64> = before[before.len().saturating_sub(2)..].iter().map(|t| *t as i64).collect();
-        let tokens: Vec<i64> = tokens.iter().map(|token| *token as i64).collect();
+        let id = |token: &u32| if *token >= IMAGE_TOKEN { i64::from(IMAGE_PAD) } else { i64::from(*token) };
+        let history: Vec<i64> = before[before.len().saturating_sub(2)..].iter().map(id).collect();
+        let tokens: Vec<i64> = tokens.iter().map(id).collect();
         ngram_rows(&history, &tokens, &self.weights.integer_arrays)
     }
 
@@ -1338,6 +1355,62 @@ impl Model {
     fn token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let ids: Vec<i64> = tokens.iter().map(|token| *token as i64).collect();
         self.weights.rows("token_embd.weight", &ids)
+    }
+
+    /// The rows the first layer reads for `tokens` from `position`: the token table's, an image's own where its span is.
+    fn rows_at(&self, position: usize, tokens: &[u32]) -> Result<Vec<f32>> {
+        if !tokens.iter().any(|token| *token >= IMAGE_TOKEN) {
+            return self.token_embeddings(tokens);
+        }
+        let ids: Vec<u32> = tokens.iter().map(|token| if *token >= IMAGE_TOKEN { IMAGE_PAD } else { *token }).collect();
+        let mut rows = self.token_embeddings(&ids)?;
+        for span in &self.images {
+            let (from, to) = (span.start.max(position), (span.start + span.grid.0 * span.grid.1).min(position + tokens.len()));
+            if from < to {
+                let source = span.rows.get((from - span.start) * HIDDEN..(to - span.start) * HIDDEN).ok_or("Straydog image rows are short")?;
+                rows[(from - position) * HIDDEN..(to - position) * HIDDEN].copy_from_slice(source);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The next request's images (none for a prompt without any).
+    pub fn set_images(&mut self, images: Vec<ImageSpan>) {
+        self.images = images;
+    }
+
+    /// The devices' rope positions for a pass over `tokens` from `start`: as the sequence's images say, or, as ever, the rows' own.
+    /// Whether the rows or the block the first of them is in touch an image: only a batch's table has their positions then.
+    fn set_rope(&mut self, start: usize, tokens: usize) -> Result<bool> {
+        let end = start + tokens;
+        if self.images.first().is_none_or(|first| first.start >= end) {
+            if self.rope_delta != 0 {
+                self.rope_delta = 0;
+                self.group.rope_delta(0)?;
+            }
+            if std::mem::take(&mut self.rope_table) {
+                self.group.rope_rows(0, &[])?;
+            }
+            return Ok(false);
+        }
+        // (from here on the drafter is off: it reads no images, and its layer has none of this sequence's rows)
+        self.speculative = 0;
+        let block = start / 4 * 4;
+        let touched = self.images.iter().any(|span| span.start < end && span.start + span.grid.0 * span.grid.1 > block);
+        if touched && tokens < 2 {
+            return Err(IMAGE_ROWS.into());
+        }
+        let delta = qwen_vision::rope_delta(&self.images, start);
+        if delta != self.rope_delta {
+            self.rope_delta = delta;
+            self.group.rope_delta(delta)?;
+        }
+        if tokens > 1 {
+            let axes: Vec<u32> = (block..end).flat_map(|position| qwen_vision::rope_of(&self.images, position)).collect();
+            self.group.rope_rows(block as u64, &axes)?;
+            self.rope_table = true;
+        }
+        Ok(touched)
     }
 
     fn with_operands<T>(&mut self, build: impl FnOnce(&Model) -> Result<Vec<Operand<'_>>>,
@@ -1416,7 +1489,9 @@ impl Model {
 
     /// Advance the model over `tokens`; the logits after the last one when asked (None on cancellation).
     fn forward(&mut self, tokens: &[u32], logits: bool, cancelled: &dyn Fn() -> bool) -> Result<Option<Option<Vec<f32>>>> {
-        if self.history.len() + tokens.len() > self.context || tokens.iter().any(|token| *token as usize >= VOCABULARY) {
+        if self.history.len() + tokens.len() > self.context
+            || tokens.iter().any(|token| *token as usize >= VOCABULARY && (*token < IMAGE_TOKEN || self.images.is_empty()))
+        {
             return Err("Straydog token or context is out of range".into());
         }
         // Every write below lies in these positions: the layers' rows of the tokens, and the MTP
@@ -1424,16 +1499,17 @@ impl Model {
         // prefill, a resident or pipelined one with the MTP rows on the host, stashed or kept, a
         // decode step), all from here.
         let start = self.history.len();
+        let touches_image = self.set_rope(start, tokens.len())?;
         self.ensure_kv(start + tokens.len())?;
         self.protect(start.saturating_sub(usize::from(self.speculative > 0)), start + tokens.len())?;
         self.prefetch_ple(&self.history, tokens)?;
-        let embeddings = self.token_embeddings(tokens)?;
+        let embeddings = self.rows_at(start, tokens)?;
         let previous = self.final_hidden.clone();
         let position = self.history.len() as u64;
         // Inside a pipelined prompt the last batch's rows stayed on the GPUs: a batch on the
         // verified or the one-token path pairs its first token with that batch's last row, read
         // back from where the MTP layer's device kept it (the next batch pairs from this one's).
-        let verified = tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL;
+        let verified = tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL && !touches_image;
         let previous = match previous {
             None if verified || tokens.len() == 1 => {
                 let kept = self.kept_hidden()?;
@@ -1725,7 +1801,7 @@ impl Model {
     fn draft_note(&mut self, tokens: &[u32]) {
         if self.draft_vocabulary {
             for &token in tokens {
-                if u64::from(token) >= DRAFT_ROWS && self.draft_extras.insert(token) {
+                if u64::from(token) >= DRAFT_ROWS && (token as usize) < VOCABULARY && self.draft_extras.insert(token) {
                     self.draft_pending.push(token);
                 }
             }
@@ -1837,6 +1913,10 @@ impl Model {
                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         // A long prompt's batches take the slots' VRAM until its end, however it ends.
         let mut batch = self.prefill_batch_size;
+        // (a pass over an image's rows is one of at least two)
+        if !self.images.is_empty() {
+            batch = batch.max(2);
+        }
         let long = self.partial && tokens.len() - position >= LONG_PREFILL;
         if long {
             self.ensure_kv(tokens.len())?;
@@ -1860,7 +1940,11 @@ impl Model {
                 if cancelled() {
                     return Ok(None);
                 }
-                let end = (position + batch).min(stop);
+                let mut end = (position + batch).min(stop);
+                // (none is left to a batch of one row, which may be an image's or end a block begun in one)
+                if !self.images.is_empty() && stop - end == 1 && end - position > 2 {
+                    end -= 1;
+                }
                 // The next batch's PLE rows arrive while this one runs.
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
@@ -1889,7 +1973,7 @@ impl Model {
     /// layers while the second finishes batch n on its own, nothing waiting on the host between
     /// (with experts split, each also helps the other's batch on its helper stream).
     fn pipelined_prefill(&self, tokens: usize) -> Result<bool> {
-        Ok(self.resident && (self.speculative == 0 || self.group.keeps_mtp_rows()) && self.group.backends.len() == 2
+        Ok(self.images.is_empty() && self.resident && (self.speculative == 0 || self.group.keeps_mtp_rows()) && self.group.backends.len() == 2
            && tokens > self.prefill_batch_size)
     }
 
@@ -2189,7 +2273,10 @@ impl Model {
             self.pass_counts = [0; 2];
             self.memory_before = crate::host::memory_note();
         }
+        // (a prompt with images turns the drafter off where it reaches the first: Model::set_rope)
+        let drafts = self.speculative;
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
+        self.speculative = drafts;
         self.report_profile();
         result
     }

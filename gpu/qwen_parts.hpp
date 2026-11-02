@@ -291,8 +291,8 @@ void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const Verify
         size_t offset = 0;
         for (size_t i = 0; i < 5; ++i) { m[i].output_offset = offset; offset += m[i].rows; }
         gemv(d, m, 5, v.mixed, v.qsa, steps, 2564, verify_qsa);
-        qsa_decode_attend_rows<2>(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context, v.positions, v.qsa,
-                                  verify_qsa, v.attended, steps);
+        qsa_decode_attend_rows<2>(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context, v.positions,
+                                  v.positions + verify_ropes, v.qsa, verify_qsa, v.attended, steps);
         gemv(d, &m[5], 1, v.attended, v.branch, steps, H::query * 256, 2560);
     }
     qwen_sum_rows(d, v.branch, steps, v.hidden, v.mixed, 2564);

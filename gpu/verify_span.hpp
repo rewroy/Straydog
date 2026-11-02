@@ -8,6 +8,8 @@
 // before any later token can select them.
 constexpr size_t verify_max = 4, verify_projection = 16480, verify_qsa = 13952;
 constexpr size_t verify_snapshot = 4 * 10240 + 48 * 128 * 128;
+// The rows' positions, then at this distance their rope positions (the same numbers but past an image: Device::rope_delta).
+constexpr size_t verify_ropes = verify_max;
 
 struct VerifyLayout {
     float* hidden; float* mixed; float* branch; uint32_t* positions;
@@ -84,10 +86,10 @@ void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const Verif
         gemv(d, m, 5, v.mixed, v.qsa, steps, 2564, verify_qsa);
         if (steps == 1)
             qsa_decode_attend(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context,
-                              v.positions, v.qsa, v.attended);
+                              v.positions, v.positions + verify_ropes, v.qsa, v.attended);
         else   // (the rows side by side: each row the one token's arithmetic)
             qsa_decode_attend_rows(d, pointers + 4, plan.states[0], plan.states[1], plan.states[2], plan.context,
-                                   v.positions, v.qsa, verify_qsa, v.attended, steps);
+                                   v.positions, v.positions + verify_ropes, v.qsa, verify_qsa, v.attended, steps);
         gemv(d, &m[5], 1, v.attended, nullptr, steps, 6144, 0, residual);
     }
     hc_operands(pointers + 4 + attention, kinds + 4 + attention, hc);
@@ -121,9 +123,12 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     const VerifyLayout v = verify_layout(workspace);
     if (input) upload(d, v.hidden, input, steps * 10240 * 4);
     else if (source != v.hidden) check(hipMemcpyAsync(v.hidden, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
-    uint32_t positions[verify_max];
-    for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
-    upload(d, v.positions, positions, steps * 4);
+    uint32_t positions[verify_max + verify_ropes]{};
+    for (size_t b = 0; b < steps; ++b) {
+        positions[b] = uint32_t(position + b);
+        positions[verify_ropes + b] = positions[b] - d.rope_delta;
+    }
+    upload(d, v.positions, positions, sizeof(positions));
     if (begin < 48 && position != d.hybrid_position) { d.hybrid_position = position; d.hybrid_tokens += steps; }
     hybrid_settle(d, false);
     const bool ahead = hybrid_ahead(d, begin, end);
@@ -222,9 +227,12 @@ float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, s
     const VerifyLayout v = verify_layout(workspace);
     if (input) upload(d, v.hidden, input, steps * 10240 * 4);
     else if (source && source != v.hidden) check(hipMemcpyAsync(v.hidden, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
-    uint32_t positions[verify_max];
-    for (size_t b = 0; b < steps; ++b) positions[b] = uint32_t(position + b);
-    upload(d, v.positions, positions, steps * 4);
+    uint32_t positions[verify_max + verify_ropes]{};
+    for (size_t b = 0; b < steps; ++b) {
+        positions[b] = uint32_t(position + b);
+        positions[verify_ropes + b] = positions[b] - d.rope_delta;
+    }
+    upload(d, v.positions, positions, sizeof(positions));
     auto submit = [&]() {
         for (size_t layer = begin; layer < end; ++layer) {
             DecoderLayer& plan = d.decoder.find(layer)->second;

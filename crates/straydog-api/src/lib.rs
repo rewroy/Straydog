@@ -299,7 +299,7 @@ async fn health(State(api): State<Arc<Api>>) -> Response {
 async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     api.authorize(&headers)?;
     let config = &api.config;
-    let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false});
+    let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision()});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -332,7 +332,17 @@ async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body:
     api.authorize(&headers)?;
     api.ready()?;
     let payload = read_payload(&headers, body).await?;
-    let (request, shape) = request::translate(&payload, &api.config, api.vision())?;
+    let (request, shape) = request::translate(&payload, &api.config, api.vision()).map_err(|mut error| {
+        // (what the worker found wrong with the model's vision encoder file, for the one who sent the image)
+        if error.message == request::NO_IMAGES {
+            if let EngineState::Ready { placement, .. } = api.engine.state() {
+                if let Some(reason) = placement["vision_refusal"].as_str() {
+                    error.message = format!("{}: {reason}", request::NO_IMAGES);
+                }
+            }
+        }
+        error
+    })?;
     let generation = api.engine.generate(request).await?;
     answer::respond(generation, shape, &api.config.model_id).await
 }

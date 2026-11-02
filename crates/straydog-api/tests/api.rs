@@ -754,7 +754,7 @@ async fn health_and_models_follow_the_engine() {
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
-        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false}}]}));
+        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false}}]}));
     for path in ["/props", "/slots"] {
         assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
     }
@@ -763,7 +763,7 @@ async fn health_and_models_follow_the_engine() {
                                         placement: json!({"resident": true, "host_kv": false}) });
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
-    assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true,
+    assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false,
                                                  "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,

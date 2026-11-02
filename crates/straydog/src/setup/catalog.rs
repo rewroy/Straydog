@@ -29,7 +29,7 @@ pub const ORDER: [&str; 7] =
 pub enum Extra {
     /// DeepSeek-V4.1's DSpark drafter.
     Dspark,
-    /// DeepSeek-V4.1's vision encoder, built from the official checkpoint's tensors.
+    /// The vision encoder: DeepSeek-V4.1's built from the official checkpoint's tensors, Qwen3.8's the GGUF repository's projector.
     Vision,
     /// Qwen3.8's MTP drafter, built from the official checkpoint's tensors.
     Mtp,
@@ -122,6 +122,9 @@ impl Entry {
             let tensors = source.tensors.iter().map(|tensor| tensor.bytes).sum();
             sidecars.push(Sidecar { kind: Extra::Mtp, label: "MTP drafter", purpose: "faster replies", file: source.asset.name,
                                     download: tensors, kept: source.asset.bytes, tree: 0, scratch: tensors });
+            let vision = bundle::qwen_vision_source()?.asset;
+            sidecars.push(Sidecar { kind: Extra::Vision, label: "vision encoder", purpose: "image input", file: vision.name,
+                                    download: vision.bytes, kept: vision.bytes, tree: 0, scratch: 0 });
         }
         Ok(Entry {
             model: bundle::model_of(quant)?,
@@ -193,7 +196,8 @@ impl Entry {
         for sidecar in self.chosen(chosen) {
             let places = match sidecar.kind {
                 Extra::Dspark => bundle::dspark_directories(&place.bundle),
-                Extra::Vision => vec![place.bundle.clone()],
+                // (Qwen3.8's serves every quantization, from the folder above theirs)
+                Extra::Vision => [Some(place.bundle.clone()), place.bundle.parent().map(Path::to_path_buf)].into_iter().flatten().collect(),
                 Extra::Mtp => vec![place.drafter.clone()],
             };
             present += places.iter().map(|directory| on_disk(&directory.join(&sidecar.file), sidecar.kept)).max().unwrap_or(0);
@@ -459,8 +463,9 @@ pub(crate) mod tests {
         let with_dspark = xxs.disk_bytes(&[Extra::Dspark]);
         assert_eq!(with_dspark, xxs.disk_bytes(&[]) + dspark.kept + dspark.tree);
         assert_eq!(xxs.disk_bytes(&[Extra::Vision]), xxs.disk_bytes(&[]) + vision.kept + vision.tree + vision.scratch);
-        // Qwen3.8 has the MTP drafter and no DSpark or vision
-        assert_eq!(entry("Q2_0").default_extras(), [Extra::Mtp]);
+        // Qwen3.8 has the MTP drafter and the vision encoder, and no DSpark
+        assert_eq!(entry("Q2_0").default_extras(), [Extra::Mtp, Extra::Vision]);
+        assert_eq!((entry("Q2_0").sidecar(Extra::Vision).unwrap().download, entry("Q2_0").sidecar(Extra::Vision).unwrap().tree), (907_543_008, 0));
         assert_eq!(entry("UD-IQ2_XXS").default_extras(), [Extra::Vision]);
         // every bundle: its tokenizer files come with it and are small
         for quant in ORDER {

@@ -458,6 +458,12 @@ int sd_parts_settle(void* first, void* second);
 /* Move the prompt rows a span left in `from`'s decoder workspace (of layer from_layer) into
    `to`'s (of layer to_layer), device to device, for the next span to continue from. */
 int sd_prefill_handoff(void* from, void* to, uint64_t from_layer, uint64_t to_layer, uint64_t steps);
+/* A sequence with images: what the K/V index less its rope position (mRoPE) is for the next decode and verification rows,
+   all text past the images. 0 when the sequence holds none. */
+int sd_rope_delta(void* handle, uint32_t delta);
+/* The rope positions of a sequence with images for the next prefill spans: three (t, h, w) a position from `first`, `count`
+   positions, covering each span's rows and the block its first row is in. count 0: the rows' own positions again. */
+int sd_rope_rows(void* handle, uint64_t first, uint64_t count, const uint32_t* axes);
 int sd_prefill_defer(void* handle, int on);
 int sd_prefill_settle(void* handle);
 /* Start a prompt in layer's decoder workspace from its embeddings (steps rows of 2560), each

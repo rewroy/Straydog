@@ -22,6 +22,33 @@ __global__ void qsa_normalize(const float* source, const float* norm, size_t hea
     target[head*width+column]=qsa_rope(own,partner,column,position+token);
 }
 
+// A row of a sequence with images: mRoPE's own position for each axis (t, h, w), interleaved over the pairs. Text
+// holds one position on all three, which is qsa_rope's angle.
+__device__ float qsa_rope_axes(float own, float partner, size_t column, const uint32_t* axes) {
+    if (column>=64) return own;
+    const size_t pair=column%32;
+    const float angle=float(axes[pair%3])/powf(1e7f,float(pair)/32.0f);
+    return own*cosf(angle)+(column<32 ? -partner : partner)*sinf(angle);
+}
+
+// qsa_normalize over rows whose rope positions come from `axes` (three a row, from the chunk's first): a prefill
+// batch of a sequence with images. A prompt without images never launches it.
+__global__ void qsa_normalize_axes(const float* source, const float* norm, size_t heads, size_t width,
+                                   size_t stride, const uint32_t* axes, float* target) {
+    const size_t head=blockIdx.x, token=head/heads, column=threadIdx.x;
+    __shared__ float values[256], sums[256];
+    const float x=source[head*stride+column]; values[column]=x*norm[column]; sums[column]=x*x;
+    __syncthreads();
+    for (unsigned offset=unsigned(width/2);offset;offset/=2) {
+        if (column<offset) sums[column]+=sums[column+offset];
+        __syncthreads();
+    }
+    const float denominator=sqrtf(sums[0]/float(width)+1e-6f);
+    const float own=values[column]/denominator;
+    const float partner=column<64 ? values[(column+32)%64]/denominator : 0;
+    target[head*width+column]=qsa_rope_axes(own,partner,column,axes+token*3);
+}
+
 // The three single-token normalizations of QSA decode in one launch: blocks 0-23
 // query heads (width 256, stride 512), 24-25 key heads, 26-29 index-query heads
 // (width 128, in place); each block is exactly qsa_normalize's.
@@ -76,6 +103,30 @@ __global__ void qsa_pool(const float* incoming, const float* history, const floa
     const float own=values[column]/denominator;
     const float partner=column<64 ? values[(column+32)%64]/denominator : 0;
     blocks[column*pool+block]=qsa_rope(own,partner,column,begin);
+}
+
+// qsa_pool in a sequence with images: a block turns by the rope position of its first token, whose row of `axes`
+// (three a row, from position `first`) may lie in an image or in the batch before.
+__global__ void qsa_pool_axes(const float* incoming, const float* history, const float* norm,
+                              size_t pool, size_t base, const uint32_t* axes, size_t first, float* blocks) {
+    const size_t block=base/4+blockIdx.x, column=threadIdx.x;
+    const size_t begin=block*4;
+    float x=0;
+    for (size_t tap=0;tap<4;++tap) {
+        const size_t pos=begin+tap;
+        x+=pos<base ? history[(pos%qsa_history)*128+column] : incoming[(pos-base)*128+column];
+    }
+    x/=4.0f;
+    __shared__ float values[128], sums[128]; values[column]=x*norm[column]; sums[column]=x*x;
+    __syncthreads();
+    for (unsigned offset=64;offset;offset/=2) {
+        if (column<offset) sums[column]+=sums[column+offset];
+        __syncthreads();
+    }
+    const float denominator=sqrtf(sums[0]/128.0f+1e-6f);
+    const float own=values[column]/denominator;
+    const float partner=column<64 ? values[(column+32)%64]/denominator : 0;
+    blocks[column*pool+block]=qsa_rope_axes(own,partner,column,axes+(begin-first)*3);
 }
 
 __global__ void qsa_save_history(const float* incoming, size_t base, size_t steps, float* history) {

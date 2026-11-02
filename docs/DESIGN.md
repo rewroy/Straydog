@@ -877,6 +877,40 @@ layer (§6.2).
   first GPU and 51K on the second. A pass at 60K: 1 row 15.7 to 14.9 ms, 4 rows 26.4 to 23.6 (62K: 31.1 to
   26.4); 20K and the first tokens unchanged.
 
+### 8.1 Images
+
+The GGUF repository's `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (encoder and projector, one file for every bundle, pinned by
+size and SHA-256) sits in the bundle's directory or the one above it, or is named by `--mmproj`; `straydog setup` fetches it.
+The worker hashes it at the start through the page cache, so none of it stays in memory until an image comes. A wrong or
+missing file leaves the model serving text: images are refused with what is wrong (`/v1/models`' `meta.vision`, `/props`'
+`modalities.vision` say whether it reads them).
+
+How an image is read (`qwen_vision.rs`, after transformers' `qwen3_5` vision model, `Qwen2VLImageProcessorFast` and llama.cpp's
+`qwen3vl`):
+1. **Size.** `smart_resize` with factor 32: at least 65536 pixels, at most 4096 merged tokens (llama.cpp's limit; the
+   processor's own 16777216 pixels would be 65536 patches). Bicubic as Pillow does it, values `(x - 127.5) / 127.5`.
+2. **Span.** The template's image part is a marker of its own (§7.5). Its place takes `<|vision_start|>`, one position a merged
+   token, `<|vision_end|>`, with ids from 2^31 up made from the image's digest: a held sequence continues only with the
+   same image, and the rows of the last images are kept, so a later turn re-reads nothing.
+3. **Encoder**, on the CPU, every thread: patches in merge-block order through the two temporal filters (a still image is
+   two equal frames), the position table bilinearly with corners aligned, 27 blocks of full attention with axial RoPE (theta
+   10000, row on the first 18 pairs of a head's 36, column on the rest), and the merger. Each product reads the BF16 weights
+   where they are mapped and sums in F32: the mapping goes when the image is encoded.
+4. **mRoPE.** A token has (t, h, w): text one position on all three, an image's tokens the position where the image starts,
+   plus their row and column. The next text goes on from there by the grid's longer side, so past an image a token's rope
+   position is its K/V index less a delta (`rope_of`). Each rotated pair takes its axis by its index mod 3, which on text is
+   the one position every kernel always used. The K/V, the blocks and the history go by the index alone.
+   - A decode or verification row is text: beside the GPU position scalar lies its rope position, the same number unless a
+     delta is set (`sd_rope_delta`). A replay reads both from memory. Text-only passes run the same kernels and launches.
+   - A prefill batch of a sequence with images reads a table of three a row (`sd_rope_rows`), with the row of the first
+     position of the block its first row is in: a pooled block turns by its first token's position, which may lie in an
+     image or in the last batch. Only such batches launch `qsa_normalize_axes` and `qsa_pool_axes`.
+5. **The rest of a pass.** PLE's n-grams hash `<|image_pad|>` at an image's positions, as the reference reads the ids before their
+   rows go in. Routing is as for any row. A batch over image rows runs as a batched prefill even when short.
+6. **Drafter.** The reference's MTP model is text-only. It stays off from a prompt's first image to the end of the request.
+   A prompt without images shares nothing with a sequence past its first image (their ids differ), and the batches
+   before that image keep the MTP layer's rows, so a later text prompt that resumes before it drafts as ever.
+
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
 **The architecture.** One residual stream runs through blocks whose mixer is a Gated DeltaNet
@@ -957,6 +991,7 @@ named as llama-server names it where it has the same setting.
 | `-m, --model DIR` | model bundle directory, or its first shard | the settings `setup` wrote |
 | `--quant NAME` | the bundle, when the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | Qwen3.8's MTP drafter | none |
+| `--mmproj FILE` | Qwen3.8's vision encoder and projector (§8.1) | a `mmproj-*.gguf` in the model's directory or the one above it |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 8192 | 1024; 4096 with 48 GiB or more of GPU budget, and for Qwen3.5 MoE; DeepSeek-V4.1: 8192 (§7.2) |

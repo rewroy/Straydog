@@ -129,9 +129,9 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     kv_prepare_span(d,begin,end,position);
     float* hidden=workspace; float* mixed=hidden+10240; float* branch=mixed+2564;
     auto* gpu_position=reinterpret_cast<uint32_t*>(branch+2560);
-    const uint32_t current=uint32_t(position);
+    const uint32_t current[2]={uint32_t(position),uint32_t(position)-d.rope_delta};
     upload(d,hidden,input,10240*4);
-    upload(d,gpu_position,&current,sizeof(current));
+    upload(d,gpu_position,current,sizeof(current));
     if (position!=d.hybrid_position) { d.hybrid_position=position; ++d.hybrid_tokens; }
     hybrid_settle(d,false);
     auto early=[&](size_t layer) { return hybrid_early(d,layer); };
@@ -230,9 +230,9 @@ void decode_span(Device& d,size_t begin,size_t end,size_t position,const float* 
     kv_prepare_span(d,begin,end,position);
     float* hidden=workspace; float* mixed=hidden+10240; float* branch=mixed+2564;
     auto* gpu_position=reinterpret_cast<uint32_t*>(branch+2560);
-    const uint32_t current=uint32_t(position);
+    const uint32_t current[2]={uint32_t(position),uint32_t(position)-d.rope_delta};
     upload(d,hidden,input,10240*4);
-    upload(d,gpu_position,&current,sizeof(current));
+    upload(d,gpu_position,current,sizeof(current));
     auto submit=[&]() {
         // Both residual updates are fused: into the attention output projection and
         // into the expert combination, exactly as speculative verification does.

@@ -53,7 +53,7 @@ straydog
 `straydog setup` lists the pinned models that can run on the machine it finds, with their
 sizes and what each needs, and recommends one; it asks where to put it (by default the
 platform's data folder), checks the free space, resumes or verifies what is there already, adds
-the extras you choose (DSpark and vision for DeepSeek-V4.1, MTP for Qwen3.8) and writes
+the extras you choose (DSpark and vision for DeepSeek-V4.1, MTP and vision for Qwen3.8) and writes
 `config.toml` in the platform's config folder, which a plain `straydog` reads. Every answer is
 also an option: `straydog setup --yes --quant GSQ-RCO-IQ2_XXS --dir ~/models` asks nothing
 (`--offline` downloads nothing, `--config FILE` writes the settings elsewhere).
@@ -73,7 +73,9 @@ straydog -m ~/models/IQ3_S -md ~/models/mtp -gpu 0,1 --api-key-file ~/.straydog-
 
 For DeepSeek-V4.1, `fetch` also downloads the DSpark drafter (into `dspark/` in the bundle's
 directory) and builds the vision encoder's file from the official checkpoint's tensors; the
-server finds both there and runs without either.
+server finds both there and runs without either. Qwen3.8 reads images with
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` from its GGUF repository (`straydog setup` fetches it): in
+the bundle's directory or the one above it, or named by `--mmproj`.
 
 Each GPU's VRAM budget is its free memory unless `--vram` gives one (`--vram 28`) or one per
 GPU (`--vram 30,10` for a 32 GB and a 12 GB card).

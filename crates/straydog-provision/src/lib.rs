@@ -202,6 +202,20 @@ fn build_drafter(root: &Path, keep_source: bool, progress: Progress) -> io::Resu
     Ok(target)
 }
 
+/// Download Qwen3.8's vision encoder and projector into `root` (a model's directory or the one above it: it serves every
+/// quantization), authenticated before it is published; one there already is authenticated. With `offline`, only that;
+/// none there is left missing (the model then reads no images). Its path when there.
+pub fn fetch_qwen_vision(root: &Path, offline: bool, progress: Progress) -> Result<Option<PathBuf>, String> {
+    let source = bundle::qwen_vision_source()?;
+    let target = root.join(&source.asset.name);
+    if offline && !target.is_file() {
+        return Ok(None);
+    }
+    let url = format!("https://huggingface.co/{}/resolve/{}/{}", source.repository, source.revision, source.path);
+    assets::fetch_with(&http::agent(assets::TIMEOUT), root, &[(source.asset, url)], offline, true, progress).map_err(|error| error.to_string())?;
+    Ok(Some(target))
+}
+
 /// Build DeepSeek-V4.1's vision encoder file in `root` from the authenticated official tensors,
 /// when the quantization's model has one pinned and it is not there yet; with `offline`, leave it
 /// missing (the model then reads no images). Its verity tree then authenticates it.
