@@ -851,7 +851,11 @@ impl Driver {
                 let message = format!("{message}; restart the server");
                 let _ = job.events.send(json!({"event": "error", "message": message, "fatal": true})).await;
                 self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
-                self.fail(message);
+                // (the reason goes to the client it failed for and to the server's last line; other clients see that it failed)
+                let public = message.split_once(": ").map_or(message.clone(), |(head, _)| format!("{head}; restart the server"));
+                tracing::error!("{message}");
+                self.set(Phase::Failed(public));
+                self.shared.failure.send_replace(Some(message));
                 process.end(Duration::from_secs(5)).await;
                 return false;
             }
@@ -1155,6 +1159,8 @@ impl Driver {
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
+                    // (why the server is ending: its last line is what whatever started it shows, and that line must say)
+                    let why: String = event["message"].as_str().unwrap_or("no message").chars().take(500).flat_map(char::escape_debug).collect();
                     // (the failing client gets the event; the server log keeps why, escaped and cut short,
                     // and nothing of it reaches the failure other clients are told)
                     if kind == "error" {
@@ -1192,7 +1198,7 @@ impl Driver {
                     }
                     if kind == "done" || kind == "error" {
                         if fatal {
-                            return Err("Straydog reported a fatal inference error".into());
+                            return Err(format!("Straydog reported a fatal inference error: {why}"));
                         }
                         return Ok(());
                     }
