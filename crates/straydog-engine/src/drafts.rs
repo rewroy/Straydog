@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::vision::IMAGE_TOKEN;
+
 /// The fewest tokens a match takes before it proposes anything.
 const SHORTEST: usize = 3;
 /// How far back a match is measured.
@@ -80,7 +82,8 @@ impl Ngrams {
         if matched < SHORTEST {
             return (Vec::new(), 0);
         }
-        let drafts = self.tokens[earlier + 1..].iter().take(most).copied().collect();
+        // (an image's positions hold ids past the vocabulary, which only that position's rows give meaning: a copy stops before one)
+        let drafts = self.tokens[earlier + 1..].iter().take(most).take_while(|&&token| token < IMAGE_TOKEN).copied().collect();
         (drafts, matched)
     }
 }
@@ -150,6 +153,17 @@ mod tests {
         // the latest earlier occurrence wins
         ngrams.extend(&[7, 2, 3, 4]);
         assert_eq!(ngrams.propose(1), (vec![7], 3));
+    }
+
+    #[test]
+    fn a_copy_stops_before_an_image_position() {
+        let mut ngrams = Ngrams::new();
+        ngrams.extend(&[1, 2, 3, 4, IMAGE_TOKEN, IMAGE_TOKEN + 1, 5, 9, 1, 2, 3]);
+        let (drafts, matched) = ngrams.propose(4);
+        assert_eq!((drafts, matched), (vec![4], 3));
+        ngrams.push(4);
+        let (drafts, matched) = ngrams.propose(4);
+        assert_eq!((drafts, matched), (Vec::new(), 4), "the next position is an image's");
     }
 
     #[test]
