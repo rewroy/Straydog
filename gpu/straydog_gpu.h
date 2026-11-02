@@ -246,6 +246,7 @@ int sd_op_slot_moe_down(void* handle, const uint64_t* bases, const uint32_t* fir
                         const void* product, float* outputs, uint64_t out_stride, void* tables, uint64_t table_bytes);
 // `values` (a multiple of four) rounded to FP16.
 int sd_op_half_values(void* handle, const float* input, uint64_t values, void* output);
+int sd_op_repeat_rows(void* handle, const float* input, uint64_t rows, uint64_t copies, uint64_t width, float* output);
 // Every device's `out` (rows of `full` FP16 values) = each device's `part` (rows of its `share` columns)
 // at its columns `firsts[d]`, the peers' read over the peer link; ordered as sd_op_sum_devices.
 int sd_op_gather_columns(void* const* handles, void* const* outs, const void* const* parts, const uint64_t* firsts, uint64_t devices,
