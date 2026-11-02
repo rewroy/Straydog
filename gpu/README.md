@@ -6,7 +6,7 @@ generated from it, and a test keeps the two in step.
 
 The executable links a static build: `cargo build --release --features hip` (or `cuda`)
 runs CMake on this directory from `crates/straydog-gpu/build.rs`. Set
-`STRAYDOG_GPU_ARCHITECTURES` (default `gfx1201`, or `86-real;89-real;120` for CUDA),
+`STRAYDOG_GPU_ARCHITECTURES` (default `gfx1201`, or `75-real;86-real;89-real;120` for CUDA),
 `ROCM_PATH` or `CUDA_PATH`.
 
 The library implements compressed matrix-vector products and grouped GEMM for the

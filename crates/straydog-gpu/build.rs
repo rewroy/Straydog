@@ -1,7 +1,7 @@
 //! Builds gpu/ with CMake as a static library for the chosen backend and links it with
 //! the vendor libraries it needs.
 //!
-//! Environment: STRAYDOG_GPU_ARCHITECTURES (default gfx1201 for HIP, "86-real;89-real;120"
+//! Environment: STRAYDOG_GPU_ARCHITECTURES (default gfx1201 for HIP, "75-real;86-real;89-real;120"
 //! for CUDA), ROCM_PATH (default /opt/rocm), CUDA_PATH.
 
 use std::env;
@@ -23,7 +23,7 @@ fn main() {
     }
     let backend = if hip { "HIP" } else { "CUDA" };
     let architectures = env::var("STRAYDOG_GPU_ARCHITECTURES")
-        .unwrap_or_else(|_| if hip { "gfx1201" } else { "86-real;89-real;120" }.to_string());
+        .unwrap_or_else(|_| if hip { "gfx1201" } else { "75-real;86-real;89-real;120" }.to_string());
     let windows = env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows";
 
     let mut config = cmake::Config::new(&source);
