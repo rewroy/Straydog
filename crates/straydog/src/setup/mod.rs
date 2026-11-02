@@ -13,7 +13,7 @@ use clap::Args;
 use straydog_provision::Extras;
 
 use crate::config;
-use catalog::{Entry, Extra, Fit, Place, DEFAULT_CONTEXT, GIB};
+use catalog::{Entry, Extra, Fit, Place, DEFAULT_CONTEXT};
 use machine::Machine;
 
 pub use settings::{write_settings, Settings, Written};
@@ -169,10 +169,6 @@ pub fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
 
-fn gib(bytes: u64) -> String {
-    format!("{:.0} GiB", bytes as f64 / GIB as f64)
-}
-
 /// The directory of `entry`'s bundle under the models folder `folder`: the folder itself when
 /// it holds the bundle already (or the start of it), else `folder/<model>/<quant>`.
 pub fn bundle_directory(folder: &Path, entry: &Entry) -> PathBuf {
@@ -236,7 +232,7 @@ fn menu(talk: &mut Talk, entries: &[Entry], fits: &[(u64, Fit)], gpus: usize, re
                           if index == recommended { "  recommended" } else { "" }));
         let (context, fit) = &fits[index];
         let limited = if *context < DEFAULT_CONTEXT { format!(" with a context of {context} tokens (the most that starts)") } else { String::new() };
-        talk.say(&format!("       needs {} of VRAM at the least{limited}; {}", gib(catalog::min_vram(entry, gpus, *context)), fit.note(entry)));
+        talk.say(&format!("       needs {} of VRAM at the least{limited}; {}", catalog::tenths(catalog::min_vram(entry, gpus, *context)), fit.note(entry)));
     }
     let left: Vec<String> = (0..entries.len())
         .filter(|&index| !fits[index].1.runs())
@@ -269,7 +265,7 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
             let recommended = catalog::recommend(entries, &verdicts).filter(|&index| fits[index].1.runs()).ok_or_else(|| {
                 // (the reason of the model that comes closest: the least VRAM short)
                 let reason = entries.iter().zip(&fits).min_by_key(|(_, (_, fit))| match fit {
-                    Fit::TooLittleVram { needs, has } => needs - has,
+                    Fit::TooLittleVram { needs, has } => needs.saturating_sub(*has),
                     _ => 0,
                 }).map_or_else(String::new, |(entry, (_, fit))| format!(": {} {}", entry.name(), fit.note(entry)));
                 format!("none of the models can run here{reason}")
@@ -294,12 +290,15 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
             Extra::Vision => args.no_vision,
             Extra::Mtp => args.no_mtp,
         };
+        // (a drafter only costs VRAM's slots where the budget is small: it is not offered as the default there)
+        let pays = sidecar.kind != Extra::Mtp || catalog::drafter_pays(machine);
+        let purpose = if pays { sidecar.purpose } else { "no faster at this VRAM" };
         let wanted = if left_out {
             false
         } else if ask && !args.offline {
-            talk.confirm(&format!("Also get the {} ({}, {})?", sidecar.label, sidecar.purpose, gb(sidecar.download)), true)?
+            talk.confirm(&format!("Also get the {} ({}, {})?", sidecar.label, purpose, gb(sidecar.download)), pays)?
         } else {
-            true
+            pays || args.offline
         };
         if wanted {
             extras.push(sidecar.kind);
@@ -626,7 +625,7 @@ mod tests {
         let ask = |args: SetupArgs, machine: &Machine| run_with(&SetupArgs { yes: true, dir: Some(root.join("models")), ..args }, machine, &entries, &defaults(&root), &recorder, "", false).0;
         // by model name, in any case: its best bundle for the machine
         let outcome = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &small).unwrap();
-        assert_eq!(outcome.quant, "Q2_0");
+        assert_eq!(outcome.quant, "IQ2_XS");
         let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &doggybox()).unwrap();
         assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
         // the extras left out by option

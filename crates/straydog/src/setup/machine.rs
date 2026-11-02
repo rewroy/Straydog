@@ -97,6 +97,8 @@ pub fn free_space(path: &Path) -> Option<u64> {
             return None;
         }
     };
+    // (Windows canonicalizes to `\\?\C:\...`, which no mount point `C:\` is a prefix of)
+    let existing = existing.to_str().and_then(|text| text.strip_prefix(r"\\?\")).map_or(existing.clone(), PathBuf::from);
     let disks = sysinfo::Disks::new_with_refreshed_list();
     // (the disk whose mount point is the longest prefix of the path)
     disks.iter().filter(|disk| existing.starts_with(disk.mount_point())).max_by_key(|disk| disk.mount_point().components().count()).map(|disk| disk.available_space())

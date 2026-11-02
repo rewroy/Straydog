@@ -618,6 +618,10 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - **Two R9700s:** they hold the weights of every bundle with every layer in parts (below), with the
   K/V in host memory at 262144 tokens.
 - **Smaller budgets:** host K/V and a smaller prefill batch come first, then partial residency.
+  What a budget must hold for it is the placement's own arithmetic (`model::partial_slot_bytes`):
+  the device's workspaces, the recurrent state, the prefill rows, the K/V stage and the pinned dense
+  weights, 4.1 GiB in all for IQ2_XS at 262144 tokens; `straydog setup` counts with the same
+  function, and what is over goes to the expert slots.
 - **Partial residency:** the CPU computes experts beyond VRAM in F32 from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):

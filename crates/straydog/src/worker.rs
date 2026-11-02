@@ -183,14 +183,28 @@ pub(crate) struct Plan {
 }
 
 /// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more; on Windows, where the
-/// desktop and other programs share the GPU, 2 GiB at least.
-fn margin(total: u64) -> u64 {
-    #[cfg(windows)]
-    {
-        return (2u64 << 30).max(total / 100 * 3);
-    }
-    #[cfg(not(windows))]
-    (512 << 20).max(total / 100 * 3)
+/// desktop and other programs share the GPU, an eighth of the card in whole 256 MiB (at least 512 MiB, and
+/// 2 GiB from a 16 GB card up): 768 MiB of 6 GB, 1 GiB of 8, 1.5 of 12.
+///
+/// What it has to hold is the engine's own memory outside its budget and what the others come to want after
+/// `auto` has looked. Measured on an RTX 5070 Ti (15.9 GiB) only: others holding 2.85 GiB, 1.8 GiB left free
+/// served with the desktop fine, and 0.2-0.8 GiB left free stalled it (271d191). No small card has been tried: that
+/// the others' growth scales with the card is the reasoning, and at 6 GB a whole 2 GiB would leave no budget that
+/// starts Qwen3.8 at all (`catalog::min_vram`).
+pub(crate) fn margin_on(windows: bool, total: u64) -> u64 {
+    let least = if windows {
+        (total.div_ceil(8).div_ceil(256 << 20) * (256 << 20)).clamp(512 << 20, 2 << 30)
+    } else {
+        512 << 20
+    };
+    least.max(total / 100 * 3)
+}
+
+/// What `auto` takes of a GPU with `free` of `total` bytes free: the free memory less the margin, in whole 256 MiB
+/// (on a small card under Windows, whole 64 MiB: there a rounding is a tenth of the expert slots).
+pub(crate) fn auto_budget(windows: bool, free: u64, total: u64) -> u64 {
+    let step: u64 = if windows && total < 12 << 30 { 64 << 20 } else { 256 << 20 };
+    free.saturating_sub(margin_on(windows, total)) / step * step
 }
 
 /// How long `auto` waits for a GPU's free memory to stop growing (a previous worker releasing it).
@@ -207,7 +221,7 @@ const SETTLE_HELD: Duration = VRAM_PATIENCE;
 /// [`VRAM_PATIENCE`] (a GPU smaller than its budget is left to fail as it does). `auto` waits
 /// until nine tenths of each GPU are free, or until its free memory has stopped growing for
 /// [`SETTLE`] with at most a quarter of it held ([`SETTLE_HELD`] with more), and at most [`VRAM_PATIENCE`] in all; then it
-/// takes what is free less a margin, in whole 256 MiB. A display's or another program's share is
+/// takes what is free less a margin ([`auto_budget`]). A display's or another program's share is
 /// left to it, but a job holding more of the GPU (a test or benchmark about to end) is waited
 /// for, not placed around in the memory it leaves.
 fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> Result<Vec<u64>, String> {
@@ -246,7 +260,7 @@ fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> R
                     // (a share of up to a quarter that another program keeps is left to it)
                     let settled = grown.1.elapsed() >= if free >= total / 4 * 3 { SETTLE } else { SETTLE_HELD };
                     if free >= total / 10 * 9 || settled || started.elapsed() >= VRAM_PATIENCE {
-                        chosen.push(free.saturating_sub(margin(total)) / (256 << 20) * (256 << 20));
+                        chosen.push(auto_budget(cfg!(windows), free, total));
                         break;
                     }
                     total / 10 * 9
@@ -331,6 +345,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         let model = Model::new(weights, group, &settings, &report);
         (text.join().unwrap(), model)
     });
+    let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
     let (text, mut model) = (Arc::new(text?), model?);
     loading.report("warm", 0, 0);
     let warming = Instant::now();
@@ -355,6 +370,17 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "gpu": model.info()?,
     }));
     serve(Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new() })), text, output)
+}
+
+/// A placement's refusal under `auto`, which no one chose the budget of: what it took and what to do.
+fn auto_too_small(error: String, given: &str, budgets: &[u64]) -> String {
+    match error.strip_suffix("; raise --vram") {
+        Some(reason) if given == "auto" => {
+            let taken: Vec<String> = budgets.iter().map(|&bytes| format!("{:.2}", bytes as f64 / (1u64 << 30) as f64)).collect();
+            format!("{reason}: `auto` took {} GiB, what the GPU had free less a margin for the desktop; close what holds its memory, or give --vram", taken.join(", "))
+        }
+        _ => error,
+    }
 }
 
 fn bundle_vision() -> Result<straydog_engine::bundle::Asset, String> {
@@ -742,6 +768,38 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn autos_margin_scales_on_small_cards_and_stays_from_16_gb() {
+        // Windows, as CUDA reports cards: an eighth of each in whole 256 MiB
+        for (total, margin) in [(4096, 512), (6144, 768), (6078, 768), (8188, 1024), (12288, 1536), (16303, 2048), (16376, 2048), (24564, 2048)] {
+            assert_eq!(margin_on(true, total * MIB), margin * MIB, "{total} MiB");
+        }
+        // what f6362a9 left from 16 GB up: 2 GiB or 3%
+        for total in [16303, 24564, 49140, 81920, 131072] {
+            assert_eq!(margin_on(true, total * MIB), (2048 * MIB).max(total * MIB / 100 * 3), "{total} MiB");
+        }
+        // elsewhere, 512 MiB or 3%, whatever the card
+        for total in [6144, 16303, 32624] {
+            assert_eq!(margin_on(false, total * MIB), (512 * MIB).max(total * MIB / 100 * 3), "{total} MiB");
+        }
+        // the budget: whole 256 MiB as before from a 12 GB card, off Windows on any; finer on a small one under Windows
+        assert_eq!(auto_budget(true, 13_384 * MIB, 16303 * MIB), 11_264 * MIB);
+        assert_eq!(auto_budget(false, 6000 * MIB, 6144 * MIB), 5376 * MIB);
+        assert_eq!(auto_budget(true, 5344 * MIB, 6144 * MIB), 4544 * MIB);
+        assert_eq!(auto_budget(true, 500 * MIB, 6144 * MIB), 0);
+    }
+
+    #[test]
+    fn a_refusal_under_auto_says_what_it_took() {
+        let reason = "the GPU budget cannot hold the model's dense weights";
+        let refused = auto_too_small(format!("{reason}; raise --vram"), "auto", &[3 << 30]);
+        assert!(refused.starts_with(reason) && refused.contains("`auto` took 3.00 GiB") && refused.contains("close what holds"), "{refused}");
+        assert_eq!(auto_too_small(format!("{reason}; raise --vram"), "5368709120", &[5 << 30]), format!("{reason}; raise --vram"));
+        assert_eq!(auto_too_small("other".into(), "auto", &[3 << 30]), "other");
+    }
 
     // No GPU or model: an actual tokenizer error goes through the production request
     // completion/reset path, followed by another request on the same served instance.

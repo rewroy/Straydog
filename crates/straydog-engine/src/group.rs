@@ -876,7 +876,7 @@ impl Group {
     }
 
     pub fn create_expert_slots(&mut self) -> Result<u64> {
-        self.backends.iter_mut().map(|backend| backend.create_expert_slots(32, 64 << 20)).sum()
+        self.backends.iter_mut().map(|backend| backend.create_expert_slots(crate::model::STAGING_SLOTS, crate::model::SLOTS_MARGIN)).sum()
     }
 
     pub fn hybrid_supported(&self) -> Result<bool> {

@@ -58,6 +58,20 @@ pub fn decoder_workspace_bytes(capacity: u64) -> u64 {
     (capacity * 15364 + 1024 * 2564 + 8) * 4
 }
 
+/// What `sd_create` counts of a device's budget from 2 GiB up: its input and output (64 MiB each), the expanded GEMMs (128), half input (32),
+/// BLAS (16) and attention scores (48).
+const DEVICE_WORKSPACES: u64 = (64 + 64 + 128 + 32 + 16 << 20) + 256 * 24 * 2052 * 4;
+
+/// The VRAM [`Backend::state_plan`] and `sd_create` count of a budget of one GPU for a partially resident Qwen3.8 without a drafter, K/V
+/// in host memory: its workspaces, the indexers and scratch of a K/V of `kv` positions, the recurrent state and the K/V stage.
+pub fn partial_state_bytes(kv: u64, context: u64, prefill: u64, budget: u64) -> u64 {
+    let (delta, conv) = (36 * 48 * 128 * 128 * 4, 36 * 4 * WIDTH as u64 * 4);
+    let (indexers, scratch) = (12 * ((kv / 4 + 1) * 128 + INDEX_HISTORY) * 4, 256 * (kv / 4 + 1) * 4);
+    let stage = context.min(budget / 64 / 4096);
+    DEVICE_WORKSPACES + (context.min(prefill) * MOE_ROW + 65536) * 4 + delta + conv + 10 * WIDTH as u64 * 4 + indexers + scratch
+        + if stage >= 256 { stage * 4096 } else { 0 }
+}
+
 fn last_error() -> String {
     straydog_gpu::last_error().to_string()
 }
@@ -965,7 +979,7 @@ impl Backend {
     }
 
     /// VRAM a placement leaves free for what it allocates later.
-    fn slack(budget: u64) -> u64 {
+    pub fn slack(budget: u64) -> u64 {
         (128u64 << 20).max(budget * 3 / 100)
     }
 
