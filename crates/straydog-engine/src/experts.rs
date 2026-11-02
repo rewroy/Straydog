@@ -742,6 +742,9 @@ struct Class {
     host_free: VecDeque<usize>,
     /// Host slots holding an expert (read or written back), by last use.
     host_lru: BTreeSet<(u64, usize)>,
+    /// Those of `host_lru` whose expert a VRAM slot holds too: its eviction writes nothing back,
+    /// and a host slot needed comes from here first (the tier then still holds what it alone holds).
+    copies: BTreeSet<(u64, usize)>,
 }
 
 /// Counters since creation.
@@ -953,7 +956,7 @@ impl DeviceExperts {
             classes.push(Class {
                 vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).collect(),
                 lru: BTreeSet::new(), reserve, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), hosts: 0,
-                host_free: VecDeque::new(), host_lru: BTreeSet::new(),
+                host_free: VecDeque::new(), host_lru: BTreeSet::new(), copies: BTreeSet::new(),
             });
         }
         let (done_tx, done_rx) = channel();
@@ -1606,6 +1609,17 @@ impl DeviceExperts {
         class.lru.remove(&(entry.used, slot));
         class.free.push_back(slot);
         self.map.remove(&key);
+        // (the host tier alone holds it now, as if just written back)
+        if let Some(&host) = self.host_map.get(&key) {
+            let entry = &mut self.host[host];
+            let class = &mut self.classes[entry.class];
+            if class.copies.remove(&(entry.used, host)) {
+                class.host_lru.remove(&(entry.used, host));
+                self.clock += 1;
+                entry.used = self.clock;
+                class.host_lru.insert((entry.used, host));
+            }
+        }
         Some(key)
     }
 
@@ -1791,19 +1805,27 @@ impl DeviceExperts {
     }
 
     /// VRAM slot `slot` holds host slot `host`'s expert once `stream` passes `mark` (its gate and
-    /// up at its `ready_first`); the host tier gives the expert up.
+    /// up at its `ready_first`). The host tier keeps its copy while it has room: an expert leaving
+    /// VRAM then costs no write-back. Beside its misses' uploads, those write-backs took 2.8 of a
+    /// DeepSeek-V4.1 3-row pass's 30 ms on two R9700s (34 misses a pass), the bits unchanged.
     fn uploaded(&mut self, slot: usize, host: usize, stream: Stream, mark: Mark) {
         self.slots[slot].ready = Some((stream, mark));
         self.vram_changes += 1;
         self.slots[slot].waiting = None;
-        if self.slots[slot].streamed && self.host[host].key.is_some() {
-            // (streamed: the host tier keeps the expert, back in its LRU as just used)
+        let keeps = self.classes[self.host[host].class].host_capacity > 0 || self.slots[slot].streamed;
+        if keeps && self.host[host].key.is_some() {
+            // (back in its LRU as just used)
             self.clock += 1;
             let entry = &mut self.host[host];
             entry.busy = Some(mark);
             entry.waiter = None;
             entry.used = self.clock;
-            self.classes[entry.class].host_lru.insert((entry.used, host));
+            let class = &mut self.classes[entry.class];
+            class.host_lru.insert((entry.used, host));
+            // (a copy until its slot empties: that may already have been a failed fill's)
+            if self.slots[slot].key == entry.key {
+                class.copies.insert((entry.used, host));
+            }
             return;
         }
         let entry = &mut self.host[host];
@@ -2035,6 +2057,7 @@ impl DeviceExperts {
             self.host_map.remove(&key);
             let class = &mut self.classes[entry.class];
             class.host_lru.remove(&(entry.used, host));
+            class.copies.remove(&(entry.used, host));
             class.host_free.push_back(host);
         }
         if let Some(slot) = slot {
@@ -2076,7 +2099,8 @@ impl DeviceExperts {
         for class in 0..self.classes.len() {
             while self.classes[class].free.len() < self.classes[class].reserve {
                 let victim = self.victim(class)?;
-                if !waited {
+                let copied = self.slots[victim].key.is_some_and(|key| self.host_map.contains_key(&key));
+                if !waited && !copied {
                     gpu.wait_mark(Stream::Download, after)?;
                     waited = true;
                 }
@@ -2145,7 +2169,8 @@ impl DeviceExperts {
             }
             // The least recently used expert's slot (its copies long done), before an emptied slot
             // whose upload is still running.
-            let candidate = self.classes[class].host_lru.iter().map(|&(_, host)| host).next()
+            let candidate = self.classes[class].copies.iter().map(|&(_, host)| host).next()
+                .or_else(|| self.classes[class].host_lru.iter().map(|&(_, host)| host).next())
                 .or_else(|| self.classes[class].host_free.front().copied());
             let Some(host) = candidate else {
                 if self.take_arena(class, true)? {
@@ -2174,8 +2199,11 @@ impl DeviceExperts {
                 Some(key) => {
                     self.host_map.remove(&key);
                     self.classes[class].host_lru.remove(&(entry.used, host));
-                    self.counts.host_drops += 1;
-                    self.counts.host_drops_short += u64::from(short);
+                    // (a VRAM slot still holds a copy's expert)
+                    if !self.classes[class].copies.remove(&(entry.used, host)) {
+                        self.counts.host_drops += 1;
+                        self.counts.host_drops_short += u64::from(short);
+                    }
                 }
                 None => {
                     self.classes[class].host_free.pop_front();
@@ -2367,7 +2395,7 @@ impl DeviceExperts {
     pub fn fill_plan(&self, window: &[(usize, usize)]) -> Contents {
         let mut room: Vec<(usize, usize)> = self.classes.iter().map(|class| {
             let free = class.free.iter().filter(|&&slot| !self.slots[slot].taken_back).count();
-            let hosted = class.hosts.saturating_sub(class.host_free.len());
+            let hosted = class.hosts.saturating_sub(class.host_free.len() + class.copies.len());
             let host = if class.host_capacity == 0 { 0 } else { class.host_capacity.saturating_sub(hosted).saturating_sub(class.reserve) };
             (free.saturating_sub(class.reserve + PASS_FREE), host)
         }).collect();
@@ -2397,8 +2425,7 @@ impl DeviceExperts {
         if !entry.host_free.is_empty() || entry.hosts < entry.arenas.len() * entry.per_arena || self.take_arena(class, false)? {
             return Ok(true);
         }
-        let oldest = self.classes[class].host_lru.iter().next().map(|&(_, host)| host);
-        Ok(oldest.is_some_and(|host| self.host[host].key.is_some_and(|key| self.map.contains_key(&key))))
+        Ok(!self.classes[class].copies.is_empty())
     }
 
     /// Of a warm-up's lists (least recently used first), what this store's slots hold (see
