@@ -2941,6 +2941,11 @@ int sd_graph_begin(void* handle) {
     try {
         auto& value = device(handle);
         if (value.op_recording) throw std::runtime_error("a Straydog graph is already being recorded");
+        // (made here, not by the route's launch: a capture takes no allocation)
+        if (!value.route_counter) {
+            value.route_counter = static_cast<unsigned*>(allocate(value, 4));
+            check(hipMemset(value.route_counter, 0, 4));
+        }
         check(hipStreamBeginCapture(value.stream, hipStreamCaptureModeThreadLocal));
         value.op_recording = true;
         return 0;

@@ -416,6 +416,8 @@ struct Shard {
 /// batches after a layer's first (ATTENTION_ROWS): a layer's on two GPUs take ~170 MB. Expanded for
 /// every batch, they held a GPU ~0.23 s of an agent's 1.6K-token turn (2.9 s).
 pub const EXPANSIONS: u64 = 192 << 20;
+/// Passes of a width before its layers' graphs start to be recorded, one layer a pass.
+const GRAPHS_AFTER: usize = 64;
 
 /// The target layers whose input streams DSpark reads (the mean of their hc copies), in order.
 pub const TAP_LAYERS: [usize; 3] = [37, 38, 39];
@@ -627,6 +629,8 @@ pub struct Engine<'a, T: Tensors> {
     link_dirty: bool,
     /// A pass began and has not ended: its sums' counts may be out of step (a wait that gave up voids it).
     sums_dirty: bool,
+    /// Passes run so far by their rows, to [`VERIFY_ROWS`].
+    width_passes: [u32; VERIFY_ROWS + 1],
     /// The devices' GEMM policy as last set: FP16 operands (see [`Settings::half_gemm`]).
     half_policy: Option<bool>,
     /// With DS41_PROFILE set: seconds per phase, the GPUs synchronized at each phase's end
@@ -1144,6 +1148,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             link_pass: false,
             link_dirty: false,
             sums_dirty: false,
+            width_passes: [0; VERIFY_ROWS + 1],
             half_policy: None,
             profile: std::env::var_os("DS41_PROFILE").map(|_| (std::time::Instant::now(), BTreeMap::new())),
             profile_sync: std::env::var("DS41_PROFILE").is_ok_and(|value| !value.starts_with("host")),
@@ -2118,6 +2123,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.link_dirty = false;
         }
         self.sums_dirty = false;
+        if n <= VERIFY_ROWS {
+            self.width_passes[n] = self.width_passes[n].saturating_add(1);
+        }
         self.history.extend_from_slice(tokens);
         self.position += n;
         self.rewind = rewind;
@@ -2280,7 +2288,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (from, kv_from, full_from) = self.rows_of(layer, n);
         // Decode repeats a layer's launches every token: a device queues each run of them that
         // takes no host data at once, from a graph recorded the first time (not while profiling).
-        let record = n == 1 && (self.profile.is_none() || !self.profile_sync) && std::env::var_os("DS41_NO_GRAPHS").is_none();
+        // (a pass of a few rows only once that width is common, and a layer a pass: a capture costs that pass more than a graph saves it)
+        let settled = n > 1 && n <= VERIFY_ROWS && self.width_passes[n] as usize > GRAPHS_AFTER + layer;
+        let record = (n == 1 || settled) && (self.profile.is_none() || !self.profile_sync) && std::env::var_os("DS41_NO_GRAPHS").is_none();
         // a layer that compresses or indexes changes its launches from token to token
         let fixed = plan.compressed.is_none_or(|c| c.kv_source != layer && c.index_source != layer);
         let predict = n == 1 && self.settings.layers.contains(&(layer + 1)) && self.prefetches > 0;
@@ -2327,6 +2337,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let attention = self.attention_plan(layer, first, end, kv_from, full_from, saves);
             let key = |segment: u64| {
                 (layer as u64) << 8 | u64::from(link) << 5 | segment << 4 | u64::from(expand) << 1 | u64::from(attention.groups > 0)
+                    | (n as u64) << 20 | (attention.kv_from as u64) << 24 | (attention.full_from as u64) << 28 | u64::from(saves) << 32
             };
             // the rows of the batch that attend, from this row
             let attending = first + attention.full_from;
@@ -2334,13 +2345,21 @@ impl<'a, T: Tensors> Engine<'a, T> {
             // rows that attend). A miss builds them inside the recording. The other path is unchanged.
             let mut avoided = 0u64;
             let devices = self.shards.len();
+            // A pass of a few rows: the attention, the sum over the link, the FFN's step and the router in one graph, so the
+            // queue takes them whole (HIP's kernels around a graph, and its launches between two, cost more than graphs save).
+            let merged = record && fixed && !link && self.linked && attending < end;
+            let publish_merged = merged && self.publishes(layer, n, predict);
+            if publish_merged {
+                self.shards[0].gpu.route_mailbox_clear()?;
+            }
             self.stamp(layer, n, Stamp::AttentionStart)?;
             // (device 0's stamp between the two, recorded with them)
             let hc_stamp = self.stamps.as_ref().filter(|_| n <= VERIFY_ROWS)
                 .map(|stamps| (stamps.buffer.base(), (layer * Stamp::COUNT + Stamp::HcDone as usize) as u64));
             for index in 0..devices {
                 if record && fixed {
-                    if recorded(&mut self.shards[index], key(0), |shard| {
+                    let whole = key(0) | u64::from(merged) << 36 | u64::from(publish_merged) << 37;
+                    if recorded(&mut self.shards[index], whole, |shard| {
                         let work = shard.work.view(first);
                         let attend = shard.work.view(attending);
                         let target = if devices == 1 { attend.out.base() } else { attend.parts[0].base() };
@@ -2349,9 +2368,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
                             shard.gpu.debug_stamp(at, slot)?;
                         }
                         tap_features(shard, &work, &hp, layer, first, rows as usize, n)?;
-                        attention_ops(shard, &work, &hp, &attention, target, link)
+                        attention_ops(shard, &work, &hp, &attention, target, link)?;
+                        if merged {
+                            let attended = end - attending;
+                            shard.gpu.link_sum(attend.parts[0].base() as P, (attended * hp.width) as u64, attend.out.base(), false)?;
+                            hc_ffn(shard, &attend, &hp, layer, attended, false)?;
+                            router_ops(shard, &attend, &hp, layer, attended, false, publish_merged && index == 0)?;
+                        }
+                        Ok(())
                     })? {
-                        avoided += 2;
+                        avoided += if merged { 3 } else { 2 };
                     }
                 } else {
                     let work = self.shards[index].work.view(first);
@@ -2377,11 +2403,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 continue;
             }
             let attended = end - attending;
-            if !link {
+            if !link && !merged {
                 self.sum_parts(0, attending, attended)?;
             }
             self.stamp(layer, n, Stamp::AttentionDone)?;
             self.mark("attention")?;
+            if merged {
+                self.route_images(layer, attending, end)?;
+                self.mark("router")?;
+                continue;
+            }
             // (the flag is lowered before the router is queued: it may run at once)
             let publish = self.publishes(layer, n, predict);
             if publish {
