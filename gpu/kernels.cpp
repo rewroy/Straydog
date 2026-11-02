@@ -288,7 +288,7 @@ template<int P> struct QwenHeads {
 constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1024 * 1024;
 // A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
 // verify_max) leave what it reads in place, with nothing to copy again.
-constexpr size_t kv_mirror_margin = 4;
+constexpr size_t kv_mirror_margin = 8;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 

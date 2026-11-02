@@ -3,7 +3,7 @@
 //!
 //! Every layer runs in native spans on the GPUs; the host gathers embedding rows, takes the
 //! first maximum of the logits and samples. Speculative decoding drafts with the model's own
-//! MTP layer and verifies up to four tokens per pass with the one-token arithmetic, so greedy
+//! MTP layer and verifies up to eight tokens per pass with the one-token arithmetic, so greedy
 //! output is identical to token-by-token decode.
 //!
 //! A prompt resumes from the longest prefix it shares with what the model holds: the live
@@ -26,11 +26,19 @@ use crate::sampling::{self, Generated, Sampling};
 use crate::vision::IMAGE_TOKEN;
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
 
-pub const MAX_DRAFTS: usize = 3;
+/// The most drafts a pass can verify. MTP drafts stay at three (--draft-max): at 20K, 2048 tokens greedy 154.8 tok/s at three, 153.9
+/// at four and five, 153.3 at seven; sampled 141.2 at three, 137.6 at five, 125.9 at seven. The rows past four are for drafts
+/// that cost no drafting and are nearly always accepted: all accepted, 20K, milliseconds a token by the pass's rows 4.21 at four,
+/// 3.47 at eight.
+pub const MAX_DRAFTS: usize = crate::gpu::VERIFY_MAX - 1;
 /// The per-layer (PLE) n-gram embedding table, read by rows from the host.
 const PLE_TABLE: &str = "per_layer_token_embd.weight";
-/// Rows per verification pass: a token and its drafts.
-const VERIFY_ROWS: usize = MAX_DRAFTS + 1;
+/// Most rows a verification pass takes: a token and its drafts.
+const VERIFY_ROWS: usize = crate::gpu::VERIFY_MAX;
+/// Most rows a partially resident model's pass takes (gpu/hybrid_slots.hpp, hybrid_rows).
+const PARTIAL_ROWS: usize = 4;
+/// Rows a pass of a short prompt takes: every row is kept, and four cost less per row than a wider pass.
+const PROMPT_ROWS: usize = 4;
 /// Longest fully resident prompt that runs as verification passes (about 27 ms per four rows)
 /// rather than as a batched prefill, whose fixed cost is about 110 ms on two R9700s.
 const VERIFIED_PREFILL: usize = 16;
@@ -380,6 +388,8 @@ pub struct Model {
     pub prefill_batch_size: usize,
     pub state_bytes: u64,
     pub speculative: usize,
+    /// The most drafts a long match's copy verifies (drafts::Policy, by the match's length).
+    pub copy_drafts: usize,
     pub resident: bool,
     pub partial: bool,
     pub host_kv: bool,
@@ -396,6 +406,8 @@ pub struct Model {
     pub logits_digests: Option<Vec<String>>,
     /// When set, every logits vector the model returns (validation tooling).
     pub logits_capture: Option<Vec<Vec<f32>>>,
+    /// When set, a speculative decode verifies a known sequence at given widths, with no drafter (see [`ForcedRows`]).
+    pub forced_rows: Option<ForcedRows>,
     /// Inside a pipelined prefill: batches before the last return no rows.
     deferred: bool,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
@@ -433,6 +445,27 @@ pub struct Model {
     /// whether a table of rope positions is up (`sd_rope_rows`). A sequence without any costs a test of these two.
     rope_delta: u32,
     rope_table: bool,
+}
+
+/// A measurement of what a verification pass costs by its rows (examples/prefill --force-rows): the rows are the sequence's next
+/// tokens, the widths taken in turn, with the drafter out of the pass. Given the greedy tokens of the prompt, every draft is
+/// accepted: no replay, and the sequence's kept rows hashed show that a width changes no bit of them.
+#[derive(Default)]
+pub struct ForcedRows {
+    /// The reply as a greedy decode gave it.
+    pub tokens: Vec<u32>,
+    /// A pass's rows, taken in turn.
+    pub widths: Vec<usize>,
+    /// (rows, milliseconds) of every pass.
+    pub passes: Vec<(usize, f64)>,
+    /// The kept rows of the final hidden states, and with `read_logits` their logits, in order.
+    pub digest: sha2::Sha256,
+    pub logits_digest: sha2::Sha256,
+    pub read_logits: bool,
+    /// Passes with a draft that was not accepted (without `reject`, not zero means the rows are not the one-token arithmetic's).
+    pub rejected: usize,
+    /// Every this many passes (0: none), a draft made wrong, its place going round: what follows must not see the rows taken back.
+    pub reject: usize,
 }
 
 impl Model {
@@ -507,6 +540,7 @@ impl Model {
             prefill_batch_size: batch,
             state_bytes,
             speculative: 0,
+            copy_drafts: 0,
             resident: false,
             partial: false,
             host_kv: host,
@@ -519,6 +553,7 @@ impl Model {
             last_metrics: Map::new(),
             logits_digests: None,
             logits_capture: None,
+            forced_rows: None,
             deferred: false,
             mtp_kept: 0,
             draft_vocabulary: false,
@@ -620,7 +655,14 @@ impl Model {
         // Two once the slots hold enough ([`TWO_DRAFTS_SHARE`]).
         let drafts = if model.partial { settings.speculative.min(if two_drafts { 2 } else { 1 }) } else { settings.speculative };
         model.speculative = if drafting && model.weights.drafter { drafts } else { 0 };
+        // (a partially resident model's rows cost it far more: as many as it drafts)
+        model.copy_drafts = if model.partial || model.speculative == 0 { model.speculative } else { VERIFY_ROWS - 1 };
         Ok(model)
+    }
+
+    /// The most rows a pass of this placement takes.
+    pub fn pass_rows(&self) -> usize {
+        if self.partial { PARTIAL_ROWS } else { VERIFY_ROWS }
     }
 
     pub fn info(&self) -> Result<Value> {
@@ -2070,11 +2112,11 @@ impl Model {
         Ok((first, embeddings, hidden, targets, scores))
     }
 
-    /// A short prompt through the verification spans, up to four rows per pass and every row
+    /// A short prompt through the verification spans, up to [`PROMPT_ROWS`] rows per pass and every row
     /// kept: its fixed cost is that of a few decode steps rather than of a batched prefill.
     fn prefill_verified(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let mut rows = Vec::with_capacity(tokens.len() * WIDTH);
-        for chunk in tokens.chunks(VERIFY_ROWS) {
+        for chunk in tokens.chunks(PROMPT_ROWS) {
             let (first, embeddings, hidden) = self.verify_rows(chunk)?;
             self.commit(chunk, chunk.len(), &first, &embeddings)?;
             rows.extend_from_slice(&hidden);
@@ -2236,7 +2278,7 @@ impl Model {
         // accepted nearly always, and the drafter's steps are saved. The MTP layer still takes the kept rows' pairs.
         let mut ngrams = Ngrams::new();
         ngrams.extend(&self.history);
-        let mut policy = Policy::new(self.speculative + 1);
+        let mut policy = Policy::new(self.copy_drafts + 1);
         while produced < max_new {
             if cancelled() {
                 break;
@@ -2248,13 +2290,24 @@ impl Model {
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let (copy, matched) = ngrams.propose(limit);
+            let copy_limit = self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
+            let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
             let width = held.as_deref().map_or(width, |held| held.allowed_prefix(&copy[..width]));
-            let copied = width > 0;
+            let copied = width > 0 && self.forced_rows.is_none();
             let suppression = held.as_deref().and_then(Constraint::suppression).cloned();
-            let (drafts, proposed) = if copied {
+            let (drafts, proposed) = if let Some(forced) = self.forced_rows.as_ref() {
+                let (pass, width) = (forced.passes.len(), forced.widths[forced.passes.len() % forced.widths.len()]);
+                let most = (width - 1).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
+                let mut drafts: Vec<u32> = forced.tokens.iter().skip(produced).take(most).copied().collect();
+                if forced.reject > 0 && pass % forced.reject == 0 && !drafts.is_empty() {
+                    let at = (pass / forced.reject) % drafts.len();
+                    drafts[at] = (drafts[at] + 1) % VOCABULARY as u32;
+                }
+                self.ensure_kv(self.history.len() + most + 1)?;
+                (drafts, Vec::new())
+            } else if copied {
                 self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng, suppression)?;
                 self.ensure_kv(self.history.len() + 1 + width)?;
                 self.protect(self.history.len(), self.history.len() + 1 + width)?;
@@ -2271,7 +2324,8 @@ impl Model {
             }
             let position = self.history.len() as u64;
             let top = if held.is_some() { 0 } else { sampling.top_candidates().unwrap_or(0) };
-            let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some(), top)?;
+            let read_logits = self.forced_rows.as_ref().is_some_and(|forced| forced.read_logits);
+            let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some() || read_logits, top)?;
             let mut clock = Instant::now();
             let (accepted, following) = match (held.as_deref_mut(), scores.as_mut()) {
                 (Some(held), Some(Scores::Logits(logits))) => held.accept_rows(&drafts, &proposed, logits, VOCABULARY, sampling, &mut generated, rng)?,
@@ -2290,6 +2344,15 @@ impl Model {
                 emitted.truncate(index);
             }
             self.commit(&rows, kept, &first, &embeddings)?;
+            if let Some(forced) = self.forced_rows.as_mut() {
+                let bytes = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|value| value.to_le_bytes()).collect() };
+                sha2::Digest::update(&mut forced.digest, bytes(&hidden[..kept * WIDTH]));
+                if let Some(Scores::Logits(logits)) = scores.as_ref() {
+                    sha2::Digest::update(&mut forced.logits_digest, bytes(&logits[..kept * VOCABULARY]));
+                }
+                forced.rejected += usize::from(accepted < drafts.len());
+                forced.passes.push((rows.len(), 1e3 * pass_started.elapsed().as_secs_f64()));
+            }
             self.final_hidden = Some(hidden[(kept - 1) * WIDTH..kept * WIDTH].to_vec());
             self.metric_count("speculative_passes", 1);
             self.metric_count("drafted_tokens", drafts.len() as u64);
@@ -2341,7 +2404,7 @@ impl Model {
         // The pairs no pass caught up on, now: else the MTP layer's rows from the last pass up
         // to the sequence's last would keep what was there before (another sequence's, or a
         // draft's), which every later draft attends to. (The draft does nothing more at 0.)
-        if !mtp_tokens.is_empty() {
+        if !mtp_tokens.is_empty() && self.forced_rows.is_none() {
             self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng, None)?;
         }
         Ok(())

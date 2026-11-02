@@ -162,6 +162,68 @@ fn speculation_leaves_the_target_as_decoding() {
     assert_eq!((&with_next.tokens, &with_next.logits), (&without_next.tokens, &without_next.logits), "the next turn");
 }
 
+/// Passes of up to eight rows, drafts rejected at every place, on the resident placements (each its own path through the layers:
+/// layers in parts, whole layers with their experts split, host K/V behind its stage): the tokens, final hidden state and target
+/// state of plain one-row decode, and the next turn the same logits. A row taken back must leave what the kept rows read (K/V
+/// mirrors' margin, the indexers' history ring, DeltaNet and PLE replay).
+#[test]
+fn wide_passes_leave_the_target_as_decoding() {
+    let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
+                                             common::model_env("STRAYDOG_DRAFTER", "the drafter directory"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
+    let golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let quantization = golden["quantization"].as_str().unwrap();
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let only = std::env::var("STRAYDOG_PLACEMENT").ok();
+    for name in ["two-gpu-experts-mtp", "two-gpu-layers-mtp", "two-gpu-host-kv-mtp"] {
+        if only.as_ref().is_some_and(|only| only != name) {
+            continue;
+        }
+        let expected = &golden["placements"][name];
+        let prompt = |label: &str| -> Vec<u32> {
+            let request = expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == label).unwrap();
+            serde_json::from_value(request["prompt"].clone()).unwrap()
+        };
+        // (a request for a long story, so that the passes go past every width and rows are taken back at every place)
+        let text = straydog_engine::text::Text::new(&std::fs::read(PathBuf::from(&model_root).join("tokenizer.json")).unwrap()).unwrap();
+        let story = text.encode("Write a long, original short story about a lighthouse keeper who receives a strange radio \
+                                 signal during a winter storm. Use vivid detail and dialogue, at least 800 words.").unwrap();
+        let conversation = turn(&prompt("root"), &[], &story);
+        let mut plain = open(&model_root, &drafter, quantization, &expected["placement"]);
+        plain.speculative = 0;
+        let without = go(&mut plain, &conversation, 192, None);
+        assert_eq!(without.tokens.len(), 192, "{name}: a long reply");
+        let next = turn(&conversation, &without.tokens, &prompt("root")[4030..4060]);
+        let without_next = go(&mut plain, &next, 1, None);
+        drop(plain);
+        for reject in [0, 2] {
+            let mut model = open(&model_root, &drafter, quantization, &expected["placement"]);
+            model.forced_rows = Some(straydog_engine::model::ForcedRows {
+                tokens: without.tokens.clone(), widths: vec![8, 5, 7, 6, 8, 2, 3, 4, 1], reject, ..Default::default()
+            });
+            let wide = go(&mut model, &conversation, 192, None);
+            let forced = model.forced_rows.take().unwrap();
+            let widest = forced.passes.iter().map(|(rows, _)| *rows).max().unwrap();
+            eprintln!("{name}: {} passes, rejected {}", forced.passes.len(), forced.rejected);
+            assert!(widest == 8 && forced.passes.len() >= 30, "{name}: {} passes up to {widest} rows", forced.passes.len());
+            assert!(if reject > 0 { forced.rejected > 0 } else { forced.rejected == 0 }, "{name}: rejected {}", forced.rejected);
+            assert_eq!(wide.tokens, without.tokens, "{name}: tokens");
+            assert_eq!(wide.hidden, without.hidden, "{name}: final hidden");
+            let target = |outcome: &Outcome| -> Vec<String> { outcome.state.iter().filter(|line| !line.contains(":blk.48.")).cloned().collect() };
+            let (wide_state, without_state) = (target(&wide), target(&without));
+            for (a, b) in wide_state.iter().zip(&without_state).filter(|(a, b)| a != b).take(24) {
+                eprintln!("{name}: wide {a} (one row {})", b.rsplit(' ').next().unwrap());
+            }
+            assert!(wide_state == without_state, "{name}: target state");
+            let wide_next = go(&mut model, &next, 1, None);
+            assert_eq!((&wide_next.tokens, &wide_next.logits), (&without_next.tokens, &without_next.logits), "{name}: the next turn");
+        }
+    }
+}
+
 #[test]
 fn generations_equal_the_reference() {
     let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
