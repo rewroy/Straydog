@@ -96,6 +96,16 @@ impl ChatTemplate {
         self.render_decoded(&decoded, tools, &[("enable_thinking", Value::Bool(thinking)), ("reasoning_effort", Value::Str(effort.into()))])
     }
 
+    /// [`ChatTemplate::render`] of a request with images: a message's content may also be a list of text parts, each image's
+    /// part a text part by then (see the worker's images).
+    pub fn render_parts(&self, messages: &Value, tools: &Value, thinking: bool, effort: &str) -> Result<String, ChatError> {
+        let decoded = Self::messages(messages, true)?;
+        if !matches!(effort, "low" | "medium" | "xhigh") {
+            return Err(error("invalid Straydog reasoning effort"));
+        }
+        self.render_decoded(&decoded, tools, &[("enable_thinking", Value::Bool(thinking)), ("reasoning_effort", Value::Str(effort.into()))])
+    }
+
     /// The prompt for `messages` and `tools` with the template's own variables (a family's
     /// thinking and effort controls), ending with the assistant's generation prompt. A message's
     /// content may also be a list of text parts (a request's with images, each image's part a text

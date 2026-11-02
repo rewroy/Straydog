@@ -559,7 +559,8 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     };
     // (a message's own text never writes the template's tokens: see Text::defuse)
     let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
-    let prompt = engine.template.render(messages, &tools, thinking, effort).map_err(|exc| refused(exc.0))?;
+    let prompt = if images.is_empty() { engine.template.render(messages, &tools, thinking, effort) } else { engine.template.render_parts(messages, &tools, thinking, effort) }
+        .map_err(|exc| refused(exc.0))?;
     let (ids, prepared, spans) = if images.is_empty() {
         (text.encode(&prompt).map_err(Failure::from)?, Vec::new(), Vec::new())
     } else {
