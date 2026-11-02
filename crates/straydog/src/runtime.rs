@@ -182,6 +182,9 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
         push("drafter", drafter.display().to_string());
         push("speculative", settings.draft_max.to_string());
     }
+    if let Some(vision) = &settings.model_vision {
+        push("mmproj", vision.display().to_string());
+    }
     push("devices", settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","));
     push("split-mode", if settings.split_mode == SplitMode::Layer { "layer" } else { "experts" }.into());
     push("context", settings.ctx_size.to_string());
@@ -253,6 +256,10 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
     if let (Some(drafter), true) = (&settings.model_draft, settings.draft_max > 0) {
         files.push(drafter.join(&pins.drafter.name));
         directories.push(drafter.clone());
+    }
+    if let Some(vision) = &settings.model_vision {
+        files.push(vision.clone());
+        directories.extend(vision.parent().map(std::path::Path::to_path_buf));
     }
     files.extend(trees);
     directories.extend(tree_directory);
@@ -1262,7 +1269,8 @@ impl Engine for Runtime {
                 speculative: ready["speculative_drafts"].as_u64().unwrap_or(0),
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
-                                  "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true}),
+                                  "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true,
+                                  "vision_refusal": ready["vision_refusal"]}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }

@@ -86,6 +86,15 @@
       "sha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b"
     }
   ],
+  "vision": {
+    "kind": "mmproj",
+    "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    "revision": "1c04b8102ca5346f1faf4d9914503e378d713021",
+    "source_path": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "name": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "bytes": 907543008,
+    "sha256": "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"
+  },
   "drafter": {
     "kind": "mtp",
     "repository": "Qwen/Qwen3.8-Flash-Next",

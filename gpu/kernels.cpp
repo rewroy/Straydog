@@ -487,6 +487,11 @@ struct Device {
     // check accumulates in flags[1] until sd_prefill_settle. `handoff` orders a row handoff
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
+    // A sequence with images (sd_rope_delta, sd_rope_rows). The table is allocated at its first image, beside the budget:
+    // a few KiB the runtime's reserve holds, needed when the slots have taken all that is counted.
+    uint32_t rope_delta = 0;
+    uint32_t* rope_rows = nullptr;
+    size_t rope_first = 0, rope_count = 0;
     hipEvent_t handoff = nullptr;
     // Host states allocated beside reading the weights (sd_host_states_prefetch): zeroing and
     // page-locking ~13 GB of K/V. The thread alone writes `host_ready` until joined.
@@ -638,6 +643,7 @@ struct Device {
         if (attention_scores) cleanup(hipFree(attention_scores));
         if (blas_workspace) cleanup(hipFree(blas_workspace));
         if (flags) cleanup(hipFree(flags));
+        if (rope_rows) cleanup(hipFree(rope_rows));
         if (handoff) cleanup(hipEventDestroy(handoff));
         for (int i = 0; i < 2; ++i) {
             if (mtp_staged[i]) { cleanup(hipEventSynchronize(mtp_staged[i])); cleanup(hipEventDestroy(mtp_staged[i])); }
@@ -1596,6 +1602,25 @@ int sd_prefill_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,u
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Deferred prefill: while on, spans that return no rows end without waiting for the device.
+int sd_rope_delta(void* handle,uint32_t delta) {
+    try {
+        device(handle).rope_delta=delta;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+
+int sd_rope_rows(void* handle,uint64_t first,uint64_t count,const uint32_t* axes) {
+    try {
+        Device& d=device(handle);
+        constexpr size_t most=4096+4;
+        if (count>most || (count && !axes)) throw std::runtime_error("invalid Straydog rope table");
+        if (count && !d.rope_rows) check(hipMalloc(reinterpret_cast<void**>(&d.rope_rows),most*3*4));
+        if (count) upload(d,d.rope_rows,axes,size_t(count)*3*4);
+        d.rope_first=size_t(first); d.rope_count=size_t(count);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+
 int sd_prefill_defer(void* handle,int on) {
     try {
         Device& d=device(handle);

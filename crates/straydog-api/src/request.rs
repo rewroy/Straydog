@@ -360,6 +360,9 @@ fn same(value: &Value, other: &Value) -> bool {
     }
 }
 
+/// What an image is refused with where the model reads none.
+pub(crate) const NO_IMAGES: &str = "this model reads no images";
+
 /// A message for the template: the known fields in the client's order, a developer message
 /// as a system one, and the content as text; with `vision` (a model that reads images), a user's
 /// or a tool's content with images as its parts.
@@ -393,7 +396,7 @@ fn text(content: &Value) -> Result<String, ApiError> {
             .iter()
             .map(|part| match (part.get("type").and_then(Value::as_str), part.get("text")) {
                 (Some("text"), Some(Value::Str(text))) => Ok(text.as_str()),
-                (Some("image_url" | "image"), _) => Err(ApiError::invalid("this model reads no images")),
+                (Some("image_url" | "image"), _) => Err(ApiError::invalid(NO_IMAGES)),
                 _ => Err(ApiError::invalid("only text and image content is supported")),
             })
             .collect::<Result<String, _>>(),

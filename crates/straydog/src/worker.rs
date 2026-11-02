@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::images;
+
 use clap::Args;
 use serde_json::{json, Value};
 use straydog_engine::chat::{self, ChatTemplate};
@@ -18,6 +20,7 @@ use straydog_engine::reply::THINK_CLOSE;
 use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings, END_TOKENS};
 use straydog_engine::pyjson;
+use straydog_engine::qwen_vision::{Encoder, ImageSpan};
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
@@ -36,6 +39,9 @@ pub struct WorkerArgs {
     pub quant: String,
     #[arg(long)]
     pub drafter: Option<PathBuf>,
+    /// Qwen3.8's vision encoder and projector.
+    #[arg(long)]
+    pub mmproj: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     pub speculative: usize,
     #[arg(long, value_delimiter = ',', default_value = "0")]
@@ -110,7 +116,18 @@ impl Loading {
 struct Engine {
     model: Model,
     template: ChatTemplate,
+    /// The vision encoder, or why images are refused.
+    vision: Result<Encoder, String>,
+    /// The rows of the images encoded last (by their bytes' digest), newest last: a conversation sends its images
+    /// again with every turn.
+    encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
 }
+
+/// Bytes of image rows kept for the turns after ([`Engine::encoded`]): about 40 full screens (1440x900 is 1260 rows of 2560 values).
+const ENCODED_BYTES: usize = 512 << 20;
+
+/// What a model's images are refused with when it has no encoder file.
+const NO_VISION_FILE: &str = "its vision encoder file is not beside it: `straydog setup` fetches it, or give --mmproj FILE";
 
 /// A loaded model as the request loop drives it: one request at a time, and a reset after a
 /// failed one.
@@ -267,14 +284,23 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
     let opened = Instant::now();
-    // The model files open while the GPUs initialize.
-    let (group, weights) = std::thread::scope(|scope| {
+    // The model files open while the GPUs initialize, and the vision encoder's is hashed (it is read through the page cache:
+    // none of it stays in this process until an image comes).
+    let (group, weights, vision) = std::thread::scope(|scope| {
         let weights = scope.spawn(|| Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report));
+        let vision = scope.spawn(|| match &args.mmproj {
+            Some(path) => bundle_vision().and_then(|pin| Encoder::open(path, &pin)),
+            None => Err(NO_VISION_FILE.to_string()),
+        });
         let group = Group::new(&args.devices, &plan.budgets, split)
             .and_then(|mut group| group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16").map(|()| group));
-        (group, weights.join().unwrap())
+        (group, weights.join().unwrap(), vision.join().unwrap())
     });
     let (group, mut weights) = (group?, weights?);
+    // (the model serves text all the same)
+    if let (Err(reason), Some(_)) = (&vision, &args.mmproj) {
+        eprintln!("WARN Straydog reads no images: {reason}");
+    }
     // With the shards' verity trees, what is read again after loading is checked block by block.
     if let Some(data_dir) = &args.data_dir {
         weights.open_trees(data_dir)?;
@@ -314,13 +340,52 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
         "speculation": if model.speculative > 0 { json!([{"kind": "mtp", "drafts": model.speculative}]) } else { json!([]) },
+        "vision": vision.is_ok(),
+        "vision_refusal": vision.as_ref().err(),
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" }},
         "load_seconds": seconds,
         "gpu": model.info()?,
     }));
-    serve(Arc::new(Mutex::new(Engine { model, template })), text, output)
+    serve(Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new() })), text, output)
+}
+
+fn bundle_vision() -> Result<straydog_engine::bundle::Asset, String> {
+    straydog_engine::bundle::qwen_vision_source().map(|source| source.asset)
+}
+
+impl Engine {
+    /// The rows of the placed images (by index; none for an image the prompt does not hold): those encoded lately kept, the
+    /// others encoded. None when the request was cancelled meanwhile.
+    fn image_rows(&mut self, images: &[images::QwenImage], spans: &[(usize, usize)], cancel: &AtomicBool)
+                  -> Result<Option<Vec<Option<Arc<Vec<f32>>>>>, Failure> {
+        let encoder = self.vision.as_ref().map_err(|reason| refused(format!("this model reads no images: {reason}")))?;
+        let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
+        for &(index, _) in spans {
+            if rows[index].is_some() {
+                continue;
+            }
+            let digest = images[index].digest;
+            if let Some(at) = self.encoded.iter().position(|(kept, _)| *kept == digest) {
+                let kept = self.encoded.remove(at);
+                rows[index] = Some(kept.1.clone());
+                self.encoded.push(kept);
+                continue;
+            }
+            // (a refusal: nothing of the model's state has moved, and the worker reads on)
+            let encoded = encoder.encode(&images[index].prepared, &|| cancel.load(Ordering::SeqCst))
+                .map_err(|message| refused(format!("the vision encoder: {message}")))?;
+            let Some(encoded) = encoded else { return Ok(None) };
+            let encoded = Arc::new(encoded);
+            rows[index] = Some(encoded.clone());
+            self.encoded.push((digest, encoded));
+            while self.encoded.iter().map(|(_, values)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+                self.encoded.remove(0);
+            }
+        }
+        Ok(Some(rows))
+    }
 }
 
 /// Read bounded frames until stdin closes or `shutdown`; reject concurrent generation.
@@ -432,6 +497,7 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     // Nor does a prompt found too long before anything ran.
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
+        && !message.ends_with(straydog_engine::model::IMAGE_ROWS)
         && !message.ends_with("exceeds the allocated context");
     Failure { message: format!("{site}: {message}"), fatal }
 }
@@ -476,6 +542,14 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
        started: Instant) -> Result<Value, Failure> {
     use pyjson::Value as Py;
     let messages = body.get("messages").ok_or_else(|| refused("'messages'"))?;
+    // (each image part a marker of its own until the prompt is rendered)
+    let (messages, images) = images::take(messages).map_err(refused)?;
+    if !images.is_empty() {
+        if let Err(reason) = &engine.vision {
+            return Err(refused(format!("this model reads no images: {reason}")));
+        }
+    }
+    let messages = &messages;
     let tools = body.get("tools").cloned().unwrap_or(Py::Null);
     let thinking = body.get("thinking").is_some_and(Py::truthy);
     let effort = match body.get("reasoning_effort") {
@@ -486,9 +560,36 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // (a message's own text never writes the template's tokens: see Text::defuse)
     let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
     let prompt = engine.template.render(messages, &tools, thinking, effort).map_err(|exc| refused(exc.0))?;
-    let ids = text.encode(&prompt).map_err(Failure::from)?;
+    let (ids, prepared, spans) = if images.is_empty() {
+        (text.encode(&prompt).map_err(Failure::from)?, Vec::new(), Vec::new())
+    } else {
+        let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
+        let prepared: Vec<images::QwenImage> = images.iter().map(|bytes| images::prepare_qwen(bytes)).collect::<Result<_, _>>().map_err(refused)?;
+        let (ids, spans) = images::qwen_ids(text, &pieces, &prepared).map_err(Failure::from)?;
+        (ids, prepared, spans)
+    };
     let encode_seconds = started.elapsed().as_secs_f64();
+    let image_started = Instant::now();
     let context = engine.model.context;
+    // (a prompt too long is refused before its images are encoded)
+    if ids.len() >= context {
+        return Err(refused("Straydog prompt plus output exceeds the allocated context"));
+    }
+    let image_spans: Vec<ImageSpan> = if spans.is_empty() {
+        Vec::new()
+    } else {
+        let Some(rows) = engine.image_rows(&prepared, &spans, cancel)? else {
+            return Ok(json!({"id": id, "event": "done", "finish_reason": "cancelled",
+                             "usage": {"prompt_tokens": ids.len(), "completion_tokens": 0, "total_tokens": ids.len(), "cached_tokens": 0},
+                             "gpu": gpu_info_or_null(engine.model.info(), concat!(file!(), ":", line!(), " model.info")),
+                             "timings": {"encode_seconds": encode_seconds, "images": spans.len()}}));
+        };
+        spans.iter().map(|&(index, start)| ImageSpan {
+            start, grid: prepared[index].prepared.grid(), rows: rows[index].clone().unwrap_or_default(),
+        }).collect()
+    };
+    let image_seconds = image_started.elapsed().as_secs_f64();
+    engine.model.set_images(image_spans);
     let max_new = match body.get("max_tokens") {
         None => 512,
         Some(Py::Null) => context as i128 - ids.len() as i128,
@@ -600,6 +701,10 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     };
     let mut timings = engine.model.last_metrics.clone();
     timings.insert("encode_seconds".into(), json!(encode_seconds));
+    if !spans.is_empty() {
+        timings.insert("images".into(), json!(spans.len()));
+        timings.insert("image_seconds".into(), json!(image_seconds));
+    }
     timings.insert("first_text_seconds".into(), json!(first_text));
     timings.insert("request_seconds".into(), json!(started.elapsed().as_secs_f64()));
     let cached = timings.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0);
