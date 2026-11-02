@@ -14,6 +14,7 @@ use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings};
 use straydog_engine::qwen_vision::{ImageSpan, ROW, VISION_END, VISION_START};
 use straydog_engine::sampling::Sampling;
+use straydog_engine::text::Text;
 use straydog_engine::vision::IMAGE_TOKEN;
 use straydog_engine::weights::Weights;
 
@@ -64,12 +65,14 @@ fn rope_positions_agree_on_every_path() {
     // A sequence with an image: the reply's decode rows (the delta) are what the same tokens in a batch (the table) are.
     let grid = (8, 8);
     let rows: Vec<f32> = (0..64 * ROW).map(|index| ((index * 2_654_435_761usize) % 1000) as f32 / 10_000.0 - 0.05).collect();
-    let mut prompt = text(40, 9);
+    // (a chat's prompt, for a reply that goes on: tokens at random end it at once)
+    let tokenizer = Text::new(&std::fs::read(PathBuf::from(std::env::var_os("STRAYDOG_MODEL").unwrap()).join("tokenizer.json")).unwrap()).unwrap();
+    let mut prompt = tokenizer.encode("<|im_start|>user\nLook at this picture of static on a screen.\n").unwrap();
     prompt.push(VISION_START);
     let start = prompt.len();
     prompt.extend((0..64u32).map(|offset| IMAGE_TOKEN | (12345 + offset)));
     prompt.push(VISION_END);
-    prompt.extend(text(40, 11));
+    prompt.extend(tokenizer.encode("\nWrite a long poem about the sea, in plain words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n").unwrap());
     let span = ImageSpan { start, grid, rows: Arc::new(rows) };
     model.set_images(vec![span.clone()]);
     let (tokens, logits) = reply(&mut model, &prompt, 12);
@@ -77,6 +80,7 @@ fn rope_positions_agree_on_every_path() {
     for kept in [1, 4, 7, 11] {
         let longer: Vec<u32> = prompt.iter().chain(&tokens[..kept]).copied().collect();
         let (next, next_logits) = reply(&mut model, &longer, 1);
+        println!("after {kept} tokens: the batch's logits apart from the decode's by {}", close(&next_logits[0], &logits[kept]));
         assert_eq!(next[0], tokens[kept], "after {kept} tokens read in a batch");
         assert!(close(&next_logits[0], &logits[kept]) < 0.05, "after {kept}: logits apart by {}", close(&next_logits[0], &logits[kept]));
     }
