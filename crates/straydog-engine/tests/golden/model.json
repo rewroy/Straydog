@@ -15171,7 +15171,7 @@
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
       "drafted_tokens": 21,
-      "accepted_tokens": 21
+      "accepted_tokens": 18
      },
      "logits": [
       "65363dd25bf3b7802b28f581b7f1cdb44a0f76a65d705ffcd5b149c6197fc2bb"
@@ -45657,7 +45657,7 @@
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
       "drafted_tokens": 19,
-      "accepted_tokens": 19
+      "accepted_tokens": 18
      },
      "logits": [
       "5bae8fa584218cb984fe5fb880be00ee00152bd2236ff6bbce19a0b369acc3e4"
@@ -76151,7 +76151,7 @@
       "decode_forward_tokens": 24,
       "speculative_passes": 7,
       "drafted_tokens": 21,
-      "accepted_tokens": 21
+      "accepted_tokens": 18
      },
      "logits": [
       "65363dd25bf3b7802b28f581b7f1cdb44a0f76a65d705ffcd5b149c6197fc2bb"
