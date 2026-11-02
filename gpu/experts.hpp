@@ -959,7 +959,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
               reinterpret_cast<uintptr_t>(input) % 16 == 0 && input_stride % 4 == 0 && gate_lds <= 65536;
     down_lds = slot_q8_lds(down_kind, down.cols, plan.top_k);
     q8_down = d.q8_decode && down_kind >= 0 &&
-              (down_kind == 16 || down_kind == 17 || slot_q5k_kind(down_kind)) &&
+              (down_kind == 16 || down_kind == 17 || down_kind == 29 || slot_q5k_kind(down_kind)) &&
               down.cols % 256 == 0 && plan.top_k <= 16 && reinterpret_cast<uintptr_t>(product) % 16 == 0 && plan.product_stride % 4 == 0 &&
               down_lds <= 65536;
     // An IQ2 row of 4096 to 8191 values (DeepSeek-V4.1's gate and up, 5120) takes at most four lanes on the Q8 kernels: over eight a wave's loads
@@ -1025,7 +1025,7 @@ bool slot_experts(Device& d, SlotExperts plan, int stages, const uint64_t* bases
             else slot_down_q8<format, false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{}); \
             break;
         switch (down_kind) {
-            SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17)
+            SD_SLOT_DOWN_Q8(16) SD_SLOT_DOWN_Q8(17) SD_SLOT_DOWN_Q8(29)
             case 13:
                 if (linked) slot_down_q5k<true><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, *tail);
                 else slot_down_q5k<false><<<blocks, threads, down_lds, d.stream>>>(plan, bases, product, out, out_stride, LinkTail{});
