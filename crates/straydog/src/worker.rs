@@ -195,12 +195,18 @@ fn margin(total: u64) -> u64 {
 
 /// How long `auto` waits for a GPU's free memory to stop growing (a previous worker releasing it).
 const SETTLE: Duration = Duration::from_secs(5);
+/// The same with more than a quarter of the GPU held. On Windows the desktop's programs hold that as often as not and keep it, so a start
+/// waited [`VRAM_PATIENCE`] for nothing each time: `--vram auto` on an RTX 5070 Ti with 72% free came up in 78 s, of which 18 were the model's.
+#[cfg(windows)]
+const SETTLE_HELD: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
+const SETTLE_HELD: Duration = VRAM_PATIENCE;
 
 /// Each GPU's budget. Given ones wait until the GPU has them free: memory a previous worker still
 /// holds is released after it exits, while memory another process keeps fails the start after
 /// [`VRAM_PATIENCE`] (a GPU smaller than its budget is left to fail as it does). `auto` waits
 /// until nine tenths of each GPU are free, or until its free memory has stopped growing for
-/// [`SETTLE`] with at most a quarter of it held, and at most [`VRAM_PATIENCE`] in all; then it
+/// [`SETTLE`] with at most a quarter of it held ([`SETTLE_HELD`] with more), and at most [`VRAM_PATIENCE`] in all; then it
 /// takes what is free less a margin, in whole 256 MiB. A display's or another program's share is
 /// left to it, but a job holding more of the GPU (a test or benchmark about to end) is waited
 /// for, not placed around in the memory it leaves.
@@ -238,7 +244,7 @@ fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> R
                         grown = (free, Instant::now());
                     }
                     // (a share of up to a quarter that another program keeps is left to it)
-                    let settled = grown.1.elapsed() >= SETTLE && free >= total / 4 * 3;
+                    let settled = grown.1.elapsed() >= if free >= total / 4 * 3 { SETTLE } else { SETTLE_HELD };
                     if free >= total / 10 * 9 || settled || started.elapsed() >= VRAM_PATIENCE {
                         chosen.push(free.saturating_sub(margin(total)) / (256 << 20) * (256 << 20));
                         break;
