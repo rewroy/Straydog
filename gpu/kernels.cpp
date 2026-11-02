@@ -3884,6 +3884,15 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
             list.push_back(&d);
             all.parts[i] = parts[i];
         }
+        // Two devices with a sum link and a sum that fits it: over the link, on the devices (device_link.hpp). No host event, so a graph
+        // can record it, and no read over the bus of the other's part.
+        if (devices == 2 && list[0]->sums.peer == list[1] && size_t(count) <= list[0]->sums.capacity) {
+            for (size_t i = 0; i < 2; ++i)
+                on_device(list[i]->ordinal, [&]() {
+                    if (sd_op_link_sum(handles[i], parts[i], count, outs[i], 0)) throw std::runtime_error(last_error);
+                });
+            return 0;
+        }
         // Peer access, once per pair (a device without it cannot take part).
         static std::mutex mutex;
         static std::vector<std::pair<int, int>> linked;
