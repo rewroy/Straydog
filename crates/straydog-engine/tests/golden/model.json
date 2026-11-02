@@ -60996,7 +60996,7 @@
    "resident": true,
    "partial": false,
    "host_kv": true,
-   "prefill_batch_size": 2048,
+   "prefill_batch_size": 4096,
    "speculative": 3,
    "state_bytes": 14401219072,
    "requests": [
@@ -65914,6 +65914,14 @@
       220,
       19,
       17,
+      5134,
+      421,
+      279,
+      54517,
+      4202,
+      220,
+      18,
+      24,
       16673,
       310,
       2972,
@@ -65926,16 +65934,16 @@
       "cached_tokens": 0,
       "resumed_from": "live",
       "prefill_tokens": 4902,
-      "generated_tokens": 11,
-      "decode_forward_tokens": 10,
-      "speculative_passes": 4,
-      "drafted_tokens": 12,
-      "accepted_tokens": 9
+      "generated_tokens": 19,
+      "decode_forward_tokens": 18,
+      "speculative_passes": 6,
+      "drafted_tokens": 17,
+      "accepted_tokens": 15
      },
      "logits": [
-      "ffc8ba3627aebecc7971a038a82d2f9a6754a3780dedebec2b8ea55150b808e2"
+      "a6df4f72e0154803e5b06d5f8e15090dec1ad1ea67a90829876a699d1dde14c3"
      ],
-     "final_hidden": "2a95d2d3334e7d9c2f3bf8a3443d966ec9d168e53f8692f64b68b98947120f76"
+     "final_hidden": "7eeca427c0b898d6b91155a0aeb516eec2fb2b99f93f9e8f3f494f3e4c6abefb"
     },
     {
      "name": "live",
@@ -70885,9 +70893,9 @@
       22
      ],
      "metrics": {
-      "cached_tokens": 4913,
-      "resumed_from": "live",
-      "prefill_tokens": 22,
+      "cached_tokens": 4892,
+      "resumed_from": "turn",
+      "prefill_tokens": 43,
       "generated_tokens": 3,
       "decode_forward_tokens": 2,
       "speculative_passes": 2,
@@ -70895,9 +70903,9 @@
       "accepted_tokens": 3
      },
      "logits": [
-      "1f7e40870c172495e38a3c779ae92d6b1e55d258d7d003e5252296269086c47e"
+      "48457b82160b02f909d9dff451e3f6e57464cbd27cd3c352dbd2ef48eff1f15c"
      ],
-     "final_hidden": "9be9b2519090de193cd1fb14ac22c611392a9d74d96afa0f508d7ab74de8bf9c"
+     "final_hidden": "734ec105a312b5cd6d0bdbec91df5f496eba85397fb724178205030078470eb1"
     },
     {
      "name": "tools",
@@ -76146,9 +76154,9 @@
       "accepted_tokens": 21
      },
      "logits": [
-      "65c9942df8c979735c3a46bc427e5db25dd0598db95b63350e5f4979bf19e163"
+      "65363dd25bf3b7802b28f581b7f1cdb44a0f76a65d705ffcd5b149c6197fc2bb"
      ],
-     "final_hidden": "a573229ecc06f636713843451289cb63fd6baa5ef04e356288a3ddb592074a87"
+     "final_hidden": "b5f1300da4c6b8df018c52c22620e203728183557387e336bc0582a1869d5769"
     },
     {
      "name": "step",
@@ -81426,13 +81434,13 @@
       "generated_tokens": 9,
       "decode_forward_tokens": 8,
       "speculative_passes": 3,
-      "drafted_tokens": 6,
+      "drafted_tokens": 9,
       "accepted_tokens": 6
      },
      "logits": [
-      "2f40876328cf284e78903ab94199c94c9ae2921be595057ff22663f6da99a375"
+      "6f8c518ff0a4f083b0743885728d4360314ff002af113195fb1e71b336913d37"
      ],
-     "final_hidden": "6ec9dcc9a26c579f37b8baf2cc75c8d27be40213aedea665c4ffafed24a4f29d"
+     "final_hidden": "54ec9937fd519dcd53d3a33e0820d46858ee46a301e9be900ea565e3f693b3e1"
     },
     {
      "name": "turn",
@@ -86392,9 +86400,9 @@
       "accepted_tokens": 2
      },
      "logits": [
-      "265cfb18a8afb8059f41ac370d1f1bad207fcc89b4fe33e9065e0eb856105493"
+      "33851dcc9aaecc88903f7d39591de467a7c6b7c3f0ffcce74c108f9cbaac8a04"
      ],
-     "final_hidden": "695d53783a30ac36167d9ec981b5b68002dce0d8e19e42682210df57543534df"
+     "final_hidden": "bdaecd6614def541f013844d29d5d6f7db9e38139960319b50450de8fc36bd13"
     },
     {
      "name": "new-chat",
@@ -91315,7 +91323,7 @@
       1532,
       513,
       2250,
-      8129,
+      10379,
       421,
       8900,
       310,
@@ -91361,14 +91369,14 @@
       "prefill_tokens": 22,
       "generated_tokens": 48,
       "decode_forward_tokens": 47,
-      "speculative_passes": 13,
+      "speculative_passes": 14,
       "drafted_tokens": 34,
-      "accepted_tokens": 34
+      "accepted_tokens": 33
      },
      "logits": [
-      "3fec032dbea8f66ea2f434c58114810bb76a1d49a3cd5239337a47e6d28b2a9e"
+      "72ed42097e7881017f2a8a824f7ef591724da2425bbf0fe44214db6aed9720f3"
      ],
-     "final_hidden": "8f0f7ec640f5443404e6dbc5852752751524f9115cf4310f0936cc3ce1b46b1b"
+     "final_hidden": "369373e7bb5ddd8812bba680a21dbc945123567dd2d9cd1c14b5a791ac1784a7"
     },
     {
      "name": "one-off",
