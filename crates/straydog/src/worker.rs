@@ -374,7 +374,9 @@ impl Engine {
                 continue;
             }
             // (a refusal: nothing of the model's state has moved, and the worker reads on)
-            let encoded = encoder.encode(&images[index].prepared, &|| cancel.load(Ordering::SeqCst))
+            // (whatever an image does in there, the worker reads on)
+            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(&images[index].prepared, &|| cancel.load(Ordering::SeqCst))))
+                .unwrap_or_else(|_| Err("it failed on this image".to_string()))
                 .map_err(|message| refused(format!("the vision encoder: {message}")))?;
             let Some(encoded) = encoded else { return Ok(None) };
             let encoded = Arc::new(encoded);
@@ -497,7 +499,7 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     // Nor does a prompt found too long before anything ran.
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
-        && !message.ends_with(straydog_engine::model::IMAGE_ROWS)
+        && !message.ends_with(straydog_engine::model::IMAGE_REFUSED)
         && !message.ends_with("exceeds the allocated context");
     Failure { message: format!("{site}: {message}"), fatal }
 }
@@ -548,6 +550,10 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         if let Err(reason) = &engine.vision {
             return Err(refused(format!("this model reads no images: {reason}")));
         }
+        // (a pass over an image's rows is a batch of two at the least)
+        if engine.model.prefill_batch_size < 2 {
+            return Err(refused("this model reads no images with a prefill batch of one token: raise --batch-size"));
+        }
     }
     let messages = &messages;
     let tools = body.get("tools").cloned().unwrap_or(Py::Null);
@@ -576,7 +582,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     if ids.len() >= context {
         return Err(refused("Straydog prompt plus output exceeds the allocated context"));
     }
-    let image_spans: Vec<ImageSpan> = if spans.is_empty() {
+    let image_rows = if spans.is_empty() {
         Vec::new()
     } else {
         let Some(rows) = engine.image_rows(&prepared, &spans, cancel)? else {
@@ -585,12 +591,9 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
                              "gpu": gpu_info_or_null(engine.model.info(), concat!(file!(), ":", line!(), " model.info")),
                              "timings": {"encode_seconds": encode_seconds, "images": spans.len()}}));
         };
-        spans.iter().map(|&(index, start)| ImageSpan {
-            start, grid: prepared[index].prepared.grid(), rows: rows[index].clone().unwrap_or_default(),
-        }).collect()
+        rows
     };
     let image_seconds = image_started.elapsed().as_secs_f64();
-    engine.model.set_images(image_spans);
     let max_new = match body.get("max_tokens") {
         None => 512,
         Some(Py::Null) => context as i128 - ids.len() as i128,
@@ -658,6 +661,17 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // client that sends none, as Dogmind App does, ended the worker on "exceeds the allocated context" on the first such reply.
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
     let agreed = if agreed.len() < context { agreed } else { ids.clone() };
+    // (the images past such a place have moved with it)
+    let (agreed, placed) = match images::spans_in(&spans, &ids, &agreed) {
+        Some(placed) => (agreed, placed),
+        None => (ids.clone(), spans.clone()),
+    };
+    if !spans.is_empty() && agreed.len() != ids.len() {
+        eprintln!("Straydog: a reply read back moves this request's images by {} tokens", agreed.len() as i64 - ids.len() as i64);
+    }
+    engine.model.set_images(placed.iter().map(|&(index, start)| ImageSpan {
+        start, grid: prepared[index].prepared.grid(), rows: image_rows[index].clone().unwrap_or_default(),
+    }).collect());
     let max_new = max_new.min(context - agreed.len());
     let result = engine.model.generate_constrained(
         &agreed, max_new, &sampling, seed, &cancelled,
@@ -798,6 +812,8 @@ mod tests {
         assert!(!failed.fatal);
         assert_eq!(failed.message, format!("site: {void}"));
         assert!(engine_failed("an illegal memory access was encountered", "site").fatal);
+        // (what an image asked is refused, the engine reset)
+        assert!(!engine_failed(format!("no memory for its positions {}", straydog_engine::model::IMAGE_REFUSED), "site").fatal);
         // (a prompt found too long before anything ran leaves the engine as it was)
         assert!(!engine_failed("Straydog prompt plus output exceeds the allocated context", "site").fatal);
     }

@@ -907,9 +907,9 @@ How an image is read (`qwen_vision.rs`, after transformers' `qwen3_5` vision mod
      image or in the last batch. Only such batches launch `qsa_normalize_axes` and `qsa_pool_axes`.
 5. **The rest of a pass.** PLE's n-grams hash `<|image_pad|>` at an image's positions, as the reference reads the ids before their
    rows go in. Routing is as for any row. A batch over image rows runs as a batched prefill even when short.
-6. **Drafter.** The reference's MTP model is text-only. It stays off from a prompt's first image to the end of the request.
-   A prompt without images shares nothing with a sequence past its first image (their ids differ), and the batches
-   before that image keep the MTP layer's rows, so a later text prompt that resumes before it drafts as ever.
+6. **Drafter.** It works over images as over text. Its layer pairs each hidden row with the row of the token after it, at an
+   image's position the image's own row (llama.cpp's MTP graph takes `inp->embd` there), at the same rope positions as the
+   model's layers: a table in batches, the delta in the reply's rows. So a conversation holding an image keeps its speed.
 
 ## 9. Qwen3.6-35B-A3B (`qwen35moe`)
 
