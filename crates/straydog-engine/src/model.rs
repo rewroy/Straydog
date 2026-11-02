@@ -870,6 +870,11 @@ impl Model {
             return Ok(false);
         }
         let cpu = CpuExperts::new(cpu_threads)?;
+        // (the same files as the mapping's, checked as it is: `Weights::check_unchanged` before every generation)
+        #[cfg(windows)]
+        for (map, file) in self.weights.mapped_files() {
+            cpu.gather_file(map, file)?;
+        }
         for (layer, kinds) in kinds.iter().enumerate() {
             let prefix = format!("blk.{layer}.");
             let banks = Self::host_banks(&self.weights, layer)?;
