@@ -8,13 +8,158 @@
 //! some alternative takes all of its bytes, an end token when one is complete. Sampling draws
 //! from the model's distribution and draws again without a refused token
 //! ([`crate::sampling::choose_where`]), so the allowed tokens keep their relative probabilities.
+//!
+//! A [`Suppression`] refuses, on top of that or alone, every token that would write a letter a
+//! request's `suppress` names, in the reasoning as in the answer. Alone it leaves a reply's drafts
+//! in place: it is known of a token at once, so a draft it refuses counts as rejected by the target
+//! ([`Constraint::mask_rows`]).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::model::Rng;
 use crate::pyjson::{self, Value};
 use crate::sampling::{self, Generated, Sampling};
+
+/// The one thing a request's `suppress` names: Han letters with no CP932 form.
+pub const NOT_CP932_HAN: &str = "not_cp932_han";
+
+/// U+3400..=U+9FFF, a bit a character (the low bit first), set where CP932 has it: 6682 of them, by Python's `cp932` codec,
+/// and the same by Windows' code page 932 (WideCharToMultiByte without best fit).
+static CP932_HAN: &[u8; 3456] = include_bytes!("cp932_han.bin");
+const CP932_HAN_FIRST: u32 = 0x3400;
+/// Real Japanese kanji CP932 has no form of, which a reply may still write.
+const BEYOND_CP932: [char; 8] = ['塡', '剝', '頰', '噓', '俱', '繫', '鷗', '醬'];
+
+/// Whether a suppression refuses this character: a Han letter in U+3400-U+9FFF with no CP932 form. (U+4DC0-U+4DFF, between
+/// the two blocks, are hexagrams, not letters.)
+fn suppressed_letter(code: u32) -> bool {
+    if !matches!(code, 0x3400..=0x4DBF | 0x4E00..=0x9FFF) {
+        return false;
+    }
+    let at = (code - CP932_HAN_FIRST) as usize;
+    CP932_HAN[at / 8] & (1 << (at % 8)) == 0 && char::from_u32(code).is_none_or(|letter| !BEYOND_CP932.contains(&letter))
+}
+
+/// What the bytes so far leave open of a character that could be a suppressed letter: every one is three bytes long and
+/// starts with 0xE3 to 0xE9. A token can end inside one, the next finish it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OpenLetter {
+    /// 0: none.
+    lead: u8,
+    /// 0: not yet.
+    second: u8,
+}
+
+impl OpenLetter {
+    /// Read a byte; whether it finished a suppressed letter. Anything else that breaks the character closes it, as a decode
+    /// does, which writes a replacement character there.
+    fn read(&mut self, byte: u8) -> bool {
+        let OpenLetter { lead, second } = std::mem::take(self);
+        if lead != 0 && byte & 0xC0 == 0x80 {
+            if second == 0 {
+                *self = OpenLetter { lead, second: byte };
+                return false;
+            }
+            let code = (u32::from(lead & 0x0F) << 12) | (u32::from(second & 0x3F) << 6) | u32::from(byte & 0x3F);
+            return suppressed_letter(code);
+        }
+        if matches!(byte, 0xE3..=0xE9) {
+            self.lead = byte;
+        }
+        false
+    }
+
+    /// Read a token's bytes; whether they finished a suppressed letter.
+    fn read_all(&mut self, bytes: &[u8]) -> bool {
+        // (no short cut: what is left open has to be known after any of them)
+        bytes.iter().fold(false, |found, &byte| self.read(byte) | found)
+    }
+}
+
+/// Which tokens a suppression refuses, whatever came before and after what came before.
+pub struct SuppressedTokens {
+    /// Those whose own bytes hold a suppressed letter, ascending: a row's mask.
+    always: Vec<u32>,
+    /// The same, a bit a token.
+    bits: Vec<u64>,
+    /// Those whose first byte goes on a character: they may finish a letter the last token left open.
+    openers: Vec<u32>,
+}
+
+impl SuppressedTokens {
+    fn new(tokens: &TokenBytes) -> SuppressedTokens {
+        let mut table = SuppressedTokens { always: Vec::new(), bits: vec![0; tokens.bytes.len().div_ceil(64)], openers: Vec::new() };
+        for token in 0..tokens.bytes.len() as u32 {
+            // (a control token is never refused: an end token ends any reply)
+            let Some(bytes) = tokens.text_of(token) else { continue };
+            if OpenLetter::default().read_all(bytes) {
+                table.always.push(token);
+                table.bits[token as usize / 64] |= 1 << (token % 64);
+            } else if bytes.first().is_some_and(|byte| byte & 0xC0 == 0x80) {
+                table.openers.push(token);
+            }
+        }
+        table
+    }
+
+    /// How many tokens are always refused, and how many may finish a letter.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.always.len(), self.openers.len())
+    }
+
+    fn always_refused(&self, token: u32) -> bool {
+        self.bits.get(token as usize / 64).is_some_and(|word| word & (1 << (token % 64)) != 0)
+    }
+}
+
+/// A reply's suppression as far as it has gone: the table, and what the reply has left open.
+#[derive(Clone)]
+pub struct Suppression {
+    tokens: Arc<TokenBytes>,
+    open: OpenLetter,
+}
+
+impl Suppression {
+    pub fn new(tokens: Arc<TokenBytes>) -> Suppression {
+        Suppression { tokens, open: OpenLetter::default() }
+    }
+
+    /// Whether `token` may come next.
+    pub fn allows(&self, token: u32) -> bool {
+        !self.tokens.suppressed().always_refused(token) && (self.open == OpenLetter::default() || !self.finishes(token))
+    }
+
+    /// Whether `token` finishes a suppressed letter left open.
+    fn finishes(&self, token: u32) -> bool {
+        let mut open = self.open;
+        self.tokens.bytes.get(token as usize).is_some_and(|bytes| open.read_all(bytes))
+    }
+
+    /// Take `token`.
+    pub fn advance(&mut self, token: u32) {
+        if let Some(bytes) = self.tokens.bytes.get(token as usize) {
+            self.open.read_all(bytes);
+        }
+    }
+
+    /// The refused tokens of a row at negative infinity.
+    pub fn mask(&self, row: &mut [f32]) {
+        let table = self.tokens.suppressed();
+        for &token in &table.always {
+            if let Some(logit) = row.get_mut(token as usize) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        if self.open != OpenLetter::default() {
+            for &token in table.openers.iter().filter(|&&token| self.finishes(token)) {
+                if let Some(logit) = row.get_mut(token as usize) {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+}
 
 const THINK_CLOSE: &[u8] = b"</think>";
 /// Whitespace in a row the JSON may hold: a pretty-printed line's indentation fits, a model
@@ -34,9 +179,20 @@ pub struct TokenBytes {
     special: Vec<bool>,
     /// The template's `</think>` when it is one added token: only it ends a reasoning.
     think_close: Option<u32>,
+    /// [`TokenBytes::suppressed`], built on first use.
+    suppressed: OnceLock<SuppressedTokens>,
 }
 
 impl TokenBytes {
+    /// How many token ids there are.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     /// What a token spells; none for a special one.
     pub fn text_of(&self, token: u32) -> Option<&[u8]> {
         let at = token as usize;
@@ -45,7 +201,12 @@ impl TokenBytes {
 
     pub fn new(bytes: Vec<Vec<u8>>, special: Vec<bool>) -> TokenBytes {
         assert_eq!(bytes.len(), special.len());
-        TokenBytes { bytes, special, think_close: None }
+        TokenBytes { bytes, special, think_close: None, suppressed: OnceLock::new() }
+    }
+
+    /// The tokens a suppression refuses, read off the vocabulary once, by the first request that asks.
+    pub fn suppressed(&self) -> &SuppressedTokens {
+        self.suppressed.get_or_init(|| SuppressedTokens::new(self))
     }
 
     /// The same, with the vocabulary's `</think>` token: a reasoning ends at it, never at the same
@@ -728,32 +889,112 @@ impl Alternative {
     }
 }
 
-/// A reply held to its [`Alternative`]s after its reasoning.
+/// A reply held to its [`Alternative`]s after its reasoning, and (or only) to a [`Suppression`].
 #[derive(Clone)]
 pub struct Constraint {
     tokens: Arc<TokenBytes>,
     end: Vec<u32>,
     /// While the reply reasons: its last bytes, to see `</think>` across tokens.
     thinking: Option<Vec<u8>>,
+    /// None: only the suppression holds the reply.
     alternatives: Vec<Alternative>,
+    suppression: Option<Suppression>,
 }
 
 impl Constraint {
     /// `thinking`: the reply starts as reasoning, held to nothing but going on until `</think>`.
     pub fn new(tokens: Arc<TokenBytes>, end: &[u32], thinking: bool, alternatives: Vec<Alternative>) -> Constraint {
-        Constraint { tokens, end: end.to_vec(), thinking: thinking.then(Vec::new), alternatives }
+        Constraint { tokens, end: end.to_vec(), thinking: thinking.then(Vec::new), alternatives, suppression: None }
+    }
+
+    /// Whether every token must be chosen against this one by one, so no draft is taken: not when only a suppression holds the
+    /// reply, which refuses a draft from its table.
+    pub fn chooses_every_token(&self) -> bool {
+        !self.alternatives.is_empty()
+    }
+
+    /// The reply's suppression, if it has one.
+    pub fn suppression(&self) -> Option<&Suppression> {
+        self.suppression.as_ref()
     }
 
     /// Whether `token` may come next.
     pub fn allows(&self, token: u32) -> bool {
-        self.after(token).is_some()
+        self.suppression.as_ref().is_none_or(|suppression| suppression.allows(token))
+            && (self.alternatives.is_empty() || self.after(token).is_some())
     }
 
     /// Take `token` (one [`Constraint::allows`] accepted).
     pub fn advance(&mut self, token: u32) {
+        if let Some(suppression) = &mut self.suppression {
+            suppression.advance(token);
+        }
+        if self.alternatives.is_empty() {
+            return;
+        }
         if let Some(next) = self.after(token) {
             *self = next;
         }
+    }
+
+    /// How many of `drafts`, in order from where the reply is, the reply may take.
+    pub fn allowed_prefix(&self, drafts: &[u32]) -> usize {
+        let mut held = self.clone();
+        drafts.iter().take_while(|&&draft| {
+            let allowed = held.allows(draft);
+            held.advance(draft);
+            allowed
+        }).count()
+    }
+
+    /// A verification's rows (`vocabulary` wide) for the accept rule: each with what its suppression refuses masked, row `i`'s
+    /// as the reply stands after the first `i` of `drafts`. (A row is read only when the drafts before it were kept.) A draft
+    /// masked has probability 0 under its row, so the rule rejects it; the token is drawn from the row without it.
+    pub fn mask_rows(&self, rows: &mut [f32], vocabulary: usize, drafts: &[u32]) {
+        let Some(suppression) = &self.suppression else { return };
+        let mut suppression = suppression.clone();
+        for (index, row) in rows.chunks_exact_mut(vocabulary).enumerate() {
+            suppression.mask(row);
+            if let Some(&draft) = drafts.get(index) {
+                suppression.advance(draft);
+            }
+        }
+    }
+
+    /// After the accept rule over [`Constraint::mask_rows`]'s rows: take the drafts it `kept`, and `token`, the one it chose
+    /// from `row` after them. (Single-precision weights can leave a masked token some 1e-38, which a rounding can land on:
+    /// the token is then chosen anew, so that nothing refused ever comes out.)
+    pub fn settle(&mut self, kept: &[u32], token: u32, row: &[f32], sampling: &Sampling, generated: &Generated, rng: &mut Rng) -> Result<u32, String> {
+        for &draft in kept {
+            self.advance(draft);
+        }
+        let token = if self.allows(token) {
+            token
+        } else {
+            sampling::choose_where(row, sampling, generated, rng, &mut |token| self.allows(token))
+                .ok_or("Straydog's constraint left no token to choose")?
+        };
+        self.advance(token);
+        Ok(token)
+    }
+
+    /// The accept rule over a verification's rows of whole logits (`rows`, masked here): [`sampling::accept_top_drawn`] of drafts
+    /// drawn from `proposed`, each row's top read here rather than by the head, else [`sampling::accept`]. Accepted draft count and
+    /// the next token, all taken.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_rows(&mut self, drafts: &[u32], proposed: &[Vec<(f32, u32)>], rows: &mut [f32], vocabulary: usize, sampling: &Sampling,
+                       generated: &mut Generated, rng: &mut Rng) -> Result<(usize, u32), String> {
+        self.mask_rows(rows, vocabulary, drafts);
+        let (accepted, token) = match sampling.top_candidates().filter(|_| !drafts.is_empty() && proposed.len() == drafts.len()) {
+            Some(keep) => {
+                let top: Vec<Vec<(f32, u32)>> = rows.chunks_exact(vocabulary).map(|row| sampling::top_of(row, keep)).collect();
+                sampling::accept_top_drawn(drafts, proposed, &top, sampling, generated, rng)
+            }
+            None => sampling::accept(drafts, rows, vocabulary, sampling, generated, rng),
+        };
+        let row = &rows[accepted * vocabulary..(accepted + 1) * vocabulary];
+        let token = self.settle(&drafts[..accepted], token, row, sampling, generated, rng)?;
+        Ok((accepted, token))
     }
 
     fn after(&self, token: u32) -> Option<Constraint> {
@@ -827,6 +1068,22 @@ impl Constraint {
             }
         }
         Ok(Some(Constraint::new(tokens, end, thinking, alternatives)))
+    }
+
+    /// `constraint` (if any) and what a worker request's `suppress` asks for: [`NOT_CP932_HAN`]; null asks nothing.
+    pub fn suppressing(constraint: Option<Constraint>, spec: &Value, tokens: Arc<TokenBytes>) -> Result<Option<Constraint>, String> {
+        match spec {
+            Value::Null => Ok(constraint),
+            Value::Str(kind) if kind == NOT_CP932_HAN => {
+                tokens.suppressed();
+                let suppression = Some(Suppression::new(Arc::clone(&tokens)));
+                Ok(Some(match constraint {
+                    Some(constraint) => Constraint { suppression, ..constraint },
+                    None => Constraint { tokens, end: Vec::new(), thinking: None, alternatives: Vec::new(), suppression },
+                }))
+            }
+            _ => Err(format!("a Straydog suppress must be {NOT_CP932_HAN}")),
+        }
     }
 }
 
@@ -977,6 +1234,251 @@ mod tests {
         assert!(either.allows(2) && either.allows(3));
         either.advance(3);
         assert!(!either.allows(2) && either.allows(5));
+    }
+
+    /// A vocabulary of raw byte strings; the first is a control token that ends a reply.
+    fn raw_tokens(pieces: &[&[u8]]) -> Arc<TokenBytes> {
+        let special = (0..pieces.len()).map(|index| index == 0).collect();
+        Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.to_vec()).collect(), special))
+    }
+
+    fn suppressing(tokens: &Arc<TokenBytes>) -> Constraint {
+        Constraint::suppressing(None, &Value::Str(NOT_CP932_HAN.into()), Arc::clone(tokens)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn the_letters_are_those_without_a_cp932_form_but_for_the_japanese_ones() {
+        for letter in ['员', '约', '叠', '们', '这', '你', '㐀', '鿿'] {
+            assert!(suppressed_letter(letter as u32), "{letter}");
+        }
+        for letter in ['会', '員', '約', '畳', '疊', '国', '語', '亜', '熙', '塡', '剝', '頰', '噓', '俱', '繫', '鷗', '醬', '為', '們', '一', '龠'] {
+            assert!(!suppressed_letter(letter as u32), "{letter}");
+        }
+        // Not Han letters of the range: kana, a hexagram, Hangul, past the range.
+        for letter in ['あ', 'ア', '䷀', '한', '\u{2000B}', '！'] {
+            assert!(!suppressed_letter(letter as u32), "{letter}");
+        }
+        let cp932 = (0x3400..=0x9FFFu32).filter(|code| CP932_HAN[(code - CP932_HAN_FIRST) as usize / 8] & (1 << ((code - CP932_HAN_FIRST) % 8)) != 0).count();
+        assert_eq!(cp932, 6682);
+    }
+
+    #[test]
+    fn a_token_holding_a_suppressed_letter_is_refused_and_others_are_not() {
+        let pieces: Vec<&[u8]> = vec![b"<|end|>", "员".as_bytes(), "会员".as_bytes(), "x约y".as_bytes(), "員".as_bytes(), "会員".as_bytes(),
+                                      "塡".as_bytes(), "あ".as_bytes(), b"hello", "<|员|>".as_bytes()];
+        let vocabulary = raw_tokens(&pieces);
+        let held = suppressing(&vocabulary);
+        let allowed: Vec<bool> = (0..pieces.len() as u32).map(|token| held.allows(token)).collect();
+        // (the last looks like a control token, and is an ordinary one)
+        assert_eq!(allowed, [true, false, false, false, true, true, true, true, true, false]);
+        // A control token spells nothing a reply writes.
+        let marked = Arc::new(TokenBytes::new(vec!["员".as_bytes().to_vec()], vec![true]));
+        assert!(suppressing(&marked).allows(0));
+    }
+
+    #[test]
+    fn a_letter_split_across_tokens_is_refused_where_it_would_finish() {
+        // 员 is E5 91 98, 員 E5 93 A1, 约 E7 BA A6, 你 E4 BD A0.
+        let pieces: Vec<&[u8]> = vec![b"<|end|>", b"\xE5\x91", b"\x98", b"\xE5\x93", b"\xA1", b"\xE5", b"\x91", b"a", b"x\xE5\x91", b"\x98a",
+                                      b"\x91\x98", b"\x98\xE5\x91", b"\xF0\x9F\x98"];
+        let vocabulary = raw_tokens(&pieces);
+        let (lead_two, last, other_two, other_last, lead, second, plain, ends_open, opens_text, two, both, four) = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        let held = suppressing(&vocabulary);
+        // Nothing open: a stray byte writes no letter, only a replacement character.
+        assert!(held.allows(last) && held.allows(two) && held.allows(opens_text) && held.allows(lead_two) && held.allows(ends_open));
+        let after = |tokens: &[u32]| {
+            let mut held = suppressing(&vocabulary);
+            for &token in tokens {
+                assert!(held.allows(token), "{token} after {tokens:?}");
+                held.advance(token);
+            }
+            held
+        };
+        for open in [&[lead_two][..], &[lead, second], &[ends_open], &[plain, lead_two], &[both]] {
+            let held = after(open);
+            assert!(!held.allows(last), "{open:?}");
+            assert!(!held.allows(opens_text), "{open:?}: it goes on after the byte");
+            assert!(held.allows(plain) && held.allows(lead) && held.allows(0), "{open:?}");
+        }
+        // Two bytes to go: those two together finish it, one alone does not.
+        let held = after(&[lead]);
+        assert!(!held.allows(two) && held.allows(second));
+        // Another letter's first bytes, that byte fine; the same byte after a broken character is stray.
+        assert!(after(&[other_two]).allows(other_last));
+        assert!(after(&[lead_two, plain]).allows(last));
+        // A character that cannot be a letter leaves nothing open, whatever goes on.
+        assert!(after(&[four]).allows(last));
+        // A row's mask says the same, for the stray byte too.
+        let mut row = vec![1.0; pieces.len()];
+        after(&[lead_two]).suppression().unwrap().mask(&mut row);
+        assert_eq!(row[last as usize], f32::NEG_INFINITY);
+        assert_eq!(row[opens_text as usize], f32::NEG_INFINITY);
+        let mut row = vec![1.0; pieces.len()];
+        after(&[other_two]).suppression().unwrap().mask(&mut row);
+        assert_eq!(row[other_last as usize], 1.0);
+        let mut row = vec![1.0; pieces.len()];
+        suppressing(&vocabulary).suppression().unwrap().mask(&mut row);
+        assert_eq!(row, vec![1.0; pieces.len()], "nothing here holds a whole letter");
+    }
+
+    /// The token the model likes most, by far, cannot come out, greedy or sampled, split or whole.
+    #[test]
+    fn a_refused_token_with_the_greatest_logit_never_comes_out() {
+        let pieces: Vec<&[u8]> = vec![b"<|end|>", "员".as_bytes(), "員".as_bytes(), "約".as_bytes(), b"\xE5\x91", b"\x98", b"a"];
+        let vocabulary = raw_tokens(&pieces);
+        let samplings = [Sampling::GREEDY, Sampling { temperature: 1.0, ..Sampling::GREEDY }, Sampling::recommended(true), Sampling::recommended(false),
+                         Sampling { top_k: 1, ..Sampling::recommended(true) }, Sampling { temperature: 0.1, ..Sampling::GREEDY }];
+        for sampling in &samplings {
+            let generated = Generated::new(pieces.len());
+            let mut rng = Rng::new(7);
+            let logits = [-5.0, 40.0, 1.0, 0.5, -3.0, 9.0, -4.0];
+            for _ in 0..200 {
+                let mut held = Some(suppressing(&vocabulary));
+                let token = pick(&logits, sampling, &generated, &mut rng, &mut held.as_mut()).unwrap();
+                assert!(token != 1, "{sampling:?}");
+            }
+            // Open at the byte that finishes 员, which is now the greatest.
+            let logits = [-5.0, 1.0, 1.0, 0.5, -3.0, 40.0, -4.0];
+            for _ in 0..200 {
+                let mut held = suppressing(&vocabulary);
+                held.advance(4);
+                let token = pick(&logits, sampling, &generated, &mut rng, &mut Some(&mut held)).unwrap();
+                assert!(token != 5 && token != 1, "{sampling:?}");
+            }
+        }
+    }
+
+    /// With a grammar too, both hold.
+    #[test]
+    fn a_suppression_holds_on_top_of_a_constraint() {
+        let pieces: Vec<&[u8]> = vec![b"<|end|>", b"<tool>", "员".as_bytes(), "員".as_bytes(), b"}"];
+        let vocabulary = raw_tokens(&pieces);
+        let tool = Constraint::new(Arc::clone(&vocabulary), &[0], false, vec![Alternative::prefix("<tool>", 0)]);
+        let mut held = Constraint::suppressing(Some(tool), &Value::Str(NOT_CP932_HAN.into()), Arc::clone(&vocabulary)).unwrap().unwrap();
+        assert!(held.chooses_every_token());
+        assert!(!held.allows(3) && held.allows(1), "the grammar first");
+        held.advance(1);
+        assert!(!held.allows(2) && held.allows(3) && held.allows(4), "free after the prefix, but not of the letter");
+        assert!(!suppressing(&vocabulary).chooses_every_token());
+    }
+
+    #[test]
+    fn only_the_known_suppression_is_taken() {
+        let vocabulary = raw_tokens(&[b"<|end|>"]);
+        assert!(Constraint::suppressing(None, &Value::Null, Arc::clone(&vocabulary)).unwrap().is_none());
+        for bad in [Value::Str("simplified".into()), Value::Str(String::new()), Value::Bool(true), Value::Array(Vec::new())] {
+            assert!(Constraint::suppressing(None, &bad, Arc::clone(&vocabulary)).is_err());
+        }
+    }
+
+    /// The accept rule's side: a draft masked is rejected, whatever the proposal, and the tokens that come out follow the target
+    /// without the refused tokens, a drawn draft (kept by min(1, p / q)) as a point one.
+    #[test]
+    fn a_masked_draft_counts_as_rejected_and_the_tokens_follow_the_masked_target() {
+        let pieces: Vec<&[u8]> = vec![b"<|end|>", "员".as_bytes(), "員".as_bytes(), "約".as_bytes(), "会".as_bytes(), b"a"];
+        let vocabulary = raw_tokens(&pieces);
+        let size = pieces.len();
+        let row = [-30.0f32, 3.0, 2.0, 1.0, 0.5, 0.0];
+        let expected = {
+            let weights: Vec<f64> = (0..size).map(|token| if token <= 1 { 0.0 } else { f64::from(row[token]).exp() }).collect();
+            let total: f64 = weights.iter().sum();
+            weights.into_iter().map(|weight| weight / total).collect::<Vec<f64>>()
+        };
+        let plain = Sampling { temperature: 1.0, ..Sampling::GREEDY };
+        let cut = Sampling { temperature: 1.0, top_k: 5, ..Sampling::GREEDY };
+        // Greedy: not kept, though it is the row's greatest; the row's best allowed comes.
+        let mut rows = [row, row].concat();
+        let mut held = suppressing(&vocabulary);
+        let (accepted, token) = held.accept_rows(&[1], &[], &mut rows, size, &Sampling::GREEDY, &mut Generated::new(size), &mut Rng::new(1)).unwrap();
+        assert_eq!((accepted, token), (0, 2));
+        // A kept draft moves the state on, and the next row is masked as of it.
+        let split = raw_tokens(&[b"<|end|>", b"\xE5\x91", b"\x98", "員".as_bytes()]);
+        let mut rows = vec![0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 5.0, 1.0];
+        let mut held = suppressing(&split);
+        let (accepted, token) = held.accept_rows(&[1], &[], &mut rows, 4, &Sampling::GREEDY, &mut Generated::new(4), &mut Rng::new(1)).unwrap();
+        assert_eq!((accepted, token), (1, 3), "the byte that finishes the letter is refused in the second row");
+        // Sampled: point proposals, over every token and over a cut; each draft the refused one.
+        for sampling in [&plain, &cut] {
+            let mut counts = vec![0u32; size];
+            let mut rng = Rng::new(11);
+            for _ in 0..40000 {
+                let mut rows = [row, row].concat();
+                let mut held = suppressing(&vocabulary);
+                let (accepted, token) = held.accept_rows(&[1], &[], &mut rows, size, sampling, &mut Generated::new(size), &mut rng).unwrap();
+                assert_eq!(accepted, 0);
+                counts[token as usize] += 1;
+            }
+            for token in 0..size {
+                let seen = f64::from(counts[token]) / 40000.0;
+                assert!((seen - expected[token]).abs() < 0.015, "{sampling:?} token {token}: {seen} against {}", expected[token]);
+            }
+        }
+        // A draft drawn from a drafter's own top, without what it refuses (as Model::draft does): the same distribution comes out, and
+        // only an allowed token is ever drafted or kept.
+        let proposal = [(0.5f32, 3u32), (0.2, 2), (0.0, 5), (-1.0, 4)];
+        let sampling = Sampling { temperature: 1.0, top_k: 5, ..Sampling::GREEDY };
+        let (mut counts, mut kept, mut rng) = (vec![0u32; size], 0u32, Rng::new(13));
+        for _ in 0..40000 {
+            let (draft, _) = sampling::draw_top(&proposal, &sampling, &mut rng);
+            let mut rows = [row, row].concat();
+            let mut held = suppressing(&vocabulary);
+            let (accepted, token) = held.accept_rows(&[draft], &[proposal.to_vec()], &mut rows, size, &sampling, &mut Generated::new(size), &mut rng).unwrap();
+            kept += accepted as u32;
+            counts[if accepted == 1 { draft } else { token } as usize] += 1;
+        }
+        assert!(kept > 20000, "{kept}");
+        for token in 0..size {
+            let seen = f64::from(counts[token]) / 40000.0;
+            assert!((seen - expected[token]).abs() < 0.015, "drawn: token {token}: {seen} against {}", expected[token]);
+        }
+    }
+
+    /// A drafter that draws on its device (DSpark) knows no suppression: it may draw the refused token. The accept rule rejects
+    /// that always, its replacement comes from norm(max(0, p - q)) over the rows' single-precision sums, and the tokens still follow the
+    /// target without the refused one.
+    #[test]
+    fn a_draft_drawn_with_no_regard_to_the_suppression_is_rejected_on_a_wide_row() {
+        let size = 5000;
+        let mut pieces = vec![b"x".to_vec(); size];
+        pieces[10] = "员".as_bytes().to_vec();
+        let vocabulary = Arc::new(TokenBytes::new(pieces, vec![false; size]));
+        let mut target = vec![-20.0f32; size];
+        let mut drafter = vec![-20.0f32; size];
+        for (token, logit, proposed) in [(10, 3.0, 2.5), (20, 2.0, 1.0), (30, 1.0, 1.5), (40, 0.0, -1.0)] {
+            target[token] = logit;
+            drafter[token] = proposed;
+        }
+        let expected = |token: usize| {
+            let weight = |logit: f32| f64::from(logit).exp();
+            let total = weight(2.0) + weight(1.0) + weight(0.0) + 4996.0 * weight(-20.0);
+            weight(target[token]) / total
+        };
+        let plain = Sampling { temperature: 1.0, ..Sampling::GREEDY };
+        let drafter_rows = [drafter];
+        let draws = sampling::distribution(&drafter_rows[0], &plain, &Generated::new(0));
+        let (mut counts, mut drafted, mut rng) = (vec![0u32; size], 0u32, Rng::new(17));
+        const SAMPLES: u32 = 5000;
+        for _ in 0..SAMPLES {
+            let draft = draws.draw(&mut rng);
+            let mut proposals = sampling::Rows::new(&drafter_rows, &plain);
+            let mut rows = [target.as_slice(), target.as_slice()].concat();
+            let mut held = Constraint::suppressing(None, &Value::Str(NOT_CP932_HAN.into()), Arc::clone(&vocabulary)).unwrap().unwrap();
+            held.mask_rows(&mut rows, size, &[draft]);
+            let mut generated = Generated::new(size);
+            let (accepted, token) = sampling::accept_drawn(&[draft], &mut proposals, &rows, size, &plain, &mut generated, &mut rng);
+            let token = held.settle(&[draft][..accepted], token, &rows[accepted * size..(accepted + 1) * size], &plain, &generated, &mut rng).unwrap();
+            assert!(token != 10);
+            if draft == 10 {
+                drafted += 1;
+                assert_eq!(accepted, 0, "a refused draft is never kept");
+            }
+            counts[if accepted == 1 { draft } else { token } as usize] += 1;
+        }
+        assert!(drafted > SAMPLES / 3, "{drafted}");
+        for token in [20, 30, 40] {
+            let seen = f64::from(counts[token]) / f64::from(SAMPLES);
+            assert!((seen - expected(token)).abs() < 0.035, "token {token}: {seen} against {}", expected(token));
+        }
     }
 
     #[test]

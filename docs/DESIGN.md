@@ -357,6 +357,17 @@ A constrained reply takes no drafts.
 
   Each token is drawn from the model's distribution, and drawn again without a refused one
   (masked after 32), so allowed tokens keep their relative probabilities.
+- **Suppression** (`constraint.rs`). A request's `suppress: "not_cp932_han"` refuses every token that would write a Han
+  letter in U+3400-U+9FFF with no CP932 form (a simplified 员, 约, 叠 in a Japanese reply), reasoning and tool arguments
+  included. 塡剝頰噓俱繫鷗醬 are real Japanese with no CP932 form, and stay.
+  - The tokens come from a table read off the vocabulary by the first request that asks (24603 tokens of Qwen3.8's 248K).
+    A token that only finishes a letter from the bytes the last one left open is refused by that state: a character can
+    split across tokens.
+  - A token is chosen as under a constraint. Alone a suppression keeps the drafts: it masks the rows they are verified on,
+    so one it refuses has probability 0 under the target, and is rejected like any other; what comes out is the target's
+    distribution without the refused tokens. A point proposal it refuses is not verified at all.
+  - Qwen3.8's head otherwise gives a verification's rows as an argmax or a top k picked on the GPU, which cannot be masked:
+    a request that suppresses reads the rows' whole logits instead. No `suppress`, nothing changes.
 
 ## 7. DeepSeek-V4.1-Flash
 
@@ -1077,6 +1088,7 @@ with a model of its own reads no file it was not given.
     other keywords accepted, not enforced);
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
+  - `suppress`: `not_cp932_han` (§6), listed in `/props` and `/v1/models`' `meta`;
   - `reasoning_effort` (`none` to `xhigh`) and `chat_template_kwargs`;
   - `stream_options.include_usage`.
 

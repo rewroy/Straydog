@@ -492,6 +492,24 @@ async fn response_format_and_tool_choice_reach_the_worker_as_a_constraint() {
     }
 }
 
+/// A request that asks for a suppression hands it on, after everything else; one that does not (null is none) leaves the worker's
+/// request as it was, field for field.
+#[tokio::test]
+async fn suppress_reaches_the_worker_only_when_given() {
+    let sent = |fields: serde_json::Value| async move {
+        let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
+        let (status, _, _) = send(app(&mock), chat(ask(fields).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        mock.requests()[0].clone()
+    };
+    let asking = sent(json!({"seed": 1, "suppress": "not_cp932_han"})).await;
+    assert_eq!(field(&asking, "suppress"), &pyjson::Value::Str("not_cp932_han".into()));
+    let (absent, null) = (sent(json!({"seed": 1})).await, sent(json!({"seed": 1, "suppress": null})).await);
+    assert_eq!(pyjson::dumps(&absent), pyjson::dumps(&null));
+    assert!(!pyjson::dumps(&absent).contains("suppress"));
+    assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&absent).strip_suffix('}').unwrap().to_string() + r#", "suppress": "not_cp932_han"}"#);
+}
+
 #[tokio::test]
 async fn settings_reach_the_worker_request() {
     let cases = [
@@ -622,6 +640,10 @@ async fn invalid_requests_are_refused() {
         (ask(json!({"repeat_penalty": 1.1})), "repeat_penalty is not supported (only 1)"),
         (ask(json!({"repetition_penalty": 1.05})), "repetition_penalty is not supported (only 1)"),
         (ask(json!({"logit_bias": {"42": 5}})), "logit_bias is not supported (only {})"),
+        (ask(json!({"suppress": "simplified"})), "suppress must be not_cp932_han"),
+        (ask(json!({"suppress": ""})), "suppress must be not_cp932_han"),
+        (ask(json!({"suppress": ["not_cp932_han"]})), "suppress must be not_cp932_han"),
+        (ask(json!({"suppress": true})), "suppress must be not_cp932_han"),
         (ask(json!({"logprobs": true})), "logprobs is not supported (only false)"),
         (ask(json!({"top_logprobs": 3})), "top_logprobs is not supported (only 0)"),
         (ask(json!({"parallel_tool_calls": false})), "parallel_tool_calls is not supported (only true)"),
@@ -754,7 +776,7 @@ async fn health_and_models_follow_the_engine() {
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
-        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false}}]}));
+        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false, "suppress": ["not_cp932_han"]}}]}));
     for path in ["/props", "/slots"] {
         assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
     }
@@ -763,7 +785,7 @@ async fn health_and_models_follow_the_engine() {
                                         placement: json!({"resident": true, "host_kv": false}) });
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
-    assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false,
+    assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false, "suppress": ["not_cp932_han"],
                                                  "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
@@ -773,6 +795,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,
                              "model_alias": "Qwen3.8-Flash-Next-IQ3_S", "modalities": {"vision": false, "audio": false},
+                             "suppress": ["not_cp932_han"],
                              "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false}));
     assert_eq!(fetch(app(&mock), get("/slots")).await, (StatusCode::OK, json!([slot])));
 
