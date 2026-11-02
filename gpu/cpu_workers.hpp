@@ -199,7 +199,13 @@ public:
         }
         wake_.notify_all();
         dispatch->execute();
-        while (dispatch->done.load(std::memory_order_acquire) != rows) {
+        // The last blocks are a few microseconds off: a yield here gives the core to whatever is ready on it, a build at low priority as
+        // readily as anything, and the layer waits for this thread to come back with its work long done. Qwen3.8 IQ3_XXS, Ryzen 9700X, four
+        // processes spinning at below-normal: 121-205 -> 119-122 us a dispatch, 22.7-27.6 -> 28.3-29.2 tok/s.
+        for (unsigned spin = 0; dispatch->done.load(std::memory_order_acquire) != rows; ++spin) {
+#if defined(__x86_64__) || defined(_M_X64)
+            if (spin < 20000) { _mm_pause(); continue; }
+#endif
             std::this_thread::yield();
         }
         if (dispatch->error) std::rethrow_exception(dispatch->error);
