@@ -89,12 +89,15 @@ inline std::vector<DirectPacket> direct_window(Device& d, hipGraphExec_t exec) {
     }
     return packets;
 }
-inline void direct_replay(Device& d, const std::vector<DirectPacket>& packets) {
+inline bool direct_replay(Device& d, const std::vector<DirectPacket>& packets) {
     auto* q = static_cast<DirectQueue*>(d.direct_queue);
     DirectApi& api = direct_api();
     // (HIP's kernel first as well: it waits for a copy HIP has queued, which may be off this queue, and invalidates what a copy wrote
-    // past this GPU's L2, which the packets' own invalidation does not reach)
+    // past this GPU's L2, which the packets' own invalidation does not reach. HIP may return with that kernel not yet in the queue, held
+    // behind such a copy: then only HIP can keep the order, and the graph is left to it.)
+    const uint64_t queued = api.load_write(q);
     direct_tail<<<1, 1, 0, d.stream>>>();
+    if (api.load_write(q) == queued) return false;
     const uint64_t n = packets.size(), first = api.add_write(q, n);
     while (first + n - api.load_read(q) >= q->size) {}
     for (uint64_t k = 0; k < n; ++k)
@@ -105,6 +108,7 @@ inline void direct_replay(Device& d, const std::vector<DirectPacket>& packets) {
     api.doorbell(q->doorbell, int64_t(first + n - 1));
     direct_tail<<<1, 1, 0, d.stream>>>();
     check(hipGetLastError());
+    return true;
 }
 #endif
 // Launch a cached graph: through HIP twice, the second to see that its packets are the first's (their arguments the graph's own, not
@@ -123,7 +127,7 @@ inline void graph_launch(Device& d, CachedGraph& g) {
         }
         g.direct_state = 3;
     }
-    if (g.direct_state == 2) { direct_replay(d, g.direct); return; }
+    if (g.direct_state == 2 && direct_replay(d, g.direct)) return;
 #endif
     check(hipGraphLaunch(g.executable, d.stream));
 }
