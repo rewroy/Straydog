@@ -60,8 +60,20 @@ inline bool direct_ready(Device& d) {
     check(hipMemcpyAsync(&queue, out, 8, hipMemcpyDeviceToHost, d.stream));
     check(hipStreamSynchronize(d.stream));
     check(hipFree(out));
+    if (!queue) return false;
+    // (direct_tail's kernel object, to find it in the queue: the newest kernel after a launch and a wait)
+    auto* q = reinterpret_cast<DirectQueue*>(queue);
+    const uint64_t quiet = api.load_write(q);
+    direct_tail<<<1, 1, 0, d.stream>>>();
+    check(hipGetLastError());
+    check(hipStreamSynchronize(d.stream));
+    for (uint64_t i = api.load_write(q); i > quiet && !d.direct_tail_object; --i) {
+        const DirectPacket& packet = q->base[(i - 1) & (q->size - 1)];
+        if ((packet.header & 255) != 3 && packet.object && packet.gx == 1) d.direct_tail_object = packet.object;
+    }
+    if (!d.direct_tail_object) return false;
     d.direct_queue = reinterpret_cast<void*>(queue);
-    return d.direct_queue != nullptr;
+    return true;
 }
 // A launch of a graph through HIP, its kernels read back from the queue's ring. (The ring's bodies stay until it wraps.) Empty when
 // the launch waits for a signal: a graph with a copy off this queue stays HIP's.
@@ -97,7 +109,10 @@ inline bool direct_replay(Device& d, const std::vector<DirectPacket>& packets) {
     // behind such a copy: then only HIP can keep the order, and the graph is left to it.)
     const uint64_t queued = api.load_write(q);
     direct_tail<<<1, 1, 0, d.stream>>>();
-    if (api.load_write(q) == queued) return false;
+    // (this kernel itself: the index alone could have moved for an earlier command HIP's thread was just queuing)
+    bool held = true;
+    for (uint64_t i = api.load_write(q); i > queued && held; --i) held = q->base[(i - 1) & (q->size - 1)].object != d.direct_tail_object;
+    if (held) return false;
     const uint64_t n = packets.size(), first = api.add_write(q, n);
     while (first + n - api.load_read(q) >= q->size) {}
     for (uint64_t k = 0; k < n; ++k)
