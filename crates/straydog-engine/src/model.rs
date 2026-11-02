@@ -88,9 +88,10 @@ fn attention_layers(drafting: bool) -> u64 {
 /// is sound, and a shorter sequence can still run.
 pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this sequence";
 
-/// The end of the error of a prompt whose image rows would run in a pass of one row, which no pass of its kind takes: a prompt
-/// the chat template cannot render (its images are followed by text enough). Nothing has run.
-pub const IMAGE_ROWS: &str = "an image in a pass of one row";
+/// The end of the error of what an image asked and the devices could not give, or of a prompt whose image rows would run in a
+/// pass of one row, which no pass of its kind takes (the chat template cannot render one: its images are followed by text enough).
+/// The devices are sound: the request fails, and the engine resets.
+pub const IMAGE_REFUSED: &str = "(a request with an image, refused)";
 
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 const SCARCE_ROW_CACHE: u64 = 1 << 30;
@@ -1367,7 +1368,8 @@ impl Model {
         for span in &self.images {
             let (from, to) = (span.start.max(position), (span.start + span.grid.0 * span.grid.1).min(position + tokens.len()));
             if from < to {
-                let source = span.rows.get((from - span.start) * HIDDEN..(to - span.start) * HIDDEN).ok_or("Straydog image rows are short")?;
+                let source = span.rows.get((from - span.start) * HIDDEN..(to - span.start) * HIDDEN)
+                    .ok_or_else(|| format!("Straydog image rows are short {IMAGE_REFUSED}"))?;
                 rows[(from - position) * HIDDEN..(to - position) * HIDDEN].copy_from_slice(source);
             }
         }
@@ -1393,24 +1395,29 @@ impl Model {
             }
             return Ok(false);
         }
-        // (from here on the drafter is off: it reads no images, and its layer has none of this sequence's rows)
-        self.speculative = 0;
-        let block = start / 4 * 4;
+        // (the table reaches back to the block of the MTP layer's pair before these rows, which is at the row before them)
+        let block = start.saturating_sub(1) / 4 * 4;
         let touched = self.images.iter().any(|span| span.start < end && span.start + span.grid.0 * span.grid.1 > block);
         if touched && tokens < 2 {
-            return Err(IMAGE_ROWS.into());
+            return Err(format!("an image in a pass of one row {IMAGE_REFUSED}"));
         }
-        let delta = qwen_vision::rope_delta(&self.images, start);
+        self.set_rope_delta(start)?;
+        if tokens > 1 {
+            let axes: Vec<u32> = (block..end).flat_map(|position| qwen_vision::rope_of(&self.images, position)).collect();
+            self.group.rope_rows(block as u64, &axes).map_err(|error| format!("{error} {IMAGE_REFUSED}"))?;
+            self.rope_table = true;
+        }
+        Ok(touched)
+    }
+
+    /// The devices' delta of the decode and verification rows at `position`, as the images before it say.
+    fn set_rope_delta(&mut self, position: usize) -> Result<()> {
+        let delta = qwen_vision::rope_delta(&self.images, position);
         if delta != self.rope_delta {
             self.rope_delta = delta;
             self.group.rope_delta(delta)?;
         }
-        if tokens > 1 {
-            let axes: Vec<u32> = (block..end).flat_map(|position| qwen_vision::rope_of(&self.images, position)).collect();
-            self.group.rope_rows(block as u64, &axes)?;
-            self.rope_table = true;
-        }
-        Ok(touched)
+        Ok(())
     }
 
     fn with_operands<T>(&mut self, build: impl FnOnce(&Model) -> Result<Vec<Operand<'_>>>,
@@ -1736,7 +1743,7 @@ impl Model {
         let (following, first) = if previous.is_some() { (tokens, start - 1) } else { (&tokens[1..], start) };
         for offset in (0..following.len()).step_by(512) {
             let end = (offset + 512).min(following.len());
-            let embedded = self.token_embeddings(&following[offset..end])?;
+            let embedded = self.rows_at(first + 1 + offset, &following[offset..end])?;
             // Pair j's hidden row is the prompt's row j, or row j - 1 after the previous row.
             let (row, earlier) = match previous.as_deref() {
                 Some(row) if offset == 0 => (0, Some(row)),
@@ -1763,7 +1770,7 @@ impl Model {
         if following.is_empty() {
             return Ok(());
         }
-        let embedded = self.token_embeddings(following)?;
+        let embedded = self.rows_at(first + 1, following)?;
         self.group.mtp_embed(&embedded)?;
         for offset in (0..following.len()).step_by(512) {
             let count = (following.len() - offset).min(512) as u64;
@@ -1774,7 +1781,8 @@ impl Model {
         Ok(())
     }
 
-    /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t.
+    /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t. The token's row at an image's
+    /// position is the image's own (llama.cpp's MTP graph takes `inp->embd` there), through the layer's prologue as any.
     fn mtp_prompt(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>) -> Result<()> {
         let start = self.history.len();
         let mut hidden: Vec<&[f32]> = rows.chunks_exact(WIDTH).take(row_count(rows) - 1).collect();
@@ -1787,12 +1795,18 @@ impl Model {
                 first = start - 1;
             }
         }
-        for offset in (0..hidden.len()).step_by(512) {
-            let end = (offset + 512).min(hidden.len());
+        let mut offset = 0;
+        while offset < hidden.len() {
+            let mut end = (offset + 512).min(hidden.len());
+            // (a last pass of one row reads the delta alone: in a sequence with images it stays in the table's)
+            if !self.images.is_empty() && hidden.len() - end == 1 {
+                end -= 1;
+            }
             let chunk: Vec<f32> = hidden[offset..end].concat();
-            let embedded = self.token_embeddings(&following[offset..end])?;
+            let embedded = self.rows_at(first + 1 + offset, &following[offset..end])?;
             let prologue = self.mtp_prologue(&embedded, &chunk)?;
             self.mtp_layer(&prologue, (first + offset) as u64)?;
+            offset = end;
         }
         Ok(())
     }
@@ -2273,10 +2287,7 @@ impl Model {
             self.pass_counts = [0; 2];
             self.memory_before = crate::host::memory_note();
         }
-        // (a prompt with images turns the drafter off where it reaches the first: Model::set_rope)
-        let drafts = self.speculative;
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
-        self.speculative = drafts;
         self.report_profile();
         result
     }
@@ -2394,6 +2405,8 @@ impl Model {
             self.group.rebalance(0)?;
             self.last_metrics.insert("rebalance_seconds".into(), json!(rebalance.elapsed().as_secs_f64()));
         }
+        // (the last batch's delta was of where it began: the reply is past all of its images)
+        self.set_rope_delta(self.history.len())?;
         let mut rng = Rng::new(seed);
         let Some(mut logits) = output else { return Ok(()) };
         if self.speculative > 0 && constraint.is_none() {

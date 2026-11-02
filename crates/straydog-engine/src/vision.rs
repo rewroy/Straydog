@@ -71,6 +71,16 @@ pub const MAX_BYTES: usize = 32 << 20;
 /// Decode a PNG, JPEG, WebP or GIF (its first frame) to RGB, as Pillow's `convert("RGB")` takes
 /// it: an alpha channel dropped, gray repeated, no EXIF rotation.
 pub fn decode(bytes: &[u8]) -> Result<Rgb, String> {
+    decode_with(bytes, false)
+}
+
+/// [`decode`], turned as its EXIF orientation says, as transformers' `load_image` does (`exif_transpose`): a phone's photo stands
+/// the way it was taken.
+pub fn decode_upright(bytes: &[u8]) -> Result<Rgb, String> {
+    decode_with(bytes, true)
+}
+
+fn decode_with(bytes: &[u8], upright: bool) -> Result<Rgb, String> {
     if bytes.len() > MAX_BYTES {
         return Err(format!("an image of more than {} MB", MAX_BYTES >> 20));
     }
@@ -83,12 +93,15 @@ pub fn decode(bytes: &[u8]) -> Result<Rgb, String> {
     limits.max_alloc = Some(MAX_PIXELS * 8);
     let mut reader = reader;
     reader.limits(limits);
-    let decoder = reader.into_decoder().map_err(|exc| format!("the image does not decode: {exc}"))?;
+    let mut decoder = reader.into_decoder().map_err(|exc| format!("the image does not decode: {exc}"))?;
+    // (metadata that does not read leaves an image as it is, as Pillow does)
+    let orientation = if upright { decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms) } else { image::metadata::Orientation::NoTransforms };
     let (width, height) = decoder.dimensions();
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!("an image of {width}x{height} pixels (at most {} million)", MAX_PIXELS >> 20));
     }
-    let image = image::DynamicImage::from_decoder(decoder).map_err(|exc| format!("the image does not decode: {exc}"))?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|exc| format!("the image does not decode: {exc}"))?;
+    image.apply_orientation(orientation);
     let rgb = image.into_rgb8();
     Ok(Rgb { width: rgb.width() as usize, height: rgb.height() as usize, pixels: rgb.into_raw() })
 }
@@ -396,6 +409,24 @@ mod tests {
         assert_eq!(slots[1..5], [Slot::Image(0), Slot::Image(1), Slot::Image(2), Slot::NewLine]);
         assert_eq!(slots[5..9], [Slot::Image(3), Slot::Image(4), Slot::Image(5), Slot::NewLine]);
         assert_eq!(slots[9], Slot::End);
+    }
+
+    /// A JPEG 2 wide and 1 high with orientation 6 (turn a quarter clockwise to show it): `decode` leaves it, `decode_upright` stands it up.
+    #[test]
+    fn exif_orientation_turns_only_what_asks() {
+        use image::ImageEncoder;
+        let tiff: [u8; 26] = [b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0];
+        let mut jpeg = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100);
+        encoder.set_exif_metadata(tiff.to_vec()).unwrap();
+        let pixels: Vec<u8> = (0..40 * 20).flat_map(|at| if at % 40 < 20 { [250, 0, 0] } else { [0, 0, 250] }).collect();
+        encoder.write_image(&pixels, 40, 20, image::ExtendedColorType::Rgb8).unwrap();
+        let plain = decode(&jpeg).unwrap();
+        assert_eq!((plain.width, plain.height), (40, 20));
+        let upright = decode_upright(&jpeg).unwrap();
+        assert_eq!((upright.width, upright.height), (20, 40));
+        // what was on the left is on top
+        assert!(upright.pixels[(2 * 20 + 10) * 3] > 200 && upright.pixels[(37 * 20 + 10) * 3 + 2] > 200);
     }
 
     #[test]
