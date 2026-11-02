@@ -106,6 +106,11 @@ const STARTING_KV: usize = 32768;
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
 const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
+/// The share of the routed experts the slots hold at load from which a partially resident model drafts two tokens a pass. Routing is uneven:
+/// IQ3_S on an R9700, the slots of `--vram 24` (30% at load, 39% once the K/V has settled) serve 87% of the routes, and the second draft
+/// costs less CPU. Two drafts against one, same seeds, tok/s of a second and third request: `--vram 24` 69.5, 70.5 / 67.7, 61.4; 16 (17%) 58.7,
+/// 57.3 / 57.4, 56.6; 12 (under 15%) 50.1, 49.1 / 50.7, 48.0. HIP only: CUDA has not been measured.
+const TWO_DRAFTS_SHARE: f64 = 0.15;
 /// New tokens from which a partially resident model's batches take the slots' VRAM: past one batch, the second batch's streaming costs more
 /// than putting the slots back, a fraction of a second.
 const LONG_PREFILL: usize = 1536;
@@ -546,11 +551,14 @@ impl Model {
         if model.partial && model.weights.drafter {
             model.group.verify_reserve()?;
         }
+        let mut two_drafts = false;
         if model.partial {
             let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
             model.lock_host_banks(pinned)?;
             crate::host::commit_note("banks locked");
-            model.group.create_expert_slots()?;
+            let slots = model.group.create_expert_slots()?;
+            let experts = 48 * model.weights.tensor("blk.0.ffn_gate_exps.weight")?.dims.last().copied().unwrap_or(0) as u64;
+            two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_SHARE * experts as f64;
             crate::host::commit_note("expert slots");
         }
         if drafting && model.resident && model.weights.drafter
@@ -583,7 +591,8 @@ impl Model {
         model.load_seconds = load_seconds;
         // A partially resident model drafts one token a pass: IQ2_XS --vram 12 on an R9700, 64 tok/s without drafts, 70 with one,
         // 64 with two and 65 with three. The widest pass costs far more than the rest (16 ms for one row, 24 for two, 53 for four).
-        let drafts = if model.partial { settings.speculative.min(1) } else { settings.speculative };
+        // Two once the slots hold enough ([`TWO_DRAFTS_SHARE`]).
+        let drafts = if model.partial { settings.speculative.min(if two_drafts { 2 } else { 1 }) } else { settings.speculative };
         model.speculative = if drafting && model.weights.drafter { drafts } else { 0 };
         Ok(model)
     }
