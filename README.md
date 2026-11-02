@@ -78,7 +78,7 @@ server finds both there and runs without either. Qwen3.8 reads images with
 the bundle's directory or the one above it, or named by `--mmproj`.
 
 Each GPU's VRAM budget is its free memory less a margin (512 MiB or 3%; on Windows, where the
-desktop shares the GPU, an eighth of a small card, and 2 GiB from 16 GB up) unless `--vram` gives
+desktop shares the GPU, an eighth of a small card and 256 MiB, and 2 GiB from 16 GB up) unless `--vram` gives
 one (`--vram 28`) or one per GPU (`--vram 30,10` for a 32 GB and a 12 GB card).
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
