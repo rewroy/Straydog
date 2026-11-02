@@ -615,12 +615,22 @@ fn split(hp: &Hparams, dense: &[u64], head: u64, budgets: &[u64]) -> Result<Vec<
 
 /// The prefill batches placement chooses among when none is asked for, largest first.
 const AUTO_BATCHES: [usize; 6] = [8192, 4096, 2048, 1024, 512, 256];
+/// Wider batches for a card of at least [`WIDE_BUDGET`]. A batch streams nearly every expert over the bus whatever its rows, so a long
+/// prompt takes fewer of those trips, and between long passes its buffers are lent to the expert store, so decode keeps its slots: two
+/// R9700s, which take 16384: 6064 -> 6059 slots; a 45K prompt's first token 30.8 -> 27.5 s, a 20K one's 14.6 -> 11.9 s, the same replies.
+const WIDE_BATCHES: [usize; 2] = [32768, 16384];
+const WIDE_BUDGET: u64 = 24 << 30;
 
-/// The largest of [`AUTO_BATCHES`] whose pass buffers (`per_row` bytes a row, and a few rows of a
-/// pass's own) take no more than an eighth of a GPU's `budget`; the least when none does.
+/// The largest batch whose pass buffers (`per_row` bytes a row, and a few rows of a pass's own) take no more than a third of a GPU's
+/// `budget` ([`WIDE_BATCHES`]) or an eighth of it ([`AUTO_BATCHES`]); the least when none does.
 fn auto_batch(budget: u64, per_row: u64) -> usize {
-    AUTO_BATCHES.into_iter().find(|&batch| (batch + OWN_ROWS.min(batch)) as u64 * per_row.max(1) <= budget / 8)
-        .unwrap_or(AUTO_BATCHES[AUTO_BATCHES.len() - 1])
+    let bytes = |batch: usize| (batch + OWN_ROWS.min(batch)) as u64 * per_row.max(1);
+    if budget >= WIDE_BUDGET {
+        if let Some(batch) = WIDE_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 3) {
+            return batch;
+        }
+    }
+    AUTO_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 8).unwrap_or(AUTO_BATCHES[AUTO_BATCHES.len() - 1])
 }
 
 fn layer_of(name: &str) -> Option<usize> {
@@ -865,13 +875,14 @@ mod tests {
         assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
     }
 
-    /// With the 0.31 MB a row takes on each of two GPUs, 8192 rows are chosen for the R9700s' 30.7 GiB
-    /// budgets and for 24 GiB cards, fewer on a 16 GiB card, and the least where nothing fits.
+    /// With 0.32 MB a row, 32768 rows are chosen for a 31 GiB budget, 16384 for 24 GiB, 8192 below that,
+    /// fewer on a 16 GiB card, and the least where nothing fits.
     #[test]
-    fn the_prefill_batch_is_the_largest_whose_buffers_take_an_eighth_of_the_budget() {
+    fn the_prefill_batch_is_the_largest_whose_buffers_fit_their_share_of_the_budget() {
         const GIB: u64 = 1 << 30;
         let per_row = 320_000;
-        assert_eq!(auto_batch(30 * GIB, per_row), 8192);
+        assert_eq!(auto_batch(31 * GIB, per_row), 32768);
+        assert_eq!(auto_batch(24 * GIB, per_row), 16384);
         assert_eq!(auto_batch(22 * GIB, per_row), 8192);
         assert_eq!(auto_batch(16 * GIB, per_row), 4096);
         assert_eq!(auto_batch(8 * GIB, per_row), 2048);

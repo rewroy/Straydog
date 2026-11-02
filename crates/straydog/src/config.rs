@@ -116,7 +116,7 @@ pub struct Options {
     pub ctx_size: Option<u32>,
     /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for the models read on demand (Qwen3.5 MoE: fewer when an eighth of the GPU budget, or a quarter of what its weights and state leave, cannot hold them); DeepSeek-V4.1: 8192, fewer when its pass buffers would take over an eighth of a GPU's budget]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
-          value_parser = clap::value_parser!(u16).range(1..=8192))]
+          value_parser = clap::value_parser!(u16).range(1..=32768))]
     pub batch_size: Option<u16>,
     /// GPU ordinals, comma separated (also -gpu; -dev and --device are accepted) [default: 0]
     #[arg(long = "gpu", alias = "device", env = "STRAYDOG_GPU", value_name = "LIST", value_delimiter = ',')]
