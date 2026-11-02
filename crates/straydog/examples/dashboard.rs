@@ -46,6 +46,7 @@ fn main() {
         model: PathBuf::from("/simulated").join(quant),
         quant: quant.into(),
         model_draft,
+        model_vision: None,
         draft_max,
         ctx_size: 262_144,
         batch_size: Some(4096),
