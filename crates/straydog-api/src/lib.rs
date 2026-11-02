@@ -23,6 +23,7 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use straydog_engine::pyjson;
 pub use straydog_engine::reply::Markup;
+use straydog_engine::constraint::NOT_CP932_HAN;
 use straydog_engine::sampling::Sampling;
 use subtle::ConstantTimeEq;
 
@@ -74,7 +75,7 @@ pub enum SubmitError {
 /// `{"messages": [...], "tools": [...] | null, "max_tokens": n | null, "temperature": t,
 /// "top_k": k, "top_p": p, "min_p": p, "presence_penalty": x, "seed": n, "thinking": bool,
 /// "reasoning_effort": "low" | "medium" | "xhigh",
-/// "checkpoint": bool}`.
+/// "checkpoint": bool}`, and `"suppress": "not_cp932_han"` only when asked for.
 ///
 /// Each message keeps, in the client's order, the fields the template reads or a client
 /// sends back (`role`, `content`, `name`, `tool_call_id`, `tool_calls`,
@@ -299,7 +300,8 @@ async fn health(State(api): State<Arc<Api>>) -> Response {
 async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     api.authorize(&headers)?;
     let config = &api.config;
-    let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision()});
+    let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision(),
+                          "suppress": [NOT_CP932_HAN]});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -316,6 +318,8 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
     Ok(Json(json!({
         "default_generation_settings": api.slot()?, "total_slots": 1, "model_alias": api.config.model_id,
         "modalities": {"vision": api.vision(), "audio": false},
+        // (what a chat completion's `suppress` may name)
+        "suppress": [NOT_CP932_HAN],
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }

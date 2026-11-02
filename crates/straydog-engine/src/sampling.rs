@@ -789,32 +789,7 @@ pub fn distribution(logits: &[f32], sampling: &Sampling, generated: &Generated) 
     // The candidates by logit, most likely first (the lower token on a tie).
     let top_k = sampling.top_k.min(logits.len());
     let candidates: Vec<(f64, u32)> = if (1..=SCANNED_TOP_K).contains(&top_k) {
-        let mut best: Vec<(f64, u32)> = Vec::with_capacity(top_k + 1);
-        // A token whose logit, raised by the most the penalty can raise it, is at most the last
-        // kept cannot be kept (the last kept only rises): a run of such tokens is passed over at
-        // once, in a loop that vectorizes, and the scan keeps the same candidates.
-        let raise = (-sampling.presence_penalty).max(0.0);
-        for (run, chunk) in logits.chunks(SKIPPED_RUN).enumerate() {
-            if best.len() == top_k {
-                let last = best[top_k - 1].0;
-                if chunk
-                    .iter()
-                    .fold(true, |all, &logit| all & (f64::from(logit) + raise <= last))
-                {
-                    continue;
-                }
-            }
-            for index in run * SKIPPED_RUN..run * SKIPPED_RUN + chunk.len() {
-                let logit = penalized(logits, index, sampling, generated);
-                if best.len() == top_k && logit <= best[best.len() - 1].0 {
-                    continue;
-                }
-                let at = best.partition_point(|(other, _)| *other >= logit);
-                best.insert(at, (logit, index as u32));
-                best.truncate(top_k);
-            }
-        }
-        best
+        scanned_top(logits, top_k, sampling, generated)
     } else {
         let mut all: Vec<(f64, u32)> = (0..logits.len())
             .map(|index| (penalized(logits, index, sampling, generated), index as u32))
@@ -827,6 +802,41 @@ pub fn distribution(logits: &[f32], sampling: &Sampling, generated: &Generated) 
         all
     };
     cut(candidates, sampling)
+}
+
+/// The `top_k` (at most [`SCANNED_TOP_K`]) greatest logits after the penalty, most likely first, the lower token on a tie.
+fn scanned_top(logits: &[f32], top_k: usize, sampling: &Sampling, generated: &Generated) -> Vec<(f64, u32)> {
+    let mut best: Vec<(f64, u32)> = Vec::with_capacity(top_k + 1);
+    // A token whose logit, raised by the most the penalty can raise it, is at most the last
+    // kept cannot be kept (the last kept only rises): a run of such tokens is passed over at
+    // once, in a loop that vectorizes, and the scan keeps the same candidates.
+    let raise = (-sampling.presence_penalty).max(0.0);
+    for (run, chunk) in logits.chunks(SKIPPED_RUN).enumerate() {
+        if best.len() == top_k {
+            let last = best[top_k - 1].0;
+            if chunk
+                .iter()
+                .fold(true, |all, &logit| all & (f64::from(logit) + raise <= last))
+            {
+                continue;
+            }
+        }
+        for index in run * SKIPPED_RUN..run * SKIPPED_RUN + chunk.len() {
+            let logit = penalized(logits, index, sampling, generated);
+            if best.len() == top_k && logit <= best[best.len() - 1].0 {
+                continue;
+            }
+            let at = best.partition_point(|(other, _)| *other >= logit);
+            best.insert(at, (logit, index as u32));
+            best.truncate(top_k);
+        }
+    }
+    best
+}
+
+/// A row's `top` greatest logits with their tokens, read on the host, as a GPU's head gives them ([`accept_top`]'s `top`).
+pub fn top_of(logits: &[f32], top: usize) -> Vec<(f32, u32)> {
+    scanned_top(logits, top.min(logits.len()), &Sampling::GREEDY, &Generated::new(0)).into_iter().map(|(logit, token)| (logit as f32, token)).collect()
 }
 
 /// The draw among `candidates` (by logit, most likely first, the lower token on a tie; top_k of them at most): top_p and
@@ -903,8 +913,14 @@ pub fn choose_where(logits: &[f32], sampling: &Sampling, generated: &Generated, 
             distribution = distribution.without(token);
         }
     } else {
+        // (the first choice needs no copy of the row)
+        let token = choose(logits, sampling, generated, rng);
+        if logits[token as usize] != f32::NEG_INFINITY && allowed(token) {
+            return Some(token);
+        }
         let mut masked = logits.to_vec();
-        for _ in 0..REDRAWS {
+        masked[token as usize] = f32::NEG_INFINITY;
+        for _ in 1..REDRAWS {
             let token = choose(&masked, sampling, generated, rng);
             if masked[token as usize] == f32::NEG_INFINITY {
                 break;
