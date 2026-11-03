@@ -2031,7 +2031,8 @@ impl Model {
         if !self.images.is_empty() {
             batch = batch.max(2);
         }
-        let long = self.partial && tokens.len() - position >= LONG_PREFILL;
+        // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
+        let long = self.partial && tokens.len() - position >= LONG_PREFILL.min(self.prefill_batch_size * 2);
         if long {
             self.ensure_kv(tokens.len())?;
             if let Some(rows) = self.group.begin_long_prefill()? {

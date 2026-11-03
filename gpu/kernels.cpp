@@ -485,6 +485,7 @@ struct Device {
     hipblasHandle_t blas = nullptr;
     hipblasHandle_t blas_f32 = nullptr;   // F32 products: see create_f32_blas
     float* expanded = nullptr;
+    size_t expanded_bytes = 0;
     __half* half_input = nullptr;
     float* attention_scores = nullptr;
     void* blas_workspace = nullptr;
@@ -2141,6 +2142,7 @@ void* sd_create(int ordinal, uint64_t budget) {
         value->used = workspace_bytes + 256;
         if (budget >= 256 * 1024 * 1024) {
             check(hipMalloc(reinterpret_cast<void**>(&value->expanded), gemm_elements * 4));
+            value->expanded_bytes = gemm_elements * 4;
             check(hipMalloc(reinterpret_cast<void**>(&value->half_input), value->input_capacity * 2));
             check(hipMalloc(&value->blas_workspace, blas_workspace_bytes));
             check(hipMalloc(reinterpret_cast<void**>(&value->attention_scores), attention_score_bytes));
@@ -2596,6 +2598,18 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision) {
         if (minimum_batch < 2 || minimum_batch > max_batch + 1 || (half_precision != 0 && half_precision != 1))
             throw std::runtime_error("invalid Straydog GEMM options");
         value.gemm_min_batch = size_t(minimum_batch); value.half_gemm = half_precision != 0;
+        // A matrix expanded to FP16 takes half of what it does in FP32, and the rest is a token's worth of slots on a small card.
+        const size_t expanded_bytes = gemm_elements * (value.half_gemm ? 2 : 4);
+        if (value.expanded && value.expanded_bytes != expanded_bytes) {
+            check(hipStreamSynchronize(value.stream));
+            check(hipFree(value.expanded));
+            value.expanded = nullptr;
+            value.used -= value.expanded_bytes;
+            value.expanded_bytes = 0;
+            check(hipMalloc(reinterpret_cast<void**>(&value.expanded), expanded_bytes));
+            value.expanded_bytes = expanded_bytes;
+            value.used += expanded_bytes;
+        }
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
