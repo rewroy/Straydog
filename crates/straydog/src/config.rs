@@ -804,13 +804,16 @@ mod tests {
         let environment = |pairs: &'static [(&'static str, &'static str)]| move |name: &str| {
             pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| std::ffi::OsString::from(value))
         };
-        let (data, config) = user_folders(Platform::Unix, &environment(&[("HOME", "/home/u")])).unwrap();
-        assert_eq!((data, config), (PathBuf::from("/home/u/.local/share/straydog"), PathBuf::from("/home/u/.config/straydog")));
-        let moved = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/data"), ("XDG_CONFIG_HOME", "/etc/u")]);
-        assert_eq!(user_folders(Platform::Unix, &moved).unwrap(), (PathBuf::from("/data/straydog"), PathBuf::from("/etc/u/straydog")));
-        // (a relative XDG value is not a base directory)
-        let relative = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "data")]);
-        assert_eq!(user_folders(Platform::Unix, &relative).unwrap().0, PathBuf::from("/home/u/.local/share/straydog"));
+        // (`/home/u` is not absolute on Windows, as a drive path is not elsewhere)
+        if !cfg!(windows) {
+            let (data, config) = user_folders(Platform::Unix, &environment(&[("HOME", "/home/u")])).unwrap();
+            assert_eq!((data, config), (PathBuf::from("/home/u/.local/share/straydog"), PathBuf::from("/home/u/.config/straydog")));
+            let moved = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/data"), ("XDG_CONFIG_HOME", "/etc/u")]);
+            assert_eq!(user_folders(Platform::Unix, &moved).unwrap(), (PathBuf::from("/data/straydog"), PathBuf::from("/etc/u/straydog")));
+            // (a relative XDG value is not a base directory)
+            let relative = environment(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "data")]);
+            assert_eq!(user_folders(Platform::Unix, &relative).unwrap().0, PathBuf::from("/home/u/.local/share/straydog"));
+        }
         assert!(user_folders(Platform::Unix, &environment(&[])).is_none());
         let windows = environment(&[("LOCALAPPDATA", "C:\\Users\\u\\AppData\\Local"), ("USERPROFILE", "C:\\Users\\u")]);
         if cfg!(windows) {
