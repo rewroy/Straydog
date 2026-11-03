@@ -31,6 +31,17 @@ endif()
 # Drafter quantization must produce the pinned bytes on every compiler.
 set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
 set_target_properties(straydog_gpu PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 CUDA_STANDARD 17)
+# __FILE__, which a failed call's check names, relative to this folder and not where it was built: the builder's home was in every one
+# in a released executable. (cl's option, and through nvcc to its host compiler, as one word: SHELL: reads a backslash as an escape and
+# left none of the path's; no separator at its end, which would escape the quote.)
+if(MSVC)
+  file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" STRAYDOG_SOURCE_DIR)
+  target_compile_options(straydog_gpu PRIVATE
+    "$<$<COMPILE_LANGUAGE:CXX>:/d1trimfile:${STRAYDOG_SOURCE_DIR}>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/d1trimfile:${STRAYDOG_SOURCE_DIR}>")
+else()
+  target_compile_options(straydog_gpu PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=")
+endif()
 
 option(STRAYDOG_CPU_TESTS "Build standalone CPU scheduling regressions" OFF)
 if(STRAYDOG_CPU_TESTS)
