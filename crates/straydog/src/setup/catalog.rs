@@ -520,8 +520,8 @@ pub(crate) mod tests {
         Machine { backend: "ROCm/HIP", gpus, gpu_error: None, ram }
     }
 
-    /// The owner's: two R9700s (34208743424 bytes each) and the 134411186176 bytes of RAM the worker measures.
-    pub fn doggybox() -> Machine {
+    /// The test machine: two R9700s (34208743424 bytes each) and the 134411186176 bytes of RAM the worker measures.
+    pub fn two_r9700s() -> Machine {
         machine(2, 34_208_743_424, 134_411_186_176)
     }
 
@@ -604,13 +604,13 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The fit rule against what the placement did on the owner's machine (Homelab's logs, 2026-10-28):
+    /// The fit rule against what the placement did on the test machine (its server's logs, 2026-10-28):
     /// GSQ-RCO-IQ2_XXS held 5832 expert slots in VRAM and had a 102.2 GiB host tier, GSQ-RCO-IQ2_XS 5147
     /// slots and the same tier; the experts' bytes per slot are the average.
     #[test]
     fn the_fit_rule_agrees_with_the_placement_on_two_r9700s() {
         // (it runs Linux: under Windows' margin IQ3_S would not fit whole)
-        let machine = doggybox();
+        let machine = two_r9700s();
         for (quant, slots) in [("GSQ-RCO-IQ2_XXS", 5832u64), ("GSQ-RCO-IQ2_XS", 5147)] {
             let entry = entry(quant);
             let in_vram = slots * entry.footprint.experts / 15360;
@@ -737,7 +737,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// 6 GB and 32 GB, the owner's goal: IQ2_XS runs, what it misses in RAM is told as measured, and the messages say what `auto` takes.
+    /// 6 GB and 32 GB, the low-spec target: IQ2_XS runs, what it misses in RAM is told as measured, and the messages say what `auto` takes.
     #[test]
     fn the_goal_machine_gets_iq2_xs_with_true_words() {
         let pc = windows_pc(6144, DESKTOP, RAM_32);
@@ -800,7 +800,7 @@ pub(crate) mod tests {
         // (the budgets depend on the platform's margin: 6 GB under Windows leaves about 4.2 GiB, elsewhere 4.5)
         assert!(!drafter_pays(&windows_pc(6144, DESKTOP, RAM_32)));
         assert!(drafter_pays(&windows_pc(8188, DESKTOP, RAM_32)));
-        assert!(drafter_pays(&doggybox()));
+        assert!(drafter_pays(&two_r9700s()));
     }
 
     #[test]
