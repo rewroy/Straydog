@@ -53,9 +53,31 @@ pub fn fetch_with(agent: &Agent, root: &Path, entries: &[(Asset, String)], offli
         if target.exists() || (gguf && reuse(&target, asset, progress)?) {
             continue;
         }
-        download(agent, &target, asset, url, progress)?;
+        download_resuming(agent, &target, asset, url, progress)?;
     }
     Ok(())
+}
+
+/// How many times a connection may go away during one file before the download gives up.
+const RESUMES: u32 = 5;
+
+/// Whether the other end, or something on the way, dropped the connection.
+fn dropped(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe)
+}
+
+/// A connection reset is no reason to give up many GB: the next try goes on from the partial file.
+fn download_resuming(agent: &Agent, target: &Path, asset: &Asset, url: &str, progress: Progress) -> io::Result<()> {
+    let mut resumes = 0;
+    loop {
+        match download(agent, target, asset, url, progress) {
+            Err(error) if resumes < RESUMES && dropped(&error) => {
+                resumes += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200 << resumes));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Size, then SHA-256, of a pinned file, the hashing shown as `label`.
@@ -393,8 +415,10 @@ mod tests {
         let long = Server::start(|_| mock::reply(200, &[], b"pinned and more"));
         assert_eq!(failure(fetch(&long, &root, std::slice::from_ref(&asset), true)), "model download exceeded pinned size");
         fs::write(root.join("model.part"), b"pinned and more").unwrap();
+        // (no request for what is too big already; the first fetch may have made more than one, if a connection dropped)
+        let asked = long.requests().len();
         assert!(failure(fetch(&long, &root, std::slice::from_ref(&asset), true)).starts_with("oversized partial asset"));
-        assert_eq!(long.requests().len(), 1);
+        assert_eq!(long.requests().len(), asked);
         let missing = Server::start(|_| mock::reply(404, &[], b""));
         fs::remove_file(root.join("model.part")).unwrap();
         assert!(failure(fetch(&missing, &root, std::slice::from_ref(&asset), true)).contains("404"));

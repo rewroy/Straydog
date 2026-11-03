@@ -62,6 +62,10 @@ fn serve(mut stream: TcpStream, respond: &(dyn Fn(&Request) -> Vec<u8> + Sync), 
     let response = respond(&request);
     seen.lock().unwrap().push(request);
     stream.write_all(&response).ok();
+    // A client with the whole reply closes first. On Windows a server's close as the reply arrives can reach it as a reset (os error 10054). One with a reply
+    // cut short gets its end when this one closes.
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
+    let _ = stream.read(&mut byte);
 }
 
 /// A complete response.
