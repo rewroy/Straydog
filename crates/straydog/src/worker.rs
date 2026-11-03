@@ -285,7 +285,7 @@ pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result
     let batch = match args.prefill_batch_size.as_str() {
         // (as the configuration derives it from given budgets: 2048 for the resident models, see config::resolve)
         "auto" if straydog_engine::bundle::is_on_demand(&args.quant) => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
-        "auto" => if budgets.iter().sum::<u64>() >= 48 << 30 { 2048 } else { 1024 },
+        "auto" => crate::config::resident_batch(budgets.iter().sum()) as usize,
         given => given.parse().map_err(|_| format!("invalid Straydog prefill batch {given:?}"))?,
     };
     let (least, most) = (*budgets.iter().min().unwrap(), *budgets.iter().max().unwrap());

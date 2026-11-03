@@ -889,7 +889,7 @@ impl Backend {
         let (used, budget) = self.memory()?;
         let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
         let free = budget.saturating_sub(used + self.slot_margin) + bytes(self.prefill_capacity);
-        for capacity in [4096, 2048] {
+        for capacity in [4096, 2048, 1024] {
             if capacity > self.prefill_capacity && bytes(capacity) + 2 * ALLOCATION_TAIL <= free {
                 self.prefill_buffers(capacity)?;
                 break;

@@ -399,6 +399,16 @@ fn drafter_directory(file: &Path) -> Result<PathBuf, String> {
 }
 
 /// Fill every derived setting.
+/// The rows of a prefill batch for a resident model on this much GPU budget. Under 8 GiB the batches' workspaces rest at 256 rows, with some 200 MiB more for decode's
+/// slots, and widen for a long prompt ([`straydog_engine`]'s `begin_long_prefill`).
+pub(crate) fn resident_batch(total: u64) -> u16 {
+    match total {
+        total if total >= 48 << 30 => 2048,
+        total if total >= 8 << 30 => 1024,
+        _ => 256,
+    }
+}
+
 pub fn resolve(options: Options) -> Result<Settings, String> {
     let model = options.model.ok_or("no model: give -m DIR or set model in the config file")?;
     let model = model.canonicalize().map_err(|exc| format!("model {}: {exc}", model.display()))?;
@@ -472,7 +482,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         _ if deepseek => None,
         _ if on_demand => Some(4096),
         // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048, 2026-10-29)
-        Some(total) => Some(if total >= 48 << 30 { 2048 } else { 1024 }),
+        Some(total) => Some(resident_batch(total)),
         None => None,
     });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
@@ -743,6 +753,7 @@ mod tests {
         let settings = resolved(&["--gpu", "0,1", "--vram", "30,10"], None).unwrap();
         assert_eq!(settings.vram.bytes(2), Some(vec![30 << 30, 10 << 30]));
         assert_eq!(settings.batch_size, Some(1024));   // 40 GiB in all
+        assert_eq!((resident_batch(5 << 30), resident_batch(8 << 30)), (256, 1024), "a small card's batches rest narrow");
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "8"], None).unwrap().vram.bytes(2), Some(vec![8 << 30, 8 << 30]));
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "auto"], None).unwrap().vram, Vram::Auto);
         assert!(resolved(&["--gpu", "0,1", "--vram", "30,10,5"], None).unwrap_err().contains("3 budgets for 2 GPUs"));
