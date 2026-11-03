@@ -146,14 +146,48 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
 #endif
 }
 
+// A row's softmax, once: each head's denominator into its first partial's x, each score into its weight (0 past a masked key), in place.
+// The output's blocks of a row then read them: a row has dim / 64 blocks, and each computing them was most of what they did.
+// Grid (1, rows), 256 threads.
+template<int HM>
+__global__ void __launch_bounds__(256) ds_attention_weights_wmma(
+        float* scores, float2* partial, size_t chunks, const int32_t* positions, size_t window, size_t selections, const float* sinks,
+        size_t heads, size_t stride) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr int H = HM * 16;
+    const size_t row = blockIdx.y;
+    const int64_t p = positions[row];
+    const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
+    const size_t total = size_t(p - first + 1) + selections;
+    const unsigned t = threadIdx.x;
+    __shared__ float tops[H];
+    if (t < H && t < heads) {
+        float2* parts = partial + (row * heads + t) * chunks;
+        float top = sinks[t];
+        for (size_t c = 0; c < chunks; ++c) top = fmaxf(top, parts[c].x);
+        float denominator = expf(sinks[t] - top);
+        for (size_t c = 0; c < chunks; ++c)
+            if (parts[c].y > 0.0f) denominator += parts[c].y * expf(parts[c].x - top);
+        tops[t] = top;
+        parts[0].x = denominator;
+    }
+    __syncthreads();
+    for (size_t at = t; at < heads * total; at += blockDim.x) {
+        const size_t h = at / total, k = at % total;
+        float& score = scores[(row * heads + h) * stride + k];
+        score = score == -INFINITY ? 0.0f : expf(score - tops[h]);
+    }
+#endif
+}
+
 // Weighted sums: grid (dim / 64, rows), 128 threads, every head of the row (HM tiles of 16); wave w
 // takes columns d0 + 16w ... Keys go 64 a stage: the next stage's weights and values load into
 // registers while the current one's products run (LDS in two buffers). Dynamic LDS: the row's key
-// addresses.
+// addresses. `weights` and `partial` as ds_attention_weights_wmma leaves them.
 template<int HM>
 __global__ void __launch_bounds__(128) ds_attention_output_wmma(
-        const float* scores, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
-        size_t window, const float* compressed, const int32_t* selected, size_t selections, const float* sinks, size_t heads,
+        const float* weights, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
+        size_t window, const float* compressed, const int32_t* selected, size_t selections, size_t heads,
         size_t dim, size_t pairs, const double2* inverse, size_t stride, float* out) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int H = HM * 16, KS = 64, L = ds_attention_lds, PW = H * KS / 128;
@@ -162,23 +196,13 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
     const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
     const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, half = lane / 16;
-    __shared__ float tops[H], denominators[H];
+    __shared__ float denominators[H];
     __shared__ __attribute__((aligned(16))) _Float16 ps[2][H][L];
     __shared__ __attribute__((aligned(16))) _Float16 vt[2][64][L];
     extern __shared__ const float* keys[];
     for (size_t index = t; index < total; index += blockDim.x)
         keys[index] = attention_key(index, raw_count, first, raw, raw_rows, compressed, selected + row * selections, total, dim);
-    if (t < H) {
-        const size_t head = std::min<size_t>(t, heads - 1);
-        const float2* parts = partial + (row * heads + head) * chunks;
-        float top = sinks[head];
-        for (size_t c = 0; c < chunks; ++c) top = fmaxf(top, parts[c].x);
-        float denominator = expf(sinks[head] - top);
-        for (size_t c = 0; c < chunks; ++c)
-            if (parts[c].y > 0.0f) denominator += parts[c].y * expf(parts[c].x - top);
-        tops[t] = top;
-        denominators[t] = denominator;
-    }
+    if (t < H && t < heads) denominators[t] = partial[(row * heads + t) * chunks].x;
     __syncthreads();
     // A thread's weights of the stage (heads x 64 keys, PW of them) and one key's 32 columns.
     float pw[PW];
@@ -189,12 +213,7 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
         for (int j = 0; j < PW; ++j) {
             const unsigned at = t + j * 128, h = at / KS, k = at % KS;
             const size_t index = k0 + k;
-            float w = 0.0f;
-            if (h < heads && index < total) {
-                const float score = scores[(row * heads + h) * stride + index];
-                if (score != -INFINITY) w = expf(score - tops[h]);
-            }
-            pw[j] = w;
+            pw[j] = h < heads && index < total ? weights[(row * heads + h) * stride + index] : 0.0f;
         }
         const size_t index = k0 + vkey;
         const float* key = index < total ? keys[index] : nullptr;

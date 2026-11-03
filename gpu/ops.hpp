@@ -436,6 +436,96 @@ __device__ __forceinline__ float wave_xor_add(float v) {
     return v + __shfl_xor(v, OFFSET, 32);
 #endif
 }
+// The last of a row's sublayer: its blocks' sums gathered, its norm and coefficients, and its columns normalized. The row's blocks have
+// finished; every thread of one block runs this, with `totals` and `gathered` in its LDS.
+template<int HC, size_t GATHER>
+__device__ __forceinline__ void hc_step_finish(size_t row, size_t blocks, size_t width, const float* fn, const float* base, const float* scale,
+                                               size_t iterations, float eps, float norm_eps, const float* norm_weight, float* row_partial,
+                                               unsigned* counter, float* pre, float* post, float* comb, float* out, float* totals, float* gathered) {
+    constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
+    const unsigned wave = threadIdx.x / 32;
+    // The row's columns, as the blocks left them (their stores are out: each block counted itself in after its fence), loaded now with
+    // their norm weights, so that those loads' latency is spent under the gather and the coefficients and not after them.
+    constexpr unsigned EACH = 24;
+    const bool early = width <= EACH * hc_step_threads;
+    float* o = out + row * width;
+    float early_x[EACH], early_w[EACH];
+    if (early) {
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = threadIdx.x + j * hc_step_threads;
+            if (col < width) { early_x[j] = hc_step_load(o + col); early_w[j] = norm_weight[col]; }
+        }
+    }
+    // The blocks' sums arrive GATHER at a time, all loads at once (a thread's issued before it
+    // stores any); each total adds them in order.
+    float total = 0.0f;
+    constexpr unsigned LOADS = (GATHER + hc_step_threads - 1) / hc_step_threads;
+    for (size_t b0 = 0; b0 < blocks; b0 += GATHER / SUMS) {
+        const size_t count = std::min<size_t>(GATHER / SUMS, blocks - b0) * SUMS;
+        float* sums = row_partial + b0 * SUMS;
+        float loaded[LOADS];
+        #pragma unroll
+        for (unsigned j = 0; j < LOADS; ++j) {
+            const size_t i = threadIdx.x + j * hc_step_threads;
+            if (i < count) loaded[j] = hc_step_load(sums + i);
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < LOADS; ++j) {
+            const size_t i = threadIdx.x + j * hc_step_threads;
+            if (i < count) gathered[i] = loaded[j];
+        }
+        __syncthreads();
+        if (threadIdx.x < SUMS)
+            for (size_t b = 0; b < count / SUMS; ++b) total += gathered[b * SUMS + threadIdx.x];
+        __syncthreads();
+    }
+    if (threadIdx.x < SUMS) totals[threadIdx.x] = total;
+    __syncthreads();
+    if (counter && threadIdx.x == 0) *counter = 0;
+    const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
+    // (the norm needs only its factor: the other waves store their columns while the first forms the coefficients)
+    if (early && (!fn || wave)) {
+        #pragma unroll
+        for (unsigned j = 0; j < EACH; ++j) {
+            const size_t col = threadIdx.x + j * hc_step_threads;
+            if (col < width) o[col] = early_x[j] * factor * early_w[j];
+        }
+    }
+    if (fn) {
+        const float rsqrt = rsqrtf(totals[MIX] / float(HC * width) + norm_eps);
+        if constexpr (HC * HC <= 32) {
+            if (wave == 0)
+                hc_coefficients_wave<HC>(totals, rsqrt, base, scale, iterations, eps, pre + row * HC, post + row * HC,
+                                         comb + row * HC * HC);
+        } else if (threadIdx.x == 0)
+            hc_coefficients_of(totals, rsqrt, HC, base, scale, iterations, eps, pre + row * HC, post + row * HC, comb + row * HC * HC);
+    }
+    if (early) {
+        if (fn && wave == 0) {
+            #pragma unroll
+            for (unsigned j = 0; j < EACH; ++j) {
+                const size_t col = threadIdx.x + j * hc_step_threads;
+                if (col < width) o[col] = early_x[j] * factor * early_w[j];
+            }
+        }
+        return;
+    }
+    // the row's columns a few at a time, each group's loads issued before its stores
+    for (size_t col0 = 0; col0 < width; col0 += size_t(8) * blockDim.x) {
+        float loaded[8], weights[8];
+        #pragma unroll
+        for (unsigned j = 0; j < 8; ++j) {
+            const size_t col = col0 + j * blockDim.x + threadIdx.x;
+            if (col < width) { loaded[j] = hc_step_load(o + col); weights[j] = norm_weight[col]; }
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < 8; ++j) {
+            const size_t col = col0 + j * blockDim.x + threadIdx.x;
+            if (col < width) o[col] = loaded[j] * factor * weights[j];
+        }
+    }
+}
 template<int HC>
 __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
                                   float* stream, const float* fn, const float* base, const float* scale, size_t iterations,
@@ -530,87 +620,93 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
     __syncthreads();
     if (!last) return;
     __threadfence();
-    // The row's columns, as the blocks left them (their stores are out: each block counted itself in after its fence), loaded now with
-    // their norm weights, so that those loads' latency is spent under the gather and the coefficients and not after them.
-    constexpr unsigned EACH = 24;
-    const bool early = width <= EACH * hc_step_threads;
-    float* o = out + row * width;
-    float early_x[EACH], early_w[EACH];
-    if (early) {
-        #pragma unroll
-        for (unsigned j = 0; j < EACH; ++j) {
-            const size_t col = threadIdx.x + j * hc_step_threads;
-            if (col < width) { early_x[j] = hc_step_load(o + col); early_w[j] = norm_weight[col]; }
-        }
-    }
-    // The blocks' sums arrive GATHER at a time, all loads at once (a thread's issued before it
-    // stores any); each total adds them in order.
-    float total = 0.0f;
-    constexpr unsigned LOADS = (GATHER + hc_step_threads - 1) / hc_step_threads;
-    for (size_t b0 = 0; b0 < blocks; b0 += GATHER / SUMS) {
-        const size_t count = std::min<size_t>(GATHER / SUMS, blocks - b0) * SUMS;
-        float* sums = row_partial + b0 * SUMS;
-        float loaded[LOADS];
-        #pragma unroll
-        for (unsigned j = 0; j < LOADS; ++j) {
-            const size_t i = threadIdx.x + j * hc_step_threads;
-            if (i < count) loaded[j] = hc_step_load(sums + i);
-        }
-        #pragma unroll
-        for (unsigned j = 0; j < LOADS; ++j) {
-            const size_t i = threadIdx.x + j * hc_step_threads;
-            if (i < count) gathered[i] = loaded[j];
-        }
-        __syncthreads();
-        if (threadIdx.x < SUMS)
-            for (size_t b = 0; b < count / SUMS; ++b) total += gathered[b * SUMS + threadIdx.x];
-        __syncthreads();
-    }
-    if (threadIdx.x < SUMS) totals[threadIdx.x] = total;
-    __syncthreads();
-    if (threadIdx.x == 0) *counter = 0;
-    const float factor = rsqrtf(totals[MIX + 1] / float(width) + norm_eps);
-    // (the norm needs only its factor: the other waves store their columns while the first forms the coefficients)
-    if (early && (!fn || wave)) {
-        #pragma unroll
-        for (unsigned j = 0; j < EACH; ++j) {
-            const size_t col = threadIdx.x + j * hc_step_threads;
-            if (col < width) o[col] = early_x[j] * factor * early_w[j];
-        }
-    }
-    if (fn) {
-        const float rsqrt = rsqrtf(totals[MIX] / float(HC * width) + norm_eps);
-        if constexpr (HC * HC <= 32) {
-            if (wave == 0)
-                hc_coefficients_wave<HC>(totals, rsqrt, base, scale, iterations, eps, pre + row * HC, post + row * HC,
-                                         comb + row * HC * HC);
-        } else if (threadIdx.x == 0)
-            hc_coefficients_of(totals, rsqrt, HC, base, scale, iterations, eps, pre + row * HC, post + row * HC, comb + row * HC * HC);
-    }
-    if (early) {
-        if (fn && wave == 0) {
+    hc_step_finish<HC, GATHER>(row, blocks, width, fn, base, scale, iterations, eps, norm_eps, norm_weight, row_partial, counter, pre, post, comb,
+                               out, totals, gathered);
+}
+// op_hc_step_kernel over a long pass's rows, for the same values: every row read the same `fn` again (a row's 983 KB, 250 MB for a batch of 256
+// rows against 21 MB of stream), so a block takes op_hc_step_rows rows and each thread loads its column's weights once. The rows' last
+// steps follow in op_hc_step_finish_kernel. No link: a long pass's sums come first. Grid (blocks, rows / op_hc_step_rows, rounded up).
+constexpr size_t op_hc_step_rows = 16;
+template<int HC>
+__global__ void __launch_bounds__(hc_step_threads) op_hc_step_rows_kernel(const float* x, const float* residual, const float* post_in, const float* comb_in,
+                                  float* stream, const float* fn, const float* collapse, size_t rows, size_t width, float* partial, float* out) { SD_KERNEL_ACQUIRE;
+    constexpr int MIX = (2 + HC) * HC, SUMS = MIX + 2;
+    const size_t block = blockIdx.x, blocks = gridDim.x, first_row = size_t(blockIdx.y) * op_hc_step_rows;
+    const size_t first = block * hc_step_columns, columns = std::min(size_t(hc_step_columns), width - first);
+    const size_t last_row = std::min(rows, first_row + op_hc_step_rows);
+    const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    __shared__ float values[HC][hc_step_columns];
+    __shared__ float reduce[8][SUMS];
+    // (a thread's pairs of the block, as op_hc_step_kernel's loop gives them: one at four streams or fewer)
+    constexpr unsigned PAIRS = (HC * hc_step_columns + hc_step_threads - 1) / hc_step_threads;
+    float f[PAIRS][MIX];
+    #pragma unroll
+    for (unsigned at = 0; at < PAIRS; ++at) {
+        const size_t pair = threadIdx.x + at * hc_step_threads;
+        if (pair >= HC * hc_step_columns) continue;
+        const size_t j = pair / hc_step_columns, c = pair % hc_step_columns, col = first + c;
+        if (c >= columns) continue;
+        if (reinterpret_cast<uintptr_t>(fn) & 1u) {
+            const uint16_t* halves = reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(fn) & ~uintptr_t(1));
             #pragma unroll
-            for (unsigned j = 0; j < EACH; ++j) {
-                const size_t col = threadIdx.x + j * hc_step_threads;
-                if (col < width) o[col] = early_x[j] * factor * early_w[j];
-            }
-        }
-        return;
-    }
-    // the row's columns a few at a time, each group's loads issued before its stores
-    for (size_t col0 = 0; col0 < width; col0 += size_t(8) * blockDim.x) {
-        float loaded[8], weights[8];
-        #pragma unroll
-        for (unsigned j = 0; j < 8; ++j) {
-            const size_t col = col0 + j * blockDim.x + threadIdx.x;
-            if (col < width) { loaded[j] = hc_step_load(o + col); weights[j] = norm_weight[col]; }
-        }
-        #pragma unroll
-        for (unsigned j = 0; j < 8; ++j) {
-            const size_t col = col0 + j * blockDim.x + threadIdx.x;
-            if (col < width) o[col] = loaded[j] * factor * weights[j];
+            for (int m = 0; m < MIX; ++m) f[at][m] = __uint_as_float(uint32_t(halves[(m * HC + j) * width + col]) << 16);
+        } else {
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) f[at][m] = fn[(m * HC + j) * width + col];
         }
     }
+    for (size_t row = first_row; row < last_row; ++row) {
+        float acc[SUMS] = {};
+        float* s_row = stream + row * HC * width;
+        #pragma unroll
+        for (unsigned at = 0; at < PAIRS; ++at) {
+            const size_t pair = threadIdx.x + at * hc_step_threads;
+            if (pair >= HC * hc_step_columns) continue;
+            const size_t j = pair / hc_step_columns, c = pair % hc_step_columns, col = first + c;
+            if (c >= columns) continue;
+            float v = post_in[row * HC + j] * x[row * width + col];
+            #pragma unroll
+            for (int i = 0; i < HC; ++i) v += comb_in[(row * HC + i) * HC + j] * residual[(row * HC + i) * width + col];
+            s_row[j * width + col] = v;
+            values[j][c] = v;
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) acc[m] += f[at][m] * v;
+            acc[MIX] += v * v;
+        }
+        __syncthreads();
+        if (threadIdx.x < columns) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < HC; ++j) v += collapse[row * HC + j] * values[j][threadIdx.x];
+            out[row * width + first + threadIdx.x] = v;
+            acc[MIX + 1] = v * v;
+        }
+        #pragma unroll
+        for (int m = 0; m < SUMS; ++m) {
+            float v = acc[m];
+            v = wave_xor_add<16>(v); v = wave_xor_add<8>(v); v = wave_xor_add<4>(v); v = wave_xor_add<2>(v); v = wave_xor_add<1>(v);
+            if (lane == 0) reduce[wave][m] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < SUMS) {
+            float v = 0.0f;
+            for (unsigned w = 0; w < blockDim.x / 32; ++w) v += reduce[w][threadIdx.x];
+            partial[(row * blocks + block) * SUMS + threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+}
+// What op_hc_step_rows_kernel left of each row: grid (1, rows).
+template<int HC>
+__global__ void __launch_bounds__(hc_step_threads) op_hc_step_finish_kernel(size_t blocks, size_t width, const float* fn, const float* base, const float* scale,
+                                  size_t iterations, float eps, float norm_eps, const float* norm_weight, float* partial, float* pre, float* post,
+                                  float* comb, float* out) { SD_KERNEL_ACQUIRE;
+    constexpr int SUMS = (2 + HC) * HC + 2;
+    constexpr size_t GATHER = (3072 / SUMS) * SUMS;
+    __shared__ float totals[SUMS], gathered[GATHER];
+    const size_t row = blockIdx.y;
+    hc_step_finish<HC, GATHER>(row, blocks, width, fn, base, scale, iterations, eps, norm_eps, norm_weight, partial + row * blocks * SUMS, nullptr, pre, post,
+                               comb, out, totals, gathered);
 }
 // Values of op_hc_step_kernel's workspace per row: its counter, then its blocks' sums.
 size_t hc_step_row_values(size_t hc, size_t width) {
