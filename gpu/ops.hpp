@@ -436,6 +436,22 @@ __device__ __forceinline__ float wave_xor_add(float v) {
     return v + __shfl_xor(v, OFFSET, 32);
 #endif
 }
+// Each of N values summed over its wave as wave_xor_add's five steps sum it (lane 0's the same), a step of every value at a
+// time: the N chains interleave. (A value's five steps at a time, then lane 0's store, stalled on each step and changed
+// the exec mask between values: the HC step's 26 sums serialized ~400 dependent instructions a row.)
+template<int N>
+__device__ __forceinline__ void wave_sums(float (&v)[N]) {
+    #pragma unroll
+    for (int m = 0; m < N; ++m) v[m] = wave_xor_add<16>(v[m]);
+    #pragma unroll
+    for (int m = 0; m < N; ++m) v[m] = wave_xor_add<8>(v[m]);
+    #pragma unroll
+    for (int m = 0; m < N; ++m) v[m] = wave_xor_add<4>(v[m]);
+    #pragma unroll
+    for (int m = 0; m < N; ++m) v[m] = wave_xor_add<2>(v[m]);
+    #pragma unroll
+    for (int m = 0; m < N; ++m) v[m] = wave_xor_add<1>(v[m]);
+}
 // The last of a row's sublayer: its blocks' sums gathered, its norm and coefficients, and its columns normalized. The row's blocks have
 // finished; every thread of one block runs this, with `totals` and `gathered` in its LDS.
 template<int HC, size_t GATHER>
@@ -597,11 +613,10 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_kernel(const float
         out[row * width + first + threadIdx.x] = v;
         acc[MIX + 1] = v * v;
     }
-    #pragma unroll
-    for (int m = 0; m < SUMS; ++m) {
-        float v = acc[m];
-        v = wave_xor_add<16>(v); v = wave_xor_add<8>(v); v = wave_xor_add<4>(v); v = wave_xor_add<2>(v); v = wave_xor_add<1>(v);
-        if (lane == 0) reduce[wave][m] = v;
+    wave_sums(acc);
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < SUMS; ++m) reduce[wave][m] = acc[m];
     }
     __syncthreads();
     float* row_partial = partial + row * blocks * SUMS;
@@ -681,11 +696,10 @@ __global__ void __launch_bounds__(hc_step_threads) op_hc_step_rows_kernel(const 
             out[row * width + first + threadIdx.x] = v;
             acc[MIX + 1] = v * v;
         }
-        #pragma unroll
-        for (int m = 0; m < SUMS; ++m) {
-            float v = acc[m];
-            v = wave_xor_add<16>(v); v = wave_xor_add<8>(v); v = wave_xor_add<4>(v); v = wave_xor_add<2>(v); v = wave_xor_add<1>(v);
-            if (lane == 0) reduce[wave][m] = v;
+        wave_sums(acc);
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < SUMS; ++m) reduce[wave][m] = acc[m];
         }
         __syncthreads();
         if (threadIdx.x < SUMS) {
