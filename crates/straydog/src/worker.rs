@@ -691,7 +691,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // reasoning quoting a tag) stays the reasoning's.
     let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
     // The held tokens can be more than the tokenizer's for the same text, and with no `max_tokens` the reply's room was all that `ids` left: a
-    // client that sends none, as Dogmind App does, ended the worker on "exceeds the allocated context" on the first such reply.
+    // client that sends none, as some do, ended the worker on "exceeds the allocated context" on the first such reply.
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
     let agreed = if agreed.len() < context { agreed } else { ids.clone() };
     // (the images past such a place have moved with it)

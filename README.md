@@ -93,6 +93,7 @@ settings in effect and where each came from.
 | --- | --- | ---: | --- |
 | DeepSeek-V4.1-Flash | GSQ-RCO-IQ2_XXS | 248.8 GB | ISTA's recommended build; the faster where VRAM is short |
 | | GSQ-RCO-IQ2_XS | 265.8 GB | |
+| | UD-IQ1_M | 250.4 GB | Unsloth's; the size of GSQ-RCO-IQ2_XXS |
 | | UD-IQ2_XXS | 300.5 GB | Unsloth's |
 | Qwen3.8-Flash-Next | Q2_0 | 66.4 GB | the fastest |
 | | IQ2_XS | 68.0 GB | |
@@ -189,7 +190,8 @@ temperatures, power and memory, the CPU's and the memory's, as charts of the las
 minutes; prefill and decode speed live and per request; the engine's state. The
 environment and the service log are tabs, and a chat opens over the page. Sensors are
 read only while a dashboard is open. With an API key set, the page asks for it and
-keeps it in that tab.
+keeps it in that tab. The page is in English; a switch in the top bar shows it in Japanese, and
+the browser remembers the choice.
 
 ## Development
 
@@ -212,4 +214,6 @@ cargo run --release --features hip --example dashboard
 
 ## License
 
-MIT
+MIT. Code and data from other projects, and their licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+No model weights are part of this repository: each bundle is downloaded from its publisher and
+is under that publisher's license.

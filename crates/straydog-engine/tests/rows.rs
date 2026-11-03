@@ -131,7 +131,7 @@ fn the_automatic_budget_holds_the_table_while_half_the_free_memory_does() {
     let (count, width) = (320_001_536u64, 90u64);
     let all = rows::full_budget(count, width);
     assert_eq!(all, count * 114);
-    // Homelab: 125 GiB with 14 GiB of state, half of 111 GiB holds the 34 GiB table.
+    // Two R9700s and 125 GiB with 14 GiB of state, half of 111 GiB holds the 34 GiB table.
     assert_eq!(rows::auto_budget(count, width, 125 * GIB, 14 * GIB), all);
     // 64 GiB: half of what the state leaves, not the table.
     assert_eq!(rows::auto_budget(count, width, 64 * GIB, 14 * GIB), 25 * GIB);

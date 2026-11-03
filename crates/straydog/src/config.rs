@@ -114,7 +114,7 @@ pub struct Options {
     #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u32).range(1..=262144))]
     pub ctx_size: Option<u32>,
-    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget and for the models read on demand (Qwen3.5 MoE: fewer when an eighth of the GPU budget, or a quarter of what its weights and state leave, cannot hold them); DeepSeek-V4.1: 8192, fewer when its pass buffers would take over an eighth of a GPU's budget]
+    /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget; DeepSeek-V4.1: the largest whose pass buffers take at most an eighth of a GPU's budget, 8192 down to 256, or on a card of 24 GiB or more a third of it, 32768 or 16384]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
           value_parser = clap::value_parser!(u16).range(1..=32768))]
     pub batch_size: Option<u16>,
@@ -473,12 +473,11 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     }
     let ctx_size = options.ctx_size.unwrap_or(262144);
     // The bundles read on demand read each routed expert a pass needs once per pass: the longer
-    // the pass, the fewer reads. Qwen3.5 MoE's placement takes fewer rows when the GPU budget
-    // has not the room.
+    // the pass, the fewer reads.
     // With the budgets left to the worker, it chooses the same way from those it finds.
     let total = vram.bytes(gpu.len()).map(|bytes| bytes.iter().sum::<u64>());
     let batch_size = options.batch_size.or(match total {
-        // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 8192)
+        // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 32768)
         _ if deepseek => None,
         _ if on_demand => Some(4096),
         // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048, 2026-10-29)

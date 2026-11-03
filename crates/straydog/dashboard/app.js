@@ -10,7 +10,7 @@ const SVG = "http://www.w3.org/2000/svg";
 const STRINGS = {
   en: {
     connecting: "Connecting…", ready: "Ready", generating: "Generating", loading: "Loading", failed: "Failed",
-    offline: "Server unreachable", unauthorized: "API key required", uptime: "Uptime", apiKey: "API key",
+    offline: "Server unreachable", unauthorized: "API key required", uptime: "Uptime", apiKey: "API key", language: "Language",
     apiKeyHelp: "This server requires its API key. It is kept in this tab only.", save: "Save", cancel: "Cancel",
     overview: "Overview", environment: "Environment", logsTab: "Log",
     decode: "Decode", prefill: "Prefill", firstToken: "First token", speculative: "Speculative acceptance", live: "live",
@@ -50,7 +50,7 @@ const STRINGS = {
   },
   ja: {
     connecting: "接続中…", ready: "待機中", generating: "生成中", loading: "読み込み中", failed: "停止",
-    offline: "サーバーに接続できません", unauthorized: "API キーが必要です", uptime: "稼働時間", apiKey: "API キー",
+    offline: "サーバーに接続できません", unauthorized: "API キーが必要です", uptime: "稼働時間", apiKey: "API キー", language: "言語",
     apiKeyHelp: "このサーバーには API キーが必要です。キーはこのタブの中だけに保存します。", save: "保存", cancel: "キャンセル",
     overview: "概要", environment: "環境", logsTab: "ログ",
     decode: "デコード", prefill: "プレフィル", firstToken: "最初のトークン", speculative: "投機採択率", live: "ライブ",
@@ -89,7 +89,10 @@ const STRINGS = {
     stagePrepare: "モデルを GPU に配置中", stageWarm: "GPU のコードを準備中", error: "エラー",
   },
 };
-const LANG = (navigator.language || "en").toLowerCase().startsWith("ja") ? "ja" : "en";
+// English unless the viewer chose Japanese with the top bar's switch (kept in this browser).
+const LANG_STORAGE = "straydog.dashboard.lang";
+let LANG = "en";
+try { if (localStorage.getItem(LANG_STORAGE) === "ja") LANG = "ja"; } catch { /* storage unavailable */ }
 
 function t(key, ...args) {
   let text = STRINGS[LANG][key] ?? STRINGS.en[key] ?? key;
@@ -99,6 +102,9 @@ function t(key, ...args) {
 
 function translatePage() {
   document.documentElement.lang = LANG;
+  // (the switch names the language it switches to, in that language)
+  const switcher = document.getElementById("lang-button");
+  if (switcher) switcher.textContent = LANG === "en" ? "日本語" : "English";
   for (const element of document.querySelectorAll("[data-i18n]")) element.textContent = t(element.dataset.i18n);
   for (const element of document.querySelectorAll("[data-i18n-placeholder]")) element.placeholder = t(element.dataset.i18nPlaceholder);
   for (const element of document.querySelectorAll("[data-i18n-title]")) {
@@ -1192,6 +1198,14 @@ $("clear").addEventListener("click", () => {
   conversation.length = 0;
   $("messages").replaceChildren($("chat-empty"));
   $("chat-empty").hidden = false;
+});
+
+document.getElementById("lang-button").addEventListener("click", () => {
+  LANG = LANG === "en" ? "ja" : "en";
+  try { localStorage.setItem(LANG_STORAGE, LANG); } catch { /* storage unavailable */ }
+  numberFormats.clear();
+  translatePage();
+  poll();
 });
 
 translatePage();

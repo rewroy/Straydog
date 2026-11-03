@@ -460,7 +460,7 @@ mod tests {
     use straydog_engine::bundle::{Asset, Footprint};
     use straydog_provision::mock::{self, Scratch, Server};
 
-    use super::catalog::tests::{doggybox, machine as machine_of};
+    use super::catalog::tests::{two_r9700s, machine as machine_of};
     use super::catalog::File;
     use super::*;
     use crate::config::Options;
@@ -563,7 +563,7 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("test-00001-of-00002.gguf.part"), b"the f").unwrap();
         let args = SetupArgs { quant: Some("T-Q1".into()), dir: Some(root.join("models")), yes: true, ..SetupArgs::default() };
-        let (result, said) = run_with(&args, &doggybox(), std::slice::from_ref(&entry), &defaults(&root), &Local(urls.clone()), "", false);
+        let (result, said) = run_with(&args, &two_r9700s(), std::slice::from_ref(&entry), &defaults(&root), &Local(urls.clone()), "", false);
         let outcome = result.unwrap();
         for (name, data) in FILES {
             assert_eq!(std::fs::read(bundle.join(name)).unwrap(), data);
@@ -581,7 +581,7 @@ mod tests {
         assert!(said.contains("already here"), "{said}");
         assert!(said.contains("Start the server with: straydog\n") && said.contains("http://127.0.0.1:8080"), "{said}");
         // again: nothing is fetched (what is there is authenticated), nothing changes
-        let (again, said) = run_with(&args, &doggybox(), std::slice::from_ref(&entry), &defaults(&root), &Local(urls), "", false);
+        let (again, said) = run_with(&args, &two_r9700s(), std::slice::from_ref(&entry), &defaults(&root), &Local(urls), "", false);
         assert!(!again.unwrap().written.changed && said.contains("already in"), "{said}");
         assert_eq!(server.requests().len(), 3);
         assert_eq!(std::fs::read_to_string(root.join("config").join("config.toml")).unwrap(), written);
@@ -599,7 +599,7 @@ mod tests {
         let mut small = defaults(&root);
         small.free_space = |_| Some(30);
         assert_eq!(need, 41);
-        let (result, said) = run_with(&args, &doggybox(), std::slice::from_ref(&entry), &small, &Local(urls.clone()), "", false);
+        let (result, said) = run_with(&args, &two_r9700s(), std::slice::from_ref(&entry), &small, &Local(urls.clone()), "", false);
         let error = result.unwrap_err();
         assert!(error.contains(&format!("needs {}", gb(need))) && error.contains("free"), "{error} / {said}");
         assert!(server.requests().is_empty() && !root.join("config").exists() && !root.join("models").exists());
@@ -610,9 +610,9 @@ mod tests {
         let present = FILES[0].1.len() as u64;
         assert_eq!(need - present, 18);
         small.free_space = |_| Some(17);
-        assert!(run_with(&args, &doggybox(), std::slice::from_ref(&entry), &small, &Local(urls.clone()), "", false).0.is_err());
+        assert!(run_with(&args, &two_r9700s(), std::slice::from_ref(&entry), &small, &Local(urls.clone()), "", false).0.is_err());
         small.free_space = |_| Some(18);
-        assert!(run_with(&args, &doggybox(), std::slice::from_ref(&entry), &small, &Local(urls), "", false).0.is_ok());
+        assert!(run_with(&args, &two_r9700s(), std::slice::from_ref(&entry), &small, &Local(urls), "", false).0.is_ok());
     }
 
     /// A transcript of the questions on a terminal, answered mostly by Enter.
@@ -625,7 +625,7 @@ mod tests {
         // the model (Enter: the recommended), DSpark (n), vision (Enter), the folder (typed: ~ is the home), Go ahead (Enter);
         // a wrong answer is asked again
         let script = "x\n\nn\n\n~/models\n\n";
-        let (result, said) = run_with(&SetupArgs::default(), &doggybox(), &entries, &defaults(&root), &recorder, script, true);
+        let (result, said) = run_with(&SetupArgs::default(), &two_r9700s(), &entries, &defaults(&root), &recorder, script, true);
         let outcome = result.unwrap();
         println!("{said}");
         assert!(said.contains("2 x GPU (31.9 GiB each)") || said.contains("GPUs (ROCm/HIP)"), "{said}");
@@ -649,7 +649,7 @@ mod tests {
         let entries = catalog::pinned().unwrap();
         let recorder = Recorder::default();
         for (script, interactive, expected) in [("\n\nn\n\n", true, "input ended"), ("\n\nn\n\nn\n", true, "stopped"), ("", false, "give --yes")] {
-            let (result, _) = run_with(&SetupArgs::default(), &doggybox(), &entries, &defaults(&root), &recorder, script, interactive);
+            let (result, _) = run_with(&SetupArgs::default(), &two_r9700s(), &entries, &defaults(&root), &recorder, script, interactive);
             let error = result.unwrap_err();
             assert!(error.contains(expected), "{error}");
         }
@@ -668,10 +668,10 @@ mod tests {
         // by model name, in any case: its best bundle for the machine
         let outcome = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &small).unwrap();
         assert_eq!(outcome.quant, "IQ2_XS");
-        let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &doggybox()).unwrap();
+        let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &two_r9700s()).unwrap();
         assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
         // the extras left out by option
-        let outcome = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), no_dspark: true, no_vision: true, ..SetupArgs::default() }, &doggybox()).unwrap();
+        let outcome = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), no_dspark: true, no_vision: true, ..SetupArgs::default() }, &two_r9700s()).unwrap();
         assert!(outcome.extras.is_empty());
         // a bundle this machine cannot run, a bundle nobody pinned, a model and bundle that disagree, no machine at all
         let error = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XXS".into()), ..SetupArgs::default() }, &small).unwrap_err();
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn the_listing_names_the_recommendation_and_what_cannot_run() {
         let entries = catalog::pinned().unwrap();
-        let listed = listing(&entries, &doggybox());
+        let listed = listing(&entries, &two_r9700s());
         let bundles = listed["bundles"].as_array().unwrap();
         assert_eq!(bundles.len(), entries.len());
         let recommended: Vec<_> = bundles.iter().filter(|bundle| bundle["recommended"] == true).collect();

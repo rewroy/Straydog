@@ -1,5 +1,5 @@
 //! The worker's side of a bundle read on demand ([`straydog_engine::pinned`]): the architecture the
-//! bundle's pins name places its engines (DeepSeek-V4.1, Qwen3.5 MoE) into a served session, the
+//! bundle's pins name (DeepSeek-V4.1) places its engines into a served session, the
 //! tokenizer and chat template come from the model's pinned resources (else the GGUF's own
 //! metadata), and the request loop of [`crate::worker`] runs over it.
 
