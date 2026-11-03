@@ -57,6 +57,10 @@ pub struct SetupArgs {
     /// Ask nothing: take the recommended answer to whatever the options leave open
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// With --quant: set that bundle up even where it needs more free VRAM than there is now; at load it waits for what it needs (close what
+    /// holds the GPU). A machine with no GPU is still refused
+    #[arg(long, requires = "quant")]
+    pub force: bool,
     /// Print this machine and every bundle, with how it would run here and which is recommended, as JSON, and exit
     #[arg(long)]
     pub list: bool,
@@ -219,6 +223,8 @@ fn named(args: &SetupArgs, entries: &[Entry], fits: &[(u64, Fit)]) -> Result<Opt
         }
         return match &fits[index].1 {
             fit if fit.runs() => Ok(Some(index)),
+            // (asked for by name, past what the free VRAM is now: the person may free it, and the load waits for it)
+            Fit::TooLittleVram { .. } if args.force => Ok(Some(index)),
             fit => Err(format!("{} cannot run on this machine: {}", entries[index].name(), fit.note(&entries[index]))),
         };
     }
@@ -292,7 +298,10 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
     if matches!(fit, Fit::Drive(_)) {
         talk.say(&format!("Note: {}: {}.", entry.name(), fit.note(entry)));
     }
-    if *context < DEFAULT_CONTEXT {
+    if matches!(fit, Fit::TooLittleVram { .. }) {
+        talk.say(&format!("Note: {} {}: set up as asked (--force), at the smallest context; at load it waits for that VRAM to be free.",
+                          entry.name(), fit.note(entry)));
+    } else if *context < DEFAULT_CONTEXT {
         talk.say(&format!("Note: its context is set to {context} tokens, the most that starts here."));
     }
 
@@ -533,6 +542,19 @@ mod tests {
         let (mut input, mut output) = (script.as_bytes(), Vec::new());
         let result = run(args, machine, entries, defaults, provision, &mut Talk::new(&mut input, &mut output, interactive), &quiet);
         (result, String::from_utf8(output).unwrap())
+    }
+
+    /// A bundle asked for by name past the free VRAM there is now is set up with --force, and refused without it; on a machine with no GPU it is
+    /// refused either way.
+    #[test]
+    fn force_sets_up_a_bundle_short_of_free_vram_and_not_one_with_no_gpu() {
+        let entries = [Entry::of("GSQ-RCO-IQ2_XS").unwrap()];
+        let short = [(4096, Fit::TooLittleVram { needs: 15 << 30, has: 12 << 30 })];
+        let asked = SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), ..SetupArgs::default() };
+        assert!(named(&asked, &entries, &short).unwrap_err().contains("cannot run on this machine"));
+        let forced = SetupArgs { force: true, ..asked.clone() };
+        assert_eq!(named(&forced, &entries, &short), Ok(Some(0)));
+        assert!(named(&forced, &entries, &[(4096, Fit::NoGpu)]).is_err());
     }
 
     /// `--vision-only` fetches the one file and leaves the settings as a full setup would write them, the drafter kept.
