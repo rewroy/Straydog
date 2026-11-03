@@ -101,6 +101,7 @@ button.primary {
 button.primary.stop { background: color-mix(in srgb, var(--error) 80%, transparent); color: #fff; }
 button.ghost { background: transparent; }
 .icon-button { padding: 6px; display: inline-grid; place-items: center; }
+.lang-button { padding: 4px 10px; font-size: 12px; }
 .icon-button svg { width: 18px; height: 18px; fill: currentColor; }
 input, select, textarea { background: var(--faint); border: 1px solid var(--glass-border); border-radius: 10px; padding: 5px 9px; outline: none; }
 input:focus, select:focus, textarea:focus { border-color: color-mix(in srgb, var(--decode) 60%, transparent); }

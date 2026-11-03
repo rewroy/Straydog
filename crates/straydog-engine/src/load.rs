@@ -333,7 +333,7 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                             break;
                         }
                         let source = &sources[source];
-                        // (checked whole at download and unchanged since, the owner's rule: a start only reads; hashing 58 GB here was 5 of its 7 parts)
+                        // (checked whole at download and unchanged since, by design: a start only reads; hashing 58 GB here was 5 of its 7 parts)
                         if source.checked.is_some() {
                             let base = chunk as u64 * CHUNK_BYTES;
                             for &(at, part, target) in &source.pieces[chunk] {

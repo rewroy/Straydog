@@ -1,18 +1,18 @@
 # Straydog — design
 
 Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as one
-executable per GPU backend (HIP on Linux, CUDA on Windows). It serves pinned GGUF bundles of three
+executable per GPU backend (HIP on Linux, CUDA on Windows). It serves pinned GGUF bundles of two
 models:
 
 - **DeepSeek-V4.1-Flash** (748B total, 16B active), the main one;
-- **Qwen3.8-Flash-Next**, with its MTP drafter;
-- **Qwen3.6-35B-A3B**, for a small GPU and 32 GB of RAM.
+- **Qwen3.8-Flash-Next**, with its MTP drafter, also the model for a small GPU (5-6 GB of VRAM)
+  and 32 GB of RAM.
 
 This document describes what the code does now. It does not keep the project's history; git
 does. The roundings are listed in the README's Numerics, which this document does not repeat.
 
-Updated: 2026-10-29. All three models run on Linux with ROCm. The Qwen models have run on
-Windows with CUDA; DeepSeek-V4.1 and `straydog setup` have not.
+Updated: 2026-11-03. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
+Windows with CUDA; DeepSeek-V4.1 has not.
 
 ## 1. Goals
 
@@ -114,7 +114,7 @@ The engine is built in layers:
    - hyper-connections (n streams, Sinkhorn);
    - embedding tables: token embeddings, and per-layer n-gram tables gathered by row;
    - output heads.
-4. **Architectures** (`arch/deepseek41`, `arch/qwen35moe`, the Qwen3.8 engine). An architecture
+4. **Architectures** (`arch/deepseek41`, the Qwen3.8 engine). An architecture
    reads its hyperparameters and tensor names, gives every tensor a role (dense per layer,
    routed experts, a gathered table, the head, a drafter) and composes its layers from the ops.
    `arch/served.rs` holds what every served model shares: continuing the held sequence,
@@ -139,7 +139,7 @@ The engine is built in layers:
   - A cached chunk is read from the page cache. When the files fit in three quarters of host
     memory, an uncached one is read through the page cache, so a restart finds it; otherwise it
     is read around it (direct reads).
-- **A model read on demand** (DeepSeek-V4.1, Qwen3.6) opens its shards against their verity
+- **A model read on demand** (DeepSeek-V4.1) opens its shards against their verity
   trees. The routed experts are not read whole at the start: the expert store fills from the
   files as tokens route to them, and the drive blocks they come from are checked against the
   trees.
@@ -218,7 +218,7 @@ There is no `-ngl`. Placement measures what fits, in this order:
    store of VRAM slots over a page-locked host tier over the files.
 
 Each GPU's budget is its free memory less max(512 MiB, 3%) (`--vram auto`), or what `--vram`
-gives. Two GPUs of similar budgets split every layer between them (§7.1, §8, §9); GPUs whose
+gives. Two GPUs of similar budgets split every layer between them (§7.1, §8); GPUs whose
 budgets differ by more than a tenth split by layers, each taking layers in proportion to its
 budget.
 
@@ -243,9 +243,10 @@ The expert store (`experts.rs`) has three tiers:
 - **A page-locked host tier.** By default it gets what Straydog's other host memory leaves of 85%
   of host memory (as the server measures it, cgroup limits included).
   - The other host memory is the row cache, 2 GiB for the rest, and the checkpoints.
-  - For DeepSeek-V4.1 the tiers are exclusive. The host tier takes what VRAM evicts, written back
-    over the bus's other direction, and gives up what it hands to VRAM. On traced routes this
-    halved the drive's reads against a tier that kept copies.
+  - For DeepSeek-V4.1 the host tier takes what VRAM evicts, and keeps its copy of an expert it
+    hands to VRAM while it has room, so an expert leaving VRAM then costs no write-back (beside a
+    pass's miss uploads those write-backs took 2.8 of a 3-row pass's 30 ms). When it needs room it
+    gives up first the copies VRAM also holds, so it still holds everything it alone held.
 - **The files.** Read as whole aligned 4 KiB blocks around the page cache, each block verified
   (§2).
 
@@ -278,8 +279,18 @@ The engine holds one sequence.
   - A checkpoint is saved where a reply's generation prompt begins, plus one at the root.
   - A prompt that leaves the held sequence at an earlier turn, or comes back to a conversation
     switched away from, restarts from the latest checkpoint it extends.
-  - Checkpoint copies are made while the engine is idle, not before the first token.
+  - Checkpoint copies are made while the engine is idle, not before the first token. A new
+    conversation finishes the copies still pending first (a 20K conversation's: ~0.1-0.2 s at the
+    8-12 GB/s a large read-back takes through both halves of the staging arena).
+  - A turn that resumes from a checkpoint the held sequence still extends (a client that sent the
+    last reply back without its reasoning) goes back in place (`Engine::rewind_to`): only the
+    window's rows and the incomplete groups' tails go back, since a later position never writes a
+    complete group's compressed row or index key. Its copy may go on later; the copies of
+    checkpoints above it are made first.
   - Beyond about 160K tokens a checkpoint no longer fits the budget, and none is saved.
+- **A void pass** (DeepSeek-V4.1: a part link's wait gave up after 10 s, as when the host stalled)
+  voids that pass, not the reply: once, the sequence starts over from the checkpoints with the
+  tokens already sent as part of its prompt, and the reply goes on.
 - **Qwen3.8** parks a sequence when a prompt departs from it at least 1024 tokens below its end:
   - Its K/V and indexer positions from the departure on go to host memory (up to an eighth of
     it), and its recurrent state to a page-locked slot.
@@ -287,7 +298,6 @@ The engine holds one sequence.
     back (`parked`: `saved` or `restored`, with `park_seconds`).
   - So a one-off request with another prefix (a title, a summary, a subagent) does not cost the
     conversation it interrupted its whole prompt again.
-- **Qwen3.6** keeps the DeltaNets' state where each prompt's generation prompt begins (§9).
 - A request may mark itself one-off (`"straydog": {"checkpoint": false}`) so it saves no
   checkpoint.
 
@@ -320,11 +330,14 @@ target, and each row's logits equal what token-by-token decode would compute, bi
 Three drafters:
 
 - **Qwen3.8's MTP drafter** (`-md`, `--draft-max`, default 3). It drafts while the product of
-  the drafts' probabilities under the drafter stays at 0.6 or more.
+  the drafts' probabilities under the drafter stays at 0.6 or more. Partially resident, it drafts
+  one token a pass, or two when the slots hold at least 15% of the routed experts at load (HIP).
 - **DeepSeek-V4.1's DSpark** (§7.4). It needs no option: it is used when its file sits beside the
   bundle.
-- **An n-gram lookup of the sequence's own text.** A match of eight tokens or more (an edit
-  repeating its source) is verified as it is.
+- **An n-gram lookup of the sequence's own text** (`drafts.rs`), for both models. A match of eight
+  tokens or more (an edit repeating its source, a tool's output quoted back) is verified as it is,
+  without asking a drafter. A resident Qwen3.8 verifies up to eight rows a pass for such copies
+  (three for its MTP drafts): a long match is checked seven tokens at a time.
 
 A constrained reply takes no drafts.
 
@@ -386,6 +399,8 @@ Pinned bundles:
 - **GSQ-RCO-IQ2_XXS** (ISTA, the default). Its experts are IQ1_M in 20 layers, IQ2_XXS in 14 and
   IQ2_XS in 6.
 - **GSQ-RCO-IQ2_XS** (ISTA).
+- **UD-IQ1_M** (Unsloth), the size of GSQ-RCO-IQ2_XXS: four shards, its Engram tables the same
+  bytes as ISTA's file, which it pins as its fifth (a manifest item may name its own repository).
 - **UD-IQ2_XXS** (Unsloth).
 
 Optional files sit beside a bundle: the DSpark drafter (§7.4) and the vision encoder (§7.5).
@@ -418,12 +433,11 @@ the first `</think>` and at DSML tool calls.
 - its rows of the head;
 - its rows of every expert, shared and routed: its share of gate and up, its columns of down.
 
-The rest is replicated. Every device sums the devices' parts in device order:
-- after the attention;
-- of the experts' activations;
-- after the experts.
-
-So all devices hold the same values, and every route runs on every device. A missing expert
+The rest is replicated. Every device sums the attention's parts in device order. The experts'
+activations and their output are each device's columns, the others zero: the devices gather them,
+each reading only the others' columns over the bus (a long pass's activations in FP16, as the
+products that read them take them). So all devices hold the same values, and every route runs on
+every device. A missing expert
 comes over every device's bus at once, each a share of it.
 
 In a decode pass, the kernels forming a part also store it into the other GPU's inbox and raise
@@ -452,10 +466,9 @@ Then:
   though the placement counts the first device's footprint on both.
 
 The rest is expert slots. After the first passes each device also lends what its card has free
-beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 6064 slots
-per device with the default prefill batch of 8192 (6067 with 4096: the arena for a larger pass's
-rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, of 15,360), using
-60.6 of 61.5 GiB.
+beyond 768 MiB (§5). Example: two R9700s with GSQ-RCO-IQ2_XXS at 262144 tokens hold 6059 slots
+per device with their prefill batch of 16384 (the arena for a pass's rows is lent between passes)
+and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
 
 ### 7.2 Passes
 
@@ -464,18 +477,16 @@ rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, o
   read once for them all, in waves, with the next wave's fills behind the one computing.
 - **A long prompt** takes back the slots lent to the store and streams its experts through VRAM,
   while the host tier keeps theirs.
-- **The prefill batch** is 8192 rows when nothing else is asked for, fewer (down to 256) while
-  its pass buffers (~0.3 MB a row on each GPU) would take over an eighth of the smallest GPU
-  budget; `--batch-size` takes up to 8192.
+- **The prefill batch,** when nothing else is asked for, is the largest whose pass buffers (~0.32 MB
+  a row on each GPU) take at most an eighth of the smallest GPU budget, from 8192 down to 256; on
+  cards of 24 GiB and more, 32768 or 16384 within a third of it. `--batch-size` takes up to 32768.
   - Every pass reads the ~35 GB a GPU of experts the VRAM does not hold over the bus (~1.5 s at
-    ~24 GB/s on both GPUs), whatever its rows. A layer's experts over 4096 rows computed in
-    ~16 ms against ~40 ms of copies; over 8192 rows they compute in ~30 ms. A 70K-token prompt
-    moved ~600 GB a GPU in passes of 4096 and ~350 GB in 8192.
-  - The lent arena (§5) covers the larger buffers: the slot count between passes does not
-    change, and a long pass writes back the few hundred experts its buffers take.
-  - 16384 rows were slower than 4096 (88 s): the host side of a pass (the Engram rows read ahead
-    for three batches, 1 GB of embeddings a pass) outgrew the row cache and the free memory of a
-    machine whose host tier pins most of it.
+    ~24 GB/s on both GPUs), whatever its rows, so a long prompt takes fewer of those trips in wider
+    passes. Two R9700s take 16384: a 45K prompt's first token 30.8 to 27.5 s and a 20K one's 14.6 to
+    11.9 s against 8192, the same replies.
+  - The lent arena (§5) covers the larger buffers: the slot count between passes barely changes
+    (6064 to 6059), and a long pass writes back the few hundred experts its buffers take.
+  - Engram decodes a batch at a time, so a wide pass's Engram rows no longer outgrow the row cache.
   - A pass embeds its tokens a slab of 1024 at a time, uploading each. The embedding rows of the
     batches to come are read ahead before their Engram rows: those queue the drive 128 deep, and
     a page fault of the embedding table behind them waited seconds.
@@ -487,6 +498,13 @@ rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, o
   for comparisons.
 - **Products in prompt passes of 32 rows or more** use FP16 operands; smaller passes use F32
   (README, Numerics).
+- **What a long pass's kernels share.** The attention's output kernel splits a row into dim / 64
+  blocks: a kernel before them forms each row's softmax weights and denominators once, in place. The
+  HC step takes 16 rows a block, each thread holding its column's mixing weights, and forms its 26
+  wave sums a step of all at a time. A wave's routed outputs go to their rows in one launch, each
+  row's routes added in the wave's order (`Grouped::by_row`), only this device's columns. All of it
+  bit for bit; on a 45K prompt each GPU's kernels took 17.65 s before the gathers, the one launch a
+  wave and the interleaved sums, and 16.88 s after.
 - **A decode step.**
   - Each device runs the step as recorded graphs, replayed while their launches stay the same.
   - The router writes its routes into page-locked memory, which the host polls.
@@ -496,11 +514,12 @@ rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, o
     2. The hits' gate and up run while the misses' uploads land. One event stands behind all
        the misses' gates and ups, and one behind all their downs.
     3. The misses' gate and up run, then every expert's down.
-  - Evicted slots are written back to the host tier after the compute stream passes the point
-    where the slots were last read. Each size class keeps up to 32 slots free during passes, and
-    64 more between requests, for a prefill's first waves.
-- **What a miss costs.** On two R9700s (PCIe 5.0 x8 each) a miss costs ~0.22 ms of a pass. The
-  copy is ~0.17 ms of that, at ~26 GB/s per GPU with both copying.
+  - An evicted slot whose expert the host tier still holds is dropped; any other is written back
+    to the host tier after the compute stream passes the point where the slot was last read. Each
+    size class keeps up to 32 slots free during passes, and 64 more between requests, for a
+    prefill's first waves.
+- **What a miss costs.** On two R9700s (PCIe 5.0 x8 each) a decode pass took 22.3 ms + 0.003 ms a
+  distinct expert + 0.125 ms a miss (served stamps, 2026-11-02).
 - **Engram rows** for a pass's tokens are prefetched before it (§4.2) and gathered at the layers
   that hold a module.
 - **Verify passes.** A pass of up to the verify rows can be taken back but for its first few
@@ -508,25 +527,19 @@ rows is lent between passes) and a 102.2 GiB host tier (12,629 experts' worth, o
   source's compressor rows of its tokens. A verify pass computes every row in every layer, with
   every token's logits.
 
-### 7.3 Speed (2026-10-28)
+### 7.3 Speed
 
-Two R9700s, 125 GiB of RAM, GSQ-RCO-IQ2_XXS with DSpark, the owner's agent sessions:
+Two R9700s, 125 GiB of RAM, with DSpark:
 
 | Measure | Result |
 | --- | --- |
-| Decode, 3K context | 78-81 tokens/s |
-| Decode, 10-50K | 57-66 tokens/s |
-| Decode, 55-73K | ~57 tokens/s |
-| Prefill, a turn continuing the conversation | 800-1100 tokens/s |
-| First token, a fresh 19.5K prompt | 18-22 s |
-| First token, a fresh 70K prompt (2026-10-29, Engram's page cache dropped) | 45-46 s (58-62 s in passes of 4096) |
-
-| Pass, at ~50K context | Wall time | Misses |
-| --- | --- | --- |
-| 1 row | 18.0 ms | ~19 |
-| 2 rows | 25.5 ms | ~33 |
-| 3 rows | 32.4 ms | ~48 |
-| 4 rows | 40.5 ms | ~70 |
+| Decode, a 20K conversation's turns, GSQ-RCO-IQ2_XXS (2026-11-03) | 74-80 tokens/s |
+| Decode, the same, UD-IQ1_M (2026-11-03) | 63-71 tokens/s |
+| Decode, 55-73K, GSQ-RCO-IQ2_XXS (2026-10-28) | ~57 tokens/s |
+| First token, a turn continuing a 20K conversation (2026-11-03) | 0.3-0.6 s |
+| First token, a fresh 20K prompt (2026-11-02/03; it varies between sessions) | 11.9-20.8 s |
+| First token, a fresh 45K prompt (2026-11-02, before the 2026-11-03 prefill kernels) | 27.5 s |
+| A 3-row decode pass on fixed tokens (2026-11-02) | 27.4 ms |
 
 ### 7.4 DSpark
 
@@ -926,77 +939,7 @@ How an image is read (`qwen_vision.rs`, after transformers' `qwen3_5` vision mod
    image's position the image's own row (llama.cpp's MTP graph takes `inp->embd` there), at the same rope positions as the
    model's layers: a table in batches, the delta in the reply's rows. So a conversation holding an image keeps its speed.
 
-## 9. Qwen3.6-35B-A3B (`qwen35moe`)
-
-**The architecture.** One residual stream runs through blocks whose mixer is a Gated DeltaNet
-(three of every four) or gated full attention. Each mixer is followed by a softmax top-8 MoE with
-a sigmoid-gated shared expert. Its definitions follow llama.cpp's `qwen35moe` at ead9f32 over the
-same GGUF, checked layer by layer (examples/q35_reference on the CPU, examples/q35_chat on the
-GPU).
-- **DeltaNet.**
-  1. `attn_qkv` gives [q | k | v], convolved per channel over the last `ssm.conv_kernel` inputs
-     and passed through SiLU.
-  2. q and k are L2-normalized per head (q also scaled by 1/sqrt(dim)). Value head h reads key
-     head h mod (key heads).
-  3. The state decays by exp(`ssm_a` · softplus(alpha + `ssm_dt`)), takes the delta rule with
-     sigmoid(beta), and is read by q.
-  4. The output is RMS-normed per head and gated by SiLU of `attn_gate`, then `ssm_out`.
-- **Attention.**
-  1. `attn_q` gives each head's query, then its gate.
-  2. q and k are RMS-normed per head, and the leading `rope.dimension_count` values rotate at the
-     text position.
-  3. Causal grouped-query attention, times sigmoid of the gate, then `attn_output`.
-- **MoE.**
-  - The top `expert_used_count` experts, weighted by their normalized probabilities.
-  - The shared expert's output, scaled by sigmoid(`ffn_gate_inp_shexp` · x).
-  - The MTP block after the main layers is not run.
-
-**The bundle.** It is read on demand: the GGUF pinned by size, SHA-256 and fs-verity digest, plus
-the official tokenizer, chat template and generation config pinned as resources. Unsloth's GGUF
-embeds a modified template, which is not used. Replies split as Qwen's do (`</think>`,
-`<tool_call>`) and end at the generation config's end tokens.
-
-**Continuing a conversation.** Qwen3.6's template drops a past turn's thinking (unless
-`preserve_thinking`), so its next prompt never extends the sequence that ran.
-- The DeltaNets' state (conv histories and recurrent states, a few MB a layer) is copied on the
-  GPU where each prompt's generation prompt begins, keeping the last two.
-- A prompt that extends such a checkpoint, while the held sequence matches it that far, restores
-  it and runs only the rest (`resumed_from` "turn" or "prior").
-
-**Two GPUs that each hold half of every layer with all its experts** run it tensor parallel
-(`arch/qwen35moe/part.rs`).
-- **The split.** Each GPU runs every layer with its half of:
-  - the attention heads and KV heads;
-  - the DeltaNet key heads, with the value heads that read them;
-  - the shared expert's rows and every routed expert's rows;
-  - the vocabulary.
-
-  Both keep the whole residual stream, the norms and the router, so they route alike.
-- **The sums.** Partial sums are added on the devices twice a layer (`gpu/device_link.hpp`).
-  - Each GPU copies its part into the other's inbox, raises the other's flag and waits for its
-    own.
-  - Both add the same two values, so their streams stay equal.
-  - The counts live in device memory, so a decode step stays one recorded graph per GPU.
-- A model that needs the host tier stays split by layers.
-
-**Where its experts go:**
-- **All of a GPU's experts fit in its VRAM.** They are read in at placement and kept for good.
-  - A pass looks each route's slot up on the GPU (`sd_op_experts_table`), so no routes come back
-    to the host, and a decode step runs as one recorded graph per GPU.
-  - A pass of 16 rows or more groups its routes by expert on the device and runs them as RDNA4
-    grouped GEMMs (`gpu/moe_prefill.hpp`).
-- **Otherwise,** the expert store serves them, and routes to experts outside VRAM run on the CPU
-  from the host tier. Only activations cross the bus.
-  - A decode step is queued whole as one recorded graph per GPU (`arch/qwen35moe/engine/hybrid.rs`).
-  - Each layer exports its routes and MoE input to page-locked memory, runs its shared and VRAM
-    experts, then waits on the GPU for the host's sum of the other routes and adds it.
-  - The host serves the layers in order. So the CPU's experts overlap the GPU's, with no host
-    launch or read-back between layers.
-  - Experts the CPU ran often (a count of their routes decaying 5% a step) move into VRAM between
-    steps, up to 32 a step into free slots and up to four into slots clearly weaker experts give
-    up.
-
-## 10. Command line, configuration and setup
+## 9. Command line, configuration and setup
 
 With no subcommand, `straydog` is the server, as llama-server is. Every setting is an option,
 named as llama-server names it where it has the same setting.
@@ -1009,7 +952,7 @@ named as llama-server names it where it has the same setting.
 | `--mmproj FILE` | Qwen3.8's vision encoder and projector (§8.1) | a `mmproj-*.gguf` in the model's directory or the one above it |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
 | `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
-| `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 8192 | 1024; 4096 with 48 GiB or more of GPU budget, and for Qwen3.5 MoE; DeepSeek-V4.1: 8192 (§7.2) |
+| `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 32768 | 1024; 4096 with 48 GiB or more of GPU budget; DeepSeek-V4.1: from its GPUs' budgets (§7.2) |
 | `-gpu, --gpu LIST` | GPU ordinals (`-dev`, `--device` also accepted) | `0` |
 | `-sm, --split-mode MODE` | `experts`: every layer split across the GPUs; `layer`: ranges of layers | `experts` |
 | `--vram GIB[,GIB...]\|auto` | VRAM budget for every GPU, or one per GPU (`30,10`) | `auto` (§5) |
@@ -1060,14 +1003,14 @@ starts. When the data directory cannot be written, the start fails, naming `--da
      model's measured working memory (`setup/catalog.rs`).
    - A model gets the largest of 262144, 131072, 65536, 32768 and 16384 tokens that fits. Setup
      writes `ctx_size` when that is less than the default.
-   - The first model, in the order DeepSeek-V4.1, Qwen3.8, Qwen3.6, with a bundle that VRAM and
+   - The first model, in the order DeepSeek-V4.1, Qwen3.8, with a bundle that VRAM and
      RAM hold alone is recommended, with its best bundle in that class. Failing that, the bundle
      that reads least from the drive is.
 3. It asks where the models go. The default is the platform's data folder:
    `$XDG_DATA_HOME/straydog/models` or `%LOCALAPPDATA%\Straydog\models`. The bundle goes in
    `<dir>/<model>/<quant>`.
 4. It checks the free space and asks which extras to add: DSpark and the vision encoder for
-   DeepSeek-V4.1, MTP for Qwen3.8.
+   DeepSeek-V4.1, MTP and the vision encoder for Qwen3.8.
 5. It fetches as `fetch` does.
 6. It writes `config.toml` in the platform's config folder. The file is written whole and
    renamed, keeping the earlier one as `config.toml.old`.
@@ -1075,7 +1018,7 @@ starts. When the data directory cannot be written, the start fails, naming `--da
 A plain `straydog` reads that file when no `--config` and no model are given. A server started
 with a model of its own reads no file it was not given.
 
-## 11. API
+## 10. API
 
 - **Endpoints.**
   - `GET /health` (no key needed): 200 when ready, 503 while loading (with progress), 500 after a
@@ -1113,14 +1056,15 @@ with a model of its own reads no file it was not given.
     was seen before is observable. Users who must not see each other's prompts need separate
     servers.
 - **Dashboard.** `GET /dashboard` is a page compiled into the executable, with a strict CSP and no
-  other origin.
+  other origin. English by default; the top bar's switch shows it in Japanese (kept in the browser's
+  local storage).
   - It reads `GET /dashboard/status?since=T`: settings, engine state and placement, the running
     and the latest 120 generations with their speeds and speculative acceptance, and host,
     process and GPU sensors.
   - It reads `GET /dashboard/logs?after=N`, and chats through `/v1/chat/completions`.
   - Sensors are read only while a dashboard is open: amdgpu's sysfs, or NVML in CUDA builds.
 
-## 12. Build and distribution
+## 11. Build and distribution
 
 - `cargo build --release --features hip` (or `cuda`). `build.rs` runs CMake on `gpu/` with the
   vendor's compiler and links the result statically. The architectures come from
@@ -1131,7 +1075,7 @@ with a model of its own reads no file it was not given.
   executable's SHA-256 is published with each release. The model pins are compiled in, so a
   binary authenticates exactly the bundles it was tested with.
 
-## 13. Decisions
+## 12. Decisions
 
 - **Rust host, C++ kernels.** The host is Rust; the kernels stay C++/HIP/CUDA behind a C ABI.
   HTTP is `axum` on `tokio`.
@@ -1143,7 +1087,7 @@ with a model of its own reads no file it was not given.
 - **What Straydog makes for a model is kept with it** (`<model>/.straydog`) unless `--data-dir`
   says elsewhere: the verity trees and the warm-up state. The trees are as trustworthy anywhere,
   being checked against the compiled-in digests.
-- **The settings file `setup` writes is read only when nothing names a model.** Homelab, and any
+- **The settings file `setup` writes is read only when nothing names a model.** A process manager, or any
   script that names its model, is unaffected.
 - **DeepSeek-V4.1's misses are uploaded, not computed on the CPU,** and the store is LRU (§5).
   Both were measured against the alternatives.

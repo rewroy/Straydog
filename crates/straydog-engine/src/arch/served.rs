@@ -223,7 +223,7 @@ pub const RESERVE: u64 = 13 << 27;
 pub const SCRATCH: u64 = 512 << 20;
 /// Without a host tier budget, Straydog takes this share of the host memory in all, and the
 /// experts' host tier what its other host memory leaves of it: the row cache, and the rest below.
-/// (On Doggybox, 125 GiB, DeepSeek-V4.1's tier is then 103 GiB, Straydog's own memory 104 GiB:
+/// (On a machine of 125 GiB, DeepSeek-V4.1's tier is then 103 GiB, Straydog's own memory 104 GiB:
 /// an agent's turn reads half what it did from the drive at 0.75.)
 pub const HOST_SHARE: f64 = 0.85;
 /// The worker's host memory beside the tier and the row cache: the GPU runtime, the verity
