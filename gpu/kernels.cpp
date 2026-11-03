@@ -3238,6 +3238,22 @@ static int hc_step_op(void* handle, int channel, const float* x, const float* re
     op_span(value, workspace, size_t(workspace_bytes), "a hyper-connection workspace");
     auto* counters = reinterpret_cast<unsigned*>(workspace);
     const dim3 grid(unsigned((width + hc_step_columns - 1) / hc_step_columns), unsigned(rows));
+    // (a long pass's rows take the weights once a block of rows: op_hc_step_rows_kernel's values are op_hc_step_kernel's)
+    if (x && fn && channel < 0 && rows >= 32) {
+        const size_t blocks = grid.x;
+        float* const partial = workspace + capacity;
+        const dim3 rows_grid(grid.x, unsigned((size_t(rows) + op_hc_step_rows - 1) / op_hc_step_rows)), finish_grid(1, unsigned(rows));
+        #define SD_HC_STEP_ROWS(n) case n: \
+            op_hc_step_rows_kernel<n><<<rows_grid, hc_step_threads, 0, value.stream>>>(x, residual, post_in, comb_in, stream, fn, collapse, size_t(rows), \
+                size_t(width), partial, out); \
+            check(hipGetLastError()); \
+            op_hc_step_finish_kernel<n><<<finish_grid, hc_step_threads, 0, value.stream>>>(blocks, size_t(width), fn, base, scale, size_t(iterations), eps, norm_eps, \
+                norm_weight, partial, pre, post, comb, out); break;
+        switch (hc) { SD_HC_STEP_ROWS(1) SD_HC_STEP_ROWS(2) SD_HC_STEP_ROWS(3) SD_HC_STEP_ROWS(4) SD_HC_STEP_ROWS(5) SD_HC_STEP_ROWS(6) SD_HC_STEP_ROWS(7) SD_HC_STEP_ROWS(8) }
+        #undef SD_HC_STEP_ROWS
+        check(hipGetLastError());
+        return 0;
+    }
     #define SD_HC_STEP(n) case n: op_hc_step_kernel<n><<<grid, hc_step_threads, 0, value.stream>>>(x, residual, post_in, comb_in, stream, fn, \
         base, scale, size_t(iterations), eps, norm_eps, collapse, norm_weight, size_t(width), counters, workspace + capacity, pre, \
         post, comb, out, link); break;
@@ -3663,14 +3679,17 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         } else {
             value.attention_turns_ready = false;
         }
-        const dim3 score_grid{unsigned(wmma_chunks), unsigned(rows)}, out_grid{unsigned(dim / 64), unsigned(rows)};
+        const dim3 score_grid{unsigned(wmma_chunks), unsigned(rows)}, weight_grid{1, unsigned(rows)}, out_grid{unsigned(dim / 64), unsigned(rows)};
         const size_t keys_bytes = size_t(stride) * sizeof(float*);
         #define SD_DS_ATTENTION(HM) \
             ds_attention_scores_wmma<HM><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
                 compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial); \
             check(hipGetLastError()); \
+            ds_attention_weights_wmma<HM><<<weight_grid, 256, 0, value.stream>>>(scores, partial, wmma_chunks, positions, size_t(window), \
+                size_t(selections), sinks, size_t(heads), stride); \
+            check(hipGetLastError()); \
             ds_attention_output_wmma<HM><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, size_t(raw_rows), \
-                positions, size_t(window), compressed, selected, size_t(selections), sinks, size_t(heads), size_t(dim), pairs, inverse, \
+                positions, size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), pairs, inverse, \
                 stride, out);
         if (heads == 32) { SD_DS_ATTENTION(2) } else { SD_DS_ATTENTION(4) }
         #undef SD_DS_ATTENTION
