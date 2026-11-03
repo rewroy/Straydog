@@ -233,6 +233,10 @@ int sd_op_zero(void* handle, void* pointer, uint64_t bytes);
 int sd_op_gather(void* handle, const float* x, uint64_t x_rows, const int32_t* rows, uint64_t count, uint64_t width, float* out);
 int sd_op_scatter(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
 int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_t count, uint64_t width, float* out, uint64_t out_rows);
+// out[r] += x[t] for each route t of row r in turn: table[offsets[r]..offsets[r + 1]] (offsets lie in the table of
+// table_values), each below x_rows; `cols` values of rows `stride` apart. sd_op_scatter_add of each expert's routes in turn.
+int sd_op_scatter_rows(void* handle, const float* x, uint64_t x_rows, const int32_t* offsets, const int32_t* table, uint64_t table_values,
+                       uint64_t rows, uint64_t cols, uint64_t stride, float* out);
 // A wave of experts in slots through the RDNA4 grouped WMMA kernels (see kernels.cpp): whether the
 // device and these kinds and shapes take them (1), gate/up into FP16 grouped products (clamped
 // SwiGLU times the routes' weights), down from FP16 grouped products into F32 rows out_stride apart.
@@ -246,11 +250,21 @@ int sd_op_slot_moe_down(void* handle, const uint64_t* bases, const uint32_t* fir
                         const void* product, float* outputs, uint64_t out_stride, void* tables, uint64_t table_bytes);
 // `values` (a multiple of four) rounded to FP16.
 int sd_op_half_values(void* handle, const float* input, uint64_t values, void* output);
+// `steps` rows of `cols` values (`stride` apart) rounded to FP16 and packed, as an FP16 GEMM rounds its F32 input.
+int sd_op_half_rows(void* handle, const float* input, uint64_t stride, uint64_t cols, uint64_t steps, void* output);
+// sd_op_linear_gemm's FP16 product (more steps than a GEMV takes) of input rows already rounded (as sd_op_half_rows rounds them).
+int sd_op_linear_gemm_half(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                           const void* input, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes);
 int sd_op_repeat_rows(void* handle, const float* input, uint64_t rows, uint64_t copies, uint64_t width, float* output);
 // Every device's `out` (rows of `full` FP16 values) = each device's `part` (rows of its `share` columns)
 // at its columns `firsts[d]`, the peers' read over the peer link; ordered as sd_op_sum_devices.
 int sd_op_gather_columns(void* const* handles, void* const* outs, const void* const* parts, const uint64_t* firsts, uint64_t devices,
                          uint64_t rows, uint64_t share, uint64_t full);
+// Every device's `out` (rows of `full` F32 values) = at each device's columns `firsts[d]`.. (`share` of
+// them) that device's `part` (rows of `full` values): what sd_op_sum_devices makes of parts zero but at
+// their columns, with only the peers' columns read over the peer link; ordered as sd_op_sum_devices.
+int sd_op_gather_owned(void* const* handles, float* const* outs, const float* const* parts, const uint64_t* firsts, uint64_t devices,
+                       uint64_t rows, uint64_t share, uint64_t full);
 /* Experts in slots: route r (rows * top_k of them, token-major) runs the expert at bases[r], a slot
    of slot_bytes holding its gate and up (ffn x hidden) and down (hidden x ffn) matrices at byte
    offsets[0..2] (a zero base: a route another device runs); product[r] = SwiGLU of the route

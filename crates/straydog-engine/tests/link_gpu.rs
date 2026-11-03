@@ -6,7 +6,8 @@
 //! in for, also among plain sums in recorded graphs, also when the last block's waves of a folded
 //! sum run far apart (as they can on a GPU another process loads). Part links, as tensor-parallel
 //! DeepSeek-V4.1 sums its decode steps' outputs (sent as they form, added as the next step reads
-//! them), give the bits of sd_op_sum_devices and the ops they stand in for. Skipped without two GPUs.
+//! them), give the bits of sd_op_sum_devices and the ops they stand in for, and a gather of each
+//! device's columns the bits of the sum of parts zero elsewhere. Skipped without two GPUs.
 //!
 //! cargo test --release -p straydog-engine --features hip --test link_gpu, under the GPU lock.
 #![cfg(any(feature = "hip", feature = "cuda"))]
@@ -120,6 +121,45 @@ fn device_sums_read_parts_before_they_are_written_again() {
         b.copy(source_b.at(at).cast_const(), part_b.base(), (count * 4) as u64).unwrap();
         straydog_engine::ops::sum_devices(&[&a, &b], &[out_a.at(at), out_b.at(at)], &[part_a.base().cast_const(), part_b.base().cast_const()],
                                           count as u64).unwrap();
+    }
+    let (result_a, result_b) = (read(&mut a, &out_a, rounds * count), read(&mut b, &out_b, rounds * count));
+    check(&result_a, &result_b, &first, &second, &vec![0.0; rounds * count]);
+}
+
+/// gather_owned gives sum_devices' bits for parts that are zero but at their device's columns
+/// (DeepSeek-V4.1's experts' part, its activations), reading only the other's columns, and as the
+/// sum does, it has read a part before that part is written again.
+#[test]
+fn owned_columns_gather_to_the_sums_bits() {
+    let _gpus = gpus();
+    let (Ok(mut a), Ok(mut b)) = (Backend::new(0, 2 << 30), Backend::new(1, 2 << 30)) else {
+        eprintln!("skipped: device gathers need two GPUs");
+        return;
+    };
+    let (rows, full, rounds) = (96, 5120, 40);
+    let (share, count) = (full / 2, rows * full);
+    // (no negative zero: the sum makes it a positive one)
+    let own = |device: usize, values: Vec<f32>| -> Vec<f32> {
+        values.into_iter().enumerate().map(|(i, value)| if (i % full) / share == device { value + 0.0 } else { 0.0 }).collect()
+    };
+    let (first, second) = (own(0, parts(0, rounds, count, 3)), own(1, parts(1, rounds, count, 4)));
+    let bytes = (rounds * count * 4) as u64;
+    let (source_a, source_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap());
+    a.write_buffer(&source_a, 0, &first).unwrap();
+    b.write_buffer(&source_b, 0, &second).unwrap();
+    let (part_a, part_b) = (a.buffer((count * 4) as u64).unwrap(), b.buffer((count * 4) as u64).unwrap());
+    let (out_a, out_b) = (a.buffer(bytes).unwrap(), b.buffer(bytes).unwrap());
+    let busy = b.buffer(64 << 20).unwrap();
+    for round in 0..rounds {
+        let at = round * count;
+        if round % 7 == 0 {
+            b.copy(busy.base().cast_const(), busy.at(8 << 20), 32 << 20).unwrap();
+        }
+        straydog_engine::ops::devices_settle(&[&a, &b]).unwrap();
+        a.copy(source_a.at(at).cast_const(), part_a.base(), (count * 4) as u64).unwrap();
+        b.copy(source_b.at(at).cast_const(), part_b.base(), (count * 4) as u64).unwrap();
+        straydog_engine::ops::gather_owned(&[&a, &b], &[out_a.at(at), out_b.at(at)], &[part_a.base().cast_const(), part_b.base().cast_const()],
+                                           &[0, share as u64], rows as u64, share as u64, full as u64).unwrap();
     }
     let (result_a, result_b) = (read(&mut a, &out_a, rounds * count), read(&mut b, &out_b, rounds * count));
     check(&result_a, &result_b, &first, &second, &vec![0.0; rounds * count]);
