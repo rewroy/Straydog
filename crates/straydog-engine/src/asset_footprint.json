@@ -42,6 +42,12 @@
       "experts": 132073390080,
       "tables": 110595290400,
       "state_per_token": 3200
+    },
+    "UD-IQ1_M": {
+      "dense": 7588260288,
+      "experts": 132214947840,
+      "tables": 110595290400,
+      "state_per_token": 3200
     }
   }
 }

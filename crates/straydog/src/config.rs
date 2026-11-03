@@ -98,7 +98,7 @@ pub struct Options {
     /// Model bundle: its directory (the pinned GGUF shards and tokenizer files of one quantization) or one of its shards
     #[arg(short = 'm', long, env = "STRAYDOG_MODEL", value_name = "PATH")]
     pub model: Option<PathBuf>,
-    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS (DeepSeek-V4.1-Flash) [default: detected from its files]
+    /// The bundle's quantization: Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (Qwen3.8-Flash-Next), GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ1_M, UD-IQ2_XXS (DeepSeek-V4.1-Flash) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
     /// Qwen3.8-Flash-Next's MTP drafter: its directory or its GGUF file (also -md). DeepSeek-V4.1's DSpark drafter takes no option: it drafts when its files sit beside the bundle (`straydog setup` puts them there; DS41_DSPARK=0 leaves it out)

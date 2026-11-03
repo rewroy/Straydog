@@ -416,10 +416,10 @@ pub fn qwen_vision_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
 /// trees are built once from the files into Straydog's data directory ([`tree_path`]), and the
 /// worker checks every block it uses against them. A model whose official repository gives its
 /// tokenizer and chat template has them pinned too, as resources (read whole and hashed).
-pub const ON_DEMAND_MANIFESTS: [&str; 3] = [include_str!("assets_deepseek41.json"), include_str!("assets_deepseek41_gsq.json"),
-                                            include_str!("assets_deepseek41_gsq.json")];
+pub const ON_DEMAND_MANIFESTS: [&str; 4] = [include_str!("assets_deepseek41.json"), include_str!("assets_deepseek41_gsq.json"),
+                                            include_str!("assets_deepseek41_gsq.json"), include_str!("assets_deepseek41.json")];
 /// Every on-demand quantization, with the manifest that pins it.
-pub const ON_DEMAND_QUANTIZATIONS: [&str; 3] = ["UD-IQ2_XXS", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS"];
+pub const ON_DEMAND_QUANTIZATIONS: [&str; 4] = ["UD-IQ2_XXS", "GSQ-RCO-IQ2_XS", "GSQ-RCO-IQ2_XXS", "UD-IQ1_M"];
 
 #[derive(Debug, Clone)]
 pub struct OnDemand {
@@ -511,7 +511,9 @@ pub fn on_demand_sources(quantization: &str) -> Result<Vec<Source>, String> {
         .zip(listed.iter().chain(sidecars))
         .map(|(asset, item)| {
             let revision = if item["revision"].is_string() { text(&item["revision"], "a revision")? } else { revision.clone() };
-            Ok(Source { asset, repository: repository.clone(), revision, path: text(&item["source_path"], "a source path")? })
+            // (a file another repository holds the same tables in, as UD-IQ1_M's Engram)
+            let repository = if item["repository"].is_string() { text(&item["repository"], "a repository")? } else { repository.clone() };
+            Ok(Source { asset, repository, revision, path: text(&item["source_path"], "a source path")? })
         })
         .collect::<Result<Vec<_>, String>>()?;
     if !pins.resources.is_empty() {
@@ -610,6 +612,13 @@ mod tests {
                    (gsq.sidecars[0].asset.sha256.as_str(), gsq.sidecars[0].verity.as_str(), gsq.sidecars[0].asset.bytes));
         assert_eq!(xxs.shards[5].name, "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00006-of-00006.gguf");
         assert_eq!(verity_pins("GSQ-RCO-IQ2_XXS").unwrap().len(), 6);
+        // Unsloth's UD-IQ1_M: four shards of its own, and its Engram the same file, from ISTA's repository
+        let ud = on_demand("UD-IQ1_M").unwrap();
+        assert_eq!((ud.shards.len(), ud.sidecars.len()), (5, 0));
+        assert_eq!((ud.shards[4].sha256.as_str(), ud.verity[4].as_str()), (gsq.sidecars[0].asset.sha256.as_str(), gsq.sidecars[0].verity.as_str()));
+        let sources = on_demand_sources("UD-IQ1_M").unwrap();
+        assert_eq!((sources[0].repository.as_str(), sources[4].repository.as_str()),
+                   ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"));
         assert!(xxs.verity.iter().all(|digest| digest.bytes().any(|digit| digit != b'0')));
         let (first, engram) = (on_demand_sources("GSQ-RCO-IQ2_XXS").unwrap(), on_demand_sources("GSQ-RCO-IQ2_XS").unwrap());
         assert!(first[..5].iter().all(|source| source.revision == "a419d74cd28d5b9f8c5e2b9077d11a609c17bc32"));
@@ -646,7 +655,7 @@ mod tests {
         assert!(footprint("Q8_0").unwrap_err().contains("no footprint"));
     }
 
-    /// DSpark's drafter is pinned for the GSQ-RCO bundle alone, as Unsloth's file of a repository at
+    /// DSpark's drafter is pinned for the GSQ-RCO bundles and UD-IQ1_M, as Unsloth's file of a repository at
     /// a revision, and found in its directory or beside it; when found, its verity tree is among the
     /// bundle's (from the directory it lies in).
     #[test]

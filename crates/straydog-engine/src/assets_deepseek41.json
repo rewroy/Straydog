@@ -50,6 +50,48 @@
           "verity": "892d3e948d1918eb24dde49e29d620ec78cdfe73a63eb9c9a35eca73749f276c"
         }
       ]
+    },
+    "UD-IQ1_M": {
+      "revision": "2688c0c3c2c3b052ec4f6d10a8417b0ef7ee4eba",
+      "assets": [
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf",
+          "source_path": "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf",
+          "bytes": 5780868,
+          "sha256": "5197c309479c7be06e3612dc696d7f18e13e5942cfe52e70c3c586b7e585a5ac",
+          "verity": "dadb996740d493232de412cbb0a9c28c8a20ef39a385d8ef6f103bfe928e8417"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf",
+          "source_path": "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf",
+          "bytes": 49707332128,
+          "sha256": "fbfb546557a33f41332ffbed7f15fbed249b9f7796975d9db571c8cf3870f335",
+          "verity": "ad92b6945ba3b6af3b9b98f59ed77e095a36afced1e905539c1036641904b82f"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf",
+          "source_path": "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf",
+          "bytes": 49292777280,
+          "sha256": "394b7a06e04d4b1b96b6028ec3d4dec49e4716900c26a493e8c2aa38a357ea1a",
+          "verity": "ac9dfd20301c20c83bbcefae50eb266c4e89b8ae827b074ebba71898d9c95132"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf",
+          "source_path": "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf",
+          "bytes": 40803165856,
+          "sha256": "323a7f59a2938879eaac82b37c443c85151e518071ad44c79b1e4580c91d0ed7",
+          "verity": "ba73acbe7001d967c8edc93dbe0a240c41516b24bdd75ad55d9029df88c534cd"
+        },
+        {
+          "name": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf",
+          "source_path": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+          "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+          "revision": "cb02422c900df489cea5833e8a92171224059b3c",
+          "bytes": 110595290816,
+          "sha256": "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a",
+          "verity": "9e7a67f276e45441a0f2426d891da3bb69ac18a914906d13cd33574c9f79df31"
+        }
+      ]
     }
   }
 }
