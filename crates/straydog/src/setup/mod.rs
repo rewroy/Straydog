@@ -24,7 +24,7 @@ pub struct SetupArgs {
     /// The model to set up (DeepSeek-V4.1-Flash or Qwen3.8-Flash-Next): its best bundle for this machine
     #[arg(long, value_name = "NAME")]
     pub model_name: Option<String>,
-    /// The bundle to set up (as `fetch --quant`: GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ2_XXS, IQ3_S, IQ3_XXS, IQ2_XS or Q2_0)
+    /// The bundle to set up (as `fetch --quant`: GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ1_M, UD-IQ2_XXS, IQ3_S, IQ3_XXS, IQ2_XS or Q2_0)
     #[arg(long, value_name = "NAME")]
     pub quant: Option<String>,
     /// The folder for models: the bundle goes in DIR/<model>/<quant>, or is DIR when DIR holds it already [default: the platform's data folder]
@@ -630,7 +630,7 @@ mod tests {
         println!("{said}");
         assert!(said.contains("2 x GPU (31.9 GiB each)") || said.contains("GPUs (ROCm/HIP)"), "{said}");
         assert!(said.contains("1) DeepSeek-V4.1-Flash") && said.contains("GSQ-RCO-IQ2_XXS") && said.contains("recommended"), "{said}");
-        assert!(said.contains("Please give a number from 1 to 7."), "{said}");
+        assert!(said.contains("Please give a number from 1 to 8."), "{said}");
         assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
         assert_eq!(outcome.extras, [Extra::Vision]);
         assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash").join("GSQ-RCO-IQ2_XXS"));

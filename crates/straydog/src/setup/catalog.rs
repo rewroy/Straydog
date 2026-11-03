@@ -21,10 +21,10 @@ pub const GIB: u64 = 1 << 30;
 pub const DEFAULT_CONTEXT: u64 = 262_144;
 
 /// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash's
-/// recommended build and its other two, then Qwen3.8-Flash-Next from the most exact quantization to
+/// recommended build and its other three, then Qwen3.8-Flash-Next from the most exact quantization to
 /// the smallest.
-pub const ORDER: [&str; 7] =
-    ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"];
+pub const ORDER: [&str; 8] =
+    ["GSQ-RCO-IQ2_XXS", "UD-IQ1_M", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"];
 
 /// A file a model can do without, which `setup` offers to add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,25 +827,25 @@ pub(crate) mod tests {
     fn the_recommendation_is_the_best_class_of_the_first_model_that_runs_well() {
         let entries = pinned_entries();
         // all DeepSeek on the drive, Qwen3.8 in RAM for one bundle and in VRAM for another: Qwen3.8's in VRAM
-        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram, Fit::Vram];
-        assert_eq!(recommend(&entries, &fits), Some(5));
+        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram];
+        assert_eq!(recommend(&entries, &fits), Some(6));
         // DeepSeek in RAM wins over Qwen3.8 in VRAM: the first model that runs well, its first bundle of the best class
-        fits[1] = Fit::Ram(1);
+        fits[2] = Fit::Ram(1);
         fits[0] = Fit::Ram(2);
         assert_eq!(recommend(&entries, &fits), Some(0));
         // DeepSeek in VRAM for a later bundle only
         fits[0] = Fit::Drive(1);
-        fits[2] = Fit::Vram;
-        assert_eq!(recommend(&entries, &fits), Some(2));
+        fits[3] = Fit::Vram;
+        assert_eq!(recommend(&entries, &fits), Some(3));
         // nothing runs well: of the model reading least from the drive, the first bundle within a twentieth of its experts of that
         let bytes = |gib: u64| gib * GIB;
-        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
-        assert_eq!(recommend(&entries, &slow), Some(5));
+        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &slow), Some(6));
         // ... or the one reading least, past that
-        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
-        assert_eq!(recommend(&entries, &wide), Some(6));
+        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &wide), Some(7));
         // a model that reads least is chosen over the bundles of another, however near
-        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
-        assert_eq!(recommend(&entries, &other), Some(5));
+        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &other), Some(6));
     }
 }
