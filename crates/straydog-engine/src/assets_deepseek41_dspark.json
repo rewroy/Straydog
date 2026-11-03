@@ -4,7 +4,8 @@
   "architecture": "deepseek41",
   "quantizations": [
     "GSQ-RCO-IQ2_XS",
-    "GSQ-RCO-IQ2_XXS"
+    "GSQ-RCO-IQ2_XXS",
+    "UD-IQ1_M"
   ],
   "dspark": {
     "kind": "dspark",
