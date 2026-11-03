@@ -630,11 +630,39 @@ impl<E: Engines> Session<E> {
         self.generate_constrained(tokens, max_new, sampling, seed, cancelled, progress, emit, None)
     }
 
-    /// [`Session::generate`] with the reply held to `constraint` ([`crate::constraint`]).
+    /// [`Session::generate`] with the reply held to `constraint` ([`crate::constraint`]). A void pass
+    /// (a DeepSeek-V4.1 part link's wait gave up: the other device's part came more than its timeout
+    /// late, as when the host stalled) voids that pass, not the reply: once, the sequence starts over
+    /// from the checkpoints with the tokens already sent as part of its prompt, and the reply goes on.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_constrained(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64,
                                 cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), emit: &mut dyn FnMut(u32),
-                                constraint: Option<&mut Constraint>) -> Result<(), String> {
+                                mut constraint: Option<&mut Constraint>) -> Result<(), String> {
+        let mut sent = Vec::new();
+        let first = self.generate_once(tokens, max_new, sampling, seed, cancelled, &mut *progress,
+                                       &mut |token| { sent.push(token); emit(token) }, constraint.as_deref_mut());
+        match first {
+            Err(message) if message.ends_with(crate::arch::deepseek41::engine::VOID_PASS) && !cancelled() => {
+                eprintln!("Straydog: a pass was void ({message}); the reply goes on from its {} tokens sent", sent.len());
+                // (the engines' state is the void pass's: the held sequence is left, the checkpoints kept)
+                self.reset();
+                if sent.len() == max_new {
+                    return Ok(());
+                }
+                let prompt: Vec<u32> = tokens.iter().chain(&sent).copied().collect();
+                let result = self.generate_once(&prompt, max_new - sent.len(), sampling, seed.wrapping_add(sent.len() as u64), cancelled,
+                                                progress, emit, constraint);
+                self.last_metrics.insert("void_pass_retried".into(), json!(true));
+                result
+            }
+            other => other,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_once(&mut self, tokens: &[u32], max_new: usize, sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool,
+                     progress: &mut dyn FnMut(usize, usize), emit: &mut dyn FnMut(u32), constraint: Option<&mut Constraint>)
+                     -> Result<(), String> {
         let started = Instant::now();
         self.last_metrics = Map::new();
         if tokens.is_empty() || max_new == 0 || tokens.len() + max_new > self.context {
