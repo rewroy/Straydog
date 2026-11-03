@@ -349,6 +349,9 @@ struct Work {
     xh: Buffer,
     ph: Buffer,
     ah: Buffer,
+    /// A pass's waves' routes by row (`moe::Grouped::by_row`): each wave's outputs added to their
+    /// rows in one launch.
+    by_row: Buffer,
     tables: Buffer,
     /// Values a row of the buffers of every row: hc, width, routes, selections, candidate blocks.
     widths: (usize, usize, usize, usize, usize),
@@ -448,6 +451,10 @@ const GEMM_MIN_BATCH: u64 = 8;
 /// tiles of up to a pass's routes take ~11 KB).
 const SLOT_TABLE_BYTES: u64 = 64 << 10;
 
+/// The most waves of a layer whose outputs go to their rows in a launch a wave (`Work::by_row`);
+/// a layer of more scatters an expert at a time.
+const BY_ROW_WAVES: usize = 16;
+
 /// What sizes a device's buffers of every row: hc, width, routes a row, the experts' width,
 /// selections a row, the index source layers (in order), whether the device has parts of sums,
 /// and the routes a wave of a pass's experts takes at most.
@@ -476,9 +483,10 @@ impl RowShape {
                               rows * hc * hc, rows * w, rows * w, split * w, split * w, rows, rows, rows, rows, rows];
         floats.extend(self.chosen.iter().map(|_| rows * self.top_k));
         floats.push(rows * self.blocks);
-        // (y: a wave's routes' outputs; xh, ph and ah: halves, two to a float)
+        // (y: a wave's routes' outputs; xh, ph and ah: halves, two to a float; by_row: i32 values)
         floats.extend([rows * k + PREDICTED, rows * k, rows * k, (rows * k).max(PREDICTED), rows * w, rows * ff, rows * ff,
-                       routes * ff, if self.split { routes } else { 0 } * ff, routes * w, rows * w / 2, routes * ff / 2, routes * ff / 2]);
+                       routes * ff, if self.split { routes } else { 0 } * ff, routes * w, rows * w / 2, routes * ff / 2, routes * ff / 2,
+                       BY_ROW_WAVES * (rows + 1) + rows * k]);
         floats
     }
 
@@ -919,6 +927,7 @@ impl Shard {
             xh: floats(&mut gpu, own * w / 2)?,
             ph: floats(&mut gpu, routes * ff / 2)?,
             ah: floats(&mut gpu, routes * ff / 2)?,
+            by_row: floats(&mut gpu, BY_ROW_WAVES * (own + 1) + own * k)?,
             tables: gpu.buffer(SLOT_TABLE_BYTES)?,
             widths: (hc, w, k, hp.index_top_k, blocks),
         };
@@ -1794,7 +1803,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// With several devices: every device's `out` = the sum of the devices' parts `part`, of `rows`
-    /// rows from row `first`.
+    /// rows from row `first`. (The experts' part is each device's columns, the others zero: only the
+    /// others' columns cross the bus.)
     fn sum_parts(&mut self, part: usize, first: usize, rows: usize) -> Result<()> {
         if self.shards.len() == 1 || rows == 0 {
             return Ok(());
@@ -1803,6 +1813,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
         let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.out.at(first * w)).collect();
         let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.parts[part].at(first * w) as P).collect();
+        if part == 1 {
+            let firsts: Vec<u64> = self.shards.iter().map(|shard| shard.rows.hidden.0 as u64).collect();
+            return ops::gather_owned(&devices, &outs, &parts, &firsts, rows as u64, self.shards[0].rows.hidden.1 as u64, w as u64);
+        }
         ops::sum_devices(&devices, &outs, &parts, (rows * w) as u64)
     }
 
@@ -3016,10 +3030,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let limit = self.shards.iter().map(|shard| shard.experts.wave_limit()).fold(WAVE, usize::min);
         let waves = grouped.waves(limit, capacity);
         let experts = |wave: &[moe::Span]| -> Vec<usize> { wave.iter().map(|span| span.expert).collect() };
+        // (each wave's routes by row, for its outputs' launch on the grouped kernels' path)
+        let by_row = (waves.len() <= BY_ROW_WAVES).then(|| grouped.by_row(&waves, rows));
         for shard in &mut self.shards {
             let work = shard.work.clone();
             shard.gpu.write_buffer(&work.route_rows, 0, &grouped.rows)?;
             shard.gpu.write_buffer(&work.route_weights, 0, &grouped.weights)?;
+            if let Some(table) = &by_row {
+                shard.gpu.write_buffer(&work.by_row, 0, table)?;
+            }
             // (the layer's misses stream through, leaving the VRAM's experts to decoding)
             shard.experts.set_streaming(&mut shard.gpu, true)?;
             if let Some(wave) = waves.first() {
@@ -3039,14 +3058,38 @@ impl<'a, T: Tensors> Engine<'a, T> {
                              &scratch, half_gemm)?;
             shard.gpu.swiglu(work.gate.base(), work.up.base(), rows as u64, ff as u64, clamp_shared, None, work.act.base())?;
         }
-        self.sum_activations(rows)?;
-        for shard in &mut self.shards {
-            let (work, scratch, shared) = (shard.work.view(first), shard.scratch, shard.shared[&layer]);
-            let (h0, hs) = shard.rows.hidden;
-            let down = shared.buffer.slice(shared.offsets[2], shared.buffer.bytes - shared.offsets[2]);
-            let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
-            shard.gpu.linear_gemm(&down, shared.kinds[2], hs as u64, ff as u64, 0, input.base(), 0, rows as u64, target.at(h0), w as u64,
-                             &scratch, half_gemm)?;
+        if split && half_gemm {
+            // Down takes its activations in FP16: each device's columns rounded where they formed and gathered whole, a
+            // quarter of the bytes over PCIe of the F32 sum of its columns and zeros, the same FP16 values.
+            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+            // (ph: another device's gather of the layer before may still read it)
+            ops::devices_settle(&devices)?;
+            for shard in &mut self.shards {
+                let (f0, fs) = shard.rows.ffn;
+                shard.gpu.half_rows(shard.work.act.at(f0) as P, ff as u64, fs as u64, rows as u64, shard.work.ph.base())?;
+            }
+            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+            let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.ah.base()).collect();
+            let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.ph.base() as P).collect();
+            let firsts: Vec<u64> = self.shards.iter().map(|shard| shard.rows.ffn.0 as u64).collect();
+            ops::gather_columns(&devices, &outs, &parts, &firsts, rows as u64, self.shards[0].rows.ffn.1 as u64, ff as u64)?;
+            for shard in &mut self.shards {
+                let (work, scratch, shared) = (shard.work.view(first), shard.scratch, shard.shared[&layer]);
+                let (h0, hs) = shard.rows.hidden;
+                let down = shared.buffer.slice(shared.offsets[2], shared.buffer.bytes - shared.offsets[2]);
+                shard.gpu.linear_gemm_half(&down, shared.kinds[2], hs as u64, ff as u64, 0, work.ah.base() as P, rows as u64,
+                                           work.parts[1].at(h0), w as u64, &scratch)?;
+            }
+        } else {
+            self.sum_activations(rows)?;
+            for shard in &mut self.shards {
+                let (work, scratch, shared) = (shard.work.view(first), shard.scratch, shard.shared[&layer]);
+                let (h0, hs) = shard.rows.hidden;
+                let down = shared.buffer.slice(shared.offsets[2], shared.buffer.bytes - shared.offsets[2]);
+                let (input, target) = (if split { work.act_sum } else { work.act }, if split { work.parts[1] } else { work.out });
+                shard.gpu.linear_gemm(&down, shared.kinds[2], hs as u64, ff as u64, 0, input.base(), 0, rows as u64, target.at(h0),
+                                      w as u64, &scratch, half_gemm)?;
+            }
         }
         self.mark("shared expert")?;
         let (gate_bytes, down_bytes, kinds) = self.expert_kinds(layer, self.shards[0].rows)?;
@@ -3149,11 +3192,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                                   ffn_share: fs as u64, ffn: ff as u64, hidden_share: hs as u64, tables: &work.tables };
                     let product = if split { work.ah.base() } else { work.ph.base() };
                     shard.gpu.slot_moe_down(&grouped, product, work.y.at(h0), w as u64)?;
-                    // (an expert's routes at a time: a row routes to several experts of a wave, and a
-                    // scatter's adds to one row race; an expert's routes are of distinct rows)
-                    for span in wave.iter() {
-                        shard.gpu.scatter_add(work.y.at((span.first - base) * w), work.route_rows.at(span.first), span.routes as u64, w as u64,
-                                              target.base(), rows as u64)?;
+                    if let Some(table) = &by_row {
+                        // each row's routes in the wave's order, this device's columns: as an expert at a time adds them
+                        shard.gpu.scatter_rows(work.y.at(h0) as P, routes as u64, work.by_row.at(index * (rows + 1)) as P,
+                                               work.by_row.base() as P, table.len() as u64, rows as u64, hs as u64, w as u64,
+                                               target.at(h0))?;
+                    } else {
+                        // (an expert's routes at a time: a row routes to several experts of a wave, and a
+                        // scatter's adds to one row race; an expert's routes are of distinct rows)
+                        for span in wave.iter() {
+                            shard.gpu.scatter_add(work.y.at((span.first - base) * w), work.route_rows.at(span.first), span.routes as u64,
+                                                  w as u64, target.base(), rows as u64)?;
+                        }
                     }
                 } else {
                     let scratch = moe::Scratch { gemm: &shard.scratch, half_gemm, input: &work.xe, gate: &work.gate, up: &work.up, output: &work.y };
@@ -3173,7 +3223,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// With several devices: every device's `act_sum` = the sum of the devices' `act` (each its
-    /// columns of `routes` rows of the expert width, the others zero).
+    /// columns of `routes` rows of the expert width, the others zero), gathered: only the others'
+    /// columns cross the bus.
     fn sum_activations(&mut self, routes: usize) -> Result<()> {
         if self.shards.len() == 1 || routes == 0 {
             return Ok(());
@@ -3181,7 +3232,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
         let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.act_sum.base()).collect();
         let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.act.base() as P).collect();
-        ops::sum_devices(&devices, &outs, &parts, (routes * self.hp.expert_ff) as u64)
+        let firsts: Vec<u64> = self.shards.iter().map(|shard| shard.rows.ffn.0 as u64).collect();
+        ops::gather_owned(&devices, &outs, &parts, &firsts, routes as u64, self.shards[0].rows.ffn.1 as u64, self.hp.expert_ff as u64)
     }
 }
 
@@ -3616,7 +3668,7 @@ impl Work {
             visible: [next(), next(), next()], chosen: self.chosen.keys().map(|&layer| (layer, next())).collect(), candidates: next(),
             ids: next(),
             weights: next(), route_rows: next(), route_weights: next(), xe: next(), gate: next(), up: next(), act: next(),
-            act_sum: next(), y: next(), xh: next(), ph: next(), ah: next(), ..self.clone()
+            act_sum: next(), y: next(), xh: next(), ph: next(), ah: next(), by_row: next(), ..self.clone()
         })
     }
 

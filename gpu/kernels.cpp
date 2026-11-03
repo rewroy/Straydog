@@ -2962,6 +2962,42 @@ static int op_linear_checked(void* handle, const void* weights, int kind, uint64
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_op_linear_gemm_half(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
+                           const void* input, uint64_t steps, float* output, uint64_t output_stride, float* scratch, uint64_t scratch_bytes) {
+    try {
+        auto& value = device(handle);
+        output_stride = output_stride ? output_stride : rows;
+        if (!rows || !cols || steps <= uint64_t(gemv_max_vectors) || output_stride < rows || !value.blas)
+            throw std::runtime_error("invalid Straydog FP16 linear shape");
+        const size_t row_bytes = matrix_row_bytes(kind, cols);
+        op_span(value, weights, size_t(first_row + rows) * row_bytes, "a weight matrix");
+        op_span(value, input, size_t(steps * cols) * 2, "an FP16 linear input");
+        op_span(value, output, size_t((steps - 1) * output_stride + rows) * 4, "a linear output");
+        op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
+        const Matrix matrix{static_cast<const uint8_t*>(weights) + first_row * row_bytes, row_bytes, size_t(rows), size_t(cols), 0, 0, 0, kind};
+        // (the pieces sd_op_linear_gemm's would be, its rounded input at the scratch's end: the same GEMMs)
+        const size_t input_bytes = (size_t(steps * cols) * 2 + 255) & ~size_t(255);
+        if (scratch_bytes <= input_bytes) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
+        op_linear_half(value, matrix, static_cast<const __half*>(input), size_t(steps), output, size_t(output_stride), scratch,
+                       size_t(scratch_bytes) - input_bytes);
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_half_rows(void* handle, const float* input, uint64_t stride, uint64_t cols, uint64_t steps, void* output) {
+    try {
+        auto& value = device(handle);
+        if (!input || !output || !cols || !steps || stride < cols) throw std::runtime_error("invalid Straydog half rows");
+        op_span(value, input, size_t((steps - 1) * stride + cols) * 4, "rows to round");
+        op_span(value, output, size_t(steps * cols) * 2, "rounded rows");
+        op_half_rows<<<unsigned((steps * cols + 255) / 256), 256, 0, value.stream>>>(input, size_t(stride), size_t(cols), size_t(steps),
+                                                                                     static_cast<__half*>(output));
+        check(hipGetLastError());
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_op_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, uint64_t first_row,
                  const float* input, uint64_t input_stride, uint64_t steps, float* output, uint64_t output_stride,
                  float* scratch, uint64_t scratch_bytes) {
@@ -3448,6 +3484,20 @@ int sd_op_scatter_add(void* handle, const float* x, const int32_t* rows, uint64_
     op_span(value, rows, size_t(count) * 4, "row indices");
     op_span(value, out, size_t(out_rows * width) * 4, "a scatter output");
     op_scatter_add_kernel<<<op_blocks(size_t(count * width)), 256, 0, value.stream>>>(x, rows, size_t(count), size_t(width), out);
+    SD_OP_END
+}
+
+int sd_op_scatter_rows(void* handle, const float* x, uint64_t x_rows, const int32_t* offsets, const int32_t* table, uint64_t table_values,
+                       uint64_t rows, uint64_t cols, uint64_t stride, float* out) {
+    SD_OP_BEGIN
+    if (!x || !x_rows || !offsets || !table || !table_values || !rows || !cols || cols > stride) throw std::runtime_error("invalid Straydog row scatter");
+    op_span(value, x, size_t((x_rows - 1) * stride + cols) * 4, "added rows");
+    op_span(value, offsets, size_t(rows + 1) * 4, "row offsets");
+    op_span(value, table, size_t(table_values) * 4, "routes by row");
+    op_span(value, out, size_t((rows - 1) * stride + cols) * 4, "a scatter output");
+    if (offsets < table || offsets + rows + 1 > table + table_values) throw std::runtime_error("row offsets outside their table");
+    op_scatter_rows_kernel<<<op_blocks(size_t(rows * cols)), 256, 0, value.stream>>>(x, size_t(x_rows), offsets, table, size_t(table_values),
+                                                                                     size_t(rows), size_t(cols), size_t(stride), out);
     SD_OP_END
 }
 
@@ -3953,6 +4003,28 @@ __global__ void sum_devices_kernel(DeviceParts list, unsigned devices, size_t co
     out[index] = sum;
 }
 
+extern "C++" {
+// Peer access, once per pair (a device without it cannot take part).
+static void link_peers(const std::vector<Device*>& list) {
+    static std::mutex mutex;
+    static std::vector<std::pair<int, int>> linked;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (Device* a : list)
+        for (Device* b : list) {
+            if (a == b || std::find(linked.begin(), linked.end(), std::make_pair(a->ordinal, b->ordinal)) != linked.end()) continue;
+            int can = 0;
+            check(hipDeviceCanAccessPeer(&can, a->ordinal, b->ordinal));
+            if (!can) throw std::runtime_error("Straydog devices without peer access cannot sum their parts");
+            on_device(a->ordinal, [&]() {
+                const hipError_t state = hipDeviceEnablePeerAccess(b->ordinal, 0);
+                if (state == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
+                else check(state);
+            });
+            linked.emplace_back(a->ordinal, b->ordinal);
+        }
+}
+} // extern "C++"
+
 int sd_op_sum_devices(void* const* handles, float* const* outs, const float* const* parts, uint64_t devices, uint64_t count) {
     try {
         if (!handles || !outs || !parts || devices < 1 || devices > sum_devices_max || !count)
@@ -3979,25 +4051,7 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 });
             return 0;
         }
-        // Peer access, once per pair (a device without it cannot take part).
-        static std::mutex mutex;
-        static std::vector<std::pair<int, int>> linked;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (Device* a : list)
-                for (Device* b : list) {
-                    if (a == b || std::find(linked.begin(), linked.end(), std::make_pair(a->ordinal, b->ordinal)) != linked.end()) continue;
-                    int can = 0;
-                    check(hipDeviceCanAccessPeer(&can, a->ordinal, b->ordinal));
-                    if (!can) throw std::runtime_error("Straydog devices without peer access cannot sum their parts");
-                    on_device(a->ordinal, [&]() {
-                        const hipError_t state = hipDeviceEnablePeerAccess(b->ordinal, 0);
-                        if (state == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
-                        else check(state);
-                    });
-                    linked.emplace_back(a->ordinal, b->ordinal);
-                }
-        }
+        link_peers(list);
         // Every part's end is marked before any device waits, so no device waits for another's sum.
         for (Device* d : list)
             on_device(d->ordinal, [&]() {
@@ -4091,6 +4145,73 @@ int sd_op_gather_columns(void* const* handles, void* const* outs, const void* co
                     if (j != i) check(hipStreamWaitEvent(list[i]->stream, list[j]->parts_ready, 0));
                 gather_columns_kernel<<<unsigned((rows * full / 2 + 255) / 256), 256, 0, list[i]->stream>>>(
                     all, unsigned(devices), size_t(rows), size_t(share), size_t(full), static_cast<uint32_t*>(outs[i]));
+                check(hipGetLastError());
+                if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
+                check(hipEventRecord(list[i]->parts_read, list[i]->stream));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// Every device's `out` (rows of `full` F32 values) = at each device's columns firsts[d].. (`share` of
+// them) that device's `part` (rows of `full` values, its other columns unread), the others' read over
+// the peer link at system scope as sd_op_sum_devices reads them: the devices' disjoint columns of one
+// result. The sum of parts whose other columns are zero, bit for bit but for a zero's sign, with only
+// the others' columns over the bus (the sum read every part whole, half of it zeros with two devices).
+struct DeviceColumns { const float* parts[sum_devices_max]; uint64_t firsts[sum_devices_max]; };
+__global__ void gather_owned_kernel(DeviceColumns list, unsigned devices, unsigned self, size_t count, size_t share, size_t full,
+                                    float* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const size_t column = index % full;
+    for (unsigned d = 0; d < devices; ++d) {
+        if (column - list.firsts[d] >= share) continue;   // (unsigned: a column before firsts[d] too)
+        out[index] = d == self ? list.parts[d][index] : link_load(list.parts[d] + index);
+        return;
+    }
+    out[index] = 0;
+}
+
+int sd_op_gather_owned(void* const* handles, float* const* outs, const float* const* parts, const uint64_t* firsts, uint64_t devices,
+                       uint64_t rows, uint64_t share, uint64_t full) {
+    try {
+        if (!handles || !outs || !parts || !firsts || devices < 1 || devices > sum_devices_max || !rows || !share || share > full ||
+            rows > (uint64_t(1) << 40) / full)
+            throw std::runtime_error("invalid Straydog column gather");
+        const size_t count = size_t(rows * full);
+        std::vector<Device*> list;
+        DeviceColumns all{};
+        for (size_t i = 0; i < devices; ++i) {
+            Device& d = device(handles[i]);
+            for (Device* other : list) if (other == &d) throw std::runtime_error("a device twice in a Straydog column gather");
+            if (firsts[i] + share > full) throw std::runtime_error("invalid Straydog column gather");
+            for (size_t j = 0; j < i; ++j)
+                if (firsts[i] < firsts[j] + share && firsts[j] < firsts[i] + share)
+                    throw std::runtime_error("a Straydog column gather's shares overlap");
+            op_span(d, parts[i], count * 4, "a device's part");
+            op_span(d, outs[i], count * 4, "a device's gathered rows");
+            for (size_t j = 0; j < devices; ++j)
+                if (static_cast<const void*>(outs[i]) == static_cast<const void*>(parts[j]))
+                    throw std::runtime_error("a column gather cannot overwrite a part");
+            list.push_back(&d);
+            all.parts[i] = parts[i];
+            all.firsts[i] = firsts[i];
+        }
+        // What the sum link takes goes over it as a sum (no host event, so a graph can record it).
+        if (devices == 2 && list[0]->sums.peer == list[1] && count <= list[0]->sums.capacity)
+            return sd_op_sum_devices(handles, outs, parts, devices, rows * full);
+        link_peers(list);
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
+                check(hipEventRecord(d->parts_ready, d->stream));
+            });
+        for (size_t i = 0; i < devices; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                for (size_t j = 0; j < devices; ++j)
+                    if (j != i) check(hipStreamWaitEvent(list[i]->stream, list[j]->parts_ready, 0));
+                gather_owned_kernel<<<unsigned((count + 255) / 256), 256, 0, list[i]->stream>>>(all, unsigned(devices), unsigned(i), count,
+                                                                                                size_t(share), size_t(full), outs[i]);
                 check(hipGetLastError());
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));

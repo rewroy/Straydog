@@ -62,6 +62,38 @@ impl Grouped {
         }
         waves
     }
+
+    /// The `waves`' routes by row, for adding a wave's outputs to `rows` rows in one pass (see
+    /// `Backend::scatter_rows`): wave i's row offsets at `i * (rows + 1)`, `rows + 1` of them,
+    /// indexing this table; at those positions, from `waves.len() * (rows + 1)` on, each row's routes
+    /// as the wave numbers them (its first route 0), in the wave's order (expert by expert), which is
+    /// the order an expert at a time adds them in.
+    pub fn by_row(&self, waves: &[&[Span]], rows: usize) -> Vec<i32> {
+        let lists = waves.len() * (rows + 1);
+        let routes: usize = waves.iter().flat_map(|wave| wave.iter()).map(|span| span.routes).sum();
+        let mut table = vec![0i32; lists + routes];
+        let mut at = lists;
+        for (index, wave) in waves.iter().enumerate() {
+            let Some(base) = wave.first().map(|span| span.first) else { continue };
+            let count: usize = wave.iter().map(|span| span.routes).sum();
+            let own = &self.rows[base..base + count];
+            let offsets = &mut table[index * (rows + 1)..(index + 1) * (rows + 1)];
+            for &row in own {
+                offsets[row as usize + 1] += 1;
+            }
+            offsets[0] = at as i32;
+            for row in 0..rows {
+                offsets[row + 1] += offsets[row];
+            }
+            let mut next: Vec<i32> = offsets[..rows].to_vec();
+            for (route, &row) in own.iter().enumerate() {
+                table[next[row as usize] as usize] = route as i32;
+                next[row as usize] += 1;
+            }
+            at += count;
+        }
+        table
+    }
 }
 
 /// An expert as a slot holds it: gate and up (`gate_bytes` each) and down (`down_bytes`) back to
@@ -133,5 +165,29 @@ mod tests {
         let waves = grouped.waves(2, 4);
         assert_eq!(waves.iter().map(|wave| wave.len()).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(grouped.waves(2, 1).iter().map(|wave| wave.len()).collect::<Vec<_>>(), [1, 1, 1]);
+    }
+
+    #[test]
+    fn a_wave_s_routes_by_row_come_in_the_wave_s_order() {
+        // rows 0..3, routes grouped [0, 1, 2 | 0, 2 | 1]; waves [expert 1] and [experts 5, 7]
+        let grouped = Grouped::new(&[5, 1, 1, 7, 5, 1], &[0.5, 0.25, 0.75, 0.125, 1.0, 2.0], 2);
+        let waves = grouped.waves(2, 4);
+        let table = grouped.by_row(&waves, 3);
+        let lists = 2 * 4;
+        // wave 0: rows 0, 1, 2 one route each (0, 1, 2)
+        assert_eq!(&table[..4], &[lists as i32, lists as i32 + 1, lists as i32 + 2, lists as i32 + 3]);
+        assert_eq!(&table[lists..lists + 3], &[0, 1, 2]);
+        // wave 1 (its routes: expert 5's rows 0 and 2, then expert 7's row 1): row 0 route 0, row 1 route 2, row 2 route 1
+        let w1 = lists as i32 + 3;
+        assert_eq!(&table[4..8], &[w1, w1 + 1, w1 + 2, w1 + 3]);
+        assert_eq!(&table[lists + 3..], &[0, 2, 1]);
+        // a row of two routes in one wave keeps the wave's order
+        let both = Grouped::new(&[3, 4, 4, 3], &[1.0; 4], 2);
+        let waves = both.waves(2, 8);
+        assert_eq!(waves.len(), 1);
+        let table = both.by_row(&waves, 2);
+        assert_eq!(&table[..3], &[3, 5, 7]);
+        // expert 3's routes (rows 0, 1) are the wave's 0 and 1, expert 4's (rows 0, 1) its 2 and 3
+        assert_eq!(&table[3..], &[0, 2, 1, 3]);
     }
 }

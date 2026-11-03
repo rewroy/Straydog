@@ -130,6 +130,22 @@ pub fn gather_columns(devices: &[&Backend], outs: &[M], parts: &[P], firsts: &[u
     })
 }
 
+/// Every device's `outs` (`rows` of `full` F32 values) = at each device's columns `firsts`.. (`share`
+/// of them) that device's `parts` (rows of `full` values): [`sum_devices`] of parts that are zero
+/// but at their device's columns, with only the others' columns read over the peer link.
+pub fn gather_owned(devices: &[&Backend], outs: &[M], parts: &[P], firsts: &[u64], rows: u64, share: u64, full: u64) -> Result<()> {
+    if outs.len() != devices.len() || parts.len() != devices.len() || firsts.len() != devices.len() {
+        return Err("a column gather takes one out, one part and one first column per device".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let outs: Vec<*mut f32> = outs.iter().map(|out| out.cast()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe {
+        ffi::sd_op_gather_owned(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), firsts.as_ptr(), handles.len() as u64, rows, share, full)
+    })
+}
+
 /// Every device's later work waits until each other device's last [`sum_devices`] has read its
 /// part (that sum reads the parts where they lie): before a device writes a summed part's buffer
 /// again, as a pass's next wave of experts writes its activations.
@@ -638,6 +654,18 @@ impl Backend {
         check(unsafe { ffi::sd_op_scatter_add(self.handle(), x.cast(), rows.cast(), count, width, out.cast(), out_rows) })
     }
 
+    /// `out[r] += x[t]` for each route `t` of row `r` of `rows` in turn: `table[offsets[r]..offsets[r + 1]]`
+    /// (`offsets` inside `table`, of `table_values` values; each route below `x_rows`), `cols` values of rows
+    /// `stride` apart: [`Backend::scatter_add`] of each expert's routes in turn, a row read and written once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_rows(&mut self, x: P, x_rows: u64, offsets: P, table: P, table_values: u64, rows: u64, cols: u64, stride: u64,
+                        out: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe {
+            ffi::sd_op_scatter_rows(self.handle(), x.cast(), x_rows, offsets.cast(), table.cast(), table_values, rows, cols, stride, out.cast())
+        })
+    }
+
     /// Whether a wave of experts of these kinds and shares takes the grouped WMMA kernels here
     /// (RDNA4, whole tiles and units): see [`SlotWave`].
     pub fn slot_moe_supported(&self, kinds: [u32; 3], width: u64, ffn_share: u64, ffn: u64, hidden_share: u64) -> Result<bool> {
@@ -682,6 +710,25 @@ impl Backend {
     pub fn half_values(&mut self, input: P, values: u64, output: M) -> Result<()> {
         // SAFETY: as above.
         check(unsafe { ffi::sd_op_half_values(self.handle(), input.cast(), values, output.cast()) })
+    }
+
+    /// `steps` rows of `cols` values (`stride` apart) rounded to FP16 and packed into `output`, as
+    /// [`Backend::linear_gemm`]'s FP16 product rounds its input.
+    pub fn half_rows(&mut self, input: P, stride: u64, cols: u64, steps: u64, output: M) -> Result<()> {
+        // SAFETY: as above.
+        check(unsafe { ffi::sd_op_half_rows(self.handle(), input.cast(), stride, cols, steps, output.cast()) })
+    }
+
+    /// [`Backend::linear_gemm`]'s FP16 product of `steps` (more than a GEMV takes) input rows already
+    /// rounded ([`Backend::half_rows`]), packed: the same sums.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_gemm_half(&mut self, weights: &Buffer, kind: u32, rows: u64, cols: u64, first: u64, input: P, steps: u64, output: M,
+                            output_stride: u64, scratch: &Buffer) -> Result<()> {
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linear_gemm_half(self.handle(), weights.pointer, kind as i32, rows, cols, first, input, steps, output.cast(),
+                                        output_stride, scratch.pointer.cast(), scratch.bytes)
+        })
     }
 
     /// `output` = each of `rows` rows of `input` (`width` values), `copies` times over, row after row.

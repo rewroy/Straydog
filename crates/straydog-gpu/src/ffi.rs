@@ -791,6 +791,20 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_scatter_rows(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        x_rows: u64,
+        offsets: *const i32,
+        table: *const i32,
+        table_values: u64,
+        rows: u64,
+        cols: u64,
+        stride: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_slot_moe_supported(
         handle: *mut ::std::os::raw::c_void,
         kinds: *const ::std::os::raw::c_int,
@@ -854,6 +868,32 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_half_rows(
+        handle: *mut ::std::os::raw::c_void,
+        input: *const f32,
+        stride: u64,
+        cols: u64,
+        steps: u64,
+        output: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_linear_gemm_half(
+        handle: *mut ::std::os::raw::c_void,
+        weights: *const ::std::os::raw::c_void,
+        kind: ::std::os::raw::c_int,
+        rows: u64,
+        cols: u64,
+        first_row: u64,
+        input: *const ::std::os::raw::c_void,
+        steps: u64,
+        output: *mut f32,
+        output_stride: u64,
+        scratch: *mut f32,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_half_values(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,
@@ -866,6 +906,18 @@ unsafe extern "C" {
         handles: *const *mut ::std::os::raw::c_void,
         outs: *const *mut ::std::os::raw::c_void,
         parts: *const *const ::std::os::raw::c_void,
+        firsts: *const u64,
+        devices: u64,
+        rows: u64,
+        share: u64,
+        full: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_gather_owned(
+        handles: *const *mut ::std::os::raw::c_void,
+        outs: *const *mut f32,
+        parts: *const *const f32,
         firsts: *const u64,
         devices: u64,
         rows: u64,

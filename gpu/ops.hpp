@@ -217,6 +217,32 @@ const __half* kept_expansion(Device& d, const Matrix& matrix) {
     d.expansions_at = at + bytes;
     return reinterpret_cast<const __half*>(d.expansions + at);
 }
+// `matrix` (expanded to FP16: kept, else in pieces in `scratch`) by `steps` FP16 input rows (packed), F32 sums into `output`.
+void op_linear_half(Device& d, const Matrix& matrix, const __half* half_input, size_t steps, float* output, size_t output_stride,
+                    float* scratch, size_t scratch_bytes) {
+    const size_t rows = matrix.rows, cols = matrix.cols, row_bytes = matrix.row_bytes;
+    if (const __half* kept = kept_expansion(d, matrix)) {
+        const float alpha = 1, beta = 0;
+        blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(rows), int(steps), int(cols), &alpha, kept, HIP_R_16F, int(cols),
+                                 half_input, HIP_R_16F, int(cols), &beta, output, HIP_R_32F, int(output_stride), HIPBLAS_COMPUTE_32F,
+                                 HIPBLAS_GEMM_DEFAULT));
+        return;
+    }
+    const size_t piece = std::min(rows, scratch_bytes / (cols * 2));
+    if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
+    const float alpha = 1, beta = 0;
+    for (size_t done = 0; done < rows; done += piece) {
+        const size_t count = std::min(piece, rows - done);
+        const Matrix part{matrix.data + done * row_bytes, row_bytes, count, cols, 0, 0, 0, matrix.kind};
+        expand(part, scratch, d.stream, true);
+        if (d.gemm_checks)
+            op_half_weight_checks<<<unsigned((count * cols + 255) / 256), 256, 0, d.stream>>>(
+                reinterpret_cast<const __half*>(scratch), count * cols, d.gemm_checks);
+        blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha, scratch, HIP_R_16F,
+                                 int(cols), half_input, HIP_R_16F, int(cols), &beta, output + done, HIP_R_32F, int(output_stride),
+                                 HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+    }
+}
 void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t cols, size_t first,
                const float* input, size_t input_stride, size_t steps, float* output, size_t output_stride,
                float* scratch, size_t scratch_bytes, int precision = -1) {
@@ -238,27 +264,7 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
         if (d.gemm_checks)
             op_half_input_checks<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(
                 input, input_stride, cols, steps, half_input, d.gemm_checks);
-        if (const __half* kept = kept_expansion(d, matrix)) {
-            const float alpha = 1, beta = 0;
-            blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(rows), int(steps), int(cols), &alpha, kept, HIP_R_16F, int(cols),
-                                     half_input, HIP_R_16F, int(cols), &beta, output, HIP_R_32F, int(output_stride), HIPBLAS_COMPUTE_32F,
-                                     HIPBLAS_GEMM_DEFAULT));
-            return;
-        }
-        const size_t piece = std::min(rows, (scratch_bytes - input_bytes) / (cols * 2));
-        if (!piece) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
-        const float alpha = 1, beta = 0;
-        for (size_t done = 0; done < rows; done += piece) {
-            const size_t count = std::min(piece, rows - done);
-            const Matrix part{matrix.data + done * row_bytes, row_bytes, count, cols, 0, 0, 0, kind};
-            expand(part, scratch, d.stream, true);
-            if (d.gemm_checks)
-                op_half_weight_checks<<<unsigned((count * cols + 255) / 256), 256, 0, d.stream>>>(
-                    reinterpret_cast<const __half*>(scratch), count * cols, d.gemm_checks);
-            blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(count), int(steps), int(cols), &alpha, scratch, HIP_R_16F,
-                                     int(cols), half_input, HIP_R_16F, int(cols), &beta, output + done, HIP_R_32F, int(output_stride),
-                                     HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-        }
+        op_linear_half(d, matrix, half_input, steps, output, output_stride, scratch, scratch_bytes - input_bytes);
         return;
     }
     const size_t piece = std::min(rows, scratch_bytes / (cols * 4));
@@ -1160,6 +1166,25 @@ __global__ void op_scatter_add_kernel(const float* x, const int32_t* rows, size_
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count * width) return;
     out[size_t(rows[index / width]) * width + index % width] += x[index];
+}
+
+// out[r] += x[t] for each route t of row r in turn (table[table[r]..table[r + 1]] with `offsets` = table + r's list, each below
+// x_rows), `cols` values of rows `stride` apart: op_scatter_add_kernel of each expert's routes in turn, in their order, with each
+// row read and written once (the scatters read and wrote a row once a route).
+__global__ void op_scatter_rows_kernel(const float* x, size_t x_rows, const int32_t* offsets, const int32_t* table, size_t table_values,
+                                       size_t rows, size_t cols, size_t stride, float* out) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= rows * cols) return;
+    const size_t row = index / cols, col = index % cols;
+    const int32_t begin = offsets[row], end = offsets[row + 1];
+    if (begin < 0 || begin >= end || size_t(end) > table_values) return;
+    float* at = out + row * stride + col;
+    float v = *at;
+    for (int32_t i = begin; i < end; ++i) {
+        const uint32_t route = uint32_t(table[i]);
+        if (route < x_rows) v += x[size_t(route) * stride + col];
+    }
+    *at = v;
 }
 
 // ---- Latent attention over a sliding window and selected compressed rows ----
