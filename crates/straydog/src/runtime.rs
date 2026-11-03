@@ -1259,6 +1259,13 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// The most tokens a pass drafts, as `/props` reports it: whichever drafter the ready frame lists drafts
+/// most (`speculative_drafts` counts Qwen3.8's MTP drafts alone, so DSpark is in `speculation` only).
+fn most_drafts(ready: &Value) -> u64 {
+    let listed = ready["speculation"].as_array().into_iter().flatten().filter_map(|kind| kind["drafts"].as_u64());
+    listed.chain(ready["speculative_drafts"].as_u64()).max().unwrap_or(0)
+}
+
 impl Engine for Runtime {
     fn state(&self) -> EngineState {
         match &*self.shared.phase.lock().unwrap() {
@@ -1266,7 +1273,7 @@ impl Engine for Runtime {
             Phase::Loading(progress) => EngineState::Loading { progress: progress.clone() },
             Phase::Ready(ready) => EngineState::Ready {
                 context: ready["context"].as_u64().unwrap_or(0),
-                speculative: ready["speculative_drafts"].as_u64().unwrap_or(0),
+                speculative: most_drafts(ready),
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
                                   "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true,
@@ -1338,6 +1345,16 @@ mod tests {
         let mut plain = ready.clone();
         plain["placement"]["dspark"] = Value::Null;
         assert!(!ready_summary(&plain).contains("DSpark"));
+    }
+
+    /// `/props` counts DSpark's drafts as it counts MTP's: a model that drafts is not reported as one that does not.
+    #[test]
+    fn a_placed_dspark_drafter_is_speculation() {
+        let dspark = json!({"speculative_drafts": 0, "speculation": [{"kind": "dspark", "drafts": 3, "resident": [87]}, {"kind": "lookup"}]});
+        let mtp = json!({"speculative_drafts": 3, "speculation": [{"kind": "mtp", "drafts": 3}]});
+        let lookup = json!({"speculative_drafts": 0, "speculation": [{"kind": "lookup"}]});
+        let old = json!({"speculative_drafts": 2});
+        assert_eq!([most_drafts(&dspark), most_drafts(&mtp), most_drafts(&lookup), most_drafts(&old)], [3, 3, 0, 2]);
     }
 
     /// A request's prompt reads as its new tokens and their time, with a rate only for a prompt worth one.
