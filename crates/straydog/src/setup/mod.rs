@@ -42,6 +42,9 @@ pub struct SetupArgs {
     /// Leave out the vision encoder
     #[arg(long)]
     pub no_vision: bool,
+    /// Fetch only the vision encoder, for a model already set up: its shards are not read again
+    #[arg(long, conflicts_with = "no_vision")]
+    pub vision_only: bool,
     /// Leave out the MTP drafter (Qwen3.8)
     #[arg(long)]
     pub no_mtp: bool,
@@ -82,6 +85,8 @@ impl Defaults {
 /// Fetching a bundle and the extras chosen with it: the pinned downloads, or in a test a local server's.
 pub trait Provision {
     fn fetch(&self, place: &Place, entry: &Entry, extras: &[Extra], offline: bool, progress: straydog_provision::Progress) -> Result<(), String>;
+    /// The vision encoder alone, for a bundle already there.
+    fn fetch_vision(&self, place: &Place, entry: &Entry, offline: bool, progress: straydog_provision::Progress) -> Result<(), String>;
 }
 
 /// The pinned bundles from Hugging Face, authenticated.
@@ -96,12 +101,21 @@ impl Provision for Pinned {
             let path = straydog_provision::fetch_drafter(&place.drafter, false, progress)?;
             println!("verified {}", path.display());
         }
+        if extras.contains(&Extra::Vision) {
+            self.fetch_vision(place, entry, offline, progress)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_vision(&self, place: &Place, entry: &Entry, offline: bool, progress: straydog_provision::Progress) -> Result<(), String> {
+        // (DeepSeek's is built with its bundle, in `fetch`)
+        if straydog_engine::bundle::is_on_demand(&entry.quant) {
+            return Ok(());
+        }
         // (one file for every quantization, beside their directories: a server finds it there)
-        if !straydog_engine::bundle::is_on_demand(&entry.quant) && extras.contains(&Extra::Vision) {
-            let beside = place.bundle.parent().unwrap_or(&place.bundle);
-            if let Some(path) = straydog_provision::fetch_qwen_vision(beside, offline, progress)? {
-                println!("verified {}", path.display());
-            }
+        let beside = place.bundle.parent().unwrap_or(&place.bundle);
+        if let Some(path) = straydog_provision::fetch_qwen_vision(beside, offline, progress)? {
+            println!("verified {}", path.display());
         }
         Ok(())
     }
@@ -352,7 +366,11 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
     }
 
     std::fs::create_dir_all(&place.bundle).map_err(|error| format!("{}: {error}", place.bundle.display()))?;
-    provision.fetch(&place, entry, &extras, args.offline, progress)?;
+    if args.vision_only {
+        provision.fetch_vision(&place, entry, args.offline, progress)?;
+    } else {
+        provision.fetch(&place, entry, &extras, args.offline, progress)?;
+    }
 
     let model_draft = extras.contains(&Extra::Mtp).then(|| place.drafter.clone()).filter(|directory| entry.sidecar(Extra::Mtp).is_some_and(|mtp| directory.join(&mtp.file).is_file()));
     let gpus: Vec<usize> = machine.gpus.iter().map(|gpu| gpu.ordinal).collect();
@@ -466,6 +484,11 @@ mod tests {
             self.0.lock().unwrap().push((place.bundle.clone(), extras.to_vec(), offline));
             Ok(())
         }
+
+        fn fetch_vision(&self, place: &Place, _: &Entry, offline: bool, _: straydog_provision::Progress) -> Result<(), String> {
+            self.0.lock().unwrap().push((place.bundle.clone(), vec![Extra::Vision], offline));
+            Ok(())
+        }
     }
 
     /// Fetches the files of a bundle that is not a pinned one from a local server.
@@ -474,6 +497,10 @@ mod tests {
     impl Provision for Local {
         fn fetch(&self, place: &Place, _: &Entry, _: &[Extra], _: bool, progress: straydog_provision::Progress) -> Result<(), String> {
             straydog_provision::fetch_files_plain(&place.bundle, &self.0, progress)
+        }
+
+        fn fetch_vision(&self, _: &Place, _: &Entry, _: bool, _: straydog_provision::Progress) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -506,6 +533,21 @@ mod tests {
         let (mut input, mut output) = (script.as_bytes(), Vec::new());
         let result = run(args, machine, entries, defaults, provision, &mut Talk::new(&mut input, &mut output, interactive), &quiet);
         (result, String::from_utf8(output).unwrap())
+    }
+
+    /// `--vision-only` fetches the one file and leaves the settings as a full setup would write them, the drafter kept.
+    #[test]
+    fn vision_only_fetches_the_vision_file_and_not_the_bundle() {
+        let scratch = Scratch::new("setup-vision-only");
+        let entry = Entry::of("IQ2_XS").unwrap();
+        let args = SetupArgs { vision_only: true, yes: true, quant: Some("IQ2_XS".into()), dir: Some(scratch.path().join("models")), ..SetupArgs::default() };
+        let recorder = Recorder::default();
+        let (result, _) = run_with(&args, &machine_of(1, 16 << 30, 64 << 30), std::slice::from_ref(&entry), &defaults(scratch.path()), &recorder, "", false);
+        let outcome = result.unwrap();
+        let asked = recorder.0.lock().unwrap();
+        assert_eq!(asked.len(), 1, "one fetch");
+        assert_eq!(asked[0].1, [Extra::Vision], "of the vision file alone");
+        assert!(outcome.extras.contains(&Extra::Mtp), "the settings still name the drafter");
     }
 
     /// `--yes` with the bundle and the folder given asks nothing: the partial download is resumed,
