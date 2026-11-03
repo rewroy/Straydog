@@ -3,6 +3,9 @@
 A local inference engine with an OpenAI-compatible server, in one executable per GPU
 backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash.
 
+It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). AMD GPUs on Windows
+are not supported.
+
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
   operands in prompt batches; for DeepSeek-V4.1 also INT8 and FP16 inputs in decode and
@@ -27,8 +30,8 @@ ROCM_PATH=/opt/rocm/core-10.0 cargo build --release --features hip
 # other AMD GPUs: STRAYDOG_GPU_ARCHITECTURES="gfx1100;gfx1201"
 ```
 
-Windows (CUDA 13, from an "x64 Native Tools Command Prompt" with Ninja and the CUDA
-Toolkit; RTX 30/40/50 by default):
+Windows, NVIDIA GPUs only (CUDA 13, from an "x64 Native Tools Command Prompt" with Ninja and the
+CUDA Toolkit; RTX 20/30/40/50 by default):
 
 ```bat
 cargo build --release --features cuda
