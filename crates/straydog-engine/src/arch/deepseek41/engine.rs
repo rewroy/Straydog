@@ -620,6 +620,8 @@ pub struct Engine<'a, T: Tensors> {
     outputs: usize,
     /// The state before the last pass, when it can be taken back.
     rewind: Option<Rewind>,
+    /// Tests only: passes left before one is made void as a part link's timeout makes it ([`Engine::void_pass_in`]).
+    void_in: Option<usize>,
     /// How many of a decode row's predicted next-layer experts are prefetched (DS41_PREDICT, up to
     /// [`PREDICTED`]; 0, the default, predicts nothing).
     prefetches: usize,
@@ -1150,6 +1152,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             decoder,
             outputs: 1,
             rewind: None,
+            void_in: None,
             hp: std::rc::Rc::new(hp),
             tensors,
             settings,
@@ -1721,6 +1724,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
+    /// Tests only: the pass `passes` passes from now (0: the next) that reads logits ends void, as a part link's wait that
+    /// gave up ends it (its layers ran, the sequence not advanced).
+    #[doc(hidden)]
+    pub fn void_pass_in(&mut self, passes: usize) {
+        self.void_in = Some(passes);
+    }
+
     /// Whether the held sequence extends `snapshot`'s: the devices then hold its compressed rows and
     /// index keys as they were when it was taken (a later position never writes a complete group's).
     pub fn extends(&self, snapshot: &Snapshot) -> bool {
@@ -2201,6 +2211,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     logits[at..at + part_rows].copy_from_slice(&rows[row * part_rows..(row + 1) * part_rows]);
                 }
                 failed |= (link || self.linked) && rows[outputs * part_rows].to_bits() != 0;
+            }
+            if let Some(left) = self.void_in.as_mut() {
+                failed |= *left == 0;
+                *left = left.saturating_sub(1);
+                if failed {
+                    self.void_in = None;
+                }
             }
             if failed {
                 return Err(VOID_PASS.into());

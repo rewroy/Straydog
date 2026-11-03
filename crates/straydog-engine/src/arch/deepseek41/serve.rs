@@ -545,6 +545,14 @@ impl Engines {
         Ok(())
     }
 
+    /// Tests only: the pass `passes` passes from now that reads logits ends void ([`Engine::void_pass_in`]).
+    #[doc(hidden)]
+    pub fn void_pass_in(&mut self, passes: usize) {
+        if let Some(last) = self.engines.last_mut() {
+            last.void_pass_in(passes);
+        }
+    }
+
     /// Tests only: copy at most `floats` of the checkpoints' pending rows a step between requests.
     #[doc(hidden)]
     pub fn limit_checkpoint_steps(&mut self, floats: usize) {
