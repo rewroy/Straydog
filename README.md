@@ -191,7 +191,7 @@ minutes; prefill and decode speed live and per request; the engine's state. The
 environment and the service log are tabs, and a chat opens over the page. Sensors are
 read only while a dashboard is open. With an API key set, the page asks for it and
 keeps it in that tab. The page is in English; a switch in the top bar shows it in Japanese, and
-the browser remembers the choice.
+the browser remembers the choice. A link can name the language: `/dashboard?lang=ja`.
 
 ## Development
 
