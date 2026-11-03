@@ -355,10 +355,21 @@ impl served::Engines for Engines {
             return Err("no such Straydog checkpoint".into());
         }
         if !save {
-            // (the restore takes the devices' buffers from under the copies still to be made)
-            self.finish_checkpoints(usize::MAX)?;
             let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
-            self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot))?;
+            let held = self.engines.iter().zip(snapshots).all(|(engine, snapshot)| engine.extends(snapshot));
+            let position = snapshots.first().map_or(0, Snapshot::position);
+            if held {
+                // Where the held sequence still is: back to it in place (Engine::rewind_to). The copies of the checkpoints
+                // above it are made first (the sequence goes below them); its own and those below may go on later.
+                self.finish_checkpoints_above(position)?;
+                let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
+                self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.rewind_to(snapshot))?;
+            } else {
+                // (the restore takes the devices' buffers from under the copies still to be made)
+                self.finish_checkpoints(usize::MAX)?;
+                let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
+                self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot))?;
+            }
             // (the history of the sequence restored, else none: it refills as the sequence goes on)
             if let Some(drafting) = self.drafting.as_mut() {
                 drafting.forget();
@@ -513,6 +524,25 @@ impl Engines {
             }
         }
         Ok(!self.saved.iter().flatten().flatten().any(Snapshot::pending))
+    }
+
+    /// [`Engines::finish_checkpoints`] of the checkpoints taken above `position` alone: those a sequence
+    /// going back to it leaves (the others' rows stay on the devices). One whose copy fails is given up.
+    fn finish_checkpoints_above(&mut self, position: usize) -> Result<(), String> {
+        for slot in 0..CHECKPOINTS {
+            let Some(snapshots) = self.saved[slot].as_mut() else { continue };
+            if snapshots.first().is_none_or(|snapshot| snapshot.position() <= position) {
+                continue;
+            }
+            let copied = self.engines.iter_mut().zip(snapshots.iter_mut())
+                .try_for_each(|(engine, snapshot)| engine.finish_snapshot(snapshot, usize::MAX).map(drop));
+            if let Err(error) = copied {
+                self.saved[slot] = None;
+                self.order.retain(|&held| held != slot);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Tests only: copy at most `floats` of the checkpoints' pending rows a step between requests.

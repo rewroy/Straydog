@@ -542,6 +542,11 @@ impl Snapshot {
         self.pending
     }
 
+    /// The sequence's length when it was taken.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
     /// Host bytes it holds (pending ones too: their room is taken).
     pub fn bytes(&self) -> u64 {
         let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
@@ -1705,6 +1710,51 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.rewind = None;
         self.primed = None;
         Ok(())
+    }
+
+    /// Whether the held sequence extends `snapshot`'s: the devices then hold its compressed rows and
+    /// index keys as they were when it was taken (a later position never writes a complete group's).
+    pub fn extends(&self, snapshot: &Snapshot) -> bool {
+        self.position >= snapshot.position && self.history.starts_with(&snapshot.history)
+    }
+
+    /// [`Engine::restore`] of a snapshot the held sequence [extends](Engine::extends): only what the
+    /// positions since changed goes back (the window's rows, the incomplete groups' tails) with the
+    /// counts. The compressed rows and index keys stay as the devices hold them, neither written nor
+    /// read from the snapshot, which may still be pending (its copy goes on while the sequence stays
+    /// at or above it). A follow-up turn whose client sent the last reply back otherwise than it was
+    /// generated (without its reasoning) resumes so: the whole state's copy back took ~1.4 s at 20K.
+    pub fn rewind_to(&mut self, snapshot: &Snapshot) -> Result<()> {
+        if !self.extends(snapshot) {
+            return Err("a rewind to a snapshot the held sequence does not extend".into());
+        }
+        let (dim, ring, position) = (self.hp.head_dim, self.ring, snapshot.position);
+        for shard in &mut self.shards {
+            for (layer, rows) in &snapshot.windows {
+                let buffer = shard.rings.get(layer).ok_or("a snapshot of another engine's layers")?;
+                for (at, run, done) in ring_runs(position - rows.len() / dim, position, ring) {
+                    shard.gpu.write_buffer(buffer, (at * dim * 4) as u64, &rows[done * dim..(done + run) * dim])?;
+                }
+            }
+            for (layer, kept) in &snapshot.rows {
+                let buffers = shard.sources.get(layer).ok_or("a snapshot of another engine's layers")?;
+                for (buffer, values) in [&buffers.tail_kv, &buffers.tail_gate].into_iter().zip(&kept[2..]) {
+                    if !values.is_empty() {
+                        shard.gpu.write_buffer(buffer, 0, values)?;
+                    }
+                }
+            }
+        }
+        for &(layer, groups, tail) in &snapshot.sources {
+            let source = self.sources.get_mut(&layer).ok_or("a snapshot of another engine's layers")?;
+            (source.groups, source.tail) = (groups, tail);
+        }
+        self.position = position;
+        self.history.clone_from(&snapshot.history);
+        self.rewind = None;
+        self.primed = None;
+        // (the state's rooms past it back to the stores, as far as a restore there gives them)
+        self.reserve_state(position)
     }
 
     /// The expert stores' counters, summed over the devices.
