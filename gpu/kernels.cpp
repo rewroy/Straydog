@@ -2598,8 +2598,10 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision) {
         if (minimum_batch < 2 || minimum_batch > max_batch + 1 || (half_precision != 0 && half_precision != 1))
             throw std::runtime_error("invalid Straydog GEMM options");
         value.gemm_min_batch = size_t(minimum_batch); value.half_gemm = half_precision != 0;
-        // A matrix expanded to FP16 takes half of what it does in FP32, and the rest is a token's worth of slots on a small card.
-        const size_t expanded_bytes = gemm_elements * (value.half_gemm ? 2 : 4);
+        // A matrix expanded to FP16 takes half of what it does in FP32, and the rest is a token's worth of slots on a small card. Only there:
+        // DeepSeek-V4.1 turns FP16 on and off between passes, and a single op may ask for FP32 (op_linear's precision), on a larger card.
+        const bool small_card = value.budget < size_t(8) << 30;
+        const size_t expanded_bytes = gemm_elements * (value.half_gemm && small_card ? 2 : 4);
         if (value.expanded && value.expanded_bytes != expanded_bytes) {
             check(hipStreamSynchronize(value.stream));
             check(hipFree(value.expanded));
