@@ -106,17 +106,36 @@ void upload(Device& d, void* device, const void* host, size_t bytes) {
     }
     d.io_used = io_arena_bytes;   // both halves may still be in flight: the next slot waits for the stream
 }
-// Waits for the stream: the bytes are in `host` on return.
+// Waits for the stream: the bytes are in `host` on return. A large read lands in the arena's halves in turn, each half
+// copied out by the staging threads while the next lands (one thread copying a piece out after another piece's wait
+// read back a checkpoint's rows at ~6 GB/s).
 void download(Device& d, void* host, const void* device, size_t bytes) {
-    for (size_t done = 0; done < bytes;) {
-        const size_t part = std::min(bytes - done, io_arena_bytes);
-        uint8_t* slot = io_slot(d, part);
-        check(hipMemcpyAsync(slot, static_cast<const uint8_t*>(device) + done, part, hipMemcpyDeviceToHost, d.stream));
+    constexpr size_t half = io_arena_bytes / 2;
+    if (bytes <= half) {
+        uint8_t* slot = io_slot(d, bytes);
+        check(hipMemcpyAsync(slot, device, bytes, hipMemcpyDeviceToHost, d.stream));
         check(hipStreamSynchronize(d.stream));
-        std::memcpy(static_cast<uint8_t*>(host) + done, slot, part);
+        StagingCopier::instance().copy(host, slot, bytes);
         d.io_used = 0;   // the stream is idle, so every staged upload has landed
-        done += part;
+        return;
     }
+    check(hipStreamSynchronize(d.stream));   // (the staged uploads have landed: both halves are free)
+    const size_t pieces = (bytes + half - 1) / half;
+    const auto piece_bytes = [&](size_t piece) { return std::min(half, bytes - piece * half); };
+    const auto queue = [&](size_t piece) {
+        check(hipMemcpyAsync(d.io + (piece % 2) * half, static_cast<const uint8_t*>(device) + piece * half, piece_bytes(piece),
+                             hipMemcpyDeviceToHost, d.stream));
+        check(hipEventRecord(d.io_halves[piece % 2], d.stream));
+    };
+    queue(0);
+    if (pieces > 1) queue(1);
+    for (size_t piece = 0; piece < pieces; ++piece) {
+        check(hipEventSynchronize(d.io_halves[piece % 2]));
+        StagingCopier::instance().copy(static_cast<uint8_t*>(host) + piece * half, d.io + (piece % 2) * half, piece_bytes(piece));
+        if (piece + 2 < pieces) queue(piece + 2);
+    }
+    check(hipStreamSynchronize(d.stream));
+    d.io_used = 0;
 }
 // Several device ranges read back with one wait (`download` waits for each): the copies are queued into the staging arena
 // together, and the pieces are copied out to the caller's memory on the copier's threads when they add up to enough.
