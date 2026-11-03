@@ -49,7 +49,9 @@ static TOOL_CALL_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
 });
 static TOOL_PARAMETER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<parameter=([^>\s\x1c-\x1f]+)>(.*?)</parameter>").unwrap());
-static DSML_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^[\s\x1c-\x1f]*name="(.*?)">\n$"#).unwrap());
+/// An invoke's name line; one with no parameters is closed after a blank line, as the template writes it (its parameter lines, none, joined between two
+/// line ends), and so as the model writes it.
+static DSML_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^[\s\x1c-\x1f]*name="(.*?)">\n\n?$"#).unwrap());
 static DSML_PARAMETER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?s)^ name="(.*?)" string="(true|false)">(.*?)<$"#).unwrap());
 
@@ -874,6 +876,11 @@ mod tests {
         let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"now\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let (_, answer, calls) = split_dsml(&[text], false, Some(&tools));
         assert_eq!((answer.as_str(), calls.len(), calls[0].arguments.as_str()), ("", 1, "{}"));
+        // A call with no parameters as the template writes one, and so as the model learned it: a blank line inside the invoke. DeepSeek Harness's
+        // load_workspace_dependencies came back as answer text this way, which ended its turn.
+        let blank = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"load_workspace_dependencies\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let (_, answer, calls) = split_dsml(&[blank], false, Some(&tools));
+        assert_eq!((answer.as_str(), calls.len(), calls[0].name.as_str(), calls[0].arguments.as_str()), ("", 1, "load_workspace_dependencies", "{}"));
         // Without tools, or not parsing (a value that is not JSON), the markup stays text.
         let (_, answer, calls) = split_dsml(&[text], false, None);
         assert_eq!((answer.as_str(), calls.len()), (text, 0));
