@@ -1057,7 +1057,8 @@ with a model of its own reads no file it was not given.
     servers.
 - **Dashboard.** `GET /dashboard` is a page compiled into the executable, with a strict CSP and no
   other origin. English by default; the top bar's switch shows it in Japanese (kept in the browser's
-  local storage).
+  local storage), and `?lang=ja` or `?lang=en` on the page's URL chooses it, as an app that knows its
+  user's language opens it.
   - It reads `GET /dashboard/status?since=T`: settings, engine state and placement, the running
     and the latest 120 generations with their speeds and speculative acceptance, and host,
     process and GPU sensors.

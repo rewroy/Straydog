@@ -89,10 +89,18 @@ const STRINGS = {
     stagePrepare: "モデルを GPU に配置中", stageWarm: "GPU のコードを準備中", error: "エラー",
   },
 };
-// English unless the viewer chose Japanese with the top bar's switch (kept in this browser).
+// English unless the viewer chose Japanese with the top bar's switch (kept in this browser). A link may
+// name the language (`?lang=ja` or `?lang=en`, as an app that knows its own opens it): that wins, and is kept.
 const LANG_STORAGE = "straydog.dashboard.lang";
 let LANG = "en";
 try { if (localStorage.getItem(LANG_STORAGE) === "ja") LANG = "ja"; } catch { /* storage unavailable */ }
+{
+  const asked = new URLSearchParams(location.search).get("lang");
+  if (asked === "ja" || asked === "en") {
+    LANG = asked;
+    try { localStorage.setItem(LANG_STORAGE, LANG); } catch { /* storage unavailable */ }
+  }
+}
 
 function t(key, ...args) {
   let text = STRINGS[LANG][key] ?? STRINGS.en[key] ?? key;
