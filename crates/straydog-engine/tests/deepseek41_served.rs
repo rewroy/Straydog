@@ -1,5 +1,5 @@
 //! DeepSeek-V4.1 served on real GPUs: a conversation switched away from comes back from its
-//! checkpoint as if nothing had come between.
+//! checkpoint as if nothing had come between, and a reply goes on past a void pass.
 //!
 //! cargo test -p straydog-engine --features hip --test deepseek41_served, with STRAYDOG_DS41 (the
 //! GSQ-RCO IQ2_XS bundle directory (STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS for the IQ2_XXS one), its verity trees in .straydog there); under the GPU lock.
@@ -148,4 +148,18 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert_eq!(rooted.logits, direct.logits, "prompt logits from the root");
     assert_eq!(rooted.tokens, direct.tokens, "tokens from the root");
     assert_eq!(rooted.state, direct.state, "state from the root");
+
+    // A pass made void mid-reply (as a part link's wait that gave up makes it) voids that pass, not
+    // the reply: the sequence starts over from the checkpoints with the tokens already sent, and the
+    // reply goes on to its length. Its tokens before the void are the uninterrupted run's.
+    model.forget();
+    let clean = go(&mut model, &other, 24);
+    model.forget();
+    model.engines.void_pass_in(5);
+    let retried = go(&mut model, &other, 24);
+    assert_eq!(model.last_metrics.get("void_pass_retried"), Some(&serde_json::json!(true)), "the void pass was taken again");
+    assert_eq!(retried.tokens.len(), clean.tokens.len(), "the reply's length");
+    assert_eq!(retried.tokens[..5], clean.tokens[..5], "the tokens sent before the void");
+    eprintln!("after a void pass: {} of {} tokens as the uninterrupted run's", retried.tokens.iter().zip(&clean.tokens).take_while(|(a, b)| a == b).count(),
+              clean.tokens.len());
 }
