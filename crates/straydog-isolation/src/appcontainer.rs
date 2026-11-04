@@ -20,7 +20,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{check_exposable, resolve, Exposure, LAUNCHER_SUBCOMMAND};
+use crate::{check_exposable, resolve, Exposure, LAUNCHER_SUBCOMMAND, LAUNCHER_WARNING};
 
 /// The AppContainer profile the worker runs as. It persists, and so do its grants.
 pub const PROFILE_NAME: &str = "Straydog.Worker";
@@ -61,6 +61,30 @@ fn runtime_library(path: &Path) -> bool {
     (name.starts_with("cublas64_") || name.starts_with("cublaslt64_")) && name.ends_with(".dll")
 }
 
+/// The flag of a volume that keeps file permissions (FILE_PERSISTENT_ACLS).
+pub const PERSISTENT_ACLS: u32 = 0x0000_0008;
+
+/// What to tell of `path` on a volume with these file system `flags`: that it keeps no file
+/// permissions (exFAT and FAT32 keep none), or None when it does. Such a volume cannot hold the
+/// profile's entry, and the AppContainer is refused there whatever the launcher grants.
+pub fn permissionless_volume(root: &str, file_system: &str, flags: u32, path: &Path) -> Option<String> {
+    (flags & PERSISTENT_ACLS == 0).then(|| {
+        format!(
+            "{root} is formatted {file_system}, which keeps no file permissions, so Straydog's contained worker \
+             may not read {} there; put it on an NTFS drive",
+            path.display()
+        )
+    })
+}
+
+/// What to tell of a `path` whose permissions hold no entry that lets the profile read it.
+pub fn ungranted_path(path: &Path) -> String {
+    format!(
+        "Straydog's worker has no read permission on {} (no {PROFILE_NAME} entry in its permissions)",
+        path.display()
+    )
+}
+
 /// The access a grant gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
@@ -95,6 +119,12 @@ pub trait Grants {
     /// Merge an entry allowing `access` to the profile into the path's DACL, inherited by the
     /// subtree when `inherit` (writing it propagates it there).
     fn grant(&self, path: &Path, sid: &Self::Sid, access: Access, inherit: bool) -> io::Result<()>;
+    /// What to tell when the path's volume keeps no file permissions ([`permissionless_volume`]).
+    /// A grant there is not in effect, however it was made: a volume without permissions has a
+    /// NULL DACL, which `has_grant` takes for a grant and `grant` leaves alone.
+    fn permissionless(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// What the launcher was asked to do.
@@ -207,7 +237,15 @@ pub fn cuda_directories(root: Option<&OsStr>) -> Vec<PathBuf> {
 /// Idempotent: a grant already present is not written again (the first grant on a tree
 /// propagates through it and is slow). Nothing is granted, and no profile created, when an
 /// exposed path is, holds or lies inside a secret.
+///
+/// A path on a volume that keeps no file permissions earns one warning line on standard error
+/// (not an error), before the worker starts: the worker's own last line stays the last.
 pub fn grant_worker_access<G: Grants>(grants: &G, launch: &Launch) -> Result<G::Sid, String> {
+    grant_and_warn(grants, launch, |line| eprintln!("{line}"))
+}
+
+/// [`grant_worker_access`] with `warn` for its warning line.
+fn grant_and_warn<G: Grants>(grants: &G, launch: &Launch, warn: impl FnOnce(String)) -> Result<G::Sid, String> {
     // A pinned file is a regular file: what the worker authenticates is what it opens.
     for file in &launch.files {
         if !std::fs::symlink_metadata(file).is_ok_and(|metadata| metadata.is_file()) {
@@ -224,6 +262,10 @@ pub fn grant_worker_access<G: Grants>(grants: &G, launch: &Launch) -> Result<G::
     }
     let exposed: Vec<&Path> = trees.iter().chain(&files).chain(&directories).map(PathBuf::as_path).collect();
     check_exposable(&exposed, &launch.secrets)?;
+    // One warning, not an error: the worker may yet be able to read what it needs.
+    if let Some(line) = warning(grants, &exposed) {
+        warn(line);
+    }
 
     let sid = grants
         .create_profile(PROFILE_NAME)
@@ -267,6 +309,11 @@ pub fn grant_worker_access<G: Grants>(grants: &G, launch: &Launch) -> Result<G::
         ensure(grants, directory, &sid, Access::ReadExecute, false).map_err(|error| refused(directory, error))?;
     }
     Ok(sid)
+}
+
+/// The launcher's warning line for the first of `exposed` on a volume that keeps no file permissions.
+fn warning<G: Grants>(grants: &G, exposed: &[&Path]) -> Option<String> {
+    exposed.iter().find_map(|path| grants.permissionless(path)).map(|sentence| format!("{LAUNCHER_WARNING} {sentence}"))
 }
 
 fn ensure<G: Grants>(grants: &G, path: &Path, sid: &G::Sid, access: Access, inherit: bool) -> io::Result<()> {
@@ -470,6 +517,8 @@ mod tests {
         administered: BTreeSet<PathBuf>,
         refused: BTreeSet<PathBuf>,
         inheritance_blocked: bool,
+        /// Paths on a volume that keeps no file permissions.
+        permissionless: BTreeSet<PathBuf>,
         calls: RefCell<Vec<(PathBuf, Access, bool)>>,
         profiles: RefCell<usize>,
     }
@@ -512,6 +561,14 @@ mod tests {
             }
             ungranted.remove(path);
             Ok(())
+        }
+
+        fn permissionless(&self, path: &Path) -> Option<String> {
+            if self.permissionless.contains(path) {
+                permissionless_volume(r"X:\", "exFAT", 0, path)
+            } else {
+                None
+            }
         }
     }
 
@@ -625,6 +682,51 @@ mod tests {
             let linked = Launch { files: vec![link], ..Launch::default() };
             assert!(grant_worker_access(&fake, &linked).unwrap_err().contains("not a regular file"));
         }
+    }
+
+    #[test]
+    fn a_volume_that_keeps_no_file_permissions_is_told_and_one_that_does_is_not() {
+        let model = Path::new(r"D:\Models\Qwen3.8-Flash-Next\IQ2_XS");
+        // exFAT: case-sensitive search, preserved case and Unicode names, and no persistent ACLs.
+        let told = permissionless_volume(r"D:\", "exFAT", 0x0000_0007, model).unwrap();
+        assert_eq!(
+            told,
+            r"D:\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read D:\Models\Qwen3.8-Flash-Next\IQ2_XS there; put it on an NTFS drive"
+        );
+        assert_eq!(told.lines().count(), 1);
+        assert!(permissionless_volume(r"E:\", "FAT32", 0x0000_0006, model).unwrap().starts_with(r"E:\ is formatted FAT32,"));
+        for flags in [PERSISTENT_ACLS, 0x0000_03ff, 0x0000_0008 | 0x0000_0007] {
+            assert_eq!(permissionless_volume(r"C:\", "NTFS", flags, model), None);
+        }
+        assert_eq!(
+            ungranted_path(model),
+            r"Straydog's worker has no read permission on D:\Models\Qwen3.8-Flash-Next\IQ2_XS (no Straydog.Worker entry in its permissions)"
+        );
+    }
+
+    #[test]
+    fn the_launcher_warns_once_of_the_first_path_on_a_volume_without_permissions() {
+        let scratch = Scratch::new("straydog-launcher-warning");
+        let shard = resolve(&scratch.file("model/a.gguf", "a"));
+        let model = resolve(&scratch.0.join("model"));
+        let drafter = resolve(scratch.file("mtp/mtp.gguf", "m").parent().unwrap());
+        let fake = Fake { permissionless: [shard.clone(), drafter.clone()].into(), ..Fake::lacking(&[&shard, &drafter]) };
+        let line = warning(&fake, &[&model, &shard, &drafter]).unwrap();
+        assert!(line.starts_with(r"Straydog warning: X:\ is formatted exFAT, which keeps no file permissions"), "{line}");
+        assert!(line.contains(&shard.display().to_string()) && !line.contains(&drafter.display().to_string()), "{line}");
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(warning(&fake, &[&model]), None);
+        assert_eq!(warning(&Fake::default(), &[&model, &shard]), None);
+
+        // The launcher warns once, and goes on: a warning, not an error. Nothing warns of a volume that keeps permissions.
+        let launch = Launch { files: vec![shard.clone()], directories: vec![drafter.clone()], ..launch(vec![]) };
+        let warned = RefCell::new(Vec::new());
+        assert_eq!(grant_and_warn(&fake, &launch, |line| warned.borrow_mut().push(line)), Ok(7));
+        assert_eq!(warned.into_inner(), vec![line]);
+        assert_eq!(fake.calls(), vec![(shard, Access::Read, false), (drafter, Access::ReadExecute, false)]);
+        let quiet = RefCell::new(Vec::new());
+        assert_eq!(grant_and_warn(&Fake::default(), &launch, |line| quiet.borrow_mut().push(line)), Ok(7));
+        assert!(quiet.into_inner().is_empty());
     }
 
     #[test]

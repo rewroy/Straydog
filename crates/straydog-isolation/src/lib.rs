@@ -47,6 +47,11 @@ pub struct Exposure {
 /// The executable's subcommand that runs `launcher_main` on Windows (`straydog contain`).
 pub const LAUNCHER_SUBCOMMAND: &str = "contain";
 
+/// What a line the launcher writes to standard error begins with when it only warns. The server
+/// takes the worker's last line of standard error for the reason it failed to start, and passes
+/// over these.
+pub const LAUNCHER_WARNING: &str = "Straydog warning:";
+
 #[cfg(not(windows))]
 const UNAVAILABLE: &str = "Straydog requires Linux bubblewrap or Windows AppContainer GPU isolation";
 
@@ -132,6 +137,20 @@ pub fn launcher_main(args: &[OsString]) -> i32 {
         |launch| appcontainer::grant_worker_access(&win32::Acl::new().map_err(|error| error.to_string())?, launch),
         |launch, sid| win32::launch(&launch.command, &sid, launch.working_directory.as_deref()),
     )
+}
+
+/// Windows: why the contained worker may have been refused (Win32 error 5, "access denied") the
+/// first of `paths` it reads, found as the user, or None when every path looks right.
+///
+/// Two causes are told apart. A drive that keeps no file permissions (exFAT, FAT32) cannot hold
+/// the `Straydog.Worker` AppContainer's read entry, so the worker is refused there however the
+/// launcher grants. On a drive that does, the path's permissions may hold no entry for the
+/// profile (or for ALL APPLICATION PACKAGES) that allows reading. A path whose permissions
+/// cannot be read is passed over, and nothing is created: the profile's SID is derived from its
+/// name.
+#[cfg(windows)]
+pub fn why_refused(paths: &[PathBuf]) -> Option<String> {
+    win32::why_refused(paths)
 }
 
 /// Windows: the CUDA Toolkit's DLL directories (`bin`, and `bin\x64` since CUDA 13) named by

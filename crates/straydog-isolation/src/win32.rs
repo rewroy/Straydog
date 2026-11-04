@@ -26,7 +26,9 @@ use windows_sys::Win32::Security::{
     ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, NO_INHERITANCE,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
-use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+use windows_sys::Win32::Storage::FileSystem::{
+    GetVolumeInformationW, GetVolumePathNameW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX};
@@ -44,7 +46,10 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-use crate::appcontainer::{command_line, environment_block, Access, Grants};
+use crate::appcontainer::{
+    command_line, environment_block, permissionless_volume, ungranted_path, Access, Grants, PROFILE_NAME,
+};
+use crate::resolve;
 
 /// ALL APPLICATION PACKAGES: an entry for it lets every AppContainer in, ours included.
 const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
@@ -145,36 +150,13 @@ impl Acl {
         }
         Ok(Acl { all_application_packages: Sid { pointer: sid, local: true } })
     }
-}
 
-impl Grants for Acl {
-    type Sid = Sid;
-
-    /// The profile persists once created: a later start derives its SID from its name.
-    fn create_profile(&self, name: &str) -> io::Result<Sid> {
-        let [name, display, description] =
-            [name, "Straydog worker", "The contained Straydog inference worker"].map(|text| wide(OsStr::new(text)));
-        let mut sid: PSID = null_mut();
-        // SAFETY: NUL-terminated strings and no capabilities; the SID returned is freed with FreeSid.
-        let result = unsafe {
-            CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), null(), 0, &mut sid)
-        };
-        if result == PROFILE_EXISTS {
-            // SAFETY: as above.
-            let result = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-            if result != 0 {
-                return Err(hresult_error("DeriveAppContainerSidFromAppContainerName", result));
-            }
-        } else if result != 0 {
-            return Err(hresult_error("CreateAppContainerProfile", result));
-        }
-        Ok(Sid { pointer: sid, local: false })
-    }
-
-    fn has_grant(&self, path: &Path, sid: &Sid, access: Access, inherit: bool) -> bool {
-        let Ok(descriptor) = Descriptor::read(path) else { return false };
+    /// Whether the descriptor's DACL holds an entry that allows `access` to the profile or to ALL
+    /// APPLICATION PACKAGES (by an entry the subtree inherits, when `inherit`). A NULL DACL holds
+    /// none, though it lets everyone in: [`Grants::has_grant`] decides what that means to it.
+    fn lists(&self, descriptor: &Descriptor, sid: &Sid, access: Access, inherit: bool) -> bool {
         if descriptor.dacl.is_null() {
-            return true; // a NULL DACL: everyone has full access
+            return false;
         }
         // SAFETY: an all-zero structure is a valid value.
         let mut size: ACL_SIZE_INFORMATION = unsafe { zeroed() };
@@ -216,6 +198,78 @@ impl Grants for Acl {
             }
         }
         false
+    }
+
+    /// The SID of the AppContainer profile `name`, derived from the name: nothing is created, and
+    /// the profile need not exist.
+    fn profile_sid(name: &str) -> io::Result<Sid> {
+        let name = wide(OsStr::new(name));
+        let mut sid: PSID = null_mut();
+        // SAFETY: a NUL-terminated name; the SID returned is freed with FreeSid.
+        let result = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+        if result != 0 {
+            return Err(hresult_error("DeriveAppContainerSidFromAppContainerName", result));
+        }
+        Ok(Sid { pointer: sid, local: false })
+    }
+
+    /// Why the profile `sid` may be refused `path`, as the user sees it: its volume keeps no file
+    /// permissions, or its permissions hold no entry that lets the profile read it. None when it
+    /// looks right, and when its permissions cannot be read.
+    fn refusal(&self, path: &Path, sid: &Sid) -> Option<String> {
+        let path = resolve(path);
+        let volume = Volume::of(&path);
+        self.refusal_on(&path, sid, volume.as_ref())
+    }
+
+    /// [`Acl::refusal`] for a path on `volume`. The volume comes first: one that keeps no file
+    /// permissions gives every path a NULL DACL, which is no sign of a grant.
+    fn refusal_on(&self, path: &Path, sid: &Sid, volume: Option<&Volume>) -> Option<String> {
+        if let Some(volume) = volume {
+            if let Some(sentence) = permissionless_volume(&volume.root, &volume.file_system, volume.flags, path) {
+                return Some(sentence);
+            }
+        }
+        let descriptor = Descriptor::read(path).ok()?;
+        (!self.lists(&descriptor, sid, Access::Read, false)).then(|| ungranted_path(path))
+    }
+}
+
+impl Grants for Acl {
+    type Sid = Sid;
+
+    /// The profile persists once created: a later start derives its SID from its name.
+    fn create_profile(&self, name: &str) -> io::Result<Sid> {
+        let [name, display, description] =
+            [name, "Straydog worker", "The contained Straydog inference worker"].map(|text| wide(OsStr::new(text)));
+        let mut sid: PSID = null_mut();
+        // SAFETY: NUL-terminated strings and no capabilities; the SID returned is freed with FreeSid.
+        let result = unsafe {
+            CreateAppContainerProfile(name.as_ptr(), display.as_ptr(), description.as_ptr(), null(), 0, &mut sid)
+        };
+        if result == PROFILE_EXISTS {
+            // SAFETY: as above.
+            let result = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+            if result != 0 {
+                return Err(hresult_error("DeriveAppContainerSidFromAppContainerName", result));
+            }
+        } else if result != 0 {
+            return Err(hresult_error("CreateAppContainerProfile", result));
+        }
+        Ok(Sid { pointer: sid, local: false })
+    }
+
+    fn has_grant(&self, path: &Path, sid: &Sid, access: Access, inherit: bool) -> bool {
+        let Ok(descriptor) = Descriptor::read(path) else { return false };
+        if descriptor.dacl.is_null() {
+            return true; // a NULL DACL: everyone has full access
+        }
+        self.lists(&descriptor, sid, access, inherit)
+    }
+
+    fn permissionless(&self, path: &Path) -> Option<String> {
+        let volume = Volume::of(path)?;
+        permissionless_volume(&volume.root, &volume.file_system, volume.flags, path)
     }
 
     /// The existing DACL is the merge base: an ACL built from nothing would replace the path's
@@ -264,6 +318,61 @@ impl Grants for Acl {
             return Err(io::Error::from_raw_os_error(error as i32));
         }
         Ok(())
+    }
+}
+
+/// Why the worker may have been refused the first of `paths`; see [`crate::why_refused`].
+pub fn why_refused(paths: &[PathBuf]) -> Option<String> {
+    why_refused_as(PROFILE_NAME, paths)
+}
+
+fn why_refused_as(profile: &str, paths: &[PathBuf]) -> Option<String> {
+    let acl = Acl::new().ok()?;
+    let sid = Acl::profile_sid(profile).ok()?;
+    paths.iter().find_map(|path| acl.refusal(path, &sid))
+}
+
+/// The volume a path is on.
+struct Volume {
+    /// Its root: a drive (`D:\`), or the mount point of a volume or a share.
+    root: String,
+    /// The name of its file system (NTFS, exFAT, FAT32, ReFS...).
+    file_system: String,
+    /// Its file system's flags (FILE_PERSISTENT_ACLS among them).
+    flags: u32,
+}
+
+impl Volume {
+    /// The volume holding `path` (which need not exist), or None when Windows will not say.
+    fn of(path: &Path) -> Option<Volume> {
+        let name = wide(path.as_os_str());
+        let mut root = vec![0u16; 1024];
+        // SAFETY: a NUL-terminated name and a buffer of the length given.
+        if unsafe { GetVolumePathNameW(name.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+            return None;
+        }
+        let mut file_system = vec![0u16; 261];
+        let mut flags = 0;
+        // SAFETY: the NUL-terminated root just written, and a buffer of the length given for the file system's name.
+        let read = unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                &mut flags,
+                file_system.as_mut_ptr(),
+                file_system.len() as u32,
+            )
+        };
+        if read == 0 {
+            return None;
+        }
+        let text = |units: &[u16]| {
+            String::from_utf16_lossy(&units[..units.iter().position(|&unit| unit == 0).unwrap_or(units.len())])
+        };
+        Some(Volume { root: text(&root), file_system: text(&file_system), flags })
     }
 }
 
@@ -530,6 +639,7 @@ fn hresult_error(call: &str, result: i32) -> io::Error {
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+    use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
 
     use super::*;
     use crate::tests::Scratch;
@@ -586,6 +696,116 @@ mod tests {
         assert!(acl.has_grant(&directory, &sid, Access::ReadExecute, true));
         let created = scratch.file("bin/cublas64_12.dll", "MZ");
         assert!(acl.has_grant(&created, &sid, Access::ReadExecute, false));
+    }
+
+    #[test]
+    fn a_path_without_the_profiles_entry_is_named_and_one_with_it_is_not() {
+        let profile = Profile("Straydog.Worker.Test.Refusal");
+        let scratch = Scratch::new("straydog-refusal");
+        let denied = scratch.file("model/denied.gguf", "a");
+        let granted = scratch.file("model/granted.gguf", "b");
+        let shared = scratch.file("model/shared.gguf", "c");
+        let directory = scratch.0.join("bin");
+        std::fs::create_dir_all(&directory).unwrap();
+        let acl = Acl::new().unwrap();
+        let sid = acl.create_profile(profile.0).unwrap();
+        acl.grant(&granted, &sid, Access::Read, false).unwrap();
+        acl.grant(&directory, &sid, Access::ReadExecute, false).unwrap();
+        // ALL APPLICATION PACKAGES lets the profile in as well.
+        acl.grant(&shared, &acl.all_application_packages, Access::Read, false).unwrap();
+
+        // (the path as resolved: with the platform's separators)
+        let sentence = |path: &PathBuf| {
+            format!(
+                "Straydog's worker has no read permission on {} (no Straydog.Worker entry in its permissions)",
+                resolve(path).display()
+            )
+        };
+        assert_eq!(why_refused_as(profile.0, std::slice::from_ref(&denied)), Some(sentence(&denied)));
+        // The first path without an entry, in the order given.
+        let other = scratch.file("model/other.gguf", "d");
+        assert_eq!(why_refused_as(profile.0, &[granted.clone(), other.clone(), denied.clone()]), Some(sentence(&other)));
+        assert_eq!(why_refused_as(profile.0, &[denied.clone(), other.clone()]), Some(sentence(&denied)));
+        // After a grant, nothing is named; nor is a directory with one, a path ALL APPLICATION
+        // PACKAGES may read, or a path that is gone (its permissions cannot be read).
+        assert_eq!(why_refused_as(profile.0, &[granted.clone(), directory, shared]), None);
+        assert_eq!(why_refused_as(profile.0, &[scratch.0.join("model/missing.gguf")]), None);
+        acl.grant(&denied, &sid, Access::Read, false).unwrap();
+        assert_eq!(why_refused_as(profile.0, &[denied]), None);
+        // The profile's SID is derived from its name: another name has no entry on any of them.
+        assert!(why_refused_as("Straydog.Worker.Test.Someone.Else", &[granted]).is_some());
+    }
+
+    #[test]
+    fn a_null_dacl_is_a_grant_to_the_launcher_but_no_entry_to_the_hint() {
+        let profile = Profile("Straydog.Worker.Test.NullDacl");
+        let scratch = Scratch::new("straydog-null-dacl");
+        let file = scratch.file("model/a.gguf", "a");
+        let name = wide(file.as_os_str());
+        // SAFETY: a NUL-terminated name; no DACL given with DACL_SECURITY_INFORMATION sets a NULL one.
+        let error = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null(),
+                null(),
+            )
+        };
+        assert_eq!(error, 0);
+        assert!(Descriptor::read(&file).unwrap().dacl.is_null());
+        let acl = Acl::new().unwrap();
+        let sid = acl.create_profile(profile.0).unwrap();
+        // What the launcher relies on is unchanged, and it writes nothing there.
+        assert!(acl.has_grant(&file, &sid, Access::Read, false));
+        acl.grant(&file, &sid, Access::Read, false).unwrap();
+        assert!(Descriptor::read(&file).unwrap().dacl.is_null());
+        // A NULL DACL says nothing about an AppContainer: it is named.
+        let named = why_refused_as(profile.0, std::slice::from_ref(&file)).unwrap();
+        assert!(named.contains("no Straydog.Worker entry") && named.contains(&resolve(&file).display().to_string()), "{named}");
+    }
+
+    #[test]
+    fn a_drive_without_file_permissions_is_named_before_the_permissions_of_its_paths() {
+        let profile = Profile("Straydog.Worker.Test.Drive");
+        let scratch = Scratch::new("straydog-drive");
+        let granted = scratch.file("model/granted.gguf", "a");
+        let denied = scratch.file("model/denied.gguf", "b");
+        let acl = Acl::new().unwrap();
+        let sid = acl.create_profile(profile.0).unwrap();
+        acl.grant(&granted, &sid, Access::Read, false).unwrap();
+        let drive = |file_system: &str, flags| Volume { root: r"D:\".into(), file_system: file_system.into(), flags };
+        let (exfat, ntfs) = (drive("exFAT", 0x7), drive("NTFS", 0x7 | FILE_PERSISTENT_ACLS));
+        // On exFAT every path reads as a NULL DACL (or a granted one): the drive is what is named, whatever the path.
+        for path in [&granted, &denied] {
+            let told = acl.refusal_on(path, &sid, Some(&exfat)).unwrap();
+            let start = r"D:\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read ";
+            assert!(told.starts_with(start) && told.ends_with(" there; put it on an NTFS drive"), "{told}");
+        }
+        // On a drive that keeps them, the path's own entry decides; and where Windows will not say, so does it.
+        assert_eq!(acl.refusal_on(&granted, &sid, Some(&ntfs)), None);
+        assert_eq!(acl.refusal_on(&granted, &sid, None), None);
+        for volume in [Some(&ntfs), None] {
+            assert!(acl.refusal_on(&denied, &sid, volume).unwrap().contains("no Straydog.Worker entry"));
+        }
+    }
+
+    #[test]
+    fn the_drive_of_the_scratch_files_keeps_file_permissions() {
+        assert_eq!(FILE_PERSISTENT_ACLS, crate::appcontainer::PERSISTENT_ACLS);
+        let scratch = Scratch::new("straydog-volume");
+        let file = scratch.file("a.gguf", "a");
+        let volume = Volume::of(&file).unwrap();
+        assert_ne!(volume.flags & FILE_PERSISTENT_ACLS, 0, "{} is {}", volume.root, volume.file_system);
+        assert!(!volume.file_system.is_empty() && volume.root.ends_with('\\'), "{:?}", (&volume.root, &volume.file_system));
+        assert_eq!(Acl::new().unwrap().permissionless(&file), None);
+        // The path need not exist.
+        assert_eq!(Volume::of(&scratch.0.join("not/yet/there")).unwrap().root, volume.root);
+        // Were its flags without the permissions, the sentence would name its root and file system.
+        let told = permissionless_volume(&volume.root, &volume.file_system, 0, &file).unwrap();
+        assert!(told.starts_with(&format!("{} is formatted {}, which keeps no file permissions", volume.root, volume.file_system)));
     }
 
     #[test]
