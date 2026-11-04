@@ -429,7 +429,7 @@ fn fit_on(windows: bool, entry: &Entry, machine: &Machine, context: u64) -> Fit 
     let budget: u64 = budgets.iter().sum();
     let has: u64 = machine.gpus.iter().map(free_for_auto).sum();
     let needs = min_vram(entry, gpus, context) + machine.gpus.iter().map(|gpu| margin_on(windows, gpu.total)).sum::<u64>();
-    let share = (machine.ram as f64 * HOST_SHARE) as u64;
+    let share = host_share(machine);
     // (the experts' slots take what the placement does not count: the rows' arena is lent to them)
     let whole = counted(entry, gpus, context);
     if entry.architecture == "deepseek41" {
@@ -459,6 +459,14 @@ fn fit_on(windows: bool, entry: &Entry, machine: &Machine, context: u64) -> Fit 
     }
     let starting = entry.footprint.state_per_token * context.min(STARTING_KV as u64);
     Fit::Drive(beyond.saturating_sub(keep.saturating_sub(starting)))
+}
+
+/// The host memory the server's worker may take: its share of the machine's, at most what other programs leave free now
+/// less what the system keeps free beside page-locked and guaranteed memory (an RTX 5070 Ti with 62 GiB, 30 GiB of it held by
+/// other programs, kept 23 GiB of its experts' banks and faulted 2-4 million pages a request: it is not a machine that keeps them in RAM).
+fn host_share(machine: &Machine) -> u64 {
+    let share = (machine.ram as f64 * HOST_SHARE) as u64;
+    if machine.free_ram == 0 { share } else { share.min(machine.free_ram.saturating_sub(straydog_engine::host::left_free(machine.ram))) }
 }
 
 /// A partially resident Qwen3.8's row cache of the PLE table (rows of 90 bytes), as `Model::new` chooses it.
@@ -529,7 +537,7 @@ pub(crate) mod tests {
     /// A machine of `gpus` GPUs of `bytes` each and `ram` bytes of memory.
     pub fn machine(gpus: usize, bytes: u64, ram: u64) -> Machine {
         let gpus = (0..gpus).map(|ordinal| Gpu { ordinal, name: "GPU".into(), total: bytes, free: bytes }).collect();
-        Machine { backend: "ROCm/HIP", gpus, gpu_error: None, ram }
+        Machine { backend: "ROCm/HIP", gpus, gpu_error: None, ram, free_ram: ram }
     }
 
     /// The test machine: two R9700s (34208743424 bytes each) and the 134411186176 bytes of RAM the worker measures.
@@ -688,7 +696,7 @@ pub(crate) mod tests {
     fn windows_pc(mib: u64, others: u64, ram: u64) -> Machine {
         let total = mib << 20;
         let gpus = vec![Gpu { ordinal: 0, name: "GPU".into(), total, free: total - others }];
-        Machine { backend: "CUDA", gpus, gpu_error: None, ram }
+        Machine { backend: "CUDA", gpus, gpu_error: None, ram, free_ram: ram }
     }
 
     /// Every bundle's verdict and the recommended one's name, under Windows or elsewhere.
@@ -839,6 +847,20 @@ pub(crate) mod tests {
         // no state of a Qwen3.8 is counted at the whole context for what a shorter one will take: a smaller context keeps more
         let ram_only = |context| match fit_on(true, &big, &windows_pc(16303, DESKTOP, 64 << 30), context) { Fit::Ram(_) => true, Fit::Drive(_) => false, verdict => panic!("{verdict:?}") };
         assert!(ram_only(131_072));
+    }
+
+    /// Memory other programs hold is not the server's: an RTX 5070 Ti with 62 GiB, 28 GiB of it free (Windows, 2026-11-05: setup
+    /// said UD-IQ1_M's banks stay in RAM, the server kept 23 GiB of them and faulted millions of pages a request).
+    #[test]
+    fn what_other_programs_hold_is_not_counted_as_ram() {
+        let ours = Entry::of(unsloth("UD-IQ1_M")).unwrap();
+        let idle = windows_pc(16303, DESKTOP, 62 << 30);
+        assert!(matches!(fit_on(true, &ours, &idle, DEFAULT_CONTEXT), Fit::Ram(_)), "{:?}", fit_on(true, &ours, &idle, DEFAULT_CONTEXT));
+        let busy = Machine { free_ram: 28 << 30, ..idle.clone() };
+        let Fit::Drive(from_drive) = fit_on(true, &ours, &busy, DEFAULT_CONTEXT) else { panic!("{:?}", fit_on(true, &ours, &busy, DEFAULT_CONTEXT)) };
+        assert!(from_drive > 5 << 30, "{from_drive}");
+        assert!(busy.describe().iter().any(|line| line.contains("28.0 GiB of it is free now")), "{:?}", busy.describe());
+        assert!(!idle.describe().iter().any(|line| line.contains("free now")));
     }
 
     #[test]

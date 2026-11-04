@@ -23,6 +23,22 @@ pub fn host_memory_bytes() -> u64 {
     }
 }
 
+/// The physical memory available on the machine now (what other programs leave), 0 where unknown.
+pub fn available_bytes() -> u64 {
+    #[cfg(windows)]
+    {
+        windows_available().0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:")).and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok())
+            .map_or(0, |kib| kib * 1024)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    0
+}
+
 /// This process's memory for a request's log line: resident bytes, the bytes available on the machine, and its page faults so far.
 pub fn memory_note() -> Option<(u64, u64, u64)> {
     #[cfg(windows)]
