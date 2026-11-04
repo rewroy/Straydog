@@ -1,7 +1,8 @@
 //! The runtime's control path against stand-in workers (this test binary, run as
 //! `stand-in MARKER` and so on): an interrupt from a client that reads none of its events
 //! still reaches the worker at once, and the client then gets the generation's end; a worker
-//! that fails to start fails the runtime, which says so (the server then exits); closing the
+//! that fails to start fails the runtime, which says so (the server then exits), and when the OS
+//! refused it, says why after the worker's own reason; closing the
 //! runtime returns only once every process of the worker's tree has exited, the one outside
 //! its process group too (as a sandbox's is); a request too large for the worker is refused alone;
 //! a client that leaves during a long prefill pass costs nothing but the pass, and only a worker
@@ -12,13 +13,13 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use straydog::config::{self, Options};
-use straydog::runtime::Runtime;
+use straydog::runtime::{Refusal, Runtime};
 use straydog_api::{Engine, EngineState};
 use straydog_engine::pyjson;
 
@@ -26,6 +27,10 @@ const CONTEXT: u32 = 4096;
 const QUANT: &str = "IQ3_S";
 /// Longer than the 10 s a worker once had to end a cancelled generation, which a real pass exceeds.
 const PASS: Duration = Duration::from_secs(11);
+/// What a worker the OS refused says last (as Windows words it, ending in Rust's rendering of the code), and
+/// the warning its launcher printed before it started.
+const DENIED: &str = r"\\?\D:\Models\IQ2_XS: Access is denied. (os error 5)";
+const WARNING: &str = r"Straydog warning: D:\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read D:\Models\IQ2_XS there; put it on an NTFS drive";
 
 /// The worker's side of the protocol: ready, then for a chat a delta every millisecond (up to
 /// 20000) until a cancel arrives, which it records in MARKER before ending the generation.
@@ -150,6 +155,12 @@ fn main() {
             eprintln!("Straydog VRAM budget is unavailable");
             std::process::exit(1);
         }
+        // As a worker the OS refused a file: its launcher's warning first, then its reason.
+        Some("denied") => {
+            eprintln!("{WARNING}");
+            eprintln!("{DENIED}");
+            std::process::exit(1);
+        }
         #[cfg(unix)]
         Some("lingers") => return lingering(Path::new(&args[2])),
         #[cfg(unix)]
@@ -261,6 +272,41 @@ fn main() {
         assert!(message.contains("VRAM budget is unavailable"), "{message}");
         assert!(matches!(engine.state(), EngineState::Failed(_)));
         engine.close().await;
+
+        // A worker the OS refused: the runtime looks for why and says it after the worker's own reason
+        // (the launcher's warning is not that reason); for any other failure it does not look.
+        let program = std::env::current_exe().unwrap();
+        let why = r"D:\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read D:\Models\IQ2_XS\a.gguf there; put it on an NTFS drive";
+        let looked = Arc::new(AtomicUsize::new(0));
+        let refusal = |answer: Option<&'static str>| -> Refusal {
+            let looked = looked.clone();
+            Arc::new(move || {
+                looked.fetch_add(1, Ordering::SeqCst);
+                answer.map(str::to_string)
+            })
+        };
+        let failure = |engine: Runtime| async move {
+            let message = tokio::time::timeout(Duration::from_secs(10), engine.failed()).await
+                .expect("a worker that failed to start did not fail the runtime");
+            assert!(matches!(engine.state(), EngineState::Failed(_)));
+            engine.close().await;
+            message
+        };
+        let plain = format!("Straydog failed to start ({DENIED}); see the server log and restart the server");
+        let told = failure(Runtime::start_with_refusal(&settings, (program.clone(), vec!["denied".into()]), refusal(Some(why)))).await;
+        assert_eq!(told, format!("Straydog failed to start ({DENIED}: {why}); see the server log and restart the server"));
+        assert_eq!(looked.load(Ordering::SeqCst), 1);
+        // (nothing to tell: the reason alone)
+        let untold = failure(Runtime::start_with_refusal(&settings, (program.clone(), vec!["denied".into()]), refusal(None))).await;
+        assert_eq!((untold, looked.load(Ordering::SeqCst)), (plain.clone(), 2));
+        // (a worker that failed some other way is not looked into)
+        let other = failure(Runtime::start_with_refusal(&settings, (program.clone(), vec!["fails".into()]), refusal(Some(why)))).await;
+        assert!(other.contains("VRAM budget is unavailable") && !other.contains(why) && !other.contains(": D:"), "{other}");
+        assert_eq!(looked.load(Ordering::SeqCst), 2);
+        // (the runtime's own search, over files it has no verity trees for: it cannot tell)
+        let searched = failure(Runtime::start(&settings, (program, vec!["denied".into()]))).await;
+        assert_eq!(searched, plain);
+        println!("runtime_controls: a worker the OS refused is told why after its own reason, and no other");
 
         // Closing waits for the worker's processes, the one outside its process group too.
         // Windows has no process-group escape of this shape; Job Object cleanup is tested elsewhere.
