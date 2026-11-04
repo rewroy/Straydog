@@ -24,6 +24,8 @@ pub struct Machine {
     pub gpu_error: Option<String>,
     /// Host memory as the server measures it (cgroup limits included); 0 if unknown.
     pub ram: u64,
+    /// Of it, what other programs leave free now; 0 if unknown.
+    pub free_ram: u64,
 }
 
 /// The GPU library this executable links.
@@ -39,7 +41,9 @@ impl Machine {
     /// Look at this machine: every GPU (or, with `only`, those ordinals; at most four are used)
     /// and the host memory.
     pub fn probe(only: Option<&[usize]>) -> Machine {
-        let mut machine = Machine { backend: BACKEND, gpus: Vec::new(), gpu_error: None, ram: straydog_engine::host::host_memory_bytes() };
+        let ram = straydog_engine::host::host_memory_bytes();
+        let free_ram = straydog_engine::host::available_bytes().min(ram);
+        let mut machine = Machine { backend: BACKEND, gpus: Vec::new(), gpu_error: None, ram, free_ram };
         match straydog_gpu::device_count() {
             Ok(count) => {
                 let ordinals: Vec<usize> = only.map_or_else(|| (0..count).collect(), <[usize]>::to_vec);
@@ -82,6 +86,11 @@ impl Machine {
             }
         }
         lines.push(if self.ram == 0 { "Memory: unknown.".to_string() } else { format!("Memory: {:.1} GiB of RAM.", self.ram as f64 / GIB as f64) });
+        // (memory other programs hold is not the server's: what is free now is what it counts with)
+        if self.free_ram > 0 && self.free_ram < self.ram / 4 * 3 {
+            lines.push(format!("{:.1} GiB of it is free now: other programs are using the rest, and setup counts with what is free.",
+                               self.free_ram as f64 / GIB as f64));
+        }
         lines
     }
 }
@@ -123,12 +132,12 @@ mod tests {
 
     #[test]
     fn a_machine_is_described_in_a_line_or_two() {
-        let two = Machine { backend: "ROCm/HIP", gpus: vec![gpu(0, "R9700", 32, 32), gpu(1, "R9700", 32, 32)], gpu_error: None, ram: 125 * GIB };
+        let two = Machine { backend: "ROCm/HIP", gpus: vec![gpu(0, "R9700", 32, 32), gpu(1, "R9700", 32, 32)], gpu_error: None, ram: 125 * GIB, free_ram: 120 * GIB };
         assert_eq!(two.describe(), ["GPUs (ROCm/HIP): 2 x R9700 (32.0 GiB each).", "Memory: 125.0 GiB of RAM."]);
-        let mixed = Machine { gpus: vec![gpu(0, "RTX 4070", 12, 3), gpu(1, "RTX 3060", 12, 12)], backend: "CUDA", gpu_error: None, ram: 32 * GIB };
+        let mixed = Machine { gpus: vec![gpu(0, "RTX 4070", 12, 3), gpu(1, "RTX 3060", 12, 12)], backend: "CUDA", gpu_error: None, ram: 32 * GIB, free_ram: 30 * GIB };
         assert_eq!(mixed.describe(), ["GPUs (CUDA): RTX 4070 (12.0 GiB), RTX 3060 (12.0 GiB).",
                                       "GPU 0 has 3.0 GiB free now: another program is using the rest.", "Memory: 32.0 GiB of RAM."]);
-        let none = Machine { backend: "CUDA", gpus: vec![], gpu_error: Some("no driver".into()), ram: 0 };
+        let none = Machine { backend: "CUDA", gpus: vec![], gpu_error: Some("no driver".into()), ram: 0, free_ram: 0 };
         assert_eq!(none.describe(), ["No GPU found (CUDA): no driver.", "Memory: unknown."]);
     }
 
