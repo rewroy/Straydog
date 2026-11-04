@@ -145,6 +145,21 @@ fn error(message: impl Into<String>) -> String {
     message.into()
 }
 
+/// A model or drafter directory as an absolute path, without asking the file system anything.
+///
+/// The server has already resolved it, as the user (links followed, and on Windows the `\\?\` form), before it starts
+/// the worker, so resolving it again changes nothing. It also asks the contained worker for more than it needs:
+/// `canonicalize` opens the directory itself and, on Windows, asks for its final name (`GetFinalPathNameByHandleW`,
+/// the drive-letter lookup), and in the worker's AppContainer that open can be refused (os error 5) where reading the
+/// pinned files inside the directory is not. An absolute path, a `\\?\` one too, comes back as it was given. A relative
+/// one (an example or a test run by hand) is made absolute against the current directory.
+fn absolute_directory(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::path::absolute(path).map_err(|exc| format!("{}: {exc}", path.display()))
+}
+
 /// An opened file, its signature then, and the chunk digests reading will verify.
 type Opened = ((File, Signature), Vec<String>);
 
@@ -239,7 +254,7 @@ impl Weights {
         if names != HashSet::from(["tokenizer.json", "chat_template.jinja", "config.json"]) {
             return Err(error("Straydog requires authenticated tokenizer, template, and config"));
         }
-        let root = root.canonicalize().map_err(|exc| format!("{}: {exc}", root.display()))?;
+        let root = absolute_directory(root)?;
         let mut weights = Weights {
             root: root.clone(),
             quantization: quantization.to_string(),
@@ -268,7 +283,7 @@ impl Weights {
         }
         let mut opened = open_pinned(&root, &pins.shards, "open", progress)?;
         if let Some(directory) = drafter {
-            let directory = directory.canonicalize().map_err(|exc| format!("{}: {exc}", directory.display()))?;
+            let directory = absolute_directory(directory)?;
             opened.extend(open_pinned(&directory, std::slice::from_ref(&pins.drafter), "drafter", progress)?);
         }
         // Each header's chunk is read and hashed on a thread of its own.
@@ -809,4 +824,58 @@ pub fn ngram_rows(history: &[i64], tokens: &[i64], arrays: &BTreeMap<String, Vec
         previous.push(token);
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An absolute path to a directory that is not there.
+    fn missing() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("straydog-no-such-directory-{}", std::process::id())).join("model");
+        assert!(path.is_absolute() && !path.exists());
+        path
+    }
+
+    #[test]
+    fn an_absolute_path_comes_back_as_given_without_the_file_system() {
+        // `canonicalize` fails on a directory that is not there: this must not ask.
+        let path = missing();
+        assert_eq!(absolute_directory(&path).unwrap(), path);
+        // Nothing resolves a `..` either.
+        let dotted = path.join("..").join("other");
+        assert_eq!(absolute_directory(&dotted).unwrap(), dotted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_path_comes_back_as_given() {
+        for text in [r"\\?\C:\straydog-no-such-directory\IQ2_XS", r"\\?\UNC\straydog-no-such-server\share\IQ2_XS"] {
+            let path = Path::new(text);
+            assert!(path.is_absolute());
+            assert_eq!(absolute_directory(path).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_made_absolute_against_the_current_directory() {
+        let relative = Path::new("straydog-no-such-directory").join("model");
+        let made = absolute_directory(&relative).unwrap();
+        assert!(made.is_absolute());
+        assert_eq!(made, std::env::current_dir().unwrap().join(&relative));
+    }
+
+    #[test]
+    fn an_empty_path_is_refused() {
+        assert!(absolute_directory(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn opening_a_directory_does_not_resolve_it_first() {
+        // With the directory resolved, the error would be about the directory; it is about the first file read in it.
+        let path = missing();
+        let Err(message) = Weights::open(&path, "IQ2_XS", None, 0, &|_, _, _| {}) else { panic!("a missing directory opened") };
+        assert!(!message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("os error"), "{message}");
+    }
 }
