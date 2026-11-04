@@ -510,6 +510,32 @@ async fn suppress_reaches_the_worker_only_when_given() {
     assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&absent).strip_suffix('}').unwrap().to_string() + r#", "suppress": "not_cp932_han"}"#);
 }
 
+/// A client's X-Request-Id reaches the worker request as its `request_id`, for the server's log: printable ASCII but the space
+/// and at most 64 of it, nothing at all when none is left, and a request without one is the request it always was.
+#[tokio::test]
+async fn a_clients_request_id_reaches_the_worker_request_cut_to_printable_ascii() {
+    let sent = |id: Option<Vec<u8>>| async move {
+        let mock = Mock::new(vec![Script::Events(vec![done("stop")])]);
+        let mut request = chat(ask(json!({"seed": 1})).to_string());
+        if let Some(id) = id {
+            request.headers_mut().insert(straydog_api::REQUEST_ID, axum::http::HeaderValue::from_bytes(&id).unwrap());
+        }
+        let (status, _, _) = send(app(&mock), request).await;
+        assert_eq!(status, StatusCode::OK);
+        mock.requests()[0].clone()
+    };
+    let plain = sent(None).await;
+    assert!(plain.get("request_id").is_none());
+    let named = sent(Some(b"8f3c2a/12".to_vec())).await;
+    assert_eq!(pyjson::dumps(&named), pyjson::dumps(&plain).strip_suffix('}').unwrap().to_string() + r#", "request_id": "8f3c2a/12"}"#);
+    // (spaces, tabs and bytes past ASCII are dropped, and the rest is cut at 64)
+    let cut = sent(Some([b"a b\tc\xff".as_slice(), &[b'x'; 100]].concat())).await;
+    assert_eq!(field(&cut, "request_id"), &pyjson::Value::Str(format!("abc{}", "x".repeat(61))));
+    for nothing in [b" ".to_vec(), b"\t\xff".to_vec()] {
+        assert!(sent(Some(nothing)).await.get("request_id").is_none());
+    }
+}
+
 #[tokio::test]
 async fn settings_reach_the_worker_request() {
     let cases = [
