@@ -20,18 +20,21 @@ pub const GIB: u64 = 1 << 30;
 /// The context a server starts with unless told otherwise.
 pub const DEFAULT_CONTEXT: u64 = 262_144;
 
-/// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash-1017's
-/// recommended build (ISTA-DASLab's IQ2_XXS) and its other three, then Qwen3.8-Flash-Next from the most exact
-/// quantization to the smallest (Unsloth's UD-IQ1_M, 20 MB smaller than ISTA-DASLab's IQ2_XS, before Q2_0).
-pub const ORDER: [Id; 9] = [
-    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XXS" },
+/// The bundles in the order they are offered and recommended from, Unsloth's first (the owner's choice, 2026-11-05):
+/// DeepSeek-V4.1-Flash-1017's UD-IQ1_M (the size of ISTA-DASLab's IQ2_XXS) and UD-IQ2_XXS, then ISTA-DASLab's two; then
+/// Qwen3.8-Flash-Next's, Unsloth's and then ISTA-DASLab's, each from the most exact quantization to the smallest.
+pub const ORDER: [Id; 12] = [
     Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ1_M" },
-    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XS" },
     Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ2_XXS" },
+    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XXS" },
+    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XS" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ3_XXS" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ2_XS" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_S" },
     Id { model: MODEL, provider: ISTA, quant: "IQ3_S" },
     Id { model: MODEL, provider: ISTA, quant: "IQ3_XXS" },
     Id { model: MODEL, provider: ISTA, quant: "IQ2_XS" },
-    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" },
     Id { model: MODEL, provider: ISTA, quant: "Q2_0" },
 ];
 
@@ -351,12 +354,14 @@ const PARTIAL_BATCH: u64 = 1024;
 /// What a partial placement pins of a bundle's `dense` bytes (`Weights::dense_requirements`): not the HyperConnections' and the PLE
 /// layer's BF16 matrices' 626442240 bytes they save going up as Q8_0, nor the token embeddings, kept on the host: 273152000 bytes
 /// in IQ3_XXS, whose 3216268800 bytes pinned were read from its header; for bundles whose headers were not at hand, their
-/// 635699200 weights at 2 bits at the least, which may count up to 0.11 GiB too much. Unsloth's UD-IQ1_M keeps its
-/// HyperConnections in Q8_0 already and its token embeddings in IQ4_XS (337715200 bytes, from its header); its PLE layer's
-/// BF16 matrices are counted as they are, which counts what they save going up as Q8_0 too much.
+/// 635699200 weights at 2 bits at the least, which may count up to 0.11 GiB too much. Unsloth's keep their HyperConnections in
+/// Q8_0 already and their token embeddings in IQ4_XS (337715200 bytes; UD-IQ3_XXS's in Q6_K, 521475200), and save 30720000
+/// bytes of the PLE layer's BF16 matrices: from their headers, and the pinned bytes Weights counted for UD-IQ1_S, UD-IQ1_M and
+/// UD-IQ2_XS (3802437120, 4014773760 and 4368668160).
 fn pinned_dense(entry: &Entry) -> u64 {
-    if entry.id == (Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" }) {
-        return entry.footprint.dense.saturating_sub(337_715_200);
+    if entry.id.model == MODEL && entry.id.provider == UNSLOTH {
+        let embeddings = if entry.id.quant == "UD-IQ3_XXS" { 521_475_200 } else { 337_715_200 };
+        return entry.footprint.dense.saturating_sub(embeddings + 30_720_000);
     }
     let embeddings = if entry.id == (Id { model: MODEL, provider: ISTA, quant: "IQ3_XXS" }) { 273_152_000 } else { 635_699_200 / 4 };
     entry.footprint.dense.saturating_sub(626_442_240 + embeddings)
@@ -542,6 +547,11 @@ pub(crate) mod tests {
         Entry::of(id(quant)).unwrap()
     }
 
+    /// Unsloth's Qwen3.8 bundle of `quant`.
+    pub fn unsloth(quant: &'static str) -> Id {
+        Id { model: MODEL, provider: UNSLOTH, quant }
+    }
+
     #[test]
     fn every_pinned_bundle_is_offered_once() {
         assert_eq!(ORDER.len(), bundle::BUNDLES.len());
@@ -646,7 +656,8 @@ pub(crate) mod tests {
         }
         let entries = pinned_entries();
         let fits: Vec<Fit> = entries.iter().map(|entry| fit_on(false, entry, &machine, DEFAULT_CONTEXT)).collect();
-        assert_eq!(recommend(&entries, &fits).map(|index| entries[index].id), Some(id("GSQ-RCO-IQ2_XXS")));
+        // (Unsloth's first: UD-IQ1_M, as large as ISTA-DASLab's IQ2_XXS, fits as it does)
+        assert_eq!(recommend(&entries, &fits).map(|index| entries[index].id), Some(Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ1_M" }));
     }
 
     #[test]
@@ -669,7 +680,8 @@ pub(crate) mod tests {
             assert!(matches!(of(quant), (DEFAULT_CONTEXT, Fit::Drive(_))), "{quant}: {:?}", of(quant));
         }
         let recommended = recommend(&entries, &fits.iter().map(|(_, fit)| fit.clone()).collect::<Vec<_>>()).unwrap();
-        assert_eq!(entries[recommended].id, id("IQ2_XS"));
+        // (Unsloth's first: of their bundles the one reading least from the drive, UD-IQ1_S)
+        assert_eq!(entries[recommended].id, unsloth("UD-IQ1_S"));
     }
 
     /// `machine` with `others` bytes of each GPU held by the desktop and other programs, and a reported card of `mib`.
@@ -686,6 +698,10 @@ pub(crate) mod tests {
         let classes: Vec<Fit> = fits.iter().map(|(_, fit)| fit.clone()).collect();
         let named = recommend(&entries, &classes).map(|index| entries[index].id);
         (entries.iter().zip(fits).map(|(entry, (context, fit))| (entry.id, context, fit)).collect(), named)
+    }
+
+    fn verdicts_of(verdicts: &[(Id, u64, Fit)], bundle: Id) -> Fit {
+        verdicts.iter().find(|(named, ..)| *named == bundle).map(|(_, _, fit)| fit.clone()).unwrap()
     }
 
     fn verdict(verdicts: &[(Id, u64, Fit)], quant: &str) -> (u64, Fit) {
@@ -720,6 +736,10 @@ pub(crate) mod tests {
         };
         assert!(starts(4.15) && !starts(4.1));
         assert_eq!(pinned_dense(&entry("IQ3_XXS")), 3_216_268_800);
+        // Unsloth's, as Weights counted them
+        for (quant, pinned) in [("UD-IQ1_S", 3_802_437_120u64), ("UD-IQ1_M", 4_014_773_760), ("UD-IQ2_XS", 4_368_668_160)] {
+            assert_eq!(pinned_dense(&Entry::of(unsloth(quant)).unwrap()), pinned, "{quant}");
+        }
         // two GPUs each keep their workspaces, and share the weights
         let (one, two) = (min_vram(&entry("IQ2_XS"), 1, DEFAULT_CONTEXT), min_vram(&entry("IQ2_XS"), 2, DEFAULT_CONTEXT));
         assert!(two > one && two < 2 * one);
@@ -745,8 +765,15 @@ pub(crate) mod tests {
                     assert_eq!(context, DEFAULT_CONTEXT, "{name}: {quant}");
                     assert!(matches!(fit, Fit::Drive(_)), "{name}: {quant}: {fit:?}");
                 }
-                // and 32 GB holds none of them whole: the K/V's whole context would leave the banks 10 GiB of it
-                assert_eq!(named, Some(id("IQ2_XS")), "{name}");
+                // and 32 GB holds none of them whole: the K/V's whole context would leave the banks 10 GiB of it. From 8 GB Unsloth's
+                // first, the one reading least; at 6 GB their dense layers (Q5_K to Q8_0: 3.5 to 4.1 GiB pinned, ISTA-DASLab's IQ2_XS
+                // 2.6) leave them short of VRAM, and ISTA-DASLab's IQ2_XS is the one
+                assert_eq!(named, Some(if mib < 8000 { id("IQ2_XS") } else { unsloth("UD-IQ1_S") }), "{name}");
+                if mib < 8000 {
+                    for quant in ["UD-IQ3_XXS", "UD-IQ2_XS", "UD-IQ1_M", "UD-IQ1_S"] {
+                        assert!(matches!(verdicts_of(&fits, unsloth(quant)), Fit::TooLittleVram { .. }), "{name}: {quant}");
+                    }
+                }
                 // DeepSeek-V4.1 runs on none of these with the desktop's share gone, or when it does never well
                 let (_, deepseek) = verdict(&fits, "GSQ-RCO-IQ2_XXS");
                 assert!(matches!(deepseek, Fit::TooLittleVram { .. } | Fit::Drive(_)), "{name}: {deepseek:?}");
@@ -803,7 +830,9 @@ pub(crate) mod tests {
         // the K/V's growth is what parts 16 GB's RAM class: the banks of IQ3_S do not keep beside it at 62 GiB, IQ3_XXS's do
         let (pc, cases) = (windows_pc(16303, DESKTOP, 62 << 30), pinned_entries());
         let (fits, named) = verdicts(true, &pc);
-        assert_eq!(named, Some(id("IQ3_XXS")));
+        // (Unsloth's first: UD-IQ2_XS, as large as ISTA-DASLab's IQ3_XXS, keeps its banks as that does)
+        assert_eq!(named, Some(unsloth("UD-IQ2_XS")));
+        assert!(matches!(verdicts_of(&fits, unsloth("UD-IQ2_XS")), Fit::Ram(_)));
         assert!(matches!(fit_on(true, &big, &pc, DEFAULT_CONTEXT), Fit::Drive(0)), "{:?}", fit_on(true, &big, &pc, DEFAULT_CONTEXT));
         assert!(matches!(verdict(&fits, "IQ3_XXS").1, Fit::Ram(_)));
         assert_eq!(cases.len(), fits.len());
@@ -844,8 +873,9 @@ pub(crate) mod tests {
     fn the_recommendation_is_the_best_class_of_the_first_model_that_runs_well() {
         let entries = pinned_entries();
         // all DeepSeek on the drive, Qwen3.8 in RAM for one bundle and in VRAM for another: Qwen3.8's in VRAM
-        // (Qwen3.8's: ISTA-DASLab's IQ3_S, IQ3_XXS and IQ2_XS, Unsloth's UD-IQ1_M, ISTA-DASLab's Q2_0)
-        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram, Fit::Vram];
+        // (Qwen3.8's: Unsloth's UD-IQ3_XXS, UD-IQ2_XS, UD-IQ1_M and UD-IQ1_S, ISTA-DASLab's IQ3_S, IQ3_XXS, IQ2_XS and Q2_0)
+        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram,
+                                      Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram];
         assert_eq!(recommend(&entries, &fits), Some(6));
         // DeepSeek in RAM wins over Qwen3.8 in VRAM: the first model that runs well, its first bundle of the best class
         fits[2] = Fit::Ram(1);
@@ -857,13 +887,16 @@ pub(crate) mod tests {
         assert_eq!(recommend(&entries, &fits), Some(3));
         // nothing runs well: of the model reading least from the drive, the first bundle within a twentieth of its experts of that
         let bytes = |gib: u64| gib * GIB;
-        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)),
+                                  Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
         assert_eq!(recommend(&entries, &slow), Some(6));
         // ... or the one reading least, past that
-        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
-        assert_eq!(recommend(&entries, &wide), Some(8));
+        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(16)),
+                                  Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &wide), Some(11));
         // a model that reads least is chosen over the bundles of another, however near
-        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)),
+                                  Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
         assert_eq!(recommend(&entries, &other), Some(6));
     }
 }

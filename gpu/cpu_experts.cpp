@@ -219,6 +219,16 @@ void decode_bf16(const uint8_t* b, float* out) {
         std::memcpy(out + i, &bits, 4);
     }
 }
+// Q5_0: the scale, 32 high bits (bit i of value i), then 16 bytes of low nibbles (values i and i + 16); values minus 16.
+// (Unsloth's Qwen3.8 UD-IQ2_XS keeps one layer's down experts in it.)
+void decode_q5_0(const uint8_t* b, float* out) {
+    const float d = half_at(b);
+    const uint32_t high = load32(b + 2);
+    for (int i = 0; i < 16; ++i) {
+        out[i] = d * float(int((b[6 + i] & 15) | ((high >> i) & 1) << 4) - 16);
+        out[i + 16] = d * float(int((b[6 + i] >> 4) | ((high >> (i + 16)) & 1) << 4) - 16);
+    }
+}
 void decode_iq4_nl(const uint8_t* b, float* out) {
     const float d = half_at(b);
     for (int i = 0; i < 16; ++i) { out[i] = d * float(iq4_values[b[2 + i] & 15]); out[i + 16] = d * float(iq4_values[b[2 + i] >> 4]); }
@@ -543,6 +553,7 @@ CpuFormat cpu_format(int kind) {
         case 19: return {256, 50, decode_iq1_s, decode_iq1_s, SD_ROWS(19)};
         case 10: return {256, 84, decode_q2_k, decode_q2_k, SD_ROWS(10)};
         case 39: return {32, 17, decode_mxfp4, decode_mxfp4, SD_ROWS(39)};
+        case 6: return {32, 22, decode_q5_0, decode_q5_0, nullptr};
     }
     #undef SD_WIDE
     #undef SD_ROWS
