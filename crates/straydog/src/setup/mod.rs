@@ -676,16 +676,16 @@ mod tests {
         println!("{said}");
         assert!(said.contains("2 x GPU (31.9 GiB each)") || said.contains("GPUs (ROCm/HIP)"), "{said}");
         let first = said.lines().find(|line| line.contains("1) ")).unwrap_or_default();
-        assert!(first.contains("DeepSeek-V4.1-Flash-1017") && first.contains("ISTA-DASLab") && first.contains("IQ2_XXS") && first.contains("recommended"), "{said}");
-        assert!(said.contains("Please give a number from 1 to 9."), "{said}");
-        assert_eq!(outcome.bundle, catalog::tests::id("GSQ-RCO-IQ2_XXS"));
+        assert!(first.contains("DeepSeek-V4.1-Flash-1017") && first.contains("Unsloth") && first.contains("UD-IQ1_M") && first.contains("recommended"), "{said}");
+        assert!(said.contains("Please give a number from 1 to 12."), "{said}");
+        assert_eq!(outcome.bundle, straydog_engine::bundle::Id { model: straydog_engine::bundle::DEEPSEEK, provider: straydog_engine::bundle::UNSLOTH, quant: "UD-IQ1_M" });
         assert_eq!(outcome.extras, [Extra::Vision]);
-        assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash-1017").join("ISTA-DASLab-IQ2_XXS"));
+        assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash-1017").join("Unsloth-UD-IQ1_M"));
         let calls = recorder.0.lock().unwrap();
         assert_eq!(*calls, [(outcome.place.bundle.clone(), vec![Extra::Vision], false)]);
         let read: Options = toml::from_str(&std::fs::read_to_string(&outcome.written.path).unwrap()).unwrap();
         assert_eq!((read.model_name.as_deref(), read.provider.as_deref(), read.quant.as_deref(), read.model_draft, read.gpu),
-                   (Some("DeepSeek-V4.1-Flash-1017"), Some("ISTA-DASLab"), Some("IQ2_XXS"), None, Some(vec![0, 1])));
+                   (Some("DeepSeek-V4.1-Flash-1017"), Some("Unsloth"), Some("UD-IQ1_M"), None, Some(vec![0, 1])));
     }
 
     /// The input ending (Ctrl-D, a closed pipe), a "no" at the last question and no terminal without --yes all
@@ -715,16 +715,18 @@ mod tests {
         let ask = |args: SetupArgs, machine: &Machine| run_with(&SetupArgs { yes: true, dir: Some(root.join("models")), ..args }, machine, &entries, &defaults(&root), &recorder, "", false).0;
         // by model name, in any case: its best bundle for the machine
         let outcome = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &small).unwrap();
-        assert_eq!(outcome.bundle, catalog::tests::id("IQ2_XS"));
+        assert_eq!(outcome.bundle, catalog::tests::unsloth("UD-IQ1_S"));
         let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &two_r9700s()).unwrap();
-        assert_eq!(outcome.bundle, catalog::tests::id("GSQ-RCO-IQ2_XXS"));
+        assert_eq!(outcome.bundle, straydog_engine::bundle::Id { model: straydog_engine::bundle::DEEPSEEK, provider: straydog_engine::bundle::UNSLOTH, quant: "UD-IQ1_M" });
         // a bundle by its labels: UD-IQ1_M is a bundle of both models, so it needs the model named; a provider alone takes its best
         let labels = |model: Option<&str>, provider: Option<&str>, quant: Option<&str>| SetupArgs {
             model_name: model.map(str::to_string), provider: provider.map(str::to_string), quant: quant.map(str::to_string), ..SetupArgs::default()
         };
         let unsloth_qwen = straydog_engine::bundle::Id { model: "Qwen3.8-Flash-Next", provider: "Unsloth", quant: "UD-IQ1_M" };
         assert_eq!(ask(labels(Some("Qwen3.8-Flash-Next"), None, Some("UD-IQ1_M")), &two_r9700s()).unwrap().bundle, unsloth_qwen);
-        assert_eq!(ask(labels(Some("qwen3.8-flash-next"), Some("unsloth"), None), &two_r9700s()).unwrap().bundle, unsloth_qwen);
+        // (a model and provider alone: their best bundle here, UD-IQ3_XXS on two R9700s)
+        let best = ask(labels(Some("qwen3.8-flash-next"), Some("unsloth"), None), &two_r9700s()).unwrap().bundle;
+        assert_eq!(best, straydog_engine::bundle::Id { quant: "UD-IQ3_XXS", ..unsloth_qwen });
         let both = ask(labels(None, None, Some("UD-IQ1_M")), &two_r9700s()).unwrap_err();
         assert!(both.contains("give --model-name and --provider"), "{both}");
         let deepseek = ask(labels(Some("DeepSeek-V4.1-Flash-1017"), Some("Unsloth"), Some("UD-IQ1_M")), &two_r9700s()).unwrap().bundle;
@@ -762,7 +764,7 @@ mod tests {
         assert_eq!(bundles.len(), entries.len());
         let recommended: Vec<_> = bundles.iter().filter(|bundle| bundle["recommended"] == true).collect();
         assert_eq!(recommended.len(), 1);
-        assert_eq!((recommended[0]["provider"].as_str(), recommended[0]["quant"].as_str()), (Some("ISTA-DASLab"), Some("IQ2_XXS")));
+        assert_eq!((recommended[0]["provider"].as_str(), recommended[0]["quant"].as_str()), (Some("Unsloth"), Some("UD-IQ1_M")));
         assert_eq!(recommended[0]["fit"], "ram");
         let q38 = bundles.iter().find(|bundle| bundle["quant"] == "IQ3_S").unwrap();
         assert_eq!(q38["extras"][0]["name"], "mtp");

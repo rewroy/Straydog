@@ -4,8 +4,8 @@ use serde_json::Value;
 
 /// The manifest, compiled in: a binary authenticates exactly the bundles it was tested with.
 pub const MANIFEST: &str = include_str!("assets.json");
-/// Qwen3.8-Flash-Next's bundles: ISTA-DASLab's (GSQ-RCO), then Unsloth's UD-IQ1_M.
-pub const QUANTIZATIONS: [&str; 5] = ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "UD-IQ1_M"];
+/// Qwen3.8-Flash-Next's bundles: ISTA-DASLab's (GSQ-RCO), then Unsloth's.
+pub const QUANTIZATIONS: [&str; 8] = ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "UD-IQ1_M", "UD-IQ1_S", "UD-IQ2_XS", "UD-IQ3_XXS"];
 /// The chunk digests of pinned files (see `digest::CHUNK_BYTES`), by whole-file SHA-256:
 /// taken from files that matched their pins, compiled in like the manifest.
 pub const CHUNKS: &str = include_str!("asset_chunks.json");
@@ -22,12 +22,15 @@ pub const ISTA: &str = "ISTA-DASLab";
 pub const UNSLOTH: &str = "Unsloth";
 
 /// Every pinned bundle: Qwen3.8's, then DeepSeek-V4.1's.
-pub const BUNDLES: [Id; 9] = [
+pub const BUNDLES: [Id; 12] = [
     Id { model: MODEL, provider: ISTA, quant: "Q2_0" },
     Id { model: MODEL, provider: ISTA, quant: "IQ2_XS" },
     Id { model: MODEL, provider: ISTA, quant: "IQ3_XXS" },
     Id { model: MODEL, provider: ISTA, quant: "IQ3_S" },
     Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_S" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ2_XS" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ3_XXS" },
     Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ2_XXS" },
     Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XS" },
     Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XXS" },

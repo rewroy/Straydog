@@ -35,7 +35,7 @@ pub fn block(kind: u32) -> Option<(usize, usize)> {
 }
 
 /// Formats the CPU expert engine evaluates (routed experts of a partially resident model).
-pub const CPU_EXPERT_KINDS: [u32; 13] = [8, 10, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39, 42];
+pub const CPU_EXPERT_KINDS: [u32; 14] = [6, 8, 10, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39, 42];
 
 /// Packed size of a `rows` x `cols` matrix of whole blocks.
 pub fn matrix_bytes(kind: u32, rows: usize, cols: usize) -> Option<usize> {

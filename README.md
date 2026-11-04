@@ -98,15 +98,22 @@ the server takes all three from the files in `-m`.
 
 | Model | Provider | Quantization | Size | |
 | --- | --- | --- | ---: | --- |
-| DeepSeek-V4.1-Flash-1017 | ISTA-DASLab | IQ2_XXS | 248.8 GB | ISTA's recommended build (GSQ-RCO); the faster where VRAM is short |
-| | ISTA-DASLab | IQ2_XS | 265.8 GB | |
-| | Unsloth | UD-IQ1_M | 250.4 GB | the size of ISTA-DASLab's IQ2_XXS |
+| DeepSeek-V4.1-Flash-1017 | Unsloth | UD-IQ1_M | 250.4 GB | recommended |
 | | Unsloth | UD-IQ2_XXS | 300.5 GB | |
-| Qwen3.8-Flash-Next | ISTA-DASLab | Q2_0 | 66.4 GB | the fastest |
-| | ISTA-DASLab | IQ2_XS | 68.0 GB | |
+| | ISTA-DASLab | IQ2_XXS | 248.8 GB | GSQ-RCO; the faster where VRAM is short |
+| | ISTA-DASLab | IQ2_XS | 265.8 GB | GSQ-RCO |
+| Qwen3.8-Flash-Next | Unsloth | UD-IQ3_XXS | 83.6 GB | Dynamic V3.1 |
+| | Unsloth | UD-IQ2_XS | 75.8 GB | |
+| | Unsloth | UD-IQ1_M | 68.0 GB | |
+| | Unsloth | UD-IQ1_S | 66.4 GB | |
+| | ISTA-DASLab | IQ3_S | 83.6 GB | GSQ-RCO; closest to BF16 |
 | | ISTA-DASLab | IQ3_XXS | 75.8 GB | |
-| | ISTA-DASLab | IQ3_S | 83.6 GB | closest to BF16 |
-| | Unsloth | UD-IQ1_M | 68.0 GB | Dynamic V3.1 |
+| | ISTA-DASLab | IQ2_XS | 68.0 GB | |
+| | ISTA-DASLab | Q2_0 | 66.4 GB | the fastest |
+
+Unsloth's bundles come first: `straydog setup` recommends from them before ISTA-DASLab's. Unsloth's
+Qwen3.8 bundles share their engram (PLE) table, the last shard of each: setup takes it from a bundle
+beside it rather than downloading it again.
 
 Settings files of 0.1.3 and before name DeepSeek-V4.1's ISTA-DASLab bundles by their files'
 names (GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS) and the model DeepSeek-V4.1-Flash: they are read as these.
