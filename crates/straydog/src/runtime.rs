@@ -38,6 +38,15 @@ const CANCEL_PATIENCE: Duration = Duration::from_secs(600);
 /// The program and arguments that start the worker (isolated, in production).
 pub type Command = (PathBuf, Vec<OsString>);
 
+/// How the server finds out why the OS refused its worker (Windows: the drive keeps no file
+/// permissions, or the worker's profile has no read entry on a path), once the worker has failed
+/// to start with "access denied". None when it cannot tell.
+pub type Refusal = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// How Rust renders Win32's ERROR_ACCESS_DENIED at the end of an OS error's message, whatever
+/// language the system's message is in.
+const ACCESS_DENIED: &str = "(os error 5)";
+
 /// What runs before the worker starts and yields its command (building missing verity trees,
 /// then the isolation command over them), reporting (stage, done, total).
 pub type Prepare = Box<dyn FnOnce(&(dyn Fn(&str, u64, u64) + Sync)) -> Result<Command, String> + Send>;
@@ -270,6 +279,53 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
         working_directory: settings.model.clone(),
         secrets: settings.api_key_file.iter().cloned().collect(),
     })
+}
+
+/// The paths the worker reads, for [`straydog_isolation::why_refused`]: the pinned files, then the
+/// directories it opens them in.
+#[cfg(any(windows, test))]
+fn refusal_paths(exposure: &straydog_isolation::Exposure) -> Vec<PathBuf> {
+    exposure.files.iter().chain(&exposure.directories).cloned().collect()
+}
+
+/// [`Refusal`] for these settings: on Windows, what [`straydog_isolation::why_refused`] says of the
+/// paths the worker reads; elsewhere nothing.
+fn refusal_of(settings: &Settings) -> Refusal {
+    #[cfg(windows)]
+    {
+        let settings = settings.clone();
+        Arc::new(move || straydog_isolation::why_refused(&refusal_paths(&exposure(&settings).ok()?)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = settings;
+        Arc::new(|| None)
+    }
+}
+
+/// The reason a worker failed to start: the last line it wrote to standard error that is not a
+/// warning of its launcher's (cut to its last 500 characters), or `message` when it wrote none.
+fn start_reason(tail: &str, message: String) -> String {
+    let last = tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with(straydog_isolation::LAUNCHER_WARNING));
+    match last {
+        Some(line) => line.chars().skip(line.chars().count().saturating_sub(500)).collect(),
+        None => message,
+    }
+}
+
+/// Whether the reason says the OS refused the worker access (so the server looks for why).
+fn was_refused(reason: &str) -> bool {
+    reason.contains(ACCESS_DENIED)
+}
+
+/// What the server reports of a worker that failed to start, with `why` after the worker's reason.
+fn start_failure(reason: &str, why: Option<&str>) -> String {
+    let reason = why.map_or_else(|| reason.to_string(), |why| format!("{reason}: {why}"));
+    format!("Straydog failed to start ({reason}); see the server log and restart the server")
 }
 
 /// The minimal environment the worker starts with: no proxy, token, secret or key variables.
@@ -676,16 +732,22 @@ impl Runtime {
 
     /// [`Runtime::start`] once `prepare` has run (shown as loading) and given the command.
     pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
-        Runtime::driven(settings, prepare, CANCEL_PATIENCE)
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings))
     }
 
     /// Tests only: [`Runtime::start`] with its worker given `patience` to end a cancelled generation.
     #[doc(hidden)]
     pub fn start_with_cancel_patience(settings: &Settings, command: Command, patience: Duration) -> Runtime {
-        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience)
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience, refusal_of(settings))
     }
 
-    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration) -> Runtime {
+    /// Tests only: [`Runtime::start`] with `refusal` in place of the search for why the OS refused the worker.
+    #[doc(hidden)]
+    pub fn start_with_refusal(settings: &Settings, command: Command, refusal: Refusal) -> Runtime {
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), CANCEL_PATIENCE, refusal)
+    }
+
+    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration, refusal: Refusal) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
             failure: watch::Sender::new(None),
@@ -703,6 +765,7 @@ impl Runtime {
             verbose: settings.verbose,
             warm_directory: Some(settings.data_dir.join("warm")),
             cancel_patience,
+            refusal,
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
@@ -763,6 +826,8 @@ struct Driver {
     warm_directory: Option<PathBuf>,
     /// [`CANCEL_PATIENCE`].
     cancel_patience: Duration,
+    /// Why the OS refused a worker that failed to start with "access denied".
+    refusal: Refusal,
 }
 
 /// How often a changed warm-up state is saved while the server runs.
@@ -1100,10 +1165,19 @@ impl Driver {
                 // Let the last stderr lines arrive: the worker's last line names the cause.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let tail = String::from_utf8_lossy(&self.shared.stderr_tail.lock().unwrap()).to_string();
-                let reason = tail.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_string();
-                let reason = if reason.is_empty() { message } else { reason.chars().rev().take(500).collect::<Vec<_>>()
-                    .into_iter().rev().collect() };
-                Err((format!("Straydog failed to start ({reason}); see the server log and restart the server"), process.holders))
+                let reason = start_reason(&tail, message);
+                // Refused by the OS: find out why, as the user (a drive that keeps no file
+                // permissions, a path the worker's profile may not read) and say so.
+                let why = if was_refused(&reason) {
+                    let refusal = self.refusal.clone();
+                    tokio::task::spawn_blocking(move || refusal()).await.ok().flatten()
+                } else {
+                    None
+                };
+                if let Some(why) = &why {
+                    tracing::error!("Straydog worker was refused access: {why}");
+                }
+                Err((start_failure(&reason, why.as_deref()), process.holders))
             }
         }
     }
@@ -1322,6 +1396,50 @@ impl Engine for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason a worker failed to start is its last line, which its launcher's warning (printed
+    /// before the worker starts) never is, unless the worker said nothing at all.
+    #[test]
+    fn the_reason_is_the_workers_last_line_and_never_a_warning() {
+        let warning = format!("{} D:\\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read D:\\m there; put it on an NTFS drive", straydog_isolation::LAUNCHER_WARNING);
+        let tail = format!("{warning}\nStraydog loading weights\nStraydog VRAM budget is unavailable \r\n\n");
+        assert_eq!(start_reason(&tail, "ended".into()), "Straydog VRAM budget is unavailable");
+        // a worker that wrote nothing after the warning: the warning is not its reason
+        assert_eq!(start_reason(&format!("{warning}\n"), "Straydog worker ended".into()), "Straydog worker ended");
+        assert_eq!(start_reason("", "Straydog worker ended".into()), "Straydog worker ended");
+        // cut to the last 500 characters
+        let long = format!("{}end (os error 5)", "あ".repeat(600));
+        let reason = start_reason(&long, String::new());
+        assert_eq!((reason.chars().count(), reason.ends_with("end (os error 5)")), (500, true));
+    }
+
+    /// A worker the OS refused is told why after its own reason; any other failure reads as before.
+    #[test]
+    fn a_worker_refused_access_is_told_why_after_its_reason() {
+        let denied = r"\\?\D:\Models\Qwen3.8-Flash-Next\IQ2_XS: アクセスが拒否されました。 (os error 5)";
+        assert!(was_refused(denied));
+        for other in ["Straydog VRAM budget is unavailable", "x: The system cannot find the file specified. (os error 2)",
+                      "x: (os error 50)", "Straydog worker ended"] {
+            assert!(!was_refused(other), "{other}");
+        }
+        let why = r"D:\ is formatted exFAT, which keeps no file permissions, so Straydog's contained worker may not read D:\Models\Qwen3.8-Flash-Next\IQ2_XS\a.gguf there; put it on an NTFS drive";
+        assert_eq!(start_failure(denied, Some(why)),
+                   format!("Straydog failed to start ({denied}: {why}); see the server log and restart the server"));
+        assert_eq!(start_failure(denied, None),
+                   format!("Straydog failed to start ({denied}); see the server log and restart the server"));
+    }
+
+    /// The files the worker reads come before the directories it opens them in.
+    #[test]
+    fn the_refusal_looks_at_the_files_then_the_directories() {
+        let exposure = straydog_isolation::Exposure {
+            executable: PathBuf::from("straydog.exe"),
+            files: vec![PathBuf::from("m/a.gguf"), PathBuf::from("m/b.gguf")],
+            directories: vec![PathBuf::from("m"), PathBuf::from("d")],
+            ..Default::default()
+        };
+        assert_eq!(refusal_paths(&exposure), ["m/a.gguf", "m/b.gguf", "m", "d"].map(PathBuf::from));
+    }
 
     /// A counted prefill phase reads as a count after the timed phases, not as seconds.
     #[test]
