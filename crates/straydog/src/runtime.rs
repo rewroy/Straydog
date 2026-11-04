@@ -1114,8 +1114,10 @@ impl Driver {
                 let excess = tail.len().saturating_sub(STDERR_TAIL);
                 tail.drain(..excess);
                 let text = String::from_utf8_lossy(&line);
-                // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm"].iter().any(|start| text.starts_with(start));
+                // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
+                // account of the host banks a partially resident model page-locked)
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks"]
+                    .iter().any(|start| text.starts_with(start));
                 if verbose || warm {
                     tracing::info!("worker: {text}");
                 } else {

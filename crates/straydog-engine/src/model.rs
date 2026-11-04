@@ -996,7 +996,9 @@ impl Model {
         let banks_total = layer_banks.iter().flatten().map(|bank| bank.len() as u64).sum();
         let (vram_used, vram_budget) = self.group.memory()?;
         let vram_room = vram_budget.saturating_sub(vram_used);
-        let budget = lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state).min(crate::host::lockable(self.weights.host_memory_bytes, vram_room));
+        let (by_memory, by_free) = (lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state),
+                                    crate::host::lockable(self.weights.host_memory_bytes, vram_room));
+        let budget = by_memory.min(by_free);
         // Whole layers from the last: reading went through those most recently, so they are the
         // likeliest to be cached; the rest of the locked range is read ahead meanwhile.
         let (mut layers, mut locked) = (Vec::new(), 0u64);
@@ -1009,6 +1011,8 @@ impl Model {
             locked += size;
         }
         let mut registered = 0;
+        // The layer whose banks the runtime would not page-lock, and why.
+        let mut refused: Option<(usize, String)> = None;
         if !layers.is_empty() {
             let weights = &self.weights;
             let ranges: Vec<(String, (u64, u64))> = layers
@@ -1029,7 +1033,8 @@ impl Model {
                     }
                 });
                 for layer in &layers {
-                    if !layer_banks[*layer].iter().all(|bank| group.register_host(bank)) {
+                    if let Some(error) = layer_banks[*layer].iter().find_map(|bank| group.register_host(bank).err()) {
+                        refused = Some((*layer, error));
                         break;
                     }
                     registered += 1;
@@ -1043,6 +1048,28 @@ impl Model {
                 }
             }
         }
+        // What the start did with the banks and why it did no more, for a log that says where the CPU's experts are read from.
+        let gib = |bytes: u64| if bytes == u64::MAX { "no bound".to_string() } else { format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64) };
+        let locked = layers[..registered].iter().map(|layer| layer_banks[*layer].iter().map(|bank| bank.len() as u64).sum::<u64>()).sum::<u64>();
+        let free = crate::host::left_free(self.weights.host_memory_bytes);
+        // (on Windows the commit, which locked memory and VRAM are charged to 1 to 1, can bind before the physical memory does)
+        let commit = crate::host::commit_left();
+        let why = match &refused {
+            Some((layer, error)) => format!("registering layer {layer}'s banks failed ({error})"),
+            None if registered == 48 => "none left".to_string(),
+            None if by_memory <= by_free => format!("the lock budget of {} was used", gib(by_memory)),
+            None if commit.is_some_and(|(available, commit)| commit < available) => {
+                format!("the commit left allows {} (host::lockable: less the VRAM slots to come and {} kept free)", gib(by_free), gib(free))
+            }
+            None => format!("the available memory allows {} (host::lockable: less {} kept free)", gib(by_free), gib(free)),
+        };
+        let (available, commit) = match commit {
+            Some((available, commit)) => (gib(available), format!(", commit left {}", gib(commit))),
+            None => (crate::host::memory_note().map_or("unknown".to_string(), |(_, available, _)| gib(available)), String::new()),
+        };
+        eprintln!("Straydog host banks: {registered} of 48 layers page-locked, {} of {}; stopped because {why}; lock_budget {}, lockable {}, \
+                   host memory {}, available {available}{commit}, VRAM slots to come {}", gib(locked), gib(banks_total), gib(by_memory),
+                  gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state, banks_total);
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
