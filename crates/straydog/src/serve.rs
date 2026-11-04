@@ -46,7 +46,7 @@ fn drafter_clause(settings: &config::Settings) -> String {
     let off = |name| std::env::var_os(name).is_some_and(|value| value == "0");
     let mtp = settings.model_draft.is_some().then_some(settings.draft_max).filter(|&drafts| drafts > 0);
     let dspark = !off("DS41_DSPARK") && !off("DS41_DRAFTS")
-        && matches!(straydog_engine::bundle::dspark_in(&settings.model, &settings.quant), Ok(Some(_)));
+        && matches!(straydog_engine::bundle::dspark_in(&settings.model, settings.bundle), Ok(Some(_)));
     drafter_phrase(mtp, dspark)
 }
 
@@ -72,7 +72,7 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     tokio.block_on(async move {
         tracing::info!(
             "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
-            settings.quant,
+            settings.bundle,
             settings.model.display(),
             settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
             match &settings.vram { Vram::Auto => "auto".into(), budgets => format!("{budgets} GiB") },
@@ -92,7 +92,7 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             None => {
                 let prepared = settings.clone();
                 Runtime::start_prepared(&settings, Box::new(move |progress| {
-                    for name in straydog_provision::ensure_trees(&prepared.model, &prepared.quant, &prepared.data_dir, progress)? {
+                    for name in straydog_provision::ensure_trees(&prepared.model, prepared.bundle, &prepared.data_dir, progress)? {
                         tracing::info!("Straydog verified {name} (its verity tree is built)");
                     }
                     runtime::worker_command(&prepared)
@@ -102,7 +102,7 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         let api = straydog_api::ApiConfig {
             model_id: settings.alias.clone(),
             context: u64::from(settings.ctx_size),
-            quantization: settings.quant.clone(),
+            quantization: settings.bundle.quant.to_string(),
             api_key: settings.api_key.clone(),
             sampling: straydog_api::SamplingDefaults {
                 temperature: settings.temp,
@@ -119,7 +119,7 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
                 Effort::High => ReasoningEffort::High,
             },
             created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs()),
-            markup: straydog_engine::bundle::architecture_of(&settings.quant)
+            markup: straydog_engine::bundle::architecture_of(settings.bundle)
                 .ok()
                 .and_then(|architecture| straydog_api::Markup::of_architecture(&architecture))
                 .ok_or("no reply markup for this model")?,

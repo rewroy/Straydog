@@ -19,9 +19,9 @@ fn main() -> Result<(), String> {
         return Err("usage: ds41_vision MODEL_DIR IMAGE OUT".into());
     };
     let root = Path::new(model);
-    let vision = bundle::vision_source("GSQ-RCO-IQ2_XS")?.ok_or("no vision encoder pinned")?;
+    let vision = bundle::vision_source(bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS")?)?.ok_or("no vision encoder pinned")?;
     let pins = OnDemand {
-        model: "DeepSeek-V4.1-Flash".into(), architecture: bundle::VISION_ARCHITECTURE.into(), quantization: "vision".into(),
+        model: bundle::DEEPSEEK.into(), architecture: bundle::VISION_ARCHITECTURE.into(), quantization: "vision".into(),
         shards: vec![vision.asset], verity: vec![vision.verity], resources: Vec::new(), sidecars: Vec::new(),
     };
     let files = Pinned::open(root, &bundle::default_data_dir(root), &pins)?;

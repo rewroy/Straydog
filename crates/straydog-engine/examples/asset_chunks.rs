@@ -18,8 +18,8 @@ fn find(directories: &[PathBuf], name: &str) -> Option<PathBuf> {
 fn main() -> Result<(), String> {
     let directories: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
     let mut assets: BTreeMap<String, (Asset, PathBuf)> = BTreeMap::new();
-    for quantization in bundle::QUANTIZATIONS {
-        let pins = bundle::bundle(quantization)?;
+    for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
+        let pins = bundle::bundle(id)?;
         for asset in pins.shards.into_iter().chain([pins.drafter]) {
             let Some(path) = find(&directories, &asset.name) else {
                 eprintln!("not found: {}", asset.name);

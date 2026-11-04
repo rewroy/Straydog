@@ -1,11 +1,12 @@
 {
   "schema": 1,
-  "model": "DeepSeek-V4.1-Flash",
+  "model": "DeepSeek-V4.1-Flash-1017",
+  "provider": "ISTA-DASLab",
   "architecture": "deepseek41",
   "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
   "revision": "cb02422c900df489cea5833e8a92171224059b3c",
   "bundles": {
-    "GSQ-RCO-IQ2_XS": {
+    "IQ2_XS": {
       "assets": [
         {
           "name": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf",
@@ -47,7 +48,7 @@
         }
       ]
     },
-    "GSQ-RCO-IQ2_XXS": {
+    "IQ2_XXS": {
       "revision": "a419d74cd28d5b9f8c5e2b9077d11a609c17bc32",
       "assets": [
         {

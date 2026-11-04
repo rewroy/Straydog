@@ -395,13 +395,13 @@ Its definitions follow the reference implementation, checked layer by layer agai
 
 ### 7.1 Bundles and layout
 
-Pinned bundles:
-- **GSQ-RCO-IQ2_XXS** (ISTA, the default). Its experts are IQ1_M in 20 layers, IQ2_XXS in 14 and
+Pinned bundles (a bundle is named by its model, provider and quantization: two providers name their quantizations alike):
+- **ISTA-DASLab IQ2_XXS** (GSQ-RCO, the default). Its experts are IQ1_M in 20 layers, IQ2_XXS in 14 and
   IQ2_XS in 6.
-- **GSQ-RCO-IQ2_XS** (ISTA).
-- **UD-IQ1_M** (Unsloth), the size of GSQ-RCO-IQ2_XXS: four shards, its Engram tables the same
+- **ISTA-DASLab IQ2_XS** (GSQ-RCO).
+- **Unsloth UD-IQ1_M**, the size of ISTA-DASLab's IQ2_XXS: four shards, its Engram tables the same
   bytes as ISTA's file, which it pins as its fifth (a manifest item may name its own repository).
-- **UD-IQ2_XXS** (Unsloth).
+- **Unsloth UD-IQ2_XXS**.
 
 Optional files sit beside a bundle: the DSpark drafter (§7.4) and the vision encoder (§7.5).
 
@@ -617,7 +617,8 @@ How an image is read:
 
 ## 8. Qwen3.8-Flash-Next
 
-Qwen3.8-Flash-Next is served from four pinned bundles (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) with the
+Qwen3.8-Flash-Next is served from five pinned bundles (ISTA-DASLab's GSQ-RCO Q2_0, IQ2_XS, IQ3_XXS and
+IQ3_S, two shards each, and Unsloth's UD-IQ1_M, three shards: the first holds the metadata alone) with the
 tokenizer and template files of the official release, and optionally with its MTP drafter.
 `straydog fetch-mtp` builds the drafter from the official tensors, byte for byte the pinned file.
 Its experts are quantized to Q2_0, which changes only how many drafts are accepted.
@@ -947,7 +948,7 @@ named as llama-server names it where it has the same setting.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `-m, --model DIR` | model bundle directory, or its first shard | the settings `setup` wrote |
-| `--quant NAME` | the bundle, when the directory alone does not say | detected from the pinned files |
+| `--model-name NAME`, `--provider NAME`, `--quant NAME` | the bundle's three labels, where the directory alone does not say | detected from the pinned files |
 | `-md, --model-draft DIR` | Qwen3.8's MTP drafter | none |
 | `--mmproj FILE` | Qwen3.8's vision encoder and projector (§8.1) | a `mmproj-*.gguf` in the model's directory or the one above it |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
@@ -983,8 +984,8 @@ computing them.
 
 **Subcommands.**
 - `straydog setup`: the first run.
-- `straydog fetch -m DIR --quant NAME`: download, resume and authenticate a bundle, with its
-  extras.
+- `straydog fetch -m DIR [--model-name NAME] [--provider NAME] --quant NAME`: download, resume and authenticate a
+  bundle, with its extras; the labels that name one bundle will do.
 - `straydog verify`: authenticate a bundle and build its verity trees.
 - `straydog fetch-mtp`: build Qwen3.8's MTP drafter.
 

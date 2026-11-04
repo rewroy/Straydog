@@ -22,8 +22,8 @@ fn main() -> Result<(), String> {
     std::fs::create_dir_all(data_dir.join("verity")).map_err(|exc| exc.to_string())?;
     // Per whole-file SHA-256: the assets pinned with it (a file shared by bundles has a name in each).
     let mut assets: BTreeMap<String, (Vec<Asset>, PathBuf)> = BTreeMap::new();
-    for quantization in bundle::QUANTIZATIONS {
-        for asset in bundle::bundle(quantization)?.shards {
+    for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
+        for asset in bundle::bundle(id)?.shards {
             let Some(path) = find(directories, &asset.name) else {
                 eprintln!("not found: {}", asset.name);
                 continue;

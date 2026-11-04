@@ -41,7 +41,7 @@ struct Loaded<E: Engines> {
 const ENCODED_BYTES: usize = 512 << 20;
 
 /// How an architecture's engines are placed.
-type Place<E> = fn(&Path, &str, &Path, &Settings, &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Session<E>, String>;
+type Place<E> = fn(&Path, bundle::Id, &Path, &Settings, &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Session<E>, String>;
 
 /// A request for the model's thread.
 enum Job {
@@ -90,7 +90,7 @@ impl Served for Handle {
 }
 
 pub(crate) fn main(args: &WorkerArgs, plan: &Plan, output: Output, report: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<(), String> {
-    match bundle::architecture_of(&args.quant)?.as_str() {
+    match bundle::architecture_of(args.bundle()?)?.as_str() {
         "deepseek41" => run::<deepseek41::serve::Engines>(args, plan, output, report, deepseek41::serve::place),
         other => Err(format!("no engine for the {other} architecture")),
     }
@@ -106,7 +106,7 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
         vram_bytes: plan.budgets.clone(),
         context: args.context,
         // (0: the architecture's own choice, from the memory it has: DeepSeek-V4.1's)
-        batch: if args.prefill_batch_size == "auto" && bundle::architecture_of(&args.quant)? == "deepseek41" { 0 } else { plan.batch },
+        batch: if args.prefill_batch_size == "auto" && bundle::architecture_of(args.bundle()?)? == "deepseek41" { 0 } else { plan.batch },
         host_expert_bytes: args.host_expert_bytes,
         host_memory_bytes,
         row_cache_bytes: args.row_cache_bytes.unwrap_or(straydog_engine::rows::DEFAULT_CACHE_BYTES),
@@ -212,13 +212,14 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
 fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, report: &(dyn Fn(&str, u64, u64) + Sync),
                     place: Place<E>) -> Result<(Loaded<E>, Value, Arc<Text>), String> {
     report("open", 0, 0);
-    let mut model = place(&args.model, &args.quant, data_dir, settings, report)?;
+    let id = args.bundle()?;
+    let mut model = place(&args.model, id, data_dir, settings, report)?;
     report("prepare", 0, 0);
     let header = model.header();
     let architecture = header.architecture.clone();
     // The official tokenizer and chat template when the bundle pins them, else the GGUF's (but
     // DeepSeek-V4.1's own: not every GGUF carries the reference's).
-    let resources = bundle::on_demand(&args.quant)?.resources;
+    let resources = bundle::on_demand(id)?.resources;
     let resource = |name: &str| resources.iter().find(|asset| asset.name == name)
         .map(|asset| straydog_engine::pinned::resource(&args.model, asset)).transpose();
     let text = match resource("tokenizer.json")? {
@@ -248,8 +249,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     let card = model.card.clone();
     let frame = json!({
         "event": "ready", "protocol": 1, "engine": "Straydog",
-        "model": straydog_engine::bundle::model_of(&args.quant)?, "architecture": architecture,
-        "quantization": args.quant, "context": model.context, "state_bytes": model.state_bytes, "speculative_drafts": 0,
+        "model": id.model, "provider": id.provider, "architecture": architecture,
+        "quantization": id.quant, "context": model.context, "state_bytes": model.state_bytes, "speculative_drafts": 0,
         "speculation": speculation(&model.placement),
         "placement": model.placement,
         "sampling": {"temperature": card.temperature, "top_k": card.top_k, "top_p": card.top_p, "min_p": card.min_p,

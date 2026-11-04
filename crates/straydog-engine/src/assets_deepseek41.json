@@ -1,6 +1,7 @@
 {
   "schema": 1,
-  "model": "DeepSeek-V4.1-Flash",
+  "model": "DeepSeek-V4.1-Flash-1017",
+  "provider": "Unsloth",
   "architecture": "deepseek41",
   "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
   "revision": "60ad3651641b5c97679c807e064ab1d7a3ca1455",

@@ -102,6 +102,7 @@ type EmbeddingCache = (HashMap<i64, Arc<Vec<f32>>>, VecDeque<i64>);
 
 pub struct Weights {
     pub root: PathBuf,
+    pub bundle: bundle::Id,
     pub quantization: String,
     /// Measured outside isolation by the runtime (cgroup limits included).
     pub host_memory_bytes: u64,
@@ -244,11 +245,13 @@ fn tree_is_current(file: &File, tree: &Path) -> bool {
 impl Weights {
     /// Open the pinned bundle: resources and headers authenticated, tensors not yet read
     /// (placement may run; [`crate::load::load`] or [`Weights::authenticate`] reads them).
-    pub fn open(root: &Path, quantization: &str, drafter: Option<&Path>, host_memory_bytes: u64,
+    pub fn open(root: &Path, id: bundle::Id, drafter: Option<&Path>, host_memory_bytes: u64,
                 progress: Progress) -> Result<Weights, String> {
-        let pins = bundle::bundle(quantization)?;
-        if pins.shards.len() != 2 {
-            return Err(error("Straydog requires both fixed model shards"));
+        let pins = bundle::bundle(id)?;
+        // (GSQ-RCO's two shards, Unsloth's three: its first holds the metadata alone)
+        let shards = pins.shards.len();
+        if shards == 0 {
+            return Err(error("Straydog bundle without shards"));
         }
         let names: HashSet<&str> = pins.resources.iter().map(|asset| asset.name.as_str()).collect();
         if names != HashSet::from(["tokenizer.json", "chat_template.jinja", "config.json"]) {
@@ -257,7 +260,8 @@ impl Weights {
         let root = absolute_directory(root)?;
         let mut weights = Weights {
             root: root.clone(),
-            quantization: quantization.to_string(),
+            bundle: id,
+            quantization: id.quant.to_string(),
             host_memory_bytes: if host_memory_bytes > 0 { host_memory_bytes } else { crate::host::host_memory_bytes() },
             integer_arrays: BTreeMap::new(),
             resources: HashMap::new(),
@@ -296,14 +300,14 @@ impl Weights {
         });
         for (index, (((file, pieces), header), asset)) in opened.into_iter().zip(headers).zip(assets).enumerate() {
             let header = header?;
-            if index == 2 {
+            if index == shards {
                 weights.add_drafter(asset, file, pieces, header)?;
                 continue;
             }
-            if header.shard_count != 2 || header.shard_index != index as u64 {
+            if header.shard_count != shards as u64 || header.shard_index != index as u64 {
                 return Err(error("Straydog shard identity mismatch"));
             }
-            let architecture_ok = header.architecture == "qwen4exp" || (index == 1 && header.architecture.is_empty());
+            let architecture_ok = header.architecture == "qwen4exp" || (index > 0 && header.architecture.is_empty());
             if !architecture_ok {
                 return Err(error("Straydog architecture mismatch"));
             }
@@ -313,7 +317,7 @@ impl Weights {
             weights.add_tensors(index, &header.tensors)?;
             weights.integer_arrays.extend(header.integer_arrays.clone());
             weights.map(&asset.name, file, pieces)?;
-            if index == 1 && weights.tensors.len() != TENSOR_COUNT {
+            if index == shards - 1 && weights.tensors.len() != TENSOR_COUNT {
                 return Err(error("Straydog model tensor count mismatch"));
             }
         }
@@ -326,7 +330,7 @@ impl Weights {
     pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
         let mut verifiers = vec![None; self.files.len()];
         let mut current = vec![false; self.files.len()];
-        for (asset, digest) in bundle::verity_pins(&self.quantization)? {
+        for (asset, digest) in bundle::verity_pins(self.bundle)? {
             let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
             let tree = bundle::tree_path(data_dir, &asset);
             current[index] = tree_is_current(&self.files[index], &tree);
@@ -874,7 +878,7 @@ mod tests {
     fn opening_a_directory_does_not_resolve_it_first() {
         // With the directory resolved, the error would be about the directory; it is about the first file read in it.
         let path = missing();
-        let Err(message) = Weights::open(&path, "IQ2_XS", None, 0, &|_, _, _| {}) else { panic!("a missing directory opened") };
+        let Err(message) = Weights::open(&path, bundle::Id::find(Some(bundle::MODEL), None, "IQ2_XS").unwrap(), None, 0, &|_, _, _| {}) else { panic!("a missing directory opened") };
         assert!(!message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("os error"), "{message}");
     }

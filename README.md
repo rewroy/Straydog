@@ -58,18 +58,18 @@ sizes and what each needs, and recommends one; it asks where to put it (by defau
 platform's data folder), checks the free space, resumes or verifies what is there already, adds
 the extras you choose (DSpark and vision for DeepSeek-V4.1, MTP and vision for Qwen3.8) and writes
 `config.toml` in the platform's config folder, which a plain `straydog` reads. Every answer is
-also an option: `straydog setup --yes --quant GSQ-RCO-IQ2_XXS --dir ~/models` asks nothing
+also an option: `straydog setup --yes --model-name DeepSeek-V4.1-Flash-1017 --provider ISTA-DASLab --quant IQ2_XXS --dir ~/models` asks nothing
 (`--offline` downloads nothing, `--config FILE` writes the settings elsewhere).
 
 By hand, and for scripts that name their model:
 
 ```bash
-# DeepSeek-V4.1-Flash: download and authenticate a bundle (once), then serve it
-straydog fetch -m ~/models/ds41 --quant GSQ-RCO-IQ2_XXS
+# DeepSeek-V4.1-Flash-1017: download and authenticate a bundle (once), then serve it
+straydog fetch -m ~/models/ds41 --model-name DeepSeek-V4.1-Flash-1017 --provider ISTA-DASLab --quant IQ2_XXS
 straydog -m ~/models/ds41 -gpu 0,1 --api-key-file ~/.straydog-key
 
 # Qwen3.8-Flash-Next with its MTP drafter
-straydog fetch -m ~/models/IQ3_S --quant IQ3_S
+straydog fetch -m ~/models/IQ3_S --model-name Qwen3.8-Flash-Next --provider ISTA-DASLab --quant IQ3_S
 straydog fetch-mtp --model-draft ~/models/mtp       # build the MTP drafter (once, optional)
 straydog -m ~/models/IQ3_S -md ~/models/mtp -gpu 0,1 --api-key-file ~/.straydog-key
 ```
@@ -92,20 +92,28 @@ and `--config FILE` reads them from a TOML file (with no `--config` and no model
 `setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
 settings in effect and where each came from.
 
-| Model | Bundle (`--quant`) | Size | |
-| --- | --- | ---: | --- |
-| DeepSeek-V4.1-Flash | GSQ-RCO-IQ2_XXS | 248.8 GB | ISTA's recommended build; the faster where VRAM is short |
-| | GSQ-RCO-IQ2_XS | 265.8 GB | |
-| | UD-IQ1_M | 250.4 GB | Unsloth's; the size of GSQ-RCO-IQ2_XXS |
-| | UD-IQ2_XXS | 300.5 GB | Unsloth's |
-| Qwen3.8-Flash-Next | Q2_0 | 66.4 GB | the fastest |
-| | IQ2_XS | 68.0 GB | |
-| | IQ3_XXS | 75.8 GB | |
-| | IQ3_S | 83.6 GB | closest to BF16 |
+A bundle is named by three labels: its model (`--model-name`), its provider, who quantized it
+(`--provider`), and its quantization (`--quant`). Where fewer name one bundle, fewer will do;
+the server takes all three from the files in `-m`.
+
+| Model | Provider | Quantization | Size | |
+| --- | --- | --- | ---: | --- |
+| DeepSeek-V4.1-Flash-1017 | ISTA-DASLab | IQ2_XXS | 248.8 GB | ISTA's recommended build (GSQ-RCO); the faster where VRAM is short |
+| | ISTA-DASLab | IQ2_XS | 265.8 GB | |
+| | Unsloth | UD-IQ1_M | 250.4 GB | the size of ISTA-DASLab's IQ2_XXS |
+| | Unsloth | UD-IQ2_XXS | 300.5 GB | |
+| Qwen3.8-Flash-Next | ISTA-DASLab | Q2_0 | 66.4 GB | the fastest |
+| | ISTA-DASLab | IQ2_XS | 68.0 GB | |
+| | ISTA-DASLab | IQ3_XXS | 75.8 GB | |
+| | ISTA-DASLab | IQ3_S | 83.6 GB | closest to BF16 |
+| | Unsloth | UD-IQ1_M | 68.0 GB | Dynamic V3.1 |
+
+Settings files of 0.1.3 and before name DeepSeek-V4.1's ISTA-DASLab bundles by their files'
+names (GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS) and the model DeepSeek-V4.1-Flash: they are read as these.
 
 DeepSeek-V4.1's sizes include its 110.6 GB Engram tables, which stay on the SSD and are read
 a few rows per token; its DSpark drafter adds 8.0 GB. On two R9700s and 128 GB of RAM,
-GSQ-RCO-IQ2_XXS decodes 57-77 tokens/s (prose to code) once a request's experts are in memory.
+ISTA-DASLab's IQ2_XXS decodes 57-77 tokens/s (prose to code) once a request's experts are in memory.
 
 ## Use
 
@@ -207,8 +215,8 @@ STRAYDOG_MODEL=DIR STRAYDOG_DRAFTER=DIR cargo test -p straydog-engine --features
 STRAYDOG_MODEL=DIR cargo test -p straydog --features hip --test runtime_gpu
 cargo test -p straydog-engine --features hip --test gemm_gpu
 # DeepSeek-V4.1 served end to end, with and without DSpark (STRAYDOG_DS41_QUANT names the bundle)
-STRAYDOG_DS41=DIR STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS cargo test -p straydog-engine --features hip --test deepseek41_served
-STRAYDOG_DS41=DIR STRAYDOG_DS41_QUANT=GSQ-RCO-IQ2_XXS cargo test -p straydog-engine --features hip --test deepseek41_dspark_served
+STRAYDOG_DS41=DIR STRAYDOG_DS41_QUANT=IQ2_XXS cargo test -p straydog-engine --features hip --test deepseek41_served
+STRAYDOG_DS41=DIR STRAYDOG_DS41_QUANT=IQ2_XXS cargo test -p straydog-engine --features hip --test deepseek41_dspark_served
 # A/B of this build against another
 cargo run --release --features hip --example ab -- --baseline BIN --model DIR --drafter DIR --output ab.json
 # The dashboard over a simulated engine (no GPU, no model): http://127.0.0.1:18090/dashboard

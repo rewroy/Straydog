@@ -43,7 +43,13 @@ enum Command {
         /// The bundle directory
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
-        /// Qwen3.8-Flash-Next: Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB); DeepSeek-V4.1-Flash: GSQ-RCO-IQ2_XXS (248.8 GB), UD-IQ1_M (250.4 GB), GSQ-RCO-IQ2_XS (265.8 GB), UD-IQ2_XXS (300.5 GB). `straydog setup` chooses for you
+        /// The bundle's model: Qwen3.8-Flash-Next or DeepSeek-V4.1-Flash-1017 (needed where another model has a bundle of the provider and quantization given)
+        #[arg(long = "model-name", value_name = "NAME")]
+        model_name: Option<String>,
+        /// The bundle's provider: ISTA-DASLab or Unsloth (needed where another provider has a bundle of the model and quantization given)
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
+        /// Qwen3.8-Flash-Next: ISTA-DASLab's Q2_0 (66.4 GB), IQ2_XS (68.0 GB), IQ3_XXS (75.8 GB), IQ3_S (83.6 GB), Unsloth's UD-IQ1_M (68.0 GB); DeepSeek-V4.1-Flash-1017: ISTA-DASLab's IQ2_XXS (248.8 GB), IQ2_XS (265.8 GB), Unsloth's UD-IQ1_M (250.4 GB), UD-IQ2_XXS (300.5 GB). `straydog setup` chooses for you
         #[arg(long, value_name = "NAME")]
         quant: String,
         /// Authenticate what is there; download nothing
@@ -57,6 +63,10 @@ enum Command {
     Verify {
         #[arg(short = 'm', long, value_name = "DIR")]
         model: PathBuf,
+        #[arg(long = "model-name", value_name = "NAME")]
+        model_name: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
         #[arg(long, value_name = "NAME")]
         quant: String,
         /// Where the shards' verity trees go [default: .straydog in the bundle directory]
@@ -93,11 +103,14 @@ fn main() -> ExitCode {
             serve::main(&matches, file.as_deref(), cli.print_config)
         }
         Some(Command::Setup(args)) => setup::main(&args),
-        Some(Command::Fetch { model, quant, offline, data_dir }) => {
-            straydog_provision::fetch(&model, &quant, offline, data_dir.as_deref(), &progress::report)
+        Some(Command::Fetch { model, model_name, provider, quant, offline, data_dir }) => {
+            straydog_engine::bundle::Id::find(model_name.as_deref(), provider.as_deref(), &quant)
+                .and_then(|id| straydog_provision::fetch(&model, id, offline, data_dir.as_deref(), &progress::report))
         }
-        Some(Command::Verify { model, quant, data_dir }) => {
-            straydog_provision::verify(&model, &quant, data_dir.as_deref(), &progress::report)
+        Some(Command::Verify { model, model_name, provider, quant, data_dir }) => {
+            // (a bundle there already: the labels it fits that leave others open name the one whose shards are there)
+            config::find_bundle(&model, model_name.as_deref(), provider.as_deref(), Some(&quant))
+                .and_then(|id| straydog_provision::verify(&model, id, data_dir.as_deref(), &progress::report))
         }
         Some(Command::FetchMtp { directory, keep_source }) => {
             straydog_provision::fetch_drafter(&directory, keep_source, &progress::report)

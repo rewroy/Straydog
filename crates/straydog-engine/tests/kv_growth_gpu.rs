@@ -21,7 +21,7 @@ fn open_with(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>, quantiza
     let budget = 24u64 << 30;
     let mut group = Group::new(&[0], &[budget], SplitMode::Experts).unwrap();
     group.configure_gemm(2, true).unwrap();
-    let weights = Weights::open(&PathBuf::from(root), quantization, drafter.map(PathBuf::from).as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    let weights = Weights::open(&PathBuf::from(root), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quantization).unwrap(), drafter.map(PathBuf::from).as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     let settings = Settings { context: 262144, state_budget_bytes: 14 << 30, prefill_batch_size: 4096, speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0, row_cache_bytes: None };
     Model::new(weights, group, &settings, &|_, _, _| {}).unwrap()
 }

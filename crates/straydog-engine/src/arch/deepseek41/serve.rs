@@ -593,12 +593,12 @@ fn off(name: &str) -> bool {
 /// DSpark's file, opened and authenticated, when the model's drafter is pinned, lies in its directory
 /// ([`bundle::dspark_in`]) and can sit beside an engine: DS41_DSPARK=0 leaves it out, and so does
 /// DS41_DRAFTS=0 (no verify passes to draft for). Its layout is checked against the model's.
-fn open_dspark(root: &Path, quantization: &str, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)])
+fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)])
                -> Result<Option<(Pinned, DsparkPlan)>, String> {
     if off("DS41_DSPARK") || off("DS41_DRAFTS") {
         return Ok(None);
     }
-    let Some((source, path)) = bundle::dspark_in(root, quantization)? else { return Ok(None) };
+    let Some((source, path)) = bundle::dspark_in(root, id)? else { return Ok(None) };
     let (first, last) = (TAP_LAYERS[0], TAP_LAYERS[TAP_LAYERS.len() - 1]);
     let Some(engine) = groups.iter().position(|(_, range)| range.start <= first && range.end > last) else {
         eprintln!("Straydog DSpark: layers {first}-{last} are split between engines: no drafter");
@@ -677,12 +677,12 @@ fn layer_of(name: &str) -> Option<usize> {
 
 /// Open and authenticate the pinned bundle in `root` (trees from `data_dir`) and place it.
 /// `progress` gets (stage, done, total).
-pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settings,
+pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
              progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Model, String> {
     let started = Instant::now();
-    let mut pins = bundle::on_demand(quantization)?;
+    let mut pins = bundle::on_demand(id)?;
     // The vision encoder, when its file is there (the model reads no images without it).
-    if let Some(vision) = bundle::vision_source(quantization)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
+    if let Some(vision) = bundle::vision_source(id)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
         pins.sidecars.push(bundle::Sidecar { asset: vision.asset, verity: vision.verity, architecture: bundle::VISION_ARCHITECTURE.into() });
     }
     let mut files = Pinned::open(root, data_dir, &pins)?;
@@ -730,7 +730,7 @@ pub fn place(root: &Path, quantization: &str, data_dir: &Path, settings: &Settin
     };
     // DSpark, when its file is there: opened (and its layout checked against the model's), and
     // the VRAM it takes counted with the engine it sits beside.
-    let (dspark_files, dspark_plan) = match open_dspark(root, quantization, data_dir, &files, &groups)? {
+    let (dspark_files, dspark_plan) = match open_dspark(root, id, data_dir, &files, &groups)? {
         Some((files, plan)) => (Some(files), Some(plan)),
         None => (None, None),
     };
