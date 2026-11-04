@@ -303,18 +303,24 @@ fn refusal_of(settings: &Settings) -> Refusal {
     }
 }
 
-/// The reason a worker failed to start: the last line it wrote to standard error that is not a
-/// warning of its launcher's (cut to its last 500 characters), or `message` when it wrote none.
+/// The reason a worker failed to start, cut to its last 500 characters: the panic it ended in (its
+/// `panicked at` line and the message after it, without Rust's backtrace note), else the last line
+/// it wrote to standard error that is not a warning of its launcher's; or `message` when it wrote
+/// none.
 fn start_reason(tail: &str, message: String) -> String {
-    let last = tail
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with(straydog_isolation::LAUNCHER_WARNING));
-    match last {
-        Some(line) => line.chars().skip(line.chars().count().saturating_sub(500)).collect(),
-        None => message,
-    }
+    let lines: Vec<&str> = tail.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let panic = lines.iter().rposition(|line| line.starts_with("thread '") && line.contains("' panicked at "));
+    let reason = match panic {
+        Some(at) => {
+            let message = lines[at + 1..].iter().take_while(|line| !line.starts_with("note: ") && **line != "stack backtrace:");
+            std::iter::once(&lines[at]).chain(message).copied().collect::<Vec<_>>().join(" ")
+        }
+        None => match lines.iter().rev().find(|line| !line.starts_with(straydog_isolation::LAUNCHER_WARNING)) {
+            Some(line) => line.to_string(),
+            None => return message,
+        },
+    };
+    reason.chars().skip(reason.chars().count().saturating_sub(500)).collect()
 }
 
 /// Whether the reason says the OS refused the worker access (so the server looks for why).
@@ -1423,6 +1429,21 @@ mod tests {
         let long = format!("{}end (os error 5)", "あ".repeat(600));
         let reason = start_reason(&long, String::new());
         assert_eq!((reason.chars().count(), reason.ends_with("end (os error 5)")), (500, true));
+    }
+
+    /// A worker that panicked while it started is reported by its panic and the message after it,
+    /// never by Rust's note on how to see a backtrace (nor by the backtrace itself).
+    #[test]
+    fn a_panicking_worker_is_reported_by_its_panic_not_the_backtrace_note() {
+        let panic = "thread 'main' panicked at crates/straydog/src/worker.rs:88:14:\ncalled `Option::unwrap()` on a `None` value";
+        let reason = "thread 'main' panicked at crates/straydog/src/worker.rs:88:14: called `Option::unwrap()` on a `None` value";
+        let note = "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace";
+        assert_eq!(start_reason(&format!("Straydog loading weights\n{panic}\n{note}\n"), "ended".into()), reason);
+        // a message over several lines, and a backtrace printed after it
+        let tail = format!("{panic}\nsecond line\r\nstack backtrace:\n   0: rust_begin_unwind\n{note}\n");
+        assert_eq!(start_reason(&tail, "ended".into()), format!("{reason} second line"));
+        // the panic is found even when the worker wrote more after it
+        assert_eq!(start_reason(&format!("{panic}\n{note}\nStraydog worker ended\n"), "ended".into()), reason);
     }
 
     /// A worker the OS refused is told why after its own reason; any other failure reads as before.
