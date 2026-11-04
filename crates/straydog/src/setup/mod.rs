@@ -466,6 +466,7 @@ fn listing(entries: &[Entry], machine: &Machine) -> serde_json::Value {
             })).collect::<Vec<_>>(),
             "gpu_error": machine.gpu_error,
             "ram_bytes": machine.ram,
+            "free_ram_bytes": machine.free_ram,
         },
         "bundles": bundles,
     })
