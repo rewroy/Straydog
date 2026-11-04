@@ -77,7 +77,7 @@ fn main() -> Result<(), String> {
     let mut group = Group::new(&devices, &vec![budget; devices.len()], split)?;
     group.configure_gemm(gemm_min_batch, half_gemm)?;
     let root = PathBuf::from(model);
-    let weights = Weights::open(&root, quant, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    let weights = Weights::open(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(4096),
                               speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,

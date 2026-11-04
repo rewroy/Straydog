@@ -186,7 +186,9 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
         args.push(value.into());
     };
     push("model", settings.model.display().to_string());
-    push("quant", settings.quant.clone());
+    push("model-name", settings.bundle.model.to_string());
+    push("provider", settings.bundle.provider.to_string());
+    push("quant", settings.bundle.quant.to_string());
     if let (Some(drafter), true) = (&settings.model_draft, settings.draft_max > 0) {
         push("drafter", drafter.display().to_string());
         push("speculative", settings.draft_max.to_string());
@@ -219,7 +221,7 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
 /// The verity trees the worker reads: the pinned shards' in the data directory.
 fn trees(settings: &Settings) -> Result<Vec<PathBuf>, String> {
     use straydog_engine::bundle;
-    Ok(bundle::verity_pins_in(&settings.model, &settings.quant)?.iter().map(|(asset, _)| bundle::tree_path(&settings.data_dir, asset)).collect())
+    Ok(bundle::verity_pins_in(&settings.model, settings.bundle)?.iter().map(|(asset, _)| bundle::tree_path(&settings.data_dir, asset)).collect())
 }
 
 /// Whether verity trees are still to be built before the worker can start.
@@ -241,14 +243,14 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
         return Err(format!("no verity tree {}: it is built at the server's start, or by `straydog verify`", tree.display()));
     }
     let tree_directory = Some(settings.data_dir.join("verity")).filter(|directory| directory.is_dir());
-    if bundle::is_on_demand(&settings.quant) {
-        let pins = bundle::on_demand(&settings.quant)?;
+    if settings.bundle.is_on_demand() {
+        let pins = bundle::on_demand(settings.bundle)?;
         let sidecars = pins.sidecars.iter().map(|sidecar| &sidecar.asset);
         let mut files: Vec<PathBuf> =
             pins.shards.iter().chain(&pins.resources).chain(sidecars).map(|asset| settings.model.join(&asset.name)).collect();
         // (the vision encoder and DSpark's drafter when they are there: their trees are among the trees then)
-        files.extend(bundle::vision_source(&settings.quant)?.map(|vision| settings.model.join(&vision.asset.name)).filter(|path| path.is_file()));
-        files.extend(bundle::dspark_in(&settings.model, &settings.quant)?.map(|(_, path)| path));
+        files.extend(bundle::vision_source(settings.bundle)?.map(|vision| settings.model.join(&vision.asset.name)).filter(|path| path.is_file()));
+        files.extend(bundle::dspark_in(&settings.model, settings.bundle)?.map(|(_, path)| path));
         files.extend(trees);
         return Ok(straydog_isolation::Exposure {
             executable: std::env::current_exe().map_err(|exc| exc.to_string())?,
@@ -258,7 +260,7 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
             secrets: settings.api_key_file.iter().cloned().collect(),
         });
     }
-    let pins = straydog_engine::bundle::bundle(&settings.quant)?;
+    let pins = straydog_engine::bundle::bundle(settings.bundle)?;
     let mut files: Vec<PathBuf> =
         pins.shards.iter().chain(&pins.resources).map(|asset| settings.model.join(&asset.name)).collect();
     let mut directories = vec![settings.model.clone()];
@@ -776,7 +778,7 @@ impl Runtime {
         let driver = Driver {
             shared: shared.clone(),
             timeout: Duration::from_secs_f64(settings.startup_timeout),
-            expected: (settings.ctx_size as u64, settings.quant.clone()),
+            expected: (settings.ctx_size as u64, settings.bundle),
             verbose: settings.verbose,
             warm_directory: Some(settings.data_dir.join("warm")),
             cancel_patience,
@@ -835,7 +837,7 @@ impl Runtime {
 struct Driver {
     shared: Arc<Shared>,
     timeout: Duration,
-    expected: (u64, String),
+    expected: (u64, straydog_engine::bundle::Id),
     verbose: bool,
     /// Where the expert store's contents are kept between runs (`<data-dir>/warm`), if anywhere.
     warm_directory: Option<PathBuf>,
@@ -956,10 +958,10 @@ impl Driver {
     fn warm_path(&self) -> Option<PathBuf> {
         use sha2::Digest;
         let directory = self.warm_directory.as_ref()?;
-        let quant = &self.expected.1;
+        let quant = self.expected.1.quant;
         let mut key = sha2::Sha256::new();
         key.update(b"straydog warm-up state 2\n");
-        for shard in straydog_engine::bundle::shards(quant).ok()? {
+        for shard in straydog_engine::bundle::shards(self.expected.1).ok()? {
             key.update(shard.sha256.as_bytes());
         }
         let key: String = key.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
@@ -974,7 +976,7 @@ impl Driver {
         if path.is_file() {
             return Some(path);
         }
-        let prefix = format!("{}-", self.expected.1);
+        let prefix = format!("{}-", self.expected.1.quant);
         std::fs::read_dir(path.parent()?).ok()?.flatten()
             .filter(|entry| entry.file_name().to_str().is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json")))
             .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
@@ -1149,11 +1151,11 @@ impl Driver {
                     self.set(Phase::Loading(json!({"stage": stage, "done": done, "total": total})));
                     continue;
                 }
-                let (context, quant) = &self.expected;
+                let (context, id) = &self.expected;
                 if frame["event"] != "ready" || frame["protocol"] != 1 || frame["engine"] != "Straydog"
                     || frame["context"].as_u64() != Some(*context)
-                    || frame["model"].as_str() != straydog_engine::bundle::model_of(quant).ok().as_deref()
-                    || frame["quantization"].as_str() != Some(quant)
+                    || frame["model"].as_str() != Some(id.model) || frame["provider"].as_str() != Some(id.provider)
+                    || frame["quantization"].as_str() != Some(id.quant)
                 {
                     return Err("Straydog startup contract mismatch".to_string());
                 }

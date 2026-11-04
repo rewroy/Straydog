@@ -35,6 +35,11 @@ pub const FRAME_BYTES: usize = straydog_api::BODY_LIMIT + (16 << 20);
 pub struct WorkerArgs {
     #[arg(long)]
     pub model: PathBuf,
+    /// The bundle's three labels ([`straydog_engine::bundle::Id`]).
+    #[arg(long)]
+    pub model_name: String,
+    #[arg(long)]
+    pub provider: String,
     #[arg(long)]
     pub quant: String,
     #[arg(long)]
@@ -277,14 +282,22 @@ fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> R
     Ok(chosen)
 }
 
+impl WorkerArgs {
+    /// The pinned bundle its labels name.
+    pub fn bundle(&self) -> Result<straydog_engine::bundle::Id, String> {
+        straydog_engine::bundle::Id::find(Some(&self.model_name), Some(&self.provider), &self.quant)
+    }
+}
+
 /// The budgets, batch and split for `args`. Budgets more than a tenth apart do not split every
 /// layer across the GPUs (each would take the smaller share): the layers are split instead, in
 /// proportion to the budgets.
 pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result<Plan, String> {
     let budgets = budgets(&args.devices, &args.vram_bytes, report)?;
+    let on_demand = args.bundle()?.is_on_demand();
     let batch = match args.prefill_batch_size.as_str() {
         // (as the configuration derives it from given budgets: 2048 for the resident models, see config::resolve)
-        "auto" if straydog_engine::bundle::is_on_demand(&args.quant) => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
+        "auto" if on_demand => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
         "auto" => crate::config::resident_batch(budgets.iter().sum()) as usize,
         given => given.parse().map_err(|_| format!("invalid Straydog prefill batch {given:?}"))?,
     };
@@ -297,7 +310,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     let plan = plan(&args, &|stage, done, total| loading.report(stage, done, total))?;
-    if straydog_engine::bundle::is_on_demand(&args.quant) {
+    let id = args.bundle()?;
+    if id.is_on_demand() {
         return crate::worker_on_demand::main(&args, &plan, output, &|stage, done, total| loading.report(stage, done, total));
     }
     let split = plan.split;
@@ -307,7 +321,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     // The model files open while the GPUs initialize, and the vision encoder's is hashed (it is read through the page cache:
     // none of it stays in this process until an image comes).
     let (group, weights, vision) = std::thread::scope(|scope| {
-        let weights = scope.spawn(|| Weights::open(&args.model, &args.quant, drafter, args.host_memory_bytes, &report));
+        let weights = scope.spawn(|| Weights::open(&args.model, id, drafter, args.host_memory_bytes, &report));
         let vision = scope.spawn(|| match &args.mmproj {
             Some(path) => bundle_vision().and_then(|pin| Encoder::open(path, &pin)),
             None => Err(NO_VISION_FILE.to_string()),
@@ -357,8 +371,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     }
     seconds.insert("warm".into(), warming.elapsed().as_secs_f64().into());
     output.send(&json!({
-        "event": "ready", "protocol": 1, "engine": "Straydog", "model": straydog_engine::bundle::MODEL,
-        "quantization": model.weights.quantization, "context": model.context, "state_bytes": model.state_bytes,
+        "event": "ready", "protocol": 1, "engine": "Straydog", "model": id.model, "provider": id.provider,
+        "quantization": id.quant, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
         "speculation": if model.speculative > 0 { json!([{"kind": "mtp", "drafts": model.speculative}]) } else { json!([]) },
         "vision": vision.is_ok(),

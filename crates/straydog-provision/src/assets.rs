@@ -18,10 +18,10 @@ use crate::{at, invalid, partial_path, Progress};
 pub const TIMEOUT: Duration = Duration::from_secs(180);
 const BLOCK: usize = 1 << 20;
 
-/// Every pinned file of `quantization` with the URL it is fetched from: the shards, then
+/// Every pinned file of the bundle with the URL it is fetched from: the shards, then
 /// the resources.
-pub fn entries(quantization: &str) -> Result<Vec<(Asset, String)>, String> {
-    let sources = if bundle::is_on_demand(quantization) { bundle::on_demand_sources(quantization)? } else { bundle::sources(quantization)? };
+pub fn entries(id: bundle::Id) -> Result<Vec<(Asset, String)>, String> {
+    let sources = if id.is_on_demand() { bundle::on_demand_sources(id)? } else { bundle::sources(id)? };
     Ok(sources
         .into_iter()
         .map(|source| {
@@ -300,19 +300,21 @@ mod tests {
 
     #[test]
     fn pinned_files_come_from_fixed_revisions() {
-        for quantization in bundle::QUANTIZATIONS {
-            let entries = entries(quantization).unwrap();
-            assert_eq!(entries.len(), 5);
+        for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
+            let entries = entries(id).unwrap();
+            // the shards (two of GSQ-RCO's, three of Unsloth's) and the three official resources
+            assert_eq!(entries.len(), bundle::shards(id).unwrap().len() + 3, "{id}");
             assert!(entries.iter().all(|(_, url)| url.starts_with("https://huggingface.co/") && url.contains("/resolve/")
                 && !url.contains("/main/")));
-            assert!(entries[0].1.ends_with(&format!("/{quantization}/{}", entries[0].0.name)));
+            assert!(entries[0].1.ends_with(&format!("/{}/{}", id.quant, entries[0].0.name)), "{id}");
         }
-        let entries = entries("Q2_0").unwrap();
+        let entries = entries(bundle::Id::find(None, None, "Q2_0").unwrap()).unwrap();
         assert_eq!(entries[0].1, "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/\
             ed59f92082b1e93c0e96d60a8b11aab089b52f09/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf");
         assert_eq!(entries[2].1, "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/\
             de4b8e4d43b917e7706784d8bb445c9af86a3540/tokenizer.json");
-        assert!(super::entries("Q4_K_M").unwrap_err().contains("unsupported"));
+        let unpinned = bundle::Id { model: bundle::MODEL, provider: bundle::ISTA, quant: "Q4_K_M" };
+        assert!(super::entries(unpinned).unwrap_err().contains("not a bundle"));
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn stand_in(marker: &Path) {
         out.flush().unwrap();
     };
     emit(serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
-                            "model": straydog_engine::bundle::MODEL, "quantization": QUANT}));
+                            "model": straydog_engine::bundle::MODEL, "provider": straydog_engine::bundle::ISTA, "quantization": QUANT}));
     let cancelled = Arc::new(AtomicBool::new(false));
     let (chats, requests) = std::sync::mpsc::channel::<String>();
     {
@@ -77,7 +77,7 @@ fn stand_in(marker: &Path) {
 
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
-                                      "model": straydog_engine::bundle::MODEL, "quantization": QUANT}));
+                                      "model": straydog_engine::bundle::MODEL, "provider": straydog_engine::bundle::ISTA, "quantization": QUANT}));
 }
 
 /// A worker in a prefill pass that takes `PASS`: its first chat answers only once the pass has

@@ -21,13 +21,16 @@ pub use settings::{write_settings, Settings, Written};
 /// The options of `straydog setup`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SetupArgs {
-    /// The model to set up (DeepSeek-V4.1-Flash or Qwen3.8-Flash-Next): its best bundle for this machine
+    /// The model to set up (DeepSeek-V4.1-Flash-1017 or Qwen3.8-Flash-Next): alone, its best bundle for this machine
     #[arg(long, value_name = "NAME")]
     pub model_name: Option<String>,
-    /// The bundle to set up (as `fetch --quant`: GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS, UD-IQ1_M, UD-IQ2_XXS, IQ3_S, IQ3_XXS, IQ2_XS or Q2_0)
+    /// The provider whose bundle to set up (ISTA-DASLab or Unsloth)
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<String>,
+    /// The bundle's quantization (as `fetch --quant`); with --model-name and --provider where it names more than one bundle
     #[arg(long, value_name = "NAME")]
     pub quant: Option<String>,
-    /// The folder for models: the bundle goes in DIR/<model>/<quant>, or is DIR when DIR holds it already [default: the platform's data folder]
+    /// The folder for models: the bundle goes in DIR/<model>/<provider>-<quant>, or is DIR when DIR holds it already [default: the platform's data folder]
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// Where the shards' verity trees go [default: .straydog in the bundle directory]
@@ -99,7 +102,7 @@ pub struct Pinned;
 impl Provision for Pinned {
     fn fetch(&self, place: &Place, entry: &Entry, extras: &[Extra], offline: bool, progress: straydog_provision::Progress) -> Result<(), String> {
         let wanted = Extras { dspark: extras.contains(&Extra::Dspark), vision: extras.contains(&Extra::Vision) };
-        straydog_provision::fetch_extras(&place.bundle, &entry.quant, offline, Some(&place.data), wanted, progress)?;
+        straydog_provision::fetch_extras(&place.bundle, entry.id, offline, Some(&place.data), wanted, progress)?;
         // (the drafter is built from tensors fetched for it: offline, only one already built is authenticated)
         if entry.sidecar(Extra::Mtp).is_some_and(|mtp| extras.contains(&Extra::Mtp) && (!offline || place.drafter.join(&mtp.file).is_file())) {
             let path = straydog_provision::fetch_drafter(&place.drafter, false, progress)?;
@@ -113,7 +116,7 @@ impl Provision for Pinned {
 
     fn fetch_vision(&self, place: &Place, entry: &Entry, offline: bool, progress: straydog_provision::Progress) -> Result<(), String> {
         // (DeepSeek's is built with its bundle, in `fetch`)
-        if straydog_engine::bundle::is_on_demand(&entry.quant) {
+        if entry.id.is_on_demand() {
             return Ok(());
         }
         // (one file for every quantization, beside their directories: a server finds it there)
@@ -188,20 +191,21 @@ pub fn gb(bytes: u64) -> String {
 }
 
 /// The directory of `entry`'s bundle under the models folder `folder`: the folder itself when
-/// it holds the bundle already (or the start of it), else `folder/<model>/<quant>`.
+/// it holds the bundle already (or the start of it), else `folder/<model>/<provider>-<quant>` (a model's bundles side by
+/// side: a file one has that another needs is taken from it).
 pub fn bundle_directory(folder: &Path, entry: &Entry) -> PathBuf {
     let first = &entry.files[0].name;
     if folder.join(first).exists() || folder.join(format!("{first}.part")).exists() {
         folder.to_path_buf()
     } else {
-        folder.join(&entry.model).join(&entry.quant)
+        folder.join(entry.id.model).join(format!("{}-{}", entry.id.provider, entry.id.quant))
     }
 }
 
 /// What a finished setup did.
 #[derive(Debug)]
 pub struct Outcome {
-    pub quant: String,
+    pub bundle: straydog_engine::bundle::Id,
     pub place: Place,
     pub extras: Vec<Extra>,
     /// The context the settings give, when less than the default.
@@ -209,18 +213,37 @@ pub struct Outcome {
     pub written: Written,
 }
 
-/// A bundle by the options' `--quant` or `--model-name`, if they name one: an error when they
-/// name none that exists or runs here.
+/// A bundle by the options' labels (`--model-name`, `--provider`, `--quant`), if they give any: with `--quant`, the
+/// one bundle they name; without, the best for this machine of those they fit. An error when they name none
+/// that exists or runs here, or more than one.
 fn named(args: &SetupArgs, entries: &[Entry], fits: &[(u64, Fit)]) -> Result<Option<usize>, String> {
-    if let Some(quant) = &args.quant {
-        let index = entries.iter().position(|entry| entry.quant == *quant).ok_or_else(|| {
-            format!("unknown bundle {quant}: {}", entries.iter().map(|entry| entry.quant.as_str()).collect::<Vec<_>>().join(", "))
-        })?;
-        if let Some(model) = &args.model_name {
-            if !entries[index].model.eq_ignore_ascii_case(model) {
-                return Err(format!("{quant} is a bundle of {}, not {model}", entries[index].model));
-            }
+    let (model, provider) = (args.model_name.as_deref(), args.provider.as_deref());
+    if model.is_none() && provider.is_none() && args.quant.is_none() {
+        return Ok(None);
+    }
+    // (earlier releases' names name their bundles: DeepSeek-V4.1's GSQ-RCO-IQ2_XS is ISTA-DASLab's IQ2_XS)
+    let pinned = straydog_engine::bundle::matching(model, provider, args.quant.as_deref());
+    let label = |given: Option<&str>, label: &str| given.is_none_or(|given| label.eq_ignore_ascii_case(given));
+    let fitting: Vec<usize> = (0..entries.len())
+        .filter(|&index| {
+            let id = entries[index].id;
+            pinned.contains(&id) || label(model, id.model) && label(provider, id.provider) && args.quant.as_deref().is_none_or(|quant| quant == id.quant)
+        })
+        .collect();
+    let described = || [model, provider, args.quant.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" / ");
+    if fitting.is_empty() {
+        if let Some(model) = model.filter(|model| !entries.iter().any(|entry| entry.id.model.eq_ignore_ascii_case(model))) {
+            return Err(format!("unknown model {model}: {}", catalog::models(entries).join(", ")));
         }
+        let known: Vec<String> = entries.iter().filter(|entry| label(model, entry.id.model) && label(provider, entry.id.provider))
+            .map(Entry::name).collect();
+        return Err(format!("unknown bundle {}: {}", described(), known.join(", ")));
+    }
+    if args.quant.is_some() {
+        let [index] = fitting[..] else {
+            let names: Vec<String> = fitting.iter().map(|&index| entries[index].name()).collect();
+            return Err(format!("{} names {}: give --model-name and --provider too", described(), names.join(" and ")));
+        };
         return match &fits[index].1 {
             fit if fit.runs() => Ok(Some(index)),
             // (asked for by name, past what the free VRAM is now: the person may free it, and the load waits for it)
@@ -228,14 +251,9 @@ fn named(args: &SetupArgs, entries: &[Entry], fits: &[(u64, Fit)]) -> Result<Opt
             fit => Err(format!("{} cannot run on this machine: {}", entries[index].name(), fit.note(&entries[index]))),
         };
     }
-    let Some(model) = &args.model_name else { return Ok(None) };
-    let of_model: Vec<usize> = (0..entries.len()).filter(|&index| entries[index].model.eq_ignore_ascii_case(model)).collect();
-    if of_model.is_empty() {
-        return Err(format!("unknown model {model}: {}", catalog::models(entries).join(", ")));
-    }
-    let runs: Vec<usize> = of_model.iter().copied().filter(|&index| fits[index].1.runs()).collect();
+    let runs: Vec<usize> = fitting.iter().copied().filter(|&index| fits[index].1.runs()).collect();
     if runs.is_empty() {
-        return Err(format!("{model} cannot run on this machine: {}", fits[of_model[0]].1.note(&entries[of_model[0]])));
+        return Err(format!("{} cannot run on this machine: {}", described(), fits[fitting[0]].1.note(&entries[fitting[0]])));
     }
     let subset: Vec<Entry> = runs.iter().map(|&index| entries[index].clone()).collect();
     let subset_fits: Vec<Fit> = runs.iter().map(|&index| fits[index].1.clone()).collect();
@@ -248,7 +266,7 @@ fn menu(talk: &mut Talk, entries: &[Entry], fits: &[(u64, Fit)], gpus: usize, re
     talk.say("Models that can run here (download size; what each needs):");
     for (number, &index) in offered.iter().enumerate() {
         let entry = &entries[index];
-        talk.say(&format!("  {}) {:<22} {:<16} {:>9}{}", number + 1, entry.model, entry.quant, gb(entry.download_bytes(&[])),
+        talk.say(&format!("  {}) {:<24} {:<12} {:<10} {:>9}{}", number + 1, entry.id.model, entry.id.provider, entry.id.quant, gb(entry.download_bytes(&[])),
                           if index == recommended { "  recommended" } else { "" }));
         let (context, fit) = &fits[index];
         let limited = if *context < DEFAULT_CONTEXT { format!(" with a context of {context} tokens (the most that starts)") } else { String::new() };
@@ -256,7 +274,7 @@ fn menu(talk: &mut Talk, entries: &[Entry], fits: &[(u64, Fit)], gpus: usize, re
     }
     let left: Vec<String> = (0..entries.len())
         .filter(|&index| !fits[index].1.runs())
-        .map(|index| format!("{} {} ({})", entries[index].model, entries[index].quant, fits[index].1.note(&entries[index])))
+        .map(|index| format!("{} ({})", entries[index].name(), fits[index].1.note(&entries[index])))
         .collect();
     if !left.is_empty() {
         talk.say(&format!("Not offered: {}.", left.join("; ")));
@@ -386,7 +404,9 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
     let target = args.config.clone().or_else(|| defaults.config.clone()).ok_or("no default folder for settings on this machine: give --config")?;
     let written = write_settings(&target, &Settings {
         model: place.bundle.clone(),
-        quant: entry.quant.clone(),
+        model_name: entry.id.model.to_string(),
+        provider: entry.id.provider.to_string(),
+        quant: entry.id.quant.to_string(),
         model_draft,
         gpu: (gpus != [0]).then_some(gpus),
         ctx_size: (*context < DEFAULT_CONTEXT).then_some(*context as u32),
@@ -399,7 +419,7 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
     let plain = defaults.config.as_ref() == Some(&written.path);
     talk.say(&format!("Start the server with: {}", if plain { "straydog".to_string() } else { format!("straydog --config {}", quote(&written.path)) }));
     talk.say(&format!("It listens on {} (the dashboard is at {}/dashboard).", written.url, written.url));
-    Ok(Outcome { quant: entry.quant.clone(), place, extras, context: (*context < DEFAULT_CONTEXT).then_some(*context), written })
+    Ok(Outcome { bundle: entry.id, place, extras, context: (*context < DEFAULT_CONTEXT).then_some(*context), written })
 }
 
 /// A path as a shell takes it.
@@ -418,8 +438,12 @@ fn listing(entries: &[Entry], machine: &Machine) -> serde_json::Value {
     let bundles: Vec<serde_json::Value> = entries.iter().zip(&fits).enumerate().map(|(index, (entry, (context, fit)))| {
         let extras = entry.default_extras();
         serde_json::json!({
-            "model": entry.model,
-            "quant": entry.quant,
+            "model": entry.id.model,
+            "provider": entry.id.provider,
+            "quant": entry.id.quant,
+            "creator": straydog_engine::bundle::model(entry.id.model).map(|model| model.creator),
+            "license": straydog_engine::bundle::model(entry.id.model).map(|model| model.license),
+            "license_url": straydog_engine::bundle::model(entry.id.model).map(|model| model.license_url),
             "download_bytes": entry.download_bytes(&extras),
             "disk_bytes": entry.disk_bytes(&extras),
             "extras": entry.sidecars.iter().map(|sidecar| serde_json::json!({
@@ -522,7 +546,7 @@ mod tests {
             .map(|(name, data)| Asset { name: name.to_string(), bytes: data.len() as u64, sha256: format!("{:x}", Sha256::digest(data)) })
             .collect();
         let entry = Entry {
-            model: "Test-Model".into(), quant: "T-Q1".into(), architecture: "qwen4exp".into(),
+            id: straydog_engine::bundle::Id { model: "Test-Model", provider: "Test", quant: "T-Q1" }, architecture: "qwen4exp".into(),
             files: assets.iter().map(|asset| File { name: asset.name.clone(), bytes: asset.bytes, tree: 0 }).collect(),
             footprint: Footprint { dense: 1 << 20, experts: 1 << 20, tables: 0, state_per_token: 1024 }, sidecars: Vec::new(),
         };
@@ -548,7 +572,7 @@ mod tests {
     /// refused either way.
     #[test]
     fn force_sets_up_a_bundle_short_of_free_vram_and_not_one_with_no_gpu() {
-        let entries = [Entry::of("GSQ-RCO-IQ2_XS").unwrap()];
+        let entries = [Entry::of(catalog::tests::id("GSQ-RCO-IQ2_XS")).unwrap()];
         let short = [(4096, Fit::TooLittleVram { needs: 15 << 30, has: 12 << 30 })];
         let asked = SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), ..SetupArgs::default() };
         assert!(named(&asked, &entries, &short).unwrap_err().contains("cannot run on this machine"));
@@ -561,7 +585,7 @@ mod tests {
     #[test]
     fn vision_only_fetches_the_vision_file_and_not_the_bundle() {
         let scratch = Scratch::new("setup-vision-only");
-        let entry = Entry::of("IQ2_XS").unwrap();
+        let entry = Entry::of(catalog::tests::id("IQ2_XS")).unwrap();
         let args = SetupArgs { vision_only: true, yes: true, quant: Some("IQ2_XS".into()), dir: Some(scratch.path().join("models")), ..SetupArgs::default() };
         let recorder = Recorder::default();
         let (result, _) = run_with(&args, &machine_of(1, 16 << 30, 64 << 30), std::slice::from_ref(&entry), &defaults(scratch.path()), &recorder, "", false);
@@ -581,7 +605,7 @@ mod tests {
         let root = scratch.path().to_path_buf();
         let server = serve();
         let (entry, urls) = small_bundle(&server);
-        let bundle = root.join("models").join("Test-Model").join("T-Q1");
+        let bundle = root.join("models").join("Test-Model").join("Test-T-Q1");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("test-00001-of-00002.gguf.part"), b"the f").unwrap();
         let args = SetupArgs { quant: Some("T-Q1".into()), dir: Some(root.join("models")), yes: true, ..SetupArgs::default() };
@@ -626,7 +650,7 @@ mod tests {
         assert!(error.contains(&format!("needs {}", gb(need))) && error.contains("free"), "{error} / {said}");
         assert!(server.requests().is_empty() && !root.join("config").exists() && !root.join("models").exists());
         // some of it there already is not asked for again
-        let bundle = root.join("models").join("Test-Model").join("T-Q1");
+        let bundle = root.join("models").join("Test-Model").join("Test-T-Q1");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join(FILES[0].0), FILES[0].1).unwrap();
         let present = FILES[0].1.len() as u64;
@@ -651,15 +675,17 @@ mod tests {
         let outcome = result.unwrap();
         println!("{said}");
         assert!(said.contains("2 x GPU (31.9 GiB each)") || said.contains("GPUs (ROCm/HIP)"), "{said}");
-        assert!(said.contains("1) DeepSeek-V4.1-Flash") && said.contains("GSQ-RCO-IQ2_XXS") && said.contains("recommended"), "{said}");
-        assert!(said.contains("Please give a number from 1 to 8."), "{said}");
-        assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
+        let first = said.lines().find(|line| line.contains("1) ")).unwrap_or_default();
+        assert!(first.contains("DeepSeek-V4.1-Flash-1017") && first.contains("ISTA-DASLab") && first.contains("IQ2_XXS") && first.contains("recommended"), "{said}");
+        assert!(said.contains("Please give a number from 1 to 9."), "{said}");
+        assert_eq!(outcome.bundle, catalog::tests::id("GSQ-RCO-IQ2_XXS"));
         assert_eq!(outcome.extras, [Extra::Vision]);
-        assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash").join("GSQ-RCO-IQ2_XXS"));
+        assert_eq!(outcome.place.bundle, root.join("models").join("DeepSeek-V4.1-Flash-1017").join("ISTA-DASLab-IQ2_XXS"));
         let calls = recorder.0.lock().unwrap();
         assert_eq!(*calls, [(outcome.place.bundle.clone(), vec![Extra::Vision], false)]);
         let read: Options = toml::from_str(&std::fs::read_to_string(&outcome.written.path).unwrap()).unwrap();
-        assert_eq!((read.quant.as_deref(), read.model_draft, read.gpu), (Some("GSQ-RCO-IQ2_XXS"), None, Some(vec![0, 1])));
+        assert_eq!((read.model_name.as_deref(), read.provider.as_deref(), read.quant.as_deref(), read.model_draft, read.gpu),
+                   (Some("DeepSeek-V4.1-Flash-1017"), Some("ISTA-DASLab"), Some("IQ2_XXS"), None, Some(vec![0, 1])));
     }
 
     /// The input ending (Ctrl-D, a closed pipe), a "no" at the last question and no terminal without --yes all
@@ -689,9 +715,21 @@ mod tests {
         let ask = |args: SetupArgs, machine: &Machine| run_with(&SetupArgs { yes: true, dir: Some(root.join("models")), ..args }, machine, &entries, &defaults(&root), &recorder, "", false).0;
         // by model name, in any case: its best bundle for the machine
         let outcome = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &small).unwrap();
-        assert_eq!(outcome.quant, "IQ2_XS");
+        assert_eq!(outcome.bundle, catalog::tests::id("IQ2_XS"));
         let outcome = ask(SetupArgs { model_name: Some("DeepSeek-V4.1-Flash".into()), ..SetupArgs::default() }, &two_r9700s()).unwrap();
-        assert_eq!(outcome.quant, "GSQ-RCO-IQ2_XXS");
+        assert_eq!(outcome.bundle, catalog::tests::id("GSQ-RCO-IQ2_XXS"));
+        // a bundle by its labels: UD-IQ1_M is a bundle of both models, so it needs the model named; a provider alone takes its best
+        let labels = |model: Option<&str>, provider: Option<&str>, quant: Option<&str>| SetupArgs {
+            model_name: model.map(str::to_string), provider: provider.map(str::to_string), quant: quant.map(str::to_string), ..SetupArgs::default()
+        };
+        let unsloth_qwen = straydog_engine::bundle::Id { model: "Qwen3.8-Flash-Next", provider: "Unsloth", quant: "UD-IQ1_M" };
+        assert_eq!(ask(labels(Some("Qwen3.8-Flash-Next"), None, Some("UD-IQ1_M")), &two_r9700s()).unwrap().bundle, unsloth_qwen);
+        assert_eq!(ask(labels(Some("qwen3.8-flash-next"), Some("unsloth"), None), &two_r9700s()).unwrap().bundle, unsloth_qwen);
+        let both = ask(labels(None, None, Some("UD-IQ1_M")), &two_r9700s()).unwrap_err();
+        assert!(both.contains("give --model-name and --provider"), "{both}");
+        let deepseek = ask(labels(Some("DeepSeek-V4.1-Flash-1017"), Some("Unsloth"), Some("UD-IQ1_M")), &two_r9700s()).unwrap().bundle;
+        assert_eq!((deepseek.model, deepseek.provider), ("DeepSeek-V4.1-Flash-1017", "Unsloth"));
+        assert!(ask(labels(None, Some("ISTA-DASLab"), Some("UD-IQ1_M")), &two_r9700s()).unwrap_err().contains("unknown bundle"));
         // the extras left out by option
         let outcome = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), no_dspark: true, no_vision: true, ..SetupArgs::default() }, &two_r9700s()).unwrap();
         assert!(outcome.extras.is_empty());
@@ -709,9 +747,9 @@ mod tests {
     #[test]
     fn a_folder_that_holds_the_bundle_already_is_the_bundle_directory() {
         let scratch = Scratch::new("setup-folder");
-        let entry = Entry::of("GSQ-RCO-IQ2_XXS").unwrap();
+        let entry = Entry::of(catalog::tests::id("GSQ-RCO-IQ2_XXS")).unwrap();
         let root = scratch.path();
-        assert_eq!(bundle_directory(root, &entry), root.join("DeepSeek-V4.1-Flash").join("GSQ-RCO-IQ2_XXS"));
+        assert_eq!(bundle_directory(root, &entry), root.join("DeepSeek-V4.1-Flash-1017").join("ISTA-DASLab-IQ2_XXS"));
         std::fs::write(root.join(format!("{}.part", entry.files[0].name)), b"x").unwrap();
         assert_eq!(bundle_directory(root, &entry), root);
     }
@@ -724,11 +762,17 @@ mod tests {
         assert_eq!(bundles.len(), entries.len());
         let recommended: Vec<_> = bundles.iter().filter(|bundle| bundle["recommended"] == true).collect();
         assert_eq!(recommended.len(), 1);
-        assert_eq!(recommended[0]["quant"], "GSQ-RCO-IQ2_XXS");
+        assert_eq!((recommended[0]["provider"].as_str(), recommended[0]["quant"].as_str()), (Some("ISTA-DASLab"), Some("IQ2_XXS")));
         assert_eq!(recommended[0]["fit"], "ram");
         let q38 = bundles.iter().find(|bundle| bundle["quant"] == "IQ3_S").unwrap();
         assert_eq!(q38["extras"][0]["name"], "mtp");
         assert!(q38["disk_bytes"].as_u64().unwrap() > q38["download_bytes"].as_u64().unwrap() / 2);
+        // each bundle's three labels, and who made the model and its license
+        let unsloth = bundles.iter().find(|bundle| bundle["model"] == "Qwen3.8-Flash-Next" && bundle["quant"] == "UD-IQ1_M").unwrap();
+        assert_eq!((unsloth["provider"].as_str(), unsloth["creator"].as_str(), unsloth["license"].as_str()),
+                   (Some("Unsloth"), Some("Qwen"), Some("Qwen Community License 1.0")));
+        assert!(unsloth["license_url"].as_str().is_some_and(|url| url.starts_with("https://huggingface.co/Qwen/")));
+        assert_eq!((q38["provider"].as_str(), q38["creator"].as_str()), (Some("ISTA-DASLab"), Some("Qwen")));
         let none = listing(&entries, &machine_of(0, 0, 32 << 30));
         for bundle in none["bundles"].as_array().unwrap() {
             assert_eq!((bundle["fit"].as_str(), bundle["runs"].as_bool(), bundle["recommended"].as_bool()), (Some("no_gpu"), Some(false), Some(false)));

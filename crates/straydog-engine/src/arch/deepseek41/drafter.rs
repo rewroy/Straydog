@@ -1115,7 +1115,7 @@ mod tests {
     /// a device's share 3 x 1152 rows of MXFP4 blocks.
     #[test]
     fn the_drafters_footprint_is_its_file_its_experts_kept_and_its_buffers() {
-        let file = crate::bundle::dspark_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned DSpark").asset.bytes;
+        let file = crate::bundle::dspark_source(crate::bundle::Id::find(Some(crate::bundle::DEEPSEEK), None, "IQ2_XS").unwrap()).unwrap().expect("a pinned DSpark").asset.bytes;
         let vocabulary = 129_280;
         let whole = footprint(0, 1, vocabulary, [EXPERTS; 3]);
         assert!(whole > file && whole < file + (100 << 20), "{whole} for a file of {file}");

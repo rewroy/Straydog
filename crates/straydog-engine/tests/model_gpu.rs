@@ -33,7 +33,7 @@ fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &
     let speculative = placement["speculative"].as_u64().unwrap() as usize;
     let mut group = Group::new(&devices, &vec![budget; devices.len()], split).unwrap();
     group.configure_gemm(2, true).unwrap();
-    let mut weights = Weights::open(&PathBuf::from(model_root), quantization,
+    let mut weights = Weights::open(&PathBuf::from(model_root), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quantization).unwrap(),
                                     (speculative > 0).then(|| PathBuf::from(drafter)).as_deref(),
                                     straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     // With STRAYDOG_DATA_DIR (the shards' verity trees there), what is read again after

@@ -43,11 +43,11 @@ fn main() -> Result<(), String> {
     // (a model's hyperparameters are one: a bundle whose metadata does not give them all, as GSQ-RCO's
     // DeepSeek-V4.1 keeps Engram's in tensors, takes those of the model's bundle that does)
     let mut states: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for quantization in bundle::quantizations() {
+    for id in bundle::bundles() {
         // The shards, and a bundle read on demand's sidecars: the files that hold its tensors.
-        let mut names: Vec<String> = bundle::shards(quantization)?.into_iter().map(|asset| asset.name).collect();
-        if bundle::is_on_demand(quantization) {
-            names.extend(bundle::on_demand(quantization)?.sidecars.into_iter().map(|sidecar| sidecar.asset.name));
+        let mut names: Vec<String> = bundle::shards(id)?.into_iter().map(|asset| asset.name).collect();
+        if id.is_on_demand() {
+            names.extend(bundle::on_demand(id)?.sidecars.into_iter().map(|sidecar| sidecar.asset.name));
         }
         let holds = |directory: &PathBuf| directory.join(&names[0]).is_file();
         let found = directories.iter().flat_map(|directory| {
@@ -55,7 +55,7 @@ fn main() -> Result<(), String> {
             std::iter::once(directory.clone()).chain(inside)
         });
         let Some(directory) = found.into_iter().find(holds) else {
-            return Err(format!("{quantization}: {} not found", names[0]));
+            return Err(format!("{id}: {} not found", names[0]));
         };
         let (mut dense, mut experts, mut tables, mut first) = (0u64, 0u64, 0u64, None);
         for name in &names {
@@ -73,15 +73,20 @@ fn main() -> Result<(), String> {
                 *sum += tensor.bytes;
             }
         }
-        let model = bundle::model_of(quantization)?;
-        let state = match state_per_token(&bundle::architecture_of(quantization)?, &first.ok_or("no shards")?) {
+        let model = id.model.to_string();
+        let state = match state_per_token(&bundle::architecture_of(id)?, &first.ok_or("no shards")?) {
             Ok(state) => *states.entry(model).or_insert(state),
             Err(error) => *states.get(&model).ok_or(error)?,
         };
-        eprintln!("{quantization}: dense {dense}, experts {experts}, tables {tables}, state per token {state} ({})", directory.display());
-        bundles.insert(quantization.to_string(), json!({"dense": dense, "experts": experts, "tables": tables, "state_per_token": state}));
+        eprintln!("{id}: dense {dense}, experts {experts}, tables {tables}, state per token {state} ({})", directory.display());
+        let of_model = bundles.entry(id.model).or_insert_with(|| json!({}));
+        if of_model.get(id.provider).is_none() {
+            of_model[id.provider] = json!({});
+        }
+        of_model[id.provider][id.quant] = json!({"dense": dense, "experts": experts, "tables": tables, "state_per_token": state});
     }
-    let table = json!({"schema": 1, "bundles": bundles});
+    // (by model, provider and quantization, the labels that name a bundle)
+    let table = json!({"schema": 3, "bundles": bundles});
     println!("{}", serde_json::to_string_pretty(&table).map_err(|exc| exc.to_string())?);
     Ok(())
 }

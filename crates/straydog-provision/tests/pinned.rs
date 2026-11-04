@@ -56,21 +56,21 @@ fn a_bundle_authenticates() {
     let given = std::env::var_os("STRAYDOG_DATA_DIR").map(PathBuf::from);
     let data = given.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("straydog-pinned-{}", std::process::id())));
     let stages = Stages::new();
-    straydog_provision::verify(&root, "IQ3_S", Some(&data), &|stage, done, total| stages.report(stage, done, total)).unwrap();
-    let pins = bundle::bundle("IQ3_S").unwrap();
+    straydog_provision::verify(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "IQ3_S").unwrap(), Some(&data), &|stage, done, total| stages.report(stage, done, total)).unwrap();
+    let pins = bundle::bundle(straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "IQ3_S").unwrap()).unwrap();
     let total: u64 = pins.shards.iter().chain(&pins.resources).map(|asset| asset.bytes).sum();
     let reported = stages.0.lock().unwrap().clone();
     assert_eq!(reported[0], ("authenticating 5 present file(s)".to_string(), total, total));
     // Then the verity trees the data directory lacked, each built whole.
     assert!(reported[1..].iter().all(|(stage, done, total)| stage.starts_with("building the verity tree of ") && done == total));
-    for (asset, _) in bundle::verity_pins("IQ3_S").unwrap() {
+    for (asset, _) in bundle::verity_pins(straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "IQ3_S").unwrap()).unwrap() {
         assert!(bundle::tree_path(&data, &asset).is_file(), "{}", asset.name);
     }
     if given.is_none() {
         fs::remove_dir_all(&data).unwrap();
     }
     // The Q2_0 bundle's first shard is not there.
-    let message = straydog_provision::verify(&root, "Q2_0", Some(&data), &|_, _, _| {}).unwrap_err();
+    let message = straydog_provision::verify(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "Q2_0").unwrap(), Some(&data), &|_, _, _| {}).unwrap_err();
     assert!(message.contains("Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"), "{message}");
 }
 

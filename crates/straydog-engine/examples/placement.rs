@@ -18,7 +18,7 @@ fn main() -> Result<(), String> {
     let mut group = Group::new(&devices, &vec![budget; devices.len()], SplitMode::Experts)?;
     group.configure_gemm(2, true)?;
     let drafter = rest.first().map(PathBuf::from);
-    let weights = Weights::open(&PathBuf::from(model), quant, drafter.as_deref(),
+    let weights = Weights::open(&PathBuf::from(model), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(),
                                 straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: 4096,
                               speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,

@@ -16,7 +16,7 @@ use tower::ServiceExt;
 fn settings() -> Settings {
     Settings {
         model: PathBuf::from("/models/IQ3_S"),
-        quant: "IQ3_S".into(),
+        bundle: straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "IQ3_S").unwrap(),
         model_draft: None,
         model_vision: None,
         draft_max: 0,

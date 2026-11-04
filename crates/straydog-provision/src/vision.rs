@@ -55,7 +55,7 @@ mod tests {
     #[ignore]
     fn build_the_vision_file() {
         let directory = PathBuf::from(std::env::var("STRAYDOG_VISION_DIR").expect("STRAYDOG_VISION_DIR"));
-        let pins = bundle::vision_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned vision encoder");
+        let pins = bundle::vision_source(bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap()).unwrap().expect("a pinned vision encoder");
         let source = directory.join(SOURCE_FILE);
         if !source.is_file() {
             let base = format!("https://huggingface.co/{}/resolve/{}/", pins.repository, pins.revision);

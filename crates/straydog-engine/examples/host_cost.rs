@@ -10,7 +10,7 @@ static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::Hu
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut weights = Weights::open(&PathBuf::from(&args[0]), &args[1], None, 0, &|_, _, _| {}).unwrap();
+    let mut weights = Weights::open(&PathBuf::from(&args[0]), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, &args[1]).unwrap(), None, 0, &|_, _, _| {}).unwrap();
     weights.authenticate(&|_, _, _| {}).unwrap();
     let tokens: Vec<i64> = (0..4096).map(|i| (i * 7919 + 13) % 248000).collect();
     for _ in 0..3 {

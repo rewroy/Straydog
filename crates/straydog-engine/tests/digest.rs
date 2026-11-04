@@ -7,8 +7,8 @@ use straydog_engine::load;
 
 #[test]
 fn every_pinned_shard_and_drafter_has_its_chunk_digests() {
-    for quantization in bundle::QUANTIZATIONS {
-        let pins = bundle::bundle(quantization).unwrap();
+    for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
+        let pins = bundle::bundle(id).unwrap();
         for asset in pins.shards.iter().chain([&pins.drafter]) {
             let pieces = bundle::chunk_digests(&asset.sha256).unwrap().unwrap_or_else(|| panic!("{} unpinned", asset.name));
             assert_eq!(pieces.len() as u64, asset.bytes.div_ceil(digest::CHUNK_BYTES), "{}", asset.name);

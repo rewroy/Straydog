@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use straydog_engine::arch::deepseek41::serve::CHECKPOINT_BYTES;
 use straydog_engine::arch::served::{HOST_OTHER, HOST_SHARE, RESERVE};
-use straydog_engine::bundle::{self, Asset, Footprint};
+use straydog_engine::bundle::{self, Asset, Footprint, Id, DEEPSEEK, ISTA, MODEL, UNSLOTH};
 use straydog_engine::model::{checkpoint_bytes, partial_slot_bytes, SCARCE_ROW_CACHE, STARTING_KV};
 use straydog_engine::rows::{auto_budget as row_cache_budget, DEFAULT_CACHE_BYTES};
 use straydog_engine::verity::Geometry;
@@ -20,11 +20,20 @@ pub const GIB: u64 = 1 << 30;
 /// The context a server starts with unless told otherwise.
 pub const DEFAULT_CONTEXT: u64 = 262_144;
 
-/// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash's
-/// recommended build and its other three, then Qwen3.8-Flash-Next from the most exact quantization to
-/// the smallest.
-pub const ORDER: [&str; 8] =
-    ["GSQ-RCO-IQ2_XXS", "UD-IQ1_M", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS", "IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0"];
+/// The bundles in the order they are offered and recommended from: DeepSeek-V4.1-Flash-1017's
+/// recommended build (ISTA-DASLab's IQ2_XXS) and its other three, then Qwen3.8-Flash-Next from the most exact
+/// quantization to the smallest (Unsloth's UD-IQ1_M, 20 MB smaller than ISTA-DASLab's IQ2_XS, before Q2_0).
+pub const ORDER: [Id; 9] = [
+    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XXS" },
+    Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ1_M" },
+    Id { model: DEEPSEEK, provider: ISTA, quant: "IQ2_XS" },
+    Id { model: DEEPSEEK, provider: UNSLOTH, quant: "UD-IQ2_XXS" },
+    Id { model: MODEL, provider: ISTA, quant: "IQ3_S" },
+    Id { model: MODEL, provider: ISTA, quant: "IQ3_XXS" },
+    Id { model: MODEL, provider: ISTA, quant: "IQ2_XS" },
+    Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" },
+    Id { model: MODEL, provider: ISTA, quant: "Q2_0" },
+];
 
 /// A file a model can do without, which `setup` offers to add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +85,8 @@ pub struct File {
 /// One pinned bundle.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    pub model: String,
-    pub quant: String,
+    /// Its model, provider and quantization.
+    pub id: Id,
     pub architecture: String,
     pub files: Vec<File>,
     pub footprint: Footprint,
@@ -90,17 +99,17 @@ fn tree(bytes: u64) -> u64 {
 
 /// Every bundle that can be set up, in [`ORDER`].
 pub fn pinned() -> Result<Vec<Entry>, String> {
-    ORDER.iter().map(|quant| Entry::of(quant)).collect()
+    ORDER.into_iter().map(Entry::of).collect()
 }
 
 impl Entry {
-    pub fn of(quant: &str) -> Result<Entry, String> {
-        let trees: HashSet<String> = bundle::verity_pins(quant)?.into_iter().map(|(asset, _)| asset.name).collect();
-        let (held, resources): (Vec<Asset>, Vec<Asset>) = if bundle::is_on_demand(quant) {
-            let pins = bundle::on_demand(quant)?;
+    pub fn of(id: Id) -> Result<Entry, String> {
+        let trees: HashSet<String> = bundle::verity_pins(id)?.into_iter().map(|(asset, _)| asset.name).collect();
+        let (held, resources): (Vec<Asset>, Vec<Asset>) = if id.is_on_demand() {
+            let pins = bundle::on_demand(id)?;
             (pins.shards.into_iter().chain(pins.sidecars.into_iter().map(|sidecar| sidecar.asset)).collect(), pins.resources)
         } else {
-            let pins = bundle::bundle(quant)?;
+            let pins = bundle::bundle(id)?;
             (pins.shards, pins.resources)
         };
         let files = held
@@ -109,17 +118,17 @@ impl Entry {
             .map(|asset| File { tree: if trees.contains(&asset.name) { tree(asset.bytes) } else { 0 }, name: asset.name, bytes: asset.bytes })
             .collect();
         let mut sidecars = Vec::new();
-        if let Some(source) = bundle::dspark_source(quant)? {
+        if let Some(source) = bundle::dspark_source(id)? {
             let bytes = source.asset.bytes;
             sidecars.push(Sidecar { kind: Extra::Dspark, label: "DSpark drafter", purpose: "faster replies", file: source.asset.name,
                                     download: bytes, kept: bytes, tree: tree(bytes), scratch: 0 });
         }
-        if let Some(source) = bundle::vision_source(quant)? {
+        if let Some(source) = bundle::vision_source(id)? {
             let tensors = source.tensors.iter().map(|tensor| tensor.bytes).sum();
             sidecars.push(Sidecar { kind: Extra::Vision, label: "vision encoder", purpose: "image input", file: source.asset.name.clone(),
                                     download: tensors, kept: source.asset.bytes, tree: tree(source.asset.bytes), scratch: tensors });
         }
-        if !bundle::is_on_demand(quant) {
+        if !id.is_on_demand() {
             let source = bundle::drafter_source()?;
             let tensors = source.tensors.iter().map(|tensor| tensor.bytes).sum();
             sidecars.push(Sidecar { kind: Extra::Mtp, label: "MTP drafter", purpose: "faster replies", file: source.asset.name,
@@ -128,14 +137,7 @@ impl Entry {
             sidecars.push(Sidecar { kind: Extra::Vision, label: "vision encoder", purpose: "image input", file: vision.name,
                                     download: vision.bytes, kept: vision.bytes, tree: 0, scratch: 0 });
         }
-        Ok(Entry {
-            model: bundle::model_of(quant)?,
-            quant: quant.to_string(),
-            architecture: bundle::architecture_of(quant)?,
-            files,
-            footprint: bundle::footprint(quant)?,
-            sidecars,
-        })
+        Ok(Entry { id, architecture: bundle::architecture_of(id)?, files, footprint: bundle::footprint(id)?, sidecars })
     }
 
     pub fn sidecar(&self, kind: Extra) -> Option<&Sidecar> {
@@ -166,7 +168,7 @@ impl Entry {
     }
 
     pub fn name(&self) -> String {
-        format!("{} {}", self.model, self.quant)
+        self.id.to_string()
     }
 }
 
@@ -349,9 +351,14 @@ const PARTIAL_BATCH: u64 = 1024;
 /// What a partial placement pins of a bundle's `dense` bytes (`Weights::dense_requirements`): not the HyperConnections' and the PLE
 /// layer's BF16 matrices' 626442240 bytes they save going up as Q8_0, nor the token embeddings, kept on the host: 273152000 bytes
 /// in IQ3_XXS, whose 3216268800 bytes pinned were read from its header; for bundles whose headers were not at hand, their
-/// 635699200 weights at 2 bits at the least, which may count up to 0.11 GiB too much.
+/// 635699200 weights at 2 bits at the least, which may count up to 0.11 GiB too much. Unsloth's UD-IQ1_M keeps its
+/// HyperConnections in Q8_0 already and its token embeddings in IQ4_XS (337715200 bytes, from its header); its PLE layer's
+/// BF16 matrices are counted as they are, which counts what they save going up as Q8_0 too much.
 fn pinned_dense(entry: &Entry) -> u64 {
-    let embeddings = if entry.quant == "IQ3_XXS" { 273_152_000 } else { 635_699_200 / 4 };
+    if entry.id == (Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" }) {
+        return entry.footprint.dense.saturating_sub(337_715_200);
+    }
+    let embeddings = if entry.id == (Id { model: MODEL, provider: ISTA, quant: "IQ3_XXS" }) { 273_152_000 } else { 635_699_200 / 4 };
     entry.footprint.dense.saturating_sub(626_442_240 + embeddings)
 }
 
@@ -482,8 +489,8 @@ fn best_context_on(windows: bool, entry: &Entry, machine: &Machine) -> (u64, Fit
 pub fn models(entries: &[Entry]) -> Vec<&str> {
     let mut models: Vec<&str> = Vec::new();
     for entry in entries {
-        if !models.contains(&entry.model.as_str()) {
-            models.push(&entry.model);
+        if !models.contains(&entry.id.model) {
+            models.push(entry.id.model);
         }
     }
     models
@@ -497,7 +504,7 @@ pub fn models(entries: &[Entry]) -> Vec<&str> {
 pub fn recommend(entries: &[Entry], fits: &[Fit]) -> Option<usize> {
     let rank = |index: usize| fits[index].rank();
     for model in models(entries) {
-        let of_model: Vec<usize> = (0..entries.len()).filter(|&index| entries[index].model == model).collect();
+        let of_model: Vec<usize> = (0..entries.len()).filter(|&index| entries[index].id.model == model).collect();
         let best = of_model.iter().filter_map(|&index| rank(index)).min();
         if let Some(best @ (0 | 1)) = best {
             return of_model.into_iter().find(|&index| rank(index) == Some(best));
@@ -505,7 +512,7 @@ pub fn recommend(entries: &[Entry], fits: &[Fit]) -> Option<usize> {
     }
     let read = |index: usize| match fits[index] { Fit::Drive(bytes) => bytes, _ => 0 };
     let least = (0..entries.len()).filter(|&index| rank(index).is_some()).min_by_key(|&index| read(index))?;
-    (0..entries.len()).find(|&index| rank(index).is_some() && entries[index].model == entries[least].model
+    (0..entries.len()).find(|&index| rank(index).is_some() && entries[index].id.model == entries[least].id.model
                                      && read(index) <= read(least) + entries[index].footprint.experts / 20)
 }
 
@@ -525,19 +532,22 @@ pub(crate) mod tests {
         machine(2, 34_208_743_424, 134_411_186_176)
     }
 
+    /// The bundle a test names by its quantization: the only one of that name (DeepSeek-V4.1's by 0.1.3's names), else
+    /// Qwen3.8's.
+    pub fn id(quant: &str) -> Id {
+        Id::find(None, None, quant).or_else(|_| Id::find(Some(MODEL), None, quant)).unwrap()
+    }
+
     fn entry(quant: &str) -> Entry {
-        Entry::of(quant).unwrap()
+        Entry::of(id(quant)).unwrap()
     }
 
     #[test]
     fn every_pinned_bundle_is_offered_once() {
-        let mut named: Vec<&str> = ORDER.to_vec();
-        named.sort_unstable();
-        let mut pinned: Vec<&str> = bundle::quantizations().collect();
-        pinned.sort_unstable();
-        assert_eq!(named, pinned);
+        assert_eq!(ORDER.len(), bundle::BUNDLES.len());
+        assert!(bundle::BUNDLES.iter().all(|pinned| ORDER.iter().filter(|offered| *offered == pinned).count() == 1));
         let entries = pinned_entries();
-        assert_eq!(models(&entries), ["DeepSeek-V4.1-Flash", "Qwen3.8-Flash-Next"]);
+        assert_eq!(models(&entries), ["DeepSeek-V4.1-Flash-1017", "Qwen3.8-Flash-Next"]);
     }
 
     fn pinned_entries() -> Vec<Entry> {
@@ -568,11 +578,18 @@ pub(crate) mod tests {
         assert_eq!(entry("Q2_0").default_extras(), [Extra::Mtp, Extra::Vision]);
         assert_eq!((entry("Q2_0").sidecar(Extra::Vision).unwrap().download, entry("Q2_0").sidecar(Extra::Vision).unwrap().tree), (907_543_008, 0));
         assert_eq!(entry("UD-IQ2_XXS").default_extras(), [Extra::Vision]);
+        // Unsloth's Qwen3.8 UD-IQ1_M: its three shards (68.0 GB) beside the official resources, and Qwen3.8's extras
+        let unsloth = Entry::of(Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" }).unwrap();
+        assert_eq!(unsloth.architecture, "qwen4exp");
+        assert_eq!(unsloth.files.iter().filter(|file| file.name.ends_with(".gguf")).count(), 3);
+        assert!((68_000_000_000..68_100_000_000).contains(&unsloth.download_bytes(&[])));
+        assert_eq!(unsloth.default_extras(), [Extra::Mtp, Extra::Vision]);
+        assert_eq!(unsloth.name(), "Qwen3.8-Flash-Next / Unsloth / UD-IQ1_M");
         // every bundle: its tokenizer files come with it and are small
-        for quant in ORDER {
-            let entry = entry(quant);
-            assert!(entry.download_bytes(&[]) > 30_000_000_000, "{quant}");
-            assert!(entry.footprint.dense + entry.footprint.experts + entry.footprint.tables <= entry.download_bytes(&[]), "{quant}");
+        for id in ORDER {
+            let entry = Entry::of(id).unwrap();
+            assert!(entry.download_bytes(&[]) > 30_000_000_000, "{id}");
+            assert!(entry.footprint.dense + entry.footprint.experts + entry.footprint.tables <= entry.download_bytes(&[]), "{id}");
         }
     }
 
@@ -629,7 +646,7 @@ pub(crate) mod tests {
         }
         let entries = pinned_entries();
         let fits: Vec<Fit> = entries.iter().map(|entry| fit_on(false, entry, &machine, DEFAULT_CONTEXT)).collect();
-        assert_eq!(recommend(&entries, &fits).map(|index| entries[index].quant.as_str()), Some("GSQ-RCO-IQ2_XXS"));
+        assert_eq!(recommend(&entries, &fits).map(|index| entries[index].id), Some(id("GSQ-RCO-IQ2_XXS")));
     }
 
     #[test]
@@ -639,9 +656,9 @@ pub(crate) mod tests {
         let entries = pinned_entries();
         let fits: Vec<(u64, Fit)> = entries.iter().map(|entry| fit_at_best_context(entry, &small)).collect();
         for (entry, (context, fit)) in entries.iter().zip(&fits) {
-            eprintln!("{:<22} {:<16} {:>6} {:?}  {}", entry.model, entry.quant, context, fit, fit.note(entry));
+            eprintln!("{:<48} {:>6} {:?}  {}", entry.name(), context, fit, fit.note(entry));
         }
-        let of = |quant: &str| fits[entries.iter().position(|entry| entry.quant == quant).unwrap()].clone();
+        let of = |quant: &str| fits[entries.iter().position(|entry| entry.id == id(quant)).unwrap()].clone();
         // DeepSeek-V4.1's weights and working memory do not fit 12 GB whatever the context: not offered
         for quant in ["GSQ-RCO-IQ2_XXS", "GSQ-RCO-IQ2_XS", "UD-IQ2_XXS"] {
             assert!(matches!(of(quant).1, Fit::TooLittleVram { .. }), "{quant}");
@@ -652,7 +669,7 @@ pub(crate) mod tests {
             assert!(matches!(of(quant), (DEFAULT_CONTEXT, Fit::Drive(_))), "{quant}: {:?}", of(quant));
         }
         let recommended = recommend(&entries, &fits.iter().map(|(_, fit)| fit.clone()).collect::<Vec<_>>()).unwrap();
-        assert_eq!(entries[recommended].quant, "IQ2_XS");
+        assert_eq!(entries[recommended].id, id("IQ2_XS"));
     }
 
     /// `machine` with `others` bytes of each GPU held by the desktop and other programs, and a reported card of `mib`.
@@ -663,16 +680,16 @@ pub(crate) mod tests {
     }
 
     /// Every bundle's verdict and the recommended one's name, under Windows or elsewhere.
-    fn verdicts(on_windows: bool, pc: &Machine) -> (Vec<(String, u64, Fit)>, Option<String>) {
+    fn verdicts(on_windows: bool, pc: &Machine) -> (Vec<(Id, u64, Fit)>, Option<Id>) {
         let entries = pinned_entries();
         let fits: Vec<(u64, Fit)> = entries.iter().map(|entry| best_context_on(on_windows, entry, pc)).collect();
         let classes: Vec<Fit> = fits.iter().map(|(_, fit)| fit.clone()).collect();
-        let named = recommend(&entries, &classes).map(|index| entries[index].quant.clone());
-        (entries.iter().zip(fits).map(|(entry, (context, fit))| (entry.quant.clone(), context, fit)).collect(), named)
+        let named = recommend(&entries, &classes).map(|index| entries[index].id);
+        (entries.iter().zip(fits).map(|(entry, (context, fit))| (entry.id, context, fit)).collect(), named)
     }
 
-    fn verdict(verdicts: &[(String, u64, Fit)], quant: &str) -> (u64, Fit) {
-        verdicts.iter().find(|(name, ..)| name == quant).map(|(_, context, fit)| (*context, fit.clone())).unwrap()
+    fn verdict(verdicts: &[(Id, u64, Fit)], quant: &str) -> (u64, Fit) {
+        verdicts.iter().find(|(named, ..)| *named == id(quant)).map(|(_, context, fit)| (*context, fit.clone())).unwrap()
     }
 
     const GIB_F: f64 = GIB as f64;
@@ -717,8 +734,8 @@ pub(crate) mod tests {
                 let pc = windows_pc(mib, DESKTOP, RAM_32);
                 let (fits, named) = verdicts(on_windows, &pc);
                 eprintln!("{name} windows={on_windows}, 32 GB: recommended {named:?}");
-                for (quant, context, fit) in &fits {
-                    eprintln!("  {quant:<16} {context:>6} {fit:?}  {}", fit.note(&entry(quant)));
+                for (id, context, fit) in &fits {
+                    eprintln!("  {:<48} {context:>6} {fit:?}  {}", id.to_string(), fit.note(&Entry::of(*id).unwrap()));
                 }
                 // the smaller Qwen3.8 bundles run on every card at the whole context, reading from the drive what RAM will not keep;
                 // from 8 GB the larger do too (at 6 GB they are short of budget, or of the context's indexers)
@@ -729,7 +746,7 @@ pub(crate) mod tests {
                     assert!(matches!(fit, Fit::Drive(_)), "{name}: {quant}: {fit:?}");
                 }
                 // and 32 GB holds none of them whole: the K/V's whole context would leave the banks 10 GiB of it
-                assert_eq!(named.as_deref(), Some("IQ2_XS"), "{name}");
+                assert_eq!(named, Some(id("IQ2_XS")), "{name}");
                 // DeepSeek-V4.1 runs on none of these with the desktop's share gone, or when it does never well
                 let (_, deepseek) = verdict(&fits, "GSQ-RCO-IQ2_XXS");
                 assert!(matches!(deepseek, Fit::TooLittleVram { .. } | Fit::Drive(_)), "{name}: {deepseek:?}");
@@ -742,7 +759,7 @@ pub(crate) mod tests {
     fn the_goal_machine_gets_iq2_xs_with_true_words() {
         let pc = windows_pc(6144, DESKTOP, RAM_32);
         let (fits, named) = verdicts(true, &pc);
-        assert_eq!(named.as_deref(), Some("IQ2_XS"));
+        assert_eq!(named, Some(id("IQ2_XS")));
         let ours = entry("IQ2_XS");
         let (context, fit) = verdict(&fits, "IQ2_XS");
         assert_eq!(context, DEFAULT_CONTEXT);
@@ -786,7 +803,7 @@ pub(crate) mod tests {
         // the K/V's growth is what parts 16 GB's RAM class: the banks of IQ3_S do not keep beside it at 62 GiB, IQ3_XXS's do
         let (pc, cases) = (windows_pc(16303, DESKTOP, 62 << 30), pinned_entries());
         let (fits, named) = verdicts(true, &pc);
-        assert_eq!(named.as_deref(), Some("IQ3_XXS"));
+        assert_eq!(named, Some(id("IQ3_XXS")));
         assert!(matches!(fit_on(true, &big, &pc, DEFAULT_CONTEXT), Fit::Drive(0)), "{:?}", fit_on(true, &big, &pc, DEFAULT_CONTEXT));
         assert!(matches!(verdict(&fits, "IQ3_XXS").1, Fit::Ram(_)));
         assert_eq!(cases.len(), fits.len());
@@ -827,7 +844,8 @@ pub(crate) mod tests {
     fn the_recommendation_is_the_best_class_of_the_first_model_that_runs_well() {
         let entries = pinned_entries();
         // all DeepSeek on the drive, Qwen3.8 in RAM for one bundle and in VRAM for another: Qwen3.8's in VRAM
-        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram];
+        // (Qwen3.8's: ISTA-DASLab's IQ3_S, IQ3_XXS and IQ2_XS, Unsloth's UD-IQ1_M, ISTA-DASLab's Q2_0)
+        let mut fits: Vec<Fit> = vec![Fit::Drive(5), Fit::Drive(5), Fit::Drive(4), Fit::Drive(3), Fit::Ram(9), Fit::Ram(8), Fit::Vram, Fit::Vram, Fit::Vram];
         assert_eq!(recommend(&entries, &fits), Some(6));
         // DeepSeek in RAM wins over Qwen3.8 in VRAM: the first model that runs well, its first bundle of the best class
         fits[2] = Fit::Ram(1);
@@ -839,13 +857,13 @@ pub(crate) mod tests {
         assert_eq!(recommend(&entries, &fits), Some(3));
         // nothing runs well: of the model reading least from the drive, the first bundle within a twentieth of its experts of that
         let bytes = |gib: u64| gib * GIB;
-        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        let slow: Vec<Fit> = vec![Fit::Drive(bytes(20)), Fit::Drive(bytes(20)), Fit::Drive(bytes(19)), Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(18)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
         assert_eq!(recommend(&entries, &slow), Some(6));
         // ... or the one reading least, past that
-        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
-        assert_eq!(recommend(&entries, &wide), Some(7));
+        let wide: Vec<Fit> = vec![Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(16)), Fit::Drive(bytes(16)), Fit::Drive(bytes(10))];
+        assert_eq!(recommend(&entries, &wide), Some(8));
         // a model that reads least is chosen over the bundles of another, however near
-        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
+        let other: Vec<Fit> = vec![Fit::Drive(bytes(11)), Fit::NoGpu, Fit::NoGpu, Fit::NoGpu, Fit::Drive(bytes(30)), Fit::Drive(bytes(20)), Fit::Drive(bytes(11)), Fit::Drive(bytes(11)), Fit::Drive(bytes(10))];
         assert_eq!(recommend(&entries, &other), Some(6));
     }
 }

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "model": "DeepSeek-V4.1-Flash",
+  "model": "DeepSeek-V4.1-Flash-1017",
   "architecture": "deepseek41",
   "vision": {
     "kind": "vision",

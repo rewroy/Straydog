@@ -45,7 +45,7 @@ fn model_tensors_vectors_and_rows_equal_the_reference() {
     let golden = golden();
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the bundle of tests/golden/weights.json") else { return };
     let model = &golden["model"];
-    let mut weights = Weights::open(&PathBuf::from(root), model["quantization"].as_str().unwrap(), None, 0,
+    let mut weights = Weights::open(&PathBuf::from(root), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, model["quantization"].as_str().unwrap()).unwrap(), None, 0,
                                     &|_, _, _| {}).unwrap();
     weights.authenticate(&|_, _, _| {}).unwrap();
     let mut names: Vec<&String> = weights.names().iter().collect();

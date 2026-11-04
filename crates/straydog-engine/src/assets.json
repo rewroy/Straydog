@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "model": "Qwen3.8-Flash-Next",
+  "provider": "ISTA-DASLab",
   "quantization": "Q2_0",
   "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
   "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
@@ -64,6 +65,31 @@
           "source_path": "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
           "bytes": 28800138432,
           "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+        }
+      ]
+    },
+    "UD-IQ1_M": {
+      "provider": "Unsloth",
+      "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "revision": "d96201194f103c906994f283f504209dc8d2a10c",
+      "assets": [
+        {
+          "name": "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+          "source_path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+          "bytes": 10946618,
+          "sha256": "b0d883bb9464021f31074145af74bfc2aa2d4bf0cf506f26f6f5107f4ca6ce17"
+        },
+        {
+          "name": "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+          "source_path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+          "bytes": 39196009888,
+          "sha256": "bddcd79634ccddbb2e0951345c73c6ae8bd7b12594f55a2a529474701757391e"
+        },
+        {
+          "name": "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+          "source_path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+          "bytes": 28800138432,
+          "sha256": "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"
         }
       ]
     }
