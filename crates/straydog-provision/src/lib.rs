@@ -31,14 +31,27 @@ pub type Progress<'a> = &'a (dyn Fn(&str, u64, u64) + Sync);
 
 /// The optional files of a bundle read on demand that a fetch adds to its shards: DeepSeek-V4.1's
 /// DSpark drafter and its vision encoder (a model without either pinned has nothing to add).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extras {
     pub dspark: bool,
     pub vision: bool,
+    /// An engram table to fetch instead of the bundle's own (its precision: Unsloth's Qwen3.8), into the model's `engram`
+    /// directory beside the bundle's, where the model's bundles share it; the bundle's own table shard is then not fetched.
+    pub table: Option<String>,
 }
 
 impl Extras {
-    pub const ALL: Extras = Extras { dspark: true, vision: true };
+    pub const ALL: Extras = Extras { dspark: true, vision: true, table: None };
+}
+
+/// The engram table of `precision` a bundle may read instead of its own; none for its own table's precision.
+pub fn chosen_table(id: bundle::Id, precision: &str) -> Result<Option<bundle::Table>, String> {
+    let tables = bundle::tables(id)?;
+    let table = tables.iter().find(|table| table.precision.eq_ignore_ascii_case(precision)).cloned().ok_or_else(|| {
+        let offered: Vec<&str> = tables.iter().map(|table| table.precision.as_str()).collect();
+        if offered.is_empty() { format!("{id} has no engram table to choose") } else { format!("no {precision} engram table: {}", offered.join(", ")) }
+    })?;
+    Ok(Some(table).filter(|table| !table.bundled))
 }
 
 /// Download (resuming) and authenticate `files` (their pins and plain-HTTP URLs) into `root`, as the
@@ -70,7 +83,19 @@ pub fn fetch_extras(root: &Path, id: bundle::Id, offline: bool, data_dir: Option
         fetch_dspark(root, id, offline || !extras.dspark, progress).map_err(|error| error.to_string())?;
         return print_trees(root, id, &data_dir, false, progress);
     }
-    fetch_assets(root, id, offline, true, progress)?;
+    match extras.table.as_deref().map(|precision| chosen_table(id, precision)).transpose()?.flatten() {
+        Some(table) => {
+            let shard = bundle::bundle(id)?.shards.last().cloned().ok_or("Straydog bundle without shards")?;
+            let entries: Vec<_> = assets::entries(id)?.into_iter().filter(|(asset, _)| *asset != shard).collect();
+            let agent = http::agent(assets::TIMEOUT);
+            assets::fetch_with(&agent, root, &entries, offline, true, progress).map_err(|error| error.to_string())?;
+            let source = bundle::table_source(&table)?;
+            let url = format!("https://huggingface.co/{}/resolve/{}/{}", source.repository, source.revision, source.path);
+            let directory = root.parent().unwrap_or(root).join(bundle::ENGRAM_DIRECTORY);
+            assets::fetch_with(&agent, &directory, &[(table.asset, url)], offline, true, progress).map_err(|error| error.to_string())?;
+        }
+        None => fetch_assets(root, id, offline, true, progress)?,
+    }
     print_trees(root, id, &data_dir, true, progress)
 }
 
@@ -82,7 +107,18 @@ pub fn verify(root: &Path, id: bundle::Id, data_dir: Option<&Path>, progress: Pr
     if id.is_on_demand() {
         return print_trees(root, id, &data_dir, false, progress);
     }
-    fetch_assets(root, id, true, true, progress)?;
+    // (a bundle reading one of the model's engram tables instead of its own: that file, in its own directory, for the shard)
+    match bundle::table_in(root, id)?.filter(|(table, _)| !table.bundled) {
+        Some((table, path)) => {
+            let shard = bundle::bundle(id)?.shards.last().cloned().ok_or("Straydog bundle without shards")?;
+            let entries: Vec<_> = assets::entries(id)?.into_iter().filter(|(asset, _)| *asset != shard).collect();
+            let agent = http::agent(assets::TIMEOUT);
+            assets::fetch_with(&agent, root, &entries, true, true, progress).map_err(|error| error.to_string())?;
+            let directory = path.parent().ok_or("Straydog engram table without a directory")?;
+            assets::fetch_with(&agent, directory, &[(table.asset, String::new())], true, true, progress).map_err(|error| error.to_string())?;
+        }
+        None => fetch_assets(root, id, true, true, progress)?,
+    }
     print_trees(root, id, &data_dir, true, progress)
 }
 

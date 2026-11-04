@@ -264,6 +264,14 @@ pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, Str
     let mut files: Vec<PathBuf> =
         pins.shards.iter().chain(&pins.resources).map(|asset| settings.model.join(&asset.name)).collect();
     let mut directories = vec![settings.model.clone()];
+    // (a more exact engram table the bundle reads in its last shard's place, there or beside it)
+    if let Some((_, path)) = bundle::table_in(&settings.model, settings.bundle)?.filter(|(table, _)| !table.bundled) {
+        if let Some(shard) = pins.shards.last() {
+            files.retain(|file| *file != settings.model.join(&shard.name));
+        }
+        directories.extend(path.parent().map(std::path::Path::to_path_buf).filter(|directory| *directory != settings.model));
+        files.push(path);
+    }
     if let (Some(drafter), true) = (&settings.model_draft, settings.draft_max > 0) {
         files.push(drafter.join(&pins.drafter.name));
         directories.push(drafter.clone());
@@ -344,7 +352,7 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
     #[cfg(not(windows))]
     // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports; and
     // the controls of DeepSeek-V4.1's drafts: DS41_DRAFTS, DS41_DSPARK and DS41_DSPARK_RESIDENT)
-    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT"];
+    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT", "STRAYDOG_ENGRAM"];
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()

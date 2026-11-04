@@ -70,6 +70,7 @@
     },
     "UD-IQ1_M": {
       "provider": "Unsloth",
+      "table": "IQ4_NL",
       "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
       "revision": "d96201194f103c906994f283f504209dc8d2a10c",
       "assets": [
@@ -95,6 +96,7 @@
     },
     "UD-IQ1_S": {
       "provider": "Unsloth",
+      "table": "IQ4_NL",
       "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
       "revision": "d96201194f103c906994f283f504209dc8d2a10c",
       "assets": [
@@ -120,6 +122,7 @@
     },
     "UD-IQ2_XS": {
       "provider": "Unsloth",
+      "table": "IQ4_NL",
       "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
       "revision": "d96201194f103c906994f283f504209dc8d2a10c",
       "assets": [
@@ -145,6 +148,7 @@
     },
     "UD-IQ3_XXS": {
       "provider": "Unsloth",
+      "table": "IQ4_NL",
       "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
       "revision": "d96201194f103c906994f283f504209dc8d2a10c",
       "assets": [
@@ -366,5 +370,33 @@
         "sha256": "b933b44559879449b1baf2af8385c5c237347307e3fd452394870cb53e6eab6d"
       }
     }
+  },
+  "tables": {
+    "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "revision": "d96201194f103c906994f283f504209dc8d2a10c",
+    "tensor": "per_layer_token_embd.weight",
+    "assets": [
+      {
+        "name": "Qwen3.8-Flash-Next-engram-BF16.gguf_file",
+        "precision": "BF16",
+        "source_path": "engram/Qwen3.8-Flash-Next-engram-BF16.gguf_file",
+        "bytes": 102400491712,
+        "sha256": "fd191dd766b7b9616bc648dad1d9dec7bff7cf0a6d27cb2c9edcde9be2aef966"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-engram-Q8_0.gguf_file",
+        "precision": "Q8_0",
+        "source_path": "engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file",
+        "bytes": 54400261312,
+        "sha256": "e3d76a2747c1fe53e3420d1bb7fd9593aafd03035fee4926317db80ad5c5296a"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-engram-Q5_1.gguf_file",
+        "precision": "Q5_1",
+        "source_path": "engram/Qwen3.8-Flash-Next-engram-Q5_1.gguf_file",
+        "bytes": 38400184512,
+        "sha256": "6eabff6df91df62f802d0c7185512c776d705dd73679a8f65cfb0a7843480e26"
+      }
+    ]
   }
 }

@@ -9,9 +9,14 @@ use straydog_engine::load;
 fn every_pinned_shard_and_drafter_has_its_chunk_digests() {
     for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
         let pins = bundle::bundle(id).unwrap();
-        for asset in pins.shards.iter().chain([&pins.drafter]) {
+        let tables: Vec<bundle::Asset> = bundle::tables(id).unwrap().into_iter().filter(|table| !table.bundled).map(|table| table.asset).collect();
+        for asset in pins.shards.iter().chain([&pins.drafter]).chain(&tables) {
             let pieces = bundle::chunk_digests(&asset.sha256).unwrap().unwrap_or_else(|| panic!("{} unpinned", asset.name));
             assert_eq!(pieces.len() as u64, asset.bytes.div_ceil(digest::CHUNK_BYTES), "{}", asset.name);
+        }
+        // (each engram table a bundle may read has its verity digest: its rows are checked as they are read)
+        for asset in &tables {
+            assert!(bundle::verity_digest(&asset.sha256).unwrap().is_some(), "{} has no verity digest", asset.name);
         }
     }
 }

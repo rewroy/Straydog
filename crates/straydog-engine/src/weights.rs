@@ -103,6 +103,8 @@ type EmbeddingCache = (HashMap<i64, Arc<Vec<f32>>>, VecDeque<i64>);
 pub struct Weights {
     pub root: PathBuf,
     pub bundle: bundle::Id,
+    /// The engram table read in the last shard's place, when it is one of the model's engram files ([`bundle::table_in`]).
+    pub table: Option<bundle::Table>,
     pub quantization: String,
     /// Measured outside isolation by the runtime (cgroup limits included).
     pub host_memory_bytes: u64,
@@ -258,9 +260,12 @@ impl Weights {
             return Err(error("Straydog requires authenticated tokenizer, template, and config"));
         }
         let root = absolute_directory(root)?;
+        // (Unsloth's Qwen3.8: a more exact engram table there is read in place of the last shard, which holds the bundled one)
+        let table = bundle::table_in(&root, id)?.filter(|(table, _)| !table.bundled);
         let mut weights = Weights {
             root: root.clone(),
             bundle: id,
+            table: table.as_ref().map(|(table, _)| table.clone()),
             quantization: id.quant.to_string(),
             host_memory_bytes: if host_memory_bytes > 0 { host_memory_bytes } else { crate::host::host_memory_bytes() },
             integer_arrays: BTreeMap::new(),
@@ -285,13 +290,24 @@ impl Weights {
         for asset in &pins.resources {
             weights.resources.insert(asset.name.clone(), read_resource(&root, asset)?);
         }
-        let mut opened = open_pinned(&root, &pins.shards, "open", progress)?;
+        let mut files: Vec<Asset> = pins.shards.clone();
+        let mut opened = match &table {
+            Some((table, path)) => {
+                files.pop();
+                let mut opened = open_pinned(&root, &files, "open", progress)?;
+                let directory = path.parent().ok_or("Straydog engram table without a directory")?;
+                opened.extend(open_pinned(directory, std::slice::from_ref(&table.asset), "open", progress)?);
+                files.push(table.asset.clone());
+                opened
+            }
+            None => open_pinned(&root, &pins.shards, "open", progress)?,
+        };
         if let Some(directory) = drafter {
             let directory = absolute_directory(directory)?;
             opened.extend(open_pinned(&directory, std::slice::from_ref(&pins.drafter), "drafter", progress)?);
         }
         // Each header's chunk is read and hashed on a thread of its own.
-        let assets: Vec<&Asset> = pins.shards.iter().chain([&pins.drafter]).collect();
+        let assets: Vec<&Asset> = files.iter().chain([&pins.drafter]).collect();
         let headers: Vec<Result<straydog_gguf::ModelHeader, String>> = std::thread::scope(|scope| {
             let threads: Vec<_> = opened.iter().zip(&assets)
                 .map(|(((file, _), pieces), asset)| scope.spawn(move || header(file, &asset.name, &pieces[0])))
@@ -304,8 +320,14 @@ impl Weights {
                 weights.add_drafter(asset, file, pieces, header)?;
                 continue;
             }
-            if header.shard_count != shards as u64 || header.shard_index != index as u64 {
+            // (an engram file is a file of one: its table alone, where the last shard's was)
+            let engram = index == shards - 1 && table.is_some();
+            let identity = if engram { (1, 0) } else { (shards as u64, index as u64) };
+            if (header.shard_count, header.shard_index) != identity {
                 return Err(error("Straydog shard identity mismatch"));
+            }
+            if engram && !(header.tensors.len() == 1 && header.tensors[0].name == "per_layer_token_embd.weight") {
+                return Err(error("Straydog engram table holds other tensors"));
             }
             let architecture_ok = header.architecture == "qwen4exp" || (index > 0 && header.architecture.is_empty());
             if !architecture_ok {
@@ -330,7 +352,11 @@ impl Weights {
     pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
         let mut verifiers = vec![None; self.files.len()];
         let mut current = vec![false; self.files.len()];
-        for (asset, digest) in bundle::verity_pins(self.bundle)? {
+        let table = self.table.as_ref().map(|table| -> Result<_, String> {
+            let digest = bundle::verity_digest(&table.asset.sha256)?.ok_or_else(|| format!("{} has no pinned verity digest", table.asset.name))?;
+            Ok((table.asset.clone(), digest))
+        }).transpose()?;
+        for (asset, digest) in bundle::verity_pins(self.bundle)?.into_iter().chain(table) {
             let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
             let tree = bundle::tree_path(data_dir, &asset);
             current[index] = tree_is_current(&self.files[index], &tree);

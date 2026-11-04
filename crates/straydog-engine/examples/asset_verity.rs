@@ -23,12 +23,17 @@ fn main() -> Result<(), String> {
     // Per whole-file SHA-256: the assets pinned with it (a file shared by bundles has a name in each).
     let mut assets: BTreeMap<String, (Vec<Asset>, PathBuf)> = BTreeMap::new();
     for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
-        for asset in bundle::bundle(id)?.shards {
+        let tables = bundle::tables(id)?.into_iter().filter(|table| !table.bundled).map(|table| table.asset);
+        for asset in bundle::bundle(id)?.shards.into_iter().chain(tables) {
             let Some(path) = find(directories, &asset.name) else {
                 eprintln!("not found: {}", asset.name);
                 continue;
             };
-            assets.entry(asset.sha256.clone()).or_insert_with(|| (Vec::new(), path)).0.push(asset);
+            // (a file the model's bundles share, as an engram table, once under each name)
+            let names = &mut assets.entry(asset.sha256.clone()).or_insert_with(|| (Vec::new(), path)).0;
+            if !names.iter().any(|named| named.name == asset.name) {
+                names.push(asset);
+            }
         }
     }
     let results: Vec<Result<(String, String), String>> = std::thread::scope(|scope| {

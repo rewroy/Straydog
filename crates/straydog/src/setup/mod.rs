@@ -51,6 +51,10 @@ pub struct SetupArgs {
     /// Leave out the MTP drafter (Qwen3.8)
     #[arg(long)]
     pub no_mtp: bool,
+    /// Unsloth's Qwen3.8 bundles: the engram table to read, BF16 (102.4 GB, lossless), Q8_0 (54.4 GB), Q5_1 (38.4 GB) or IQ4_NL
+    /// (28.8 GB, the bundle's own), fetched into the model's engram folder, which its bundles share [default: the bundle's own]
+    #[arg(long, value_name = "PRECISION")]
+    pub engram: Option<String>,
     /// The settings file to write [default: config.toml in the platform's config folder, which a plain `straydog` reads]
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -101,7 +105,7 @@ pub struct Pinned;
 
 impl Provision for Pinned {
     fn fetch(&self, place: &Place, entry: &Entry, extras: &[Extra], offline: bool, progress: straydog_provision::Progress) -> Result<(), String> {
-        let wanted = Extras { dspark: extras.contains(&Extra::Dspark), vision: extras.contains(&Extra::Vision) };
+        let wanted = Extras { dspark: extras.contains(&Extra::Dspark), vision: extras.contains(&Extra::Vision), table: entry.table.clone() };
         straydog_provision::fetch_extras(&place.bundle, entry.id, offline, Some(&place.data), wanted, progress)?;
         // (the drafter is built from tensors fetched for it: offline, only one already built is authenticated)
         if entry.sidecar(Extra::Mtp).is_some_and(|mtp| extras.contains(&Extra::Mtp) && (!offline || place.drafter.join(&mtp.file).is_file())) {
@@ -311,7 +315,12 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
             if ask { menu(talk, entries, &fits, machine.gpus.len(), recommended)? } else { recommended }
         }
     };
-    let entry = &entries[index];
+    // (with the engram table asked for in its own table's place)
+    let chosen = match &args.engram {
+        Some(precision) => entries[index].with_table(precision)?,
+        None => entries[index].clone(),
+    };
+    let entry = &chosen;
     let (context, fit) = &fits[index];
     if matches!(fit, Fit::Drive(_)) {
         talk.say(&format!("Note: {}: {}.", entry.name(), fit.note(entry)));
@@ -441,6 +450,8 @@ fn listing(entries: &[Entry], machine: &Machine) -> serde_json::Value {
             "model": entry.id.model,
             "provider": entry.id.provider,
             "quant": entry.id.quant,
+            "tables": entry.tables().into_iter().map(|(precision, bytes)| serde_json::json!({"precision": precision, "download_bytes": bytes}))
+                .collect::<Vec<_>>(),
             "creator": straydog_engine::bundle::model(entry.id.model).map(|model| model.creator),
             "license": straydog_engine::bundle::model(entry.id.model).map(|model| model.license),
             "license_url": straydog_engine::bundle::model(entry.id.model).map(|model| model.license_url),
@@ -547,7 +558,7 @@ mod tests {
             .map(|(name, data)| Asset { name: name.to_string(), bytes: data.len() as u64, sha256: format!("{:x}", Sha256::digest(data)) })
             .collect();
         let entry = Entry {
-            id: straydog_engine::bundle::Id { model: "Test-Model", provider: "Test", quant: "T-Q1" }, architecture: "qwen4exp".into(),
+            id: straydog_engine::bundle::Id { model: "Test-Model", provider: "Test", quant: "T-Q1" }, table: None, architecture: "qwen4exp".into(),
             files: assets.iter().map(|asset| File { name: asset.name.clone(), bytes: asset.bytes, tree: 0 }).collect(),
             footprint: Footprint { dense: 1 << 20, experts: 1 << 20, tables: 0, state_per_token: 1024 }, sidecars: Vec::new(),
         };

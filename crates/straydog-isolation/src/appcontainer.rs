@@ -30,8 +30,8 @@ pub const PROFILE_NAME: &str = "Straydog.Worker";
 /// AppContainer process points LOCALAPPDATA and the user profile at the container's own
 /// folders, and fails with ERROR_ENVVAR_NOT_FOUND (203) when they are absent. Nothing else
 /// reaches it: no proxy, token, key or credential the server's environment may hold. DS41_PROFILE
-/// is the engines' phase timing, as on Linux.
-pub const WORKER_VARIABLES: [&str; 18] = [
+/// is the engines' phase timing, as on Linux, and STRAYDOG_ENGRAM the engram table Qwen3.8 reads.
+pub const WORKER_VARIABLES: [&str; 19] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
@@ -50,6 +50,7 @@ pub const WORKER_VARIABLES: [&str; 18] = [
     "CUDA_PATH",
     "LANG",
     "DS41_PROFILE",
+    "STRAYDOG_ENGRAM",
 ];
 
 /// Whether a file is a CUDA runtime DLL a CUDA build of the executable loads: cuBLAS

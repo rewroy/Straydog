@@ -13,6 +13,7 @@ pub fn block(kind: u32) -> Option<(usize, usize)> {
         1 | 30 => (1, 2),
         2 => (32, 18),
         6 => (32, 22),
+        7 => (32, 24),
         8 => (32, 34),
         20 => (32, 18),
         39 => (32, 17),
@@ -172,6 +173,7 @@ fn decode_blocks(kind: u32, data: &[u8], size: usize, target: &mut [f32]) {
             .for_each(|(o, b)| *o = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)),
         2 => blocks(data, target, size, q4_0),
         6 => blocks(data, target, size, q5_0),
+        7 => blocks(data, target, size, q5_1),
         8 => blocks(data, target, size, q8_0),
         20 => blocks(data, target, size, iq4_nl),
         39 => blocks(data, target, size, mxfp4),
@@ -212,6 +214,13 @@ fn q4_0(block: &[u8], out: &mut [f32]) {
 fn q5_0(block: &[u8], out: &mut [f32]) {
     let (d, high) = (half(block, 0), word(block, 2));
     nibbles(&block[6..22], out, |nibble, i| d * f32::from((nibble | (((high >> i) & 1) as u8) << 4) as i8 - 16));
+}
+
+/// Q5_1: d and m (f16), 32 high bits (bit i of value i), then 16 bytes of low nibbles; a value is d * code + m, the
+/// product exact (an f16 times five bits) and the sum rounded once, as ggml's. (Unsloth's Q5_1 engram table.)
+fn q5_1(block: &[u8], out: &mut [f32]) {
+    let (d, m, high) = (half(block, 0), half(block, 2), word(block, 4));
+    nibbles(&block[8..24], out, |nibble, i| d * f32::from(nibble | (((high >> i) & 1) as u8) << 4) + m);
 }
 
 /// IQ4_NL: d (f16), then 16 bytes of nonlinear four-bit values.
@@ -453,6 +462,25 @@ fn iq4_xs(block: &[u8], out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q5_1 decodes as ggml's dequantize_row_q5_1: d * ((qs & 15) | high bit << 4) + m, values j and j + 16 a byte.
+    #[test]
+    fn q5_1_decodes_as_ggml_does() {
+        let mut block = vec![0u8; 24];
+        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1
+        block[2..4].copy_from_slice(&0xc000u16.to_le_bytes()); // m = -2
+        block[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes()); // high bits of values 0 and 31
+        for j in 0..16 {
+            block[8 + j] = (j as u8) | ((15 - j as u8) << 4);
+        }
+        let mut out = Vec::new();
+        decode_into(7, &block, &mut out).unwrap();
+        assert_eq!(out.len(), 32);
+        for j in 0..16 {
+            assert_eq!(out[j], (j as u32 | if j == 0 { 16 } else { 0 }) as f32 - 2.0, "{j}");
+            assert_eq!(out[j + 16], ((15 - j) as u32 | if j == 15 { 16 } else { 0 }) as f32 - 2.0, "{}", j + 16);
+        }
+    }
 
     #[test]
     fn half_precision_converts_exactly() {

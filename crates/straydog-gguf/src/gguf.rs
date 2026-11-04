@@ -307,7 +307,8 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<ModelHeader> {
     if shard_count > 1 && !metadata.contains_key("split.no") {
         return Err(invalid("split GGUF is missing its shard number"));
     }
-    if architecture.is_empty() && shard_index == 0 {
+    // (a file of tensors alone, as Unsloth's engram tables are, declares none: the reader takes it for its pinned tensors)
+    if architecture.is_empty() && shard_index == 0 && shard_count > 1 {
         return Err(invalid("the first GGUF shard must declare its architecture"));
     }
     let mut names = BTreeSet::new();

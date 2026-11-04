@@ -271,6 +271,80 @@ pub fn verity_pins(id: Id) -> Result<Vec<(Asset, String)>, String> {
     Ok(pins)
 }
 
+/// The directory beside (or inside) a Qwen3.8 bundle's that holds engram tables any of the model's bundles may read.
+pub const ENGRAM_DIRECTORY: &str = "engram";
+
+/// Table precisions from the most exact: a bundle reads the most exact table there is ([`table_in`]).
+pub const TABLE_PRECISIONS: [&str; 4] = ["BF16", "Q8_0", "Q5_1", "IQ4_NL"];
+
+/// A table a bundle may read its engram (PLE) rows from: its own last shard (`bundled`), or one of Unsloth's engram files,
+/// the same rows at another precision, one tensor in a file of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub precision: String,
+    pub asset: Asset,
+    pub bundled: bool,
+}
+
+/// The tables a bundle may read: its own shard's first, then the engram files of the model's manifest; none for a bundle
+/// whose last shard is not a table of its own.
+pub fn tables(id: Id) -> Result<Vec<Table>, String> {
+    if id.is_on_demand() {
+        return Ok(Vec::new());
+    }
+    let manifest: Value = serde_json::from_str(MANIFEST).map_err(|exc| exc.to_string())?;
+    let Some(precision) = manifest["bundles"][id.quant]["table"].as_str() else { return Ok(Vec::new()) };
+    let shard = bundle(id)?.shards.last().cloned().ok_or("Straydog bundle without shards")?;
+    let mut tables = vec![Table { precision: precision.to_string(), asset: shard, bundled: true }];
+    for item in manifest["tables"]["assets"].as_array().ok_or("manifest tables missing")? {
+        let precision = item["precision"].as_str().ok_or("manifest table without a precision")?;
+        tables.push(Table { precision: precision.to_string(), asset: asset(item)?, bundled: false });
+    }
+    Ok(tables)
+}
+
+/// Where a bundle in `root` may keep an engram table: in `root`, in `root/engram`, or in an `engram` directory beside
+/// `root` (the model's bundles side by side share one).
+pub fn engram_directories(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    [Some(root.to_path_buf()), Some(root.join(ENGRAM_DIRECTORY)), root.parent().map(|parent| parent.join(ENGRAM_DIRECTORY))]
+        .into_iter().flatten().collect()
+}
+
+/// The table a bundle in `root` reads, and where: of those there, the most exact ([`TABLE_PRECISIONS`]), its own shard
+/// before a file of the same precision; with `STRAYDOG_ENGRAM` set, the one of that precision (an error when it is not
+/// there). None for a bundle without a table of its own, or when none is there.
+pub fn table_in(root: &std::path::Path, id: Id) -> Result<Option<(Table, std::path::PathBuf)>, String> {
+    let tables = tables(id)?;
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    let rank = |table: &Table| TABLE_PRECISIONS.iter().position(|precision| *precision == table.precision).unwrap_or(TABLE_PRECISIONS.len());
+    let mut found: Vec<(Table, std::path::PathBuf)> = Vec::new();
+    for table in tables {
+        let directories = if table.bundled { vec![root.to_path_buf()] } else { engram_directories(root) };
+        if let Some(path) = directories.into_iter().map(|directory| directory.join(&table.asset.name)).find(|path| path.is_file()) {
+            found.push((table, path));
+        }
+    }
+    found.sort_by_key(|(table, _)| (rank(table), !table.bundled));
+    if let Some(precision) = std::env::var("STRAYDOG_ENGRAM").ok().filter(|precision| !precision.is_empty()) {
+        return found.into_iter().find(|(table, _)| table.precision.eq_ignore_ascii_case(&precision)).map(Some)
+            .ok_or_else(|| format!("STRAYDOG_ENGRAM={precision}: no such engram table for {id} in {} or its engram directories", root.display()));
+    }
+    Ok(found.into_iter().next())
+}
+
+/// Where the pinned engram tables come from (provisioning only).
+pub fn table_source(table: &Table) -> Result<Source, String> {
+    let manifest: Value = serde_json::from_str(MANIFEST).map_err(|exc| exc.to_string())?;
+    let tables = &manifest["tables"];
+    let item = tables["assets"].as_array().into_iter().flatten().find(|item| item["name"] == table.asset.name.as_str())
+        .ok_or_else(|| format!("{} is not a pinned engram table", table.asset.name))?;
+    let text = |value: &Value| value.as_str().map(str::to_string).ok_or("manifest tables incomplete");
+    Ok(Source { asset: table.asset.clone(), repository: text(&tables["repository"])?, revision: text(&tables["revision"])?,
+                path: text(&item["source_path"])? })
+}
+
 /// [`verity_pins`] of the files a model in `root` has: with its vision encoder and its DSpark
 /// drafter when pinned and there ([`vision_source`], [`dspark_in`]).
 pub fn verity_pins_in(root: &std::path::Path, id: Id) -> Result<Vec<(Asset, String)>, String> {
@@ -281,6 +355,13 @@ pub fn verity_pins_in(root: &std::path::Path, id: Id) -> Result<Vec<(Asset, Stri
 /// the DSpark drafter where [`dspark_in`] finds it.
 pub fn verity_files_in(root: &std::path::Path, id: Id) -> Result<Vec<(std::path::PathBuf, Asset, String)>, String> {
     let mut files: Vec<_> = verity_pins(id)?.into_iter().map(|(asset, digest)| (root.join(&asset.name), asset, digest)).collect();
+    // (the table the bundle reads, when it is an engram file rather than its own last shard: in the shard's place)
+    if let Some((table, path)) = table_in(root, id)?.filter(|(table, _)| !table.bundled) {
+        let shard = bundle(id)?.shards.last().cloned().ok_or("Straydog bundle without shards")?;
+        files.retain(|(_, asset, _)| *asset != shard);
+        let digest = verity_digest(&table.asset.sha256)?.ok_or_else(|| format!("{} has no pinned verity digest", table.asset.name))?;
+        files.push((path, table.asset, digest));
+    }
     if let Some(vision) = vision_source(id)?.filter(|vision| root.join(&vision.asset.name).is_file()) {
         files.push((root.join(&vision.asset.name), vision.asset, vision.verity));
     }
@@ -805,6 +886,39 @@ mod tests {
             assert!(!BUNDLES[..index].contains(id), "{id}");
             assert_eq!(Id::find(Some(id.model), Some(id.provider), id.quant).as_ref(), Ok(id));
         }
+    }
+
+    /// Unsloth's Qwen3.8 bundles read the most exact engram table there is: their own last shard (IQ4_NL), or one of the
+    /// model's engram files in the bundle's directory, its engram directory or the one beside it, the shard before a file of
+    /// its precision. Bundles without a table shard of their own have none.
+    #[test]
+    fn a_bundle_reads_the_most_exact_engram_table_there_is() {
+        let id = Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" };
+        let offered: Vec<(String, bool)> = tables(id).unwrap().into_iter().map(|table| (table.precision, table.bundled)).collect();
+        assert_eq!(offered, [("IQ4_NL".into(), true), ("BF16".into(), false), ("Q8_0".into(), false), ("Q5_1".into(), false)]);
+        assert!(tables(qw("IQ2_XS")).unwrap().is_empty() && tables(ds("UD-IQ1_M")).unwrap().is_empty());
+        let family = std::env::temp_dir().join(format!("straydog-bundle-engram-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&family);
+        let root = family.join("Unsloth-UD-IQ1_M");
+        std::fs::create_dir_all(&root).unwrap();
+        let precision = || table_in(&root, id).unwrap().map(|(table, path)| (table.precision, path));
+        assert_eq!(precision(), None);
+        let shard = bundle(id).unwrap().shards[2].name.clone();
+        std::fs::write(root.join(&shard), b"").unwrap();
+        assert_eq!(precision(), Some(("IQ4_NL".into(), root.join(&shard))));
+        // the model's engram directory beside the bundle's, which its bundles share
+        std::fs::create_dir_all(family.join(ENGRAM_DIRECTORY)).unwrap();
+        let q5 = family.join(ENGRAM_DIRECTORY).join("Qwen3.8-Flash-Next-engram-Q5_1.gguf_file");
+        std::fs::write(&q5, b"").unwrap();
+        assert_eq!(precision(), Some(("Q5_1".into(), q5)));
+        // a more exact one in the bundle's own directory
+        let q8 = root.join("Qwen3.8-Flash-Next-engram-Q8_0.gguf_file");
+        std::fs::write(&q8, b"").unwrap();
+        assert_eq!(precision(), Some(("Q8_0".into(), q8.clone())));
+        // the files whose trees the server builds: the table read, in the last shard's place
+        let files = verity_files_in(&root, id).unwrap();
+        assert!(files.iter().any(|(path, ..)| *path == q8) && !files.iter().any(|(path, ..)| path.ends_with(&shard)), "{files:?}");
+        std::fs::remove_dir_all(family).unwrap();
     }
 
     /// Every bundle's footprint is the tensors of its files: what the three kinds add up to is the
