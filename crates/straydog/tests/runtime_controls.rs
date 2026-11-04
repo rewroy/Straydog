@@ -155,6 +155,12 @@ fn main() {
             eprintln!("Straydog VRAM budget is unavailable");
             std::process::exit(1);
         }
+        // As a worker that panics while it starts: Rust's own panic output, then status 101.
+        Some("panics") => {
+            let held: Option<u32> = None;
+            held.expect("Straydog VRAM budget is held");
+            return;
+        }
         // As a worker the OS refused a file: its launcher's warning first, then its reason.
         Some("denied") => {
             eprintln!("{WARNING}");
@@ -272,6 +278,14 @@ fn main() {
         assert!(message.contains("VRAM budget is unavailable"), "{message}");
         assert!(matches!(engine.state(), EngineState::Failed(_)));
         engine.close().await;
+        // (one that panicked: by its panic and message, never Rust's note on backtraces)
+        let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["panics".into()]));
+        let message = tokio::time::timeout(Duration::from_secs(10), engine.failed()).await
+            .expect("a worker that panicked did not fail the runtime");
+        assert!(message.contains("panicked at") && message.contains("Straydog VRAM budget is held")
+                && !message.contains("RUST_BACKTRACE"), "{message}");
+        engine.close().await;
+        println!("runtime_controls: a worker that panicked at start is reported by its panic: {message}");
 
         // A worker the OS refused: the runtime looks for why and says it after the worker's own reason
         // (the launcher's warning is not that reason); for any other failure it does not look.
