@@ -309,7 +309,7 @@ fn refusal_of(settings: &Settings) -> Refusal {
 /// none.
 fn start_reason(tail: &str, message: String) -> String {
     let lines: Vec<&str> = tail.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
-    let panic = lines.iter().rposition(|line| line.starts_with("thread '") && line.contains("' panicked at "));
+    let panic = lines.iter().rposition(|line| line.starts_with("thread '") && line.contains(" panicked at "));
     let reason = match panic {
         Some(at) => {
             let message = lines[at + 1..].iter().take_while(|line| !line.starts_with("note: ") && **line != "stack backtrace:");
@@ -1442,6 +1442,9 @@ mod tests {
         // a message over several lines, and a backtrace printed after it
         let tail = format!("{panic}\nsecond line\r\nstack backtrace:\n   0: rust_begin_unwind\n{note}\n");
         assert_eq!(start_reason(&tail, "ended".into()), format!("{reason} second line"));
+        // as current Rust words it, with the thread's id
+        let numbered = "thread 'main' (835602) panicked at src/worker.rs:88:14:\nheld";
+        assert_eq!(start_reason(&format!("{numbered}\n{note}\n"), "ended".into()), "thread 'main' (835602) panicked at src/worker.rs:88:14: held");
         // the panic is found even when the worker wrote more after it
         assert_eq!(start_reason(&format!("{panic}\n{note}\nStraydog worker ended\n"), "ended".into()), reason);
     }
