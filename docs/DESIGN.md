@@ -617,9 +617,12 @@ How an image is read:
 
 ## 8. Qwen3.8-Flash-Next
 
-Qwen3.8-Flash-Next is served from five pinned bundles (ISTA-DASLab's GSQ-RCO Q2_0, IQ2_XS, IQ3_XXS and
-IQ3_S, two shards each, and Unsloth's UD-IQ1_M, three shards: the first holds the metadata alone) with the
-tokenizer and template files of the official release, and optionally with its MTP drafter.
+Qwen3.8-Flash-Next is served from eight pinned bundles: Unsloth's UD-IQ3_XXS, UD-IQ2_XS, UD-IQ1_M and
+UD-IQ1_S (Dynamic V3.1; three or four shards, the first holding the metadata alone, the last the engram table,
+which UD-IQ1_S, UD-IQ1_M and UD-IQ2_XS share), offered first, and ISTA-DASLab's GSQ-RCO IQ3_S, IQ3_XXS, IQ2_XS
+and Q2_0, two shards each. Unsloth's keep their attention in Q5_K/Q6_K and their shared experts and SSM output in
+Q8_0: about 1.2 GB more read each token than ISTA-DASLab's bundle of the same size, about 1.1 ms on two R9700s. They
+come with the tokenizer and template files of the official release, and optionally with its MTP drafter.
 `straydog fetch-mtp` builds the drafter from the official tensors, byte for byte the pinned file.
 Its experts are quantized to Q2_0, which changes only how many drafts are accepted.
 
