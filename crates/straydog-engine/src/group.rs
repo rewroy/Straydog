@@ -903,7 +903,7 @@ impl Group {
     }
 
     /// Page locks are process-wide; one backend performs them.
-    pub fn register_host(&mut self, range: &[u8]) -> bool {
+    pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
         self.backends[0].register_host(range)
     }
 

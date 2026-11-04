@@ -2038,14 +2038,12 @@ impl Backend {
         Ok(mapped)
     }
 
-    /// Page-lock a mapped range for direct DMA; false if refused.
-    pub fn register_host(&mut self, range: &[u8]) -> bool {
+    /// Page-lock a mapped range for direct DMA; the runtime's reason if it refused.
+    pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
         // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
-        let refused = unsafe { ffi::sd_host_register(range.as_ptr().cast_mut().cast(), range.len() as u64) } != 0;
-        if !refused {
-            self.registered.push(range.as_ptr().cast_mut().cast());
-        }
-        !refused
+        check(unsafe { ffi::sd_host_register(range.as_ptr().cast_mut().cast(), range.len() as u64) })?;
+        self.registered.push(range.as_ptr().cast_mut().cast());
+        Ok(())
     }
 
     pub fn hybrid_counts(&self) -> Result<[u64; 8]> {
