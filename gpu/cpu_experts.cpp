@@ -942,7 +942,7 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
-// Ask for the pages of `count` byte ranges on every worker, before a layer's experts read them: with less host memory than
+// Ask for the pages of `count` byte ranges (on Linux on every worker), before a layer's experts read them: with less host memory than
 // the banks some are out, and the rows' faults read them a little at a time, each holding up every thread. Hints only.
 int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t* bytes, uint32_t count) {
     try {
@@ -961,6 +961,18 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
                 madvise(reinterpret_cast<void*>(page), size_t(begin - page + std::min(unit, bytes[i] - position)), MADV_WILLNEED);
             }
         });
+#elif defined(_WIN32)
+        // One request for the whole range of each expert's bank slice, queued by this thread: left to the rows' faults, a cold page is
+        // read a cluster at a time (46 KB on average), each read holding up the worker that took it. Pages in memory stay what they
+        // were (soft faults). Qwen3.8 UD-IQ1_M partially resident on an RTX 5070 Ti with 61.6 GiB, 30 of them free: a 1024-token
+        // request read from the drive in 100K reads of 46 KB before, in 20K of 200 KB after.
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+        entries.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uintptr_t begin = uintptr_t(ranges[i]) & ~uintptr_t(4095), end = (uintptr_t(ranges[i]) + bytes[i] + 4095) & ~uintptr_t(4095);
+            entries.push_back({reinterpret_cast<void*>(begin), SIZE_T(end - begin)});
+        }
+        if (!entries.empty()) PrefetchVirtualMemory(GetCurrentProcess(), ULONG_PTR(entries.size()), entries.data(), 0);
 #endif
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
