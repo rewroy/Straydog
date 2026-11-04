@@ -448,13 +448,22 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
 
-/// One line per finished generation: what was read, what was reused, how fast.
-pub fn request_summary(event: &Value) -> String {
+/// The id the client named its request by (the worker request's `request_id`, see [`straydog_api::WorkerRequest`]).
+fn client_request_id(body: &pyjson::Value) -> Option<&str> {
+    match body.get("request_id") {
+        Some(pyjson::Value::Str(id)) => Some(id),
+        _ => None,
+    }
+}
+
+/// One line per finished generation: what was read, what was reused, how fast; first the id the client named it by, if it did.
+pub fn request_summary(event: &Value, id: Option<&str>) -> String {
     let (usage, timings) = (&event["usage"], &event["timings"]);
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
+        "Straydog request: {}prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
+        id.map_or(String::new(), |id| format!("id {id}, ")),
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
@@ -1236,7 +1245,7 @@ impl Driver {
                     }
                     let kind = event["event"].as_str().unwrap_or("").to_string();
                     if kind == "done" {
-                        tracing::info!("{}", request_summary(&event));
+                        tracing::info!("{}", request_summary(&event, client_request_id(&job.body)));
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
@@ -1246,7 +1255,10 @@ impl Driver {
                     // and nothing of it reaches the failure other clients are told)
                     if kind == "error" {
                         let message: String = event["message"].as_str().unwrap_or("no message").chars().take(500).collect();
-                        tracing::warn!("Straydog request failed: {message:?}");
+                        match client_request_id(&job.body) {
+                            Some(id) => tracing::warn!("Straydog request failed: id {id}, {message:?}"),
+                            None => tracing::warn!("Straydog request failed: {message:?}"),
+                        }
                     }
                     if forwarding {
                         // Wait for room in the client's channel while still taking control
@@ -1447,7 +1459,7 @@ mod tests {
         let event = json!({"event": "done", "tokens": [], "timings": {"prefill_profile": {
             "fills: waves (count)": 1420.0, "shared expert": 0.545, "attention": 0.021},
             "decode_profile": {"hybrid: CPU routes (count)": 307.0, "step: head": 1.25, "step: layers": 26.5}}});
-        let summary = request_summary(&event);
+        let summary = request_summary(&event, None);
         assert!(summary.contains("decode phases (ms a token): step: layers 26.500, step: head 1.250, hybrid: CPU routes (count) 307.0"), "{summary}");
         assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
                 "{summary}");
@@ -1475,16 +1487,31 @@ mod tests {
         assert_eq!([most_drafts(&dspark), most_drafts(&mtp), most_drafts(&lookup), most_drafts(&old)], [3, 3, 0, 2]);
     }
 
+    /// A request the client named says its id first; one it did not name reads as it always did.
+    #[test]
+    fn the_summary_names_the_clients_request_id() {
+        let event = json!({"event": "done", "usage": {"prompt_tokens": 997, "cached_tokens": 968}, "timings": {}});
+        let body = |id: Option<&str>| {
+            let mut fields = vec![("messages".to_string(), pyjson::Value::Array(vec![]))];
+            fields.extend(id.map(|id| ("request_id".to_string(), pyjson::Value::Str(id.into()))));
+            pyjson::Value::Object(fields)
+        };
+        let (named, plain) = (body(Some("s-41/7")), body(None));
+        assert_eq!(request_summary(&event, client_request_id(&named)),
+                   request_summary(&event, None).replacen("Straydog request: ", "Straydog request: id s-41/7, ", 1));
+        assert!(request_summary(&event, client_request_id(&plain)).starts_with("Straydog request: prompt 997 tokens (reused 968"));
+    }
+
     /// A request's prompt reads as its new tokens and their time, with a rate only for a prompt worth one.
     #[test]
     fn the_summary_gives_a_prompts_new_tokens_and_their_time() {
         let short = json!({"event": "done", "usage": {"prompt_tokens": 997, "cached_tokens": 968},
                            "timings": {"prefill_tokens": 29, "prefill_seconds": 0.108, "ttft_seconds": 0.11}});
-        let summary = request_summary(&short);
+        let summary = request_summary(&short, None);
         assert!(summary.contains("(reused 968 from -), new 29 in 108 ms, first token 0.11 s"), "{summary}");
         let long = json!({"event": "done", "usage": {"prompt_tokens": 20028, "cached_tokens": 0},
                           "timings": {"prefill_tokens": 20028, "prefill_seconds": 5.84, "ttft_seconds": 5.86}});
-        assert!(request_summary(&long).contains("new 20028 in 5840 ms (3429 tok/s), first token 5.86 s"), "{}", request_summary(&long));
+        assert!(request_summary(&long, None).contains("new 20028 in 5840 ms (3429 tok/s), first token 5.86 s"), "{}", request_summary(&long, None));
     }
 
     /// A request that verified drafts says how many were kept, and how many of them DSpark's.
@@ -1492,14 +1519,14 @@ mod tests {
     fn the_summary_counts_a_requests_drafts() {
         let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
                                                           "engine_draft_tokens": 25, "accepted_engine_drafts": 18}});
-        assert!(request_summary(&event).contains("(31 of 40 drafts kept in 120 passes; DSpark 18 of 25)"), "{}", request_summary(&event));
+        assert!(request_summary(&event, None).contains("(31 of 40 drafts kept in 120 passes; DSpark 18 of 25)"), "{}", request_summary(&event, None));
         // (DSpark's draft runs, whatever was verified of them, by the width each was verified at)
         let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
                                                           "engine_draft_tokens": 25, "accepted_engine_drafts": 18,
                                                           "engine_draft_runs": 30, "engine_draft_widths": [7, 4, 12, 7]}});
-        assert!(request_summary(&event).contains("DSpark 18 of 25, 30 draft runs by width 7/4/12/7)"), "{}", request_summary(&event));
+        assert!(request_summary(&event, None).contains("DSpark 18 of 25, 30 draft runs by width 7/4/12/7)"), "{}", request_summary(&event, None));
         let none = json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
-        assert!(!request_summary(&none).contains("drafts"));
+        assert!(!request_summary(&none, None).contains("drafts"));
     }
 
     /// The dashboard's speculative acceptance is the same stat for every worker: the drafts kept of

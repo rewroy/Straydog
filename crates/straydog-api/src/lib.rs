@@ -75,7 +75,8 @@ pub enum SubmitError {
 /// `{"messages": [...], "tools": [...] | null, "max_tokens": n | null, "temperature": t,
 /// "top_k": k, "top_p": p, "min_p": p, "presence_penalty": x, "seed": n, "thinking": bool,
 /// "reasoning_effort": "low" | "medium" | "xhigh",
-/// "checkpoint": bool}`, and `"suppress": "not_cp932_han"` only when asked for.
+/// "checkpoint": bool}`, and `"suppress": "not_cp932_han"` only when asked for. `"request_id"` follows only when the
+/// client sent one ([`REQUEST_ID`]): the worker reads nothing of it, and the server's log line for the request names it.
 ///
 /// Each message keeps, in the client's order, the fields the template reads or a client
 /// sends back (`role`, `content`, `name`, `tool_call_id`, `tool_calls`,
@@ -336,7 +337,7 @@ async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body:
     api.authorize(&headers)?;
     api.ready()?;
     let payload = read_payload(&headers, body).await?;
-    let (request, shape) = request::translate(&payload, &api.config, api.vision()).map_err(|mut error| {
+    let (mut request, shape) = request::translate(&payload, &api.config, api.vision()).map_err(|mut error| {
         // (what the worker found wrong with the model's vision encoder file, for the one who sent the image)
         if error.message == request::NO_IMAGES {
             if let EngineState::Ready { placement, .. } = api.engine.state() {
@@ -347,8 +348,24 @@ async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body:
         }
         error
     })?;
+    if let (Some(id), pyjson::Value::Object(fields)) = (request_id(&headers), &mut request) {
+        fields.push(("request_id".into(), pyjson::Value::Str(id)));
+    }
     let generation = api.engine.generate(request).await?;
     answer::respond(generation, shape, &api.config.model_id).await
+}
+
+/// The header a client names its request by, for matching its own records with the server's log.
+pub const REQUEST_ID: &str = "x-request-id";
+/// The most of it the log keeps.
+const REQUEST_ID_CHARS: usize = 64;
+
+/// The client's [`REQUEST_ID`] as the log line names it: printable ASCII but the space, and at most
+/// [`REQUEST_ID_CHARS`] of it, so that no caller can break or flood the line. None when nothing of it is left.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let id: String = headers.get(REQUEST_ID)?.as_bytes().iter().filter(|byte| byte.is_ascii_graphic())
+        .take(REQUEST_ID_CHARS).map(|&byte| char::from(byte)).collect();
+    (!id.is_empty()).then_some(id)
 }
 
 /// The request body as Python's `json.loads` reads it: the prompt is rendered from it.
