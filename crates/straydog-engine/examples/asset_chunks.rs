@@ -20,7 +20,9 @@ fn main() -> Result<(), String> {
     let mut assets: BTreeMap<String, (Asset, PathBuf)> = BTreeMap::new();
     for id in bundle::bundles().filter(|id| !id.is_on_demand()) {
         let pins = bundle::bundle(id)?;
-        for asset in pins.shards.into_iter().chain([pins.drafter]) {
+        // (and the engram tables the bundle may read instead of its last shard)
+        let tables = bundle::tables(id)?.into_iter().filter(|table| !table.bundled).map(|table| table.asset);
+        for asset in pins.shards.into_iter().chain([pins.drafter]).chain(tables) {
             let Some(path) = find(&directories, &asset.name) else {
                 eprintln!("not found: {}", asset.name);
                 continue;
