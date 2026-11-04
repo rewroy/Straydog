@@ -70,7 +70,7 @@ fn an_fp16_pass_through_the_grouped_kernels_is_as_accurate_as_the_expanded_gemms
             host_expert_bytes: Some(12 << 30), host_memory_bytes: straydog_engine::host::host_memory_bytes(),
             row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: half,
         };
-        let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+        let mut model = place(&root, common::deepseek41_bundle(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
         model.prompt_logits = Some(Vec::new());
         let prompt = Text::from_gguf(model.header()).unwrap().encode(&format!("{document}\n\nWhat is this project?")).unwrap();
         assert!(prompt.len() > 1000, "a prompt of several waves");

@@ -24,7 +24,7 @@ fn open() -> Option<Model> {
     let gib: f64 = std::env::var("STRAYDOG_VRAM_GIB").ok().and_then(|value| value.parse().ok()).unwrap_or(8.5);
     let mut group = Group::new(&[0], &[(gib * (1u64 << 30) as f64) as u64], SplitMode::Experts).unwrap();
     group.configure_gemm(2, true).unwrap();
-    let weights = Weights::open(&PathBuf::from(root), quant.to_str().unwrap(), None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    let weights = Weights::open(&PathBuf::from(root), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant.to_str().unwrap()).unwrap(), None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     let settings = Settings { context: 32768, state_budget_bytes: 14 << 30, prefill_batch_size: 1024, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
     Some(Model::new(weights, group, &settings, &|_, _, _| {}).unwrap())
 }

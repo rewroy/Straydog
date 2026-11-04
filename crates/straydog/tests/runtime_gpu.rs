@@ -70,7 +70,7 @@ fn main() {
         ..Options::default()
     };
     let settings = config::resolve(options).unwrap();
-    straydog_provision::ensure_trees(&settings.model, &settings.quant, &settings.data_dir, &|_, _, _| {}).unwrap();
+    straydog_provision::ensure_trees(&settings.model, settings.bundle, &settings.data_dir, &|_, _, _| {}).unwrap();
     let command = (std::env::current_exe().unwrap(), runtime::worker_args(&settings));
     let tokio = tokio::runtime::Runtime::new().unwrap();
     tokio.block_on(async {

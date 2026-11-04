@@ -18,5 +18,12 @@ pub fn model_env(name: &str, what: &str) -> Option<std::ffi::OsString> {
 /// IQ2_XS (GSQ-RCO-IQ2_XXS for the six-shard bundle).
 #[allow(dead_code)]
 pub fn deepseek41_quantization() -> String {
-    std::env::var("STRAYDOG_DS41_QUANT").unwrap_or_else(|_| "GSQ-RCO-IQ2_XS".into())
+    std::env::var("STRAYDOG_DS41_QUANT").unwrap_or_else(|_| "IQ2_XS".into())
+}
+
+/// The DeepSeek-V4.1 bundle of [`deepseek41_quantization`].
+#[allow(dead_code)]
+pub fn deepseek41_bundle() -> straydog_engine::bundle::Id {
+    let bundle = straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::DEEPSEEK), None, &deepseek41_quantization());
+    bundle.expect("a pinned DeepSeek-V4.1 bundle")
 }

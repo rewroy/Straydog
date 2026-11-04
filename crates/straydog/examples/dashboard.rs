@@ -41,10 +41,10 @@ fn main() {
         .with(fmt::layer().with_target(false).with_ansi(false).with_writer(move || LogSink(sink.clone())))
         .init();
     let (quant, model_draft, draft_max) =
-        if deepseek() { ("GSQ-RCO-IQ2_XXS", None, 0) } else { ("IQ3_S", Some(PathBuf::from("/simulated/Qwen3.8-Flash-Next-MTP")), 3) };
+        if deepseek() { ("IQ2_XXS", None, 0) } else { ("IQ3_S", Some(PathBuf::from("/simulated/Qwen3.8-Flash-Next-MTP")), 3) };
     let settings = Settings {
         model: PathBuf::from("/simulated").join(quant),
-        quant: quant.into(),
+        bundle: straydog_engine::bundle::Id::find(Some(if deepseek() { straydog_engine::bundle::DEEPSEEK } else { straydog_engine::bundle::MODEL }), None, quant).unwrap(),
         model_draft,
         model_vision: None,
         draft_max,
@@ -85,7 +85,7 @@ fn main() {
         let api = straydog_api::ApiConfig {
             model_id: settings.alias.clone(),
             context: u64::from(settings.ctx_size),
-            quantization: settings.quant.clone(),
+            quantization: settings.bundle.quant.to_string(),
             api_key: None,
             sampling: straydog_api::SamplingDefaults::default(),
             seed: None,
@@ -121,7 +121,7 @@ fn simulate() {
     let gpu = gpu_info();
     if deepseek() {
         send(json!({
-            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "DeepSeek-V4.1-Flash", "quantization": "GSQ-RCO-IQ2_XXS",
+            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "DeepSeek-V4.1-Flash-1017", "provider": "ISTA-DASLab", "quantization": "IQ2_XXS",
             "context": 262_144, "state_bytes": 3 * GIB, "speculative_drafts": 0,
             "speculation": [{"kind": "dspark", "resident": [87, 50, 29]}, {"kind": "lookup"}],
             "placement": {"expert_slots": [2916, 2916], "layers": [[0, 40]], "devices": [[0, 1]], "host_expert_bytes": 100 * GIB,
@@ -130,7 +130,7 @@ fn simulate() {
         }));
     } else {
         send(json!({
-            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "Qwen3.8-Flash-Next", "quantization": "IQ3_S",
+            "event": "ready", "protocol": 1, "engine": "Straydog", "model": "Qwen3.8-Flash-Next", "provider": "ISTA-DASLab", "quantization": "IQ3_S",
             "context": 262_144, "state_bytes": 7 * GIB, "speculative_drafts": 3,
             "speculation": [{"kind": "mtp", "drafts": 3}],
             "placement": {"resident": true, "partial": false, "host_kv": true, "prefill_batch_size": 4096},

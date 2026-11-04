@@ -57,7 +57,7 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
         host_expert_bytes: None, host_memory_bytes: straydog_engine::host::host_memory_bytes(),
         row_cache_bytes: straydog_engine::rows::DEFAULT_CACHE_BYTES, half_gemm: true,
     };
-    let mut model = place(&root, &common::deepseek41_quantization(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
+    let mut model = place(&root, common::deepseek41_bundle(), &root.join(".straydog"), &settings, &|_, _, _| {}).unwrap();
     // (as the worker does after its first passes: the VRAM the cards have spare goes to the expert stores)
     model.generate(&[0, 1000, 2000, 3000], 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, &mut |_| {}).unwrap();
     model.forget();

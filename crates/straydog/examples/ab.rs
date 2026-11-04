@@ -177,7 +177,7 @@ fn main() {
     };
     let settings = config::resolve(options).unwrap();
     // The workers read the shards' verity trees: built first where missing, as the server does.
-    straydog_provision::ensure_trees(&settings.model, &settings.quant, &settings.data_dir, &|_, _, _| {}).unwrap();
+    straydog_provision::ensure_trees(&settings.model, settings.bundle, &settings.data_dir, &|_, _, _| {}).unwrap();
     let cases: Vec<Value> =
         serde_json::from_str::<Vec<Value>>(&std::fs::read_to_string(args.repo.join("bench/cases.json")).unwrap())
             .unwrap()

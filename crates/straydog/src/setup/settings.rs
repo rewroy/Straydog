@@ -10,6 +10,9 @@ use toml::{Table, Value};
 pub struct Settings {
     /// The bundle's directory.
     pub model: PathBuf,
+    /// The bundle's labels: its model, provider and quantization.
+    pub model_name: String,
+    pub provider: String,
     pub quant: String,
     /// The MTP drafter's directory, when the model has one.
     pub model_draft: Option<PathBuf>,
@@ -34,7 +37,7 @@ pub struct Written {
 }
 
 const HEADER: &str = "# Written by `straydog setup`; a plain `straydog` reads it. Options and STRAYDOG_* variables\n\
-                      # beat it. Setup changes model, quant, model_draft, gpu and data_dir, lowers ctx_size to what the model\n\
+                      # beat it. Setup changes model, model_name, provider, quant, model_draft, gpu and data_dir, lowers ctx_size to what the model\n\
                       # starts with, and keeps the rest.\n";
 
 fn text(path: &Path) -> Result<Value, String> {
@@ -45,6 +48,8 @@ fn text(path: &Path) -> Result<Value, String> {
 fn merged(old: Table, settings: &Settings) -> Result<Table, String> {
     let mut table = old;
     table.insert("model".into(), text(&settings.model)?);
+    table.insert("model_name".into(), Value::String(settings.model_name.clone()));
+    table.insert("provider".into(), Value::String(settings.provider.clone()));
     table.insert("quant".into(), Value::String(settings.quant.clone()));
     for (key, value) in [
         ("model_draft", settings.model_draft.as_deref().map(text).transpose()?),
@@ -118,7 +123,8 @@ mod tests {
     }
 
     fn settings() -> Settings {
-        Settings { model: "/models/DeepSeek-V4.1-Flash/GSQ-RCO-IQ2_XXS".into(), quant: "GSQ-RCO-IQ2_XXS".into(), model_draft: None, gpu: Some(vec![0, 1]), ctx_size: None, data_dir: None }
+        Settings { model: "/models/DeepSeek-V4.1-Flash-1017/ISTA-DASLab-IQ2_XXS".into(), model_name: "DeepSeek-V4.1-Flash-1017".into(), provider: "ISTA-DASLab".into(),
+                   quant: "IQ2_XXS".into(), model_draft: None, gpu: Some(vec![0, 1]), ctx_size: None, data_dir: None }
     }
 
     /// What the server reads back is what setup chose; a file's other settings stay, the model's own
@@ -133,7 +139,8 @@ mod tests {
         assert!(text.starts_with("# Written by `straydog setup`"));
         let read: Options = toml::from_str(&text).unwrap();
         assert_eq!((read.model.as_deref(), read.quant.as_deref(), read.gpu.clone(), read.model_draft.clone()),
-                   (Some(Path::new("/models/DeepSeek-V4.1-Flash/GSQ-RCO-IQ2_XXS")), Some("GSQ-RCO-IQ2_XXS"), Some(vec![0, 1]), None));
+                   (Some(Path::new("/models/DeepSeek-V4.1-Flash-1017/ISTA-DASLab-IQ2_XXS")), Some("IQ2_XXS"), Some(vec![0, 1]), None));
+        assert_eq!((read.model_name.as_deref(), read.provider.as_deref()), (Some("DeepSeek-V4.1-Flash-1017"), Some("ISTA-DASLab")));
         // the same again changes nothing
         let again = write_settings(&path, &settings()).unwrap();
         assert_eq!((again.changed, again.kept), (false, None));
@@ -144,7 +151,7 @@ mod tests {
         assert_eq!((second.changed, second.url.as_str()), (true, "http://127.0.0.1:9000"));
         let read: Options = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((read.port, read.host.as_deref(), read.ctx_size, read.model_draft, read.data_dir, read.quant.as_deref()),
-                   (Some(9000), Some("0.0.0.0"), Some(32768), None, None, Some("GSQ-RCO-IQ2_XXS")));
+                   (Some(9000), Some("0.0.0.0"), Some(32768), None, None, Some("IQ2_XXS")));
         let old = second.kept.unwrap();
         assert!(std::fs::read_to_string(old).unwrap().starts_with("# mine"));
         // a context: lowered when the model starts with less, left as it is when the person's is less

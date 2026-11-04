@@ -48,49 +48,49 @@ pub fn fetch_files_plain(root: &Path, files: &[(bundle::Asset, String)], progres
     assets::fetch_with(&http::plain(assets::TIMEOUT), root, files, false, true, progress).map_err(|error| error.to_string())
 }
 
-/// Download (resuming) and authenticate every pinned file of `quantization` into `root`;
+/// Download (resuming) and authenticate every pinned file of the bundle into `root`;
 /// with `offline`, only authenticate what is there. The shards' verity trees are then built into
 /// `data_dir` (by default `.straydog` in `root`): all of a bundle read on demand's, which they
 /// authenticate, and the others' that are missing.
-pub fn fetch(root: &Path, quantization: &str, offline: bool, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
-    fetch_extras(root, quantization, offline, data_dir, Extras::ALL, progress)
+pub fn fetch(root: &Path, id: bundle::Id, offline: bool, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
+    fetch_extras(root, id, offline, data_dir, Extras::ALL, progress)
 }
 
 /// [`fetch`], adding of a bundle read on demand's optional files only those `extras` names (those
 /// already there are authenticated all the same).
-pub fn fetch_extras(root: &Path, quantization: &str, offline: bool, data_dir: Option<&Path>, extras: Extras,
+pub fn fetch_extras(root: &Path, id: bundle::Id, offline: bool, data_dir: Option<&Path>, extras: Extras,
                     progress: Progress) -> Result<(), String> {
     let data_dir = data_dir.map_or_else(|| bundle::default_data_dir(root), Path::to_path_buf);
-    if bundle::is_on_demand(quantization) {
-        let entries = assets::entries(quantization)?;
+    if id.is_on_demand() {
+        let entries = assets::entries(id)?;
         let agent = http::agent(assets::TIMEOUT);
         // The trees authenticate the files present: they are not hashed twice.
         assets::fetch_with(&agent, root, &entries, offline, false, progress).map_err(|error| error.to_string())?;
-        build_vision(root, quantization, offline || !extras.vision, progress).map_err(|error| error.to_string())?;
-        fetch_dspark(root, quantization, offline || !extras.dspark, progress).map_err(|error| error.to_string())?;
-        return print_trees(root, quantization, &data_dir, false, progress);
+        build_vision(root, id, offline || !extras.vision, progress).map_err(|error| error.to_string())?;
+        fetch_dspark(root, id, offline || !extras.dspark, progress).map_err(|error| error.to_string())?;
+        return print_trees(root, id, &data_dir, false, progress);
     }
-    fetch_assets(root, quantization, offline, true, progress)?;
-    print_trees(root, quantization, &data_dir, true, progress)
+    fetch_assets(root, id, offline, true, progress)?;
+    print_trees(root, id, &data_dir, true, progress)
 }
 
-/// Authenticate every pinned file of `quantization` in `root` (a bundle read on demand: by
+/// Authenticate every pinned file of the bundle in `root` (a bundle read on demand: by
 /// building its verity trees into `data_dir`, by default `.straydog` in `root`; another: by
 /// hashing, then building the trees missing there).
-pub fn verify(root: &Path, quantization: &str, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
+pub fn verify(root: &Path, id: bundle::Id, data_dir: Option<&Path>, progress: Progress) -> Result<(), String> {
     let data_dir = data_dir.map_or_else(|| bundle::default_data_dir(root), Path::to_path_buf);
-    if bundle::is_on_demand(quantization) {
-        return print_trees(root, quantization, &data_dir, false, progress);
+    if id.is_on_demand() {
+        return print_trees(root, id, &data_dir, false, progress);
     }
-    fetch_assets(root, quantization, true, true, progress)?;
-    print_trees(root, quantization, &data_dir, true, progress)
+    fetch_assets(root, id, true, true, progress)?;
+    print_trees(root, id, &data_dir, true, progress)
 }
 
-/// Build the verity trees of `quantization`'s shards that `data_dir` lacks (a server's first
+/// Build the verity trees of the bundle's shards that `data_dir` lacks (a server's first
 /// start): each kept only when its digest is the pinned one. A tree there already is checked
 /// against its pin whenever it is opened, and each block it covers whenever it is used.
-pub fn ensure_trees(root: &Path, quantization: &str, data_dir: &Path, progress: Progress) -> Result<Vec<String>, String> {
-    build_trees(root, quantization, data_dir, true, progress).map_err(|error| error.to_string())
+pub fn ensure_trees(root: &Path, id: bundle::Id, data_dir: &Path, progress: Progress) -> Result<Vec<String>, String> {
+    build_trees(root, id, data_dir, true, progress).map_err(|error| error.to_string())
 }
 
 /// A directory trees are about to be written into: made if missing, and found writable, or an
@@ -108,8 +108,8 @@ fn writable(directory: &Path) -> io::Result<()> {
 /// `data_dir/verity` (all of them, or with `missing_only` those not there yet) and kept only
 /// when their digests are the pinned ones. That authenticates the files: every block hashes
 /// into the pinned root. Nothing but `data_dir` is written (by default in the model directory).
-fn build_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: bool, progress: Progress) -> io::Result<Vec<String>> {
-    let mut pins = bundle::verity_files_in(root, quantization).map_err(invalid)?;
+fn build_trees(root: &Path, id: bundle::Id, data_dir: &Path, missing_only: bool, progress: Progress) -> io::Result<Vec<String>> {
+    let mut pins = bundle::verity_files_in(root, id).map_err(invalid)?;
     if missing_only {
         pins.retain(|(_, asset, _)| !bundle::tree_path(data_dir, asset).is_file());
     }
@@ -143,8 +143,8 @@ fn build_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: b
 
 /// [`build_trees`] for a provisioning command: each file authenticated by its new tree is
 /// printed as verified.
-fn print_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: bool, progress: Progress) -> Result<(), String> {
-    for name in build_trees(root, quantization, data_dir, missing_only, progress).map_err(|error| error.to_string())? {
+fn print_trees(root: &Path, id: bundle::Id, data_dir: &Path, missing_only: bool, progress: Progress) -> Result<(), String> {
+    for name in build_trees(root, id, data_dir, missing_only, progress).map_err(|error| error.to_string())? {
         println!("verified {name}");
     }
     Ok(())
@@ -154,9 +154,9 @@ fn print_trees(root: &Path, quantization: &str, data_dir: &Path, missing_only: b
 /// sizes are always checked, but a caller that starts the server right after may leave the
 /// hashing to the worker, which authenticates every file before using it. Downloads are
 /// always authenticated.
-pub fn fetch_assets(root: &Path, quantization: &str, offline: bool, authenticate_existing: bool,
+pub fn fetch_assets(root: &Path, id: bundle::Id, offline: bool, authenticate_existing: bool,
                     progress: Progress) -> Result<(), String> {
-    let entries = assets::entries(quantization)?;
+    let entries = assets::entries(id)?;
     let agent = http::agent(assets::TIMEOUT);
     assets::fetch_with(&agent, root, &entries, offline, authenticate_existing, progress).map_err(|error| error.to_string())
 }
@@ -219,8 +219,8 @@ pub fn fetch_qwen_vision(root: &Path, offline: bool, progress: Progress) -> Resu
 /// Build DeepSeek-V4.1's vision encoder file in `root` from the authenticated official tensors,
 /// when the quantization's model has one pinned and it is not there yet; with `offline`, leave it
 /// missing (the model then reads no images). Its verity tree then authenticates it.
-fn build_vision(root: &Path, quantization: &str, offline: bool, progress: Progress) -> io::Result<()> {
-    let Some(source_pins) = bundle::vision_source(quantization).map_err(invalid)? else { return Ok(()) };
+fn build_vision(root: &Path, id: bundle::Id, offline: bool, progress: Progress) -> io::Result<()> {
+    let Some(source_pins) = bundle::vision_source(id).map_err(invalid)? else { return Ok(()) };
     let target = root.join(&source_pins.asset.name);
     if offline || target.is_file() {
         return Ok(());
@@ -254,9 +254,9 @@ fn dspark_entry(source: &bundle::DsparkSource) -> (bundle::Asset, String) {
 /// is in neither of its directories ([`bundle::dspark_in`]) yet; with `offline`, leave it missing
 /// (the model then drafts from its own text only). Authenticated by its SHA-256 before it is
 /// published; its verity tree then authenticates it for good.
-fn fetch_dspark(root: &Path, quantization: &str, offline: bool, progress: Progress) -> io::Result<()> {
-    let Some(source) = bundle::dspark_source(quantization).map_err(invalid)? else { return Ok(()) };
-    if offline || bundle::dspark_in(root, quantization).map_err(invalid)?.is_some() {
+fn fetch_dspark(root: &Path, id: bundle::Id, offline: bool, progress: Progress) -> io::Result<()> {
+    let Some(source) = bundle::dspark_source(id).map_err(invalid)? else { return Ok(()) };
+    if offline || bundle::dspark_in(root, id).map_err(invalid)?.is_some() {
         return Ok(());
     }
     let agent = http::agent(assets::TIMEOUT);
@@ -293,7 +293,7 @@ mod tests {
     /// directory) and the fetch is not offline.
     #[test]
     fn the_dspark_drafter_is_fetched_from_its_pinned_revision_and_only_when_missing() {
-        let source = bundle::dspark_source("GSQ-RCO-IQ2_XS").unwrap().expect("a pinned DSpark");
+        let source = bundle::dspark_source(bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap()).unwrap().expect("a pinned DSpark");
         let (asset, url) = dspark_entry(&source);
         assert_eq!(asset, source.asset);
         assert_eq!(url, "https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/60ad3651641b5c97679c807e064ab1d7a3ca1455/\
@@ -302,12 +302,12 @@ mod tests {
         let root = scratch.path().join("GSQ-RCO-IQ2_XS");
         fs::create_dir_all(&root).unwrap();
         // (no request is made in any of these)
-        fetch_dspark(&root, "GSQ-RCO-IQ2_XS", true, &quiet).unwrap();
-        fetch_dspark(&root, "UD-IQ2_XXS", false, &quiet).unwrap();
+        fetch_dspark(&root, bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap(), true, &quiet).unwrap();
+        fetch_dspark(&root, bundle::Id::find(None, None, "UD-IQ2_XXS").unwrap(), false, &quiet).unwrap();
         assert!(!root.join("dspark").exists() && !scratch.path().join("dspark").exists());
         fs::create_dir_all(scratch.path().join("dspark")).unwrap();
         fs::write(scratch.path().join("dspark").join(&asset.name), b"").unwrap();
-        fetch_dspark(&root, "GSQ-RCO-IQ2_XS", false, &quiet).unwrap();
+        fetch_dspark(&root, bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap(), false, &quiet).unwrap();
         assert!(!root.join("dspark").exists());
     }
 }
