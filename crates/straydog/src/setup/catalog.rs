@@ -90,6 +90,8 @@ pub struct File {
 pub struct Entry {
     /// Its model, provider and quantization.
     pub id: Id,
+    /// The engram table it is set up with instead of its own (its precision), see [`Entry::with_table`].
+    pub table: Option<String>,
     pub architecture: String,
     pub files: Vec<File>,
     pub footprint: Footprint,
@@ -140,7 +142,7 @@ impl Entry {
             sidecars.push(Sidecar { kind: Extra::Vision, label: "vision encoder", purpose: "image input", file: vision.name,
                                     download: vision.bytes, kept: vision.bytes, tree: 0, scratch: 0 });
         }
-        Ok(Entry { id, architecture: bundle::architecture_of(id)?, files, footprint: bundle::footprint(id)?, sidecars })
+        Ok(Entry { id, table: None, architecture: bundle::architecture_of(id)?, files, footprint: bundle::footprint(id)?, sidecars })
     }
 
     pub fn sidecar(&self, kind: Extra) -> Option<&Sidecar> {
@@ -173,6 +175,25 @@ impl Entry {
     pub fn name(&self) -> String {
         self.id.to_string()
     }
+
+    /// The engram tables it may be set up with: (precision, bytes), its own first.
+    pub fn tables(&self) -> Vec<(String, u64)> {
+        bundle::tables(self.id).unwrap_or_default().into_iter().map(|table| (table.precision, table.asset.bytes)).collect()
+    }
+
+    /// The entry set up with the engram table of `precision` instead of its own: that file (kept in the model's `engram`
+    /// directory, which its bundles share) in place of its last shard. Its own table's precision leaves it as it is.
+    pub fn with_table(&self, precision: &str) -> Result<Entry, String> {
+        let Some(table) = straydog_provision::chosen_table(self.id, precision)? else { return Ok(self.clone()) };
+        let shard = bundle::bundle(self.id)?.shards.last().cloned().ok_or("Straydog bundle without shards")?;
+        let mut entry = self.clone();
+        entry.files.retain(|file| file.name != shard.name);
+        entry.files.push(File { tree: tree(table.asset.bytes), name: table.asset.name, bytes: table.asset.bytes });
+        entry.table = Some(table.precision);
+        // (the table's tensor at its precision: what is read from the drive by row)
+        entry.footprint.tables = table.asset.bytes;
+        Ok(entry)
+    }
 }
 
 /// Where a bundle's files lie.
@@ -199,7 +220,10 @@ impl Entry {
     /// as far as they were downloaded), trees included: what a fetch resumes from.
     pub fn present_bytes(&self, place: &Place, chosen: &[Extra]) -> u64 {
         let tree_of = |name: &str, bytes: u64| on_disk(&bundle::tree_path(&place.data, &Asset { name: name.into(), bytes: 0, sha256: String::new() }), tree(bytes));
-        let mut present: u64 = self.files.iter().map(|file| on_disk(&place.bundle.join(&file.name), file.bytes) + if file.tree > 0 { tree_of(&file.name, file.bytes) } else { 0 }).sum();
+        // (an engram table lies in the model's engram directory, or the bundle's)
+        let path = |name: &str| bundle::engram_directories(&place.bundle).into_iter().map(|directory| directory.join(name))
+            .find(|path| path.is_file()).unwrap_or_else(|| place.bundle.join(name));
+        let mut present: u64 = self.files.iter().map(|file| on_disk(&path(&file.name), file.bytes) + if file.tree > 0 { tree_of(&file.name, file.bytes) } else { 0 }).sum();
         for sidecar in self.chosen(chosen) {
             let places = match sidecar.kind {
                 Extra::Dspark => bundle::dspark_directories(&place.bundle),
@@ -847,6 +871,22 @@ pub(crate) mod tests {
         // no state of a Qwen3.8 is counted at the whole context for what a shorter one will take: a smaller context keeps more
         let ram_only = |context| match fit_on(true, &big, &windows_pc(16303, DESKTOP, 64 << 30), context) { Fit::Ram(_) => true, Fit::Drive(_) => false, verdict => panic!("{verdict:?}") };
         assert!(ram_only(131_072));
+    }
+
+    /// An Unsloth Qwen3.8 bundle set up with another engram table fetches that file instead of its own table shard, and counts it.
+    #[test]
+    fn a_bundle_set_up_with_another_engram_table_fetches_it_instead_of_its_own() {
+        let own = Entry::of(unsloth("UD-IQ1_M")).unwrap();
+        assert_eq!(own.tables().iter().map(|(precision, _)| precision.as_str()).collect::<Vec<_>>(), ["IQ4_NL", "BF16", "Q8_0", "Q5_1"]);
+        let q8 = own.with_table("q8_0").unwrap();
+        assert_eq!(q8.table.as_deref(), Some("Q8_0"));
+        assert!(!q8.files.iter().any(|file| file.name.ends_with("-00003-of-00003.gguf")));
+        assert!(q8.files.iter().any(|file| file.name == "Qwen3.8-Flash-Next-engram-Q8_0.gguf_file" && file.tree > 0));
+        assert_eq!(q8.download_bytes(&[]), own.download_bytes(&[]) - 28_800_138_432 + 54_400_261_312);
+        // its own precision changes nothing; a precision not offered, or a bundle without a table of its own, is refused
+        assert_eq!(own.with_table("IQ4_NL").unwrap().files, own.files);
+        assert!(own.with_table("Q6_K").unwrap_err().contains("no Q6_K engram table"));
+        assert!(entry("IQ2_XS").with_table("Q8_0").unwrap_err().contains("no engram table"));
     }
 
     /// Memory other programs hold is not the server's: an RTX 5070 Ti with 62 GiB, 28 GiB of it free (Windows, 2026-11-05: setup

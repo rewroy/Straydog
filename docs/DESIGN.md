@@ -623,6 +623,10 @@ which UD-IQ1_S, UD-IQ1_M and UD-IQ2_XS share), offered first, and ISTA-DASLab's 
 and Q2_0, two shards each. Unsloth's keep their attention in Q5_K/Q6_K and their shared experts and SSM output in
 Q8_0: about 1.2 GB more read each token than ISTA-DASLab's bundle of the same size, about 1.1 ms on two R9700s. They
 come with the tokenizer and template files of the official release, and optionally with its MTP drafter.
+An Unsloth bundle reads its engram (PLE) table from the most exact file there is (`bundle::table_in`):
+its own last shard (IQ4_NL) or one of Unsloth's engram files (BF16, Q8_0, Q5_1: one tensor in a file of
+its own, pinned like the shards), in the bundle's directory or an `engram` directory beside it, read in
+the last shard's place; `STRAYDOG_ENGRAM` names one. Q5_1 rows decode on the host like the others.
 `straydog fetch-mtp` builds the drafter from the official tensors, byte for byte the pinned file.
 Its experts are quantized to Q2_0, which changes only how many drafts are accepted.
 

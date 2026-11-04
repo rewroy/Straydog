@@ -64,6 +64,10 @@ required-features = ["gpu"]
 name = "prefill"
 required-features = ["gpu"]
 
+[[example]]
+name = "qwen_tables"
+required-features = ["gpu"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
