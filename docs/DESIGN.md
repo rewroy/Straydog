@@ -187,6 +187,23 @@ The engine is built in layers:
     anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
     after ready, whether a request ran meanwhile, how long the turns waited for requests in all and whether the 20 s guard fired, and why it
     stopped if it did.
+  - **The read-ahead of the banks to lock.** A layer's turn reads its banks itself, so a request that comes before the locking is done finds the
+    layers not locked yet out of memory when the page cache is cold, and reads them by faulting, one fault after another (Linux, 125 GB, UD-IQ1_S: the
+    first request at 28 to 31 tok/s with 218,547 page faults, against 49.4 after the locking; Windows, 62 GiB with the cache emptied by a 46 GiB read: 33.2
+    and 38.6 tok/s, the CPU at 18.5 and 15.4 ms a token). So a thread of its own, started when the plan is made, asks the system for the pages of the planned
+    banks in the order the layers are locked (`BankLocks::read_ahead`, `behind::read_ahead_behind`): pieces of at most 256 MiB of one bank, each by
+    `host::prefetch` (`PrefetchVirtualMemory`, `MADV_WILLNEED`), so that it can be followed and stopped between them. It reads the plan's bytes and no more,
+    leaves out the pieces of layers the locking has done and those whose pages are all resident (Linux: the page cache, by `mincore`; Windows: the
+    working set, a lower bound, since a page in the standby list is not visible), and works below a request: the thread's background mode (Windows: CPU
+    and I/O priority; Linux: nice 19 and the idle I/O class). On Windows it keeps its memory priority at 5 (`Lowered::begin_reading`), because background
+    mode lowers that to 1 as well, and a page that is read in waits in the standby list at the priority of the thread that read it: at 1 it is the first
+    the system takes back for the next page, the prefetch's own included (12 GiB prefetched in background mode with the standby list full left none
+    of it in memory, 13 GiB read again by the first touch in 28 s; at memory priority 5 the touch took 2.9 s and read 412 pages; the prefetch ran at 2.4
+    GiB/s in background mode against 5.4 normally, on an idle drive). It ends when the plan is done, when the locking is over, when the engine has
+    ended, when less than the memory the plan keeps free (`host::left_free`) is available, or when the system refuses; one line says the bytes asked for,
+    the seconds, how far ahead of the locking it stood at the end and at the most, and why it stopped if it did. On the Windows machine, the first request
+    after the cache was emptied ran at 46.9 and 43.6 tok/s (CPU 10.6 and 11.9 ms) against 33.2 and 38.6, and the locking was done 60 s after ready
+    against 71 to 87 s; with the cache warm, 46.0 against 44.1 tok/s, and the read-ahead of 11 GiB took 1.5 s.
 - **Warm-up.** Every two minutes after requests, and at shutdown (also when no request came but
   the worker was handed a state to warm up with), the runtime asks the worker
   which experts its stores hold, least recently used first, and keeps the list in the data

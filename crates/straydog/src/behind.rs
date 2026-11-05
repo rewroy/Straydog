@@ -4,11 +4,14 @@
 //! The app starts the engine when it opens, and the person then types for a while: neither step has to be done before the engine says
 //! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary when
 //! a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request never waits for a layer's turn,
-//! and the turns give way to a request that is generating).
+//! and the turns give way to a request that is generating). A third thread reads the layers to be locked ahead of the locking, at a low
+//! priority ([`read_ahead_behind`]), so that the pages a request finds in the layers not locked yet are in memory.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
+
+use straydog_engine::banks::Piece;
 
 /// Whether the request loop has read a command that takes the engine since the worker began: the warm-up behind "ready" is over at its next
 /// pass, or does not begin. A static because the engine is behind the lock the warm-up holds, and the request loop is generic over its
@@ -251,6 +254,126 @@ pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S
         }
     }
     done
+}
+
+/// How far the locking behind "ready" has got, for the read-ahead ahead of it to follow.
+#[derive(Debug, Default)]
+pub(crate) struct Progress {
+    /// The layers whose turns the locking has done.
+    pub turns: AtomicUsize,
+    /// The locking is over: its layers are done, it stopped, or its engine ended.
+    pub over: AtomicBool,
+}
+
+/// Why a read-ahead ended before the plan's last piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AheadStop {
+    /// The locking stopped (a layer could not be locked, or did not verify) or ended: the pages ahead of it are not wanted.
+    Locking,
+    /// The engine ended: its mappings are going.
+    Engine,
+    /// The physical memory available fell below the margin the plan keeps free.
+    Memory { available: u64, margin: u64 },
+    /// The system refused to read the pages.
+    Refused(String),
+}
+
+/// How far ahead of the locking the read-ahead stood: the layers it had asked pages of beyond the layers the locking had done, and those bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lead {
+    pub layers: usize,
+    pub bytes: u64,
+}
+
+/// How the read-ahead of the banks behind "ready" went.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Ahead {
+    /// The bytes of the plan's banks, and the layers they are of.
+    pub planned: u64,
+    pub layers: usize,
+    /// The bytes the system was asked for.
+    pub asked: u64,
+    /// The bytes left out: of layers the locking had done by the time they came, or whose pages were in memory already.
+    pub skipped: u64,
+    pub seconds: f64,
+    /// Where it stood against the locking when it ended, and the most it was ahead.
+    pub lead: Lead,
+    pub lead_most: Lead,
+    /// Why it ended before the plan's last piece.
+    pub stopped: Option<AheadStop>,
+}
+
+/// Read ahead the pages of the plan's banks, a piece at a time in the plan's order, for the locking and a request to find them in memory: `ask` asks the
+/// system for a piece's pages (a hint: nothing is locked, no commit is taken), `resident` says what fraction of them it holds already, and `available` is the
+/// physical memory available now. The engine is not held, only kept alive (a strong reference) while a piece is asked for, since the pieces lie in the
+/// weights' mappings. Between pieces it ends when the engine has, when the locking is over ([`Progress::over`]), and when less than `margin` is available
+/// (the plan keeps that much free; a read-ahead that went on would take it from the rest of the system, which the plan's own bytes did not count on). A piece
+/// of a layer the locking has done is left out, and so is one whose pages are all in memory. `progress` says how far the locking has got.
+pub(crate) fn read_ahead_behind<S>(engine: &Weak<Mutex<S>>, pieces: &[Piece], progress: &Progress, margin: u64,
+                                   resident: impl Fn(&Piece) -> f64, available: impl Fn() -> u64, ask: impl Fn(&Piece) -> Result<(), String>) -> Ahead {
+    let started = Instant::now();
+    let turns = pieces.iter().map(|piece| piece.turn + 1).max().unwrap_or(0);
+    let mut done = Ahead { planned: pieces.iter().map(|piece| piece.bytes).sum(), layers: turns, ..Ahead::default() };
+    // The bytes asked for in each layer's turn, to say how far ahead of the locking they reach.
+    let mut asked_in_turn = vec![0u64; turns];
+    let lead_of = |asked_in_turn: &[u64], locked: usize| {
+        let ahead = asked_in_turn.get(locked..).unwrap_or(&[]);
+        Lead { layers: ahead.iter().filter(|bytes| **bytes > 0).count(), bytes: ahead.iter().sum() }
+    };
+    for piece in pieces {
+        if progress.over.load(Ordering::SeqCst) {
+            done.stopped = Some(AheadStop::Locking);
+            break;
+        }
+        let Some(alive) = engine.upgrade() else {
+            done.stopped = Some(AheadStop::Engine);
+            break;
+        };
+        // (the locking has done this layer's turn, which read its pages itself; or they are in memory already)
+        if piece.turn < progress.turns.load(Ordering::SeqCst) || resident(piece) >= 1.0 {
+            done.skipped += piece.bytes;
+            continue;
+        }
+        let free = available();
+        if free < margin {
+            done.stopped = Some(AheadStop::Memory { available: free, margin });
+            break;
+        }
+        if let Err(message) = ask(piece) {
+            done.stopped = Some(AheadStop::Refused(message));
+            break;
+        }
+        drop(alive);
+        done.asked += piece.bytes;
+        asked_in_turn[piece.turn] += piece.bytes;
+        let lead = lead_of(&asked_in_turn, progress.turns.load(Ordering::SeqCst));
+        if lead.bytes > done.lead_most.bytes {
+            done.lead_most = lead;
+        }
+    }
+    done.lead = lead_of(&asked_in_turn, progress.turns.load(Ordering::SeqCst));
+    done.seconds = started.elapsed().as_secs_f64();
+    done
+}
+
+/// The one line the read-ahead leaves in the log when it ends, `after` seconds after "ready".
+pub(crate) fn ahead_line(done: &Ahead, after: f64) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let gib = |bytes: u64| bytes as f64 / GIB;
+    // (a piece or two that the locking had done by the time they came are not worth saying)
+    let skipped = if gib(done.skipped) >= 0.05 { format!(", {:.1} GiB left out (locked, or in memory already)", gib(done.skipped)) } else { String::new() };
+    let ahead = |lead: Lead| format!("{} layers, {:.1} GiB", lead.layers, gib(lead.bytes));
+    let stopped = match &done.stopped {
+        None => String::new(),
+        Some(AheadStop::Locking) => ", stopped because the locking was over".to_string(),
+        Some(AheadStop::Engine) => ", stopped because the engine ended".to_string(),
+        Some(AheadStop::Memory { available, margin }) => {
+            format!(", stopped because {:.1} GiB of memory was available, under the {:.1} GiB kept free", gib(*available), gib(*margin))
+        }
+        Some(AheadStop::Refused(message)) => format!(", stopped because the system refused ({message})"),
+    };
+    format!("Straydog host banks read ahead behind ready: {:.1} GiB of {:.1} GiB asked of the system in {:.1} s, {after:.1} s after ready{skipped}; \
+             {} ahead of the locking at the end, {} at the most{stopped}", gib(done.asked), gib(done.planned), done.seconds, ahead(done.lead), ahead(done.lead_most))
 }
 
 #[cfg(test)]
@@ -636,5 +759,171 @@ mod tests {
         let waited = asked.elapsed();
         assert_eq!(warming.join().unwrap(), WarmedUp::CutShort);
         assert!(waited < Duration::from_secs(2), "the request waited {waited:?}");
+    }
+
+    /// A plan of `layers` layers (the first taken is layer 47) of three pieces each, 100 bytes a piece, at distinct addresses.
+    fn plan_pieces(layers: usize) -> Vec<Piece> {
+        (0..layers).flat_map(|turn| (0..3).map(move |role| Piece { turn, layer: 47 - turn, start: 0x10_0000 + (turn * 3 + role) * 4096, bytes: 100 })).collect()
+    }
+
+    /// The addresses `read_ahead_behind` asked for, in order, over `pieces`, with every page out of memory, memory to spare and an engine that stays.
+    fn asked_over(pieces: &[Piece], progress: &Progress) -> (Ahead, Vec<usize>) {
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let asked = Mutex::new(Vec::new());
+        let done = read_ahead_behind(&Arc::downgrade(&engine), pieces, progress, 1000, |_| 0.0, || 5000, |piece| {
+            asked.lock().unwrap().push(piece.start);
+            Ok(())
+        });
+        (done, asked.into_inner().unwrap())
+    }
+
+    /// Decides: the pieces are asked for in the plan's order and no more than the plan's bytes, to its end, and the locking at its first layer leaves the
+    /// read-ahead the whole plan ahead of it.
+    #[test]
+    fn the_pieces_are_asked_for_in_the_plans_order_to_its_end() {
+        let pieces = plan_pieces(4);
+        let (done, asked) = asked_over(&pieces, &Progress::default());
+        assert_eq!(asked, pieces.iter().map(|piece| piece.start).collect::<Vec<_>>(), "the plan's order");
+        assert_eq!((done.planned, done.layers, done.asked, done.skipped, done.stopped.clone()), (1200, 4, 1200, 0, None));
+        assert!(done.asked <= done.planned);
+        assert_eq!((done.lead, done.lead_most), (Lead { layers: 4, bytes: 1200 }, Lead { layers: 4, bytes: 1200 }));
+    }
+
+    /// Decides: a piece whose pages are all in memory is left out, one that is partly in memory is asked for, and the bytes left out are counted.
+    #[test]
+    fn pieces_in_memory_are_skipped() {
+        let pieces = plan_pieces(3);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let asked = Mutex::new(Vec::new());
+        // (layer 46's pages are all there, layer 45's gate bank half)
+        let resident = |piece: &Piece| match (piece.layer, piece.start == pieces[6].start) {
+            (46, _) => 1.0,
+            (45, true) => 0.5,
+            _ => 0.0,
+        };
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, resident, || u64::MAX, |piece| {
+            asked.lock().unwrap().push((piece.layer, piece.start));
+            Ok(())
+        });
+        let layers: Vec<usize> = asked.lock().unwrap().iter().map(|(layer, _)| *layer).collect();
+        assert_eq!(layers, vec![47, 47, 47, 45, 45, 45], "layer 46 is not asked for");
+        assert_eq!((done.asked, done.skipped, done.stopped), (600, 300, None));
+        assert_eq!(done.lead, Lead { layers: 2, bytes: 600 }, "the layer left out is not ahead");
+    }
+
+    /// Decides: the pieces of a layer whose turn the locking has done are left out, as the locking goes on during the read-ahead, and the read-ahead's lead
+    /// against it is of the layers not done.
+    #[test]
+    fn layers_the_locking_has_done_are_skipped() {
+        let pieces = plan_pieces(5);
+        let progress = Progress::default();
+        progress.turns.store(1, Ordering::SeqCst);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let asked = Mutex::new(Vec::new());
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, |_| 0.0, || u64::MAX, |piece| {
+            asked.lock().unwrap().push(piece.start);
+            // (the locking has done layers 0 to 2 by the time the first piece of turn 2 has been asked for, and all five by the last piece)
+            if piece.start == pieces[6].start {
+                progress.turns.store(3, Ordering::SeqCst);
+            }
+            if piece.start == pieces[14].start {
+                progress.turns.store(5, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        // turn 0 was done when it began; turn 2's other two pieces were done by the time they came
+        let expected: Vec<usize> = pieces.iter().enumerate().filter(|(index, _)| (3..7).contains(index) || *index >= 9).map(|(_, piece)| piece.start).collect();
+        assert_eq!(*asked.lock().unwrap(), expected);
+        assert_eq!((done.asked, done.skipped, done.stopped), (1000, 500, None));
+        assert_eq!(done.lead, Lead { layers: 0, bytes: 0 }, "the locking has done every layer the read-ahead asked for");
+        assert_eq!(done.lead_most, Lead { layers: 2, bytes: 500 }, "turns 3 and 4 (300 and 200 bytes) were ahead of the locking, which had done three");
+    }
+
+    /// Decides: it ends when the locking is over, with the pieces after not asked for.
+    #[test]
+    fn it_stops_when_the_locking_is_over() {
+        let pieces = plan_pieces(4);
+        let progress = Progress::default();
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let count = AtomicUsize::new(0);
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, |_| 0.0, || u64::MAX, |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 3 {
+                progress.over.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        assert_eq!((done.asked, done.stopped), (400, Some(AheadStop::Locking)));
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    /// Decides: it ends when the engine has, and keeps the engine alive for the piece it is asking for.
+    #[test]
+    fn it_stops_when_the_engine_ends() {
+        let pieces = plan_pieces(4);
+        let engine = Mutex::new(Some(Arc::new(Mutex::new(Model::default()))));
+        let weak = Arc::downgrade(engine.lock().unwrap().as_ref().unwrap());
+        let count = AtomicUsize::new(0);
+        let done = read_ahead_behind(&weak, &pieces, &Progress::default(), 0, |_| 0.0, || u64::MAX, |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                // (the worker ends while the second piece is being asked for: that piece's engine is still there)
+                assert!(weak.upgrade().is_some());
+                engine.lock().unwrap().take();
+            }
+            Ok(())
+        });
+        assert_eq!((done.asked, done.stopped), (200, Some(AheadStop::Engine)));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Decides: it ends when the memory available falls below the margin the plan keeps free, saying how much there was, and asks for nothing more.
+    #[test]
+    fn it_stops_when_the_memory_falls_below_the_margin() {
+        let pieces = plan_pieces(4);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        // (a stand-in for the available memory: 10 units, one fewer at each look, against a margin of 7)
+        let looks = AtomicUsize::new(0);
+        let asked = AtomicUsize::new(0);
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 7, |_| 0.0, || 10 - looks.fetch_add(1, Ordering::SeqCst) as u64, |_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(done.stopped, Some(AheadStop::Memory { available: 6, margin: 7 }));
+        assert_eq!((done.asked, asked.load(Ordering::SeqCst)), (400, 4), "10, 9, 8 and 7 were enough; 6 was not");
+        let line = ahead_line(&done, 3.0);
+        assert!(line.contains("stopped because") && line.contains("of memory was available, under the"), "{line}");
+        // a margin of nothing never stops it, and a machine with less than the margin from the start asks for nothing
+        let (full, _) = asked_over(&pieces, &Progress::default());
+        assert_eq!(full.stopped, None);
+        let none = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 1 << 30, |_| 0.0, || 1 << 20, |_| panic!("no memory to spare"));
+        assert_eq!((none.asked, none.stopped), (0, Some(AheadStop::Memory { available: 1 << 20, margin: 1 << 30 })));
+    }
+
+    /// Decides: the system refusing a piece ends it with the reason, and the pieces before it count.
+    #[test]
+    fn the_system_refusing_ends_it_with_the_reason() {
+        let pieces = plan_pieces(2);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let count = AtomicUsize::new(0);
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, |_| 0.0, || u64::MAX, |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 2 { Err("not mapped".to_string()) } else { Ok(()) }
+        });
+        assert_eq!((done.asked, done.stopped.clone()), (200, Some(AheadStop::Refused("not mapped".into()))));
+        assert!(ahead_line(&done, 1.0).contains("refused (not mapped)"));
+    }
+
+    /// Decides: an empty plan asks for nothing, and the line for a plan read to its end says what was asked and how far ahead of the locking it was.
+    #[test]
+    fn an_empty_plan_asks_for_nothing_and_the_line_says_how_it_went() {
+        let (done, asked) = asked_over(&[], &Progress::default());
+        assert_eq!((done.planned, done.asked, done.stopped.clone(), asked.len()), (0, 0, None, 0));
+        let gib = 1u64 << 30;
+        let done = Ahead { planned: 17 * gib, layers: 27, asked: 17 * gib, skipped: 0, seconds: 4.26, lead: Lead { layers: 20, bytes: 12 * gib },
+                           lead_most: Lead { layers: 26, bytes: 16 * gib }, stopped: None };
+        assert_eq!(ahead_line(&done, 9.0), "Straydog host banks read ahead behind ready: 17.0 GiB of 17.0 GiB asked of the system in 4.3 s, 9.0 s after ready; \
+                                            20 layers, 12.0 GiB ahead of the locking at the end, 26 layers, 16.0 GiB at the most");
+        let left_out = Ahead { skipped: 2 * gib, planned: 19 * gib, ..done };
+        assert!(ahead_line(&left_out, 9.0).contains("asked of the system in 4.3 s, 9.0 s after ready, 2.0 GiB left out (locked, or in memory already); 20 layers"), "{}", ahead_line(&left_out, 9.0));
+        let a_piece_left_out = Ahead { skipped: 20 << 20, ..left_out };
+        assert!(!ahead_line(&a_piece_left_out, 9.0).contains("left out"));
     }
 }

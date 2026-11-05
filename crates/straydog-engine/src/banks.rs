@@ -16,6 +16,11 @@
 //!
 //! Until step 2 the layer is what every layer that is not page-locked is: the CPU's experts read its pages from the mapping and the slots'
 //! copies read them as they are. No path that takes a bank's bytes to the GPU, the assist apart, depends on the lock.
+//!
+//! The pages of the layers not yet locked are in memory only if the page cache holds them, and a request that comes before the locking is done
+//! reads the rest by faulting, one fault after another (Linux, a cold page cache: 28 to 31 tok/s with 218,547 page faults against 49.4 tok/s after
+//! the locking). [`BankLocks::read_ahead`] hands out the plan's banks as [`Piece`]s in the order the layers are locked, for a thread of the worker to ask the
+//! system for at a low priority ([`Piece::ask`], [`Piece::resident`]), a few hundred MB at a time, so that the locking and a request find them in memory.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -118,14 +123,21 @@ pub struct BankLocks {
     layers: VecDeque<(usize, [Bank; 3])>,
     /// The device whose context the locking thread uses (the one that holds the page locks).
     ordinal: usize,
+    /// The physical memory the plan keeps free ([`crate::host::left_free`]): a read-ahead stops when less than this is available.
+    margin: u64,
 }
 
 // SAFETY: the banks hold the address of the weights' mappings, which the thread that uses them keeps alive ([`BankLocks::lock_next`]).
 unsafe impl Send for BankLocks {}
 
 impl BankLocks {
-    pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize) -> BankLocks {
-        BankLocks { layers: layers.into(), ordinal }
+    pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
+        BankLocks { layers: layers.into(), ordinal, margin }
+    }
+
+    /// The physical memory the plan keeps free: what the system must have available for a read-ahead of the banks to go on.
+    pub fn margin(&self) -> u64 {
+        self.margin
     }
 
     /// The layers still to lock.
@@ -136,6 +148,15 @@ impl BankLocks {
     /// The layer [`BankLocks::lock_next`] takes next.
     pub fn next_layer(&self) -> Option<usize> {
         self.layers.front().map(|(layer, _)| *layer)
+    }
+
+    /// The plan's banks as pieces for a read-ahead, in the order the layers are taken ([`pieces_of`], [`AHEAD_PIECE`]); every byte of the banks still to lock
+    /// and no other. Addresses in the weights' mappings, which whoever asks the system for them keeps alive.
+    pub fn read_ahead(&self) -> Vec<Piece> {
+        let layers: Vec<(usize, [(usize, u64); 3])> = self.layers.iter()
+            .map(|(layer, banks)| (*layer, [0, 1, 2].map(|role| (banks[role].map as usize + banks[role].offset as usize, banks[role].bytes))))
+            .collect();
+        pieces_of(&layers, AHEAD_PIECE)
     }
 
     /// Page-lock the next layer's banks and check them against the file's tree, holding nothing of the model: None when no layer is left.
@@ -204,6 +225,63 @@ impl BankLocks {
             crate::gpu::unlock_host_range(unsafe { bank.range() });
         }
     }
+}
+
+/// The bytes of one request of a read-ahead: a few hundred MB, so that the read can be followed and stopped between two (the size of a chunk of the pinned
+/// files' digests).
+pub const AHEAD_PIECE: u64 = 256 << 20;
+
+/// One request of a read-ahead: a range of one bank of a layer of the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece {
+    /// The layer's place in the plan: 0 for the layer the locking takes first.
+    pub turn: usize,
+    pub layer: usize,
+    /// The address the range begins at, in the mapping of the bank's file, and its bytes (whole pages but at the ends of the bank).
+    pub start: usize,
+    pub bytes: u64,
+}
+
+impl Piece {
+    /// The fraction of the piece's pages that the system is known to hold in memory: Linux, the page cache's; Windows, this process's working set, which
+    /// leaves out the pages that wait in the standby list (an earlier prefetch's, or an earlier process's), so it is a lower bound there.
+    ///
+    /// # Safety
+    /// The mapping the piece is of must be alive.
+    pub unsafe fn resident(&self) -> f64 {
+        // SAFETY: the caller's; the range lies in the mapping (the plan was checked against it).
+        let range = unsafe { std::slice::from_raw_parts(self.start as *const u8, self.bytes as usize) };
+        if cfg!(windows) { crate::storage::in_working_set(range) } else { crate::storage::resident(range) }
+    }
+
+    /// Ask the system to read the piece's pages ([`crate::host::prefetch`]): a hint, nothing is locked or taken.
+    ///
+    /// # Safety
+    /// The mapping the piece is of must be alive.
+    pub unsafe fn ask(&self) -> Result<(), String> {
+        crate::host::prefetch(&[(self.start, self.bytes as usize)])
+    }
+}
+
+/// The pieces of a plan's `layers` (each with its three banks as an address and the bytes), in the order the layers are taken and the banks of a layer are
+/// locked: each bank is cut at page boundaries into pieces of at most `limit` bytes. A bank of no bytes has no piece.
+pub fn pieces_of(layers: &[(usize, [(usize, u64); 3])], limit: u64) -> Vec<Piece> {
+    const PAGE: usize = 4096;
+    let limit = limit.max(PAGE as u64);
+    let mut pieces = Vec::new();
+    for (turn, (layer, banks)) in layers.iter().enumerate() {
+        for &(start, bytes) in banks {
+            let end = start + bytes as usize;
+            let mut at = start;
+            while at < end {
+                // (the next boundary a whole number of pages past `at`, `limit` or less away)
+                let next = (at.saturating_add(limit as usize) & !(PAGE - 1)).max((at & !(PAGE - 1)) + PAGE).min(end);
+                pieces.push(Piece { turn, layer: *layer, start: at, bytes: (next - at) as u64 });
+                at = next;
+            }
+        }
+    }
+    pieces
 }
 
 /// The layers to page-lock: whole layers from the last, as many as `budget` holds. Reading went through the last layers most recently, so
@@ -275,5 +353,78 @@ mod tests {
         };
         order_by_host_routes(&mut layers, counts);
         assert_eq!(layers, vec![45, 46, 44, 47], "most first, equal counts in the order given, none last");
+    }
+
+    /// Decides: a plan's banks are cut into pieces in the order of the layers and of the banks in a layer, at page boundaries, none of them over the limit,
+    /// together exactly the banks' bytes (a read-ahead asks for no more than the plan), and a bank of no bytes has none.
+    #[test]
+    fn the_plans_banks_are_cut_into_pieces_in_the_order_they_are_locked() {
+        const PAGE: usize = 4096;
+        // (layer 47's banks start inside a page, layer 46's gate bank is empty, its down bank a page)
+        let layers = [(47, [(0x1000_0000 + 100, 10 * PAGE as u64 + 7), (0x2000_0000, 3 * PAGE as u64), (0x3000_0000 + 4000, 96)]),
+                      (46, [(0x4000_0000, 0), (0x5000_0000, 5000), (0x6000_0000, PAGE as u64)])];
+        for limit in [4 * PAGE as u64, 3 * PAGE as u64 + 17, 1, u64::MAX] {
+            let pieces = pieces_of(&layers, limit);
+            // the bytes of each layer's banks, in all
+            for (turn, (layer, banks)) in layers.iter().enumerate() {
+                let of_layer: u64 = pieces.iter().filter(|piece| piece.turn == turn && piece.layer == *layer).map(|piece| piece.bytes).sum();
+                assert_eq!(of_layer, banks.iter().map(|bank| bank.1).sum::<u64>(), "layer {layer} at a limit of {limit}");
+            }
+            assert!(pieces.iter().all(|piece| piece.bytes > 0 && piece.bytes <= limit.max(PAGE as u64)), "a piece over {limit}: {pieces:?}");
+            // the layers in the plan's order, the banks of one in theirs, each bank's pieces joined end to end and cut at page boundaries
+            assert!(pieces.windows(2).all(|pair| pair[0].turn <= pair[1].turn));
+            let mut expected = Vec::new();
+            for (_, banks) in &layers {
+                for &(start, bytes) in banks {
+                    let mut within: Vec<&Piece> = pieces.iter().filter(|piece| piece.start >= start && piece.start < start + bytes as usize && bytes > 0).collect();
+                    within.sort_by_key(|piece| piece.start);
+                    assert_eq!(within.first().map(|piece| piece.start), (bytes > 0).then_some(start));
+                    for pair in within.windows(2) {
+                        assert_eq!(pair[0].start + pair[0].bytes as usize, pair[1].start, "joined end to end");
+                        assert_eq!(pair[1].start % PAGE, 0, "cut at a page boundary");
+                    }
+                    if let Some(last) = within.last() {
+                        assert_eq!(last.start + last.bytes as usize, start + bytes as usize);
+                    }
+                    expected.extend(within.iter().map(|piece| piece.start));
+                }
+            }
+            assert_eq!(pieces.iter().map(|piece| piece.start).collect::<Vec<_>>(), expected, "the order of the layers and of their banks, at a limit of {limit}");
+        }
+        // 256 MiB pieces of a 640 MiB bank: 256, 256 and 128
+        let big = pieces_of(&[(1, [(1 << 30, 640 << 20), (0, 0), (0, 0)])], AHEAD_PIECE);
+        assert_eq!(big.iter().map(|piece| piece.bytes >> 20).collect::<Vec<_>>(), vec![256, 256, 128]);
+        assert!(pieces_of(&[], AHEAD_PIECE).is_empty());
+    }
+
+    /// Decides: a plan's read-ahead is the banks of the layers still to lock in the plan's order, at the addresses of their mappings and nothing else; a piece
+    /// of a mapped file that has been touched is resident; and asking the system for it is accepted.
+    #[test]
+    fn a_plans_read_ahead_is_its_banks_in_order_and_a_touched_piece_is_resident() {
+        let path = std::env::temp_dir().join(format!("straydog-ahead-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![7u8; 8 << 20]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a file of this test's own, which nothing changes while it is mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let bank = |index: u64| Bank::new(map.as_ptr(), map.len(), index << 20, 1 << 20, None);
+        let mut locks = BankLocks::new(vec![(47, [bank(0), bank(1), bank(2)]), (46, [bank(3), bank(4), bank(5)])], 0, 3 << 30);
+        let pieces = locks.read_ahead();
+        assert_eq!(pieces.iter().map(|piece| (piece.turn, piece.layer)).collect::<Vec<_>>(), vec![(0, 47), (0, 47), (0, 47), (1, 46), (1, 46), (1, 46)]);
+        assert_eq!(pieces.iter().map(|piece| piece.start - map.as_ptr() as usize).collect::<Vec<_>>(), (0..6).map(|index| index << 20).collect::<Vec<_>>());
+        assert_eq!(pieces.iter().map(|piece| piece.bytes).sum::<u64>(), 6 << 20, "the banks' bytes, no more");
+        assert_eq!(locks.margin(), 3 << 30);
+        // what the locking has taken is no longer in the plan
+        locks.layers.pop_front();
+        assert_eq!(locks.read_ahead().iter().map(|piece| piece.layer).collect::<Vec<_>>(), vec![46, 46, 46]);
+        // (SAFETY below: the mapping is alive until the end of the test)
+        let piece = pieces[1];
+        assert!(unsafe { piece.ask() }.is_ok());
+        let range = &map[(1 << 20)..(2 << 20)];
+        let touched: u32 = range.iter().step_by(4096).map(|byte| u32::from(*byte)).sum();
+        assert_eq!(touched, 7 * 256);
+        assert_eq!(unsafe { piece.resident() }, 1.0, "every page of the piece was touched");
+        drop(map);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 }
