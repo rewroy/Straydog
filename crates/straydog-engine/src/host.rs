@@ -49,6 +49,70 @@ pub fn full_speed() -> bool {
     true
 }
 
+/// How a thread of the engine's own work competes with the rest of it for the cores, the memory bandwidth and the drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Priority {
+    /// As the thread was made.
+    Normal,
+    /// Work that gives way to the request's: the page-locking of the banks behind "ready" and the check of what it locks.
+    Background,
+}
+
+/// A thread's lower priority ([`Priority::Background`]) for as long as this is held; [`Priority::Normal`] changes nothing. Windows begins the
+/// thread's background mode (`THREAD_MODE_BACKGROUND_BEGIN`: lower CPU, I/O and memory priority) and ends it when this is dropped. Linux sets the
+/// thread's nice value to 19 and its I/O class to idle, and keeps them: a thread cannot take its own nice value back without a privilege, and the
+/// threads that ask for this end with the work. Only the calling thread is touched, never the process or the threads it started before.
+#[must_use = "the priority is lowered for as long as this is held"]
+pub struct Lowered {
+    /// The thread's background mode was begun here, and is ended on drop.
+    #[cfg(windows)]
+    began: bool,
+}
+
+impl Lowered {
+    /// Lower the calling thread's priority as `priority` says. A system that refuses leaves the thread as it was.
+    pub fn begin(priority: Priority) -> Lowered {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+            // SAFETY: the calling thread's pseudo handle.
+            let began = priority == Priority::Background && unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0;
+            Lowered { began }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if priority == Priority::Background {
+                // (the idle class of `ioprio_set` in the class bits of the value, its level 0; `IOPRIO_WHO_PROCESS` with 0 names the caller)
+                const IOPRIO_IDLE: libc::c_long = 3 << 13;
+                const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+                // SAFETY: both calls change only the calling thread's own scheduling; a refusal is not an error here, the thread is as it was.
+                unsafe {
+                    let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                    libc::setpriority(libc::PRIO_PROCESS, tid, 19);
+                    libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, IOPRIO_IDLE);
+                }
+            }
+            Lowered {}
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = priority;
+            Lowered {}
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Lowered {
+    fn drop(&mut self) {
+        if self.began {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_END};
+            // SAFETY: the calling thread's pseudo handle; this is held on the stack of the thread that began it.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
+        }
+    }
+}
+
 /// The physical memory available on the machine now (what other programs leave), 0 where unknown.
 pub fn available_bytes() -> u64 {
     #[cfg(windows)]
@@ -359,6 +423,89 @@ mod paging {
         assert!(quiet < QUIET_CALLS);
         assert!(quiet_calls(quiet, 10, 0.25) >= QUIET_CALLS);
         assert_eq!(quiet_calls(u32::MAX, 0, 0.25), u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::{Lowered, Priority};
+
+    /// The calling thread's memory priority, which Windows' background mode lowers from 5 to 1 (with the CPU and I/O priority).
+    #[cfg(windows)]
+    fn memory_priority() -> u32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadInformation, ThreadMemoryPriority, MEMORY_PRIORITY_INFORMATION};
+        let mut information = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
+        // SAFETY: the calling thread's pseudo handle and an initialized structure of the size passed.
+        let read = unsafe {
+            GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, std::ptr::from_mut(&mut information).cast(),
+                                 std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32)
+        };
+        assert_ne!(read, 0, "{}", std::io::Error::last_os_error());
+        information.MemoryPriority
+    }
+
+    /// The calling thread's nice value.
+    #[cfg(target_os = "linux")]
+    fn nice() -> i32 {
+        // SAFETY: the calling thread's own id.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t) }
+    }
+
+    /// Decides: the background priority is the calling thread's alone, for as long as it is held on Windows (ended after) and for the thread's life
+    /// on Linux, and the normal priority changes nothing. Each runs on a thread of its own, which ends with the lowering.
+    #[test]
+    fn the_background_priority_is_the_calling_threads_alone() {
+        #[cfg(windows)]
+        let before = std::thread::spawn(memory_priority).join().unwrap();
+        #[cfg(target_os = "linux")]
+        let before = std::thread::spawn(nice).join().unwrap();
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let other = std::thread::spawn(|| {
+                let _normal = Lowered::begin(Priority::Normal);
+                #[cfg(windows)]
+                let now = memory_priority();
+                #[cfg(target_os = "linux")]
+                let now = nice();
+                now
+            });
+            assert_eq!(other.join().unwrap(), before, "the normal priority changes nothing");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (lowered, resume) = (std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+            let lowering = std::thread::spawn(move || {
+                let held = Lowered::begin(Priority::Background);
+                #[cfg(windows)]
+                sender.send(memory_priority()).unwrap();
+                #[cfg(target_os = "linux")]
+                sender.send(nice() as u32).unwrap();
+                lowered.0.send(()).unwrap();
+                resume.1.recv().unwrap();
+                drop(held);
+                #[cfg(windows)]
+                return memory_priority();
+                #[cfg(target_os = "linux")]
+                return nice() as u32;
+            });
+            lowered.1.recv().unwrap();
+            let during = receiver.recv().unwrap();
+            // (another thread started meanwhile is as it was made)
+            #[cfg(windows)]
+            assert_eq!(std::thread::spawn(memory_priority).join().unwrap(), before, "no other thread is lowered");
+            #[cfg(target_os = "linux")]
+            assert_eq!(std::thread::spawn(nice).join().unwrap(), before, "no other thread is lowered");
+            #[cfg(windows)]
+            assert!(during < before, "memory priority {during} while held against {before}");
+            #[cfg(target_os = "linux")]
+            assert_eq!(during, 19);
+            resume.0.send(()).unwrap();
+            let after = lowering.join().unwrap();
+            #[cfg(windows)]
+            assert_eq!(after, before, "the background mode ends when it is dropped");
+            #[cfg(target_os = "linux")]
+            assert_eq!(after, 19, "a thread cannot take its nice value back, and ends with the work");
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = Lowered::begin(Priority::Background);
     }
 }
 
