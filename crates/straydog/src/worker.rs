@@ -364,11 +364,6 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     loading.report("warm", 0, 0);
     let warming = Instant::now();
     warm_up(&mut model)?;
-    // (once warm, the operands uploaded at first use are on the GPUs: their host copies give back the memory they held)
-    let freed = model.weights.release_host_copies();
-    if freed > 0 {
-        eprintln!("Straydog released {:.1} GiB of host copies once warm", freed as f64 / (1u64 << 30) as f64);
-    }
     let mut seconds = serde_json::Map::new();
     seconds.insert("open".into(), open_seconds.into());
     for (step, value) in &model.load_seconds {
