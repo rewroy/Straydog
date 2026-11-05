@@ -2235,6 +2235,18 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_cpu_rows_int8(
+        kind: ::std::os::raw::c_int,
+        level: ::std::os::raw::c_int,
+        row: *const u8,
+        stride: u64,
+        count: u32,
+        x: *const f32,
+        cols: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_quantize_q2_0(
         input: *const u16,
         count: u64,

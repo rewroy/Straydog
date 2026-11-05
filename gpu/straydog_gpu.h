@@ -570,6 +570,7 @@ int sd_iq_tables(const uint8_t* iq2_xxs, const uint8_t* iq2_xs, const uint8_t* i
 const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out);
 int sd_cpu_rows(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
+int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
 int sd_quantize_q2_0(const uint16_t* input, uint64_t count, uint8_t* output);
 
 /* Host exchanges: page-locked host memory a device's ops read and write within a pass, so a host

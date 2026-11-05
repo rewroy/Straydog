@@ -353,7 +353,7 @@ fn worker_environment() -> Vec<(OsString, OsString)> {
     #[cfg(not(windows))]
     // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports; and
     // the controls of DeepSeek-V4.1's drafts: DS41_DRAFTS, DS41_DSPARK and DS41_DSPARK_RESIDENT)
-    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT", "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR"];
+    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT", "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8"];
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()
