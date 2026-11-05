@@ -284,17 +284,62 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
 // (op_index_select_kernel's), or -inf past the row's visible groups; the top groups are then
 // op_top_k_kernel's.
 constexpr int ds_index_rows = 32, ds_index_wide_groups = 256;
+// Rows of index queries prepared at a time (ds_index_query_rows; the device keeps room for so many: ds_index_queries).
+constexpr size_t ds_index_query_capacity = 256;
+// A row's index queries as ds_index_scores_wmma_rows reads them: FP16, H heads of DIM columns (zero past `heads`), the rotated
+// columns turned by the row's angle. Its arithmetic was the scores kernel's own, made there by every block of groups for every row
+// (a row's angles in double, then its heads): at 45K tokens some 44 blocks a row, against 32 WMMAs a wave a row. Grid (rows).
+template<int H, int DIM>
+__global__ void __launch_bounds__(256) ds_index_query_rows(const float* q, size_t heads, size_t pairs, const int32_t* positions,
+                                                           const float* frequencies, _Float16* out) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const size_t row = blockIdx.x;
+    const unsigned t = threadIdx.x;
+    __shared__ double turns[64][2];
+    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+        double sine, cosine;
+        sincos(double(positions[row]) * double(frequencies[pair]), &sine, &cosine);
+        turns[pair][0] = cosine;
+        turns[pair][1] = sine;
+    }
+    __syncthreads();
+    const size_t rotated = DIM - 2 * pairs;
+    const float* row_q = q + row * heads * DIM;
+    for (unsigned at = t; at < unsigned(H) * (DIM / 8); at += blockDim.x) {
+        const unsigned h = at / (DIM / 8), c0 = (at % (DIM / 8)) * 8;
+        moe_half8 v = {};
+        if (h < heads) {
+            if (c0 + 8 <= rotated) {
+                v = ds_half8(reinterpret_cast<const float4*>(row_q + h * DIM + c0)[0], reinterpret_cast<const float4*>(row_q + h * DIM + c0)[1]);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const size_t c = c0 + j;
+                    float x;
+                    if (c < rotated) x = row_q[h * DIM + c];
+                    else {
+                        const size_t pair = (c - rotated) / 2;
+                        const double a = row_q[h * DIM + rotated + 2 * pair], bb = row_q[h * DIM + rotated + 2 * pair + 1];
+                        const double cs = turns[pair][0], sn = turns[pair][1];
+                        x = (c - rotated) % 2 == 0 ? float(a * cs - bb * sn) : float(a * sn + bb * cs);
+                    }
+                    v[j] = _Float16(x);
+                }
+            }
+        }
+        *reinterpret_cast<moe_half8*>(out + (row * H + h) * DIM + c0) = v;
+    }
+#endif
+}
 template<int HM, int DIM>
-__global__ void __launch_bounds__(256) ds_index_scores_wmma_rows(const float* q, const float* keys, const float* weights,
+__global__ void __launch_bounds__(256) ds_index_scores_wmma_rows(const _Float16* queries, const float* keys, const float* weights,
                                                                  const int32_t* visible, size_t rows, size_t groups, size_t heads,
-                                                                 float scale, size_t pairs, const int32_t* positions,
-                                                                 const float* frequencies, float* scores) {
+                                                                 float scale, float* scores) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int H = HM * 16, L = DIM + 8, KS = DIM / 16;
     const size_t g0 = size_t(blockIdx.x) * ds_index_wide_groups, r0 = size_t(blockIdx.y) * ds_index_rows;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, half = lane / 16;
     __shared__ __attribute__((aligned(16))) _Float16 qs[H][L];
-    __shared__ double turns[64][2];
     __shared__ float head_weights[H];
     // b[n][s]: group g0 + 32 wave + 16 n + lane % 16, columns 16 s + 8 half .. + 8 (the last group's past the row's)
     moe_half8 b[2][KS];
@@ -305,43 +350,15 @@ __global__ void __launch_bounds__(256) ds_index_scores_wmma_rows(const float* q,
         #pragma unroll
         for (int s = 0; s < KS; ++s) b[n][s] = ds_half8(state_float4(key, 16 * s + 8 * half), state_float4(key, 16 * s + 8 * half + 4));
     }
-    const size_t rotated = DIM - 2 * pairs;
     const size_t last = std::min(rows, r0 + ds_index_rows);
     for (size_t row = r0; row < last; ++row) {
         __syncthreads();   // (the previous row's q and weights read)
-        for (size_t pair = t; pair < pairs; pair += blockDim.x) {
-            double sine, cosine;
-            sincos(double(positions[row]) * double(frequencies[pair]), &sine, &cosine);
-            turns[pair][0] = cosine;
-            turns[pair][1] = sine;
-        }
         if (t < H) head_weights[t] = t < heads ? weights[row * heads + t] : 0.0f;
-        __syncthreads();
-        const float* row_q = q + row * heads * DIM;
-        // q: every head's DIM columns, eight a thread at a time (the rotated ones turned by the row's angle)
+        // q: the row's prepared queries (ds_index_query_rows), eight columns a thread at a time
+        const _Float16* row_q = queries + row * H * DIM;
         for (unsigned at = t; at < unsigned(H) * (DIM / 8); at += blockDim.x) {
             const unsigned h = at / (DIM / 8), c0 = (at % (DIM / 8)) * 8;
-            moe_half8 v = {};
-            if (h < heads) {
-                if (c0 + 8 <= rotated) {
-                    v = ds_half8(reinterpret_cast<const float4*>(row_q + h * DIM + c0)[0], reinterpret_cast<const float4*>(row_q + h * DIM + c0)[1]);
-                } else {
-                    #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const size_t c = c0 + j;
-                        float x;
-                        if (c < rotated) x = row_q[h * DIM + c];
-                        else {
-                            const size_t pair = (c - rotated) / 2;
-                            const double a = row_q[h * DIM + rotated + 2 * pair], bb = row_q[h * DIM + rotated + 2 * pair + 1];
-                            const double cs = turns[pair][0], sn = turns[pair][1];
-                            x = (c - rotated) % 2 == 0 ? float(a * cs - bb * sn) : float(a * sn + bb * cs);
-                        }
-                        v[j] = _Float16(x);
-                    }
-                }
-            }
-            *reinterpret_cast<moe_half8*>(&qs[h][c0]) = v;
+            *reinterpret_cast<moe_half8*>(&qs[h][c0]) = *reinterpret_cast<const moe_half8*>(row_q + h * DIM + c0);
         }
         __syncthreads();
         moe_float8 acc[HM][2] = {};

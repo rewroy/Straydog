@@ -527,6 +527,7 @@ struct Device {
     unsigned* attention_tiles = nullptr;
     // sd_op_index_select's row counters (zero between launches: each row's last block resets its own)
     unsigned* index_rows = nullptr;
+    void* index_queries = nullptr;   // ds_index_query_rows's FP16 rows (ds_index_queries; HIP)
     // Forward then inverse rope for one pass, reserved once outside capture (sd_attention_turns_reserve).
     // A captured graph keeps the pointer, so it is not grown while a graph is stored.
     double2* attention_turns = nullptr;
@@ -3870,6 +3871,13 @@ static unsigned* index_counters(Device& value) {
     }
     return value.index_rows;
 }
+#if defined(__HIPCC__)
+// Room for ds_index_query_rows's FP16 queries of ds_index_query_capacity rows at most heads (64) of 128 columns: 4 MiB, once.
+static _Float16* ds_index_queries(Device& value) {
+    if (!value.index_queries) value.index_queries = allocate(value, ds_index_query_capacity * 64 * 128 * 2);
+    return static_cast<_Float16*>(value.index_queries);
+}
+#endif
 // The decode and verify passes' index scores through WMMA (index_select_block's half): with FP16 decode
 // (half_decode, which the engine sets with the prompt pass's FP16 products: its GEMM policy turns them off for
 // a pass of a few rows) or those products, on RDNA4, at its shape.
@@ -3930,16 +3938,27 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
     // An FP16 prompt pass on RDNA4: the scores through WMMA (ds_index_scores_wmma_rows), every index head
     // of 32 rows and 256 groups a block, then each row's top groups. Decode keeps the kernel below.
     if (value.rdna4 && value.half_gemm && rows >= 32 && dim == 128 && (heads == 32 || heads == 64)) {
-        const dim3 grid{unsigned((groups + ds_index_wide_groups - 1) / ds_index_wide_groups), unsigned((rows + ds_index_rows - 1) / ds_index_rows)};
-        if (heads == 32)
-            ds_index_scores_wmma_rows<2, 128><<<grid, 256, 0, value.stream>>>(q, keys, weights, visible, size_t(rows), size_t(groups),
-                                                                           size_t(heads), scale, size_t(rope_dims / 2), positions,
-                                                                           frequencies, scores);
-        else
-            ds_index_scores_wmma_rows<4, 128><<<grid, 256, 0, value.stream>>>(q, keys, weights, visible, size_t(rows), size_t(groups),
-                                                                           size_t(heads), scale, size_t(rope_dims / 2), positions,
-                                                                           frequencies, scores);
-        check(hipGetLastError());
+        // The queries FP16 and rotated once a row (ds_index_query_rows), then the scores, ds_index_query_capacity rows at a time.
+        _Float16* queries = ds_index_queries(value);
+        for (uint64_t first = 0; first < rows; first += ds_index_query_capacity) {
+            const uint64_t count = std::min<uint64_t>(ds_index_query_capacity, rows - first);
+            const dim3 grid{unsigned((groups + ds_index_wide_groups - 1) / ds_index_wide_groups), unsigned((count + ds_index_rows - 1) / ds_index_rows)};
+            const float* chunk_q = q + first * heads * dim;
+            if (heads == 32) {
+                ds_index_query_rows<32, 128><<<unsigned(count), 256, 0, value.stream>>>(chunk_q, size_t(heads), size_t(rope_dims / 2),
+                                                                                       positions + first, frequencies, queries);
+                ds_index_scores_wmma_rows<2, 128><<<grid, 256, 0, value.stream>>>(queries, keys, weights + first * heads, visible + first,
+                                                                               size_t(count), size_t(groups), size_t(heads), scale,
+                                                                               scores + first * groups);
+            } else {
+                ds_index_query_rows<64, 128><<<unsigned(count), 256, 0, value.stream>>>(chunk_q, size_t(heads), size_t(rope_dims / 2),
+                                                                                       positions + first, frequencies, queries);
+                ds_index_scores_wmma_rows<4, 128><<<grid, 256, 0, value.stream>>>(queries, keys, weights + first * heads, visible + first,
+                                                                               size_t(count), size_t(groups), size_t(heads), scale,
+                                                                               scores + first * groups);
+            }
+            check(hipGetLastError());
+        }
         // (every group scored, the top k over the candidates)
         if (candidates)
             op_top_k_candidates_kernel<<<unsigned(rows), 256, 0, value.stream>>>(scores, size_t(groups), candidates, size_t(blocks),
