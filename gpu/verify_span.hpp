@@ -189,8 +189,14 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         hybrid_wait_export(d, ++d.hybrid_sequence);
         if (ahead) await.check_failed();
         const auto computed = std::chrono::steady_clock::now();
-        for (size_t row = 0; row < steps; ++row)
-            hybrid_host_experts(d, experts, d.exchange + hybrid_export_at(row), d.exchange + hybrid_result_at(row));
+        {
+            const float* rows_exported[16]; float* rows_result[16];
+            for (size_t row = 0; row < steps; ++row) {
+                rows_exported[row] = d.exchange + hybrid_export_at(row);
+                rows_result[row] = d.exchange + hybrid_result_at(row);
+            }
+            hybrid_host_experts_rows(d, experts, steps, rows_exported, rows_result);
+        }
         if (ahead) await.publish();
         const auto finished = std::chrono::steady_clock::now();
         d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());

@@ -193,54 +193,68 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
 }
 
 // Host half of a hybrid layer: CPU experts for absent routes, then the residual update.
-extern "C" int sd_cpu_experts_run(void*, const int*, const uint8_t* const*, const uint8_t* const*, const uint8_t* const*,
-                                  const float*, uint32_t, uint64_t, uint64_t, const float*, float*);
+extern "C" int sd_cpu_experts_run_rows(void*, const int*, uint32_t, const uint32_t*, const uint8_t* const*, const uint8_t* const*,
+                                       const uint8_t* const*, const float*, uint64_t, uint64_t, const float* const*, float* const*);
 extern "C" const char* sd_cpu_error();
 extern "C" int sd_cpu_read_ahead(void*, const uint8_t* const*, const uint64_t*, uint32_t);
-void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported, float* result) {
-    const uint8_t* gate[10]; const uint8_t* up[10]; const uint8_t* down[10]; float weights[10];
-    uint32_t count = 0;
-    size_t selected[10], taken[10];
-    for (size_t route = 0; route < 10; ++route) {
-        const float raw = exported[route];
-        if (!(raw >= 0 && raw < float(plan.experts))) throw std::runtime_error("invalid hybrid expert route");
-        const size_t expert = size_t(raw);
-        selected[route] = expert;
-        // (the counts a later start warms up from: where the route went, an assisted one to the host's side)
-        ++(exported[2592 + route] == 1.0f ? plan.routed_gpu : plan.routed_host)[expert];
-        if (exported[2592 + route] != 0) { ++(exported[2592 + route] > 1.5f ? d.assisted_experts : d.gpu_experts); continue; }
-        // (speed first: a CPU route below the floor's weight is left out, sd_hybrid_route_floor)
-        if (exported[16 + route] < d.route_floor) { ++d.dropped_experts; continue; }
-        gate[count] = plan.host[0] + expert * plan.host_bytes[0];
-        up[count] = plan.host[1] + expert * plan.host_bytes[1];
-        down[count] = plan.host[2] + expert * plan.host_bytes[2];
-        taken[count] = expert;
-        weights[count++] = exported[16 + route];
+// `rows` rows' exports (a decode step's one, a verification's tokens) at exported[r], their CPU experts' sums to result[r]: the
+// rows' CPU routes in one call of the CPU engine, so an expert that rows share is read once and the engine's phases hand over once.
+void hybrid_host_experts_rows(Device& d, ResidentMoe& plan, size_t rows, const float* const* exported, float* const* result) {
+    if (rows > 16) throw std::runtime_error("invalid hybrid rows");
+    const uint8_t* gate[160]; const uint8_t* up[160]; const uint8_t* down[160]; float weights[160];
+    uint32_t counts[16];
+    size_t count = 0;
+    const uint8_t* ranges[480]; uint64_t sizes[480];
+    uint32_t hinted = 0;
+    for (size_t r = 0; r < rows; ++r) {
+        if (d.hint_experts) ++plan.host_token;   // (a token a row, as when each row's routes were a call of their own)
+        const float* e = exported[r];
+        size_t selected[10];
+        const size_t before = count;
+        for (size_t route = 0; route < 10; ++route) {
+            const float raw = e[route];
+            if (!(raw >= 0 && raw < float(plan.experts))) throw std::runtime_error("invalid hybrid expert route");
+            const size_t expert = size_t(raw);
+            selected[route] = expert;
+            // (the counts a later start warms up from: where the route went, an assisted one to the host's side)
+            ++(e[2592 + route] == 1.0f ? plan.routed_gpu : plan.routed_host)[expert];
+            if (e[2592 + route] != 0) { ++(e[2592 + route] > 1.5f ? d.assisted_experts : d.gpu_experts); continue; }
+            // (speed first: a CPU route below the floor's weight is left out, sd_hybrid_route_floor)
+            if (e[16 + route] < d.route_floor) { ++d.dropped_experts; continue; }
+            gate[count] = plan.host[0] + expert * plan.host_bytes[0];
+            up[count] = plan.host[1] + expert * plan.host_bytes[1];
+            down[count] = plan.host[2] + expert * plan.host_bytes[2];
+            weights[count++] = e[16 + route];
+            if (d.hint_experts) {
+                // Only experts unread for 64 tokens: 15% of the routes, and 98-100% of the misses of an LRU of 15 to 27 GiB in a
+                // 5592-token trace. Hinting every route costs 3% here and 5.4 ms a token on Windows with the pages in memory.
+                const bool old = plan.host_token - plan.host_read[expert] > 64;
+                plan.host_read[expert] = plan.host_token;
+                if (old) {
+                    for (size_t role = 0; role < 3; ++role) {
+                        ranges[hinted + role] = role == 0 ? gate[count - 1] : role == 1 ? up[count - 1] : down[count - 1];
+                        sizes[hinted + role] = plan.host_bytes[role];
+                    }
+                    hinted += 3;
+                }
+            }
+        }
+        counts[r] = uint32_t(count - before);
+        hybrid_observe_token(plan, selected);
     }
-    hybrid_observe_token(plan, selected);
     if (count) {
         if (!d.cpu) throw std::runtime_error("hybrid experts need an attached CPU expert engine");
+        if (hinted && sd_cpu_read_ahead(d.cpu, ranges, sizes, hinted))
+            throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
         const int kinds[3] = {plan.weights[0].kind, plan.weights[1].kind, plan.weights[2].kind};
-        if (d.hint_experts) {
-            // Only experts unread for 64 tokens: 15% of the routes, and 98-100% of the misses of an LRU of 15 to 27 GiB in a
-            // 5592-token trace. Hinting every route costs 3% here and 5.4 ms a token on Windows with the pages in memory.
-            const uint8_t* ranges[30]; uint64_t sizes[30];
-            uint32_t hinted = 0;
-            ++plan.host_token;
-            for (uint32_t i = 0; i < count; ++i) {
-                const bool old = plan.host_token - plan.host_read[taken[i]] > 64;
-                plan.host_read[taken[i]] = plan.host_token;
-                if (!old) continue;
-                ranges[hinted] = gate[i]; ranges[hinted + 1] = up[i]; ranges[hinted + 2] = down[i];
-                for (size_t role = 0; role < 3; ++role) sizes[hinted + role] = plan.host_bytes[role];
-                hinted += 3;
-            }
-            if (hinted && sd_cpu_read_ahead(d.cpu, ranges, sizes, hinted))
-                throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
-        }
-        if (sd_cpu_experts_run(d.cpu, kinds, gate, up, down, weights, count, 2560, 640, exported + 32, result))
+        const float* xs[16];
+        for (size_t r = 0; r < rows; ++r) xs[r] = exported[r] + 32;
+        if (sd_cpu_experts_run_rows(d.cpu, kinds, uint32_t(rows), counts, gate, up, down, weights, 2560, 640, xs, result))
             throw std::runtime_error(std::string("Straydog CPU experts: ") + sd_cpu_error());
         d.cpu_experts += count;
-    } else std::fill(result, result + 2560, 0.0f);
+    } else for (size_t r = 0; r < rows; ++r) std::fill(result[r], result[r] + 2560, 0.0f);
+}
+void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported, float* result) {
+    hybrid_host_experts_rows(d, plan, 1, &exported, &result);
 }
 

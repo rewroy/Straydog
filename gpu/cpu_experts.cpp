@@ -632,6 +632,8 @@ struct Engine {
     std::vector<Q8K> x_int;
     std::vector<Q8S> products_int;
     std::vector<float> gate_up, products, x_lanes, down_rows;
+    // A call's routes: each one's row and distinct expert, the distinct experts' first routes, and their routes grouped by expert.
+    std::vector<uint32_t> route_row, route_expert, distinct, members_first, members, members_fill;
     uint64_t calls = 0, experts = 0, projection_ns = 0, product_ns = 0, down_ns = 0;
     // Windows: the runtime's flag, nonzero while the machine pages (sd_cpu_paging), and the read-ahead hints taken and left because it did not.
     const std::atomic<uint8_t>* paging = nullptr;
@@ -892,20 +894,57 @@ int sd_cpu_experts_stats(void* handle, uint64_t* values) {
     return 0;
 }
 
-// out[hidden] = sum_i weights[i] * down_i(silu(gate_i x) * up_i x) for expert slices of
-// kinds[0..2] (gate, up, down): Q2_0 or a format with a block decoder (cpu_format), at any
-// hidden and inter that are whole blocks.
-int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up,
-                       const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter,
-                       const float* x, float* out) {
+// out_r[hidden] = sum_i weights[i] * down_i(silu(gate_i x_r) * up_i x_r) over row r's routes, for `rows` rows (a verification's
+// tokens: counts[r] routes each, the rows' routes one after another in gate, up, down and weights), of expert slices of kinds[0..2]
+// (gate, up, down): Q2_0 or a format with a block decoder (cpu_format), at any hidden and inter that are whole blocks. Each row's
+// sum is what a call of its own makes (the same kernels on the same rows, the routes added in their order). An expert that rows
+// share is worked by one worker for all of them at once, so its weights come from memory once, and the phases hand over once a
+// pass rather than once a row.
+int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate,
+                            const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden,
+                            uint64_t inter, const float* const* xs, float* const* outs) {
     try {
         auto* engine = static_cast<Engine*>(handle);
-        if (!engine || !kinds || !gate || !up || !down || !weights || !x || !out || !count || count > 64 ||
-            !hidden || !inter || hidden > 65536 || inter > 65536)
+        if (!engine || !kinds || !rows || rows > 16 || !counts || !gate || !up || !down || !weights || !xs || !outs || !hidden ||
+            !inter || hidden > 65536 || inter > 65536)
             throw std::runtime_error("invalid Straydog CPU expert request");
-        for (uint32_t i = 0; i < count; ++i)
+        size_t count = 0;
+        for (uint32_t r = 0; r < rows; ++r) {
+            if (counts[r] > 64 || !xs[r] || !outs[r]) throw std::runtime_error("invalid Straydog CPU expert request");
+            count += counts[r];
+        }
+        for (size_t i = 0; i < count; ++i)
             if (!gate[i] || !up[i] || !down[i] || !std::isfinite(weights[i]))
                 throw std::runtime_error("invalid Straydog CPU expert operand");
+        if (!count) {
+            for (uint32_t r = 0; r < rows; ++r) std::fill(outs[r], outs[r] + hidden, 0.0f);
+            return 0;
+        }
+        // Each route's row, and the distinct experts (one gate slice each) with the routes that take each, in order (members of
+        // expert u: route_of[first[u]] .. route_of[first[u + 1] - 1]).
+        std::vector<uint32_t>& row_of = engine->route_row;
+        std::vector<uint32_t>& expert_of = engine->route_expert;
+        std::vector<uint32_t>& distinct = engine->distinct;
+        std::vector<uint32_t>& first = engine->members_first;
+        std::vector<uint32_t>& route_of = engine->members;
+        row_of.resize(count); expert_of.resize(count); route_of.resize(count); distinct.clear();
+        for (uint32_t r = 0, i = 0; r < rows; ++r)
+            for (uint32_t k = 0; k < counts[r]; ++k) row_of[i++] = r;
+        for (size_t i = 0; i < count; ++i) {
+            size_t u = 0;
+            while (u < distinct.size() && gate[distinct[u]] != gate[i]) ++u;
+            if (u == distinct.size()) distinct.push_back(uint32_t(i));
+            expert_of[i] = uint32_t(u);
+        }
+        const size_t experts = distinct.size();
+        first.assign(experts + 1, 0);
+        for (size_t i = 0; i < count; ++i) ++first[expert_of[i] + 1];
+        for (size_t u = 0; u < experts; ++u) first[u + 1] += first[u];
+        {
+            std::vector<uint32_t>& fill = engine->members_fill;
+            fill.assign(first.begin(), first.end() - 1);
+            for (size_t i = 0; i < count; ++i) route_of[fill[expert_of[i]]++] = uint32_t(i);
+        }
         // Per role: the Q2_0 kernel (possibly lane-ordered activations) or a block decoder.
         CpuFormat formats[3]{};
         size_t bytes[3];
@@ -920,20 +959,21 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
                 bytes[role] = cols / formats[role].values * formats[role].bytes;
             }
         }
-        engine->gate_up.resize(size_t(count) * 2 * inter);
-        engine->products.resize(size_t(count) * inter);
+        engine->gate_up.resize(count * 2 * inter);
+        engine->products.resize(count * inter);
         float* gate_up = engine->gate_up.data();
         float* products = engine->products.data();
         const RowKernel kernel = engine->kernel;
         const DecodedKernel decoded = engine->decoded;
         const bool lanes = engine->lanes;
-        const size_t projection_rows = size_t(count) * 2 * inter;
-        const float* lane_input = x;
-        if (lanes && (kinds[0] == 42 || kinds[1] == 42)) {
-            engine->x_lanes.resize(hidden);
-            for (size_t i = 0; i < hidden; ++i) engine->x_lanes[lane_position(i)] = x[i];
-            lane_input = engine->x_lanes.data();
+        // Each row's activations as the kernels take them: lane-ordered for Q2_0's F32 kernel.
+        const bool lane_ordered = lanes && (kinds[0] == 42 || kinds[1] == 42);
+        if (lane_ordered) {
+            engine->x_lanes.resize(size_t(rows) * hidden);
+            for (uint32_t r = 0; r < rows; ++r)
+                for (size_t i = 0; i < hidden; ++i) engine->x_lanes[r * hidden + lane_position(i)] = xs[r][i];
         }
+        auto lane_input = [&](uint32_t r) { return lane_ordered ? engine->x_lanes.data() + r * hidden : xs[r]; };
         // The integer path where its formats allow: gate and up against x in 256-value blocks, down against each expert's products
         // in 64-value blocks.
         GateKernel gate_int[2] = {};
@@ -944,16 +984,15 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
             if (inter % 64 == 0) down_int = down_int_kernel(kinds[2], engine->int_level);
         }
         if (gate_int[0] || gate_int[1]) {
-            engine->x_int.resize(hidden / 256);
-            quantize_k(engine->int_level)(x, hidden / 256, engine->x_int.data());
+            engine->x_int.resize(size_t(rows) * (hidden / 256));
+            for (uint32_t r = 0; r < rows; ++r) quantize_k(engine->int_level)(xs[r], hidden / 256, engine->x_int.data() + r * (hidden / 256));
         }
-        const Q8K* x_int = engine->x_int.data();
         auto project = [&](int role, const uint8_t* row, const float* natural, const float* ordered, size_t cols) {
             return kinds[role] == 42 ? kernel(row, ordered, cols / 64) : decoded(formats[role], row, natural, cols);
         };
         // Consecutive rows of one bank go to the fused kernel together (same values and order).
         const int level = engine->level;
-        auto project_rows = [&](int role, const uint8_t* row, size_t count, const float* natural, const float* ordered,
+        auto project_rows = [&](int role, const uint8_t* row, size_t count, const float* natural, const float* ordered, const Q8K* x_int,
                                 size_t cols, float* out) {
             if (role < 2 && gate_int[role]) {
                 gate_int[role](row, bytes[role], count, x_int, cols / 256, out);
@@ -972,64 +1011,85 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
             for (size_t i = 0; i < count; ++i) out[i] = project(role, row + i * bytes[role], natural, ordered, cols);
         };
         auto phase = std::chrono::steady_clock::now();
-        engine->workers->run_blocks(projection_rows, 32, [&](size_t first, size_t last) {
-            for (size_t row = first; row < last;) {
-                const size_t expert = row / (2 * inter), local = row % (2 * inter);
+        // (a block of one expert's gate or up rows, for every route that takes it, one route after another: the rows' bytes are read
+        // from memory once)
+        engine->workers->run_blocks(experts * 2 * inter, 32, [&](size_t begin, size_t last) {
+            for (size_t row = begin; row < last;) {
+                const size_t u = row / (2 * inter), local = row % (2 * inter);
                 const int role = local < inter ? 0 : 1;
-                const size_t end = std::min(last, expert * 2 * inter + size_t(role + 1) * inter);
-                const uint8_t* bank = role == 0 ? gate[expert] : up[expert];
-                project_rows(role, bank + (local % inter) * bytes[role], end - row, x, lane_input, hidden, gate_up + row);
+                const size_t end = std::min(last, u * 2 * inter + size_t(role + 1) * inter);
+                const uint8_t* bank = (role == 0 ? gate : up)[distinct[u]] + (local % inter) * bytes[role];
+                for (uint32_t m = first[u]; m < first[u + 1]; ++m) {
+                    const uint32_t i = route_of[m], r = row_of[i];
+                    const Q8K* x_int = gate_int[0] || gate_int[1] ? engine->x_int.data() + r * (hidden / 256) : nullptr;
+                    project_rows(role, bank, end - row, xs[r], lane_input(r), x_int, hidden, gate_up + i * 2 * inter + local);
+                }
                 row = end;
             }
         });
         engine->projection_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
-        const size_t product_count = size_t(count) * inter;
+        const size_t product_count = count * inter;
         const bool ordered = lanes && kinds[2] == 42 && !down_int;   // inter is then a multiple of 64
         if (down_int) {
             // (the integer down takes each 64 products rounded as they are made: they are not kept in F32)
-            engine->products_int.resize(size_t(count) * (inter / 64));
+            engine->products_int.resize(count * (inter / 64));
             Q8S* quantized = engine->products_int.data();
             const QuantizeS quantize = quantize_s(engine->int_level);
-            engine->workers->run_blocks(product_count / 64, 2, [&](size_t first, size_t last) {
+            engine->workers->run_blocks(product_count / 64, 2, [&](size_t begin, size_t last) {
                 float values[64];
-                for (size_t block = first; block < last; ++block) {
+                for (size_t block = begin; block < last; ++block) {
                     const float* g = gate_up + (block * 64 / inter) * 2 * inter + (block * 64) % inter;
                     for (size_t i = 0; i < 64; ++i) values[i] = silu(g[i]) * g[inter + i];
                     quantize(values, 1, quantized + block);
                 }
             });
         } else {
-            engine->workers->run_blocks(product_count, 128, [&](size_t first, size_t last) {
-                for (size_t i = first; i < last; ++i) {
-                    const size_t expert = i / inter, j = i % inter;
-                    const float value = silu(gate_up[expert * 2 * inter + j]) * gate_up[expert * 2 * inter + inter + j];
+            engine->workers->run_blocks(product_count, 128, [&](size_t begin, size_t last) {
+                for (size_t i = begin; i < last; ++i) {
+                    const size_t route = i / inter, j = i % inter;
+                    const float value = silu(gate_up[route * 2 * inter + j]) * gate_up[route * 2 * inter + inter + j];
                     products[ordered ? lane_position(i) : i] = value;
                 }
             });
         }
         engine->product_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
-        engine->down_rows.resize(size_t(count) * hidden);
+        engine->down_rows.resize(count * hidden);
         float* down_rows = engine->down_rows.data();
-        engine->workers->run_blocks(hidden, 32, [&](size_t first, size_t last) {
-            for (size_t expert = 0; expert < count; ++expert) {
-                if (down_int) {
-                    down_int(down[expert] + first * bytes[2], bytes[2], last - first, engine->products_int.data() + expert * (inter / 64), inter / 64,
-                             down_rows + expert * hidden + first);
-                    continue;
+        engine->workers->run_blocks(hidden, 32, [&](size_t begin, size_t last) {
+            for (size_t u = 0; u < experts; ++u) {
+                const uint8_t* bank = down[distinct[u]] + begin * bytes[2];
+                for (uint32_t m = first[u]; m < first[u + 1]; ++m) {
+                    const uint32_t i = route_of[m];
+                    if (down_int) {
+                        down_int(bank, bytes[2], last - begin, engine->products_int.data() + i * (inter / 64), inter / 64,
+                                 down_rows + i * hidden + begin);
+                        continue;
+                    }
+                    const float* p = products + i * inter;
+                    project_rows(2, bank, last - begin, p, p, nullptr, inter, down_rows + i * hidden + begin);
                 }
-                const float* p = products + expert * inter;
-                project_rows(2, down[expert] + first * bytes[2], last - first, p, p, inter, down_rows + expert * hidden + first);
             }
-            // (each row's sum in the routes' order, as a loop over rows would make it)
-            std::fill(out + first, out + last, 0.0f);
-            for (size_t expert = 0; expert < count; ++expert) add_weighted(level, out + first, down_rows + expert * hidden + first, weights[expert], last - first);
+            // (each row's sum in its routes' order, as a loop over its routes would make it)
+            for (uint32_t r = 0, i = 0; r < rows; ++r) {
+                float* out = outs[r];
+                std::fill(out + begin, out + last, 0.0f);
+                for (uint32_t k = 0; k < counts[r]; ++k, ++i) add_weighted(level, out + begin, down_rows + i * hidden + begin, weights[i], last - begin);
+            }
         });
         engine->down_ns += elapsed_ns(phase);
         ++engine->calls; engine->experts += count;
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+
+// out[hidden] = sum_i weights[i] * down_i(silu(gate_i x) * up_i x): one row's routes (sd_cpu_experts_run_rows of one row).
+int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up,
+                       const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter,
+                       const float* x, float* out) {
+    if (!count) { cpu_error = "invalid Straydog CPU expert request"; return -1; }
+    return sd_cpu_experts_run_rows(handle, kinds, 1, &count, gate, up, down, weights, hidden, inter, &x, &out);
 }
 
 // `flag` is a byte that outlives the engine, nonzero while the machine pages (the runtime keeps it): on Windows the read-ahead hint below is
