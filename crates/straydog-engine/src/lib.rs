@@ -19,6 +19,7 @@ pub mod model;
 pub mod moe;
 pub mod ops;
 pub mod pinned;
+pub mod prefix;
 pub mod pyjson;
 pub mod qwen_vision;
 pub mod reply;

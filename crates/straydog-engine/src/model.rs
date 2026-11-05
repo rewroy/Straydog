@@ -266,6 +266,8 @@ struct Parked {
     history: Option<Positions>,
     saved: Vec<Positions>,
     covered: Option<(usize, usize)>,
+    /// The state of a system block held at its root, imported ([`Model::import_prefix`]): once restored, the sequence is the root's too.
+    root: bool,
 }
 
 impl Parked {
@@ -324,6 +326,62 @@ fn same_text<'a>(tokens: &[u32], held: &[u32], bytes: &dyn Fn(u32) -> Option<&'a
 /// How many leading tokens two sequences share.
 fn shared(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// What decoding a system block's state needs of the model that will take it ([`Model::prefix_plan`]).
+pub struct PrefixPlan {
+    tokens: usize,
+    hidden: usize,
+    /// The sections its bytes must have, to the byte.
+    sections: Vec<(u64, u64)>,
+    /// The parts to fill: the K/V's and the indexer's blocks, and the MTP layer's indexer history.
+    saved: Positions,
+    kept: Option<Positions>,
+    /// Each device's recurrent bytes, and the K/V's capacity the parts' places are for.
+    recurrent: Vec<u64>,
+    capacity: usize,
+}
+
+/// A system block's state decoded, ready for [`Model::install_prefix`].
+pub struct PrefixImage {
+    ids: Vec<u32>,
+    final_hidden: Option<Vec<f32>>,
+    saved: Positions,
+    kept: Option<Positions>,
+    /// Where each device's recurrent state is in the bytes that were decoded.
+    recurrent: Vec<std::ops::Range<usize>>,
+    capacity: usize,
+}
+
+impl PrefixPlan {
+    /// Decode the state `parsed` (of the bytes `Parsed::start` and `payload` came from) as this plan lays it out: its header must be the layout's
+    /// to the byte, its tokens must be tokens of the vocabulary. Takes no part of the model, and a few hundred megabytes of copying: the work of an
+    /// import that is done where nothing waits for it.
+    pub fn decode(self, parsed: &crate::prefix::Parsed) -> Result<PrefixImage> {
+        let refused = |why: &str| Err(format!("Straydog prefix state refused: {why}"));
+        crate::prefix::check(&parsed.sections, &self.sections)?;
+        let ids = crate::prefix::tokens_of(parsed.payload, self.tokens);
+        if ids.iter().any(|token| *token as usize >= VOCABULARY) {
+            return refused("a token outside the vocabulary");
+        }
+        let (hidden_bytes, rest) = parsed.payload[4 * self.tokens..].split_at(4 * self.hidden);
+        let final_hidden = (self.hidden > 0).then(|| hidden_bytes.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect());
+        let (mut saved, mut kept) = (self.saved, self.kept);
+        let places = Group::fill_prefix(&mut saved, kept.as_mut(), &self.recurrent, rest)?;
+        // (the places in the bytes parsed: past the header, the tokens and the hidden state)
+        let base = parsed.start + 4 * self.tokens + 4 * self.hidden;
+        let recurrent = places.into_iter().map(|place| base + place.start..base + place.end).collect();
+        Ok(PrefixImage { ids, final_hidden, saved, kept, recurrent, capacity: self.capacity })
+    }
+}
+
+/// A system block's state as bytes, with what names it ([`Model::export_prefix`]).
+pub struct Prefix {
+    /// The tokens it is held at.
+    pub tokens: usize,
+    /// A digest of those tokens ([`crate::prefix::tokens_digest`]).
+    pub digest: String,
+    pub bytes: Vec<u8>,
 }
 
 pub struct Settings {
@@ -1403,7 +1461,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: None,
-                    saved: vec![positions], covered: Some((from, self.history.len())) })
+                    saved: vec![positions], covered: Some((from, self.history.len())), root: false })
     }
 
     /// Park the live sequence as a prompt departs from it: its recurrent state (in `slot`) and its
@@ -1416,7 +1474,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: Some(history),
-                    saved: Vec::new(), covered: None })
+                    saved: Vec::new(), covered: None, root: false })
     }
 
     /// Free what a parked sequence holds (once nothing restores it).
@@ -1516,6 +1574,7 @@ impl Model {
             let common = shared(&self.history, &parked.tokens);
             if back > live && resumable && common >= parked.from() {
                 let mut parked = self.parked.take().unwrap();
+                let root = parked.root;
                 let slot = if parked.slot == PARK_SLOTS[0] { PARK_SLOTS[1] } else { PARK_SLOTS[0] };
                 // The live sequence whole over what the restore overwrites: from the lowest copy too
                 // (the same tokens below `common`, but perhaps not the same bits once rewritten), or
@@ -1548,8 +1607,18 @@ impl Model {
                 self.final_hidden = final_hidden;
                 self.parked = swapped;
                 self.discard(parked)?;
-                return Ok(Some("restored"));
+                if root {
+                    // (the sequence is a system block at its root again: its checkpoint, which the prompt that made the state would have left)
+                    self.save_checkpoint("root")?;
+                }
+                return Ok(Some(if root { "prefix" } else { "restored" }));
             }
+        }
+        // A system block's imported state that this prompt does not begin with is of no use to it, and holds its host memory until something
+        // takes its place.
+        if self.parked.as_ref().is_some_and(|parked| parked.root && shared(&parked.tokens, &tokens[..limit]) < parked.tokens.len()) {
+            let parked = self.parked.take().unwrap();
+            self.discard(parked)?;
         }
         if live < self.history.len() && self.parkable(live) {
             let slot = match self.parked.take() {
@@ -1969,6 +2038,91 @@ impl Model {
     /// Diagnostics: the parked sequence's positions copied out (`from..to`, if any) and its length.
     pub fn parked_coverage(&self) -> Option<(Option<(usize, usize)>, usize)> {
         self.parked.as_ref().map(|parked| (parked.covered, parked.tokens.len()))
+    }
+
+    // ---- a system block's state, handed from one start of the engine to the next ----
+
+    /// What a state of `tokens` tokens and a `hidden`-float hidden state is made of, section by section ([`crate::prefix`]).
+    fn prefix_sections(&self, tokens: usize, hidden: usize) -> Vec<(u64, u64)> {
+        let mut plan = vec![(crate::gpu::section_tag("tokens"), 4 * tokens as u64), (crate::gpu::section_tag("hidden"), 4 * hidden as u64)];
+        plan.extend(self.group.prefix_sections(tokens as u64, self.speculative > 0));
+        plan
+    }
+
+    /// A digest of the layout of this model's prefix states: the same for models that read each other's, whatever decided it (the devices and
+    /// how the layers are split, the K/V's placement, the drafter's layer).
+    pub fn prefix_layout(&self) -> String {
+        crate::prefix::layout_digest(&self.prefix_sections(4, 0))
+    }
+
+    /// The state of the system block this model holds the root of, as bytes ([`crate::prefix`]): the tokens, the last token's hidden state,
+    /// and for every device the recurrent state the root checkpoint saved, the K/V and the indexer's blocks of its positions (which the held
+    /// sequence still has as the root left them), and the MTP layer's indexer history. None unless the root exists and the held sequence still
+    /// begins with its tokens.
+    pub fn export_prefix(&mut self) -> Result<Option<Prefix>> {
+        let Some(root) = self.checkpoints.get("root") else { return Ok(None) };
+        let tokens = root.tokens.len();
+        if tokens == 0 || tokens % 4 != 0 || shared(&self.history, &root.tokens) < tokens || (self.speculative > 0) != root.history.is_some() {
+            return Ok(None);
+        }
+        let hidden = root.final_hidden.as_deref().unwrap_or(&[]);
+        let plan = self.prefix_sections(tokens, hidden.len());
+        let header = crate::prefix::header(tokens, hidden.len(), &plan);
+        let size = header.len() as u64 + plan.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size as usize).map_err(|_| format!("not enough host memory for {} MB of prefix state", size >> 20))?;
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&crate::prefix::token_bytes(&root.tokens));
+        bytes.extend(hidden.iter().flat_map(|value| value.to_le_bytes()));
+        self.group.export_prefix(root.slot, tokens as u64, root.history.as_ref(), &mut bytes)?;
+        if bytes.len() as u64 != size {
+            return Err(format!("Straydog prefix state is {} bytes where its layout has {size}", bytes.len()));
+        }
+        Ok(Some(Prefix { tokens, digest: crate::prefix::tokens_digest(&root.tokens), bytes }))
+    }
+
+    /// What an import of a state of `tokens` tokens and a `hidden`-float hidden state needs of this model, to be taken at once, under the lock that
+    /// guards the model: the layout its sections must match, the parts to fill, the K/V's capacity they are made for. The state's bytes are then
+    /// decoded ([`PrefixPlan::decode`]) without the model, and [`install_prefix`](Self::install_prefix) takes the result in another moment: a request
+    /// is held up by neither for more than a few milliseconds.
+    pub fn prefix_plan(&self, tokens: usize, hidden: usize) -> Result<PrefixPlan> {
+        let refused = |why: &str| Err(format!("Straydog prefix state refused: {why}"));
+        if tokens == 0 || tokens % 4 != 0 || tokens > self.kv_capacity || tokens + 1 >= self.context {
+            return refused(&format!("{tokens} tokens do not fit this model's K/V and context"));
+        }
+        if hidden != 0 && hidden != WIDTH {
+            return refused(&format!("a hidden state of {hidden} floats"));
+        }
+        let (saved, kept) = self.group.prefix_templates(tokens as u64, self.speculative > 0);
+        Ok(PrefixPlan { tokens, hidden, sections: self.prefix_sections(tokens, hidden), saved, kept, recurrent: self.group.recurrent_sections(),
+                        capacity: self.kv_capacity })
+    }
+
+    /// Take a decoded state ([`PrefixPlan::decode`] of `bytes`) as a parked sequence: a prompt that begins with its tokens resumes from them (the
+    /// request's `resumed_from` is `prefix`), and one that does not drops it. Refused, with nothing changed, if the K/V grew since the plan was made
+    /// (the places of its parts changed with it). The tokens held.
+    pub fn install_prefix(&mut self, image: PrefixImage, bytes: &[u8]) -> Result<usize> {
+        if image.capacity != self.kv_capacity {
+            return Err("Straydog prefix state refused: the K/V grew while it was read".into());
+        }
+        let tokens = image.ids.len();
+        // (what is parked gives way: it is a copy of a sequence this one is no longer than)
+        if let Some(parked) = self.parked.take() {
+            self.discard(parked)?;
+        }
+        self.group.write_recurrent(PARK_SLOTS[0], bytes, &image.recurrent)?;
+        self.parked = Some(Parked { tokens: image.ids, final_hidden: image.final_hidden, slot: PARK_SLOTS[0], history: image.kept, saved: vec![image.saved],
+                                    covered: Some((0, tokens)), root: true });
+        Ok(tokens)
+    }
+
+    /// Take a state [`export_prefix`](Self::export_prefix) made as a parked sequence, whole: [`prefix_plan`](Self::prefix_plan), decoding and
+    /// [`install_prefix`](Self::install_prefix) in a row. Every size is checked against this model's own layout first, and anything that differs by a
+    /// byte is refused with nothing changed.
+    pub fn import_prefix(&mut self, bytes: &[u8]) -> Result<usize> {
+        let parsed = crate::prefix::parse(bytes)?;
+        let image = self.prefix_plan(parsed.tokens, parsed.hidden)?.decode(&parsed)?;
+        self.install_prefix(image, bytes)
     }
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
@@ -2851,6 +3005,8 @@ impl Model {
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
+        // (the sequence a start was handed, and this prompt began with)
+        let resumed = if parked == Some("prefix") { "prefix" } else { resumed };
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
             "parked": parked, "park_seconds": park_seconds, "park_copied_positions": 0,
@@ -2886,6 +3042,11 @@ impl Model {
             }
         }
         let Some(output) = prefilled? else { return Ok(()) };
+        // (a root this prompt made: the tokens it holds, and a digest that names it)
+        if let Some((root, _)) = plan.iter().find(|(_, kinds)| kinds.contains(&"root")) {
+            self.last_metrics.insert("root_checkpoint".into(), json!(root));
+            self.last_metrics.insert("root_digest".into(), json!(crate::prefix::tokens_digest(&tokens[..*root])));
+        }
         let elapsed = prefill_started.elapsed().as_secs_f64();
         self.last_metrics.insert("prefill_seconds".into(), json!(elapsed));
         self.last_metrics.insert("prefill_tokens_per_second".into(), json!((tokens.len() - reused) as f64 / elapsed));
