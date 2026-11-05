@@ -93,12 +93,66 @@ void quantize_q8s_avx512(const float* x, size_t blocks, Q8S* out) {
         _mm512_store_si512(out[b].lanes, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_set1_epi8(1), q), _mm512_set1_epi16(1)));
     }
 }
+// The same rounding with AVX2 (the same maximum, products and conversion): 32 values rounded, clamped and packed in their order.
+SD_TARGET("avx2,fma,f16c")
+inline __m256i q8_pack32(const float* x, __m256 inverse) {
+    const __m256i low = _mm256_set1_epi32(-127), high = _mm256_set1_epi32(127);
+    __m256i v[4];
+    for (int k = 0; k < 4; ++k) v[k] = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 8 * k), inverse)), low), high);
+    // (the packs work within each 128 bits: dwords a0-3 b0-3 c0-3 d0-3 | a4-7 b4-7 c4-7 d4-7, put back in order)
+    const __m256i bytes = _mm256_packs_epi16(_mm256_packs_epi32(v[0], v[1]), _mm256_packs_epi32(v[2], v[3]));
+    return _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+}
+SD_TARGET("avx2,fma,f16c")
+inline float amax256(const float* x, size_t n) {
+    const __m256 magnitude = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 most = _mm256_setzero_ps();
+    for (size_t i = 0; i < n; i += 8) most = _mm256_max_ps(most, _mm256_and_ps(_mm256_loadu_ps(x + i), magnitude));
+    alignas(32) float lane[8];
+    _mm256_store_ps(lane, most);
+    float amax = 0;
+    for (int i = 0; i < 8; ++i) amax = std::max(amax, lane[i]);
+    return amax;
+}
+SD_TARGET("avx2,fma,f16c")
+void quantize_q8k_avx2(const float* x, size_t blocks, Q8K* out) {
+    for (size_t b = 0; b < blocks; ++b) {
+        const float* block = x + 256 * b;
+        const float amax = amax256(block, 256);
+        if (amax == 0 || !std::isfinite(amax)) { out[b].d = 0; std::memset(out[b].q, 0, 256); continue; }
+        const __m256 inverse = _mm256_set1_ps(127.0f / amax);
+        out[b].d = amax / 127.0f;
+        for (int k = 0; k < 8; ++k) _mm256_store_si256(reinterpret_cast<__m256i*>(out[b].q + 32 * k), q8_pack32(block + 32 * k, inverse));
+    }
+}
+SD_TARGET("avx2,fma,f16c")
+void quantize_q8s_avx2(const float* x, size_t blocks, Q8S* out) {
+    const __m256i ones8 = _mm256_set1_epi8(1), ones16 = _mm256_set1_epi16(1);
+    for (size_t b = 0; b < blocks; ++b) {
+        const float* block = x + 64 * b;
+        const float amax = amax256(block, 64);
+        alignas(32) int8_t natural[64] = {};
+        if (amax == 0 || !std::isfinite(amax)) out[b].d = 0;
+        else {
+            const __m256 inverse = _mm256_set1_ps(127.0f / amax);
+            out[b].d = amax / 127.0f;
+            _mm256_store_si256(reinterpret_cast<__m256i*>(natural), q8_pack32(block, inverse));
+            _mm256_store_si256(reinterpret_cast<__m256i*>(natural + 32), q8_pack32(block + 32, inverse));
+        }
+        for (int p = 0; p < 64; ++p) out[b].q[p] = natural[q2_order[p]];
+        for (int h = 0; h < 2; ++h) {
+            const __m256i q = _mm256_load_si256(reinterpret_cast<const __m256i*>(out[b].q + 32 * h));
+            _mm256_store_si256(reinterpret_cast<__m256i*>(out[b].lanes + 8 * h), _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, q), ones16));
+        }
+    }
+}
 #endif
 using QuantizeK = void (*)(const float*, size_t, Q8K*);
 using QuantizeS = void (*)(const float*, size_t, Q8S*);
 inline QuantizeK quantize_k(int level) {
 #ifdef SD_X86
     if (level >= 2) return quantize_q8k_avx512;
+    if (level == 1) return quantize_q8k_avx2;
 #endif
     (void)level;
     return quantize_q8k;
@@ -106,6 +160,7 @@ inline QuantizeK quantize_k(int level) {
 inline QuantizeS quantize_s(int level) {
 #ifdef SD_X86
     if (level >= 2) return quantize_q8s_avx512;
+    if (level == 1) return quantize_q8s_avx2;
 #endif
     (void)level;
     return quantize_q8s;
