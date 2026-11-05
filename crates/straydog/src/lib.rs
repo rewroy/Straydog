@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod dashboard;
+pub mod frames;
 pub mod monitor;
 pub mod progress;
 pub mod runtime;

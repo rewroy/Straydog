@@ -100,6 +100,12 @@ impl Output {
         // A closed pipe means the server is gone; the next read of stdin ends the worker.
         let _ = out.write_all(&line).and_then(|()| out.flush());
     }
+
+    /// A frame that carries bytes ([`crate::frames`]): its header, then `body`, written together so that no other frame comes between.
+    pub(crate) fn send_with_body(&self, frame: &Value, body: &[u8]) {
+        let mut out = self.0.lock().unwrap();
+        let _ = crate::frames::write_with_body(&mut *out, frame, body);
+    }
 }
 
 /// Startup progress before `ready`: each stage change at once, then a few frames per second.
@@ -156,6 +162,20 @@ pub(crate) trait Served: Send {
         Ok(())
     }
 
+    /// The state of the system block the held sequence began with, as bytes, and what names it (its tokens and their digest): none when the
+    /// model keeps none.
+    fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
+        Ok(None)
+    }
+
+    /// Take a system block's state an earlier run saved, in the background, never ahead of a request. `read_seconds` is what the server
+    /// spent getting it, `arrived` when its frame began.
+    fn prefix_in_background(_engine: &Arc<Mutex<Self>>, _state: Vec<u8>, _read_seconds: f64, _arrived: Instant)
+    where
+        Self: Sized + 'static,
+    {
+    }
+
     /// [`Served::warm`] for a model whose warm-up steps run on a thread of their own, each under the engine's lock (`engine` is the handle the request loop
     /// shares: a request that comes meanwhile waits for one step at most).
     fn warm_in_background(engine: &Arc<Mutex<Self>>, state: &Value) -> Result<(), String>
@@ -187,6 +207,18 @@ impl Served for Engine {
         let earlier = self.earlier.clone().unwrap_or_else(|| Routes::new(ROUTED_LAYERS, ROUTED_EXPERTS));
         let kept = earlier.aged_with(&run);
         Ok(if kept.total() == 0 { Value::Null } else { kept.to_state() })
+    }
+
+    fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
+        Ok(self.model.export_prefix()?.map(|prefix| (json!({"tokens": prefix.tokens, "digest": prefix.digest}), prefix.bytes)))
+    }
+
+    fn prefix_in_background(engine: &Arc<Mutex<Engine>>, state: Vec<u8>, read_seconds: f64, arrived: Instant) {
+        let weak = Arc::downgrade(engine);
+        let spawned = std::thread::Builder::new().name("straydog-prefix".into()).spawn(move || restore_prefix(&weak, &state, read_seconds, arrived));
+        if let Err(error) = spawned {
+            eprintln!("Straydog prefix: not restored ({error})");
+        }
     }
 
     fn warm_in_background(engine: &Arc<Mutex<Engine>>, state: &Value) -> Result<(), String> {
@@ -312,6 +344,50 @@ fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, beg
     };
     eprintln!("Straydog warm start: {swapped} expert slots filled ({held} of {slots} held), the OS asked for {} MB of bank pages ({} experts) in {:.1} s, \
                the slots done in {:.1} s{note}", asked >> 20, start.hints.experts, asking.as_secs_f64(), began.elapsed().as_secs_f64());
+}
+
+/// How long a restore waits for the engine before it takes the engine to be a request's: a warm start's step holds it for a few milliseconds, a request
+/// for seconds.
+const PREFIX_PATIENCE: Duration = Duration::from_millis(500);
+
+/// The engine, once it is free within [`PREFIX_PATIENCE`], unless a request has had it: what a restore may take, never ahead of a request.
+fn engine_for_prefix(engine: &Mutex<Engine>) -> Option<std::sync::MutexGuard<'_, Engine>> {
+    let asked = Instant::now();
+    loop {
+        match engine.try_lock() {
+            Ok(guard) => return (guard.requests == 0).then_some(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) if asked.elapsed() >= PREFIX_PATIENCE => return None,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
+/// Hand the model a system block's state an earlier run saved, if no request has the engine or has had it: a request that came first is never held up
+/// by this (it holds the engine for the moment the plan takes and the moment the install takes, and decodes the few hundred megabytes without it), and
+/// a model that has served one holds a sequence this state would only displace. One line in the log says what became of it.
+fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64, arrived: Instant) {
+    let not_restored = |why: &str| eprintln!("Straydog prefix: not restored ({why})");
+    let Some(alive) = engine.upgrade() else { return };
+    let parsed = match straydog_engine::prefix::parse(state) {
+        Ok(parsed) => parsed,
+        Err(message) => return not_restored(&message),
+    };
+    // (a moment under the engine's lock: what the state must match)
+    let plan = match engine_for_prefix(&alive) {
+        Some(engine) => engine.model.prefix_plan(parsed.tokens, parsed.hidden),
+        None => return not_restored("a request began first"),
+    };
+    let image = match plan.and_then(|plan| plan.decode(&parsed)) {
+        Ok(image) => image,
+        Err(message) => return not_restored(&message),
+    };
+    // (and another: the sequence it becomes)
+    let Some(mut engine) = engine_for_prefix(&alive) else { return not_restored("a request began first") };
+    match engine.model.install_prefix(image, state) {
+        Ok(tokens) => eprintln!("Straydog prefix: restored {tokens} tokens ({} MB) in {:.1} s", state.len() >> 20, read_seconds + arrived.elapsed().as_secs_f64()),
+        Err(message) => not_restored(&message),
+    }
 }
 
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
@@ -528,6 +604,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "quantization": id.quant, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
         "speculation": if model.speculative > 0 { json!([{"kind": "mtp", "drafts": model.speculative}]) } else { json!([]) },
+        // (what a system block's state a start may be handed must match: its layout, to the byte)
+        "prefix": {"version": straydog_engine::prefix::VERSION, "layout": model.prefix_layout()},
         "vision": vision.is_ok(),
         // (the engram table read: its precision and file, Unsloth's Qwen3.8)
         "engram": straydog_engine::bundle::table_in(&args.model, id).ok().flatten()
@@ -650,6 +728,42 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 if let Err(message) = S::warm_in_background(&engine, &state) {
                     eprintln!("Straydog cannot warm up: {message}");
                 }
+            }
+            Some("prefix_state") => {
+                if active.lock().unwrap().is_some() {
+                    output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
+                    continue;
+                }
+                let state = engine.lock().unwrap().prefix_state();
+                match state {
+                    Ok(Some((_, bytes))) if bytes.len() as u64 > crate::frames::BODY_LIMIT => {
+                        output.send(&json!({"id": id, "event": "prefix_state", "bytes": 0, "reason": "too large"}));
+                    }
+                    Ok(Some((mut header, bytes))) => {
+                        header["id"] = id.clone().into();
+                        header["event"] = "prefix_state".into();
+                        output.send_with_body(&header, &bytes);
+                    }
+                    Ok(None) => output.send(&json!({"id": id, "event": "prefix_state", "bytes": 0})),
+                    Err(message) => output.send(&json!({"id": id, "event": "error", "message": message, "fatal": false})),
+                }
+            }
+            Some("prefix") => {
+                let arrived = Instant::now();
+                let count = match request.get("bytes") {
+                    Some(pyjson::Value::Int(count)) if *count >= 0 => *count as u64,
+                    _ => break Err("Straydog prefix frame has no byte count".into()),
+                };
+                // (a body that is short or over its limit leaves the pipe out of step: the worker ends)
+                let state = match crate::frames::read_body(&mut reader, count) {
+                    Ok(state) => state,
+                    Err(message) => break Err(message),
+                };
+                let read_seconds = match request.get("read_seconds") {
+                    Some(pyjson::Value::Float(seconds)) => *seconds,
+                    _ => 0.0,
+                };
+                S::prefix_in_background(&engine, state, read_seconds, arrived);
             }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
                 let mut current = active.lock().unwrap();
