@@ -27,6 +27,11 @@ static GPUS: Mutex<()> = Mutex::new(());
 const LOCKED: [usize; 4] = [44, 45, 46, 47];
 /// The decode passes a run compares.
 const PASSES: usize = 12;
+/// The least relative difference of logits that two runs of one configuration are allowed. Which experts the slots hold at a moment depends on
+/// timing (the swaps that fill them run beside the passes), and where a route goes (a slot, the GPU's assist, the CPU's integer products) moves a
+/// pass's logits by that much: two runs of the same start differed by 0, 8e-3, 1.9e-2, 3.2e-2 and 6.1e-2 here. A bank read wrongly, or a layer
+/// mapped before it was checked, moves them past 1 and parts the tokens at once, which `compared` catches.
+const NOISE_FLOOR: f64 = 0.15;
 
 /// The model with no bank locked, and the prompt it continues.
 fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
@@ -139,7 +144,7 @@ fn a_decode_during_the_locking_matches_one_after() {
         decode(&mut model, &prompt)
     };
     let (compared, noise) = compare(&after_one, &after_two);
-    let tolerance = (4.0 * noise).max(1e-4);
+    let tolerance = (4.0 * noise).max(NOISE_FLOOR);
     eprintln!("locked first, twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
     assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
 
