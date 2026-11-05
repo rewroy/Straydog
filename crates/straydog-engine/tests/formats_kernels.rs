@@ -213,7 +213,7 @@ fn cpu_integer_rows_equal_their_scalar_kernels_and_err_by_the_rounding_of_x_alon
         let weights = decode(kind, &data);
         let x: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
         let scalar = cpu_rows_int8(kind, 0, &data, rows, &x).unwrap();
-        for level in [(2, avx512), (3, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
+        for level in [(1, std::is_x86_feature_detected!("avx2")), (2, avx512), (3, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
             let wide = cpu_rows_int8(kind, level, &data, rows, &x).unwrap();
             assert_eq!(wide.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                        "kind {kind} level {level}");

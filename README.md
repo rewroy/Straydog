@@ -189,7 +189,7 @@ Where it rounds, and how to turn it off:
 | DeepSeek's hyper-connection weights | BF16 on the device (F32 in the GGUF) | none |
 | MTP drafter (Qwen3.8) | its experts quantized to Q2_0 when it is built: this changes only how many drafts are accepted, never the output | run without `-md` |
 | DSpark drafter (DeepSeek) | each stage routes among its most used experts (98% of its routes): this changes only how many drafts are accepted | `DS41_DSPARK_RESIDENT=all` (`DS41_DSPARK=0`: no drafter) |
-| Qwen3.8's experts beyond VRAM (partial residency) | the CPU computes them (with activations rounded to 8-bit integers on a CPU with AVX-512 and VBMI, in F32 elsewhere) and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
+| Qwen3.8's experts beyond VRAM (partial residency) | the CPU computes them (with activations rounded to 8-bit integers on a CPU with AVX-512 and VBMI or with AVX2, in F32 elsewhere) and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
 
 How this is checked: Qwen3.8's pinned GPU generations reproduce every greedy token, logits
 vector and final hidden state bit for bit in each placement, and DeepSeek-V4.1's served
