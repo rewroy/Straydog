@@ -62,6 +62,15 @@ impl Routes {
         u64::from(self.gpu[at]) + u64::from(self.host[at])
     }
 
+    /// The routes of a layer that went to the host: to an expert the CPU computed, or one the GPU read over the bus (none for a layer outside the
+    /// model).
+    pub fn host_routes(&self, layer: usize) -> u64 {
+        if layer >= self.layers {
+            return 0;
+        }
+        self.host[layer * self.experts..(layer + 1) * self.experts].iter().map(|&count| u64::from(count)).sum()
+    }
+
     fn layer_total(&self, layer: usize) -> u64 {
         (0..self.experts).map(|expert| self.used(layer, expert)).sum()
     }
@@ -270,6 +279,13 @@ mod tests {
         assert_eq!(routes.ranked(), vec![(1, 1), (0, 2), (0, 0), (1, 3)]);
         assert_eq!(routes.sides(), (71, 39));
         assert_eq!(routes.total(), 110);
+    }
+
+    /// Decides: a layer's host routes are those of its experts that went to the host, and a layer outside the model has none.
+    #[test]
+    fn a_layers_host_routes_are_those_that_went_to_the_host() {
+        let routes = counted(3, 4, &[(0, 0, 10, 30), (0, 2, 60, 0), (1, 1, 0, 9), (1, 3, 1, 0)]);
+        assert_eq!((routes.host_routes(0), routes.host_routes(1), routes.host_routes(2), routes.host_routes(3)), (30, 9, 0, 0));
     }
 
     fn mapped(layer: usize) -> Option<Banks> {

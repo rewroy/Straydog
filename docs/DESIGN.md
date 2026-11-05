@@ -151,6 +151,25 @@ The engine is built in layers:
   trees.
 - **Startup times.** DeepSeek-V4.1's server is ready in 14 s with its dense weights in the page
   cache. Qwen3.8's IQ3_S with its drafter takes 22-23 s from a cold start and 13-14 s cached.
+- **Behind "ready"** (Qwen3.8, the worker `behind.rs`). The app starts the engine when it opens and its person then types for a while, so
+  two steps of a partially resident start come after ready and give way to a request. The ready frame's `plans` and `warm` are what they cost
+  before it; the log says what came after.
+  - **The GPU code's warm-up** (two greedy runs of a made-up prompt, 10.6 s on a machine with nothing locked and cold banks) holds the engine for
+    its passes. A request, or any command that takes the engine, ends it at the next pass boundary: the model is reset as at its end and
+    the request's first pass loads what it needs, as after any reset. One line: done or cut short, its seconds, and seconds after ready.
+  - **The banks' page locks.** The start plans which whole layers to lock (from the last, within the lock budget) at the point it always did, before
+    the expert slots are placed, so what it leaves of the commit for the locks is out of what the slots' VRAM takes; it locks none.
+    After the warm-up a thread locks the planned layers one at a time (25.9 GiB of 40 layers took 7.5 s of an 18 s start on an RTX 4060 PC,
+    nearly all of it reading the banks from the drive), the layers whose experts the host ran most routes of in the warm-up state first, else
+    from the last layer. A layer's turn holds nothing of the engine: it page-locks the three banks, then checks them against the file's tree
+    (a locked page cannot change under the check; an unlocked bank's pages may be read from the drive again after the load verified them), and
+    a layer that cannot be locked ends the locking where it is, its reason in the log, the layers before it kept. Only then does it take the
+    engine's lock, for the moment it takes to register the layer's locks with the device and map its banks for the GPU's assist (the one way
+    the GPU reads a bank in place), where a request that has the engine is waited for; between layers it waits until no request has it. A layer
+    whose bytes do not match the tree is unlocked, never registered, and every later request fails with the error. The assist and its
+    tuner turn on with the first layer, take each one as it comes (the layers' captured graphs are dropped and made again), and time their levels
+    anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
+    after ready, whether a request ran meanwhile, and why it stopped if it did.
 - **Warm-up.** Every two minutes after requests, and at shutdown (also when no request came but
   the worker was handed a state to warm up with), the runtime asks the worker
   which experts its stores hold, least recently used first, and keeps the list in the data

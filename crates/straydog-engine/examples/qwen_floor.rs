@@ -47,6 +47,7 @@ fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floo
     let settings = Settings { context: 32_768, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: 0, cpu_threads: 0,
                               row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
+    model.lock_banks_now()?;
     eprintln!("floor {floor}: loaded");
     let mut out = Vec::new();
     let (mut seconds, mut made) = (0.0, 0usize);

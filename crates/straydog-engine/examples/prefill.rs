@@ -83,6 +83,10 @@ fn main() -> Result<(), String> {
                               speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
+    // (the worker locks the banks behind "ready"; this run is served from them locked, as the worker's is once it has)
+    let locking = std::time::Instant::now();
+    model.lock_banks_now()?;
+    eprintln!("banks locked in {:.2} s: {} layers", locking.elapsed().as_secs_f64(), model.locked_layers());
     if drafts == Some(0) {
         model.speculative = 0;
     }

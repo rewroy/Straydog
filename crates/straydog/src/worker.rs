@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::behind;
 use crate::images;
 
 use clap::Args;
@@ -222,18 +223,28 @@ impl Served for Engine {
     }
 
     fn warm_in_background(engine: &Arc<Mutex<Engine>>, state: &Value) -> Result<(), String> {
-        let began = Instant::now();
-        let (start, requests) = {
-            let mut engine = engine.lock().unwrap();
-            match engine.warm_begin(state)? {
-                Some(start) => (start, engine.requests),
-                None => return Ok(()),
-            }
-        };
-        let weak = Arc::downgrade(engine);
-        std::thread::Builder::new().name("straydog-warm".into()).spawn(move || warm_start(&weak, start, requests, began))
-            .map(drop).map_err(|exc| exc.to_string())
+        // The warm-up holds the engine for its passes, and the request loop that is asking must go on reading: the thread behind "ready" begins
+        // the warm start when the warm-up is over, as it was when the warm-up came before "ready".
+        if behind::hold_warm_start(state) {
+            return Ok(());
+        }
+        begin_warm_start(engine, state)
     }
+}
+
+/// The first step of a warm start under the engine's lock, then its background work on a thread of its own ([`warm_start`]).
+fn begin_warm_start(engine: &Arc<Mutex<Engine>>, state: &Value) -> Result<(), String> {
+    let began = Instant::now();
+    let (start, requests) = {
+        let mut engine = engine.lock().unwrap();
+        match engine.warm_begin(state)? {
+            Some(start) => (start, engine.requests),
+            None => return Ok(()),
+        }
+    };
+    let weak = Arc::downgrade(engine);
+    std::thread::Builder::new().name("straydog-warm".into()).spawn(move || warm_start(&weak, start, requests, began))
+        .map(drop).map_err(|exc| exc.to_string())
 }
 
 /// Swaps one step of a warm start's slot fill may issue (about 64 MB of experts at IQ1_M, which the device's copy thread issues without the engine's
@@ -352,13 +363,21 @@ const PREFIX_PATIENCE: Duration = Duration::from_millis(500);
 
 /// The engine, once it is free within [`PREFIX_PATIENCE`], unless a request has had it: what a restore may take, never ahead of a request.
 fn engine_for_prefix(engine: &Mutex<Engine>) -> Option<std::sync::MutexGuard<'_, Engine>> {
-    let asked = Instant::now();
+    let mut asked = Instant::now();
     loop {
         match engine.try_lock() {
             Ok(guard) => return (guard.requests == 0).then_some(guard),
             Err(std::sync::TryLockError::Poisoned(_)) => return None,
-            Err(std::sync::TryLockError::WouldBlock) if asked.elapsed() >= PREFIX_PATIENCE => return None,
-            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // (the warm-up behind "ready" holds the engine for seconds, and is not a request: a restore waits for it, for it ends at once
+                // if a request comes, and its patience counts from there)
+                if behind::WARMING.load(Ordering::SeqCst) {
+                    asked = Instant::now();
+                } else if asked.elapsed() >= PREFIX_PATIENCE {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
@@ -391,18 +410,31 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
 }
 
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
-/// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty.
-fn warm_up(model: &mut Model) -> Result<(), String> {
+/// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty. It runs behind "ready" ([`behind`]), so a request can
+/// come in the middle of it: `cancelled` says so, and it stops at the next pass, resets the model as it does at its end, and a request's first
+/// pass then loads what it needs, as after any reset. Whether it ran to its end.
+fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, String> {
     let longest = model.prefill_batch_size.min(model.context.saturating_sub(4));
+    let mut complete = true;
     for length in [longest, longest.min(300)] {
         if length >= 2 {
+            if cancelled() {
+                complete = false;
+                break;
+            }
             let prompt: Vec<u32> = (0..length as u32).map(|index| 1000 + index % 50_000).collect();
-            model.generate(&prompt, 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {})?;
+            model.generate(&prompt, 2, &Sampling::GREEDY, 0, cancelled, &mut |_, _| {}, true, false, &mut |_| {})?;
+            // (a request seen in the middle of a pass: that pass may not have run to its end)
+            if cancelled() {
+                complete = false;
+                break;
+            }
         }
     }
     model.reset()?;
     // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
-    model.clear_route_counts()
+    model.clear_route_counts()?;
+    Ok(complete)
 }
 
 /// How long a GPU's memory held by another process is waited for.
@@ -593,17 +625,17 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         (text.join().unwrap(), model)
     });
     let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
-    let (text, mut model) = (Arc::new(text?), model?);
-    loading.report("warm", 0, 0);
+    let (text, model) = (Arc::new(text?), model?);
+    // The GPU code's warm-up and the page-locking of the banks come behind "ready" ([`behind`]): "plans" and "warm" are what they cost before it.
     let warming = Instant::now();
-    warm_up(&mut model)?;
+    behind::WARMING.store(true, Ordering::SeqCst);
     let mut seconds = serde_json::Map::new();
     seconds.insert("open".into(), open_seconds.into());
     for (step, value) in &model.load_seconds {
         seconds.insert(step.to_string(), (*value).into());
     }
     seconds.insert("warm".into(), warming.elapsed().as_secs_f64().into());
-    output.send(&json!({
+    let ready = json!({
         "event": "ready", "protocol": 1, "engine": "Straydog", "model": id.model, "provider": id.provider,
         "quantization": id.quant, "context": model.context, "state_bytes": model.state_bytes,
         "speculative_drafts": model.speculative,
@@ -620,8 +652,72 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" }},
         "load_seconds": seconds,
         "gpu": model.info()?,
-    }));
-    serve(Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0 })), text, output)
+    });
+    let engine = Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0 }));
+    output.send(&ready);
+    let ready_at = Instant::now();
+    behind_ready(&engine, ready_at);
+    serve(engine, text, output)
+}
+
+/// The warm-up and then the locking of the banks, on a thread of their own, from "ready" on ([`behind`]). One INFO line each says how it went and
+/// when it ended, in seconds after ready.
+fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
+    let weak = Arc::downgrade(engine);
+    let spawned = std::thread::Builder::new().name("straydog-behind".into()).spawn(move || {
+        let began = Instant::now();
+        let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| warm_up(&mut engine.model, cancelled));
+        // (a warm start that was asked for meanwhile begins now, so that the layers it counts the host's routes of are locked first)
+        let pending = behind::warm_up_over();
+        let (seconds, after) = (began.elapsed().as_secs_f64(), ready_at.elapsed().as_secs_f64());
+        match &outcome {
+            behind::WarmedUp::Done => eprintln!("Straydog warm-up: done in {seconds:.1} s, {after:.1} s after ready"),
+            behind::WarmedUp::CutShort => eprintln!("Straydog warm-up: cut short by a request after {seconds:.1} s, {after:.1} s after ready"),
+            behind::WarmedUp::Skipped => eprintln!("Straydog warm-up: not run, a request had the engine first ({after:.1} s after ready)"),
+            behind::WarmedUp::Failed(message) => eprintln!("WARN Straydog warm-up failed after {seconds:.1} s: {message}"),
+            behind::WarmedUp::Gone => return,
+        }
+        if let (Some(state), Some(engine)) = (pending, weak.upgrade()) {
+            if let Err(message) = begin_warm_start(&engine, &state) {
+                eprintln!("Straydog cannot warm up: {message}");
+            }
+        }
+        let locking = behind::lock_behind(&weak, |engine: &Engine| engine.requests,
+            |engine: &mut Engine| engine.model.bank_locks(engine.earlier.as_ref()),
+            |job| {
+                // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
+                let next = unsafe { job.lock_next() }?;
+                Some(match next {
+                    Ok(locked) => {
+                        let (layer, bytes) = (locked.layer, locked.bytes);
+                        Ok((locked, layer, bytes))
+                    }
+                    Err(stop) => Err(behind::Stopped {
+                        unverified: matches!(stop, straydog_engine::banks::Stop::Unverified { .. }), message: stop.message(),
+                    }),
+                })
+            },
+            |engine: &mut Engine, locked| engine.model.banks_locked(locked).map(drop),
+            |locked| {
+                // SAFETY: as above, the engine is held while a layer that was locked is given up.
+                unsafe { locked.unlock() }
+            },
+            |engine: &mut Engine, locking| engine.model.banks_lock_ended(locking.unverified.then(|| locking.stopped.clone()).flatten()),
+            |locking| {
+                let (after, gib) = (ready_at.elapsed().as_secs_f64(), locking.bytes as f64 / (1u64 << 30) as f64);
+                let ran = if locking.requests == 0 { "no request ran meanwhile".to_string() } else { format!("{} request(s) ran meanwhile", locking.requests) };
+                let stopped = locking.stopped.as_ref().map(|why| format!(", stopped because {why}")).unwrap_or_default();
+                if locking.layers > 0 || locking.stopped.is_some() {
+                    eprintln!("Straydog host banks locked behind ready: {} layers, {gib:.1} GiB, in {:.1} s, {after:.1} s after ready; {ran}{stopped}",
+                              locking.layers, locking.seconds);
+                }
+            });
+        let _ = locking;
+    });
+    if let Err(error) = spawned {
+        behind::warm_up_over();
+        eprintln!("WARN Straydog cannot warm up or lock the banks behind ready: {error}");
+    }
 }
 
 /// A placement's refusal under `auto`, which no one chose the budget of: what it took and what to do.
@@ -717,6 +813,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("warm_state") => {
+                behind::ARRIVED.store(true, Ordering::SeqCst);
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -734,6 +831,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("prefix_state") => {
+                behind::ARRIVED.store(true, Ordering::SeqCst);
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -770,6 +868,8 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 S::prefix_in_background(&engine, state, read_seconds, arrived);
             }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
+                // (the warm-up behind "ready" stops at its next pass and lets the request have the engine)
+                behind::ARRIVED.store(true, Ordering::SeqCst);
                 let mut current = active.lock().unwrap();
                 if current.is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy"}));

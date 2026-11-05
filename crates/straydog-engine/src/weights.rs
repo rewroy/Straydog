@@ -551,6 +551,18 @@ impl Weights {
         self.authenticated = true;
     }
 
+    /// A tensor's mapped bytes for a thread that does not hold the weights, to page-lock them and check them against the file's tree
+    /// ([`crate::banks`]): the mapping's address, where the tensor lies in it, and the file's verifier. The thread must keep the weights alive,
+    /// and so mapped, while it uses it.
+    pub(crate) fn mapped_bank(&self, name: &str) -> Result<crate::banks::Bank, String> {
+        let tensor = self.tensor(name)?;
+        let map = &self.maps[tensor.file];
+        if tensor.offset.checked_add(tensor.bytes).is_none_or(|end| end > map.len() as u64) {
+            return Err(format!("Straydog tensor {name} lies beyond its file"));
+        }
+        Ok(crate::banks::Bank::new(map.as_ptr(), map.len(), tensor.offset, tensor.bytes, self.verifier_of(tensor.file).cloned()))
+    }
+
     /// The file a tensor lives in (for read-ahead hints).
     pub fn file_of(&self, name: &str) -> Result<&File, String> {
         Ok(&self.files[self.tensor(name)?.file])
