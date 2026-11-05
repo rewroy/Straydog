@@ -23,6 +23,32 @@ pub fn host_memory_bytes() -> u64 {
     }
 }
 
+/// Windows: this process asks never to have its execution speed throttled (EcoQoS: lower clocks and efficient cores for a process
+/// the system judges to be in the background, which a worker without a window is) and keeps the timer resolution it asks for.
+/// Returns whether the system took it; elsewhere there is nothing to ask, and it returns true.
+pub fn full_speed() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        };
+        // (each bit in ControlMask and clear in StateMask: that throttling is off, whatever the system's own policy)
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        // SAFETY: this process's pseudo handle and an initialized structure of the size passed.
+        unsafe {
+            SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, std::ptr::from_ref(&state).cast(),
+                                  std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    true
+}
+
 /// The physical memory available on the machine now (what other programs leave), 0 where unknown.
 pub fn available_bytes() -> u64 {
     #[cfg(windows)]
