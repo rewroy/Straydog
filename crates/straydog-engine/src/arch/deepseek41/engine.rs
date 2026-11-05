@@ -1704,7 +1704,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// takes the buffers back for it): the rows a new sequence's passes up to there write over. The
     /// copy goes on from there later, in steps between requests.
     pub fn finish_snapshot_below(&mut self, snapshot: &mut Snapshot, tokens: usize) -> Result<()> {
-        if !snapshot.pending {
+        // A sequence at or past the snapshot's position writes past its rows: those it went over were copied on the way, or (the
+        // snapshot's own sequence, going on) are the sequence's still (a follow-up turn copied the whole checkpoint, 2.07 s).
+        if !snapshot.pending || self.position >= snapshot.position {
             return Ok(());
         }
         let (hp, shard) = (&self.hp, &mut self.shards[0]);
