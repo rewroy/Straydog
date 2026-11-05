@@ -604,6 +604,8 @@ struct Device {
     uint64_t cpu_experts=0, gpu_experts=0, assisted_experts=0, streamed_experts=0, swapped_experts=0, hybrid_tokens=0;
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
+    float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
+    uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
@@ -1766,6 +1768,15 @@ int sd_expert_slots_release(void* handle) {
 int sd_expert_slots_restore(void* handle,uint64_t cache) {
     try { restore_expert_slots(device(handle),size_t(cache)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Speed first: a route whose expert the CPU would run, of a router weight below `floor`, is left out of its token (its weight
+// taken as 0); 0 leaves none out. The GPU's routes are kept whatever their weight: they cost no read from host memory.
+int sd_hybrid_route_floor(void* handle, float floor) {
+    try {
+        if (!(floor >= 0.0f && floor < 1.0f)) throw std::runtime_error("invalid Straydog route floor");
+        device(handle).route_floor = floor;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 int sd_hybrid_supported(void* handle) {
     try { const Device& d=device(handle); return int(d.expert_prefill && d.half_gemm); }

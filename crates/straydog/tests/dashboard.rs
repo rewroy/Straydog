@@ -18,6 +18,7 @@ fn settings() -> Settings {
         model: PathBuf::from("/models/IQ3_S"),
         bundle: straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "IQ3_S").unwrap(),
         engram: None,
+        expert_floor: None,
         model_draft: None,
         model_vision: None,
         draft_max: 0,

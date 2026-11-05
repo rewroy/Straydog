@@ -2025,6 +2025,12 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_attach_cpu(self.handle, engine.handle()) }).map(drop)
     }
 
+    /// Speed first: a route the CPU would run, of a router weight below `floor`, is left out of its token (0: none).
+    pub fn route_floor(&mut self, floor: f32) -> Result<()> {
+        // SAFETY: a live handle and a plain value.
+        check(unsafe { ffi::sd_hybrid_route_floor(self.handle, floor) }).map(drop)
+    }
+
     /// Cache the highest-scoring experts by recent routing; 0 refreshes everything and waits.
     pub fn rebalance(&mut self, max_swaps: u64) -> Result<()> {
         // SAFETY: a live handle.

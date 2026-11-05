@@ -68,6 +68,10 @@ required-features = ["gpu"]
 name = "qwen_tables"
 required-features = ["gpu"]
 
+[[example]]
+name = "qwen_floor"
+required-features = ["gpu"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

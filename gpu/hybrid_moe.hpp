@@ -207,6 +207,8 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported, fl
         const size_t expert = size_t(raw);
         selected[route] = expert;
         if (exported[2592 + route] != 0) { ++(exported[2592 + route] > 1.5f ? d.assisted_experts : d.gpu_experts); continue; }
+        // (speed first: a CPU route below the floor's weight is left out, sd_hybrid_route_floor)
+        if (exported[16 + route] < d.route_floor) { ++d.dropped_experts; continue; }
         gate[count] = plan.host[0] + expert * plan.host_bytes[0];
         up[count] = plan.host[1] + expert * plan.host_bytes[1];
         down[count] = plan.host[2] + expert * plan.host_bytes[2];

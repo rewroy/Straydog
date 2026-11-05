@@ -894,6 +894,10 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.attach_cpu(engine))
     }
 
+    pub fn route_floor(&mut self, floor: f32) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.route_floor(floor))
+    }
+
     pub fn rebalance(&mut self, max_swaps: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.rebalance(max_swaps))
     }
