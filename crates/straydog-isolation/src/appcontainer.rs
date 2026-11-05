@@ -29,10 +29,9 @@ pub const PROFILE_NAME: &str = "Straydog.Worker";
 /// what the system, the loader and the CUDA runtime read, and the profile paths. Creating an
 /// AppContainer process points LOCALAPPDATA and the user profile at the container's own
 /// folders, and fails with ERROR_ENVVAR_NOT_FOUND (203) when they are absent. Nothing else
-/// reaches it: no proxy, token, key or credential the server's environment may hold. DS41_PROFILE
-/// is the engines' phase timing, as on Linux, STRAYDOG_ENGRAM the engram table Qwen3.8 reads, STRAYDOG_EXPERT_FLOOR speed first's router weight
-/// floor, and STRAYDOG_CPU_INT8=0 the CPU experts' F32 path.
-pub const WORKER_VARIABLES: [&str; 21] = [
+/// reaches it: no proxy, token, key or credential the server's environment may hold. The engine's
+/// switches ([`crate::ENGINE_VARIABLES`]) are passed as well, as on Linux.
+pub const WORKER_VARIABLES: [&str; 17] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
@@ -50,10 +49,6 @@ pub const WORKER_VARIABLES: [&str; 21] = [
     "APPDATA",
     "CUDA_PATH",
     "LANG",
-    "DS41_PROFILE",
-    "STRAYDOG_ENGRAM",
-    "STRAYDOG_EXPERT_FLOOR",
-    "STRAYDOG_CPU_INT8",
 ];
 
 /// Whether a file is a CUDA runtime DLL a CUDA build of the executable loads: cuBLAS
@@ -410,8 +405,8 @@ pub fn command_line(args: &[Vec<u16>]) -> Vec<u16> {
     line
 }
 
-/// The worker's Unicode environment block: of `variables` only those `WORKER_VARIABLES`
-/// names, then TEMP and TMP set to `temp` when given, as `NAME=value` strings sorted by name
+/// The worker's Unicode environment block: of `variables` only those `WORKER_VARIABLES` and
+/// [`crate::ENGINE_VARIABLES`] names, then TEMP and TMP set to `temp` when given, as `NAME=value` strings sorted by name
 /// without regard to case (as Windows keeps them), each NUL-terminated, then a final NUL.
 pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<u16>>) -> Vec<u16> {
     let upper = |name: &[u16]| -> Vec<u16> {
@@ -420,7 +415,7 @@ pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<
             .collect()
     };
     let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
-    let allowed: Vec<Vec<u16>> = WORKER_VARIABLES.iter().map(|name| upper(&wide(name))).collect();
+    let allowed: Vec<Vec<u16>> = WORKER_VARIABLES.iter().chain(&crate::ENGINE_VARIABLES).map(|name| upper(&wide(name))).collect();
     let temp = temp.into_iter().flat_map(|temp| [(wide("TEMP"), temp.clone()), (wide("TMP"), temp)]);
     let mut sorted = BTreeMap::new();
     for (name, value) in variables.into_iter().filter(|(name, _)| allowed.contains(&upper(name))).chain(temp) {
@@ -813,7 +808,7 @@ mod tests {
 
     #[test]
     fn no_variable_the_worker_inherits_looks_like_a_secret() {
-        for name in WORKER_VARIABLES {
+        for name in WORKER_VARIABLES.iter().chain(&crate::ENGINE_VARIABLES) {
             let name = name.to_ascii_lowercase();
             for word in ["proxy", "token", "secret", "key", "password", "credential", "auth"] {
                 assert!(!name.contains(word), "{name}");

@@ -19,6 +19,14 @@ use std::path::{Component, Path, PathBuf};
 mod tree;
 pub use tree::{prepare, ProcessTree};
 
+/// The engine's own switches, passed to the worker on both systems when the server's environment sets them: DS41_PROFILE (the engines'
+/// phase timing, which a request's log line reports), DeepSeek-V4.1's drafts (DS41_DRAFTS, DS41_DSPARK, DS41_DSPARK_RESIDENT),
+/// STRAYDOG_DIRECT (the GPU queues written directly), STRAYDOG_ENGRAM (the engram table Qwen3.8 reads), STRAYDOG_EXPERT_FLOOR (speed
+/// first's router weight floor) and STRAYDOG_CPU_INT8 (=0: the CPU experts' F32 path). One list for both: a switch named on one
+/// system's list alone never reached the other's worker (speed first and the engram table did nothing in a Linux worker).
+pub const ENGINE_VARIABLES: [&str; 8] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+                                         "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8"];
+
 #[cfg(any(windows, test))]
 mod appcontainer;
 #[cfg(windows)]

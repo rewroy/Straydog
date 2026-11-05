@@ -23,10 +23,9 @@ const LOADER: [&str; 4] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.co
 
 /// The variables the worker keeps from the server's environment, when set there: the search
 /// path, the locale and time zone, and the GPU runtimes' device selection and architecture
-/// override, and the DeepSeek-V4.1 engine's switches: its phase timing (DS41_PROFILE), its drafts
-/// (DS41_DRAFTS) and DSpark's (DS41_DSPARK, DS41_DSPARK_RESIDENT). Nothing else reaches it: no
+/// override; then the engine's switches ([`crate::ENGINE_VARIABLES`]). Nothing else reaches it: no
 /// proxy, token, key or credential the server may hold.
-const VARIABLES: [&str; 12] = [
+const VARIABLES: [&str; 7] = [
     "PATH",
     "LANG",
     "TZ",
@@ -34,11 +33,6 @@ const VARIABLES: [&str; 12] = [
     "ROCR_VISIBLE_DEVICES",
     "CUDA_VISIBLE_DEVICES",
     "HSA_OVERRIDE_GFX_VERSION",
-    "DS41_PROFILE",
-    "STRAYDOG_DIRECT",
-    "DS41_DRAFTS",
-    "DS41_DSPARK",
-    "DS41_DSPARK_RESIDENT",
 ];
 
 /// GPU device nodes: AMD's, then NVIDIA's (further NVIDIA GPUs are found by name).
@@ -117,7 +111,7 @@ pub fn arguments(worker_args: &[OsString], exposure: &Exposure) -> Result<Vec<Os
     .into_iter()
     .map(OsString::from)
     .collect();
-    for name in VARIABLES {
+    for name in VARIABLES.iter().chain(&crate::ENGINE_VARIABLES) {
         if let Some(value) = std::env::var_os(name) {
             args.extend(["--setenv".into(), name.into(), value]);
         }
@@ -233,6 +227,19 @@ mod tests {
     }
 
     #[test]
+    fn the_engines_switches_reach_the_worker() {
+        // (STRAYDOG_EXPERT_FLOOR, STRAYDOG_ENGRAM and STRAYDOG_CPU_INT8 were on the server's own list alone: bubblewrap cleared them)
+        let scratch = Scratch::new("straydog-bwrap-switches");
+        std::env::set_var("STRAYDOG_CPU_INT8", "0");
+        std::env::set_var("STRAYDOG_EXPERT_FLOOR", "0.05");
+        let args = arguments_for(&exposure(&scratch)).unwrap();
+        let set: Vec<(&OsString, &OsString)> =
+            args.windows(3).filter(|window| window[0] == "--setenv").map(|window| (&window[1], &window[2])).collect();
+        assert!(set.contains(&(&"STRAYDOG_CPU_INT8".into(), &"0".into())), "{set:?}");
+        assert!(set.contains(&(&"STRAYDOG_EXPERT_FLOOR".into(), &"0.05".into())), "{set:?}");
+    }
+
+    #[test]
     fn the_environment_is_cleared_but_for_named_variables() {
         let scratch = Scratch::new("straydog-bwrap-environment");
         let args = arguments_for(&exposure(&scratch)).unwrap();
@@ -241,7 +248,7 @@ mod tests {
             args.windows(3).filter(|window| window[0] == "--setenv").map(|window| (&window[1], &window[2])).collect();
         for (name, _) in &set {
             let name = name.to_str().unwrap();
-            assert!(["HOME", "TMPDIR"].contains(&name) || VARIABLES.contains(&name), "{name}");
+            assert!(["HOME", "TMPDIR"].contains(&name) || VARIABLES.contains(&name) || crate::ENGINE_VARIABLES.contains(&name), "{name}");
         }
         let path = std::env::var_os("PATH").unwrap();
         assert!(set.contains(&(&"PATH".into(), &path)));
