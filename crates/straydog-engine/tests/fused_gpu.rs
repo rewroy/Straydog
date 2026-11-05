@@ -49,6 +49,14 @@ impl Random {
     }
 }
 
+/// One test at a time on the device: a test that captures a graph (linears_norm_tail_graph_matches_separate_ops) fails under CUDA, and
+/// fails the test beside it, when another thread of this process launches on the device while the capture is open (codes 901 and 900;
+/// the capture mode is shared with HIP and stays as it is). As link_gpu does.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    DEVICE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn upload(gpu: &mut Backend, values: &[f32]) -> Buffer {
     let buffer = gpu.buffer((values.len() * 4) as u64).unwrap();
     gpu.write_buffer(&buffer, 0, values).unwrap();
@@ -63,6 +71,7 @@ fn read(gpu: &mut Backend, buffer: &Buffer, count: usize) -> Vec<u32> {
 
 #[test]
 fn a_fused_delta_step_matches_the_three_ops() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x9e37_79b9_7f4a_7c15);
     let (k_heads, v_heads, dim, kernel) = (8usize, 16usize, 128usize, 4usize);
@@ -107,6 +116,7 @@ fn a_fused_delta_step_matches_the_three_ops() {
 
 #[test]
 fn norm_linears_of_two_formats_match_a_launch_per_format() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x2545_f491_4f6c_dd1d);
     let width = 2048usize;
@@ -158,6 +168,7 @@ fn norm_linears_of_two_formats_match_a_launch_per_format() {
 
 #[test]
 fn norm_linears_with_a_rope_row_match_the_separate_ops() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0xbb67_ae85_84ca_a73b);
     let (width, rows, dim, rope_dims, ring_rows, position, ring_row) = (1024usize, 4096usize, 512usize, 64usize, 8usize, 70_001i32, 5i32);
@@ -210,6 +221,7 @@ fn norm_linears_with_a_rope_row_match_the_separate_ops() {
 
 #[test]
 fn a_prepared_attention_step_matches_its_ops() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x6a09_e667_f3bc_c908);
     let (rows, heads, kv_heads, dim, rope_dims, context) = (3usize, 8usize, 1usize, 256usize, 64usize, 16usize);
@@ -253,6 +265,7 @@ fn a_prepared_attention_step_matches_its_ops() {
 
 #[test]
 fn routes_picked_beside_the_shared_expert_match_the_route_op() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0xbb67_ae85_84ca_a73b);
     let (rows, cols, experts, k) = (2048usize, 256usize, 256usize, 8usize);
@@ -286,6 +299,7 @@ fn routes_picked_beside_the_shared_expert_match_the_route_op() {
 
 #[test]
 fn shapes_that_overflow_are_refused() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let buffer = gpu.buffer(1 << 20).unwrap();
     let floats = upload(&mut gpu, &[0.0; 256]);
@@ -342,6 +356,7 @@ fn top_k_reference(scores: &[f32], k: usize) -> Vec<u32> {
 
 #[test]
 fn top_k_matches_its_reference_with_many_ties() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x2f6b_91d3_c0a5_4e77);
     let k = 512usize;
@@ -371,6 +386,7 @@ fn top_k_matches_its_reference_with_many_ties() {
 
 #[test]
 fn an_index_select_matches_rope_scores_and_top_k() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0xa54f_f53a_5f1d_36f1);
     let (heads, dim, rope_dims, k) = (32usize, 128usize, 64usize, 512usize);
@@ -410,6 +426,7 @@ fn an_index_select_matches_rope_scores_and_top_k() {
 
 #[test]
 fn an_index_select_with_its_projection_matches_the_two_ops() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x510e_527f_ade6_82d1);
     let (heads, dim, rope_dims, k, width, groups) = (32usize, 128usize, 64usize, 512usize, 5120usize, 2500usize);
@@ -455,6 +472,7 @@ fn an_index_select_with_its_projection_matches_the_two_ops() {
 
 #[test]
 fn the_two_level_indexer_matches_its_reference() {
+    let _one_at_a_time = one_at_a_time();
     let (heads, dim, rope_dims, k, blocks, block) = (32usize, 128usize, 64usize, 512usize, 2048usize, 8usize);
     let mut random = Random(0x1f83_d9ab_fb41_bd6b);
     let floats = |bits: Vec<u32>| bits.into_iter().map(f32::from_bits).collect::<Vec<_>>();
@@ -546,6 +564,7 @@ fn the_two_level_indexer_matches_its_reference() {
 
 #[test]
 fn f32_router_prefetch_keeps_odd_units_and_routes_bit_exact() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x510e_527f_ade6_82d1);
     let scratch = gpu.buffer(1 << 20).unwrap();
@@ -581,6 +600,7 @@ fn f32_router_prefetch_keeps_odd_units_and_routes_bit_exact() {
 
 #[test]
 fn bf16_router_routes_its_own_logits_in_one_launch() {
+    let _one_at_a_time = one_at_a_time();
     // DeepSeek-V4.1's router (384 experts of 5120 BF16 values) and smaller shapes: the fused launch's
     // routes are the ones sd_op_route takes from its logits, and those are sd_op_linear's within
     // F32 rounding (another kernel may sum them).
@@ -624,6 +644,7 @@ fn bf16_router_routes_its_own_logits_in_one_launch() {
 
 #[test]
 fn a_verify_pass_routes_every_row_in_the_fused_launch() {
+    let _one_at_a_time = one_at_a_time();
     // A verify pass's 2-4 rows through DeepSeek-V4.1's BF16 router: each row's routes in the one
     // launch are sd_op_route's of that row's logits (every thread takes every row's scores).
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
@@ -655,6 +676,7 @@ fn a_verify_pass_routes_every_row_in_the_fused_launch() {
 
 #[test]
 fn linears_norm_tail_graph_matches_separate_ops() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (rank, dim, rope, context) = (1280usize, 512usize, 64usize, 16usize);
@@ -715,6 +737,7 @@ fn linears_norm_tail_graph_matches_separate_ops() {
 /// none twice) and their scores normalized and scaled.
 #[test]
 fn a_wave_routes_384_experts_as_the_reference_does() {
+    let _one_at_a_time = one_at_a_time();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (experts, k, scale) = (384usize, 6usize, 1.5f32);
