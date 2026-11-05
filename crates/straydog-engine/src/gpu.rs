@@ -299,6 +299,8 @@ pub struct Backend {
     states: IndexMap<String, Entry>,
     checkpoints: Vec<*mut c_void>,
     checkpoint_states: Vec<*mut c_void>,
+    /// Bytes of one checkpoint buffer (the recurrent states packed).
+    checkpoint_bytes: u64,
     prefill_capacity: u64,
     slot_bytes: u64,
     /// `create_expert_slots`' arguments, for a K/V growth to make the pool again (0: no pool).
@@ -394,6 +396,7 @@ impl Backend {
             states: IndexMap::new(),
             checkpoints: Vec::new(),
             checkpoint_states: Vec::new(),
+            checkpoint_bytes: 0,
             prefill_capacity: 1024,
             slot_bytes: 0,
             slot_stage: 0,
@@ -1738,6 +1741,7 @@ impl Backend {
         self.checkpoint_states = keys.iter().map(|key| self.states[*key].pointer).collect();
         let size: u64 = keys.iter().map(|key| self.states[*key].rows * self.states[*key].cols * 4).sum();
         self.checkpoints.clear();
+        self.checkpoint_bytes = size;
         if !self.checkpoint_states.is_empty() {
             for _ in 0..count {
                 // SAFETY: a live handle.
@@ -1776,8 +1780,14 @@ impl Backend {
     /// with, if `history`, its rolling history. [`restore_positions`](Self::restore_positions)
     /// puts them back.
     pub fn save_positions(&mut self, from: u64, to: u64, history: bool) -> Result<Vec<StatePart>> {
+        let parts = self.position_parts(from, to, history);
+        self.copy_out(parts)
+    }
+
+    /// The parts [`save_positions`](Self::save_positions) copies, before any is: where each is and how big, in the states' order.
+    fn position_parts(&self, from: u64, to: u64, history: bool) -> Vec<StatePart> {
         if from >= to {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let mut parts = Vec::new();
         for (key, entry) in &self.states {
@@ -1799,7 +1809,7 @@ impl Backend {
                 }
             }
         }
-        self.copy_out(parts)
+        parts
     }
 
     /// A saved history's place after the K/V grew to `capacity` positions: the indexer keeps it after its blocks.
@@ -1815,6 +1825,12 @@ impl Backend {
     /// changes it.
     /// `layer` ("blk.48.") keeps one layer's alone.
     pub fn save_history(&mut self, layer: Option<&str>) -> Result<Vec<StatePart>> {
+        let parts = self.history_parts(layer);
+        self.copy_out(parts)
+    }
+
+    /// The parts [`save_history`](Self::save_history) copies, before any is.
+    fn history_parts(&self, layer: Option<&str>) -> Vec<StatePart> {
         let mut parts = Vec::new();
         for (key, entry) in &self.states {
             if key.starts_with("@indexer:") && layer.is_none_or(|layer| key.ends_with(layer)) {
@@ -1823,7 +1839,7 @@ impl Backend {
                                        data: Vec::new(), device: None });
             }
         }
-        self.copy_out(parts)
+        parts
     }
 
     /// Copy `parts` out of their states: into VRAM when the budget has room, else host memory.
@@ -1968,6 +1984,100 @@ impl Backend {
                                         self.checkpoint_states.len() as u64, *buffer)
             })?;
         }
+        Ok(())
+    }
+
+    // ---- a prefix's state, to bytes and back (see `Model::export_prefix`) ----
+
+    /// The bytes of a recurrent checkpoint: none on a device with no recurrent state.
+    fn recurrent_bytes(&self) -> u64 {
+        if self.checkpoints.is_empty() { 0 } else { self.checkpoint_bytes }
+    }
+
+    /// Which recurrent states, of which device, a checkpoint's bytes are of.
+    fn recurrent_tag(&self, device: usize) -> u64 {
+        let states: Vec<String> = self.states.iter().filter(|(key, _)| RECURRENT.iter().any(|prefix| key.starts_with(prefix)))
+            .map(|(key, entry)| format!("{key}={}", entry.rows * entry.cols * 4)).collect();
+        section_tag(&format!("{device}|recurrent|{}", states.join(",")))
+    }
+
+    /// What a part of a prefix is of: a layer's K/V, its indexer's pooled blocks or its indexer's history, on this device.
+    fn part_tag(device: usize, part: &StatePart) -> u64 {
+        let kind = if part.key.starts_with("@qsa:") { "kv" } else if part.height == 1 { "history" } else { "pool" };
+        section_tag(&format!("{device}|{}|{kind}", part.key))
+    }
+
+    /// This device's sections of a prefix of `tokens` positions (`device` is its place in the group), each as (a tag for what it is, its bytes): the
+    /// recurrent state of a checkpoint, then the K/V and the indexer's blocks of positions `0..tokens`, then, with `history`, the MTP layer's
+    /// indexer's rolling history.
+    pub fn prefix_sections(&self, device: usize, tokens: u64, history: bool) -> Vec<(u64, u64)> {
+        let mut sections = vec![(self.recurrent_tag(device), self.recurrent_bytes())];
+        let kept = if history { self.history_parts(Some("blk.48.")) } else { Vec::new() };
+        sections.extend(self.position_parts(0, tokens, false).iter().chain(&kept)
+            .map(|part| (Self::part_tag(device, part), part.width * part.height * 4)));
+        sections
+    }
+
+    /// Append this device's sections of a prefix to `out`, in the order of [`prefix_sections`](Self::prefix_sections): the recurrent state
+    /// that checkpoint `slot` holds, the positions `0..tokens` as the device holds them now (a part at a time: the copy is never held
+    /// twice), and the indexer's history a checkpoint kept (`kept`, in host memory: the few kilobytes `copy_out` leaves there).
+    pub fn export_prefix(&mut self, slot: usize, tokens: u64, kept: &[StatePart], out: &mut Vec<u8>) -> Result<()> {
+        if !self.checkpoints.is_empty() {
+            let buffer = *self.checkpoints.get(slot).ok_or("no such Straydog checkpoint slot")?;
+            // SAFETY: a page-locked buffer of `checkpoint_bytes` bytes, reserved with the device; the copy that filled it was synchronized.
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), self.checkpoint_bytes as usize) });
+        }
+        for mut part in self.position_parts(0, tokens, false) {
+            part.data = vec![0f32; (part.width * part.height) as usize];
+            self.state_copy(&mut part, true)?;
+            out.extend_from_slice(bytemuck_bytes(&part.data));
+        }
+        for part in kept {
+            if part.device.is_some() {
+                return Err("a Straydog checkpoint's history is not in host memory".into());
+            }
+            out.extend_from_slice(bytemuck_bytes(&part.data));
+        }
+        Ok(())
+    }
+
+    /// This device's parts of a prefix of `tokens` positions with no data yet, to be filled by [`fill_parts`](Self::fill_parts): the K/V's and
+    /// the indexer's blocks of positions `0..tokens`, and, with `history`, the MTP layer's indexer history.
+    pub fn prefix_templates(&self, tokens: u64, history: bool) -> (Vec<StatePart>, Vec<StatePart>) {
+        (self.position_parts(0, tokens, false), if history { self.history_parts(Some("blk.48.")) } else { Vec::new() })
+    }
+
+    /// The bytes of this device's recurrent state in a prefix (none on a device that has none).
+    pub fn recurrent_section(&self) -> u64 {
+        self.recurrent_bytes()
+    }
+
+    /// Give each of `parts` the data of its place in `input`, which holds their sections one after the other, and leave `input` at what follows.
+    pub fn fill_parts(parts: &mut [StatePart], input: &mut &[u8]) -> Result<()> {
+        for part in parts {
+            let bytes = usize::try_from(part.width * part.height * 4).map_err(|_| "a Straydog prefix section is too long")?;
+            if input.len() < bytes {
+                return Err("a Straydog prefix state is short".into());
+            }
+            let (head, rest) = input.split_at(bytes);
+            part.data = floats_of(head);
+            *input = rest;
+        }
+        Ok(())
+    }
+
+    /// Put `bytes` (this device's recurrent state of a prefix) into checkpoint `slot`'s buffer: the next restore of the slot brings it back.
+    pub fn write_recurrent(&mut self, slot: usize, bytes: &[u8]) -> Result<()> {
+        if bytes.len() as u64 != self.recurrent_bytes() {
+            return Err("a Straydog prefix state's recurrent section is not this device's".into());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let buffer = *self.checkpoints.get(slot).ok_or("no such Straydog checkpoint slot")?;
+        // SAFETY: a page-locked buffer of `checkpoint_bytes` bytes, which `bytes` fills exactly; no copy into or out of it is in flight (every
+        // checkpoint copy is synchronized before it returns).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len()) };
         Ok(())
     }
 
@@ -2270,6 +2380,20 @@ impl Drop for CpuExperts {
 }
 
 /// The bytes of F32 values as they lie in memory (little-endian on every supported host).
+/// A tag for what a section of a prefix state is of (FNV-1a over its description): the state's layout, which a reader checks before it
+/// takes any byte of it.
+pub fn section_tag(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// `bytes` as floats (their own bytes, in the order of the machine: the state never leaves it).
+fn floats_of(bytes: &[u8]) -> Vec<f32> {
+    let mut floats = vec![0f32; bytes.len() / 4];
+    // SAFETY: `floats` has room for `bytes.len() / 4 * 4` bytes, and `bytes` is a multiple of four (the caller takes sections of whole floats).
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), floats.as_mut_ptr().cast::<u8>(), floats.len() * 4) };
+    floats
+}
+
 fn bytemuck_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: an f32 slice reinterpreted as its bytes, same length in bytes and alignment 1.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
