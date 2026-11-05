@@ -773,8 +773,10 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     UD-IQ1_S, a route with the experts cold, F32 -> Q8: on six threads 48.0 -> 35.2 us on its IQ2_XXS layers and 46.0 -> 36.9 us on
     its IQ2_S layers; on one thread 226 -> 168 and 209 -> 165 us. Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
     0.0009). The AVX2 kernels (Intel's 12th to 14th generation, Zen 3) compute the same lanes in two 256-bit halves, so the same
-    bits; on the 7500F held to AVX2 (`STRAYDOG_CPU_AVX512=0`), six threads, cold: 72.4 -> 68.9 us (IQ2_XXS layers: the F32 kernels'
-    table lookups are as quick there), 84.8 -> 68.5 us (IQ2_S), and the down alone 18.7 -> 10.2 (one thread 93 -> 32). Formats
+    bits. They read a block's grid rows, sign masks (a 64-bit mask a sign field, from a table) and scales straight from its bytes, with
+    no prepared block written and read back. On the 7500F held to AVX2 (`STRAYDOG_CPU_AVX512=0`), six threads, cold: 73.7 -> 47.4 us
+    (IQ2_XXS layers), 84.9 -> 59.0 us (IQ2_S), the down alone 18.7 -> 10.0 (one thread 93 -> 32); served at 5.5 GiB, 42.1 -> 48.4
+    tok/s. Formats
     without integer kernels, and CPUs without AVX2, keep F32; `STRAYDOG_CPU_INT8=0` keeps it everywhere.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The

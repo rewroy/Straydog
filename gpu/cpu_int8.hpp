@@ -367,48 +367,62 @@ void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t bl
 // --- AVX2 kernels: the AVX-512 kernels' sixteen lanes as two 256-bit halves (lanes 0-7 and 8-15), the same integers and the same F32
 // operations in the same order, so the same bits. For CPUs without AVX-512 (Intel's 12th to 14th generation, Zen 3 and before) ---
 
-// A block of IQ2_XXS or IQ2_S prepared for one row: its 32 grid rows' byte offsets, sign bytes, and the 16 group scales (2 ls + 1, a
-// 16-value group each).
-struct Avx2Prepared {
-    uint16_t offset[32];
-    uint8_t sign[32];
-    int16_t scale[16];
-};
-inline void prepare_avx2_iq2_xxs(const uint8_t* block, Avx2Prepared& p) {
-    for (int g = 0; g < 8; ++g) {
-        const uint32_t aux = load32(block + 2 + 8 * g + 4);
-        for (int l = 0; l < 4; ++l) {
-            p.offset[4 * g + l] = uint16_t(8 * block[2 + 8 * g + l]);
-            p.sign[4 * g + l] = sign_table.value[(aux >> (7 * l)) & 127];
-        }
-        p.scale[2 * g] = p.scale[2 * g + 1] = int16_t(2 * (aux >> 28) + 1);
-    }
-}
-inline void prepare_avx2_iq2_s(const uint8_t* block, Avx2Prepared& p) {
-    for (int g = 0; g < 8; ++g)
-        for (int l = 0; l < 4; ++l)
-            p.offset[4 * g + l] = uint16_t(8 * (block[2 + 4 * g + l] | ((unsigned(block[66 + g]) << (8 - 2 * l)) & 0x300)));
-    std::memcpy(p.sign, block + 34, 32);
-    for (int g = 0; g < 16; ++g) p.scale[g] = int16_t(2 * ((block[74 + g / 2] >> (4 * (g % 2))) & 15) + 1);
-}
 // Four grid rows' eight bytes each, as 32 bytes.
 SD_TARGET("avx2,fma,f16c")
 inline __m256i grid32(const uint8_t* grid, const uint16_t* offset) {
     return _mm256_set_epi64x(int64_t(grid_row(grid, offset[3])), int64_t(grid_row(grid, offset[2])), int64_t(grid_row(grid, offset[1])),
                              int64_t(grid_row(grid, offset[0])));
 }
-// x's 32 values against four grid rows: each value's sign from its row's sign byte, the rows' two 16-value groups' scales, eight lanes.
+// IQ2_XXS's 7-bit sign fields as eight bytes each, 0xFF where the value is negative (sign_table's bit for bit, its parity bit too).
+struct SignMasks {
+    uint64_t value[128];
+    constexpr SignMasks() : value() {
+        for (unsigned bits = 0; bits < 128; ++bits) {
+            unsigned parity = bits ^ (bits >> 4); parity ^= parity >> 2; parity ^= parity >> 1;
+            const unsigned signs = bits | ((parity & 1u) << 7);
+            for (unsigned j = 0; j < 8; ++j) if (signs >> j & 1) value[bits] |= uint64_t(0xFF) << (8 * j);
+        }
+    }
+};
+constexpr SignMasks sign_masks;
+// IQ2_XXS's group g (32 values) read straight from its block against x's 32 values: the four grid rows its index bytes name, the
+// signs of its four 7-bit fields, its one scale; eight of the AVX-512 kernels' lanes (no prepared block in between).
 SD_TARGET("avx2,fma,f16c")
-inline __m256i half_lanes(const uint8_t* grid, const Avx2Prepared& p, unsigned first_row, unsigned first_group, __m256i q, __m256i lanes) {
-    // (each sign byte to its row's eight bytes, then one bit a byte: 0xFF where the value is negative)
-    uint32_t signs; std::memcpy(&signs, p.sign + first_row, 4);
-    const __m256i spread = _mm256_shuffle_epi8(_mm256_set1_epi32(int(signs)),
-                                               _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
-    const __m256i bit = _mm256_set1_epi64x(int64_t(0x8040201008040201ull));
-    const __m256i negative = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit);
+inline __m256i iq2_xxs_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+    const uint8_t* group = block + 2 + 8 * g;
+    const uint32_t aux = load32(group + 4);
+    const __m256i weights = _mm256_set_epi64x(int64_t(grid_row(grid, 8u * group[3])), int64_t(grid_row(grid, 8u * group[2])),
+                                              int64_t(grid_row(grid, 8u * group[1])), int64_t(grid_row(grid, 8u * group[0])));
+    const __m256i negative = _mm256_set_epi64x(int64_t(sign_masks.value[(aux >> 21) & 127]), int64_t(sign_masks.value[(aux >> 14) & 127]),
+                                               int64_t(sign_masks.value[(aux >> 7) & 127]), int64_t(sign_masks.value[aux & 127]));
     const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, negative), negative);
-    const __m256i scales = _mm256_set_m128i(_mm_set1_epi16(p.scale[first_group + 1]), _mm_set1_epi16(p.scale[first_group]));
-    return _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_maddubs_epi16(grid32(grid, p.offset + first_row), signed_q), scales));
+    const __m256i scale = _mm256_set1_epi16(int16_t(2 * (aux >> 28) + 1));
+    return _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_maddubs_epi16(weights, signed_q), scale));
+}
+// A sign byte as eight bytes, 0xFF where its bit is set (IQ2_S's sign bytes).
+struct ByteMasks {
+    uint64_t value[256];
+    constexpr ByteMasks() : value() {
+        for (unsigned bits = 0; bits < 256; ++bits)
+            for (unsigned j = 0; j < 8; ++j) if (bits >> j & 1) value[bits] |= uint64_t(0xFF) << (8 * j);
+    }
+};
+constexpr ByteMasks byte_masks;
+// IQ2_S's group g (32 values) read straight from its block: four ten-bit grid indices (a byte each and two bits of qh[g]), four
+// sign bytes, the scale nibbles of its two 16-value halves; eight of the AVX-512 kernels' lanes.
+SD_TARGET("avx2,fma,f16c")
+inline __m256i iq2_s_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+    const uint8_t* qs = block + 2 + 4 * g;
+    const unsigned high = block[66 + g];
+    auto row = [&](unsigned l) { return int64_t(grid_row(grid, 8u * (qs[l] | ((high << (8 - 2 * l)) & 0x300)))); };
+    const __m256i weights = _mm256_set_epi64x(row(3), row(2), row(1), row(0));
+    const uint8_t* signs = block + 34 + 4 * g;
+    const __m256i negative = _mm256_set_epi64x(int64_t(byte_masks.value[signs[3]]), int64_t(byte_masks.value[signs[2]]),
+                                               int64_t(byte_masks.value[signs[1]]), int64_t(byte_masks.value[signs[0]]));
+    const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, negative), negative);
+    const unsigned nibbles = block[74 + g];
+    const __m256i scales = _mm256_set_m128i(_mm_set1_epi16(int16_t(2 * (nibbles >> 4) + 1)), _mm_set1_epi16(int16_t(2 * (nibbles & 15) + 1)));
+    return _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_maddubs_epi16(weights, signed_q), scales));
 }
 template<int kind, int N>
 SD_TARGET("avx2,fma,f16c")
@@ -416,20 +430,20 @@ void iq2_int_rows256(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
     constexpr size_t bytes = kind == 16 ? 66 : 82;
     const uint8_t* grid = iq_table(kind);
     __m256 low0 = _mm256_setzero_ps(), low1 = low0, low2 = low0, low3 = low0, high0 = low0, high1 = low0, high2 = low0, high3 = low0;
-    Avx2Prepared prepared[N];
     for (size_t b = 0; b < blocks; ++b) {
         prefetch_next<bytes, N>(row, stride, b);
-        for (int r = 0; r < N; ++r) {
-            if constexpr (kind == 16) prepare_avx2_iq2_xxs(row + size_t(r) * stride + b * bytes, prepared[r]);
-            else prepare_avx2_iq2_s(row + size_t(r) * stride + b * bytes, prepared[r]);
-        }
         __m256i l0 = _mm256_setzero_si256(), l1 = l0, l2 = l0, l3 = l0, h0 = l0, h1 = l0, h2 = l0, h3 = l0;
         for (unsigned c = 0; c < 4; ++c) {
             const __m256i ql = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q + 64 * c));
             const __m256i qh = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q + 64 * c + 32));
 #define SD_IQ2_HALVES(r, l, h) \
-            l = half_lanes(grid, prepared[r], 8 * c, 4 * c, ql, l); \
-            h = half_lanes(grid, prepared[r], 8 * c + 4, 4 * c + 2, qh, h);
+            if constexpr (kind == 16) { \
+                l = iq2_xxs_group256(grid, row + (r) * stride + b * bytes, 2 * c, ql, l); \
+                h = iq2_xxs_group256(grid, row + (r) * stride + b * bytes, 2 * c + 1, qh, h); \
+            } else { \
+                l = iq2_s_group256(grid, row + (r) * stride + b * bytes, 2 * c, ql, l); \
+                h = iq2_s_group256(grid, row + (r) * stride + b * bytes, 2 * c + 1, qh, h); \
+            }
             SD_IQ2_HALVES(0, l0, h0)
             if constexpr (N > 1) { SD_IQ2_HALVES(1, l1, h1) }
             if constexpr (N > 2) { SD_IQ2_HALVES(2, l2, h2) }
