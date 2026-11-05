@@ -2238,12 +2238,10 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_assist_level(self.handle, level) }).map(drop)
     }
 
-    /// Page-lock a mapped range for direct DMA; the runtime's reason if it refused.
-    pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
-        // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
-        check(unsafe { ffi::sd_host_register(range.as_ptr().cast_mut().cast(), range.len() as u64) })?;
+    /// Take the page lock of a mapped range, made by [`lock_host_range`] (on any thread), as this device's: it is released when this drops,
+    /// before the range is unmapped.
+    pub fn adopt_host(&mut self, range: &[u8]) {
         self.registered.push(range.as_ptr().cast_mut().cast());
-        Ok(())
     }
 
     pub fn hybrid_counts(&self) -> Result<[u64; 8]> {
@@ -2275,6 +2273,20 @@ impl Backend {
         }
         Ok(info)
     }
+}
+
+/// Page-lock a mapped range for direct DMA, from any thread (the library's lock on its registrations is process-wide; `ordinal` is the device
+/// whose context the calling thread uses, so that none is opened on another); the runtime's reason if it refused. Reading the range from the drive
+/// is part of it. The range stays locked until [`unlock_host_range`], or until the device that [`Backend::adopt_host`]s it drops.
+pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
+    // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
+    check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// Give up a lock of [`lock_host_range`] that no device has adopted.
+pub fn unlock_host_range(range: &[u8]) {
+    // SAFETY: a range registered by `lock_host_range`.
+    unsafe { ffi::sd_host_unregister(range.as_ptr().cast_mut().cast()) };
 }
 
 pub const HYBRID_COUNTERS: [&str; 8] = ["gpu_experts", "cpu_experts", "streamed_experts", "cached_experts", "wait_ns",

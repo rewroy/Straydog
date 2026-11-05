@@ -235,6 +235,13 @@ impl Tuner {
         self.advance()
     }
 
+    /// The layers the GPU assists have changed (one more was page-locked): what a round measured was of the layers before, so one under way is
+    /// dropped and a round is due at the next request. The level in force stays.
+    pub fn restart(&mut self) {
+        self.round = None;
+        self.since = INTERVAL + 1;
+    }
+
     /// The level asked for is in force.
     pub fn set(&mut self, level: u32) {
         self.level = level;
@@ -400,6 +407,31 @@ mod tests {
         let mut fresh = Tuner::new(vec![0, 1], 1);
         fresh.request();
         assert!(fresh.probing());
+    }
+
+    #[test]
+    fn a_layer_locked_drops_the_round_under_way_and_makes_another_due() {
+        let mut tuner = Tuner::new(vec![0, 1, 2], 2);
+        tuner.request();
+        assert!(tuner.probing());
+        // (a window of the round in force, then a layer is locked)
+        for _ in 0..HELD_WINDOW {
+            tuner.pass(0.050);
+        }
+        tuner.restart();
+        assert!(!tuner.probing());
+        assert_eq!(tuner.level(), 2, "the level in force stays");
+        // the next request begins a round at once, however few tokens have gone
+        tuner.request();
+        assert!(tuner.probing());
+        // and a model with none under way is due as well
+        let mut idle = Tuner::new(vec![0, 1], 1);
+        idle.request();
+        idle.round = None;
+        idle.since = 0;
+        idle.restart();
+        idle.request();
+        assert!(idle.probing());
     }
 
     #[test]
