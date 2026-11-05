@@ -303,29 +303,48 @@ pub(crate) struct Ahead {
     pub stopped: Option<AheadStop>,
 }
 
+/// How the read-ahead keeps to a few pieces in flight. The system reads the pages of a piece on its own where the call that asks for them returns before they
+/// are in (Linux: `madvise(MADV_WILLNEED)` queues the reads), and a read-ahead that asked for every piece at once would queue the plan's gigabytes before a request's
+/// own faults, and could not be stopped. So before a piece is asked for, the piece `window` back is waited for to be in, looking every `poll`, for `at_most` in
+/// all (a read that does not end is a hint that did not come, not a reason to stop). Where the call returns when the pages are in (Windows:
+/// `PrefetchVirtualMemory`), nothing is in flight and nothing is waited for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reading {
+    pub window: usize,
+    pub poll: Duration,
+    pub at_most: Duration,
+}
+
+/// Two pieces (512 MiB) in flight, looked at every 10 ms for 5 s at the most: a piece is 0.1 to 0.5 s of an NVMe drive's reads.
+pub(crate) const READING: Reading = Reading { window: 2, poll: Duration::from_millis(10), at_most: Duration::from_secs(5) };
+
 /// Read ahead the pages of the plan's banks, a piece at a time in the plan's order, for the locking and a request to find them in memory: `ask` asks the
-/// system for a piece's pages (a hint: nothing is locked, no commit is taken), `resident` says what fraction of them it holds already, and `available` is the
-/// physical memory available now. The engine is not held, only kept alive (a strong reference) while a piece is asked for, since the pieces lie in the
-/// weights' mappings. Between pieces it ends when the engine has, when the locking is over ([`Progress::over`]), and when less than `margin` is available
-/// (the plan keeps that much free; a read-ahead that went on would take it from the rest of the system, which the plan's own bytes did not count on). A piece
-/// of a layer the locking has done is left out, and so is one whose pages are all in memory. `progress` says how far the locking has got.
-pub(crate) fn read_ahead_behind<S>(engine: &Weak<Mutex<S>>, pieces: &[Piece], progress: &Progress, margin: u64,
-                                   resident: impl Fn(&Piece) -> f64, available: impl Fn() -> u64, ask: impl Fn(&Piece) -> Result<(), String>) -> Ahead {
+/// system for a piece's pages (a hint: nothing is locked, no commit is taken), `resident` says what fraction of them it holds already, `in_flight` whether it
+/// is still reading the pages of a piece that was asked for ([`Reading`]), and `available` is the physical memory available now. The engine is not held, only
+/// kept alive (a strong reference) while a piece is asked for or looked at, since the pieces lie in the weights' mappings. Between pieces it ends when the
+/// engine has, when the locking is over ([`Progress::over`]), and when less than `margin` is available (the plan keeps that much free; a read-ahead that went on
+/// would take it from the rest of the system, which the plan's own bytes did not count on). A piece of a layer the locking has done is left out, and so is one
+/// whose pages are all in memory. `progress` says how far the locking has got.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_ahead_behind<S>(engine: &Weak<Mutex<S>>, pieces: &[Piece], progress: &Progress, margin: u64, reading: Reading,
+                                   resident: impl Fn(&Piece) -> f64, in_flight: impl Fn(&Piece) -> bool, available: impl Fn() -> u64,
+                                   ask: impl Fn(&Piece) -> Result<(), String>) -> Ahead {
     let started = Instant::now();
     let turns = pieces.iter().map(|piece| piece.turn + 1).max().unwrap_or(0);
     let mut done = Ahead { planned: pieces.iter().map(|piece| piece.bytes).sum(), layers: turns, ..Ahead::default() };
-    // The bytes asked for in each layer's turn, to say how far ahead of the locking they reach.
+    // The bytes asked for in each layer's turn, to say how far ahead of the locking they reach, and the pieces asked for, to keep to the window.
     let mut asked_in_turn = vec![0u64; turns];
+    let mut asked: Vec<&Piece> = Vec::new();
     let lead_of = |asked_in_turn: &[u64], locked: usize| {
         let ahead = asked_in_turn.get(locked..).unwrap_or(&[]);
         Lead { layers: ahead.iter().filter(|bytes| **bytes > 0).count(), bytes: ahead.iter().sum() }
     };
-    for piece in pieces {
+    'pieces: for piece in pieces {
         if progress.over.load(Ordering::SeqCst) {
             done.stopped = Some(AheadStop::Locking);
             break;
         }
-        let Some(alive) = engine.upgrade() else {
+        let Some(mut alive) = engine.upgrade() else {
             done.stopped = Some(AheadStop::Engine);
             break;
         };
@@ -333,6 +352,25 @@ pub(crate) fn read_ahead_behind<S>(engine: &Weak<Mutex<S>>, pieces: &[Piece], pr
         if piece.turn < progress.turns.load(Ordering::SeqCst) || resident(piece) >= 1.0 {
             done.skipped += piece.bytes;
             continue;
+        }
+        // The piece `window` back, if there is one, has to be in before this one is asked for. The wait ends with the locking and with the engine too.
+        if let Some(back) = asked.len().checked_sub(reading.window.max(1)).map(|index| asked[index]) {
+            let waited = Instant::now();
+            while in_flight(back) && waited.elapsed() < reading.at_most {
+                drop(alive);
+                std::thread::sleep(reading.poll);
+                if progress.over.load(Ordering::SeqCst) {
+                    done.stopped = Some(AheadStop::Locking);
+                    break 'pieces;
+                }
+                match engine.upgrade() {
+                    Some(again) => alive = again,
+                    None => {
+                        done.stopped = Some(AheadStop::Engine);
+                        break 'pieces;
+                    }
+                }
+            }
         }
         let free = available();
         if free < margin {
@@ -344,6 +382,7 @@ pub(crate) fn read_ahead_behind<S>(engine: &Weak<Mutex<S>>, pieces: &[Piece], pr
             break;
         }
         drop(alive);
+        asked.push(piece);
         done.asked += piece.bytes;
         asked_in_turn[piece.turn] += piece.bytes;
         let lead = lead_of(&asked_in_turn, progress.turns.load(Ordering::SeqCst));
@@ -770,7 +809,7 @@ mod tests {
     fn asked_over(pieces: &[Piece], progress: &Progress) -> (Ahead, Vec<usize>) {
         let engine = Arc::new(Mutex::new(Model::default()));
         let asked = Mutex::new(Vec::new());
-        let done = read_ahead_behind(&Arc::downgrade(&engine), pieces, progress, 1000, |_| 0.0, || 5000, |piece| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), pieces, progress, 1000, NOT_WAITING, |_| 0.0, |_| false, || 5000, |piece| {
             asked.lock().unwrap().push(piece.start);
             Ok(())
         });
@@ -801,7 +840,7 @@ mod tests {
             (45, true) => 0.5,
             _ => 0.0,
         };
-        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, resident, || u64::MAX, |piece| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, NOT_WAITING, resident, |_| false, || u64::MAX, |piece| {
             asked.lock().unwrap().push((piece.layer, piece.start));
             Ok(())
         });
@@ -820,7 +859,7 @@ mod tests {
         progress.turns.store(1, Ordering::SeqCst);
         let engine = Arc::new(Mutex::new(Model::default()));
         let asked = Mutex::new(Vec::new());
-        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, |_| 0.0, || u64::MAX, |piece| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, NOT_WAITING, |_| 0.0, |_| false, || u64::MAX, |piece| {
             asked.lock().unwrap().push(piece.start);
             // (the locking has done layers 0 to 2 by the time the first piece of turn 2 has been asked for, and all five by the last piece)
             if piece.start == pieces[6].start {
@@ -846,7 +885,7 @@ mod tests {
         let progress = Progress::default();
         let engine = Arc::new(Mutex::new(Model::default()));
         let count = AtomicUsize::new(0);
-        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, |_| 0.0, || u64::MAX, |_| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, NOT_WAITING, |_| 0.0, |_| false, || u64::MAX, |_| {
             if count.fetch_add(1, Ordering::SeqCst) == 3 {
                 progress.over.store(true, Ordering::SeqCst);
             }
@@ -863,7 +902,7 @@ mod tests {
         let engine = Mutex::new(Some(Arc::new(Mutex::new(Model::default()))));
         let weak = Arc::downgrade(engine.lock().unwrap().as_ref().unwrap());
         let count = AtomicUsize::new(0);
-        let done = read_ahead_behind(&weak, &pieces, &Progress::default(), 0, |_| 0.0, || u64::MAX, |_| {
+        let done = read_ahead_behind(&weak, &pieces, &Progress::default(), 0, NOT_WAITING, |_| 0.0, |_| false, || u64::MAX, |_| {
             if count.fetch_add(1, Ordering::SeqCst) == 1 {
                 // (the worker ends while the second piece is being asked for: that piece's engine is still there)
                 assert!(weak.upgrade().is_some());
@@ -883,7 +922,7 @@ mod tests {
         // (a stand-in for the available memory: 10 units, one fewer at each look, against a margin of 7)
         let looks = AtomicUsize::new(0);
         let asked = AtomicUsize::new(0);
-        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 7, |_| 0.0, || 10 - looks.fetch_add(1, Ordering::SeqCst) as u64, |_| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 7, NOT_WAITING, |_| 0.0, |_| false, || 10 - looks.fetch_add(1, Ordering::SeqCst) as u64, |_| {
             asked.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -894,7 +933,7 @@ mod tests {
         // a margin of nothing never stops it, and a machine with less than the margin from the start asks for nothing
         let (full, _) = asked_over(&pieces, &Progress::default());
         assert_eq!(full.stopped, None);
-        let none = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 1 << 30, |_| 0.0, || 1 << 20, |_| panic!("no memory to spare"));
+        let none = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 1 << 30, NOT_WAITING, |_| 0.0, |_| false, || 1 << 20, |_| panic!("no memory to spare"));
         assert_eq!((none.asked, none.stopped), (0, Some(AheadStop::Memory { available: 1 << 20, margin: 1 << 30 })));
     }
 
@@ -904,7 +943,7 @@ mod tests {
         let pieces = plan_pieces(2);
         let engine = Arc::new(Mutex::new(Model::default()));
         let count = AtomicUsize::new(0);
-        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, |_| 0.0, || u64::MAX, |_| {
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, NOT_WAITING, |_| 0.0, |_| false, || u64::MAX, |_| {
             if count.fetch_add(1, Ordering::SeqCst) == 2 { Err("not mapped".to_string()) } else { Ok(()) }
         });
         assert_eq!((done.asked, done.stopped.clone()), (200, Some(AheadStop::Refused("not mapped".into()))));
@@ -925,5 +964,82 @@ mod tests {
         assert!(ahead_line(&left_out, 9.0).contains("asked of the system in 4.3 s, 9.0 s after ready, 2.0 GiB left out (locked, or in memory already); 20 layers"), "{}", ahead_line(&left_out, 9.0));
         let a_piece_left_out = Ahead { skipped: 20 << 20, ..left_out };
         assert!(!ahead_line(&a_piece_left_out, 9.0).contains("left out"));
+    }
+
+    /// A window of two pieces that is looked at every millisecond for 50 ms at the most, for the tests that are not about it (the stand-in for the system's
+    /// reads says nothing is in flight).
+    const NOT_WAITING: Reading = Reading { window: 2, poll: Duration::from_millis(1), at_most: Duration::from_millis(50) };
+
+    /// Decides: where the system reads on its own after the call returns, no more pieces than the window are in flight when one is asked for, every piece is
+    /// still asked for, and the waiting is for the piece `window` back only.
+    #[test]
+    fn no_more_pieces_than_the_window_are_in_flight() {
+        let pieces = plan_pieces(3);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        // (a stand-in for the system's reads: a piece asked for is in flight for its next five looks)
+        let flight: Mutex<std::collections::HashMap<usize, u32>> = Mutex::new(std::collections::HashMap::new());
+        let most = AtomicUsize::new(0);
+        let waits = AtomicUsize::new(0);
+        let reading = Reading { window: 2, poll: Duration::from_millis(1), at_most: Duration::from_secs(10) };
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, reading, |_| 0.0, |piece| {
+            let mut flight = flight.lock().unwrap();
+            match flight.get_mut(&piece.start) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    waits.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                _ => false,
+            }
+        }, || u64::MAX, |piece| {
+            let mut flight = flight.lock().unwrap();
+            flight.insert(piece.start, 5);
+            most.fetch_max(flight.values().filter(|left| **left > 0).count(), Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!((done.asked, done.stopped), (900, None), "every piece is asked for");
+        assert!(waits.load(Ordering::SeqCst) >= 5, "the window was waited for: {} looks", waits.load(Ordering::SeqCst));
+        assert_eq!(most.load(Ordering::SeqCst), 2, "the piece asked for and the one before it, never more");
+    }
+
+    /// Decides: a read that does not end is waited for the longest time only, and the piece after it is asked for.
+    #[test]
+    fn a_read_that_does_not_end_holds_the_next_piece_back_for_a_time_only() {
+        let pieces = plan_pieces(2);
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let reading = Reading { window: 2, poll: Duration::from_millis(1), at_most: Duration::from_millis(60) };
+        let began = Instant::now();
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &Progress::default(), 0, reading, |_| 0.0, |_| true, || u64::MAX, |_| Ok(()));
+        let took = began.elapsed();
+        assert_eq!((done.asked, done.stopped), (600, None));
+        // (six pieces, of which the last four wait for the one two back: 4 x 60 ms)
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// Decides: the locking ending, or the engine, while a piece waits for the one before it ends the read-ahead there, with nothing more asked for.
+    #[test]
+    fn a_stop_is_felt_while_waiting_for_the_window() {
+        let pieces = plan_pieces(2);
+        let reading = Reading { window: 2, poll: Duration::from_millis(1), at_most: Duration::from_secs(10) };
+        // the locking is over by the time the third piece waits
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let progress = Progress::default();
+        let asked = AtomicUsize::new(0);
+        let done = read_ahead_behind(&Arc::downgrade(&engine), &pieces, &progress, 0, reading, |_| 0.0, |_| {
+            progress.over.store(true, Ordering::SeqCst);
+            true
+        }, || u64::MAX, |_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!((done.asked, done.stopped, asked.load(Ordering::SeqCst)), (200, Some(AheadStop::Locking), 2));
+        // the engine has ended
+        let slot = Mutex::new(Some(Arc::new(Mutex::new(Model::default()))));
+        let weak = Arc::downgrade(slot.lock().unwrap().as_ref().unwrap());
+        let done = read_ahead_behind(&weak, &pieces, &Progress::default(), 0, reading, |_| 0.0, |_| {
+            slot.lock().unwrap().take();
+            true
+        }, || u64::MAX, |_| Ok(()));
+        assert_eq!((done.asked, done.stopped), (200, Some(AheadStop::Engine)));
     }
 }
