@@ -1083,6 +1083,76 @@ impl Group {
         self.backends.iter_mut().zip(&mut positions.parts).try_for_each(|(backend, parts)| backend.restore_positions(parts))
     }
 
+    /// Every device's sections of a prefix of `tokens` positions, device after device (see [`Backend::prefix_sections`]).
+    pub fn prefix_sections(&self, tokens: u64, history: bool) -> Vec<(u64, u64)> {
+        self.backends.iter().enumerate().flat_map(|(device, backend)| backend.prefix_sections(device, tokens, history)).collect()
+    }
+
+    /// Append every device's sections of a prefix to `out` (see [`Backend::export_prefix`]): the recurrent state in checkpoint `slot`, the
+    /// positions `0..tokens`, and the history `kept` (that of a checkpoint's saving).
+    pub fn export_prefix(&mut self, slot: usize, tokens: u64, kept: Option<&Positions>, out: &mut Vec<u8>) -> Result<()> {
+        for (device, backend) in self.backends.iter_mut().enumerate() {
+            let kept = match kept {
+                Some(kept) => kept.parts.get(device).ok_or("a Straydog checkpoint's history is of other devices")?.as_slice(),
+                None => &[],
+            };
+            backend.export_prefix(slot, tokens, kept, out)?;
+        }
+        Ok(())
+    }
+
+    /// Every device's parts of a prefix of `tokens` positions with no data yet (see [`Backend::prefix_templates`]): the K/V and the indexer's blocks,
+    /// and with `history` the MTP layer's indexer history. Their places depend on the K/V's capacity now.
+    pub fn prefix_templates(&self, tokens: u64, history: bool) -> (Positions, Option<Positions>) {
+        let (mut saved, mut kept) = (Vec::new(), Vec::new());
+        for backend in &self.backends {
+            let (positions, held) = backend.prefix_templates(tokens, history);
+            saved.push(positions);
+            kept.push(held);
+        }
+        (Positions { from: 0, parts: saved }, history.then_some(Positions { from: tokens, parts: kept }))
+    }
+
+    /// Every device's recurrent bytes in a prefix.
+    pub fn recurrent_sections(&self) -> Vec<u64> {
+        self.backends.iter().map(Backend::recurrent_section).collect()
+    }
+
+    /// Fill templates from `input`, which holds device after device its recurrent state, its positions' parts and its history's parts (the sections of
+    /// [`export_prefix`](Self::export_prefix) after the tokens and the hidden state): the parts get their data, and the places of the recurrent states in
+    /// `input` come back, a device each. Needs no device: it is the work of an import that holds nothing up.
+    pub fn fill_prefix(saved: &mut Positions, mut kept: Option<&mut Positions>, recurrent: &[u64], input: &[u8])
+                       -> Result<Vec<std::ops::Range<usize>>> {
+        let mut at = 0usize;
+        let mut places = Vec::with_capacity(recurrent.len());
+        for (device, bytes) in recurrent.iter().enumerate() {
+            let end = usize::try_from(*bytes).ok().and_then(|bytes| at.checked_add(bytes)).filter(|end| *end <= input.len())
+                .ok_or("a Straydog prefix state is short")?;
+            places.push(at..end);
+            let mut rest = &input[end..];
+            Backend::fill_parts(saved.parts.get_mut(device).ok_or("a Straydog prefix state is of other devices")?, &mut rest)?;
+            if let Some(kept) = kept.as_deref_mut() {
+                Backend::fill_parts(kept.parts.get_mut(device).ok_or("a Straydog prefix state is of other devices")?, &mut rest)?;
+            }
+            at = input.len() - rest.len();
+        }
+        if at != input.len() {
+            return Err("a Straydog prefix state is longer than its layout".into());
+        }
+        Ok(places)
+    }
+
+    /// Put every device's recurrent bytes of a prefix (`places` in `input`, from [`fill_prefix`](Self::fill_prefix)) into checkpoint `slot`.
+    pub fn write_recurrent(&mut self, slot: usize, input: &[u8], places: &[std::ops::Range<usize>]) -> Result<()> {
+        if places.len() != self.backends.len() {
+            return Err("a Straydog prefix state is of other devices".into());
+        }
+        for (backend, place) in self.backends.iter_mut().zip(places) {
+            backend.write_recurrent(slot, input.get(place.clone()).ok_or("a Straydog prefix state is short")?)?;
+        }
+        Ok(())
+    }
+
     /// Free what [`save_positions`](Self::save_positions) kept in VRAM, once nothing restores it.
     pub fn release_positions(&mut self, positions: Positions) -> Result<()> {
         // Every device's, a failed one too (the first error returned).
