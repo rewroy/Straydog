@@ -52,6 +52,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The system block's state sealed on the drive (Windows alone): AES-256-GCM, whose key DPAPI keeps.
+[target.'cfg(windows)'.dependencies]
+ring = "0.17"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [dev-dependencies]
 http-body-util = "0.1"
 straydog-provision = { path = "../straydog-provision", features = ["mock"] }

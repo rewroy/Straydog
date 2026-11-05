@@ -51,6 +51,10 @@ Windows with CUDA; DeepSeek-V4.1 has not.
     server writes them, never the worker, and they are checked against the compiled-in digests
     whenever they are opened.
   - The drive is read-only to the engine: no swap, weight or K/V files.
+    - The worker never writes.
+    - On Windows the runtime writes one thing derived from conversations: the state of the system
+      block (its tools included), sealed for the user (DPAPI and AES-256-GCM), at most once per
+      run and two per bundle (section 6.4).
   - Straydog's own secret, its API key, never reaches the worker.
 - **Measurement.**
   - A performance change is judged by alternating A/B runs (base, new, new, base) on the same
@@ -421,6 +425,80 @@ A constrained reply takes no drafts.
     distribution without the refused tokens. A point proposal it refuses is not verified at all.
   - Qwen3.8's head otherwise gives a verification's rows as an argmax or a top k picked on the GPU, which cannot be masked:
     a request that suppresses reads the rows' whole logits instead. No `suppress`, nothing changes.
+
+### 6.4 The system block's state across starts (Windows)
+
+An app that starts the engine and then sends its first request sends the same system block every
+time: its system prompt with its tools, a few thousand tokens. On a small card that block is most
+of the first reply's wait. The root checkpoint (6.1) is the state at its end, so that state is saved
+once and handed back at the next start.
+
+Measured on an RTX 5070 Ti held to 5.5 GiB, UD-IQ1_S, a request of 4,048 tokens (4,020 of them the
+root): 12.2 s to read it, first token at 12.35 s. At the next start, with the state handed back:
+restored 0.9 s after `ready` (308 MB read, opened and imported), first token at 1.63 s, 28 tokens
+read. The state was saved in 0.3 s after the reply, and the file is 323 MB.
+
+- **What a state is.** What a parked sequence is (6.1), held at the root:
+  - the root's tokens and the last token's hidden state;
+  - every device's recurrent state, as the root checkpoint saved it;
+  - the K/V and the indexer's pooled blocks of positions 0..root, which the held sequence still has
+    as the root left them (the export is refused when it does not begin with the root's tokens);
+  - with MTP, the MTP layer's indexer history, as the checkpoint kept it.
+- **Export and import** (`Model::export_prefix`, `Model::import_prefix`; every platform).
+  - The bytes are a header (`SDPREFIX`, the layout version, the tokens, the sections as a tag for
+    what each is and its byte count), then the sections: the tokens, the hidden state, then each
+    device's recurrent state, K/V and indexer blocks, and MTP history. A tag names the device and
+    the state it is of.
+  - An import checks the header against what its own model would give a state of that many tokens
+    (every tag, every count, the length) before it reads a section, and refuses a state that
+    differs by a byte. Nothing is changed then.
+  - An accepted state becomes the parked sequence, covering 0..root. A prompt that begins with its
+    tokens takes it back as a parked sequence is taken back (`resumed_from` is `prefix`, and the
+    root checkpoint is saved again). A prompt that does not drops it.
+- **The channel.** A frame that carries bytes is a JSON header line that gives their count in
+  `bytes`, then exactly that many raw bytes (at most 4 GiB; a count over that is refused before a
+  byte is read, a short body ends the worker). `prefix_state` (worker to server, asked for) and
+  `prefix` (server to worker, after `ready`) are such frames. The worker never opens a file for them.
+- **Saving** (server, Windows). After the reply of a request whose prompt made a new root (the done
+  event's `root_checkpoint` and `root_digest`), at most once per run, and only if no file has that
+  key: the server asks the worker for the state and seals and writes it on a thread of its own. The
+  files are in `<data dir>/prefix`, `<bundle>.<build>.<prefix>.<key>.sdprefix`. A bundle keeps two:
+  the third written deletes the one used longest ago, and a file of another engine build goes at
+  once.
+- **The key** is SHA-256 of:
+  - the bundle (model, provider, quantization);
+  - the engine's version, and its build (a hash of the executable);
+  - what the worker placed (the digest of its layout, the context, the prefill batch, where the K/V
+    is, how much is resident, the GPUs and their split, the drafts) and the settings that change
+    the numbers (the GEMM precision, the expert floor, the engram table);
+  - the root's tokens.
+
+  All of these but the tokens make the key's prefix, which the start knows before any request. The
+  VRAM budget a start was given is not in it, only what it placed: a card whose free memory moves a
+  little keeps its file.
+- **The file.** A random 256-bit key, wrapped with DPAPI (`CryptProtectData`, the user's scope, no
+  UI) in the header; the state sealed with AES-256-GCM under it and a random 96-bit nonce, the
+  header as the associated data.
+
+  ```
+  0    8   STRAYPFX         112  8   the state's bytes
+  8    4   file version     120  4   the wrapped key's bytes, W
+  12   4   state layout     124  W   the wrapped key
+  16   32  key prefix       ..   12  nonce
+  48   32  tokens' digest   ..       the state sealed, then the 16-byte tag
+  80   32  key
+  ```
+
+  The ciphertext goes to a `.part` file, which is synced and renamed: nothing in plaintext is ever
+  written, not even a part of a file. A file that does not unwrap, open or check (any byte of it
+  changed, another user's, another build's) is deleted with one warning, and the start goes on
+  without it.
+- **Restoring.** After `ready` the server opens, on a thread of its own, the file of this build and
+  key prefix that was used last (and marks it used), and hands the state to the worker. A request
+  that arrives first is never held up: the server hands nothing over once a request has begun, the
+  worker takes the state only while no request has had the engine, and it says in the log what
+  became of it (`Straydog prefix: restored 4020 tokens (308 MB) in 0.9 s`).
+- **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`. Linux saves nothing.
 
 ## 7. DeepSeek-V4.1-Flash
 
@@ -1019,6 +1097,7 @@ named as llama-server names it where it has the same setting.
 | `--row-cache MIB` | row cache of the PLE and Engram tables; 0 reads them through the page cache | 256; Qwen3.8's PLE table: as the host memory allows (§4.2) |
 | `--expert-ram GIB` | host tier for experts outside VRAM | 85% of host memory less Straydog's other host memory |
 | `--data-dir DIR` | verity trees and warm-up state | `.straydog` in the model directory |
+| `--no-prefix-cache`, `prefix_cache = false` | Windows: keep no state of the first request's system block on the drive (§6.4) | the state is kept |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none |

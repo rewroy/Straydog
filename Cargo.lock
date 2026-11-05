@@ -1556,6 +1556,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "nvml-wrapper",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1570,6 +1571,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
