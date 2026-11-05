@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -137,10 +138,12 @@ bool cpu_has(const char* feature) {
     const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
     const bool ymm = (xcr0 & 6) == 6, zmm = (xcr0 & 0xE6) == 0xE6;
     if (!std::strcmp(feature, "avx512")) return f && bw && f16c && zmm;
+    if (!std::strcmp(feature, "avx512vbmi")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 1)) && zmm; }
     return avx2 && fma && f16c && ymm;
 #else
     __builtin_cpu_init();
     if (!std::strcmp(feature, "avx512")) return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("f16c");
+    if (!std::strcmp(feature, "avx512vbmi")) return __builtin_cpu_supports("avx512vbmi");
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
 }
@@ -516,6 +519,7 @@ using RowsKernel = void (*)(int level, const uint8_t* row, size_t stride, size_t
 #ifdef SD_X86
 #include "cpu_rows.hpp"
 #endif
+#include "cpu_int8.hpp"
 // out[i] += weight * values[i], a product then a sum: the same bits at every width.
 void add_weighted(int level, float* out, const float* values, float weight, size_t count) {
 #ifdef SD_X86
@@ -620,6 +624,11 @@ struct Engine {
     int level = 0;        // fused row kernels: 2 = AVX-512, 1 = AVX2, 0 = none (decoded rows)
     bool lanes = false;   // the Q2_0 kernel takes activations in lane_position order
     const char* isa = "scalar";
+    // Activations rounded to 8-bit integers and integer dot products for the formats that have them (cpu_int8.hpp).
+    bool int8 = false;   // on where int_level is 2, unless STRAYDOG_CPU_INT8=0
+    int int_level = 0;   // the integer kernels: 2 = AVX-512 with VBMI, 0 = scalar
+    std::vector<Q8K> x_int;
+    std::vector<Q8S> products_int;
     std::vector<float> gate_up, products, x_lanes, down_rows;
     uint64_t calls = 0, experts = 0, projection_ns = 0, product_ns = 0, down_ns = 0;
     // Windows: the runtime's flag, nonzero while the machine pages (sd_cpu_paging), and the read-ahead hints taken and left because it did not.
@@ -745,6 +754,13 @@ void* sd_cpu_experts_create(uint32_t threads) {
             engine->kernel = row_avx2; engine->decoded = decoded_avx2; engine->isa = "avx2-fma"; engine->level = 1;
         }
 #endif
+#ifdef SD_X86
+        if (cpu_has("avx512") && cpu_has("avx512vbmi")) engine->int_level = 2;
+#endif
+        // The integer path where its wide kernels run (they are faster than the F32 ones there; its scalar kernels are the reference, not a
+        // path). STRAYDOG_CPU_INT8=0 keeps the F32 path (a comparison's other side).
+        const char* int8 = std::getenv("STRAYDOG_CPU_INT8");
+        engine->int8 = engine->int_level >= 2 && !(int8 && int8[0] == '0');
         engine->workers = std::make_unique<Workers>(threads);
         return engine.release();
     } catch (const std::exception& e) { cpu_error = e.what(); return nullptr; }
@@ -789,6 +805,31 @@ int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out) {
 #endif
         (wide ? format.wide : format.decode)(block, out);
         return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+// Test hook: count rows (stride bytes apart) of one format against x through the integer path (x rounded as the engine rounds it):
+// the scalar kernels at level 0, AVX-512 (with VBMI) at 2. An error for a format without integer kernels or a level not here.
+int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out) {
+    try {
+        if (!row || !x || !out || !count || !cols) throw std::runtime_error("invalid Straydog integer rows");
+#ifdef SD_X86
+        if (level == 1 || (level == 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi")))) throw std::runtime_error("no such integer kernels here");
+#endif
+        if (GateKernel gate = gate_int_kernel(kind, level)) {
+            if (cols % 256) throw std::runtime_error("invalid Straydog integer rows");
+            std::vector<Q8K> q(cols / 256);
+            quantize_k(level)(x, cols / 256, q.data());
+            gate(row, stride, count, q.data(), cols / 256, out);
+            return 0;
+        }
+        if (DownKernel down = down_int_kernel(kind, level)) {
+            if (cols % 64) throw std::runtime_error("invalid Straydog integer rows");
+            std::vector<Q8S> q(cols / 64);
+            quantize_s(level)(x, cols / 64, q.data());
+            down(row, stride, count, q.data(), cols / 64, out);
+            return 0;
+        }
+        throw std::runtime_error("no integer kernel for this Straydog CPU expert format");
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 // Test hook: count rows (stride bytes apart) of one format against x, through the fused
@@ -886,6 +927,20 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
             for (size_t i = 0; i < hidden; ++i) engine->x_lanes[lane_position(i)] = x[i];
             lane_input = engine->x_lanes.data();
         }
+        // The integer path where its formats allow: gate and up against x in 256-value blocks, down against each expert's products
+        // in 64-value blocks.
+        GateKernel gate_int[2] = {};
+        DownKernel down_int = nullptr;
+        if (engine->int8) {
+            if (hidden % 256 == 0)
+                for (int role = 0; role < 2; ++role) gate_int[role] = gate_int_kernel(kinds[role], engine->int_level);
+            if (inter % 64 == 0) down_int = down_int_kernel(kinds[2], engine->int_level);
+        }
+        if (gate_int[0] || gate_int[1]) {
+            engine->x_int.resize(hidden / 256);
+            quantize_k(engine->int_level)(x, hidden / 256, engine->x_int.data());
+        }
+        const Q8K* x_int = engine->x_int.data();
         auto project = [&](int role, const uint8_t* row, const float* natural, const float* ordered, size_t cols) {
             return kinds[role] == 42 ? kernel(row, ordered, cols / 64) : decoded(formats[role], row, natural, cols);
         };
@@ -893,6 +948,10 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
         const int level = engine->level;
         auto project_rows = [&](int role, const uint8_t* row, size_t count, const float* natural, const float* ordered,
                                 size_t cols, float* out) {
+            if (role < 2 && gate_int[role]) {
+                gate_int[role](row, bytes[role], count, x_int, cols / 256, out);
+                return;
+            }
 #ifdef SD_X86
             if (kinds[role] == 42 && level) {
                 (lanes ? q2_rows : q2_rows_avx2)(row, bytes[role], count, ordered, cols / 64, out);
@@ -919,20 +978,40 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
         engine->projection_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
         const size_t product_count = size_t(count) * inter;
-        const bool ordered = lanes && kinds[2] == 42;   // inter is then a multiple of 64
-        engine->workers->run_blocks(product_count, 128, [&](size_t first, size_t last) {
-            for (size_t i = first; i < last; ++i) {
-                const size_t expert = i / inter, j = i % inter;
-                const float value = silu(gate_up[expert * 2 * inter + j]) * gate_up[expert * 2 * inter + inter + j];
-                products[ordered ? lane_position(i) : i] = value;
-            }
-        });
+        const bool ordered = lanes && kinds[2] == 42 && !down_int;   // inter is then a multiple of 64
+        if (down_int) {
+            // (the integer down takes each 64 products rounded as they are made: they are not kept in F32)
+            engine->products_int.resize(size_t(count) * (inter / 64));
+            Q8S* quantized = engine->products_int.data();
+            const QuantizeS quantize = quantize_s(engine->int_level);
+            engine->workers->run_blocks(product_count / 64, 2, [&](size_t first, size_t last) {
+                float values[64];
+                for (size_t block = first; block < last; ++block) {
+                    const float* g = gate_up + (block * 64 / inter) * 2 * inter + (block * 64) % inter;
+                    for (size_t i = 0; i < 64; ++i) values[i] = silu(g[i]) * g[inter + i];
+                    quantize(values, 1, quantized + block);
+                }
+            });
+        } else {
+            engine->workers->run_blocks(product_count, 128, [&](size_t first, size_t last) {
+                for (size_t i = first; i < last; ++i) {
+                    const size_t expert = i / inter, j = i % inter;
+                    const float value = silu(gate_up[expert * 2 * inter + j]) * gate_up[expert * 2 * inter + inter + j];
+                    products[ordered ? lane_position(i) : i] = value;
+                }
+            });
+        }
         engine->product_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
         engine->down_rows.resize(size_t(count) * hidden);
         float* down_rows = engine->down_rows.data();
         engine->workers->run_blocks(hidden, 32, [&](size_t first, size_t last) {
             for (size_t expert = 0; expert < count; ++expert) {
+                if (down_int) {
+                    down_int(down[expert] + first * bytes[2], bytes[2], last - first, engine->products_int.data() + expert * (inter / 64), inter / 64,
+                             down_rows + expert * hidden + first);
+                    continue;
+                }
                 const float* p = products + expert * inter;
                 project_rows(2, down[expert] + first * bytes[2], last - first, p, p, inter, down_rows + expert * hidden + first);
             }

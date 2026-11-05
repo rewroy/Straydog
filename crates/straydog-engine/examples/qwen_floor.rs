@@ -4,6 +4,7 @@
 //! they part, and tokens a second.
 //!
 //! cargo run --release --example qwen_floor --features hip -- MODEL QUANT DEVICES VRAM_GIB FLOORS [TOKENS]   (FLOORS: 0,0.03,0.05)
+//! A floor written with a trailing q (0q) runs the CPU experts on 8-bit activations (STRAYDOG_CPU_INT8=1); without it, on F32.
 
 use std::path::PathBuf;
 
@@ -26,7 +27,9 @@ const PROMPTS: [&str; 6] = [
 /// Each prompt's greedy tokens and every step's logits at `floor`, and the decode's tokens a second.
 fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floor: &str, steps: usize)
        -> Result<(Vec<(Vec<u32>, Vec<Vec<f32>>)>, f64), String> {
+    let (floor, int8) = floor.strip_suffix('q').map_or((floor, "0"), |floor| (floor, "1"));
     std::env::set_var("STRAYDOG_EXPERT_FLOOR", floor);
+    std::env::set_var("STRAYDOG_CPU_INT8", int8);
     let mut group = Group::new(devices, &vec![budget; devices.len()], SplitMode::Experts)?;
     group.configure_gemm(2, true)?;
     let weights = Weights::open(model_dir, id, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
