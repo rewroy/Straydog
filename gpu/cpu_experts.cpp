@@ -622,6 +622,9 @@ struct Engine {
     const char* isa = "scalar";
     std::vector<float> gate_up, products, x_lanes, down_rows;
     uint64_t calls = 0, experts = 0, projection_ns = 0, product_ns = 0, down_ns = 0;
+    // Windows: the runtime's flag, nonzero while the machine pages (sd_cpu_paging), and the read-ahead hints taken and left because it did not.
+    const std::atomic<uint8_t>* paging = nullptr;
+    uint64_t read_aheads = 0, read_aheads_skipped = 0;
 #if defined(_WIN32)
     // The mapped files a gather reads (sd_cpu_gather_file), each with a handle for concurrent reads.
     struct MappedFile { const uint8_t* base; uint64_t bytes; HANDLE file; };
@@ -831,12 +834,13 @@ int sd_quantize_q2_0(const uint16_t* input, uint64_t count, uint8_t* output) {
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
-// calls, experts, projection_ns, product_ns, down_ns
+// calls, experts, projection_ns, product_ns, down_ns, read_aheads, read_aheads_skipped
 int sd_cpu_experts_stats(void* handle, uint64_t* values) {
     if (!handle || !values) { cpu_error = "invalid Straydog CPU expert statistics"; return -1; }
     const auto* engine = static_cast<Engine*>(handle);
     values[0] = engine->calls; values[1] = engine->experts; values[2] = engine->projection_ns;
     values[3] = engine->product_ns; values[4] = engine->down_ns;
+    values[5] = engine->read_aheads; values[6] = engine->read_aheads_skipped;
     return 0;
 }
 
@@ -942,6 +946,16 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
+// `flag` is a byte that outlives the engine, nonzero while the machine pages (the runtime keeps it): on Windows the read-ahead hint below is
+// taken only then, and never without a flag. Linux does not read it.
+int sd_cpu_paging(void* handle, const uint8_t* flag) {
+    static_assert(std::atomic<uint8_t>::is_always_lock_free && sizeof(std::atomic<uint8_t>) == 1, "the flag is a plain byte");
+    auto* engine = static_cast<Engine*>(handle);
+    if (!engine) { cpu_error = "invalid Straydog CPU paging flag"; return -1; }
+    engine->paging = reinterpret_cast<const std::atomic<uint8_t>*>(flag);
+    return 0;
+}
+
 // Ask for the pages of `count` byte ranges (on Linux on every worker), before a layer's experts read them: with less host memory than
 // the banks some are out, and the rows' faults read them a little at a time, each holding up every thread. Hints only.
 int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t* bytes, uint32_t count) {
@@ -962,6 +976,10 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
             }
         });
 #elif defined(_WIN32)
+        // Only while the machine pages (host.rs PAGING, one load): with the pages in memory a request for them costs 113 us a layer (5.4 ms a
+        // token), 30.4 to 24.9 tok/s.
+        if (!engine->paging || !engine->paging->load(std::memory_order_relaxed)) { ++engine->read_aheads_skipped; return 0; }
+        ++engine->read_aheads;
         // One request for the whole range of each expert's bank slice, queued by this thread: left to the rows' faults, a cold page is
         // read a cluster at a time (46 KB on average), each read holding up the worker that took it. Pages in memory stay what they
         // were (soft faults). Qwen3.8 UD-IQ1_M partially resident on an RTX 5070 Ti with 61.6 GiB, 30 of them free: a 1024-token
