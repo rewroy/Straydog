@@ -3109,8 +3109,32 @@ int sd_op_linears(void* handle, const sd_linear* items, uint64_t count, uint64_t
             }
             gemv(value, matrices, size_t(count), input, output, size_t(steps), size_t(input_stride), size_t(output_stride), {},
                  op_lanes);
+        } else if (steps > uint64_t(gemv_max_vectors)) {
+            op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
+            // Several half GEMMs of one row range used to round those rows once per matrix. Round once
+            // when every item reads the same rows (same pointer, width and stride); each product is then
+            // the half GEMM op_linear would run on that cast.
+            const size_t stride0 = input_stride ? size_t(input_stride) : size_t(items[0].cols);
+            bool one_input = value.half_gemm;
+            for (size_t i = 0; one_input && i < count; ++i) {
+                const size_t stride = input_stride ? size_t(input_stride) : size_t(items[i].cols);
+                one_input = items[i].input == items[0].input && items[i].cols == items[0].cols && stride == stride0;
+            }
+            if (one_input) {
+                if (!value.blas) throw std::runtime_error("Straydog op: GEMM needs a BLAS handle");
+                const StagedHalfInput half = stage_half_gemm_input(value, items[0].input, stride0, size_t(items[0].cols),
+                                                                   size_t(steps), scratch, size_t(scratch_bytes));
+                for (size_t i = 0; i < count; ++i)
+                    op_linear_half(value, matrices[i], half.rows, size_t(steps), items[i].output,
+                                   output_stride ? size_t(output_stride) : size_t(items[i].rows), scratch, half.scratch_bytes);
+            } else {
+                for (size_t i = 0; i < count; ++i)
+                    op_linear(value, static_cast<const uint8_t*>(items[i].weights), items[i].kind, size_t(items[i].rows),
+                              size_t(items[i].cols), size_t(items[i].first_row), items[i].input,
+                              size_t(input_stride ? input_stride : items[i].cols), size_t(steps), items[i].output,
+                              size_t(output_stride ? output_stride : items[i].rows), scratch, size_t(scratch_bytes));
+            }
         } else {
-            if (steps > uint64_t(gemv_max_vectors)) op_span(value, scratch, size_t(scratch_bytes), "a linear scratch");
             for (size_t i = 0; i < count; ++i)
                 op_linear(value, static_cast<const uint8_t*>(items[i].weights), items[i].kind, size_t(items[i].rows),
                           size_t(items[i].cols), size_t(items[i].first_row), items[i].input,

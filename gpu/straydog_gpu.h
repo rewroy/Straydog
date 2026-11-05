@@ -116,7 +116,8 @@ int sd_graph_begin(void* handle);
 int sd_graph_end(void* handle, uint64_t key, int keep);
 int sd_graph_run(void* handle, uint64_t key);
 /* Several linear ops in one launch where the GEMV takes them (up to four inputs, and strides shared
-   when there are several): out = W[first_row ..] . in per item; up to 24 items. */
+   when there are several): out = W[first_row ..] . in per item; up to 24 items. A half GEMM whose
+   items read the same rows (pointer, width and stride) rounds those rows to FP16 once. */
 typedef struct sd_linear {
     const void* weights;
     int kind;
