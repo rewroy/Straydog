@@ -127,19 +127,6 @@ unsafe extern "C" {
     pub fn sd_host_unregister(pointer: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn sd_kv_scratch(handle: *mut ::std::os::raw::c_void, scratch: *mut *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
-    pub fn sd_prefill_buffers(handle: *mut ::std::os::raw::c_void, capacity: u64, moe_bytes: u64, decoder_bytes: u64, moe: *mut *mut ::std::os::raw::c_void,
-                              decoder: *mut *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
-    pub fn sd_kv_grow(
-        handle: *mut ::std::os::raw::c_void,
-        layer: u64,
-        capacity: u64,
-        valid: u64,
-        state: *mut *mut ::std::os::raw::c_void,
-        index_state: *mut *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
     pub fn sd_host_state(
         handle: *mut ::std::os::raw::c_void,
         bytes: u64,
@@ -150,6 +137,32 @@ unsafe extern "C" {
         handle: *mut ::std::os::raw::c_void,
         sizes: *const u64,
         count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_kv_grow(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        capacity: u64,
+        valid: u64,
+        state: *mut *mut ::std::os::raw::c_void,
+        index_state: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_buffers(
+        handle: *mut ::std::os::raw::c_void,
+        capacity: u64,
+        moe_bytes: u64,
+        decoder_bytes: u64,
+        moe: *mut *mut ::std::os::raw::c_void,
+        decoder: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_kv_scratch(
+        handle: *mut ::std::os::raw::c_void,
+        scratch: *mut *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -858,13 +871,11 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn sd_op_repeat_rows(
+    pub fn sd_op_half_values(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,
-        rows: u64,
-        copies: u64,
-        width: u64,
-        output: *mut f32,
+        values: u64,
+        output: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -894,11 +905,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn sd_op_half_values(
+    pub fn sd_op_repeat_rows(
         handle: *mut ::std::os::raw::c_void,
         input: *const f32,
-        values: u64,
-        output: *mut ::std::os::raw::c_void,
+        rows: u64,
+        copies: u64,
+        width: u64,
+        output: *mut f32,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2024,13 +2037,20 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 unsafe extern "C" {
-    pub fn sd_expert_slots_release(handle: *mut std::ffi::c_void) -> i32;
-    pub fn sd_expert_slots_restore(handle: *mut std::ffi::c_void, cache: u64) -> i32;
     pub fn sd_expert_slots(
         handle: *mut ::std::os::raw::c_void,
         cache: u64,
         stage: u64,
         slot_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_release(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_restore(
+        handle: *mut ::std::os::raw::c_void,
+        cache: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2111,20 +2131,20 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn sd_cpu_gather_file(
-        handle: *mut ::std::os::raw::c_void,
-        base: *const u8,
-        bytes: u64,
-        file: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int;
-}
-unsafe extern "C" {
     pub fn sd_cpu_gather(
         handle: *mut ::std::os::raw::c_void,
         sources: *const *const u8,
         targets: *const *mut u8,
         bytes: *const u64,
         count: u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_cpu_gather_file(
+        handle: *mut ::std::os::raw::c_void,
+        base: *const u8,
+        bytes: u64,
+        file: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

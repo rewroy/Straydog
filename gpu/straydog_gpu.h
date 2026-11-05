@@ -530,6 +530,9 @@ int sd_peer_direct(void* handle);
 int sd_hybrid_supported(void* handle);
 void* sd_hybrid_moe_create(void* handle, void* const* pointers, const int* kinds, const int* routed_kinds, uint64_t experts, const uint8_t* const* host, void* workspace, uint64_t capacity);
 int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes);
+/* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
+int sd_expert_slots_release(void* handle);
+int sd_expert_slots_restore(void* handle, uint64_t cache);
 int sd_hybrid_attach_cpu(void* handle, void* engine);
 int sd_hybrid_drain(void* handle);
 int sd_hybrid_rebalance(void* handle, uint64_t max_swaps);
