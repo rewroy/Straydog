@@ -425,6 +425,8 @@ pub struct Model {
     /// This request's passes by rows, and this process's memory as it began, for its log line.
     pass_counts: [u64; 2],
     memory_before: Option<(u64, u64, u64)>,
+    /// The CPU engine's read-ahead hints (taken, left) when the request began.
+    read_aheads_before: (u64, u64),
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
     /// What is page-locked, for the thread that keeps the working set's limit.
@@ -565,6 +567,7 @@ impl Model {
             passes_with_draft: 0,
             pass_counts: [0; 2],
             memory_before: None,
+            read_aheads_before: (0, 0),
             kv_capacity: context,
             pinned_now: Default::default(),
             watching_memory: false,
@@ -1085,6 +1088,7 @@ impl Model {
             self.group.enable_assist(4)?;
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
+        cpu.watch_paging(&crate::host::PAGING)?;
         self.group.attach_cpu(cpu)
     }
 
@@ -2464,6 +2468,7 @@ impl Model {
             self.hybrid_counts = self.group.info().unwrap_or_default();
             self.pass_counts = [0; 2];
             self.memory_before = crate::host::memory_note();
+            self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
         }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
@@ -2485,6 +2490,7 @@ impl Model {
             let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
+            let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             self.last_metrics.insert("partial_detail".into(), json!({
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
@@ -2494,6 +2500,7 @@ impl Model {
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
                 "page_faults": faults,
+                "read_aheads": [taken - self.read_aheads_before.0, left - self.read_aheads_before.1],
                 "graphs": info["devices"][0]["cached_graphs"], "replays": info["devices"][0]["graph_replays"].as_u64().unwrap_or(0)
                     .saturating_sub(self.hybrid_counts["devices"][0]["graph_replays"].as_u64().unwrap_or(0)),
             }));
