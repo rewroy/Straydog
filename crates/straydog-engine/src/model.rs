@@ -1240,7 +1240,7 @@ impl Model {
             let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        Ok(BankLocks::new(planned, self.group.host_ordinal()))
+        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)))
     }
 
     /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then

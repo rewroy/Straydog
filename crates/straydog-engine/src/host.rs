@@ -102,6 +102,28 @@ impl Lowered {
     }
 }
 
+impl Lowered {
+    /// [`Lowered::begin`] for a thread whose work is reading pages for others to find in memory (a read-ahead): on Windows it keeps its normal memory priority
+    /// in background mode (the CPU and I/O priority stay lowered). A page that is read in takes the memory priority of the thread that read it and waits in
+    /// the standby list with it, and background mode's priority 1 is the lowest, the first that the system takes back for a new page, the next pages this
+    /// thread reads included: a prefetch of 12 GiB in background mode, on a machine whose standby list was full, left none of it in memory a moment later (13 GiB
+    /// were read again by the first touch, in 28 s), and the same prefetch at memory priority 5 left all of it (the touch took 2.9 s, with 412 pages read).
+    pub fn begin_reading(priority: Priority) -> Lowered {
+        let lowered = Lowered::begin(priority);
+        #[cfg(windows)]
+        if lowered.began {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadInformation, ThreadMemoryPriority, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_NORMAL};
+            let information = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY_NORMAL };
+            // SAFETY: the calling thread's pseudo handle and an initialized structure of the size passed; a refusal leaves the priority as background mode set it.
+            unsafe {
+                SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, std::ptr::from_ref(&information).cast(),
+                                     std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32)
+            };
+        }
+        lowered
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Lowered {
     fn drop(&mut self) {
@@ -449,6 +471,32 @@ mod priority_tests {
     fn nice() -> i32 {
         // SAFETY: the calling thread's own id.
         unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t) }
+    }
+
+    /// Decides: a thread that reads for others keeps its normal memory priority in background mode on Windows (a page it reads in waits in the standby list at
+    /// that priority), while the plain background mode lowers it; the memory priority is as it was after the mode ends. Elsewhere it is [`Lowered::begin`].
+    #[cfg(windows)]
+    #[test]
+    fn a_thread_that_reads_for_others_keeps_its_memory_priority() {
+        let (before, plain, reading, after, normal) = std::thread::spawn(|| {
+            let before = memory_priority();
+            let plain = {
+                let _held = Lowered::begin(Priority::Background);
+                memory_priority()
+            };
+            let held = Lowered::begin_reading(Priority::Background);
+            let reading = memory_priority();
+            drop(held);
+            let after = memory_priority();
+            let normal = {
+                let _held = Lowered::begin_reading(Priority::Normal);
+                memory_priority()
+            };
+            (before, plain, reading, after, normal)
+        }).join().unwrap();
+        assert_eq!(plain, 1, "background mode lowers the memory priority to 1");
+        assert_eq!(reading, before, "a thread that reads for others keeps it");
+        assert_eq!((after, normal), (before, before), "it is as it was after the mode ends, and the normal priority changes nothing");
     }
 
     /// Decides: the background priority is the calling thread's alone, for as long as it is held on Windows (ended after) and for the thread's life
