@@ -142,7 +142,7 @@ pub trait Engines {
     /// Start reading what passes over `tokens` (continuing the held sequence) will read from the
     /// drive (DeepSeek-V4.1's Engram rows), behind the pass before them; a pass reads them itself
     /// otherwise.
-    fn prefetch_ahead(&mut self, _tokens: &[u32]) -> Result<(), String> {
+    fn prefetch_ahead(&mut self, _tokens: &[u32], _now: usize) -> Result<(), String> {
         Ok(())
     }
     /// Whether the engines read images (DeepSeek-V4.1 beside its vision encoder).
@@ -416,7 +416,7 @@ fn feed<E: Engines>(engines: &mut E, history: &mut Vec<u32>, batch: usize, token
         }
         // (the next pass's drive reads start before this pass, to land while it runs)
         let (first, ahead) = (index * batch, ((index + 2) * batch).min(tokens.len()));
-        let output = if ahead > first + piece.len() { engines.prefetch_ahead(&tokens[first..ahead]) } else { Ok(()) }
+        let output = if ahead > first + piece.len() { engines.prefetch_ahead(&tokens[first..ahead], piece.len()) } else { Ok(()) }
             .and_then(|()| engines.forward(piece));
         match output {
             Ok(output) => logits = Some(output),
