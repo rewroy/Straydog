@@ -804,7 +804,14 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   - On a CPU with AVX-512 and VBMI, or AVX2, the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
     down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
     the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
-    2-bit codes and a block's rows are looked up there; Q2_0's codes come out of one GFNI affine transform where the CPU has it. A
+    2-bit codes and a block's rows are looked up there; Q2_0's codes come out of one GFNI affine transform where the CPU has it.
+    Where the CPU has VNNI (AVX512-VNNI with the AVX-512 kernels: Intel's 10th and 11th generation, Zen 4 and 5; AVX-VNNI with the
+    AVX2 kernels: Intel's 12th generation on, Zen 5), one vpdpwssd takes an IQ2 chunk's scaled pair sums and their add, and one
+    vpdpbusd a Q2_0 row's products, their sums and its bias: the same integers (a pair of products stays under 2^15). On the 7500F,
+    six threads, IQ2_XXS layers: cold 35.5-38.3 -> 33.7 us a route, hot 29.9 -> 27.3; one thread, the down 34.1 -> 27.5 us. Served at
+    5.5 GiB, one build with VNNI off and on, two pairs: the CPU's time a token 8.7 / 8.2 -> 8.2 / 7.8 ms, 49.5 / 50.3 -> 50.3 /
+    50.9 tok/s. The 7500F has no AVX-VNNI; the AVX2 kernels' integers with it were checked there with the same instructions' EVEX
+    forms (44 -> 42 us a route held to AVX2). A
     row's accumulators stay in registers (an array of them went to memory, four 512-bit stores a block). Ryzen 5 7500F, Qwen3.8
     UD-IQ1_S, a route with the experts cold, F32 -> Q8: on six threads 48.0 -> 35.2 us on its IQ2_XXS layers and 46.0 -> 36.9 us on
     its IQ2_S layers; on one thread 226 -> 168 and 209 -> 165 us. Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by

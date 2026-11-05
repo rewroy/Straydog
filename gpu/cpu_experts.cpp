@@ -37,10 +37,12 @@
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #define SD_TARGET(x)
+#define SD_INLINE __forceinline
 // MSVC has no scalar F16C conversion; the packed one converts the same half exactly.
 #define SD_HALF_TO_FLOAT(bits) _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(int(bits))))
 #else
 #define SD_TARGET(x) __attribute__((target(x)))
+#define SD_INLINE inline __attribute__((always_inline))
 #define SD_HALF_TO_FLOAT(bits) _cvtsh_ss(bits)
 #endif
 #endif
@@ -140,12 +142,16 @@ bool cpu_has(const char* feature) {
     if (!std::strcmp(feature, "avx512")) return f && bw && f16c && zmm;
     if (!std::strcmp(feature, "avx512vbmi")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 1)) && zmm; }
     if (!std::strcmp(feature, "gfni")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 8)) && zmm; }
+    if (!std::strcmp(feature, "avx512vnni")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 11)) && zmm; }
+    if (!std::strcmp(feature, "avxvnni")) { int leaf[4]; __cpuidex(leaf, 7, 1); return (leaf[0] & (1 << 4)) && avx2 && ymm; }
     return avx2 && fma && f16c && ymm;
 #else
     __builtin_cpu_init();
     if (!std::strcmp(feature, "avx512")) return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("f16c");
     if (!std::strcmp(feature, "avx512vbmi")) return __builtin_cpu_supports("avx512vbmi");
     if (!std::strcmp(feature, "gfni")) return __builtin_cpu_supports("gfni");
+    if (!std::strcmp(feature, "avx512vnni")) return __builtin_cpu_supports("avx512vnni");
+    if (!std::strcmp(feature, "avxvnni")) return __builtin_cpu_supports("avxvnni") && __builtin_cpu_supports("avx2");
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
 }
@@ -767,7 +773,10 @@ void* sd_cpu_experts_create(uint32_t threads) {
         // path). STRAYDOG_CPU_INT8=0 keeps the F32 path (a comparison's other side).
         const char* int8 = std::getenv("STRAYDOG_CPU_INT8");
         engine->int8 = engine->int_level >= 1 && !(int8 && int8[0] == '0');
-        if (engine->int8) engine->isa = engine->int_level >= 2 ? "avx512-int8" : "avx2-int8";
+        if (engine->int8) {
+            if (engine->int_level >= 2) engine->isa = cpu_has("avx512vnni") ? "avx512-vnni-int8" : "avx512-int8";
+            else engine->isa = cpu_has("avxvnni") ? "avx2-vnni-int8" : "avx2-int8";
+        }
         engine->workers = std::make_unique<Workers>(threads);
         return engine.release();
     } catch (const std::exception& e) { cpu_error = e.what(); return nullptr; }
