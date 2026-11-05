@@ -67,6 +67,54 @@ pub fn memory_note() -> Option<(u64, u64, u64)> {
     None
 }
 
+/// Ask the system for the pages of these byte ranges (address, length) of a mapped file in as few large requests as the caller makes of them: Windows
+/// reads each range in one request of the I/O manager's (`PrefetchVirtualMemory`), Linux in the device's request size (`madvise(MADV_WILLNEED)` reads at
+/// most that much of its range, so a range goes in steps of 128 KiB). Only a hint on the mapping: nothing is locked, no commit is taken, and the pages
+/// wait in memory (Windows' standby list) for their first touch, a soft fault, without joining the working set. The ranges must lie in a mapping the
+/// caller keeps mapped meanwhile; one that is not mapped is refused and nothing more.
+pub fn prefetch(ranges: &[(usize, usize)]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const PAGE: usize = 4096;
+        let entries: Vec<WIN32_MEMORY_RANGE_ENTRY> = ranges.iter().filter(|range| range.1 > 0).map(|&(start, length)| {
+            let (begin, end) = (start & !(PAGE - 1), (start + length + PAGE - 1) & !(PAGE - 1));
+            WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: begin as *mut std::ffi::c_void, NumberOfBytes: end - begin }
+        }).collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the pseudo handle of this process and ranges of its address space, which the call only reads the file pages of.
+        if unsafe { PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const PAGE: usize = 4096;
+        const STEP: usize = 128 << 10;
+        for &(start, length) in ranges {
+            let end = start + length;
+            let mut at = start & !(PAGE - 1);
+            while at < end {
+                // SAFETY: the hint reads nothing into this process, and an address that is not mapped is refused.
+                if unsafe { libc::madvise(at as *mut libc::c_void, STEP.min(end - at), libc::MADV_WILLNEED) } != 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                at += STEP;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = ranges;
+        Ok(())
+    }
+}
+
 /// Physical memory a guaranteed working set and page locks leave to the rest of the system, which
 /// they otherwise take without looking at what the other applications and the kernel need.
 pub fn left_free(memory: u64) -> u64 {
@@ -285,6 +333,29 @@ mod paging {
         assert!(quiet < QUIET_CALLS);
         assert!(quiet_calls(quiet, 10, 0.25) >= QUIET_CALLS);
         assert_eq!(quiet_calls(u32::MAX, 0, 0.25), u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    /// Decides: a hint on the ranges of a mapped file (a bank's experts, joined or apart, one that is not a whole page, and none at all) is taken and
+    /// changes nothing of what the mapping reads.
+    #[test]
+    fn the_os_is_asked_for_ranges_of_a_mapping_and_the_bytes_stay_what_they_were() {
+        let path = std::env::temp_dir().join(format!("straydog-prefetch-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..(3 << 20)).map(|at: usize| (at % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: the file is private to this test and stays as written while mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let base = map.as_ptr() as usize;
+        super::prefetch(&[]).unwrap();
+        super::prefetch(&[(base, 0)]).unwrap();
+        super::prefetch(&[(base + 100, 3000), (base + (1 << 20), 1 << 20), (base + (2 << 20) + 4095, 5000)]).unwrap();
+        assert_eq!(&map[..], &bytes[..]);
+        drop(map);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }
 

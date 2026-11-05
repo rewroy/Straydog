@@ -91,6 +91,7 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
     for (size_t i = 0; i < 5; ++i) plan->weights.push_back(dense[i]);
     plan->slot_of.assign(experts, -1);
     plan->usage.assign(experts, 0);
+    plan->routed_gpu.assign(experts, 0); plan->routed_host.assign(experts, 0);
     std::vector<MoeGroup> groups(experts + 1);
     for (size_t group = 0; group <= experts; ++group)
         groups[group] = {{plan->weights[group * 3], plan->weights[group * 3 + 1], plan->weights[group * 3 + 2]}, 0, 0, 0};
