@@ -74,11 +74,11 @@ fn main() {
             let x: Vec<f32> = (0..HIDDEN).map(|_| ((random.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0).collect();
             let mut out = vec![0f32; HIDDEN];
             let weights = [0.5f32; ROUTES];
-            let (mut before, mut after) = ([0u64; 5], [0u64; 5]);
+            let (mut before, mut after) = ([0u64; 7], [0u64; 7]);
             let mut wall = std::time::Duration::ZERO;
             for call in 0..CALLS + 8 {
                 if call == 8 {
-                    // SAFETY: five counters.
+                    // SAFETY: seven counters.
                     unsafe { ffi::sd_cpu_experts_stats(engine, before.as_mut_ptr()) };
                 }
                 let (bank, first) = if hot { (0, 0) } else { ((random.next() % 4) as usize, (random.next() % (EXPERTS - 1) as u64) as usize) };
@@ -97,7 +97,7 @@ fn main() {
                     wall += started.elapsed();
                 }
             }
-            // SAFETY: five counters.
+            // SAFETY: seven counters.
             unsafe { ffi::sd_cpu_experts_stats(engine, after.as_mut_ptr()) };
             let routes = (CALLS * ROUTES) as f64;
             let phase = |index: usize| (after[index] - before[index]) as f64 / 1e3 / routes;

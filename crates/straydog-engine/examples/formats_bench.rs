@@ -162,11 +162,11 @@ fn main() {
             let x = random.activations(HIDDEN);
             let mut out = vec![0f32; HIDDEN];
             let weights = [1.0f32 / 6.0; TOP_K];
-            let mut before = [0u64; 5];
+            let mut before = [0u64; 7];
             let calls = 24;
             for call in 0..calls + 2 {
                 if call == 2 {
-                    // SAFETY: five counters.
+                    // SAFETY: seven counters.
                     unsafe { ffi::sd_cpu_experts_stats(engine, before.as_mut_ptr()) };
                 }
                 let selected = random.routes(1);
@@ -181,8 +181,8 @@ fn main() {
                 };
                 assert_eq!(status, 0);
             }
-            let mut after = [0u64; 5];
-            // SAFETY: five counters.
+            let mut after = [0u64; 7];
+            // SAFETY: seven counters.
             unsafe { ffi::sd_cpu_experts_stats(engine, after.as_mut_ptr()) };
             let gate_up = (decode[0] * calls) as f64 / ((after[2] - before[2]) as f64);
             let down = (decode[1] * calls) as f64 / ((after[4] - before[4]) as f64);

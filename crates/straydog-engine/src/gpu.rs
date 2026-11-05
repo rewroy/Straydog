@@ -2143,6 +2143,23 @@ impl CpuExperts {
         self.handle
     }
 
+    /// Read-ahead hints are taken (Windows) while `flag` is nonzero, which the runtime keeps true while the machine pages.
+    pub fn watch_paging(&self, flag: &'static std::sync::atomic::AtomicU8) -> Result<()> {
+        // SAFETY: a live engine and a byte that lives for the process.
+        if unsafe { ffi::sd_cpu_paging(self.handle, std::ptr::from_ref(flag).cast::<u8>()) } != 0 {
+            return Err(format!("Straydog CPU experts: {}", cpu_error()));
+        }
+        Ok(())
+    }
+
+    /// The read-ahead hints taken and the hints left because the machine was not paging, so far.
+    pub fn read_aheads(&self) -> (u64, u64) {
+        let mut values = [0u64; 7];
+        // SAFETY: a live engine and seven counters.
+        unsafe { ffi::sd_cpu_experts_stats(self.handle, values.as_mut_ptr()) };
+        (values[5], values[6])
+    }
+
     /// `map` is a mapping of `file`, which stay as long as this does: a gather may read the file instead (Windows).
     #[cfg(windows)]
     pub fn gather_file(&self, map: &[u8], file: &std::fs::File) -> Result<()> {

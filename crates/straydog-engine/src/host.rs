@@ -79,12 +79,18 @@ pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
     wanted.min(held.saturating_add(available.saturating_sub(left_free(memory))))
 }
 
+/// The marks of `memory` that the working set's limit follows: the lower under which it gives back, the upper over which it may take more.
+#[cfg(any(windows, test))]
+fn working_set_marks(memory: u64) -> (u64, u64) {
+    ((memory / 20).max(3 << 30), (memory / 13).max(4 << 30))
+}
+
 /// The limit for a working set of `held` with `available` free, of what it wants and at least `least`. Under the lower mark it gives back, over the
 /// upper it may take more, and between them it stays. The marks are low because giving back is dear: IQ3_XXS on 62 GiB read a 33K prompt in 58 s with
 /// 6M page faults at a working set of 40 GiB (2 GiB available), in 93 s with 37M at 32 GiB (7 GiB available), and in 117 s with 63M at 28 GiB.
 #[cfg(any(windows, test))]
 fn working_set_limit(wanted: u64, least: u64, held: u64, available: u64, memory: u64) -> u64 {
-    let (low, high) = ((memory / 20).max(3 << 30), (memory / 13).max(4 << 30));
+    let (low, high) = working_set_marks(memory);
     let limit = if available < low {
         held.saturating_sub(low - available)
     } else if available > high {
@@ -93,6 +99,24 @@ fn working_set_limit(wanted: u64, least: u64, held: u64, available: u64, memory:
         held
     };
     limit.min(wanted).max(least.min(wanted))
+}
+
+/// Nonzero while the machine pages, 0 otherwise: [`keep_resident`] keeps it with every limit it sets, and the CPU engine's read-ahead hint on
+/// Windows reads it with one load instead of asking the system (`CpuExperts::watch_paging`). The pages the CPU's experts touch are out of
+/// memory only while it does: with RAM to spare the banks stay in the standby list, and a read-ahead of pages already there only costs time
+/// (113 us a layer, 5.4 ms a token, 30.4 to 24.9 tok/s on a machine with RAM to spare). It is set while the system reads the drive for page
+/// faults ([`drive_busy`]), which covers a cold start with memory to spare as well as a working set held at its limit; where the system does
+/// not say, while its free memory is short ([`memory_short`]).
+pub static PAGING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether free memory is short with `available`: from the upper mark of the working set's limit, over which it may take more, until one band
+/// above it. A working set held at its limit rests between the marks (RTX 5070 Ti, 62 GiB: 2.5 to 5.3 GiB available while serving, marks 3.1
+/// and 4.7), so the lower mark alone would miss most of the time it pages. The band keeps the hint from being switched on and off by a few
+/// hundred MiB either way.
+#[cfg(any(windows, test))]
+fn memory_short(available: u64, memory: u64, was_short: bool) -> bool {
+    let (low, high) = working_set_marks(memory);
+    available < high || (was_short && available <= high + (high - low))
 }
 
 /// Keeps the working set's limit to what is free, four times a second, whatever the engine is doing: a wide batch reads a gigabyte a second, and
@@ -153,8 +177,20 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
+        let available = windows_available().0;
+        let was_paging = PAGING.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        let paging = drive_busy().unwrap_or_else(|| memory_short(available, memory, was_paging));
+        if paging != was_paging {
+            PAGING.store(u8::from(paging), std::sync::atomic::Ordering::Relaxed);
+            let gib = available as f64 / (1u64 << 30) as f64;
+            if paging {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are read ahead from now");
+            } else {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are no longer read ahead");
+            }
+        }
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
-        let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), windows_available().0, memory);
+        let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
         let mut wanted = share;
         while wanted >= 1 << 30 {
             // SAFETY: the pseudo handle of this process and plain values.
@@ -211,6 +247,45 @@ pub fn linux_memory(physical: u64, proc_cgroup: &std::path::Path, cgroup_root: &
         }
     }
     total
+}
+
+#[cfg(test)]
+mod paging {
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn memory_is_short_from_the_upper_mark_until_a_band_above_it() {
+        use super::memory_short;
+        // 62 GiB: the marks are 3.1 and 4.7 GiB, the band 1.7.
+        let memory = 62 * GIB;
+        assert!(!memory_short(30 * GIB, memory, false));
+        assert!(!memory_short(5 * GIB, memory, false));
+        assert!(memory_short(4 * GIB, memory, false));
+        // Once short, it stays so up to the band above the upper mark, and not past it.
+        assert!(memory_short(6 * GIB, memory, true));
+        assert!(!memory_short(7 * GIB, memory, true));
+        // Small memory: the marks are 3 and 4 GiB at the least.
+        assert!(memory_short(3 * GIB, 16 * GIB, false));
+        assert!(!memory_short(4 * GIB, 16 * GIB, false));
+        assert!(memory_short(5 * GIB, 16 * GIB, true));
+        assert!(!memory_short(5 * GIB + 1, 16 * GIB, true));
+    }
+
+    #[test]
+    fn the_drive_is_quiet_after_two_seconds_under_the_reads_of_a_busy_one() {
+        use super::{quiet_calls, QUIET_CALLS};
+        // 6,250 pages in a quarter of a second are 25,000 a second.
+        assert_eq!(quiet_calls(5, 6_250, 0.25), 0);
+        assert_eq!(quiet_calls(5, 6_249, 0.25), 6);
+        // An idle system reads tens of pages a second.
+        let mut quiet = 0;
+        for _ in 0..QUIET_CALLS - 1 {
+            quiet = quiet_calls(quiet, 10, 0.25);
+        }
+        assert!(quiet < QUIET_CALLS);
+        assert!(quiet_calls(quiet, 10, 0.25) >= QUIET_CALLS);
+        assert_eq!(quiet_calls(u32::MAX, 0, 0.25), u32::MAX);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -333,6 +408,63 @@ pub fn commit_note(step: &str) {
     }
     #[cfg(not(windows))]
     let _ = step;
+}
+
+/// Pages the system has read from the drive to satisfy page faults since it started (all processes): the 32-bit PageReadCount of
+/// SystemPerformanceInformation, which `Memory\Pages Input/sec` counts. None where the system does not say.
+#[cfg(windows)]
+fn windows_page_reads() -> Option<u32> {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(class: u32, information: *mut u64, length: u32, returned: *mut u32) -> i32;
+    }
+    let mut buffer = [0u64; 64];
+    let mut returned = 0u32;
+    // SAFETY: a buffer of the length given, and a place for the length returned.
+    let status = unsafe { NtQuerySystemInformation(2, buffer.as_mut_ptr(), std::mem::size_of_val(&buffer) as u32, &mut returned) };
+    // (the counter lies at byte 80, after four 64-bit counters and twelve 32-bit ones, of which AvailablePages at byte 44 tells the layout is
+    // the one known: it must be what the memory status says, to a tenth)
+    let layout_known = |available_pages: u64| {
+        let status = windows_available().0 / 4096;
+        status > 0 && available_pages.abs_diff(status) <= status / 10
+    };
+    (status >= 0 && returned >= 84 && layout_known(buffer[5] >> 32)).then_some((buffer[10] & 0xffff_ffff) as u32)
+}
+
+/// Pages a second of the system's reads for page faults from which the drive counts as being read: 25,000 are 100 MB/s, where an idle system
+/// reads tens (serving UD-IQ1_M partially resident reads 40,000 on average, in bursts).
+#[cfg(any(windows, test))]
+const READS_BUSY: f64 = 25_000.0;
+/// Calls of [`drive_busy`] (250 ms apart) that stay under [`READS_BUSY`] before the drive counts as quiet: two seconds.
+#[cfg(any(windows, test))]
+const QUIET_CALLS: u32 = 8;
+
+/// The count of calls in a row that read under [`READS_BUSY`], after one that saw `pages` read in `seconds`.
+#[cfg(any(windows, test))]
+fn quiet_calls(quiet: u32, pages: u32, seconds: f64) -> u32 {
+    if f64::from(pages) / seconds >= READS_BUSY { 0 } else { quiet.saturating_add(1) }
+}
+
+/// Whether the drive is being read for page faults: at READS_BUSY pages a second or more over the time since the last call or in the two
+/// seconds before. None where the system does not say. The first call only takes the count.
+#[cfg(windows)]
+fn drive_busy() -> Option<bool> {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
+    let count = windows_page_reads()?;
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some((at, before, quiet)) = *last else {
+        *last = Some((now, count, QUIET_CALLS));
+        return Some(false);
+    };
+    let seconds = now.duration_since(at).as_secs_f64();
+    // (calls close together, as when a K/V growth sets the limit, add nothing)
+    if seconds < 0.1 {
+        return Some(quiet < QUIET_CALLS);
+    }
+    let quiet = quiet_calls(quiet, count.wrapping_sub(before), seconds);
+    *last = Some((now, count, quiet));
+    Some(quiet < QUIET_CALLS)
 }
 
 #[cfg(windows)]

@@ -2128,6 +2128,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_cpu_paging(
+        handle: *mut ::std::os::raw::c_void,
+        flag: *const u8,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_iq_tables(
         iq2_xxs: *const u8,
         iq2_xs: *const u8,

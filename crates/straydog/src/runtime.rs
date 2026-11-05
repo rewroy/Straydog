@@ -461,7 +461,10 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
         _ => String::new(),
     };
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){memory}",
+    // (Windows: the hints that read a layer's cold experts ahead, taken while the machine paged and left when it did not)
+    let read_aheads = detail["read_aheads"].as_array().filter(|counts| counts.iter().any(|count| count.as_u64().unwrap_or(0) > 0))
+        .map_or_else(String::new, |counts| format!("; read-ahead: {} taken, {} left", counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1117,8 +1120,8 @@ impl Driver {
                 tail.drain(..excess);
                 let text = String::from_utf8_lossy(&line);
                 // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
-                // account of the host banks a partially resident model page-locked)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks"]
+                // account of the host banks a partially resident model page-locked, and when it pages or no longer)
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging"]
                     .iter().any(|start| text.starts_with(start));
                 if verbose || warm {
                     tracing::info!("worker: {text}");

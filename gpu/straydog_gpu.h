@@ -547,6 +547,7 @@ int sd_cpu_experts_stats(void* handle, uint64_t* values);
 int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter, const float* x, float* out);
 int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* targets, const uint64_t* bytes, uint32_t count);
 int sd_cpu_gather_file(void* handle, const uint8_t* base, uint64_t bytes, void* file);
+int sd_cpu_paging(void* handle, const uint8_t* flag);
 int sd_iq_tables(const uint8_t* iq2_xxs, const uint8_t* iq2_xs, const uint8_t* iq2_s, const uint8_t* iq3_xxs, const uint8_t* iq3_s, const uint8_t* iq1_s);
 const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out);
