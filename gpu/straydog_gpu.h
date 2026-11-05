@@ -563,6 +563,7 @@ void sd_cpu_experts_destroy(void* handle);
 const char* sd_cpu_experts_isa(void* handle);
 int sd_cpu_experts_stats(void* handle, uint64_t* values);
 int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter, const float* x, float* out);
+int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden, uint64_t inter, const float* const* xs, float* const* outs);
 int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* targets, const uint64_t* bytes, uint32_t count);
 int sd_cpu_gather_file(void* handle, const uint8_t* base, uint64_t bytes, void* file);
 int sd_cpu_paging(void* handle, const uint8_t* flag);
