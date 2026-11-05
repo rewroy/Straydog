@@ -455,7 +455,7 @@ whole context:
 Then:
 - the rows of a prefill pass (lent to the expert store between long passes);
 - 512 MiB of scratch;
-- 192 MiB for FP16 copies of the dense weights prompt passes use;
+- 512 MiB for FP16 copies of one layer's dense weights and its engram_kv;
 - the DSpark drafter's footprint;
 - `RESERVE`, 1.625 GiB for the runtime's own memory. On DeepSeek-V4.1 that memory (kernels,
   handles, graphs) is 0.9 GiB; the rest of `RESERVE` covers Straydog's own buffers the terms above
