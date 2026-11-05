@@ -2328,6 +2328,20 @@ impl CpuExperts {
         Ok(())
     }
 
+    /// The kernels the engine took: avx512-int8 (8-bit activations, integer products), avx512-f32, avx2-fma or scalar.
+    pub fn isa(&self) -> String {
+        // SAFETY: a live engine; the name is a static string.
+        unsafe { std::ffi::CStr::from_ptr(ffi::sd_cpu_experts_isa(self.handle)) }.to_string_lossy().into_owned()
+    }
+
+    /// Nanoseconds spent so far in each phase of a call: gate and up, the products, and down with the weighted sum.
+    pub fn phase_ns(&self) -> [u64; 3] {
+        let mut values = [0u64; 7];
+        // SAFETY: a live engine and seven counters.
+        unsafe { ffi::sd_cpu_experts_stats(self.handle, values.as_mut_ptr()) };
+        [values[2], values[3], values[4]]
+    }
+
     /// The read-ahead hints taken and the hints left because the machine was not paging, so far.
     pub fn read_aheads(&self) -> (u64, u64) {
         let mut values = [0u64; 7];
