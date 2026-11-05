@@ -149,8 +149,11 @@ fn experts_through_a_host_tier() {
 fn a_fill_waits_for_a_write_back_behind_the_pass() {
     let layers = roles();
     let roles = layers[0].clone().unwrap();
-    // 16 slots and a reserve of 4; a host tier for every expert
-    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    // 16 slots and a reserve of 4; a host tier of 12. The tier keeps a copy of each expert it uploads, and an expert whose copy is still
+    // there leaves VRAM with no write-back. With room for the first twelve alone, the next four reads take the oldest copies (0 to 3),
+    // so those are in VRAM alone when they are evicted, and their write-backs go to the next oldest copies, where they stay until they
+    // come back. (With 8 the later reads take the written-back ones too; with a slot for every expert nothing is written back.)
+    let (path, mut gpu, mut store, _) = open(&layers, 16, 12);
     let first: Vec<usize> = (0..12).collect();
     let slots = store.acquire(&mut gpu, 0, &first).unwrap();
     check_slots(&mut gpu, &roles, &first, &slots, "the first twelve");
