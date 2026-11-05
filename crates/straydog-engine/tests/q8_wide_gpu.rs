@@ -1,14 +1,14 @@
 //! The wide Q8 decode kernels (Backend::wide_q8_decode: Qwen3.8's projections) against a host
 //! reference on random data, as q8_decode_gpu.rs checks DeepSeek-V4.1's:
-//! - Q4_K, Q5_K, Q6_K and IQ4_XS GEMVs: within F32 rounding of the rows' dots with the quantized
+//! - Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 GEMVs: within F32 rounding of the rows' dots with the quantized
 //!   input (a K-quant's min term against the input itself);
 //! - two to four vectors: each vector's result the bits of its own one-vector GEMV;
 //! - a list mixing them with BF16 rows (a DeltaNet layer's qkv, gate, beta and alpha): each row the
 //!   bits of its matrix alone, for one to four vectors.
 //!
-//! cargo test --release -p straydog-engine --features hip --test q8_wide_gpu, under the GPU lock.
-// (RDNA4's kernels: kernels.cpp takes them only on an RDNA4 device, and a CUDA build runs these ops in F32, with nothing of theirs to compare)
-#![cfg(feature = "hip")]
+//! cargo test --release -p straydog-engine --features hip --test q8_wide_gpu (or --features cuda), under the GPU lock.
+// (RDNA4's v_dot4 and CUDA's dp4a: both take the kernels; other devices run these ops in F32, with nothing of theirs to compare)
+#![cfg(any(feature = "hip", feature = "cuda"))]
 
 use straydog_engine::formats;
 use straydog_engine::gpu::Backend;
@@ -31,6 +31,7 @@ impl Random {
             return self.floats(values, 0.05).iter().flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
         }
         let (per, bytes) = match kind {
+            8 => (32, 34),
             12 => (256, 144),
             13 => (256, 176),
             14 => (256, 210),
@@ -108,7 +109,7 @@ fn wide_q8_gemvs_match_the_quantized_input_and_each_vector_alone() {
     let mut random = Random(0x51f1_5a0e_7c2d_93b1);
     let scratch = gpu.buffer(1 << 20).unwrap();
     for (kind, rows, cols) in [(14u32, 10240usize, 2560usize), (14, 2560, 6144), (12, 6144, 2560), (12, 2560, 6144), (13, 10240, 2560),
-                               (23, 6144, 2560), (23, 640, 2560), (14, 124160, 2560)] {
+                               (13, 2560, 6144), (8, 6144, 2560), (8, 2560, 6144), (23, 6144, 2560), (23, 640, 2560), (14, 124160, 2560)] {
         let bytes = random.blocks(kind, rows * cols);
         let matrix = gpu.upload_bytes(&bytes).unwrap();
         let x = random.floats(4 * cols, 2.0);
@@ -137,14 +138,20 @@ fn wide_q8_gemvs_match_the_quantized_input_and_each_vector_alone() {
 
 #[test]
 fn a_mixed_wide_list_gives_each_matrix_its_own_bits() {
-    // (a DeltaNet layer's qkv, gate, beta and alpha, decoded alone and as a verification's rows)
+    // (a DeltaNet layer's qkv, gate, beta and alpha, decoded alone and as a verification's rows; then the Q5_K and Q8_0 bundles' lists)
+    mixed_list(&[(14u32, 10240usize), (12, 6144), (30, 48), (30, 48)]);
+    mixed_list(&[(13, 10240), (14, 6144), (30, 48), (30, 48)]);
+    mixed_list(&[(8, 10240), (8, 6144), (30, 48), (30, 48)]);
+    mixed_list(&[(14, 12288), (14, 512), (14, 512), (30, 512), (30, 128)]);
+}
+
+fn mixed_list(shapes: &[(u32, usize)]) {
     straydog_engine::gpu::load_iq_tables().unwrap();
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     gpu.wide_q8_decode().unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let scratch = gpu.buffer(1 << 20).unwrap();
     let cols = 2560usize;
-    let shapes = [(14u32, 10240usize), (12, 6144), (30, 48), (30, 48)];
     let matrices: Vec<Buffer> = shapes.iter().map(|&(kind, rows)| gpu.upload_bytes(&random.blocks(kind, rows * cols)).unwrap()).collect();
     let x = random.floats(4 * cols, 2.0);
     let input = upload(&mut gpu, &x);

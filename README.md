@@ -180,7 +180,8 @@ Where it rounds, and how to turn it off:
 | --- | --- | --- |
 | Qwen products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm fp32` |
 | Qwen's long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
-| Qwen decode and speculative verification, and its K/V cache | F32 | |
+| Qwen decode and speculative verification: the inputs of the dense Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 projections (RDNA4 and CUDA) | INT8 per 32 values with an F32 scale; the dots exact in INT32, then scaled in F32. A row's sum does not depend on what shares its launch, so a verification is still the tokens fed one at a time; the bits are no longer the F32 kernels' (CUDA, UD-IQ1_S, 356 decode steps: KL mean 1.1e-3, p99 1.2e-2; greedy continuations part after 19, 23 and 30 tokens in three of six prompts and agree for 128 in the others) | `STRAYDOG_Q8=0` |
+| Qwen's K/V cache | F32 | |
 | DeepSeek products over prompt passes of at least 32 rows (FFN, attention, index, router and Engram projections; more than 4 rows per expert) | FP16 operands, F32 sums and output | `--gemm fp32` |
 | DeepSeek decode and verification: the inputs of the Q8_0 and Q5_K projections and of the IQ2 experts' gate and up | INT8 per 32 values with an F32 scale; the dots exact in INT32, then scaled in F32 | none in the server (`DS41_Q8=0` in the examples) |
 | DeepSeek decode and verification: the attention's and the indexer's scores | FP16 operands, F32 sums | `--gemm fp32` |
