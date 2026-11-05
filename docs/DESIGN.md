@@ -192,7 +192,10 @@ The engine is built in layers:
     first request at 28 to 31 tok/s with 218,547 page faults, against 49.4 after the locking; Windows, 62 GiB with the cache emptied by a 46 GiB read: 33.2
     and 38.6 tok/s, the CPU at 18.5 and 15.4 ms a token). So a thread of its own, started when the plan is made, asks the system for the pages of the planned
     banks in the order the layers are locked (`BankLocks::read_ahead`, `behind::read_ahead_behind`): pieces of at most 256 MiB of one bank, each by
-    `host::prefetch` (`PrefetchVirtualMemory`, `MADV_WILLNEED`), so that it can be followed and stopped between them. It reads the plan's bytes and no more,
+    `host::prefetch` (`PrefetchVirtualMemory`, `MADV_WILLNEED`), so that it can be followed and stopped between them. `PrefetchVirtualMemory` returns when the
+    pages are in; `madvise` returns once the reads are queued, so there (Linux) no more than two pieces are in flight: before a piece is asked for, the one
+    two back is waited for to be in the page cache (by `mincore`, for 5 s at the most), which keeps a request's own reads from queuing behind gigabytes
+    of ours and a stop from coming late. It reads the plan's bytes and no more,
     leaves out the pieces of layers the locking has done and those whose pages are all resident (Linux: the page cache, by `mincore`; Windows: the
     working set, a lower bound, since a page in the standby list is not visible), and works below a request: the thread's background mode (Windows: CPU
     and I/O priority; Linux: nice 19 and the idle I/O class). On Windows it keeps its memory priority at 5 (`Lowered::begin_reading`), because background

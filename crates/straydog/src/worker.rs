@@ -783,8 +783,10 @@ fn spawn_read_ahead(engine: &Weak<Mutex<Engine>>, job: &straydog_engine::banks::
     let spawned = std::thread::Builder::new().name("straydog-ahead".into()).spawn(move || {
         // (Windows: its memory priority stays normal, or the pages it reads in are the first the system takes back, the next it reads among them)
         let _lowered = straydog_engine::host::Lowered::begin_reading(straydog_engine::host::Priority::Background);
-        // SAFETY (both): `read_ahead_behind` calls them with a strong reference to the engine held, which keeps the weights the pieces lie in mapped.
-        let done = behind::read_ahead_behind(&engine, &pieces, &progress, margin, |piece| unsafe { piece.resident() },
+        // SAFETY (all of them): `read_ahead_behind` calls them with a strong reference to the engine held, which keeps the weights the pieces lie in mapped.
+        // (Linux: `madvise` returns once the reads are queued, and a piece is in when its pages are in the page cache; Windows: the call returns when they are in)
+        let done = behind::read_ahead_behind(&engine, &pieces, &progress, margin, behind::READING, |piece| unsafe { piece.resident() },
+                                             |piece| cfg!(target_os = "linux") && unsafe { piece.resident() } < 0.98,
                                              straydog_engine::host::available_bytes, |piece| unsafe { piece.ask() });
         eprintln!("{}", behind::ahead_line(&done, ready_at.elapsed().as_secs_f64()));
     });
