@@ -82,7 +82,9 @@ sees only what isolation exposes:
 - the executable and the GPU runtime;
 - the pinned model and drafter files;
 - the GPU device nodes;
-- a short list of environment variables (the `DS41_*` controls named below).
+- a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
 
 ```
 crates/
