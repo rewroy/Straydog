@@ -713,12 +713,26 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                 eprintln!("Straydog cannot warm up: {message}");
             }
         }
+        // The pages of the layers to be locked are read meanwhile, ahead of the locking, so that a request that comes before the locking is done finds them
+        // in memory ([`behind::read_ahead_behind`]).
+        let progress = Arc::new(behind::Progress::default());
+        if let Some((job, _)) = &job {
+            spawn_read_ahead(&weak, job, &progress, ready_at);
+        }
         behind::lock_behind(&weak, |engine: &Engine| engine.requests, behind::YIELDING, job,
             |job| job.remaining() > 0,
             |job| {
                 // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
                 // (the turn works at a lower priority, on fewer cores: a request that generates meanwhile needs them)
-                let next = unsafe { job.lock_next_behind() }?;
+                let next = unsafe { job.lock_next_behind() };
+                // (the read-ahead follows the locking: a turn done, or the locking over)
+                match &next {
+                    Some(Ok(_)) => {
+                        progress.turns.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => progress.over.store(true, Ordering::SeqCst),
+                }
+                let next = next?;
                 Some(match next {
                     Ok(locked) => {
                         let (layer, bytes) = (locked.layer, locked.bytes);
@@ -747,10 +761,35 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                               locking.layers, locking.seconds);
                 }
             });
+        // (whatever ended it, the pages ahead of it are not wanted)
+        progress.over.store(true, Ordering::SeqCst);
     });
     if let Err(error) = spawned {
         behind::warm_up_over();
         eprintln!("WARN Straydog cannot warm up or lock the banks behind ready: {error}");
+    }
+}
+
+/// Read the banks the locking is planned for, ahead of it, on a thread of its own ([`behind::read_ahead_behind`]): the pieces of the plan in the order they will be
+/// locked, asked of the system a few hundred MB at a time at a priority below a request's own faults and reads (Windows' background mode for the thread, the idle I/O
+/// class on Linux). The locking and a request that comes first then find the pages in memory, where a cold page cache left them to be read by faulting, one
+/// fault after another. One line in the log says how it went when it ends.
+fn spawn_read_ahead(engine: &Weak<Mutex<Engine>>, job: &straydog_engine::banks::BankLocks, progress: &Arc<behind::Progress>, ready_at: Instant) {
+    let (pieces, margin) = (job.read_ahead(), job.margin());
+    if pieces.is_empty() {
+        return;
+    }
+    let (engine, progress) = (engine.clone(), progress.clone());
+    let spawned = std::thread::Builder::new().name("straydog-ahead".into()).spawn(move || {
+        // (Windows: its memory priority stays normal, or the pages it reads in are the first the system takes back, the next it reads among them)
+        let _lowered = straydog_engine::host::Lowered::begin_reading(straydog_engine::host::Priority::Background);
+        // SAFETY (both): `read_ahead_behind` calls them with a strong reference to the engine held, which keeps the weights the pieces lie in mapped.
+        let done = behind::read_ahead_behind(&engine, &pieces, &progress, margin, |piece| unsafe { piece.resident() },
+                                             straydog_engine::host::available_bytes, |piece| unsafe { piece.ask() });
+        eprintln!("{}", behind::ahead_line(&done, ready_at.elapsed().as_secs_f64()));
+    });
+    if let Err(error) = spawned {
+        eprintln!("WARN Straydog cannot read the banks ahead of the locking: {error}");
     }
 }
 

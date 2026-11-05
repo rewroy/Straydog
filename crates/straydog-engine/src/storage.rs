@@ -156,6 +156,47 @@ pub fn resident(range: &[u8]) -> f64 {
     }
 }
 
+/// The fraction of a mapped range's pages that are in this process's working set: Windows, by `QueryWorkingSetEx`, where [`resident`] does not say. A
+/// page that is in memory only in the standby list (read in by a prefetch, or left by an earlier process) is not in the working set until it is touched,
+/// so this is a lower bound of what is resident; 0 where the system does not say, and on Linux.
+pub fn in_working_set(range: &[u8]) -> f64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_BLOCK, PSAPI_WORKING_SET_EX_INFORMATION};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // (pages asked after in batches of 64 MiB)
+        const BATCH: usize = 16384;
+        if range.is_empty() {
+            return 0.0;
+        }
+        let start = range.as_ptr() as usize & !(ALIGN - 1);
+        let pages = (range.as_ptr() as usize + range.len() - start).div_ceil(ALIGN);
+        let mut entries = vec![PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: std::ptr::null_mut(), VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK { Flags: 0 } }; BATCH.min(pages)];
+        let mut valid = 0usize;
+        let mut done = 0usize;
+        while done < pages {
+            let count = BATCH.min(pages - done);
+            for (index, entry) in entries[..count].iter_mut().enumerate() {
+                entry.VirtualAddress = (start + (done + index) * ALIGN) as *mut std::ffi::c_void;
+            }
+            // SAFETY: the pseudo handle of this process and `count` initialized entries, whose size is passed.
+            if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), entries.as_mut_ptr().cast(), (count * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32) } == 0 {
+                return 0.0;
+            }
+            // (bit 0 of the attributes: the page is valid, in the working set)
+            // SAFETY: the system filled the attributes' word.
+            valid += entries[..count].iter().filter(|entry| unsafe { entry.VirtualAttributes.Flags } & 1 == 1).count();
+            done += count;
+        }
+        valid as f64 / pages as f64
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = range;
+        0.0
+    }
+}
+
 /// Fill `buffer` from `offset` of `file`, through the page cache.
 pub fn read_at(file: &File, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
     let mut done = 0;
