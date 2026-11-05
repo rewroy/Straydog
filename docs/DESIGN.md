@@ -761,8 +761,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   the device's workspaces, the recurrent state, the prefill rows, the K/V stage and the pinned dense
   weights, 4.1 GiB in all for IQ2_XS at 262144 tokens; `straydog setup` counts with the same
   function, and what is over goes to the expert slots.
-- **Partial residency:** the CPU computes experts beyond VRAM in F32 from the host tier. Which
+- **Partial residency:** the CPU computes experts beyond VRAM from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
+  - On a CPU with AVX-512 and VBMI the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
+    down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
+    the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
+    2-bit codes and a block's rows are looked up there. Ryzen 5 7500F, Qwen3.8 UD-IQ1_S's IQ2_XXS layers, a route on six threads:
+    44.3 -> 33.7 us (F32 -> Q8). Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
+    0.0009). Formats without integer kernels, and CPUs without those instructions, keep F32; `STRAYDOG_CPU_INT8=0` keeps it
+    everywhere.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked

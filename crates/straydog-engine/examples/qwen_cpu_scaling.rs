@@ -42,7 +42,11 @@ fn main() {
     let find = |name: &str| headers.iter().enumerate()
         .find_map(|(file, header)| header.tensors.iter().find(|tensor| tensor.name == name).map(|tensor| (file, tensor))).unwrap();
     // Four layers of the commonest format.
-    let layers: Vec<usize> = (0..48).filter(|layer| find(&format!("blk.{layer}.ffn_gate_exps.weight")).1.quant_type == 22).take(4).collect();
+    let kind_of = |layer: usize| find(&format!("blk.{layer}.ffn_gate_exps.weight")).1.quant_type;
+    let mut counts = std::collections::BTreeMap::new();
+    (0..48).for_each(|layer| *counts.entry(kind_of(layer)).or_insert(0) += 1);
+    let commonest = counts.into_iter().max_by_key(|(_, count)| *count).unwrap().0;
+    let layers: Vec<usize> = (0..48).filter(|layer| kind_of(*layer) == commonest).take(4).collect();
     // Mapped as a served model's banks are, read through once so the pages are in memory: page size and page walks count.
     // SAFETY: read-only mappings of files nothing changes during this run.
     let maps: Vec<memmap2::Mmap> = files.iter().map(|file| unsafe { memmap2::Mmap::map(file) }.unwrap()).collect();

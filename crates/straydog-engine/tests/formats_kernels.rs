@@ -184,6 +184,56 @@ fn cpu_row_kernels_decode_every_weight_and_sum_within_f32_bounds() {
     }
 }
 
+/// Rows of one bank through the integer path (sd_cpu_rows_int8: x rounded as the engine rounds it) at an instruction-set level (0: the
+/// scalar kernels, 2: AVX-512 with VBMI); None for a format without integer kernels.
+fn cpu_rows_int8(kind: u32, level: i32, rows: &[u8], count: usize, x: &[f32]) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; count];
+    // SAFETY: `count` rows of len/count bytes each against x of their width.
+    let status = unsafe {
+        ffi::sd_cpu_rows_int8(kind as i32, level, rows.as_ptr(), (rows.len() / count) as u64, count as u32, x.as_ptr(),
+                              x.len() as u64, out.as_mut_ptr())
+    };
+    (status == 0).then_some(out)
+}
+
+/// The integer CPU path (gpu/cpu_int8.hpp) on the formats it has kernels for, at Qwen3.8's expert shapes: x rounded to 8-bit integers a
+/// block (256 values for gate and up, 64 for Q2_0's down), the products summed exactly in integers. The AVX-512 kernels equal the scalar ones
+/// bit for bit. Against F64 sums of the decoded rows with x itself, the error is x's rounding (at most half a block's step a value, times
+/// the row's weights) and a few F32 roundings a block.
+#[test]
+fn cpu_integer_rows_equal_their_scalar_kernels_and_err_by_the_rounding_of_x_alone() {
+    load_tables();
+    let mut random = Random(9);
+    let avx512 = std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vbmi");
+    for (kind, cols, block) in [(16u32, 2560usize, 256usize), (22, 2560, 256), (42, 640, 64)] {
+        let (values, _) = formats::block(kind).unwrap();
+        let rows = 7;
+        let data: Vec<u8> = (0..rows * cols / values).flat_map(|_| generated_block(kind, &mut random)).collect();
+        let weights = decode(kind, &data);
+        let x: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
+        let scalar = cpu_rows_int8(kind, 0, &data, rows, &x).unwrap();
+        for level in [(2, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
+            let wide = cpu_rows_int8(kind, level, &data, rows, &x).unwrap();
+            assert_eq!(wide.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       "kind {kind} level {level}");
+        }
+        for (row, value) in scalar.iter().enumerate() {
+            let w = &weights[row * cols..(row + 1) * cols];
+            let exact: f64 = w.iter().zip(&x).map(|(w, x)| f64::from(*w) * f64::from(*x)).sum();
+            let mut bound = 0f64;
+            for (wb, xb) in w.chunks(block).zip(x.chunks(block)) {
+                let step = f64::from(xb.iter().fold(0f32, |most, v| most.max(v.abs()))) / 127.0;
+                bound += 0.5001 * step * wb.iter().map(|w| f64::from(*w).abs()).sum::<f64>();
+            }
+            let magnitude: f64 = w.iter().zip(&x).map(|(w, x)| (f64::from(*w) * f64::from(*x)).abs()).sum();
+            bound += 16.0 * 2f64.powi(-24) * (magnitude + bound) + 1e-30;
+            assert!((f64::from(*value) - exact).abs() <= bound, "kind {kind} row {row}: {value} vs {exact} (bound {bound:e})");
+        }
+    }
+    // (a format without integer kernels is refused, and the engine then keeps its F32 path)
+    assert!(cpu_rows_int8(8, 0, &[0u8; 34], 1, &[0f32; 32]).is_none());
+}
 
 /// The DeepSeek-V4.1 shards: tensors by name.
 struct Shards {
