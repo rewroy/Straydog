@@ -181,11 +181,28 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
     (memory / 2).saturating_sub(pinned_state)
 }
 
-/// With DS41_PROFILE set: seconds per phase of a request's decode, and of its passes by rows
-/// (count, seconds, phases). The host's clock alone: every call a phase covers returns after its
-/// device work, so no extra synchronization is added.
+/// The part of a partially resident request's "other" (the request line's ms a token apart from the GPU wait and the CPU) that a decode
+/// phase is, as the line names it. A lone row's step only: a pass of drafts has more besides (the drafter's, the acceptance, the commit),
+/// which the line does not break down.
+fn decode_part(phase: &str) -> Option<&'static str> {
+    Some(match phase {
+        "step: head" => "head",
+        "step: first layer" => "first layer",
+        "step: PLE rows wait" => "PLE wait",
+        "step: PLE layer" => "PLE",
+        "step: layers (first device)" | "step: layers (second device)" => "layers",
+        _ => return None,
+    })
+}
+
+/// Seconds per phase of a request's decode, and of its passes by rows (count, seconds, phases): every
+/// phase with DS41_PROFILE set, else a partially resident model's [`decode_part`]s alone. The host's
+/// clock alone: every call a phase covers returns after its device work, so no extra synchronization
+/// is added.
 #[derive(Default)]
 struct Profile {
+    /// Every phase is timed and reported (DS41_PROFILE).
+    every: bool,
     phases: BTreeMap<&'static str, f64>,
     /// The phases of the pass under way, until its rows are known.
     pass: BTreeMap<&'static str, f64>,
@@ -195,6 +212,17 @@ struct Profile {
 }
 
 impl Profile {
+    fn new(every: bool) -> Profile {
+        Profile { every, ..Default::default() }
+    }
+
+    /// `seconds` of the pass under way went to the phase `name`: kept if every phase is, else if the request line names it.
+    fn add(&mut self, name: &'static str, seconds: f64) {
+        if self.every || decode_part(name).is_some() {
+            *self.pass.entry(name).or_default() += seconds;
+        }
+    }
+
     /// The pass under way ends: it had `rows` rows and took `seconds`.
     fn end_pass(&mut self, rows: usize, seconds: f64) {
         self.rows[rows].0 += 1;
@@ -617,7 +645,7 @@ impl Model {
             draft_extras: HashSet::new(),
             draft_pending: Vec::new(),
             load_seconds: Vec::new(),
-            profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
+            profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::new(true)),
             pass_seconds: [0.0; 2],
             passes_with_draft: 0,
             assist: None,
@@ -651,6 +679,10 @@ impl Model {
         }
         if !model.resident && !model.partial {
             return Err("the GPU budget cannot hold the model's dense weights; raise --vram".into());
+        }
+        if model.partial && model.profile.is_none() {
+            // (the request line's "other" is broken down into the decode step's phases: crate::model::decode_part)
+            model.profile = Some(Profile::new(false));
         }
         crate::host::commit_note("experts placed");
         model.prepare_decoder(context64, false)?;
@@ -1624,10 +1656,11 @@ impl Model {
         rows
     }
 
-    /// Add the time since `clock` to the profile's `name` and restart the clock (with DS41_PROFILE).
+    /// Add the time since `clock` to the profile's `name` and restart the clock (with DS41_PROFILE; a partially resident model's
+    /// profile without it keeps the [`decode_part`]s alone, but the clock restarts at every phase all the same).
     fn phase(&mut self, name: &'static str, clock: &mut Instant) {
         if let Some(profile) = self.profile.as_mut() {
-            *profile.pass.entry(name).or_default() += lap(clock);
+            profile.add(name, lap(clock));
         }
     }
 
@@ -2659,7 +2692,7 @@ impl Model {
             if let Some(count) = self.pass_counts.get_mut(rows.len().wrapping_sub(1)) {
                 *count += 1;
             }
-            let hybrid = if self.partial && self.profile.is_some() {
+            let hybrid = if self.partial && self.profile.as_ref().is_some_and(|profile| profile.every) {
                 let info = self.group.info().unwrap_or_default();
                 Some((info["wait_ns"].as_u64().unwrap_or(0) as f64 / 1e9, info["cpu_ns"].as_u64().unwrap_or(0) as f64 / 1e9))
             } else {
@@ -2720,7 +2753,7 @@ impl Model {
                                 checkpoint: bool, emit: &mut dyn FnMut(u32), constraint: Option<&mut Constraint>)
                                 -> Result<()> {
         if let Some(profile) = self.profile.as_mut() {
-            *profile = Profile::default();
+            *profile = Profile::new(profile.every);
         }
         self.ple_counts = self.weights.row_counts(PLE_TABLE).unwrap_or_default();
         self.ple_wait = 0.0;
@@ -2735,8 +2768,8 @@ impl Model {
         result
     }
 
-    /// The request's PLE row counts and wait, and with DS41_PROFILE its decode phases (milliseconds a
-    /// generated token) and its passes by rows, into the metrics.
+    /// The request's PLE row counts and wait, and a partially resident model's decode step (milliseconds a generated token, its
+    /// layers, head and PLE work apart), and with DS41_PROFILE all its decode phases and its passes by rows, into the metrics.
     fn report_profile(&mut self) {
         let (asked, read, blocks) = self.weights.row_counts(PLE_TABLE).map_or((0, 0, 0), |now| {
             (now.0 - self.ple_counts.0, now.1 - self.ple_counts.1, now.2 - self.ple_counts.2)
@@ -2751,7 +2784,18 @@ impl Model {
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
             let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
+            // What the host spent outside the layers' routes in a decode step (the line's "other" is made of it and the layers' own time), on
+            // every request, DS41_PROFILE or not. Not in a request that verified drafts: its passes have phases the line does not name.
+            let mut steps: BTreeMap<&str, f64> = BTreeMap::new();
+            if let Some(profile) = self.profile.as_ref().filter(|_| !self.last_metrics.contains_key("speculative_passes")) {
+                for (name, seconds) in &profile.phases {
+                    if let Some(part) = decode_part(name) {
+                        *steps.entry(part).or_default() += 1e3 * seconds / generated;
+                    }
+                }
+            }
             self.last_metrics.insert("partial_detail".into(), json!({
+                "steps_ms": steps,
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
@@ -2766,7 +2810,7 @@ impl Model {
                     .saturating_sub(self.hybrid_counts["devices"][0]["graph_replays"].as_u64().unwrap_or(0)),
             }));
         }
-        let Some(profile) = self.profile.as_ref() else { return };
+        let Some(profile) = self.profile.as_ref().filter(|profile| profile.every) else { return };
         let mut phases: Map<String, Value> = profile.phases.iter().map(|(name, seconds)| ((*name).to_string(), json!(1e3 * seconds / generated))).collect();
         if self.partial {
             // A generated token's routes by where they ran and its swaps, the slots they ran in, and
@@ -2988,6 +3032,42 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
         return Err("Straydog model PLE placement mismatch".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{decode_part, Profile};
+
+    /// Without DS41_PROFILE a partially resident model's profile keeps the decode step's phases the request line names, whatever pass they came in.
+    #[test]
+    fn a_profile_without_every_phase_keeps_the_steps_parts_alone() {
+        let timed = [("step: head", 1.5), ("step: first layer", 1.0), ("step: PLE rows wait", 0.5), ("step: PLE layer", 0.25),
+                     ("step: layers (first device)", 30.0), ("verify: head", 2.0), ("draft: next draft", 3.0), ("accept", 0.125)];
+        let kept = |every: bool| {
+            let mut profile = Profile::new(every);
+            for (name, seconds) in timed {
+                profile.add(name, seconds);
+            }
+            profile.end_pass(1, 0.0);
+            profile.phases.into_iter().collect::<Vec<_>>()
+        };
+        let parts = kept(false);
+        assert_eq!(parts.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                   ["step: PLE layer", "step: PLE rows wait", "step: first layer", "step: head", "step: layers (first device)"]);
+        assert!(parts.iter().all(|(name, _)| decode_part(name).is_some()));
+        assert_eq!(kept(true).len(), timed.len());
+    }
+
+    /// The parts of "other": the step's phases, the layers of both devices as one.
+    #[test]
+    fn the_steps_phases_are_the_lines_parts() {
+        let parts = ["step: head", "step: first layer", "step: PLE rows wait", "step: PLE layer", "step: layers (first device)", "step: layers (second device)"]
+            .map(decode_part);
+        assert_eq!(parts, [Some("head"), Some("first layer"), Some("PLE wait"), Some("PLE"), Some("layers"), Some("layers")]);
+        for other in ["verify: head", "verify: layers (first device)", "draft: embeddings", "accept", "PLE prefetch", "commit: DeltaNet replay"] {
+            assert_eq!(decode_part(other), None, "{other}");
+        }
+    }
 }
 
 #[cfg(test)]
