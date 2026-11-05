@@ -101,20 +101,18 @@ pub(crate) struct Stopped {
 /// checks, some seconds for the whole plan): the turns go on whoever has the engine, and the layers locked meanwhile are handed to the model
 /// together (`take`, under the lock) at the first moment the engine is free after a turn, or when the last is locked, which waits for a request
 /// that has it. So requests that follow one another at once, as an agent's do, find the layers registered at the first gap between them.
-/// `give_up` lets a layer go that the model will not take. `ended` is told how it went, under the lock, when it is over. `report` says it, at once.
+/// `job` is the plan, made under the engine's lock before a request could take it, with the engine's request count then (None: nothing is to be
+/// locked). `give_up` lets a layer go that the model will not take. `ended` is told how it went, under the lock, when it is over. `report` says it,
+/// at once.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S) -> u64, begin: impl FnOnce(&mut S) -> Option<J>,
+pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S) -> u64, job: Option<(J, u64)>,
                                    mut lock: impl FnMut(&mut J) -> Option<Result<(L, usize, u64), Stopped>>,
                                    mut take: impl FnMut(&mut S, L) -> Result<(), String>, give_up: impl Fn(L),
                                    ended: impl FnOnce(&mut S, &Locking), report: impl FnOnce(&Locking)) -> Locking {
     let started = Instant::now();
     let mut done = Locking::default();
-    let (mut job, first) = {
-        let Some(alive) = engine.upgrade() else { done.gone = true; return done };
-        let Ok(mut guard) = alive.lock() else { done.gone = true; return done };
-        let Some(job) = begin(&mut guard) else { return done };
-        (job, requests(&guard))
-    };
+    // (nothing planned: nothing to lock)
+    let Some((mut job, first)) = job else { return done };
     // The layers locked and checked that the model has not taken yet, with their bytes.
     let mut waiting: Vec<(L, u64)> = Vec::new();
     // Hand what waits to the model, under the lock; once it would take no more, the rest are let go.
@@ -212,7 +210,7 @@ mod tests {
 
     fn drive(engine: &Arc<Mutex<Model>>, plan: Plan, between: impl Fn(usize) + Send + 'static) -> Locking {
         let locked_log = plan.locked.clone();
-        lock_behind(&Arc::downgrade(engine), |model: &Model| model.requests, |_| Some(plan),
+        lock_behind(&Arc::downgrade(engine), |model: &Model| model.requests, Some((plan, 0)),
                     |plan: &mut Plan| {
                         if plan.layers.is_empty() {
                             return None;
@@ -311,7 +309,7 @@ mod tests {
             let (engine, given_up) = (Arc::downgrade(&engine), given_up.clone());
             let (at_46, proceed) = (at_46.0, Mutex::new(proceed.1));
             std::thread::spawn(move || {
-                lock_behind(&engine, |model: &Model| model.requests, |_| Some(vec![47, 46, 45]),
+                lock_behind(&engine, |model: &Model| model.requests, Some((vec![47, 46, 45], 0)),
                             |layers: &mut Vec<usize>| {
                                 let layer = layers.remove(0);
                                 if layer == 46 {
@@ -365,7 +363,7 @@ mod tests {
         let engine = Arc::new(Mutex::new(Model::default()));
         let weak = Arc::downgrade(&engine);
         drop(engine);
-        let locking = lock_behind(&weak, |model: &Model| model.requests, |_| Some(()), |_: &mut ()| Some(Ok(((), 0, 0))), |_: &mut Model, ()| Ok(()), |()| {},
+        let locking = lock_behind(&weak, |model: &Model| model.requests, Some(((), 0)), |_: &mut ()| Some(Ok(((), 0, 0))), |_: &mut Model, ()| Ok(()), |()| {},
                                   |_: &mut Model, _| panic!("no engine to tell"), |_| {});
         assert!(locking.gone);
     }
@@ -374,7 +372,7 @@ mod tests {
     #[test]
     fn nothing_planned_locks_nothing() {
         let engine = Arc::new(Mutex::new(Model::default()));
-        let locking = lock_behind(&Arc::downgrade(&engine), |model: &Model| model.requests, |_| None::<()>, |_: &mut ()| None::<Result<((), usize, u64), Stopped>>,
+        let locking = lock_behind(&Arc::downgrade(&engine), |model: &Model| model.requests, None::<((), u64)>, |_: &mut ()| None::<Result<((), usize, u64), Stopped>>,
                                   |_: &mut Model, ()| Ok(()), |()| {}, |_: &mut Model, _| panic!("nothing was begun"), |_| {});
         assert_eq!((locking.layers, locking.gone), (0, false));
         assert!(engine.lock().unwrap().ended.is_none());
