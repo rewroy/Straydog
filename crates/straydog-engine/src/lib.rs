@@ -2,6 +2,7 @@
 
 pub mod alloc;
 pub mod arch;
+pub mod assist;
 pub mod bundle;
 pub mod chat;
 pub mod constraint;
