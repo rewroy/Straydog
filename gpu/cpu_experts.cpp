@@ -761,6 +761,7 @@ void* sd_cpu_experts_create(uint32_t threads) {
         // path). STRAYDOG_CPU_INT8=0 keeps the F32 path (a comparison's other side).
         const char* int8 = std::getenv("STRAYDOG_CPU_INT8");
         engine->int8 = engine->int_level >= 2 && !(int8 && int8[0] == '0');
+        if (engine->int8) engine->isa = "avx512-int8";
         engine->workers = std::make_unique<Workers>(threads);
         return engine.release();
     } catch (const std::exception& e) { cpu_error = e.what(); return nullptr; }
