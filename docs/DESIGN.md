@@ -83,7 +83,7 @@ sees only what isolation exposes:
 - the pinned model and drafter files;
 - the GPU device nodes;
 - a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
-  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_DIRECT`), one list for bubblewrap and
   the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
 
 ```
@@ -765,15 +765,17 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   function, and what is over goes to the expert slots.
 - **Partial residency:** the CPU computes experts beyond VRAM from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
-  - On a CPU with AVX-512 and VBMI the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
+  - On a CPU with AVX-512 and VBMI, or AVX2, the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
     down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
     the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
     2-bit codes and a block's rows are looked up there; Q2_0's codes come out of one GFNI affine transform where the CPU has it. A
     row's accumulators stay in registers (an array of them went to memory, four 512-bit stores a block). Ryzen 5 7500F, Qwen3.8
     UD-IQ1_S, a route with the experts cold, F32 -> Q8: on six threads 48.0 -> 35.2 us on its IQ2_XXS layers and 46.0 -> 36.9 us on
     its IQ2_S layers; on one thread 226 -> 168 and 209 -> 165 us. Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
-    0.0009). Formats without integer kernels, and CPUs without those instructions, keep F32; `STRAYDOG_CPU_INT8=0` keeps it
-    everywhere.
+    0.0009). The AVX2 kernels (Intel's 12th to 14th generation, Zen 3) compute the same lanes in two 256-bit halves, so the same
+    bits; on the 7500F held to AVX2 (`STRAYDOG_CPU_AVX512=0`), six threads, cold: 72.4 -> 68.9 us (IQ2_XXS layers: the F32 kernels'
+    table lookups are as quick there), 84.8 -> 68.5 us (IQ2_S), and the down alone 18.7 -> 10.2 (one thread 93 -> 32). Formats
+    without integer kernels, and CPUs without AVX2, keep F32; `STRAYDOG_CPU_INT8=0` keeps it everywhere.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked
