@@ -66,7 +66,8 @@ fn cycle(gpu: &mut Backend, layout: &Arc<Layout>, host_slots: u64) -> (u64, u64)
     }
     store.settle(gpu).unwrap();
     let counts = store.counts();
-    assert!(counts.writebacks > 0 && counts.host_hits > 0, "the host tier was not used: {counts:?}");
+    // (not writebacks: an upload leaves its copy in the host tier while there is room, and an eviction then writes nothing back)
+    assert!(counts.drive_reads > 0 && counts.host_hits > 0, "the host tier was not used: {counts:?}");
     let with = resident();
     drop(store);
     (with, resident())
