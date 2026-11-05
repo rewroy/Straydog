@@ -492,3 +492,20 @@ fn rows_of_a_tensor_decode_independently() {
         }
     }
 }
+
+/// F32 weights that are all BF16 values (Unsloth's Qwen3.8 routers) go up as BF16: each value kept exactly, and anything else refused.
+#[test]
+fn f32_weights_of_bf16_values_narrow_exactly_and_others_are_refused() {
+    let values: Vec<f32> = [0.0f32, -0.0, 1.0, -3.5, 1.0e-30, 6.0e30, f32::MIN_POSITIVE, 0.0078125].iter()
+        .map(|value| f32::from_bits(value.to_bits() & 0xffff_0000)).collect();
+    let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    assert!(straydog_engine::gpu::bf16_exact(&bytes));
+    let narrow = straydog_engine::gpu::narrow_bf16(&bytes, "router").unwrap();
+    let widened: Vec<f32> = narrow.chunks_exact(2).map(|half| f32::from_bits(u32::from(u16::from_le_bytes([half[0], half[1]])) << 16)).collect();
+    assert_eq!(bits(&widened), bits(&values));
+    // (one value with a low bit set: not BF16, refused rather than rounded)
+    let mut odd = bytes.clone();
+    odd[8] = 1;
+    assert!(!straydog_engine::gpu::bf16_exact(&odd));
+    assert!(straydog_engine::gpu::narrow_bf16(&odd, "router").is_err());
+}
