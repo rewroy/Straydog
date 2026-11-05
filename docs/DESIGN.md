@@ -694,6 +694,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     (`hybrid_stage_assist`), two a layer: read in place they outlast the CPU's. At
     --vram 5 on 62 GiB with 41 layers locked (RTX 5070 Ti): 38.1 tokens/s with none, 35.2 with two
     read in place, 42.8 with two staged.
+    How many a layer is given (the level: 0 to 2 on CUDA, 0 to 4 on HIP) is the engine's to choose by
+    measuring (`assist.rs`), since it depends on the machine's PCIe link, CPU and VRAM. A round times
+    32 decode passes of one row at the level in force and 16 at each other (0, 1, 2 on CUDA; 0, 2, 4
+    on HIP), the layers' wall time as `step: layers` has it, every 2048 decode tokens and at a request
+    that begins after more; a level takes over only if 2% faster. A speculating model leaves its
+    drafts out of a round's passes so that each has one row. The level is carried by the layers'
+    captured graphs (`hybrid_assist` is passed to their kernels by value): a change drops the hybrid
+    layer graphs of decode and of verification (`hybrid_set_assist`) and the next pass captures them
+    again. With no layer page-locked nothing is measured. The level is in the request line.
   - With less host memory than twice the banks, the PLE table's row cache is 1 GiB: a token reads
     few rows and hundreds of experts.
   - With no bank page-locked the workers hint a layer's absent experts as they learn its routes

@@ -1885,6 +1885,32 @@ int sd_hybrid_slots(void* handle,uint64_t* slots,uint64_t* held) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+extern "C++" {
+// The most absent routes a layer's GPU takes that the engine tries (sd_hybrid_assist_level). CUDA copies them to VRAM's staging slots
+// first (hybrid_stage_assist): two a layer, where four saved the CPU 1.3 ms a token and cost 1.7 of waiting on an RTX 5070 Ti. HIP
+// reads them in place: four, on an R9700.
+#if defined(__HIPCC__)
+constexpr uint32_t hybrid_assist_cap=4;
+#else
+constexpr uint32_t hybrid_assist_cap=2;
+#endif
+// A layer's assist level is baked into its captured graphs (hybrid_assist is passed to the layer's kernels by value, in decode's
+// graphs and in verification's alike): a change of level drops every hybrid layer graph, whose replay would keep the old level, and
+// the next pass captures them again at the new one. Graphs of other tags hold no level.
+void hybrid_set_assist(Device& d,uint32_t level) {
+    if (level==d.assist) return;
+    check(hipStreamSynchronize(d.stream));
+    for (auto graph=d.graphs.begin();graph!=d.graphs.end();) {
+        if (graph->first.compare(0,7,"hybrid-")==0) {
+            check(hipGraphExecDestroy(graph->second.executable));
+            check(hipGraphDestroy(graph->second.graph));
+            graph=d.graphs.erase(graph);
+        } else ++graph;
+    }
+    d.assist=level;
+}
+} // extern "C++"
+uint32_t sd_hybrid_assist_cap(void) { return hybrid_assist_cap; }
 // Let the GPU read the first `assist` absent routes of a layer straight from
 // page-locked host banks while the CPU evaluates the rest. Returns plans mapped.
 int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
@@ -1905,13 +1931,22 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
         }
         d.hint_experts=*mapped==0;
 #if defined(__HIPCC__)
-        d.assist=assist;
+        hybrid_set_assist(d,assist);
 #else
         // CUDA: an assisted expert read over PCIe by the zero-copy GEMV outlasts the CPU experts on the
         // measured RTX 5070 Ti, so each layer waits for it: a kernel copies it to a staging slot first
-        // (hybrid_stage_assist). Two a layer: four saved the CPU 1.3 ms a token and cost 1.7 of waiting.
-        d.assist=std::min(assist,2u);
+        // (hybrid_stage_assist).
+        hybrid_set_assist(d,std::min(assist,hybrid_assist_cap));
 #endif
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The assist level alone, once sd_hybrid_assist has mapped the banks (mapping them again is the dear part of that call). A level past
+// the cap is refused.
+int sd_hybrid_assist_level(void* handle,uint32_t assist) {
+    try {
+        if (assist>hybrid_assist_cap) throw std::runtime_error("invalid hybrid assist level");
+        hybrid_set_assist(device(handle),assist);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
