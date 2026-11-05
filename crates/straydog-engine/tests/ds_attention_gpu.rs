@@ -7,7 +7,8 @@
 //! row's within FP16's rounding of its F32 scores, and nearly the same top 512 groups chosen.
 //!
 //! cargo test --release -p straydog-engine --features hip --test ds_attention_gpu, under the GPU lock.
-#![cfg(any(feature = "hip", feature = "cuda"))]
+// (RDNA4's kernels: kernels.cpp takes them only on an RDNA4 device, and a CUDA build runs these ops in F32, with nothing of theirs to compare)
+#![cfg(feature = "hip")]
 
 use straydog_engine::gpu::Backend;
 
