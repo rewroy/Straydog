@@ -92,6 +92,9 @@ pub enum Data<'a> {
     Decode(&'a [u8], u32),
     /// Weights of a GGML kind uploaded quantized to Q8_0 (the operand's kind 8).
     Quantize(&'a [u8], u32),
+    /// F32 values that are all BF16 values, uploaded as BF16 (the operand's kind 30): the same values in half the bytes
+    /// ([`bf16_exact`]).
+    Narrow(&'a [u8]),
     /// A part of a matrix (a layer split across GPUs): pieces of the matrix's mapped bytes, each placed in the part's bytes.
     Gather(Vec<Piece<'a>>),
     /// Gather's part of a matrix of a GGML kind, uploaded quantized to Q8_0 (the operand's kind 8; the drafter's projections).
@@ -137,6 +140,8 @@ pub struct Pending {
     pub decode: Option<u32>,
     /// With `decode`: the decoded values quantized to Q8_0 rather than uploaded as F32.
     pub quantize: bool,
+    /// With `decode` (F32): the values uploaded as BF16, each exactly (Data::Narrow).
+    pub narrow: bool,
     /// Where the source's bytes go in the allocation (a piece of a part, Data::Gather): from `offset`, or with `columns`
     /// a run of each row.
     pub offset: u64,
@@ -239,6 +244,20 @@ impl<'a> Operand<'a> {
 }
 
 /// A vector's bytes decoded to `count` finite F32 values.
+/// Whether F32 bytes hold only BF16 values (each value's low 16 bits zero): an F32 tensor of a bundle converted from BF16 weights, as
+/// Unsloth's Qwen3.8 routers and shared-expert mixes are.
+pub fn bf16_exact(bytes: &[u8]) -> bool {
+    bytes.len().is_multiple_of(4) && bytes.chunks_exact(4).all(|value| value[0] == 0 && value[1] == 0)
+}
+
+/// F32 bytes as BF16, each value kept exactly; an error if one is not a BF16 value.
+pub fn narrow_bf16(bytes: &[u8], key: &str) -> Result<Vec<u8>> {
+    if !bf16_exact(bytes) {
+        return Err(format!("{key}: not BF16 values"));
+    }
+    Ok(bytes.chunks_exact(4).flat_map(|value| [value[2], value[3]]).collect())
+}
+
 pub fn decode_vector(bytes: &[u8], kind: u32, count: usize, key: &str) -> Result<Vec<f32>> {
     let mut values = Vec::with_capacity(count);
     formats::decode_into(kind, bytes, &mut values).map_err(|exc| format!("{key}: {exc}"))?;
@@ -514,7 +533,7 @@ impl Backend {
                 // SAFETY: a plain size; the bytes arrive through `write`.
                 let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
                 let pending = Pending { pointer: device, source: piece.source.as_ptr(), bytes: piece.source.len(), decode: Some(*kind),
-                                        quantize: true, offset: 0, columns: piece.columns };
+                                        quantize: true, narrow: false, offset: 0, columns: piece.columns };
                 self.deferred.as_mut().ok_or("Straydog uploads are not deferred")?.push(pending);
                 let entry = Entry { pointer: device, kind: operand.kind as c_int, rows: operand.rows, cols: operand.cols };
                 self.cache.insert(operand.key.clone(), entry);
@@ -544,11 +563,16 @@ impl Backend {
             self.cache.insert(operand.key.clone(), entry);
             return Ok(entry);
         }
-        let (decoded, quantized);
+        let (decoded, quantized, narrowed);
         let (data, decode): (&[u8], Option<u32>) = match &operand.data {
             Data::Bytes(bytes) => (bytes, None),
             Data::Gather(_) | Data::QuantizeGather(..) => unreachable!(),
             Data::Decode(bytes, kind) | Data::Quantize(bytes, kind) if self.deferred.is_some() => (bytes, Some(*kind)),
+            Data::Narrow(bytes) if self.deferred.is_some() => (bytes, Some(0)),
+            Data::Narrow(bytes) => {
+                narrowed = narrow_bf16(bytes, &operand.key)?;
+                (&narrowed[..], None)
+            }
             Data::Decode(bytes, kind) => {
                 decoded = decode_vector(bytes, *kind, size / 4, &operand.key)?;
                 (float_bytes(&decoded), None)
@@ -567,11 +591,11 @@ impl Backend {
             return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
         }
         let device = match (&mut self.deferred, &operand.data) {
-            (Some(pending), Data::Bytes(_) | Data::Decode(..) | Data::Quantize(..)) => {
+            (Some(pending), Data::Bytes(_) | Data::Decode(..) | Data::Quantize(..) | Data::Narrow(_)) => {
                 // SAFETY: a plain size; the bytes arrive through `fill` or `write`.
                 let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
-                let quantize = matches!(operand.data, Data::Quantize(..));
-                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode, quantize, offset: 0,
+                let (quantize, narrow) = (matches!(operand.data, Data::Quantize(..)), matches!(operand.data, Data::Narrow(_)));
+                pending.push(Pending { pointer: device, source: data.as_ptr(), bytes: data.len(), decode, quantize, narrow, offset: 0,
                                        columns: None });
                 device
             }
@@ -606,7 +630,7 @@ impl Backend {
             let device = pointer(unsafe { ffi::sd_allocate(self.handle, size as u64) })?;
             for piece in pieces {
                 pending.push(Pending { pointer: device, source: piece.source.as_ptr(), bytes: piece.source.len(), decode: None,
-                                       quantize: false, offset: piece.at, columns: piece.columns });
+                                       quantize: false, narrow: false, offset: piece.at, columns: piece.columns });
             }
             device
         } else {

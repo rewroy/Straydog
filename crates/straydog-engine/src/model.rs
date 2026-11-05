@@ -848,6 +848,18 @@ impl Model {
         Ok(Operand { key: format!("{name}:q8"), data: Data::Quantize(bytes, operand.kind), kind: 8, rows: operand.rows, cols: operand.cols })
     }
 
+    /// A MoE's router. Unsloth's bundles store Qwen3.8's in F32 though every value is a BF16 value (the model's own): it goes up as BF16,
+    /// the same values in half the bytes a decode step reads (251.7 of a token's MB on its 48 layers), as GSQ's BF16 routers already do.
+    fn router(&self, name: &str) -> Result<Operand<'_>> {
+        let operand = self.projection(name)?;
+        match operand.data {
+            Data::Bytes(bytes) if self.weights.narrowed(name) => {
+                Ok(Operand { key: format!("{name}:bf16"), data: Data::Narrow(bytes), kind: 30, rows: operand.rows, cols: operand.cols })
+            }
+            _ => Ok(operand),
+        }
+    }
+
     /// A vector, uploaded decoded to F32.
     fn vector(&self, name: &str, key: Option<&str>) -> Result<Operand<'_>> {
         let key = key.map_or_else(|| format!("@vector:{name}"), str::to_string);
@@ -861,6 +873,10 @@ impl Model {
     fn mix_row(&self, name: &str) -> Result<Operand<'_>> {
         let (rows, cols) = self.weights.vector_shape(name)?;
         let (data, kind) = self.weights.raw(name, 0, None)?;
+        // (an F32 mix of BF16 values, as Unsloth stores Qwen3.8's, goes up as BF16 beside its router: Model::router)
+        if rows == 1 && kind == 0 && crate::gpu::bf16_exact(data) {
+            return Ok(Operand { key: format!("{name}:row"), data: Data::Narrow(data), kind: 30, rows: 1, cols: cols as u64 });
+        }
         if rows != 1 || kind != 30 {
             return self.vector(name, Some(&format!("{name}:vector")));
         }
@@ -1006,7 +1022,7 @@ impl Model {
         }
         let mut names = vec!["token_embd.weight".to_string()];
         for operand in &operands {
-            if let Data::Bytes(bytes) | Data::Decode(bytes, _) | Data::Quantize(bytes, _) = operand.data {
+            if let Data::Bytes(bytes) | Data::Decode(bytes, _) | Data::Quantize(bytes, _) | Data::Narrow(bytes) = operand.data {
                 let (file, offset) =
                     self.weights.locate(bytes.as_ptr(), bytes.len()).ok_or("Straydog operand is not mapped")?;
                 names.push(self.weights.tensor_at(file, offset)?.to_string());
@@ -1050,7 +1066,7 @@ impl Model {
         for role in ["gate", "up", "down"] {
             operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
         }
-        operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
+        operands.push(self.router(&format!("{prefix}ffn_gate_inp.weight"))?);
         operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
         // SAFETY of the borrow: operands point into the weights, which outlive the group.
         let operands: Vec<Operand<'static>> = unsafe { std::mem::transmute(operands) };
@@ -1066,7 +1082,7 @@ impl Model {
         for role in ["gate", "up", "down"] {
             operands.push(self.q8_projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
         }
-        operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
+        operands.push(self.router(&format!("{prefix}ffn_gate_inp.weight"))?);
         operands.push(self.mix_row(&format!("{prefix}ffn_gate_inp_shexp.weight"))?);
         let banks = Self::host_banks(&self.weights, 48)?;
         let kinds = self.weights.expert_kinds(48)?;
@@ -1115,7 +1131,7 @@ impl Model {
             for role in ["gate", "up", "down"] {
                 operands.push(self.projection(&format!("{prefix}ffn_{role}_shexp.weight"))?);
             }
-            operands.push(self.projection(&format!("{prefix}ffn_gate_inp.weight"))?);
+            operands.push(self.router(&format!("{prefix}ffn_gate_inp.weight"))?);
             let name = format!("{prefix}ffn_gate_inp_shexp.weight");
             operands.push(self.vector(&name, Some(&format!("{name}:vector")))?);
             // SAFETY of the borrows: banks and operands point into the weights, which outlive the group.

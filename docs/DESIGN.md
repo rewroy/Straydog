@@ -1019,6 +1019,14 @@ layer (§6.2).
   356 decode steps). DeepSeek-V4.1's dense GEMVs stay on the F32 kernels on CUDA (its Q8 switch,
   `DS41_Q8`, has no CUDA kernels behind it yet: the dense kernels take its formats, but turning
   them on there is a change to `sd_decode_options` and a quality run on a DeepSeek bundle).
+- **Routers as BF16.** Unsloth's bundles store Qwen3.8's routers (and shared-expert mixes) in F32,
+  but every value is a BF16 value, the model's own weights widened. Such a router goes up as BF16
+  (`Weights::narrowed`, `Data::Narrow`): the same values in half the bytes, 251.7 of the MB a decode
+  step reads on its 48 layers, and the GPU-side planning counts it so (UD-IQ1_S at 5.5 GiB: 953 ->
+  1040 expert slots). The decision is made from the mapping; the upload converts the verified copy
+  and refuses a value that is not BF16 (`gpu::narrow_bf16`). GSQ's bundles store them as BF16
+  already, and this is their path. The router's sums are BF16 rows' now, so its bits are not the F32
+  kernel's.
 - **HyperConnections in Q8_0.** The HyperConnections' down and up projections (BF16 in the bundle,
   1.26 GB of the 5.2 GB a row reads) go up quantized to Q8_0 at load, as llama.cpp quantizes:
   each 32 values' scale max |x| / 127. A decode pass reads half their bytes (plain decode

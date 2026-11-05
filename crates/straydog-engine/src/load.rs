@@ -121,7 +121,8 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
     // Decoding and quantizing on every core, the uploads one after another: these bytes were most of a start's wait after the reads.
     let threads = std::thread::available_parallelism().map_or(4, |count| count.get());
     let weights = &*weights;
-    let convert = |upload_bytes: usize, columns: Option<gpu::Columns>, quantize: bool, kind: u32, name: &String, within: u64| -> Result<Vec<u8>, String> {
+    let convert = |upload_bytes: usize, columns: Option<gpu::Columns>, quantize: bool, narrow: bool, kind: u32, name: &String, within: u64|
+                   -> Result<Vec<u8>, String> {
         // (the upload's bytes of the tensor, a part's rows or, with columns, a run of each row: whole blocks)
         let (bytes, _) = weights.raw(name, 0, None)?;
         let Some(source) = bytes.get(within as usize..within as usize + upload_bytes) else {
@@ -144,6 +145,10 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
         if elements * tensor.bytes != source.len() as u64 * tensor.elements() {
             return Err(format!("Straydog upload is not whole blocks of {name}"));
         }
+        if narrow {
+            // (F32 values all of which are BF16 values: their high halves, Data::Narrow)
+            return if kind == 0 { gpu::narrow_bf16(source, name) } else { Err(format!("Straydog narrows only F32: {name}")) };
+        }
         let values = gpu::decode_vector(source, kind, elements as usize, name)?;
         Ok(if quantize { crate::formats::quantize_q8_0(&values) }
            else { values.iter().flat_map(|value| value.to_le_bytes()).collect() })
@@ -151,8 +156,8 @@ pub fn load(weights: &mut Weights, group: &mut Group, pending: Vec<Vec<Pending>>
     for batch in decodes.chunks(threads) {
         let converted: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
             let running: Vec<_> = batch.iter().map(|(_, upload, kind, name, within)| {
-                let (convert, upload_bytes, columns, quantize) = (&convert, upload.bytes, upload.columns, upload.quantize);
-                scope.spawn(move || convert(upload_bytes, columns, quantize, *kind, name, *within))
+                let (convert, upload_bytes, columns, quantize, narrow) = (&convert, upload.bytes, upload.columns, upload.quantize, upload.narrow);
+                scope.spawn(move || convert(upload_bytes, columns, quantize, narrow, *kind, name, *within))
             }).collect();
             running.into_iter().map(|thread| thread.join().unwrap_or_else(|_| Err("a Straydog upload's conversion panicked".into()))).collect()
         });

@@ -133,6 +133,8 @@ pub struct Weights {
     /// or at the first start), so a file not changed since needs no reading through at a start.
     tree_current: Vec<bool>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
+    /// The F32 routers whose every value is a BF16 value, which go up as BF16 ([`Weights::narrowed`]).
+    narrow: std::sync::OnceLock<HashSet<String>>,
     embeddings: Mutex<EmbeddingCache>,
 }
 
@@ -285,6 +287,7 @@ impl Weights {
             verifiers: Vec::new(),
             tree_current: Vec::new(),
             vectors: Mutex::new(HashMap::new()),
+            narrow: std::sync::OnceLock::new(),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
         for asset in &pins.resources {
@@ -746,6 +749,23 @@ impl Weights {
             .map(|name| (name, &self.tensors[name]))
     }
 
+    /// Whether a MoE router is F32 in the bundle but every value a BF16 value (Unsloth's Qwen3.8: the model's own BF16 weights written
+    /// as F32), so it goes up as BF16: the same values, half the bytes. Decided from the mapping; the upload converts the verified
+    /// copy and refuses any value that is not BF16 (gpu::narrow_bf16), so no unverified byte reaches a GPU.
+    pub fn narrowed(&self, name: &str) -> bool {
+        self.narrow.get_or_init(|| {
+            self.order.iter().filter(|name| name.ends_with("ffn_gate_inp.weight"))
+                .filter(|name| self.tensors[*name].kind == 0 && self.tensors[*name].dims.len() == 2)
+                .filter(|name| self.raw(name, 0, None).is_ok_and(|(bytes, _)| crate::gpu::bf16_exact(bytes)))
+                .cloned().collect()
+        }).contains(name)
+    }
+
+    /// GPU bytes of a tensor when pinned (Tensor::device_bytes), a narrowed router's as BF16.
+    fn device_bytes(&self, name: &str, tensor: &Tensor) -> u64 {
+        if self.narrowed(name) { tensor.elements() * 2 } else { tensor.device_bytes(name) }
+    }
+
     /// GPU bytes of each decoder layer and of the rest placed with the last layer (head,
     /// MTP). Under expert parallelism the routed experts are split wherever the layer
     /// boundary falls, so only the rest is balanced.
@@ -757,8 +777,8 @@ impl Weights {
                 continue;
             }
             match layers.get_mut(layer) {
-                Some(slot) => *slot += tensor.device_bytes(name),
-                None => tail += tensor.device_bytes(name),
+                Some(slot) => *slot += self.device_bytes(name, tensor),
+                None => tail += self.device_bytes(name, tensor),
             }
         }
         (layers, tail)
@@ -768,7 +788,7 @@ impl Weights {
     pub fn resident_requirements(&self, drafter: bool) -> Vec<(String, u64)> {
         self.device_tensors()
             .filter(|(name, _)| drafter || !self.drafter_names.contains(*name))
-            .map(|(name, tensor)| (name.clone(), tensor.device_bytes(name)))
+            .map(|(name, tensor)| (name.clone(), self.device_bytes(name, tensor)))
             .collect()
     }
 
@@ -776,7 +796,7 @@ impl Weights {
     pub fn dense_requirements(&self) -> Vec<(String, u64)> {
         self.device_tensors()
             .filter(|(name, _)| !name.ends_with("_exps.weight") && !self.drafter_names.contains(*name))
-            .map(|(name, tensor)| (name.clone(), tensor.device_bytes(name)))
+            .map(|(name, tensor)| (name.clone(), self.device_bytes(name, tensor)))
             .collect()
     }
 
@@ -784,7 +804,7 @@ impl Weights {
     pub fn drafter_requirements(&self) -> Vec<(String, u64)> {
         self.device_tensors()
             .filter(|(name, _)| self.drafter_names.contains(*name))
-            .map(|(name, tensor)| (name.clone(), tensor.device_bytes(name)))
+            .map(|(name, tensor)| (name.clone(), self.device_bytes(name, tensor)))
             .collect()
     }
 
