@@ -808,6 +808,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         // a pass of up to the batch's rows, layer by layer: its buffers of every row (in the arena
         // lent to the expert store between long passes), and a few rows' own
         let rows = (batch + OWN_ROWS.min(batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
+        // Reserved on each device, so it comes out of that device's expert slots.
         let expansions = if settings.half_gemm { EXPANSIONS } else { 0 };
         let fixed = resident + state(range) + rows + SCRATCH + expansions + RESERVE + dspark_bytes(index);
         let free = vram.checked_sub(fixed)
