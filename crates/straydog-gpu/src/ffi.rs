@@ -2025,6 +2025,12 @@ unsafe extern "C" {
     pub fn sd_hybrid_supported(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_route_floor(
+        handle: *mut ::std::os::raw::c_void,
+        floor: f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_moe_create(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,
