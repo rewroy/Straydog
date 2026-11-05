@@ -119,6 +119,7 @@ impl Drafting {
 impl served::Engines for Engines {
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let started = Instant::now();
+        self.finish_checkpoints_below(tokens.len())?;
         let logits = forward_split(&mut self.engines, tokens)?;
         self.passed(tokens.len(), started);
         self.inject(tokens.len())?;
@@ -126,9 +127,11 @@ impl served::Engines for Engines {
     }
 
     fn reset(&mut self) {
-        // (a checkpoint whose copy fails is given up)
-        let _ = self.finish_checkpoints(usize::MAX);
+        // The checkpoints' copies still to be made are not waited for: the new sequence's passes make those of the rows they
+        // write over first (Engines::finish_checkpoints_below), the rows past them stay out of the expert stores, and the
+        // rest is copied in steps between requests. After a 21K-token conversation a new one waited 0.05 to 2.1 s for them.
         self.engines.iter_mut().for_each(Engine::reset);
+        self.hold_pending();
         if let Some(drafting) = self.drafting.as_mut() {
             drafting.forget();
         }
@@ -274,7 +277,9 @@ impl served::Engines for Engines {
 
     /// The checkpoints' copies a step at a time, then each store's room.
     fn make_room(&mut self) -> Result<bool, String> {
-        if !self.finish_checkpoints(self.step)? {
+        let copied = self.finish_checkpoints(self.step);
+        self.hold_pending();
+        if !copied? {
             return Ok(false);
         }
         let mut done = true;
@@ -329,6 +334,7 @@ impl served::Engines for Engines {
 
     fn verify(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let started = Instant::now();
+        self.finish_checkpoints_below(tokens.len())?;
         let logits = verify_split(&mut self.engines, tokens)?;
         self.passed(tokens.len(), started);
         Ok(logits)
@@ -367,6 +373,7 @@ impl served::Engines for Engines {
             } else {
                 // (the restore takes the devices' buffers from under the copies still to be made)
                 self.finish_checkpoints(usize::MAX)?;
+                self.hold_pending();
                 let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
                 self.engines.iter_mut().zip(snapshots).try_for_each(|(engine, snapshot)| engine.restore(snapshot))?;
             }
@@ -524,6 +531,37 @@ impl Engines {
             }
         }
         Ok(!self.saved.iter().flatten().flatten().any(Snapshot::pending))
+    }
+
+    /// Before a pass of `tokens` more: the pending copies of the checkpoints' rows that the sequence
+    /// reaching that far writes over ([`Engine::finish_snapshot_below`]), as after a reset. One whose
+    /// copy fails is given up.
+    fn finish_checkpoints_below(&mut self, tokens: usize) -> Result<(), String> {
+        for slot in 0..CHECKPOINTS {
+            let Some(snapshots) = self.saved[slot].as_mut() else { continue };
+            if !snapshots.iter().any(Snapshot::pending) {
+                continue;
+            }
+            let copied = self.engines.iter_mut().zip(snapshots.iter_mut())
+                .try_for_each(|(engine, snapshot)| engine.finish_snapshot_below(snapshot, engine.position() + tokens));
+            if let Err(error) = copied {
+                self.saved[slot] = None;
+                self.order.retain(|&held| held != slot);
+                self.hold_pending();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Each engine's kv source rows held out of its expert store as far as the checkpoints still
+    /// being copied reach ([`Engine::hold_state`]).
+    fn hold_pending(&mut self) {
+        for (index, engine) in self.engines.iter_mut().enumerate() {
+            let reach = self.saved.iter().flatten().filter_map(|snapshots| snapshots.get(index))
+                .filter(|snapshot| snapshot.pending()).map(Snapshot::position).max().unwrap_or(0);
+            engine.hold_state(reach);
+        }
     }
 
     /// [`Engines::finish_checkpoints`] of the checkpoints taken above `position` alone: those a sequence
