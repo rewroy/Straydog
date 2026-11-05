@@ -947,6 +947,11 @@ impl Group {
         self.backends.iter().map(|backend| backend.hybrid_counts().map(|counts| counts[6])).sum()
     }
 
+    /// Run every device's layers at this assist level (see [`Backend::set_assist_level`]).
+    pub fn set_assist_level(&mut self, level: u32) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.set_assist_level(level))
+    }
+
     /// Page locks are process-wide; one backend performs them.
     pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
         self.backends[0].register_host(range)

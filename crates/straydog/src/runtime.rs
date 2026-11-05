@@ -464,7 +464,9 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // (Windows: the hints that read a layer's cold experts ahead, taken while the machine paged and left when it did not)
     let read_aheads = detail["read_aheads"].as_array().filter(|counts| counts.iter().any(|count| count.as_u64().unwrap_or(0) > 0))
         .map_or_else(String::new, |counts| format!("; read-ahead: {} taken, {} left", counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
+    // (where the GPU may take some of the CPU's routes: the level the engine's measuring left in force, 0 to the most)
+    let assist = detail["assist"].as_u64().map_or_else(String::new, |level| format!(" (level {level})"));
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1546,6 +1548,21 @@ mod tests {
         assert!(summary.contains("decode phases (ms a token): step: layers 26.500, step: head 1.250, hybrid: CPU routes (count) 307.0"), "{summary}");
         assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
                 "{summary}");
+    }
+
+    /// A partially resident request's line says the assist level its decode ended at, where the GPU may take the CPU's routes.
+    #[test]
+    fn a_partial_request_line_has_the_assist_level() {
+        let detail = |assist: Value| json!({"wait_ms": 8.0, "cpu_ms": 20.0, "gpu_routes": 200.0, "cpu_routes": 180.0, "assisted_routes": 70.0,
+                                            "swaps": 3.0, "slots": 900, "passes": [10, 0], "pass_ms": [70.0, 0.0], "assist": assist});
+        let event = |assist: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 14.0, "partial_detail": detail(assist)}});
+        let with = request_summary(&event(json!(1)), None);
+        assert!(with.contains("assisted 70 (level 1), swaps 3.0"), "{with}");
+        let level_0 = request_summary(&event(json!(0)), None);
+        assert!(level_0.contains("assisted 70 (level 0), swaps 3.0"), "{level_0}");
+        // (no page-locked layer: no level to say)
+        let without = request_summary(&event(Value::Null), None);
+        assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
     }
 
     /// The ready line says whether DSpark is placed, and with how many experts a stage.

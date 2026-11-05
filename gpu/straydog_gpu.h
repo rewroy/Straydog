@@ -540,6 +540,11 @@ int sd_hybrid_attach_cpu(void* handle, void* engine);
 int sd_hybrid_drain(void* handle);
 int sd_hybrid_rebalance(void* handle, uint64_t max_swaps);
 int sd_hybrid_assist(void* handle, uint32_t assist, uint64_t* mapped);
+/* The most absent routes a layer's GPU takes that the engine tries: CUDA 2 (staged), HIP 4. */
+uint32_t sd_hybrid_assist_cap(void);
+/* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
+   captured graphs, which carry the level, and the next pass captures them again. */
+int sd_hybrid_assist_level(void* handle, uint32_t assist);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);

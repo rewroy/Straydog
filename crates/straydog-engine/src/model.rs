@@ -17,6 +17,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
+use crate::assist;
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
@@ -461,6 +462,8 @@ pub struct Model {
     /// Running means of a decode pass's seconds with one row and with two (0: none yet), for [`Model::partial_drawn_cut`].
     pass_seconds: [f64; 2],
     passes_with_draft: u32,
+    /// The assist level's tuner, where banks are page-locked and the GPU can take some of the CPU's routes ([`crate::assist`]).
+    assist: Option<assist::Tuner>,
     /// This request's passes by rows, and this process's memory as it began, for its log line.
     pass_counts: [u64; 2],
     memory_before: Option<(u64, u64, u64)>,
@@ -606,6 +609,7 @@ impl Model {
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::default()),
             pass_seconds: [0.0; 2],
             passes_with_draft: 0,
+            assist: None,
             pass_counts: [0; 2],
             memory_before: None,
             read_aheads_before: (0, 0),
@@ -1183,8 +1187,13 @@ impl Model {
             // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
             // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
             // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the
-            // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist).
-            self.group.enable_assist(4)?;
+            // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist). That is the most a
+            // layer is given: how many it is worth on this machine, the engine measures in decode
+            // (crate::assist), from the most at the start.
+            let cap = crate::gpu::Backend::assist_cap();
+            if self.group.enable_assist(cap)? > 0 {
+                self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
+            }
         }
         // Speed first (STRAYDOG_EXPERT_FLOOR, a router weight from 0 to 1): the CPU's routes below it are left out.
         if let Some(floor) = expert_floor()? {
@@ -1786,6 +1795,7 @@ impl Model {
                 group.ple("blk.1.", &hidden, &embeddings, operands)
             })?;
             self.phase("step: PLE layer", &mut clock);
+            let layers = Instant::now();
             for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
                 if cancelled() {
                     self.reset()?;
@@ -1794,6 +1804,7 @@ impl Model {
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
                 self.phase(["step: layers (first device)", "step: layers (second device)"][index.min(1)], &mut clock);
             }
+            self.assist_pass(layers.elapsed().as_secs_f64());
             if self.speculative > 0 {
                 // The MTP layer's pair of the row before, its token now known (the longer
                 // prompts' paths write theirs from there too).
@@ -2318,9 +2329,13 @@ impl Model {
             self.phase("verify: PLE layer", &mut clock);
             (first, embeddings, hidden)
         };
+        let layers = Instant::now();
         for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
             hidden = self.group.verify_span(begin, end, &hidden, position)?;
             self.phase(["verify: layers (first device)", "verify: layers (second device)"][index.min(1)], &mut clock);
+        }
+        if tokens.len() == 1 {
+            self.assist_pass(layers.elapsed().as_secs_f64());
         }
         Ok((first, embeddings, hidden))
     }
@@ -2381,6 +2396,54 @@ impl Model {
         self.last_metrics.insert(key.into(), json!(value));
     }
 
+    /// Put in force the assist level a round of [`crate::assist`] asks for, or the next best where one cannot be set, and say what a
+    /// round found when it is worth saying.
+    fn assist_apply(&mut self, mut next: Option<u32>) {
+        let Some(tuner) = self.assist.as_mut() else { return };
+        while let Some(level) = next.take() {
+            match self.group.set_assist_level(level) {
+                Ok(()) => tuner.set(level),
+                Err(error) => {
+                    eprintln!("Straydog assist: level {level} cannot be set ({error}); it is left out");
+                    next = tuner.cannot_set(level);
+                }
+            }
+        }
+        if let Some(outcome) = tuner.outcome().filter(assist::Outcome::worth_saying) {
+            eprintln!("{}", outcome.line());
+        }
+    }
+
+    /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
+    fn assist_pass(&mut self, seconds: f64) {
+        if let Some(next) = self.assist.as_mut().map(|tuner| tuner.pass(seconds)) {
+            self.assist_apply(next);
+        }
+    }
+
+    /// Whether the passes now are timed as windows of a round: those of a speculating model have no drafts, so that each has one row.
+    fn assist_probing(&self) -> bool {
+        self.forced_rows.is_none() && self.assist.as_ref().is_some_and(assist::Tuner::probing)
+    }
+
+    /// `count` decode tokens were generated.
+    fn assist_tokens(&mut self, count: u64) {
+        if self.forced_rows.is_none() {
+            if let Some(tuner) = self.assist.as_mut() {
+                tuner.tokens(count);
+            }
+        }
+    }
+
+    /// A request begins to decode.
+    fn assist_request(&mut self) {
+        if self.forced_rows.is_none() {
+            if let Some(tuner) = self.assist.as_mut() {
+                tuner.request();
+            }
+        }
+    }
+
     fn update_rate(&mut self) {
         let forwards = self.last_metrics["decode_forward_tokens"].as_u64().unwrap_or(0) as f64;
         let seconds = self.last_metrics["decode_seconds"].as_f64().unwrap_or(0.0);
@@ -2420,13 +2483,15 @@ impl Model {
                 break;
             }
             let pass_started = Instant::now();
-            let limit = self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
+            // (while a round of the assist's tuner times decode passes of one row, none has drafts: crate::assist)
+            let probing = self.assist_probing();
+            let limit = if probing { 0 } else { self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let copy_limit = self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1));
+            let copy_limit = if probing { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
@@ -2500,6 +2565,7 @@ impl Model {
                 *mean = if *mean > 0.0 { *mean + (seconds.min(3.0 * *mean) - *mean) / 16.0 } else { seconds };
             }
             self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
+            self.assist_tokens(emitted.len() as u64);
             if let Some(count) = self.pass_counts.get_mut(rows.len().wrapping_sub(1)) {
                 *count += 1;
             }
@@ -2599,6 +2665,7 @@ impl Model {
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
+                "assist": self.assist.as_ref().map(assist::Tuner::level),
                 "slots": info["cached_experts"], "streamed": spent("streamed_experts"),
                 "passes": self.pass_counts, "pass_ms": [1e3 * self.pass_seconds[0], 1e3 * self.pass_seconds[1]],
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
@@ -2698,6 +2765,7 @@ impl Model {
         self.set_rope_delta(self.history.len())?;
         let mut rng = Rng::new(seed);
         let Some(mut logits) = output else { return Ok(()) };
+        self.assist_request();
         if self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token) {
             return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit, constraint);
         }
@@ -2729,6 +2797,7 @@ impl Model {
                 self.pass_counts[0] += 1;
                 self.pass_seconds[0] = if self.pass_seconds[0] > 0.0 { self.pass_seconds[0] + (seconds.min(3.0 * self.pass_seconds[0]) - self.pass_seconds[0]) / 16.0 } else { seconds };
                 self.metric_count("decode_forward_tokens", 1);
+                self.assist_tokens(1);
                 self.update_rate();
             }
         }

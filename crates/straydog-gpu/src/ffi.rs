@@ -2082,6 +2082,15 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_assist_cap() -> u32;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_assist_level(
+        handle: *mut ::std::os::raw::c_void,
+        assist: u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_decay(decay: f64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

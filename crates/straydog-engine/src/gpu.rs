@@ -2091,6 +2091,19 @@ impl Backend {
         Ok(mapped)
     }
 
+    /// The most absent routes a layer's GPU takes that this build tries (CUDA 2, staged; HIP 4).
+    pub fn assist_cap() -> u32 {
+        // SAFETY: a constant of the library.
+        unsafe { ffi::sd_hybrid_assist_cap() }
+    }
+
+    /// Change the assist level alone, once [`Backend::enable_assist`] has mapped the banks. The layers' captured graphs, which
+    /// carry the level, are dropped when it changes: the next pass captures them again.
+    pub fn set_assist_level(&mut self, level: u32) -> Result<()> {
+        // SAFETY: a live handle and a plain value.
+        check(unsafe { ffi::sd_hybrid_assist_level(self.handle, level) }).map(drop)
+    }
+
     /// Page-lock a mapped range for direct DMA; the runtime's reason if it refused.
     pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
         // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
