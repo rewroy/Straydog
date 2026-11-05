@@ -422,7 +422,11 @@ fn experts_moved_for_a_decode_table() {
         } else {
             from_host += 1;
         }
+        // (a read that failed leaves the expert in neither tier, which is a failure of the test, not a reason to look again for ever)
+        let mut looks = 0;
         while matches!(source, HostSource::Absent | HostSource::Reading) {
+            looks += 1;
+            assert!(looks < 10_000, "step {step}: the expert is in neither tier after {looks} looks (a failed read?)");
             if matches!(source, HostSource::Reading) {
                 store.wait_reads(&mut gpu).unwrap();
             }
