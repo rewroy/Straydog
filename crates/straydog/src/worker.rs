@@ -536,6 +536,10 @@ pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
+    // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
+    if !straydog_engine::host::full_speed() {
+        eprintln!("WARN Straydog could not turn off the system's power throttling of its worker");
+    }
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     let plan = plan(&args, &|stage, done, total| loading.report(stage, done, total))?;
