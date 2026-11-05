@@ -10,8 +10,11 @@
 //! pass's layers (the "step: layers" of `decode_profile`). The level in force goes first and has the longer window: it is the level the
 //! model would run at anyway, while a window at another level costs the difference of the two for each of its passes. A round spends
 //! [`ROUND_PASSES`] passes of every [`INTERVAL`] decode tokens (3% with two levels besides the one in force), most of them at the
-//! level in force. A level replaces it only if it is [`GAIN`] faster. Passes of other rows, and prefill, run at the level in force and
-//! are never timed; while a round times, a speculating model leaves its drafts out so that every pass is one of one row.
+//! level in force. A level replaces it only if it is [`GAIN`] faster and the difference is more than [`CONFIDENCE`] standard errors of
+//! it: passes vary by a quarter from one to the next, and a window of 16 cannot tell 2% from nothing, so a level that was not told apart
+//! from the one in force by its windows does not replace it (the engine never stays at a level on noise). Passes of other rows, and
+//! prefill, run at the level in force and are never timed; while a round times, a speculating model leaves its drafts out so that every
+//! pass is one of one row.
 //!
 //! Plain logic: the model feeds it passes and tokens and does what it returns (`Model::assist_apply`).
 
@@ -22,6 +25,8 @@ pub const HELD_WINDOW: usize = 32;
 pub const OTHER_WINDOW: usize = 16;
 /// The part of the level in force's time that another level must save to replace it.
 pub const GAIN: f64 = 0.02;
+/// How many standard errors of the difference of two windows' means that saving must exceed.
+pub const CONFIDENCE: f64 = 2.0;
 
 /// Passes of one row a round with `levels` levels spends: each window, and the pass after each change of level that is not timed (the
 /// layers' graphs are captured again in it) and the one at the start of a round.
@@ -43,6 +48,14 @@ pub fn levels(cap: u32) -> Vec<u32> {
     levels
 }
 
+/// A level's window: the mean seconds of a pass's layers (without the slowest eighth) and its standard error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Timing {
+    pub level: u32,
+    pub seconds: f64,
+    pub error: f64,
+}
+
 /// What a finished round found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
@@ -51,8 +64,8 @@ pub struct Outcome {
     /// The level in force when the round began, and the one in force after it.
     pub from: u32,
     pub chosen: u32,
-    /// Each level timed, with the seconds of a pass's layers there, by level.
-    pub measured: Vec<(u32, f64)>,
+    /// Each level timed, by level.
+    pub measured: Vec<Timing>,
 }
 
 impl Outcome {
@@ -61,14 +74,16 @@ impl Outcome {
         self.first || self.chosen != self.from
     }
 
-    /// The log line: each level's milliseconds a pass of the layers, and the level kept.
+    /// The log line: each level's milliseconds a pass of the layers with their standard error (to see whether the levels were told apart),
+    /// and the level kept.
     pub fn line(&self) -> String {
         let mut text = String::from("Straydog assist:");
-        for (at, (level, seconds)) in self.measured.iter().enumerate() {
+        for (at, timing) in self.measured.iter().enumerate() {
+            let (level, seconds, error) = (timing.level, timing.seconds * 1e3, timing.error * 1e3);
             if at == 0 {
-                text.push_str(&format!(" {level} a layer {:.1} ms a pass", seconds * 1e3));
+                text.push_str(&format!(" {level} a layer {seconds:.1}±{error:.1} ms a pass"));
             } else {
-                text.push_str(&format!(", {level}: {:.1}", seconds * 1e3));
+                text.push_str(&format!(", {level}: {seconds:.1}±{error:.1}"));
             }
         }
         if self.chosen == self.from {
@@ -87,7 +102,7 @@ struct Round {
     at: usize,
     skip: usize,
     samples: Vec<f64>,
-    measured: Vec<(u32, f64)>,
+    measured: Vec<Timing>,
     held: u32,
     /// Once every window is timed: the level chosen, until it is in force.
     target: Option<u32>,
@@ -103,13 +118,17 @@ pub struct Tuner {
     outcome: Option<Outcome>,
 }
 
-/// The mean of `samples` without the slowest eighth: a stall of the machine in a pass (a page fault's wait, another process's thread
-/// on a core) says nothing of its level, and one pass in 16 at ten times the rest moves the plain mean by more than [`GAIN`].
-fn trimmed_mean(samples: &[f64]) -> f64 {
+/// The mean of `samples` without the slowest eighth, and its standard error: a stall of the machine in a pass (a page fault's wait,
+/// another process's thread on a core) says nothing of its level, and one pass in 16 at ten times the rest moves the plain mean by more
+/// than [`GAIN`]. The error is that of the passes kept.
+fn trimmed_mean(samples: &[f64]) -> (f64, f64) {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
     let kept = &sorted[..sorted.len() - sorted.len() / 8];
-    kept.iter().sum::<f64>() / kept.len() as f64
+    let n = kept.len() as f64;
+    let mean = kept.iter().sum::<f64>() / n;
+    let variance = kept.iter().map(|seconds| (seconds - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
+    (mean, (variance / n).sqrt())
 }
 
 impl Tuner {
@@ -160,13 +179,17 @@ impl Tuner {
         }
     }
 
-    /// The level chosen from `measured`: the fastest, if it is [`GAIN`] faster than `held`'s, else `held`.
-    fn choose(measured: &[(u32, f64)], held: u32) -> u32 {
-        let Some(&(_, held_time)) = measured.iter().find(|(level, _)| *level == held) else {
-            return measured.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map_or(held, |best| best.0);
+    /// The level chosen from `measured`: the fastest of those that are [`GAIN`] faster than `held` and by more than [`CONFIDENCE`] standard
+    /// errors of the difference (the two windows' errors added as squares), else `held`.
+    fn choose(measured: &[Timing], held: u32) -> u32 {
+        let Some(&kept) = measured.iter().find(|timing| timing.level == held) else {
+            return measured.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds)).map_or(held, |best| best.level);
         };
-        measured.iter().filter(|(level, seconds)| *level != held && *seconds <= held_time * (1.0 - GAIN))
-            .min_by(|a, b| a.1.total_cmp(&b.1)).map_or(held, |best| best.0)
+        measured.iter().filter(|timing| {
+            let saved = kept.seconds - timing.seconds;
+            timing.level != held && timing.seconds <= kept.seconds * (1.0 - GAIN)
+                && saved > CONFIDENCE * kept.error.hypot(timing.error)
+        }).min_by(|a, b| a.seconds.total_cmp(&b.seconds)).map_or(held, |best| best.level)
     }
 
     /// The next window, or the end of the round. The level to put in force, if it is not.
@@ -190,7 +213,7 @@ impl Tuner {
         self.rounds += 1;
         self.since = 0;
         let mut measured = round.measured;
-        measured.sort_by_key(|(level, _)| *level);
+        measured.sort_by_key(|timing| timing.level);
         self.outcome = Some(Outcome { first: self.rounds == 1, from: round.held, chosen: self.level, measured });
     }
 
@@ -205,8 +228,8 @@ impl Tuner {
         if round.samples.len() < if round.at == 0 { HELD_WINDOW } else { OTHER_WINDOW } {
             return None;
         }
-        let measured = (round.order[round.at], trimmed_mean(&round.samples));
-        round.measured.push(measured);
+        let (seconds, error) = trimmed_mean(&round.samples);
+        round.measured.push(Timing { level: round.order[round.at], seconds, error });
         round.samples.clear();
         round.at += 1;
         self.advance()
@@ -224,7 +247,7 @@ impl Tuner {
     pub fn cannot_set(&mut self, level: u32) -> Option<u32> {
         self.levels.retain(|other| *other != level);
         let round = self.round.as_mut()?;
-        round.measured.retain(|(other, _)| *other != level);
+        round.measured.retain(|timing| timing.level != level);
         if round.target.is_some() {
             // (the round was over and its choice cannot be had: the best of the rest)
             let chosen = Self::choose(&round.measured, round.held);
@@ -259,15 +282,22 @@ mod tests {
     /// right after a change takes `fresh` more: the graphs are captured again). Returns the passes the round took and the levels set,
     /// in order.
     fn run(tuner: &mut Tuner, times: &dyn Fn(u32) -> f64, fresh: f64) -> (usize, Vec<u32>) {
-        let (mut passes, mut set, mut extra) = (0, Vec::new(), fresh);
+        run_with(tuner, &|level, _| times(level), fresh)
+    }
+
+    /// [`run`] with the passes' times varying: `times` gets the level and the number of the pass at it (0: the one not timed).
+    fn run_with(tuner: &mut Tuner, times: &dyn Fn(u32, usize) -> f64, fresh: f64) -> (usize, Vec<u32>) {
+        let (mut passes, mut set, mut extra, mut nth) = (0, Vec::new(), fresh, 0);
         while tuner.probing() {
             passes += 1;
             assert!(passes < 1000, "the round never ends");
-            let seconds = times(tuner.level()) + std::mem::take(&mut extra);
+            let seconds = times(tuner.level(), nth) + std::mem::take(&mut extra);
+            nth += 1;
             if let Some(level) = tuner.pass(seconds) {
                 tuner.set(level);
                 set.push(level);
                 extra = fresh;
+                nth = 0;
             }
         }
         (passes, set)
@@ -295,7 +325,7 @@ mod tests {
         assert_eq!(set, [0, 1, 0]);
         let outcome = tuner.outcome().unwrap();
         assert_eq!((outcome.first, outcome.from, outcome.chosen), (true, 2, 0));
-        assert_eq!(outcome.measured.iter().map(|(level, _)| *level).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(outcome.measured.iter().map(|timing| timing.level).collect::<Vec<_>>(), [0, 1, 2]);
         assert!(!tuner.probing() && tuner.level() == 0);
         assert!(tuner.outcome().is_none());
     }
@@ -377,13 +407,13 @@ mod tests {
         // 5 s among 50 ms passes: the trimmed mean reads 50 ms, as does the one of a window with three
         let mut with = vec![0.050; HELD_WINDOW];
         with[7] = 5.0;
-        assert!((trimmed_mean(&with) - 0.050).abs() < 1e-12);
+        assert!((trimmed_mean(&with).0 - 0.050).abs() < 1e-12);
         with[8] = 3.0;
         with[30] = 2.0;
-        assert!((trimmed_mean(&with) - 0.050).abs() < 1e-12);
+        assert!((trimmed_mean(&with).0 - 0.050).abs() < 1e-12);
         let mut other = vec![0.050; OTHER_WINDOW];
         other[3] = 5.0;
-        assert!((trimmed_mean(&other) - 0.050).abs() < 1e-12);
+        assert!((trimmed_mean(&other).0 - 0.050).abs() < 1e-12);
         // a stall in the level in force's window does not make 0 look 2% faster
         let mut tuner = Tuner::new(vec![0, 1], 1);
         tuner.request();
@@ -404,8 +434,8 @@ mod tests {
         let mut tuner = Tuner::new(vec![0, 1, 2], 1);
         tuner.request();
         run(&mut tuner, &|_| 0.1, 0.8);
-        for (_, seconds) in tuner.outcome().unwrap().measured {
-            assert!((seconds - 0.1).abs() < 1e-12, "{seconds}");
+        for timing in tuner.outcome().unwrap().measured {
+            assert!((timing.seconds - 0.1).abs() < 1e-12, "{timing:?}");
         }
     }
 
@@ -429,7 +459,7 @@ mod tests {
         assert_eq!(asked, [0, 1]);
         assert_eq!(tuner.level(), 0);
         let outcome = tuner.outcome().unwrap();
-        assert_eq!(outcome.measured.iter().map(|(level, _)| *level).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(outcome.measured.iter().map(|timing| timing.level).collect::<Vec<_>>(), [0, 2]);
         // not asked for again in the rounds after it
         tuner.tokens(INTERVAL);
         assert!(tuner.probing());
@@ -463,7 +493,7 @@ mod tests {
         assert_eq!(tuner.level(), 1);
         let outcome = tuner.outcome().unwrap();
         assert_eq!((outcome.from, outcome.chosen), (2, 1));
-        assert_eq!(outcome.measured.iter().map(|(level, _)| *level).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(outcome.measured.iter().map(|timing| timing.level).collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]
@@ -488,6 +518,62 @@ mod tests {
     }
 
     #[test]
+    fn the_error_of_a_trimmed_mean() {
+        // 1 to 8: the slowest eighth (the 8) goes, leaving 1 to 7 with a mean of 4, a sample variance of 28/6 and an error of its root over 7
+        let (mean, error) = trimmed_mean(&[3.0, 1.0, 2.0, 8.0, 5.0, 4.0, 6.0, 7.0]);
+        assert!((mean - 4.0).abs() < 1e-12);
+        assert!((error - (28.0f64 / 6.0 / 7.0).sqrt()).abs() < 1e-12, "{error}");
+        assert_eq!(trimmed_mean(&[0.05; 16]).1, 0.0);
+    }
+
+    /// A window's passes: `seconds` with the swing of `noise` (a part of it) up and down in turn, and a little else between so that no two
+    /// windows are alike.
+    fn noisy(seconds: f64, noise: f64, nth: usize) -> f64 {
+        seconds * (1.0 + noise * [1.0, -1.0, 0.5, -0.5][nth % 4])
+    }
+
+    /// A round from the level in force, 2, at `held` seconds, against 0 at `faster` times that, with passes swinging by `noise`; the level
+    /// in force afterwards.
+    fn after_a_round(faster: f64, noise: f64) -> (u32, Outcome) {
+        let mut tuner = Tuner::new(vec![0, 2], 2);
+        tuner.request();
+        run_with(&mut tuner, &|level, nth| noisy(if level == 2 { 0.100 } else { 0.100 * faster }, noise, nth), 0.0);
+        (tuner.level(), tuner.outcome().unwrap())
+    }
+
+    #[test]
+    fn a_gain_within_the_noise_leaves_the_level_in_force() {
+        // 3% faster by the means, with passes swinging by 12%: the windows cannot tell the two apart
+        let (level, outcome) = after_a_round(0.97, 0.12);
+        assert_eq!(level, 2, "{outcome:?}");
+        assert_eq!(outcome.chosen, 2);
+        let (held, other) = (outcome.measured[1], outcome.measured[0]);
+        assert!(other.seconds < held.seconds * (1.0 - GAIN), "the gain is there in the means: {outcome:?}");
+        assert!(held.seconds - other.seconds < CONFIDENCE * held.error.hypot(other.error), "and within the noise: {outcome:?}");
+        // the same 3% from clean passes is a gain
+        let (level, outcome) = after_a_round(0.97, 0.002);
+        assert_eq!(level, 0, "{outcome:?}");
+        assert!(outcome.worth_saying());
+    }
+
+    #[test]
+    fn a_gain_beyond_the_noise_replaces_the_level_in_force() {
+        // 20% faster against swings of 12%: far beyond twice the error of a difference
+        let (level, outcome) = after_a_round(0.80, 0.12);
+        assert_eq!(level, 0, "{outcome:?}");
+        // and a level slower by the same is left
+        let (level, _) = after_a_round(1.20, 0.12);
+        assert_eq!(level, 2);
+    }
+
+    #[test]
+    fn the_noisier_window_needs_the_bigger_gain() {
+        // the same 4% gain: told apart in passes swinging by 1%, not in passes swinging by 15%
+        assert_eq!(after_a_round(0.96, 0.01).0, 0);
+        assert_eq!(after_a_round(0.96, 0.15).0, 2);
+    }
+
+    #[test]
     fn a_round_costs_a_few_percent_of_the_tokens() {
         // two levels beside the one in force
         assert_eq!(ROUND_PASSES, 67);
@@ -498,10 +584,11 @@ mod tests {
 
     #[test]
     fn the_line_names_each_level_and_the_one_kept() {
-        let kept = Outcome { first: true, from: 1, chosen: 1, measured: vec![(0, 0.0612), (1, 0.0580), (2, 0.0635)] };
-        assert_eq!(kept.line(), "Straydog assist: 0 a layer 61.2 ms a pass, 1: 58.0, 2: 63.5; keeping 1");
-        let moved = Outcome { first: false, from: 2, chosen: 0, measured: vec![(0, 0.05), (2, 0.06)] };
-        assert_eq!(moved.line(), "Straydog assist: 0 a layer 50.0 ms a pass, 2: 60.0; now 0 (was 2)");
+        let timing = |level, seconds, error| Timing { level, seconds, error };
+        let kept = Outcome { first: true, from: 1, chosen: 1, measured: vec![timing(0, 0.0612, 0.0015), timing(1, 0.0580, 0.0009), timing(2, 0.0635, 0.0020)] };
+        assert_eq!(kept.line(), "Straydog assist: 0 a layer 61.2±1.5 ms a pass, 1: 58.0±0.9, 2: 63.5±2.0; keeping 1");
+        let moved = Outcome { first: false, from: 2, chosen: 0, measured: vec![timing(0, 0.05, 0.0004), timing(2, 0.06, 0.0)] };
+        assert_eq!(moved.line(), "Straydog assist: 0 a layer 50.0±0.4 ms a pass, 2: 60.0±0.0; now 0 (was 2)");
         assert!(moved.worth_saying() && kept.worth_saying());
         assert!(!Outcome { first: false, ..kept }.worth_saying());
     }
