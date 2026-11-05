@@ -926,6 +926,13 @@ size_t gemv_waves(const Matrix& m, unsigned lanes) {
 // faster on eight: 32 cost them a microsecond). Decided by the matrix and the device alone, as gemv_lanes is, so a row's sum is
 // the same whatever shares its launch.
 unsigned gemv_q8_lanes(const Device& d, const Matrix& m, unsigned lanes) {
+#if !defined(__HIPCC__)
+    // CUDA: twice the lanes of the F32 kernels' plan (the same function of the matrix, so a row's sum is the same whatever shares its launch). A
+    // row of the Q8 kernels has little to compute and each lane's units are a chain of dependent loads: half as many a lane, and twice the waves
+    // to fill the SMs (Qwen3.8's 2560 x 6144 projections: 80 blocks of eight waves, an SM short of one each, become 160), took the dense front from
+    // 45 to 40 microseconds on an RTX 5070 Ti, a floor of 38.
+    if (lanes && d.q8_wide && (m.kind == 8 || m.kind == 12 || m.kind == 13 || m.kind == 14 || m.kind == 23) && m.cols % 256 == 0) lanes = std::min(32u, 2 * lanes);
+#endif
     return lanes && d.q8_decode && m.kind == 13 && m.cols >= 1024 && m.cols < 2048 && m.cols % 256 == 0 ? 32 : lanes;
 }
 #if !defined(__HIPCC__)
@@ -1009,12 +1016,31 @@ __global__ void gemv_decode_shared_rdna4(Matrix matrix, unsigned lanes, const fl
 }
 #endif
 
-#if defined(__HIPCC__)
-// ---- Q8 decode GEMVs (RDNA4) ----
+// ---- Q8 decode GEMVs (RDNA4: v_dot4; CUDA: dp4a) ----
 // One token's input quantized per 32 values to INT8 with an F32 scale (and, given `sums`, the group's
 // F32 sum, for a format's mins), as llama.cpp's q8_1 vectors, staged in LDS by every block; a unit's
-// dot is exact in INT32 (v_dot4), then scaled. The F32 kernels spend some four VALU instructions a
-// value decoding and converting.
+// dot is exact in INT32 (v_dot4 / dp4a), then scaled. The F32 kernels spend some four VALU instructions a
+// value decoding and converting. The integer dots and the quantization are the same on both backends, so
+// a row's bits do not depend on which one runs it.
+// The dot of four weight bytes with four INT8 activations, added to `acc`: `_u8s8`'s weight bytes are
+// unsigned (a Q4_K or Q5_K code, 0 to 31), `_s8s8`'s signed. (dp4a takes both as signed: a code below 128 is the same value.)
+#if defined(__HIPCC__)
+__device__ __forceinline__ int gemv_dot_u8s8(uint32_t weights, uint32_t x, int acc) {
+    return __builtin_amdgcn_sudot4(false, int(weights), true, int(x), acc, false);
+}
+__device__ __forceinline__ int gemv_dot_s8s8(uint32_t weights, uint32_t x, int acc) {
+    return __builtin_amdgcn_sudot4(true, int(weights), true, int(x), acc, false);
+}
+#else
+__device__ __forceinline__ int gemv_dot_u8s8(uint32_t weights, uint32_t x, int acc) { return __dp4a(int(weights), int(x), acc); }
+__device__ __forceinline__ int gemv_dot_s8s8(uint32_t weights, uint32_t x, int acc) { return __dp4a(int(weights), int(x), acc); }
+#endif
+// The most dynamic shared memory a Q8 kernel stages (a launch needs no attribute below it).
+#if defined(__HIPCC__)
+constexpr size_t gemv_q8_lds_limit = 65536;
+#else
+constexpr size_t gemv_q8_lds_limit = 49152;
+#endif
 // One group of 32 values: its INT8 values (8 words) at `values`, its scale at `scale` and, given `sum`, its F32 sum.
 __device__ __forceinline__ void gemv_q8_group(const float* from, uint32_t* values, float* scale, float* sum) {
     float4 v[8];
@@ -1117,8 +1143,8 @@ template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176
             const uint32_t c1 = ((codes[m] >> 4) & 0x0F0F0F0Fu) | (((high[m] >> (2 * pair + 1)) & 0x01010101u) << 4);
             #pragma unroll
             for (int v = 0; v < V; ++v) {
-                s0[v] = __builtin_amdgcn_sudot4(false, int(c0), true, int(x.word(v, m)), s0[v], false);
-                s1[v] = __builtin_amdgcn_sudot4(false, int(c1), true, int(x.word(v, 8 + m)), s1[v], false);
+                s0[v] = gemv_dot_u8s8(c0, x.word(v, m), s0[v]);
+                s1[v] = gemv_dot_u8s8(c1, x.word(v, 8 + m), s1[v]);
             }
         }
         #pragma unroll
@@ -1128,6 +1154,7 @@ template<> struct GemvQ8<13> {   // Q5_K: a unit is two 32-value groups of a 176
         }
     }
 };
+#if defined(__HIPCC__)
 // (blocks of 34 bytes start at any even address; RDNA4 loads them unaligned)
 typedef uint32_t gemv_word4 __attribute__((ext_vector_type(4)));
 typedef gemv_word4 gemv_word4_u __attribute__((aligned(2)));
@@ -1152,6 +1179,35 @@ template<> struct GemvQ8<8> {   // Q8_0: a unit is one 34-byte block of 32 value
         }
     }
 };
+#else
+// (CUDA's loads are naturally aligned: a block's 32 bytes as nine words, realigned when the block starts two bytes in, as GemvFormat<8> reads them)
+template<> struct GemvQ8<8> {   // Q8_0: a unit is one 34-byte block of 32 values
+    static constexpr size_t elements = 32;
+    template<int V, uint32_t PAD = 0>
+    __device__ static void dots(const uint8_t* row, size_t unit, const GemvQ8Input& in, float (&r)[V]) {
+        static_assert(PAD == 0, "Q8_0 units are staged end to end");
+        const uint8_t* block = row + unit * 34;
+        const float d = gemv_half(*reinterpret_cast<const uint16_t*>(block));
+        const uintptr_t address = reinterpret_cast<uintptr_t>(block + 2);
+        const uint32_t* base = reinterpret_cast<const uint32_t*>(address & ~uintptr_t(3));
+        const bool odd = (address & 2) != 0;
+        uint32_t words[9];
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) words[i] = base[i];
+        uint32_t q[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = odd ? gemv_realign(words[i], words[i + 1], 2) : words[i];
+        #pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const uint32_t* x = in.xq + v * in.stride + unit * 8;
+            int s = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) s = gemv_dot_s8s8(q[i], x[i], s);
+            r[v] = d * in.xd[v * in.stride + unit] * float(s);
+        }
+    }
+};
+#endif
 // The wide kinds (Device::q8_wide: Qwen3.8's projections) read the staged input end to end, a group's 8 words at 8 * group, its
 // scale and sum at group (PAD 0).
 template<> struct GemvQ8<12> {   // Q4_K: GemvQ8<13>'s unit without the high bits, in a 144-byte block
@@ -1174,8 +1230,8 @@ template<> struct GemvQ8<12> {   // Q4_K: GemvQ8<13>'s unit without the high bit
             #pragma unroll
             for (int v = 0; v < V; ++v) {
                 const uint32_t* x = in.xq + v * in.stride + unit * (16 + PAD);
-                s0[v] = __builtin_amdgcn_sudot4(false, int(c0), true, int(x[m]), s0[v], false);
-                s1[v] = __builtin_amdgcn_sudot4(false, int(c1), true, int(x[8 + m]), s1[v], false);
+                s0[v] = gemv_dot_u8s8(c0, x[m], s0[v]);
+                s1[v] = gemv_dot_u8s8(c1, x[8 + m], s1[v]);
             }
         }
         #pragma unroll
@@ -1229,8 +1285,8 @@ template<> struct GemvQ8<14> {   // Q6_K: GemvFormat<14>'s unit, half of a 210-b
                 #pragma unroll
                 for (int v = 0; v < V; ++v) {
                     const uint32_t x = in.xq[v * in.stride + unit * (32 + PAD) + 8 * k + m];
-                    if (m < 4) lo[v] = __builtin_amdgcn_sudot4(true, int(q), true, int(x), lo[v], false);
-                    else hi[v] = __builtin_amdgcn_sudot4(true, int(q), true, int(x), hi[v], false);
+                    if (m < 4) lo[v] = gemv_dot_s8s8(q, x, lo[v]);
+                    else hi[v] = gemv_dot_s8s8(q, x, hi[v]);
                 }
             }
             const int scale_lo = int(int8_t(uint8_t(scales[k / 2] >> (16 * (k % 2))))),
@@ -1266,10 +1322,10 @@ template<> struct GemvQ8<23> {   // IQ4_XS: GemvFormat<23>'s unit, two groups of
             #pragma unroll
             for (int v = 0; v < V; ++v) {
                 const uint32_t* x = in.xq + v * in.stride + unit * (16 + PAD);
-                s0[v] = __builtin_amdgcn_sudot4(true, int(w0), true, int(x[m]), s0[v], false);
-                s0[v] = __builtin_amdgcn_sudot4(true, int(w1), true, int(x[4 + m]), s0[v], false);
-                s1[v] = __builtin_amdgcn_sudot4(true, int(w2), true, int(x[8 + m]), s1[v], false);
-                s1[v] = __builtin_amdgcn_sudot4(true, int(w3), true, int(x[12 + m]), s1[v], false);
+                s0[v] = gemv_dot_s8s8(w0, x[m], s0[v]);
+                s0[v] = gemv_dot_s8s8(w1, x[4 + m], s0[v]);
+                s1[v] = gemv_dot_s8s8(w2, x[8 + m], s1[v]);
+                s1[v] = gemv_dot_s8s8(w3, x[12 + m], s1[v]);
             }
         }
         #pragma unroll
@@ -1350,8 +1406,26 @@ __device__ __forceinline__ const GemvItem& gemv_q8_item(const FixedGemv& list, s
     return list.items[selected];
 }
 // gemv_fixed_kind (LINKED, one vector: gemv_linked_kind) on the staged input.
+#if !defined(__HIPCC__)
+// (CUDA) The lanes of a row ask the L2 for the first 128-byte line each of its weights before the block stages the input: the staging leaves
+// the memory idle otherwise, some microseconds of a launch of ten to thirty. (More lines a lane, all of a row, were slower: the requests
+// fill the queues ahead of the loads the first units wait for.)
+__device__ __forceinline__ void gemv_q8_prefetch_row(const Matrix& m, size_t first_row, unsigned lanes) {
+    const unsigned lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = first_row + lane / lanes;
+    if (row < m.rows && size_t(sub) * 128 < m.row_bytes)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(m.data + row * m.row_bytes + size_t(sub) * 128));
+}
+#endif
 template<int kind, int V, bool LINKED>
 __global__ void __launch_bounds__(256) gemv_q8_kind(FixedGemv list, const float* input, float* output, LinkTail tail) { SD_KERNEL_ACQUIRE;
+#if !defined(__HIPCC__)
+    {
+        const size_t first = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+        const GemvItem& at = gemv_q8_item(list, first);
+        gemv_q8_prefetch_row(at.matrix, (first - at.first_wave) * (32 / at.lanes), at.lanes);
+    }
+#endif
     const GemvQ8Input in = gemv_q8_stage_list<kind, V>(list, input);
     const size_t wave = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     const GemvItem& item = gemv_q8_item(list, wave);
@@ -1361,6 +1435,8 @@ __global__ void __launch_bounds__(256) gemv_q8_kind(FixedGemv list, const float*
                                              residual);
     if (LINKED) link_tail(tail);
 }
+#if defined(__HIPCC__)
+// (DeepSeek-V4.1's q_b rows: HIP only)
 // The 32-lane butterfly sums of gemv_q8_rows (total += __shfl_xor(total, offset, 32), offsets 16, 8, 4, 2, 1) of four rows' partial sums at
 // once, 6 exchanges where four rows one after another take 20. After the offset-16 step a row's sums are the same in lanes l and l ^ 16, and after
 // the offset-8 step in l and l ^ 8: so the step of two rows is one exchange (lanes with the bit set send the row the others keep, the others the
@@ -1437,13 +1513,14 @@ __global__ void __launch_bounds__(256) gemv_q8_rows_wave(FixedGemv list, const f
         }
     }
 }
+#endif
 // Whether a list of `vectors` takes the Q8 kernels: one kind they take, every matrix the same input
 // (offset and width: staged once), 16-byte aligned vectors; its LDS bytes, else 0.
 size_t gemv_q8_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors) {
     const Matrix& first = list.items[0].matrix;
     const size_t bytes = vectors * gemv_q8_vector_words(first.cols, first.kind) * 4;
     const bool taken = (d.q8_decode && gemv_q8_kind_taken(first.kind)) || (d.q8_wide && gemv_q8_wide_kind(first.kind));
-    if (!taken || !list.count || first.cols % 256 || bytes > 65536 ||
+    if (!taken || !list.count || first.cols % 256 || bytes > gemv_q8_lds_limit ||
         reinterpret_cast<uintptr_t>(input + first.input_offset) % 16 || (vectors > 1 && list.input_stride % 4))
         return 0;
     for (unsigned i = 0; i < list.count; ++i) {
@@ -1462,6 +1539,7 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
     const GemvItem& last = list.items[list.count - 1];
     const size_t waves = last.first_wave + gemv_waves(last.matrix, last.lanes);
     const unsigned blocks = unsigned((waves + 7) / 8);
+#if defined(__HIPCC__)
     // A Q5_K row of one unit a lane (q_b: 16384 rows of 20 units) takes four rows to a wave (eight for three or four vectors) when that leaves every CU
     // four blocks or more
     constexpr size_t rows_per_wave = V >= 3 ? 8 : 4;
@@ -1474,6 +1552,7 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
             return true;
         }
     }
+#endif
     // (past four vectors, no tail)
     #define SD_Q8_LAUNCH(format) \
         if constexpr (V <= 4) { if (tail) gemv_q8_kind<format, V, true><<<blocks, 256, lds, d.stream>>>(list, input, output, *tail); \
@@ -1500,6 +1579,9 @@ __global__ void __launch_bounds__(256) gemv_q8_mixed(FixedGemv list, const float
     const size_t first_wave = size_t(blockIdx.x) * (blockDim.x / 32);
     const GemvItem& item = gemv_q8_item(list, first_wave);
     const int kind = item.matrix.kind;
+#if !defined(__HIPCC__)
+    if (kind != 30) gemv_q8_prefetch_row(item.matrix, (first_wave - item.first_wave + threadIdx.x / 32) * (32 / item.lanes), item.lanes);
+#endif
     const size_t cols = item.matrix.cols, groups = cols / 32, stride = gemv_q8_vector_words(cols, kind);
     float* xd = reinterpret_cast<float*>(gemv_lds + gemv_q8_value_words(cols, kind));
     if (kind != 30) {
@@ -1540,7 +1622,7 @@ size_t gemv_q8_mixed_input(const Device& d, const FixedGemv& list, const float* 
         }
     }
     const size_t lds = vectors * words * 4;
-    return wide && lds <= 65536 ? lds : 0;
+    return wide && lds <= gemv_q8_lds_limit ? lds : 0;
 }
 template<int V>
 bool gemv_q8_mixed_launch(Device& d, const FixedGemv& list, const float* input, float* output) {
@@ -1556,14 +1638,11 @@ bool gemv_q8_mixed_launch(Device& d, const FixedGemv& list, const float* input, 
     check(hipGetLastError());
     return true;
 }
-#endif
 bool gemv_shared_input_launch(Device& d, const FixedGemv& list, const float* input, float* output);   // gemv_fused.hpp
 template<int V>
 void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform, const float* input, float* output) {
-#if defined(__HIPCC__)
     // (the wide kinds take the Q8 kernels ahead of the F32 kernels' special shapes)
     if (d.q8_wide && ((uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) || gemv_q8_mixed_launch<V>(d, list, input, output))) return;
-#endif
 #if !defined(__HIPCC__)
     if constexpr (V <= 2) {
         const int mixed = gemv_mixed_shared_list(list, uniform);
@@ -1627,8 +1706,8 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
 // Five to eight vectors: the Q8 kernels, and the BF16 kernel a router's list takes; false (nothing launched) otherwise.
 template<int V>
 bool gemv_launch_wide(Device& d, const FixedGemv& list, bool uniform, const float* input, float* output) {
-#if defined(__HIPCC__)
     if (d.q8_wide && ((uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) || gemv_q8_mixed_launch<V>(d, list, input, output))) return true;
+#if defined(__HIPCC__)
     if (d.rdna4 && uniform && list.items[0].matrix.kind == 30) {
         const GemvItem& last = list.items[list.count - 1];
         const unsigned blocks = unsigned((last.first_wave + gemv_waves(last.matrix, last.lanes) + 7) / 8);
@@ -1656,6 +1735,9 @@ bool gemv_linked_launch(Device& d, const Matrix& matrix, const float* input, flo
     const unsigned blocks = unsigned((gemv_waves(matrix, lanes) + 7) / 8);
 #if defined(__HIPCC__)
     if (gemv_q8_launch<1>(d, list, input, output, &tail)) return true;
+#else
+    // (CUDA's Q8 kernels have no linked form: gemv() runs the matrix on them, as it would here, and the sum is its own launch)
+    if (d.q8_wide && gemv_q8_input(d, list, input, 1)) return false;
 #endif
     #define SD_LINKED(format) case format: gemv_linked_kind<format><<<blocks, 256, 0, d.stream>>>(list, input, output, tail); return true;
     switch (matrix.kind) {
@@ -1694,8 +1776,9 @@ void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, f
 #if defined(__HIPCC__)
     const bool mixed_q8 = !uniform && gemv_q8_mixed_input(d, list, input, vectors);
 #else
-    // (or it goes whole to gemv_mixed_shared)
-    const bool mixed_q8 = vectors == 2 && gemv_mixed_shared_list(list, uniform) == 1;
+    // (or it goes whole to gemv_mixed_shared, or to the mixed Q8 kernel)
+    const bool mixed_q8 = (!uniform && gemv_q8_mixed_input(d, list, input, vectors)) ||
+                          (vectors == 2 && gemv_mixed_shared_list(list, uniform) == 1);
 #endif
     // (with the wide Q8 kernels, a list they cannot take whole is split for one vector too: a row then
     // takes the kernel of its kind whatever shares its launch, as a verification's rows do)

@@ -5,6 +5,9 @@
 //!
 //! cargo run --release --example qwen_floor --features hip -- MODEL QUANT DEVICES VRAM_GIB FLOORS [TOKENS]   (FLOORS: 0,0.03,0.05)
 //! A floor written with a trailing q (0q) runs the CPU experts on 8-bit activations (STRAYDOG_CPU_INT8=1); without it, on F32.
+//!
+//! A floor may end in @f32 or @q8 (after a q): that run takes the GPU projections on the F32 kernels (STRAYDOG_Q8=0) or the Q8 kernels
+//! (INT8 activations), whatever the environment says. `0.04@f32,0.04@q8` is the KL of the Q8 kernels against the F32 ones, at one floor.
 
 use std::path::PathBuf;
 
@@ -27,9 +30,16 @@ const PROMPTS: [&str; 6] = [
 /// Each prompt's greedy tokens and every step's logits at `floor`, and the decode's tokens a second.
 fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floor: &str, steps: usize)
        -> Result<(Vec<(Vec<u32>, Vec<Vec<f32>>)>, f64), String> {
+    let (floor, mode) = floor.split_once('@').map_or((floor, None), |(floor, mode)| (floor, Some(mode)));
     let (floor, int8) = floor.strip_suffix('q').map_or((floor, "0"), |floor| (floor, "1"));
     std::env::set_var("STRAYDOG_EXPERT_FLOOR", floor);
     std::env::set_var("STRAYDOG_CPU_INT8", int8);
+    match mode {
+        Some("f32") => std::env::set_var("STRAYDOG_Q8", "0"),
+        Some("q8") => std::env::remove_var("STRAYDOG_Q8"),
+        Some(other) => return Err(format!("no mode {other}: @f32 or @q8")),
+        None => {}
+    }
     let mut group = Group::new(devices, &vec![budget; devices.len()], SplitMode::Experts)?;
     group.configure_gemm(2, true)?;
     let weights = Weights::open(model_dir, id, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
