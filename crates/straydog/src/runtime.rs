@@ -466,7 +466,14 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         .map_or_else(String::new, |counts| format!("; read-ahead: {} taken, {} left", counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
     // (where the GPU may take some of the CPU's routes: the level the engine's measuring left in force, 0 to the most)
     let assist = detail["assist"].as_u64().map_or_else(String::new, |level| format!(" (level {level})"));
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
+    // (what "other" is made of, where the engine timed the step: the head, the first layer, the PLE rows' wait and layer, and what the layers
+    // spent beyond the wait and the CPU; a part under 0.05 ms is left out)
+    let steps = &detail["steps_ms"];
+    let parts: Vec<String> = [("head", steps["head"].as_f64()), ("first layer", steps["first layer"].as_f64()), ("PLE wait", steps["PLE wait"].as_f64()),
+                              ("PLE", steps["PLE"].as_f64()), ("in layers", steps["layers"].as_f64().map(|layers| (layers - wait - cpu).max(0.0)))]
+        .into_iter().filter_map(|(name, ms)| ms.filter(|ms| *ms >= 0.05).map(|ms| format!("{name} {ms:.1}"))).collect();
+    let other_parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1563,6 +1570,32 @@ mod tests {
         // (no page-locked layer: no level to say)
         let without = request_summary(&event(Value::Null), None);
         assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
+    }
+
+    /// A partially resident request's "other" is followed by its parts when the engine timed them: the head, the first layer, the PLE
+    /// rows' wait and layer, and what the layers spent beyond the GPU wait and the CPU; a part under 0.05 ms is left out, and a request with
+    /// none known reads as it always did.
+    #[test]
+    fn a_partial_request_line_breaks_other_into_its_parts() {
+        let detail = |steps: Value| json!({"wait_ms": 42.0, "cpu_ms": 21.5, "gpu_routes": 200.0, "cpu_routes": 180.0, "assisted_routes": 0.0,
+                                           "swaps": 3.0, "slots": 900, "passes": [10, 0], "pass_ms": [71.6, 0.0], "steps_ms": steps});
+        let event = |steps: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 1e3 / 71.6, "partial_detail": detail(steps)}});
+        let steps = json!({"head": 2.1, "first layer": 3.0, "PLE wait": 1.2, "PLE": 0.4, "layers": 64.4});
+        let line = request_summary(&event(steps.clone()), None);
+        assert!(line.contains("ms a token: GPU wait 42.0, CPU 21.5, other 8.1 (head 2.1, first layer 3.0, PLE wait 1.2, PLE 0.4, in layers 0.9); routes a token:"), "{line}");
+        // (a part under 0.05 ms: left out; the layers within the wait and the CPU: no part of their own)
+        let small = request_summary(&event(json!({"head": 2.1, "first layer": 0.049, "PLE wait": 1.2, "PLE": 0.0, "layers": 63.5})), None);
+        assert!(small.contains("other 8.1 (head 2.1, PLE wait 1.2); routes a token:"), "{small}");
+        // (a step not timed, as in a request that verified drafts: the line as before)
+        for none in [json!({}), Value::Null] {
+            let plain = request_summary(&event(none), None);
+            assert!(plain.contains("other 8.1; routes a token:"), "{plain}");
+        }
+        // (with DS41_PROFILE the decode's phases follow as ever)
+        let mut profiled = event(steps);
+        profiled["timings"]["decode_profile"] = json!({"step: head": 2.1, "step: layers (first device)": 64.4});
+        let line = request_summary(&profiled, None);
+        assert!(line.contains("in layers 0.9); routes a token:") && line.contains("; decode phases (ms a token): step: layers (first device) 64.400, step: head 2.100"), "{line}");
     }
 
     /// The ready line says whether DSpark is placed, and with how many experts a stage.
