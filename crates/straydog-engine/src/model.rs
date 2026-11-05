@@ -566,6 +566,8 @@ pub struct Model {
     memory_before: Option<(u64, u64, u64)>,
     /// The CPU engine's read-ahead hints (taken, left) when the request began.
     read_aheads_before: (u64, u64),
+    /// The CPU engine's phase times when the request began ([`CpuExperts::phase_ns`]).
+    cpu_phases_before: [u64; 3],
     /// Positions the K/V holds now (the context, unless it started small: `ensure_kv`).
     kv_capacity: usize,
     /// What is page-locked, for the thread that keeps the working set's limit.
@@ -711,6 +713,7 @@ impl Model {
             pass_counts: [0; 2],
             memory_before: None,
             read_aheads_before: (0, 0),
+            cpu_phases_before: [0; 3],
             kv_capacity: context,
             pinned_now: Default::default(),
             watching_memory: false,
@@ -1099,6 +1102,7 @@ impl Model {
             return Ok(false);
         }
         let cpu = CpuExperts::new(cpu_threads)?;
+        eprintln!("Straydog CPU experts: {} kernels", cpu.isa());
         // (the same files as the mapping's, checked as it is: `Weights::check_unchanged` before every generation)
         #[cfg(windows)]
         for (map, file) in self.weights.mapped_files() {
@@ -2916,6 +2920,7 @@ impl Model {
             self.pass_counts = [0; 2];
             self.memory_before = crate::host::memory_note();
             self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
+            self.cpu_phases_before = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
         }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
@@ -2938,6 +2943,9 @@ impl Model {
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
             let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
+            // (the CPU's time a token by the engine's phases: where a faster kernel shows, or does not)
+            let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
+            let cpu_phases: Vec<f64> = (0..3).map(|i| phases[i].saturating_sub(self.cpu_phases_before[i]) as f64 / 1e6 / generated).collect();
             // What the host spent outside the layers' routes in a decode step (the line's "other" is made of it and the layers' own time), on
             // every request, DS41_PROFILE or not. Not in a request that verified drafts: its passes have phases the line does not name.
             let mut steps: BTreeMap<&str, f64> = BTreeMap::new();
@@ -2950,7 +2958,7 @@ impl Model {
             }
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
-                "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated,
+                "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated, "cpu_phases_ms": cpu_phases,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level),

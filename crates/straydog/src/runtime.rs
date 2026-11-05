@@ -474,7 +474,12 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
                               ("PLE", steps["PLE"].as_f64()), ("in layers", steps["layers"].as_f64().map(|layers| (layers - wait - cpu).max(0.0)))]
         .into_iter().filter_map(|(name, ms)| ms.filter(|ms| *ms >= 0.05).map(|ms| format!("{name} {ms:.1}"))).collect();
     let other_parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
+    // (the CPU's time by the engine's phases: gate and up, the products, down with the weighted sum; the rest is the call's own)
+    let cpu_parts = detail["cpu_phases_ms"].as_array().filter(|ms| ms.len() == 3 && cpu >= 0.05).map_or_else(String::new, |ms| {
+        let ms: Vec<f64> = ms.iter().map(|value| value.as_f64().unwrap_or(0.0)).collect();
+        format!(" (gate and up {:.1}, products {:.1}, down {:.1})", ms[0], ms[1], ms[2])
+    });
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1251,7 +1256,7 @@ impl Driver {
                 let text = String::from_utf8_lossy(&line);
                 // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
                 // account of the host banks a partially resident model page-locked, and when it pages or no longer)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix"]
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix", "Straydog CPU experts"]
                     .iter().any(|start| text.starts_with(start));
                 if verbose || warm {
                     tracing::info!("worker: {text}");
@@ -1675,6 +1680,19 @@ mod tests {
         // (no page-locked layer: no level to say)
         let without = request_summary(&event(Value::Null), None);
         assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
+    }
+
+    /// The CPU's time is followed by the engine's phases where it reports them: gate and up, the products, down with the weighted sum.
+    #[test]
+    fn a_partial_request_line_splits_the_cpu_by_phase() {
+        let detail = |phases: Value| json!({"wait_ms": 9.3, "cpu_ms": 8.5, "cpu_phases_ms": phases, "gpu_routes": 200.0, "cpu_routes": 170.0,
+                                            "assisted_routes": 110.0, "swaps": 8.8, "slots": 953, "passes": [10, 0], "pass_ms": [20.0, 0.0]});
+        let event = |phases: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 50.0, "partial_detail": detail(phases)}});
+        let line = request_summary(&event(json!([5.9, 0.2, 2.4])), None);
+        assert!(line.contains("ms a token: GPU wait 9.3, CPU 8.5 (gate and up 5.9, products 0.2, down 2.4), other 2.2;"), "{line}");
+        // (no phases from the engine: the CPU's time alone, as before)
+        let plain = request_summary(&event(Value::Null), None);
+        assert!(plain.contains("CPU 8.5, other 2.2;"), "{plain}");
     }
 
     /// A partially resident request's "other" is followed by its parts when the engine timed them: the head, the first layer, the PLE
