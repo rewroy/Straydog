@@ -206,6 +206,15 @@ impl Profile {
     }
 }
 
+/// The assist levels of the next decode passes of one row, the last going on, and where each pass's routes went (see [`Model::assist_script`]).
+struct AssistScript {
+    next: std::collections::VecDeque<u32>,
+    /// The level in force, and the routes assisted, on the GPU and on the CPU by the end of the pass before.
+    level: u32,
+    routed: [u64; 3],
+    trace: Vec<(u32, [u64; 3], f64)>,
+}
+
 struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
@@ -464,6 +473,8 @@ pub struct Model {
     passes_with_draft: u32,
     /// The assist level's tuner, where banks are page-locked and the GPU can take some of the CPU's routes ([`crate::assist`]).
     assist: Option<assist::Tuner>,
+    /// Tests only: the levels the decode passes of one row are to run at, in place of the tuner's rounds ([`Model::assist_script`]).
+    assist_script: Option<AssistScript>,
     /// This request's passes by rows, and this process's memory as it began, for its log line.
     pass_counts: [u64; 2],
     memory_before: Option<(u64, u64, u64)>,
@@ -610,6 +621,7 @@ impl Model {
             pass_seconds: [0.0; 2],
             passes_with_draft: 0,
             assist: None,
+            assist_script: None,
             pass_counts: [0; 2],
             memory_before: None,
             read_aheads_before: (0, 0),
@@ -1088,6 +1100,56 @@ impl Model {
         Ok(WarmFill { pending, slots, held, swapped: self.group.swapped_experts()? })
     }
 
+    /// Let the GPU assist from the page-locked banks, from the most a layer is given: the plans mapped (none, and nothing is tuned, when
+    /// no bank is page-locked).
+    fn start_assist(&mut self) -> Result<u64> {
+        let cap = crate::gpu::Backend::assist_cap();
+        let mapped = self.group.enable_assist(cap)?;
+        if mapped > 0 {
+            self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
+        }
+        Ok(mapped)
+    }
+
+    /// Tests only: page-lock the banks of `layers` whatever the commit left says (as the start does for the layers it can) and let the GPU
+    /// assist from them. The plans mapped.
+    #[doc(hidden)]
+    pub fn lock_layers_for_test(&mut self, layers: &[usize]) -> Result<u64> {
+        for &layer in layers {
+            for bank in Self::host_banks(&self.weights, layer)? {
+                self.group.register_host(bank)?;
+            }
+            self.locked_layers.push(layer);
+        }
+        self.start_assist()
+    }
+
+    /// Tests only: the assist level of each next decode pass of one row, the last going on, in place of the tuner's rounds. The first is in
+    /// force now.
+    #[doc(hidden)]
+    pub fn assist_script(&mut self, levels: &[u32]) -> Result<()> {
+        let (first, rest) = levels.split_first().ok_or("an empty assist script")?;
+        let tuner = self.assist.as_mut().ok_or("no layer is page-locked: there is no assist to script")?;
+        self.group.set_assist_level(*first)?;
+        tuner.set(*first);
+        let routed = self.route_totals();
+        self.assist_script = Some(AssistScript { next: rest.iter().copied().collect(), level: *first, routed, trace: Vec::new() });
+        Ok(())
+    }
+
+    /// Tests only: the level each scripted pass ran at, its routes that the GPU assisted, that were on the GPU, and that the CPU ran, and the
+    /// seconds of its layers.
+    #[doc(hidden)]
+    pub fn assist_trace(&self) -> Vec<(u32, [u64; 3], f64)> {
+        self.assist_script.as_ref().map_or_else(Vec::new, |script| script.trace.clone())
+    }
+
+    /// The routes the GPUs have assisted, run themselves and left to the CPU so far.
+    fn route_totals(&self) -> [u64; 3] {
+        let info = self.group.info().unwrap_or_default();
+        ["assisted_experts", "gpu_experts", "cpu_experts"].map(|key| info[key].as_u64().unwrap_or(0))
+    }
+
     /// A layer's mapped gate, up and down expert banks.
     fn host_banks(weights: &Weights, layer: usize) -> Result<[&[u8]; 3]> {
         let bank = |role: &str| weights.raw(&format!("blk.{layer}.ffn_{role}_exps.weight"), 0, None).map(|raw| raw.0);
@@ -1190,10 +1252,7 @@ impl Model {
             // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist). That is the most a
             // layer is given: how many it is worth on this machine, the engine measures in decode
             // (crate::assist), from the most at the start.
-            let cap = crate::gpu::Backend::assist_cap();
-            if self.group.enable_assist(cap)? > 0 {
-                self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
-            }
+            self.start_assist()?;
         }
         // Speed first (STRAYDOG_EXPERT_FLOOR, a router weight from 0 to 1): the CPU's routes below it are left out.
         if let Some(floor) = expert_floor()? {
@@ -2416,19 +2475,46 @@ impl Model {
 
     /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
     fn assist_pass(&mut self, seconds: f64) {
+        if self.assist_script.is_some() {
+            return self.assist_scripted(seconds);
+        }
         if let Some(next) = self.assist.as_mut().map(|tuner| tuner.pass(seconds)) {
             self.assist_apply(next);
         }
     }
 
+    /// A scripted pass ended: what it assisted, and the next level of the script.
+    fn assist_scripted(&mut self, seconds: f64) {
+        let totals = self.route_totals();
+        let Some(script) = self.assist_script.as_mut() else { return };
+        script.trace.push((script.level, [0, 1, 2].map(|at| totals[at] - script.routed[at]), seconds));
+        script.routed = totals;
+        if let Some(level) = script.next.pop_front() {
+            match self.group.set_assist_level(level) {
+                Ok(()) => {
+                    script.level = level;
+                    if let Some(tuner) = self.assist.as_mut() {
+                        tuner.set(level);
+                    }
+                }
+                Err(error) => eprintln!("Straydog assist: the scripted level {level} cannot be set ({error})"),
+            }
+        }
+    }
+
+    /// Whether the tuner has the passes: not a model that verifies known rows, nor one whose levels a test scripts.
+    fn assist_tuning(&self) -> bool {
+        self.forced_rows.is_none() && self.assist_script.is_none()
+    }
+
     /// Whether the passes now are timed as windows of a round: those of a speculating model have no drafts, so that each has one row.
     fn assist_probing(&self) -> bool {
-        self.forced_rows.is_none() && self.assist.as_ref().is_some_and(assist::Tuner::probing)
+        self.assist_tuning() && self.assist.as_ref().is_some_and(assist::Tuner::probing)
     }
 
     /// `count` decode tokens were generated.
     fn assist_tokens(&mut self, count: u64) {
-        if self.forced_rows.is_none() {
+        if self.assist_tuning() {
             if let Some(tuner) = self.assist.as_mut() {
                 tuner.tokens(count);
             }
@@ -2437,7 +2523,7 @@ impl Model {
 
     /// A request begins to decode.
     fn assist_request(&mut self) {
-        if self.forced_rows.is_none() {
+        if self.assist_tuning() {
             if let Some(tuner) = self.assist.as_mut() {
                 tuner.request();
             }
