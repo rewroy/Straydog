@@ -160,7 +160,7 @@ fn a_decode_during_the_locking_matches_one_after() {
         std::thread::spawn(move || {
             let mut job = job;
             // SAFETY: the thread holds the model's Arc, and the model its weights mapped.
-            while let Some(next) = unsafe { job.lock_next() } {
+            while let Some(next) = unsafe { job.lock_next_behind() } {
                 let locked = next.unwrap();
                 locked_meanwhile.fetch_add(1, Ordering::SeqCst);
                 model.lock().unwrap().banks_locked(locked).unwrap();
