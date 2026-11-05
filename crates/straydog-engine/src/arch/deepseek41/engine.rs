@@ -3577,9 +3577,17 @@ fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize
             first_group: usize, save: bool) -> Result<(usize, usize)> {
     let dim = hp.head_dim;
     // rows 1..=n take this pass; row 0 the waiting one, when there is one
-    shard.linear(&name(layer, "attn_compressor_kv"), work.x.base(), n, work.pool_kv.at(dim))?;
+    // kv and gate read the same rows of x. One linears call rounds those rows to FP16 once.
     if ratio > 1 {
-        shard.linear(&name(layer, "attn_compressor_gate"), work.x.base(), n, work.pool_gate.at(dim))?;
+        let (kv, gate) = (shard.dense(&name(layer, "attn_compressor_kv"))?, shard.dense(&name(layer, "attn_compressor_gate"))?);
+        let scratch = shard.scratch;
+        let item = |weight: &Dense, output: M| Linear {
+            weights: weight.buffer, kind: weight.kind, rows: weight.dims[1] as u64, cols: weight.dims[0] as u64, first_row: 0,
+            input: work.x.base() as P, output,
+        };
+        shard.gpu.linears(&[item(&kv, work.pool_kv.at(dim)), item(&gate, work.pool_gate.at(dim))], n as u64, 0, 0, &scratch)?;
+    } else {
+        shard.linear(&name(layer, "attn_compressor_kv"), work.x.base(), n, work.pool_kv.at(dim))?;
     }
     let (rows, keys, tail_kv, tail_gate, pass_kv, pass_gate) = {
         let source = &shard.sources[&layer];
