@@ -666,3 +666,59 @@ fn cpu_experts_on_the_model_equal_the_reference() {
     unsafe { ffi::sd_cpu_experts_destroy(engine) };
 }
 
+
+/// A verification's rows in one call of the CPU engine (sd_cpu_experts_run_rows) give each row the bits of a call of its own, with
+/// experts that rows share and rows that share none: the integer path (IQ2_XXS gate and up, Q2_0 down) and the F32 one (IQ2_XS).
+#[test]
+fn cpu_expert_rows_in_one_call_equal_each_row_alone() {
+    load_tables();
+    let mut random = Random(23);
+    let (hidden, inter) = (2560usize, 640usize);
+    // SAFETY: a plain value; null on failure.
+    let engine = unsafe { ffi::sd_cpu_experts_create(3) };
+    assert!(!engine.is_null());
+    for gate_kind in [16u32, 17] {
+        let kinds = [gate_kind as i32, gate_kind as i32, 42];
+        let bank = |kind: u32, rows: usize, cols: usize, random: &mut Random| -> Vec<u8> {
+            let (values, _) = formats::block(kind).unwrap();
+            (0..rows * cols / values).flat_map(|_| generated_block(kind, random)).collect()
+        };
+        let experts: Vec<[Vec<u8>; 3]> = (0..5).map(|_| [bank(gate_kind, inter, hidden, &mut random), bank(gate_kind, inter, hidden, &mut random),
+                                                        bank(42, hidden, inter, &mut random)]).collect();
+        let routes: [&[usize]; 4] = [&[0, 1, 2], &[1, 3], &[0, 1, 3, 2, 4], &[4]];
+        let xs: Vec<Vec<f32>> = (0..routes.len()).map(|_| (0..hidden).map(|_| random.activation()).collect()).collect();
+        let weights: Vec<Vec<f32>> = routes.iter().map(|row| row.iter().map(|_| (random.next() % 1000) as f32 / 1000.0 + 0.01).collect()).collect();
+        let pointers = |role: usize, row: &[usize]| -> Vec<*const u8> { row.iter().map(|&e| experts[e][role].as_ptr()).collect() };
+        // each row alone
+        let mut alone = vec![vec![0f32; hidden]; routes.len()];
+        for (r, row) in routes.iter().enumerate() {
+            let (g, u, d) = (pointers(0, row), pointers(1, row), pointers(2, row));
+            // SAFETY: the row's expert slices of the declared shapes, x and out of `hidden` values.
+            let status = unsafe {
+                ffi::sd_cpu_experts_run(engine, kinds.as_ptr(), g.as_ptr(), u.as_ptr(), d.as_ptr(), weights[r].as_ptr(), row.len() as u32,
+                                        hidden as u64, inter as u64, xs[r].as_ptr(), alone[r].as_mut_ptr())
+            };
+            assert_eq!(status, 0);
+        }
+        // all rows at once
+        let flat: Vec<usize> = routes.iter().flat_map(|row| row.iter().copied()).collect();
+        let (g, u, d) = (pointers(0, &flat), pointers(1, &flat), pointers(2, &flat));
+        let all_weights: Vec<f32> = weights.iter().flatten().copied().collect();
+        let counts: Vec<u32> = routes.iter().map(|row| row.len() as u32).collect();
+        let mut together = vec![vec![1f32; hidden]; routes.len()];
+        let x_pointers: Vec<*const f32> = xs.iter().map(|x| x.as_ptr()).collect();
+        let mut out_pointers: Vec<*mut f32> = together.iter_mut().map(|out| out.as_mut_ptr()).collect();
+        // SAFETY: as above, for every row.
+        let status = unsafe {
+            ffi::sd_cpu_experts_run_rows(engine, kinds.as_ptr(), routes.len() as u32, counts.as_ptr(), g.as_ptr(), u.as_ptr(), d.as_ptr(),
+                                         all_weights.as_ptr(), hidden as u64, inter as u64, x_pointers.as_ptr(), out_pointers.as_mut_ptr())
+        };
+        assert_eq!(status, 0);
+        for r in 0..routes.len() {
+            assert_eq!(together[r].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), alone[r].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       "kind {gate_kind} row {r}");
+        }
+    }
+    // SAFETY: created above, destroyed once.
+    unsafe { ffi::sd_cpu_experts_destroy(engine) };
+}
