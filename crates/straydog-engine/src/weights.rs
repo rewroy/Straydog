@@ -539,6 +539,15 @@ impl Weights {
         self.tensors.values().filter(|tensor| tensor.file == file).map(|tensor| (tensor.offset, tensor.bytes)).collect()
     }
 
+    /// Drop the host copies kept of tensors whose operands the GPUs hold once the model is warm (the PLE's, the head's, the
+    /// drafter's): all but the token embeddings, which the host reads a row at a time. A tensor read again, if ever, comes from
+    /// the authenticated mapping, its blocks checked against its file's tree. On a machine short of memory the copies took the
+    /// room the experts' banks fault into (Windows: 3.0 GiB of a working set held to 23-25 GiB). The bytes freed.
+    pub fn release_host_copies(&mut self) -> u64 {
+        let names: Vec<String> = self.kept.keys().filter(|name| *name != "token_embd.weight").cloned().collect();
+        names.iter().filter_map(|name| self.kept.remove(name)).map(|bytes| bytes.len() as u64).sum()
+    }
+
     /// Keep a host copy of a tensor's verified bytes.
     pub(crate) fn keep(&mut self, name: String, bytes: Vec<u8>) {
         self.kept.insert(name, bytes);
