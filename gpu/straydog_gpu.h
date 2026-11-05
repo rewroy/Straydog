@@ -529,6 +529,8 @@ int sd_peer_direct(void* handle);
 
 /* Partial residency */
 int sd_hybrid_supported(void* handle);
+/* Speed first: CPU routes of a router weight below `floor` (0 to 1; 0 none) are left out of their token. */
+int sd_hybrid_route_floor(void* handle, float floor);
 void* sd_hybrid_moe_create(void* handle, void* const* pointers, const int* kinds, const int* routed_kinds, uint64_t experts, const uint8_t* const* host, void* workspace, uint64_t capacity);
 int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes);
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */

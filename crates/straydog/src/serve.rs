@@ -59,6 +59,11 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         Some(precision) => std::env::set_var("STRAYDOG_ENGRAM", precision),
         None => std::env::remove_var("STRAYDOG_ENGRAM"),
     }
+    // (speed first: the worker reads the floor from its environment, as the engine's STRAYDOG_EXPERT_FLOOR)
+    match settings.expert_floor {
+        Some(floor) => std::env::set_var("STRAYDOG_EXPERT_FLOOR", floor.to_string()),
+        None => std::env::remove_var("STRAYDOG_EXPERT_FLOOR"),
+    }
     if print_config {
         for line in config::describe(&settings, &sources) {
             println!("{line}");

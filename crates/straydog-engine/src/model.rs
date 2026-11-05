@@ -114,6 +114,21 @@ pub const STARTING_KV: usize = 32768;
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
 const VERIFY_BYTES: u64 = 130 << 20;
 const DRAFTER_SLOT_ROOM: u64 = 128 << 20;
+/// Speed first for a partially resident model: STRAYDOG_EXPERT_FLOOR, a router weight below which a route the CPU would run is
+/// left out of its token (its weight taken as 0). Unset or 0: every route runs.
+pub fn expert_floor() -> Result<Option<f32>> {
+    match std::env::var("STRAYDOG_EXPERT_FLOOR") {
+        Ok(value) if !value.is_empty() => {
+            let floor: f32 = value.parse().map_err(|_| format!("STRAYDOG_EXPERT_FLOOR {value:?}: a router weight from 0 to 1"))?;
+            if !(0.0..1.0).contains(&floor) {
+                return Err(format!("STRAYDOG_EXPERT_FLOOR {value:?}: a router weight from 0 to 1").into());
+            }
+            Ok((floor > 0.0).then_some(floor))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The share of the routed experts the slots hold at load from which a partially resident model drafts two tokens a pass. Routing is uneven:
 /// IQ3_S on an R9700, the slots of `--vram 24` (30% at load, 39% once the K/V has settled) serve 87% of the routes, and the second draft
 /// costs less CPU. Two drafts against one, same seeds, tok/s of a second and third request: `--vram 24` 69.5, 70.5 / 67.7, 61.4; 16 (17%) 58.7,
@@ -1086,6 +1101,11 @@ impl Model {
             // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the
             // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist).
             self.group.enable_assist(4)?;
+        }
+        // Speed first (STRAYDOG_EXPERT_FLOOR, a router weight from 0 to 1): the CPU's routes below it are left out.
+        if let Some(floor) = expert_floor()? {
+            self.group.route_floor(floor)?;
+            eprintln!("Straydog speed first: the CPU's routes below a router weight of {floor} are left out");
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
         cpu.watch_paging(&crate::host::PAGING)?;
