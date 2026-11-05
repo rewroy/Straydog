@@ -156,7 +156,10 @@ The engine is built in layers:
   before it; the log says what came after.
   - **The GPU code's warm-up** (two greedy runs of a made-up prompt, 10.6 s on a machine with nothing locked and cold banks) holds the engine for
     its passes. A request, or any command that takes the engine, ends it at the next pass boundary: the model is reset as at its end and
-    the request's first pass loads what it needs, as after any reset. One line: done or cut short, its seconds, and seconds after ready.
+    the request's first pass loads what it needs, as after any reset. The longest it can keep a request waiting is its longest pass: the
+    first, which loads the GPU code and streams the banks cold, took 5.8 s here. A warm start asked for meanwhile begins, and the locking below is
+    planned, under the lock the warm-up holds as it ends, so that no request has the engine first. One line: done or cut short, its seconds, and
+    seconds after ready.
   - **The banks' page locks.** The start plans which whole layers to lock (from the last, within the lock budget) at the point it always did, before
     the expert slots are placed, so what it leaves of the commit for the locks is out of what the slots' VRAM takes; it locks none.
     After the warm-up a thread locks the planned layers one at a time (25.9 GiB of 40 layers took 7.5 s of an 18 s start on an RTX 4060 PC,
