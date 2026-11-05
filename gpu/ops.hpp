@@ -243,6 +243,25 @@ void op_linear_half(Device& d, const Matrix& matrix, const __half* half_input, s
                                  HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
     }
 }
+// The FP16 rows a half GEMM reads, packed at the end of `scratch` (256-byte aligned). The bytes in
+// front stay free for weight expansion. One cast of these rows, and its observer when that is enabled.
+struct StagedHalfInput {
+    __half* rows;
+    size_t scratch_bytes;
+};
+
+inline StagedHalfInput stage_half_gemm_input(Device& d, const float* input, size_t input_stride, size_t cols, size_t steps,
+                                             float* scratch, size_t scratch_bytes) {
+    const size_t input_bytes = (steps * cols * 2 + 255) & ~size_t(255);
+    if (scratch_bytes <= input_bytes) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
+    auto* half_input = reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(scratch) + scratch_bytes - input_bytes);
+    op_half_rows<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(input, input_stride, cols, steps, half_input);
+    if (d.gemm_checks)
+        op_half_input_checks<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(
+            input, input_stride, cols, steps, half_input, d.gemm_checks);
+    return {half_input, scratch_bytes - input_bytes};
+}
+
 void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t cols, size_t first,
                const float* input, size_t input_stride, size_t steps, float* output, size_t output_stride,
                float* scratch, size_t scratch_bytes, int precision = -1) {
@@ -257,14 +276,8 @@ void op_linear(Device& d, const uint8_t* weights, int kind, size_t rows, size_t 
     // -1 retains the device policy; explicit 0/1 selects one op without changing the device
     // or its graph cache. Small-row GEMV above is identical for every policy.
     if (precision < 0 ? d.half_gemm : precision != 0) {
-        const size_t input_bytes = (steps * cols * 2 + 255) & ~size_t(255);
-        if (scratch_bytes <= input_bytes) throw std::runtime_error("Straydog op: GEMM scratch holds no row");
-        auto* half_input = reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(scratch) + scratch_bytes - input_bytes);
-        op_half_rows<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(input, input_stride, cols, steps, half_input);
-        if (d.gemm_checks)
-            op_half_input_checks<<<unsigned((steps * cols + 255) / 256), 256, 0, d.stream>>>(
-                input, input_stride, cols, steps, half_input, d.gemm_checks);
-        op_linear_half(d, matrix, half_input, steps, output, output_stride, scratch, scratch_bytes - input_bytes);
+        const StagedHalfInput half = stage_half_gemm_input(d, input, input_stride, cols, steps, scratch, scratch_bytes);
+        op_linear_half(d, matrix, half.rows, steps, output, output_stride, scratch, half.scratch_bytes);
         return;
     }
     const size_t piece = std::min(rows, scratch_bytes / (cols * 4));
