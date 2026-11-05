@@ -46,7 +46,8 @@ fn go(model: &mut Model, prompt: &[u32], max_new: usize) -> Outcome {
 /// chat, then the first one's next turn: that turn resumes from the first chat's checkpoint (where
 /// its last reply's generation prompt began, the whole state in host memory) and leaves the same
 /// tokens and state as when it follows its chat directly. The checkpoints' rows are copied when a
-/// restore or a reset needs them, or (the switched run's first) in small steps between requests.
+/// restore needs them, as far as the other chat's passes write over them, or (the switched run's
+/// first) in small steps between requests.
 #[test]
 fn a_switched_conversation_comes_back_from_its_checkpoint() {
     let Some(root) = common::model_env("STRAYDOG_DS41", "the DeepSeek-V4.1 GSQ-RCO IQ2_XS bundle directory") else { return };
