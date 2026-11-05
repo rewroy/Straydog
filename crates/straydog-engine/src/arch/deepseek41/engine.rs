@@ -677,6 +677,9 @@ pub struct Engine<'a, T: Tensors> {
     /// Position whose one-token schedule was queued after the previous logits' copy, before that
     /// copy was waited for. The next one-token pass there skips the upload.
     primed: Option<usize>,
+    /// How far the sequence of a checkpoint still being copied reached ([`Engine::hold_state`]): its
+    /// kv source rows stay out of the expert store until the copy is done.
+    held: usize,
     /// Seconds each step of its start took (each device's, the dense weights'), for the load steps
     /// a server reports.
     pub startup: Vec<(String, f64)>,
@@ -1181,6 +1184,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             image_rows: Vec::new(),
             views: ViewCounter::new(std::env::var_os("DS41_COUNT_VIEWS").is_some()),
             primed: None,
+            held: 0,
             startup,
         };
         if std::env::var("DS41_PROFILE").is_ok_and(|value| value == "host+stamps") {
@@ -1452,6 +1456,13 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position
     }
 
+    /// Keep the kv source rows a sequence of `tokens` reaches out of the expert store, whatever the
+    /// sequence's own length: those of a checkpoint whose copy a new sequence has not waited for
+    /// ([`Engine::finish_snapshot_below`]). 0 when no copy is pending.
+    pub fn hold_state(&mut self, tokens: usize) {
+        self.held = tokens;
+    }
+
     /// The devices this engine runs on, one per shard (memory and identity for reports).
     pub fn gpus(&self) -> impl Iterator<Item = &Backend> {
         self.shards.iter().map(|shard| &shard.gpu)
@@ -1689,6 +1700,35 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(copied)
     }
 
+    /// [`Engine::finish_snapshot`] as far as a sequence of `tokens` reaches (as [`Engine::reserve_state`]
+    /// takes the buffers back for it): the rows a new sequence's passes up to there write over. The
+    /// copy goes on from there later, in steps between requests.
+    pub fn finish_snapshot_below(&mut self, snapshot: &mut Snapshot, tokens: usize) -> Result<()> {
+        if !snapshot.pending {
+            return Ok(());
+        }
+        let (hp, shard) = (&self.hp, &mut self.shards[0]);
+        let (dim, index_dim) = (hp.head_dim, hp.index_dim);
+        let mut pending = false;
+        for (layer, kept) in &mut snapshot.rows {
+            let groups = snapshot.sources.iter().find(|source| source.0 == *layer).ok_or("a snapshot of another engine's layers")?.1;
+            let ratio = hp.layers[*layer].compressed.map_or(1, |c| c.ratio);
+            let reach = (tokens + STATE_AHEAD) / ratio + 1;
+            let buffers = shard.sources.get(layer).ok_or("a snapshot of another engine's layers")?;
+            for ((buffer, width), values) in [(&buffers.rows, dim / 2), (&buffers.keys, index_dim / 2)].into_iter().zip(kept.iter_mut()) {
+                let (len, done) = (groups * width, values.len());
+                let upto = len.min(reach * width);
+                if upto > done {
+                    values.resize(upto, 0.0);
+                    shard.gpu.read_buffer(buffer, done, &mut values[done..])?;
+                }
+                pending |= values.len() < len;
+            }
+        }
+        snapshot.pending = pending;
+        Ok(())
+    }
+
     /// Put a [`Engine::snapshot`] back on every device: the sequence as it was then.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
         if snapshot.pending {
@@ -1912,6 +1952,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// passes: no slot held); past [`STATE_KEEP`] more, a shorter sequence's, given back (their
     /// fills waiting for the work queued so far, the last to touch those bytes).
     fn reserve_state(&mut self, tokens: usize) -> Result<()> {
+        // (rows a pending checkpoint copy still reads are not given back)
+        let kept = tokens.max(self.held);
         for shard in &mut self.shards {
             for state in &mut shard.state_regions {
                 let reach = |tokens: usize| ((tokens / state.ratio + 1) as u64 * state.row_bytes).min(state.bytes);
@@ -1919,8 +1961,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 if need > state.reclaimed {
                     shard.experts.reclaim_region(&mut shard.gpu, state.region, need)?;
                     state.reclaimed = need;
-                } else if reach(tokens + STATE_KEEP) < state.reclaimed {
-                    let keep = reach(tokens + STATE_KEEP);
+                } else if reach(kept + STATE_KEEP) < state.reclaimed {
+                    let keep = reach(kept + STATE_KEEP);
                     let after = shard.gpu.mark(Stream::Compute)?;
                     shard.experts.restore_region(state.region, after, keep);
                     state.reclaimed = keep;
