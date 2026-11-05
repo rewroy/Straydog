@@ -2168,7 +2168,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         self.stream_rows = stream;
         if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
-            self.prefetch_engram(tokens)?;
+            self.prefetch_engram(tokens, tokens.len())?;
         }
         self.mark("embedding: Engram reads")?;
         self.image_rows = vision::runs(tokens);
@@ -2654,15 +2654,16 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// Start reading the Engram rows passes over `tokens` (continuing the held sequence) will
     /// gather, when this engine's layers hold a module ([`Engine::prefetch_engram`]): the session
-    /// asks for the next pass's before each pass, so its reads land while that pass runs.
-    pub fn prefetch_ahead(&self, tokens: &[u32]) -> Result<()> {
+    /// asks, before each pass, for that pass's (its first `now` tokens) and the next one's, so the
+    /// next pass's reads land while this one runs.
+    pub fn prefetch_ahead(&self, tokens: &[u32], now: usize) -> Result<()> {
         // (the embeddings first: the Engram reads queue the drive 128 deep, and a page fault of the
         // embedding table behind them took seconds of a cold prompt's first pass)
         if self.settings.layers.start == 0 {
             self.prefetch_embeddings(tokens)?;
         }
         if self.hp.layers[self.settings.layers.clone()].iter().any(|plan| plan.engram.is_some()) {
-            self.prefetch_engram(tokens)?;
+            self.prefetch_engram(tokens, now)?;
         }
         Ok(())
     }
@@ -2681,22 +2682,30 @@ impl<'a, T: Tensors> Engine<'a, T> {
 
     /// Start reading every Engram row these tokens will gather, while the layers before
     /// the modules run.
-    fn prefetch_engram(&self, tokens: &[u32]) -> Result<()> {
+    fn prefetch_engram(&self, tokens: &[u32], now: usize) -> Result<()> {
         let Some(engram) = self.hp.engram.as_ref() else { return Ok(()) };
         let mut history = self.history[self.history.len().saturating_sub(engram.ngram - 1)..].to_vec();
-        let mut rows = vec![Vec::new(); engram.tables.len()];
+        // The rows of the first `now` tokens (the pass about to run), then the rest's (the next pass's), each module's
+        // in layer order: a read of a module's rows waits for every row its prefetch asked for, and the drive serves the
+        // queue in order. One prefetch of both passes' rows held a cold 48K-token prompt's first Engram layer until the
+        // next pass's rows had arrived too (3.0 s of its first token).
+        let mut rows = vec![[Vec::new(), Vec::new()]; engram.tables.len()];
         for (i, &token) in tokens.iter().enumerate() {
             let before = history[history.len().saturating_sub(engram.ngram - 1)..].to_vec();
             // (an image position gathers nothing: Engram passes it by)
             if token < IMAGE_TOKEN {
                 for (module, rows) in rows.iter_mut().enumerate() {
-                    engram.rows(module, token, &before, self.position + i, rows);
+                    engram.rows(module, token, &before, self.position + i, &mut rows[usize::from(i >= now)]);
                 }
             }
             history.push(token);
         }
-        for (table, rows) in engram.tables.iter().zip(&rows) {
-            self.tensors.prefetch_rows(table, rows)?;
+        for part in 0..2 {
+            for (table, rows) in engram.tables.iter().zip(&rows) {
+                if !rows[part].is_empty() {
+                    self.tensors.prefetch_rows(table, &rows[part])?;
+                }
+            }
         }
         Ok(())
     }

@@ -289,8 +289,8 @@ impl served::Engines for Engines {
         Ok(done)
     }
 
-    fn prefetch_ahead(&mut self, tokens: &[u32]) -> Result<(), String> {
-        self.engines.iter().try_for_each(|engine| engine.prefetch_ahead(tokens))
+    fn prefetch_ahead(&mut self, tokens: &[u32], now: usize) -> Result<(), String> {
+        self.engines.iter().try_for_each(|engine| engine.prefetch_ahead(tokens, now))
     }
 
     fn verify_rows(&self) -> usize {
