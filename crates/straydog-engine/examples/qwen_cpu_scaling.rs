@@ -46,7 +46,10 @@ fn main() {
     let mut counts = std::collections::BTreeMap::new();
     (0..48).for_each(|layer| *counts.entry(kind_of(layer)).or_insert(0) += 1);
     let commonest = counts.into_iter().max_by_key(|(_, count)| *count).unwrap().0;
-    let layers: Vec<usize> = (0..48).filter(|layer| kind_of(*layer) == commonest).take(4).collect();
+    // (STRAYDOG_GATE_KIND picks another format's layers, gate and up both of it)
+    let wanted = std::env::var("STRAYDOG_GATE_KIND").ok().and_then(|kind| kind.parse().ok()).unwrap_or(commonest);
+    let up_of = |layer: usize| find(&format!("blk.{layer}.ffn_up_exps.weight")).1.quant_type;
+    let layers: Vec<usize> = (0..48).filter(|layer| kind_of(*layer) == wanted && up_of(*layer) == wanted).take(4).collect();
     // Mapped as a served model's banks are, read through once so the pages are in memory: page size and page walks count.
     // SAFETY: read-only mappings of files nothing changes during this run.
     let maps: Vec<memmap2::Mmap> = files.iter().map(|file| unsafe { memmap2::Mmap::map(file) }.unwrap()).collect();
