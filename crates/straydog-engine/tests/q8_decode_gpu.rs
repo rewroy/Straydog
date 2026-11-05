@@ -42,6 +42,7 @@ impl Random {
             13 => (256, 176),
             16 => (256, 66),
             17 => (256, 74),
+            19 => (256, 50),
             22 => (256, 82),
             29 => (256, 56),
             _ => panic!("no format {kind}"),
@@ -277,8 +278,8 @@ fn q8_expert_down_matches_the_quantized_product_on_the_host() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (hidden, ffn, routes, tokens, experts) = (1536usize, 768usize, 3usize, 3usize, 4usize);
-    // (IQ2_S's and IQ1_M's downs stay on the F32 kernels)
-    for kind in [16u32, 17, 22, 13, 29] {
+    // (IQ2_S's down stays on the F32 kernels; IQ1_M's takes the Q8 ones since eb4c279, IQ1_S's since 5e0fe12)
+    for kind in [16u32, 17, 22, 13, 29, 19] {
         // an expert's slot: gate and up (IQ2_XXS, unused: the down stage alone), then its down matrix
         let gate_bytes = random.blocks(16, ffn * hidden).len();
         let down_bytes = random.blocks(kind, hidden * ffn).len();
@@ -307,7 +308,7 @@ fn q8_expert_down_matches_the_quantized_product_on_the_host() {
                         0, None, 10.0, false, product.base(), out.base(), 0, Some(split)).unwrap();
             let got = read(&mut gpu, &out, tokens * hidden);
             // (the F32 kernels, and IQ2_S's with the Q8 ones on, take the product itself)
-            let quantize = q8 && kind != 22 && kind != 29;
+            let quantize = q8 && kind != 22;
             for token in 0..tokens {
                 let mut sums = vec![(0.0f64, 0.0f64); hidden];
                 for route in 0..routes {
