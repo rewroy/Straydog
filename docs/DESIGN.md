@@ -698,7 +698,9 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     measuring (`assist.rs`), since it depends on the machine's PCIe link, CPU and VRAM. A round times
     32 decode passes of one row at the level in force and 16 at each other (0, 1, 2 on CUDA; 0, 2, 4
     on HIP), the layers' wall time as `step: layers` has it, every 2048 decode tokens and at a request
-    that begins after more; a level takes over only if 2% faster. A speculating model leaves its
+    that begins after more; a level takes over only if 2% faster and by more than twice the standard
+    error of the difference of the windows' means (passes vary by a quarter, and the log line gives
+    each level's mean ± its error). A speculating model leaves its
     drafts out of a round's passes so that each has one row. The level is carried by the layers'
     captured graphs (`hybrid_assist` is passed to their kernels by value): a change drops the hybrid
     layer graphs of decode and of verification (`hybrid_set_assist`) and the next pass captures them
