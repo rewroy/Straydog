@@ -2,7 +2,7 @@
 //!
 //! A bank is a tensor of the mapped model file, so locking it reads it from the drive: 25.9 GiB took 7.5 s of an 18 s start on an RTX 4060 PC.
 //! [`Model::new`](crate::model::Model::new) decides what is to be locked and does not lock it ([`Model::bank_locks`](crate::model::Model::bank_locks)
-//! hands the plan out as a [`BankLocks`]); a thread of the worker then takes the layers one at a time, and between layers lets a request have the model.
+//! hands the plan out as a [`BankLocks`]); a thread of the worker then takes the layers one at a time, off the model's lock, and a request never waits for it.
 //!
 //! One layer's turn, in the order that keeps the verified-bytes rule (docs/DESIGN.md section 2: only bytes checked against the file's Merkle tree
 //! reach the GPU or the CPU's experts):

@@ -3,11 +3,12 @@
 //!
 //! The app starts the engine when it opens, and the person then types for a while: neither step has to be done before the engine says
 //! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary when
-//! a request comes), then the locking (it holds the engine only to take what it has locked, and yields to a request between layers).
+//! a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request is never waited for, and never
+//! waits for a layer's turn).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError, Weak};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Whether the request loop has read a command that takes the engine since the worker began: the warm-up behind "ready" is over at its next
 /// pass, or does not begin. A static because the engine is behind the lock the warm-up holds, and the request loop is generic over its
@@ -84,6 +85,8 @@ pub(crate) struct Locking {
     pub unverified: bool,
     /// The engine ended first.
     pub gone: bool,
+    /// The model would take no more of the layers locked (an error of its own), and the rest were let go.
+    take_failed: bool,
 }
 
 /// Why a layer could not be locked.
@@ -92,15 +95,13 @@ pub(crate) struct Stopped {
     pub unverified: bool,
 }
 
-/// How long the locking waits for a request to leave the engine before it takes its next layer, and for the lock of a layer it holds to be free.
-const IDLE_POLL: Duration = Duration::from_millis(10);
-const TAKE_POLL: Duration = Duration::from_millis(2);
-
 /// Lock a partially resident model's banks layer by layer, never holding the engine across a layer's turn: `lock` takes the next layer's turn
 /// (the page lock and the check against the file's tree, where nothing of the engine is held, with a strong reference to it so that the weights stay
-/// mapped) and returns it with its number and bytes; `take` hands it to the model under the lock, where a request that holds the engine is
-/// waited for; `give_up` lets a layer go that the model will not take. Between layers it waits until no request holds the engine. `ended` is
-/// told how it went, under the lock, when it is over. `report` says it, at once.
+/// mapped) and returns it with its number and bytes. A request is never waited for, and never waits for a layer's turn (0.1 to 0.5 s of reads and
+/// checks, some seconds for the whole plan): the turns go on whoever has the engine, and the layers locked meanwhile are handed to the model
+/// together (`take`, under the lock) at the first moment the engine is free after a turn, or when the last is locked, which waits for a request
+/// that has it. So requests that follow one another at once, as an agent's do, find the layers registered at the first gap between them.
+/// `give_up` lets a layer go that the model will not take. `ended` is told how it went, under the lock, when it is over. `report` says it, at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S) -> u64, begin: impl FnOnce(&mut S) -> Option<J>,
                                    mut lock: impl FnMut(&mut J) -> Option<Result<(L, usize, u64), Stopped>>,
@@ -114,62 +115,67 @@ pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S
         let Some(job) = begin(&mut guard) else { return done };
         (job, requests(&guard))
     };
-    'layers: loop {
-        // (a request holds the engine: the next layer waits for it to end)
-        let alive = loop {
-            let Some(alive) = engine.upgrade() else { done.gone = true; break 'layers };
-            let state = match alive.try_lock() {
-                Ok(guard) => {
-                    drop(guard);
-                    Ok(true)
-                }
-                Err(TryLockError::Poisoned(_)) => Err(()),
-                Err(TryLockError::WouldBlock) => Ok(false),
-            };
-            match state {
-                Ok(true) => break alive,
-                Ok(false) => {
-                    drop(alive);
-                    std::thread::sleep(IDLE_POLL);
-                }
-                Err(()) => {
-                    done.gone = true;
-                    break 'layers;
+    // The layers locked and checked that the model has not taken yet, with their bytes.
+    let mut waiting: Vec<(L, u64)> = Vec::new();
+    // Hand what waits to the model, under the lock; once it would take no more, the rest are let go.
+    let mut hand_over = |guard: &mut S, waiting: &mut Vec<(L, u64)>, done: &mut Locking| {
+        done.requests = requests(guard).saturating_sub(first);
+        for (locked, bytes) in waiting.drain(..) {
+            if done.take_failed {
+                give_up(locked);
+            } else {
+                match take(guard, locked) {
+                    Ok(()) => {
+                        done.layers += 1;
+                        done.bytes += bytes;
+                    }
+                    Err(message) => {
+                        done.stopped = Some(message);
+                        done.take_failed = true;
+                    }
                 }
             }
-        };
-        let Some(next) = lock(&mut job) else { break };
-        let (locked, _, bytes) = match next {
-            Ok(locked) => locked,
-            Err(stop) => {
+        }
+    };
+    loop {
+        // (held while a layer's turn runs, so that the weights it reads stay mapped)
+        let Some(alive) = engine.upgrade() else { done.gone = true; break };
+        match lock(&mut job) {
+            None => break,
+            Some(Err(stop)) => {
                 done.stopped = Some(stop.message);
                 done.unverified = stop.unverified;
                 break;
             }
-        };
-        // (a request that came meanwhile has the engine: the layer is taken when it ends)
-        let guard = loop {
-            match alive.try_lock() {
-                Ok(guard) => break Some(guard),
-                Err(TryLockError::Poisoned(_)) => break None,
-                Err(TryLockError::WouldBlock) => std::thread::sleep(TAKE_POLL),
-            }
-        };
-        let Some(mut guard) = guard else {
-            give_up(locked);
-            done.gone = true;
-            break 'layers;
-        };
-        done.requests = requests(&guard).saturating_sub(first);
-        match take(&mut guard, locked) {
-            Ok(()) => {
-                done.layers += 1;
-                done.bytes += bytes;
-            }
-            Err(message) => {
-                done.stopped = Some(message);
+            Some(Ok((locked, _, bytes))) => waiting.push((locked, bytes)),
+        }
+        match alive.try_lock() {
+            Ok(mut guard) => hand_over(&mut guard, &mut waiting, &mut done),
+            // (a request has the engine: the layers wait for it, and the next layer's turn goes on)
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => {
+                done.gone = true;
                 break;
             }
+        }
+        if done.take_failed {
+            break;
+        }
+    }
+    // The plan is over (done, stopped, or the engine ended): what waits goes to the model when the engine is free, or is let go.
+    if !waiting.is_empty() {
+        match engine.upgrade() {
+            // (the model's bytes do not match the file's tree: no layer is taken)
+            Some(_alive) if done.unverified => waiting.drain(..).for_each(|(locked, _)| give_up(locked)),
+            Some(alive) => match alive.lock() {
+                Ok(mut guard) => hand_over(&mut guard, &mut waiting, &mut done),
+                Err(_) => {
+                    done.gone = true;
+                    waiting.drain(..).for_each(|(locked, _)| give_up(locked));
+                }
+            },
+            // (the engine is gone: its weights may be unmapped, and the locks go with the process)
+            None => done.gone = true,
         }
     }
     done.seconds = started.elapsed().as_secs_f64();
@@ -186,6 +192,7 @@ pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// An engine's side of the locking: the layers it has taken in order, the requests it has run, and whether it was told the locking ended.
     #[derive(Default)]
@@ -257,15 +264,16 @@ mod tests {
         assert!(drive(&engine, failing, |_| {}).unverified);
     }
 
-    /// Decides: a request that holds the engine is not held up by the locking, which waits for it to end before it takes its next layer, and
-    /// the layer it had locked meanwhile is taken after the request, with the request counted.
+    /// Decides: a request that holds the engine is not held up by the locking and does not hold it up: the layers' turns go on meanwhile (as many as
+    /// remain), and the layers locked meanwhile are taken together as the request ends, with the request counted.
     #[test]
     fn a_request_has_the_engine_whatever_the_locking_has_reached() {
         let engine = Arc::new(Mutex::new(Model::default()));
         let requests: Arc<Mutex<Vec<std::thread::JoinHandle<Duration>>>> = Arc::new(Mutex::new(Vec::new()));
-        // a request takes the engine as the locking is at layer 46 (nothing of the engine is held there), and holds it for 200 ms
+        let locked_while_held = Arc::new(Mutex::new(Vec::new()));
+        // a request takes the engine as the locking is at layer 46 (nothing of the engine is held there), and holds it for 300 ms
         let between = {
-            let (engine, requests) = (engine.clone(), requests.clone());
+            let (engine, requests, locked_while_held) = (engine.clone(), requests.clone(), locked_while_held.clone());
             move |layer: usize| {
                 if layer == 46 {
                     let engine = engine.clone();
@@ -275,20 +283,80 @@ mod tests {
                         let mut model = engine.lock().unwrap();
                         sender.send(()).unwrap();
                         model.requests += 1;
-                        std::thread::sleep(Duration::from_millis(200));
+                        std::thread::sleep(Duration::from_millis(300));
                         started.elapsed()
                     }));
                     // (the request has the engine before the layer is taken)
                     receiver.recv().unwrap();
+                } else if layer < 46 && engine.try_lock().is_err() {
+                    locked_while_held.lock().unwrap().push(layer);
                 }
             }
         };
         let locking = drive(&engine, plan(&[47, 46, 45, 44], 99), between);
         let held: Vec<Duration> = requests.lock().unwrap().drain(..).map(|request| request.join().unwrap()).collect();
         assert_eq!(held.len(), 1);
-        assert!(held[0] >= Duration::from_millis(200) && held[0] < Duration::from_secs(5), "the request held the engine {:?}", held[0]);
+        assert!(held[0] >= Duration::from_millis(300) && held[0] < Duration::from_secs(5), "the request held the engine {:?}", held[0]);
+        assert_eq!(*locked_while_held.lock().unwrap(), vec![45, 44], "the layers after it were locked while it had the engine");
         assert_eq!((locking.layers, locking.requests, locking.stopped), (4, 1, None));
-        assert_eq!(engine.lock().unwrap().taken, vec![47, 46, 45, 44], "the layer locked while the request ran is taken after it");
+        assert_eq!(engine.lock().unwrap().taken, vec![47, 46, 45, 44], "the layers locked while the request ran are taken after it, in order");
+    }
+
+    /// Runs the locking of layers 47, 46, 45 (the last refused, as `unverified` says) with a request holding the engine from layer 46's turn on for
+    /// 200 ms: the layers taken, those given up, and how it went.
+    fn refused_during_a_request(unverified: bool) -> (Locking, Vec<usize>, Vec<usize>) {
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let (given_up, at_46, proceed) = (Arc::new(Mutex::new(Vec::new())), std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+        let locker = {
+            let (engine, given_up) = (Arc::downgrade(&engine), given_up.clone());
+            let (at_46, proceed) = (at_46.0, Mutex::new(proceed.1));
+            std::thread::spawn(move || {
+                lock_behind(&engine, |model: &Model| model.requests, |_| Some(vec![47, 46, 45]),
+                            |layers: &mut Vec<usize>| {
+                                let layer = layers.remove(0);
+                                if layer == 46 {
+                                    // (the request takes the engine now)
+                                    at_46.send(()).unwrap();
+                                    proceed.lock().unwrap().recv().unwrap();
+                                }
+                                if layer == 45 {
+                                    return Some(Err(Stopped { message: "stopped here".into(), unverified }));
+                                }
+                                Some(Ok((layer, layer, 100)))
+                            },
+                            |model: &mut Model, layer| {
+                                model.taken.push(layer);
+                                Ok(())
+                            }, move |layer| given_up.lock().unwrap().push(layer), |_: &mut Model, _| {}, |_| {})
+            })
+        };
+        at_46.1.recv().unwrap();
+        let held = engine.lock().unwrap();
+        proceed.0.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        let locking = locker.join().unwrap();
+        let taken = engine.lock().unwrap().taken.clone();
+        let given_up = given_up.lock().unwrap().clone();
+        (locking, taken, given_up)
+    }
+
+    /// Decides: a layer that cannot be locked ends the plan, and the layers locked before it that a request kept the engine from are still taken.
+    #[test]
+    fn the_layers_locked_before_a_refusal_are_taken_after_the_request() {
+        let (locking, taken, given_up) = refused_during_a_request(false);
+        assert_eq!((locking.layers, locking.stopped.as_deref(), locking.unverified), (2, Some("stopped here"), false));
+        assert_eq!(taken, vec![47, 46]);
+        assert!(given_up.is_empty());
+    }
+
+    /// Decides: layers waiting when a layer's bytes are found not to match the file's tree are let go, not taken, and the plan says so.
+    #[test]
+    fn nothing_is_taken_once_a_layer_does_not_verify() {
+        let (locking, taken, given_up) = refused_during_a_request(true);
+        // (layer 47 was taken while the engine was free; 46 was locked while the request had it, and is let go)
+        assert!(locking.unverified && locking.layers == 1, "{locking:?}");
+        assert_eq!((taken, given_up), (vec![47], vec![46]));
     }
 
     /// Decides: a locking whose engine ended (nobody holds it) is over without taking anything more.
