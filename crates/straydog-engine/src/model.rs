@@ -1116,6 +1116,10 @@ impl Model {
     #[doc(hidden)]
     pub fn lock_layers_for_test(&mut self, layers: &[usize]) -> Result<u64> {
         for &layer in layers {
+            // (a layer the start page-locked already: registering its banks again would fail)
+            if self.locked_layers.contains(&layer) {
+                continue;
+            }
             for bank in Self::host_banks(&self.weights, layer)? {
                 self.group.register_host(bank)?;
             }

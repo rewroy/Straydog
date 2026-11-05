@@ -25,8 +25,9 @@ static GPUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The layers whose banks the test locks.
 const LOCKED: [usize; 4] = [44, 45, 46, 47];
 
-/// The model, with the banks of the last layers locked, and the prompt it continues.
-fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
+/// The model, with the banks of the last layers locked, the prompt it continues, and the plans whose banks the GPU can read (the layers
+/// locked, here or by the start).
+fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>, u64) {
     // (the budget of a 6 GiB card less what the display holds: most of the experts stay on the host)
     let budget = (5.5 * (1u64 << 30) as f64) as u64;
     let mut group = Group::new(&[0], &[budget], SplitMode::Experts).unwrap();
@@ -41,7 +42,7 @@ fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
     assert!(model.partial, "the model must be partially resident at this budget");
     let mapped = model.lock_layers_for_test(&LOCKED).unwrap();
     assert!(mapped >= LOCKED.len() as u64, "{mapped} plans mapped of {}", LOCKED.len());
-    (model, prompt)
+    (model, prompt, mapped)
 }
 
 /// What a run of `passes` decode passes left: the tokens, each pass's logits, and the routes the GPU assisted in each pass.
@@ -51,11 +52,13 @@ struct Run {
     /// (the level a pass ran at, its routes assisted, on the GPU and on the CPU, and the seconds of its layers)
     trace: Vec<(u32, [u64; 3], f64)>,
     detail: Json,
+    /// The plans whose banks the GPU can read.
+    mapped: u64,
 }
 
 /// A fresh model's run: `script` gives the level of each decode pass (the last goes on).
 fn run(root: &std::ffi::OsStr, script: &[u32], passes: usize) -> Run {
-    let (mut model, prompt) = open(root);
+    let (mut model, prompt, mapped) = open(root);
     model.logits_capture = Some(Vec::new());
     model.assist_script(script).unwrap();
     let mut tokens = Vec::new();
@@ -63,7 +66,7 @@ fn run(root: &std::ffi::OsStr, script: &[u32], passes: usize) -> Run {
     model.generate(&prompt, passes + 1, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false,
                    &mut |token| tokens.push(token)).unwrap();
     let logits = model.logits_capture.take().unwrap();
-    Run { tokens, logits, trace: model.assist_trace(), detail: model.last_metrics["partial_detail"].clone() }
+    Run { tokens, logits, trace: model.assist_trace(), detail: model.last_metrics["partial_detail"].clone(), mapped }
 }
 
 fn relative_difference(a: &[f32], b: &[f32]) -> f64 {
@@ -108,8 +111,9 @@ fn every_pass_runs_at_its_level() {
             assert_eq!(total, 0, "a block at level 0 assisted {block:?}");
         } else {
             assert!(total > 0, "a block at level {level} assisted nothing: {block:?}");
-            // (a layer takes at most `level` routes, over the layers locked)
-            assert!(block.iter().all(|(_, count)| *count <= (level as usize * LOCKED.len()) as u64), "{block:?}");
+            // (a layer takes at most `level` routes, over the layers whose banks are mapped: the four the test locks, or every layer
+            // where the start has page-locked them all)
+            assert!(block.iter().all(|(_, count)| *count <= level as u64 * run.mapped), "{block:?}");
         }
     }
     let by_level = |wanted: u32| counts.iter().filter(|(level, _)| *level == wanted).map(|(_, count)| *count).sum::<u64>() as f64
@@ -130,35 +134,45 @@ fn passes_after_a_change_have_the_results_of_their_level() {
     let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let script: Vec<u32> = [2, 0, 1, 2, 0, 1].iter().flat_map(|level| [*level; 3]).collect();
     let passes = script.len();
+    // What two runs that never change level differ by. Which experts the slots hold at a moment, and so which device computes an expert,
+    // depends on timing; how far that moves the logits depends on how many routes the GPU takes from the host: a few layers' where the test
+    // locks four, every layer's where the start page-locks all of them. The tolerance follows it, and is never below 1e-4.
+    let held = run(&root, &[2], passes);
+    let held_again = run(&root, &[2], passes);
+    let (compared, noise) = compare(&held, &held_again, &vec![2; passes], &[2]);
+    let tolerance = (4.0 * noise).max(1e-4);
+    eprintln!("level 2 twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
+    assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
     let switched = run(&root, &script, passes);
-    // the passes of `other` up to where its tokens part from the switched run's, those of `levels` among them: the worst relative
-    // difference of their logits from the switched run's, and how many
-    let compare = |other: &Run, levels: &[u32]| {
-        let (mut compared, mut worst) = (0, 0f64);
-        for pass in 0..passes {
-            // (the logits of pass i come after the prompt's, and follow the tokens up to the pass's own)
-            if switched.tokens.get(..=pass) != other.tokens.get(..=pass) {
-                break;
-            }
-            if levels.contains(&script[pass]) {
-                worst = worst.max(relative_difference(&switched.logits[pass + 1], &other.logits[pass + 1]));
-                compared += 1;
-            }
-        }
-        (compared, worst)
-    };
     // the same levels again, in a fresh model
     let again = run(&root, &script, passes);
-    let (compared, worst) = compare(&again, &[0, 1, 2]);
+    let (compared, worst) = compare(&switched, &again, &script, &[0, 1, 2]);
     eprintln!("the same levels again: {compared} passes compared, the worst relative difference {worst:.2e}");
     assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
-    assert!(worst < 1e-4, "{worst}");
+    assert!(worst < tolerance, "{worst} against {tolerance}");
     // the references: the level of each pass throughout
     for level in 0..=2u32 {
-        let fixed = run(&root, &[level], passes);
-        let (compared, worst) = compare(&fixed, &[level]);
+        let fixed = if level == 2 { None } else { Some(run(&root, &[level], passes)) };
+        let (compared, worst) = compare(&switched, fixed.as_ref().unwrap_or(&held), &script, &[level]);
         eprintln!("level {level}: {compared} passes compared with a run at that level throughout, the worst relative difference {worst:.2e}");
         assert!(compared >= 3, "level {level}: too few passes before the tokens parted ({compared})");
-        assert!(worst < 1e-4, "level {level}: {worst}");
+        assert!(worst < tolerance, "level {level}: {worst} against {tolerance}");
     }
+}
+
+/// The passes of `script` whose level is among `levels`, up to where the two runs' tokens part: the worst relative difference of their
+/// logits, and how many were compared.
+fn compare(one: &Run, other: &Run, script: &[u32], levels: &[u32]) -> (usize, f64) {
+    let (mut compared, mut worst) = (0, 0f64);
+    for pass in 0..script.len() {
+        // (the logits of pass i come after the prompt's, and follow the tokens up to the pass's own)
+        if one.tokens.get(..=pass) != other.tokens.get(..=pass) {
+            break;
+        }
+        if levels.contains(&script[pass]) {
+            worst = worst.max(relative_difference(&one.logits[pass + 1], &other.logits[pass + 1]));
+            compared += 1;
+        }
+    }
+    (compared, worst)
 }
