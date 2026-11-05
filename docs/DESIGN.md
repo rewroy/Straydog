@@ -768,8 +768,9 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   - On a CPU with AVX-512 and VBMI the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
     down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
     the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
-    2-bit codes and a block's rows are looked up there. Ryzen 5 7500F, Qwen3.8 UD-IQ1_S's IQ2_XXS layers, a route on six threads:
-    44.3 -> 33.7 us (F32 -> Q8). Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
+    2-bit codes and a block's rows are looked up there. Ryzen 5 7500F, Qwen3.8 UD-IQ1_S, a route on six threads with the experts
+    cold: 52.8 -> 38.1 us on its IQ2_XXS layers, 43.7 -> 39.1 us on its IQ2_S layers (F32 -> Q8). Served at 5.5 GiB of VRAM: 49.0
+    -> 50.2 tok/s, gate and up 38.5 -> 35.0 us a route (the GPU reads its assisted routes from host memory meanwhile). Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
     0.0009). Formats without integer kernels, and CPUs without those instructions, keep F32; `STRAYDOG_CPU_INT8=0` keeps it
     everywhere.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):

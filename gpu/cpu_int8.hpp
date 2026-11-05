@@ -176,6 +176,9 @@ void q2_0_int_scalar(const uint8_t* row, size_t stride, size_t count, const Q8S*
 #ifdef SD_X86
 // --- AVX-512 (F, BW, VBMI) kernels, up to four rows at a time sharing the activations ---
 
+// A block's F16 scale by the F16C instruction (half_at's portable conversion branches: twice the time of Q2_0's whole down on Zen 5).
+SD_TARGET("f16c")
+inline float half_f16c(const uint8_t* p) { uint16_t bits; std::memcpy(&bits, p, 2); return SD_HALF_TO_FLOAT(bits); }
 inline uint64_t grid_row(const uint8_t* grid, unsigned offset) { uint64_t row; std::memcpy(&row, grid + offset, 8); return row; }
 // The eight grid rows at these byte offsets, as 64 bytes.
 SD_TARGET("avx512f,avx512bw,avx2")
@@ -278,7 +281,7 @@ inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p
     return _mm512_add_epi32(lanes, _mm512_madd_epi16(_mm512_maddubs_epi16(weights, signed_q), scales));
 }
 template<int kind, int N>
-SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2")
+SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,f16c")
 void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blocks, float* out) {
     constexpr size_t bytes = kind == 16 ? 66 : 82;
     const uint8_t* grid = iq_table(kind);
@@ -303,7 +306,7 @@ void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
             for (int r = 0; r < N; ++r) lanes[r] = chunk_lanes(grid, codes != nullptr, prepared[r], c, q, lanes[r]);
         }
         for (int r = 0; r < N; ++r) {
-            const float scale = half_at(row + size_t(r) * stride + b * bytes) * x[b].d * 0.125f;
+            const float scale = half_f16c(row + size_t(r) * stride + b * bytes) * x[b].d * 0.125f;
             acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes[r]), _mm512_set1_ps(scale), acc[r]);
         }
     }
@@ -314,7 +317,7 @@ void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
     }
 }
 template<int N>
-SD_TARGET("avx512f,avx512bw,avx2")
+SD_TARGET("avx512f,avx512bw,avx2,f16c")
 void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t blocks, float* out) {
     // (each 128 bits m = 0..3 takes the codes shifted down by 2m)
     const __m512i shifts = _mm512_setr_epi64(0, 0, 0x0002000200020002, 0x0002000200020002, 0x0004000400040004, 0x0004000400040004,
@@ -330,7 +333,7 @@ void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t bl
             const uint8_t* block = row + size_t(r) * stride + 18 * b;
             const __m512i codes = _mm512_and_si512(_mm512_srlv_epi16(_mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2))), shifts), three);
             const __m512i lanes = _mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(codes, q), ones), bias);
-            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes), _mm512_set1_ps(half_at(block) * x[b].d), acc[r]);
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes), _mm512_set1_ps(half_f16c(block) * x[b].d), acc[r]);
         }
     }
     for (int r = 0; r < N; ++r) {
