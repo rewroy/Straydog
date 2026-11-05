@@ -598,6 +598,9 @@ mod tests {
         assert!(store.prune(Some(&second)).is_empty(), "two files fit");
         // (the first is used again: it is now the newest, and the second the oldest)
         store.touch(&first);
+        assert_eq!(store.candidates(&prefix)[0].path, first, "a use makes a file the newest");
+        // (a file's time is the system's, which moves in steps of milliseconds: the third is written after one)
+        std::thread::sleep(Duration::from_millis(100));
         let third = store.save(&Flip, 1, &prefix, &tokens[2], state(10)).unwrap().0;
         let deleted = store.prune(Some(&third));
         assert_eq!(deleted, [second.clone()], "the least recently used goes");
