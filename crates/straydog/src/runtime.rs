@@ -860,6 +860,27 @@ struct Driver {
     refusal: Refusal,
 }
 
+/// The name of the file that keeps a bundle's warm-up state, in the data directory's `warm`. The key hashes the bundle's pinned shards. A bundle read on
+/// demand keeps the expert stores' state, `<quantization>-<key>.json`; a partially resident one (Qwen3.8's) keeps its route counts
+/// ([`straydog_engine::routes`]), `<model>-<provider>-<quantization>-<key>.json` with a key of its own. The two kinds never share a name, nor a prefix a
+/// search for an earlier version's file takes: Unsloth's UD-IQ1_M is the quantization of both models.
+fn warm_file(id: straydog_engine::bundle::Id, shards: &[String]) -> String {
+    use sha2::Digest;
+    let mut key = sha2::Sha256::new();
+    key.update(if id.is_on_demand() { &b"straydog warm-up state 2\n"[..] } else { &b"straydog route counts 1\n"[..] });
+    for shard in shards {
+        key.update(shard.as_bytes());
+    }
+    let key: String = key.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
+    if id.is_on_demand() {
+        return format!("{}-{key}.json", id.quant);
+    }
+    let name = |label: &str| -> String {
+        label.chars().map(|letter| if letter.is_ascii_alphanumeric() || matches!(letter, '.' | '-' | '_') { letter } else { '_' }).collect()
+    };
+    format!("{}-{}-{}-{key}.json", name(id.model), name(id.provider), name(id.quant))
+}
+
 /// How often a changed warm-up state is saved while the server runs.
 const WARM_SAVE: Duration = Duration::from_secs(120);
 /// The largest warm-up state read back.
@@ -969,25 +990,21 @@ impl Driver {
     /// placement. A state lists experts by layer and number, which any placement of the model
     /// takes: each into the store now holding its layer, as many as its slots hold.
     fn warm_path(&self) -> Option<PathBuf> {
-        use sha2::Digest;
         let directory = self.warm_directory.as_ref()?;
-        let quant = self.expected.1.quant;
-        let mut key = sha2::Sha256::new();
-        key.update(b"straydog warm-up state 2\n");
-        for shard in straydog_engine::bundle::shards(self.expected.1).ok()? {
-            key.update(shard.sha256.as_bytes());
-        }
-        let key: String = key.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
-        Some(directory.join(format!("{quant}-{key}.json")))
+        let shards: Vec<String> = straydog_engine::bundle::shards(self.expected.1).ok()?.into_iter().map(|shard| shard.sha256.to_string()).collect();
+        Some(directory.join(warm_file(self.expected.1, &shards)))
     }
 
-    /// The model's warm-up state, else the latest an earlier version kept per placement (its
+    /// The model's warm-up state, else for a bundle read on demand the latest an earlier version kept per placement (its
     /// file named for the quantization too): only a list of experts to read, so any of the
-    /// model's will do.
+    /// model's will do. A partially resident model's route counts have no such files, and another model's state is none of its.
     fn warm_source(&self) -> Option<PathBuf> {
         let path = self.warm_path()?;
         if path.is_file() {
             return Some(path);
+        }
+        if !self.expected.1.is_on_demand() {
+            return None;
         }
         let prefix = format!("{}-", self.expected.1.quant);
         std::fs::read_dir(path.parent()?).ok()?.flatten()
@@ -1431,6 +1448,31 @@ impl Engine for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: a bundle read on demand keeps its warm-up state under the name it always had, a partially resident one's route counts under a name of
+    /// the bundle's three labels and a key of their own, and the two never meet: not by name, not by the prefix an earlier version's file is searched by
+    /// (Unsloth's UD-IQ1_M is both models' quantization), and not by the shards they are keyed on.
+    #[test]
+    fn the_two_kinds_of_warm_up_state_are_named_apart() {
+        use straydog_engine::bundle::{Id, DEEPSEEK, MODEL, UNSLOTH};
+        let (qwen, deepseek) = (Id::find(Some(MODEL), Some(UNSLOTH), "UD-IQ1_M").unwrap(), Id::find(Some(DEEPSEEK), Some(UNSLOTH), "UD-IQ1_M").unwrap());
+        let shards = ["aa".to_string(), "bb".to_string()];
+        let key = |domain: &[u8]| -> String {
+            use sha2::Digest;
+            let mut hash = sha2::Sha256::new();
+            hash.update(domain);
+            shards.iter().for_each(|shard| hash.update(shard.as_bytes()));
+            hash.finalize().iter().take(12).map(|byte| format!("{byte:02x}")).collect()
+        };
+        assert_eq!(warm_file(deepseek, &shards), format!("UD-IQ1_M-{}.json", key(b"straydog warm-up state 2\n")), "as it was named before");
+        let named = warm_file(qwen, &shards);
+        assert_eq!(named, format!("{MODEL}-{UNSLOTH}-UD-IQ1_M-{}.json", key(b"straydog route counts 1\n")));
+        assert_ne!(named, warm_file(deepseek, &shards));
+        assert!(!named.starts_with("UD-IQ1_M-"), "the search for an earlier version's files is by that prefix");
+        assert_ne!(named, warm_file(qwen, &["aa".to_string(), "bc".to_string()]), "another build of the shards, another file");
+        assert_ne!(named, warm_file(Id::find(Some(MODEL), Some(UNSLOTH), "UD-IQ1_S").unwrap(), &shards));
+        assert!(named.chars().all(|letter| letter.is_ascii_alphanumeric() || matches!(letter, '.' | '-' | '_')));
+    }
 
     /// The reason a worker failed to start is its last line, which its launcher's warning (printed
     /// before the worker starts) never is, unless the worker said nothing at all.

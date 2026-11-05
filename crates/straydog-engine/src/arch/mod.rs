@@ -3,7 +3,7 @@
 
 pub mod deepseek41;
 pub mod served;
-mod warm;
+pub(crate) mod warm;
 
 use straydog_gguf::{Metadata, ModelHeader};
 

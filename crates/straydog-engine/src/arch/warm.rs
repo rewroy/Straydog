@@ -89,11 +89,8 @@ impl Warm {
     fn counts_to_save<E: Engines>(&self, engines: &E) -> Vec<[u64; 3]> {
         let (layers, experts) = (self.layers, self.experts);
         let uses = engines.uses();
-        // The earlier counts age by how much this run adds to them: not at all when it added nothing,
-        // hardly for a few passes (a restart's one reply), by half when it added as many as they held
-        // (the most, so that a long run does not erase them).
         let (had, ran) = (self.prior.iter().map(|&count| u64::from(count)).sum::<u64>(), uses.iter().map(|use_| u64::from(use_.2)).sum::<u64>());
-        let keep = if ran == 0 { 1.0 } else { (had as f64 / (had + ran) as f64).max(0.5) };
+        let keep = kept_share(had, ran);
         let mut counts = vec![0u32; layers * experts];
         for (count, &before) in counts.iter_mut().zip(&self.prior) {
             *count = (f64::from(before) * keep).round() as u32;
@@ -218,6 +215,13 @@ impl Warm {
         *cursor = end;
         true
     }
+}
+
+/// The share an earlier state's counts keep when a run adds `ran` uses to the `had` they hold: all of them when it added nothing, hardly less for a few
+/// (a restart's one reply), half when it added as many as they held or more (the most, so that a long run does not erase them). A partially resident
+/// model's route counts ([`crate::routes`]) age by the same rule.
+pub fn kept_share(had: u64, ran: u64) -> f64 {
+    if ran == 0 { 1.0 } else { (had as f64 / (had + ran) as f64).max(0.5) }
 }
 
 /// The experts in the order a fill weighs them: by how often the earlier run's passes used each

@@ -906,6 +906,47 @@ impl Group {
         self.backends.iter_mut().map(|backend| backend.enable_assist(routes)).sum()
     }
 
+    /// The decode and verification rows each partially resident layer routed to each expert since the last clear, on the devices and on the host
+    /// ([`Backend::route_counts`]).
+    pub fn route_counts(&self, clear: bool) -> Result<Vec<(usize, Vec<u32>, Vec<u32>)>> {
+        let mut counted = Vec::new();
+        for backend in &self.backends {
+            counted.extend(backend.route_counts(clear)?);
+        }
+        Ok(counted)
+    }
+
+    /// Set a layer's experts' scores from the routes a token each takes ([`Backend::seed_scores`]), on the device that has the layer.
+    pub fn seed_scores(&mut self, layer: usize, rates: &[f64]) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.seed_scores(layer, rates).map(drop))
+    }
+
+    /// One bounded refresh of every device's expert slots by their scores, never waiting for its copies: the swaps still on their way, the slots
+    /// and what they hold, in all.
+    pub fn refresh_slots(&mut self, max_swaps: u64) -> Result<(u64, u64, u64)> {
+        let mut total = (0, 0, 0);
+        for backend in &mut self.backends {
+            let (pending, slots, held) = backend.refresh_slots(max_swaps)?;
+            total = (total.0 + pending, total.1 + slots, total.2 + held);
+        }
+        Ok(total)
+    }
+
+    /// The expert slots, and what they hold, in all.
+    pub fn slots(&self) -> Result<(u64, u64)> {
+        let mut total = (0, 0);
+        for backend in &self.backends {
+            let (slots, held) = backend.slots()?;
+            total = (total.0 + slots, total.1 + held);
+        }
+        Ok(total)
+    }
+
+    /// The experts swapped into the slots since the start.
+    pub fn swapped_experts(&self) -> Result<u64> {
+        self.backends.iter().map(|backend| backend.hybrid_counts().map(|counts| counts[6])).sum()
+    }
+
     /// Page locks are process-wide; one backend performs them.
     pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
         self.backends[0].register_host(range)

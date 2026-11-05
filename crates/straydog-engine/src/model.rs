@@ -22,6 +22,7 @@ use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::qwen_vision::{self, ImageSpan, IMAGE_PAD};
+use crate::routes::{self, Banks, Hints, Routes};
 use crate::sampling::{self, Generated, Sampling};
 use crate::vision::IMAGE_TOKEN;
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
@@ -393,6 +394,29 @@ fn last_row(values: &[f32]) -> &[f32] {
     &values[values.len() - WIDTH..]
 }
 
+/// The layers a partially resident model's route counts cover (its decoder's 48 and the drafter's one) and the experts of each.
+pub const ROUTED_LAYERS: usize = 49;
+pub const ROUTED_EXPERTS: usize = 512;
+
+/// What a warm start planned ([`Model::warm_start`]): the expert slots there are, what they held and how many experts had been swapped into them
+/// at that moment, and what to ask the OS for.
+pub struct WarmStart {
+    pub slots: u64,
+    pub held: u64,
+    pub swapped: u64,
+    pub hints: Hints,
+}
+
+/// Where the slot fill of a warm start stands ([`Model::warm_fill`]): the swaps still on their way (0: no more wanted), the slots, what they hold,
+/// and how many experts have been swapped into them since the start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmFill {
+    pub pending: u64,
+    pub slots: u64,
+    pub held: u64,
+    pub swapped: u64,
+}
+
 pub struct Model {
     // Field order is drop order: the devices go before the CPU engine they use, and both
     // before the mappings their native plans point into.
@@ -451,6 +475,8 @@ pub struct Model {
     pinned_other: u64,
     /// The expert banks a partially resident model reads from host memory.
     banks_bytes: u64,
+    /// The layers whose banks are page-locked (resident until the process ends): a warm start asks the OS for no others' pages.
+    locked_layers: Vec<usize>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -588,6 +614,7 @@ impl Model {
             watching_memory: false,
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
+            locked_layers: Vec::new(),
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -1001,6 +1028,61 @@ impl Model {
         Ok(true)
     }
 
+    /// What a later start warms up with: the decode and verification rows routed to each expert of each layer, on the GPU and on the host, since the model
+    /// started or its counts were last cleared ([`routes`](crate::routes)). Empty of counts for a model that holds all its experts.
+    pub fn route_counts(&self) -> Result<Routes> {
+        let mut routes = Routes::new(ROUTED_LAYERS, ROUTED_EXPERTS);
+        for (layer, gpu, host) in self.group.route_counts(false)? {
+            routes.set_layer(layer, &gpu, &host);
+        }
+        Ok(routes)
+    }
+
+    /// Forget the routes counted so far (the start-up's own passes say nothing of a later run's).
+    pub fn clear_route_counts(&mut self) -> Result<()> {
+        self.group.route_counts(true).map(drop)
+    }
+
+    /// The first step of a warm start of a partially resident model from an earlier run's counts, before its first request: the scores the slots are ranked
+    /// by are set from them (so that the slots fill with the experts used most, and a request's own routes then weigh in on top), and the bank pages of the
+    /// next likeliest experts, those after the first as many as there are slots and of layers that are not page-locked, are planned for the OS, as far as the
+    /// physical memory available allows less [`crate::host::left_free`]. The slots fill by [`Model::warm_fill`] and the pages are asked for by
+    /// [`crate::host::prefetch`], both in the background.
+    pub fn warm_start(&mut self, prior: &Routes) -> Result<WarmStart> {
+        if !self.partial {
+            return Err("a model that holds all its experts has no slots to warm up".into());
+        }
+        if prior.total() > 0 {
+            for layer in 0..ROUTED_LAYERS {
+                let rates = prior.rates(layer);
+                if rates.iter().any(|&rate| rate > 0.0) {
+                    self.group.seed_scores(layer, &rates)?;
+                }
+            }
+        }
+        let (slots, held) = self.group.slots()?;
+        let banks = |layer: usize| -> Option<Banks> {
+            if self.locked_layers.contains(&layer) || (layer >= 48 && !self.weights.drafter) {
+                return None;
+            }
+            let banks = Self::host_banks(&self.weights, layer).ok()?;
+            if banks.iter().any(|bank| bank.is_empty() || bank.len() % ROUTED_EXPERTS != 0) {
+                return None;
+            }
+            Some(Banks { start: banks.map(|bank| bank.as_ptr() as usize), bytes: banks.map(|bank| bank.len() / ROUTED_EXPERTS) })
+        };
+        let memory = self.weights.host_memory_bytes;
+        let budget = crate::host::within_free(u64::MAX, 0, crate::host::available_bytes(), memory);
+        let hints = routes::plan_hints(&prior.ranked(), slots as usize, budget, &banks);
+        Ok(WarmStart { slots, held, swapped: self.group.swapped_experts()?, hints })
+    }
+
+    /// One bounded step of filling the expert slots by the scores a warm start set, never waiting for its copies.
+    pub fn warm_fill(&mut self, max_swaps: u64) -> Result<WarmFill> {
+        let (pending, slots, held) = self.group.refresh_slots(max_swaps)?;
+        Ok(WarmFill { pending, slots, held, swapped: self.group.swapped_experts()? })
+    }
+
     /// A layer's mapped gate, up and down expert banks.
     fn host_banks(weights: &Weights, layer: usize) -> Result<[&[u8]; 3]> {
         let bank = |role: &str| weights.raw(&format!("blk.{layer}.ffn_{role}_exps.weight"), 0, None).map(|raw| raw.0);
@@ -1089,6 +1171,7 @@ impl Model {
                    host memory {}, available {available}{commit}, VRAM slots to come {}", gib(locked), gib(banks_total), gib(by_memory),
                   gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
+        self.locked_layers = layers[..registered].to_vec();
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state, banks_total);
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
         if !self.watching_memory {

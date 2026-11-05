@@ -7,7 +7,7 @@
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::images;
@@ -18,9 +18,10 @@ use straydog_engine::chat::{self, ChatTemplate};
 use straydog_engine::constraint::Constraint;
 use straydog_engine::reply::THINK_CLOSE;
 use straydog_engine::group::{Group, SplitMode};
-use straydog_engine::model::{Model, Settings, END_TOKENS};
+use straydog_engine::model::{Model, Settings, WarmStart, END_TOKENS, ROUTED_EXPERTS, ROUTED_LAYERS};
 use straydog_engine::pyjson;
 use straydog_engine::qwen_vision::{Encoder, ImageSpan};
+use straydog_engine::routes::Routes;
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
@@ -126,6 +127,10 @@ struct Engine {
     /// The rows of the images encoded last (by their bytes' digest), newest last: a conversation sends its images
     /// again with every turn.
     encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
+    /// The route counts of the runs before this one, from the warm-up state it started with (a partially resident model's: [`straydog_engine::routes`]).
+    earlier: Option<Routes>,
+    /// The requests this run has begun: a warm start's slot fill ends with the first ([`fill_slots`]).
+    requests: u64,
 }
 
 /// Bytes of image rows kept for the turns after ([`Engine::encoded`]): about 40 full screens (1440x900 is 1260 rows of 2560 values).
@@ -150,17 +155,152 @@ pub(crate) trait Served: Send {
     fn warm(&mut self, _state: &Value) -> Result<(), String> {
         Ok(())
     }
+
+    /// [`Served::warm`] for a model whose warm-up steps run on a thread of their own, each under the engine's lock (`engine` is the handle the request loop
+    /// shares: a request that comes meanwhile waits for one step at most).
+    fn warm_in_background(engine: &Arc<Mutex<Self>>, state: &Value) -> Result<(), String>
+    where
+        Self: Sized + 'static,
+    {
+        engine.lock().unwrap().warm(state)
+    }
 }
 
 impl Served for Engine {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure> {
+        self.requests += 1;
         run(self, text, output, id, body, cancel, started)
     }
 
     fn reset(&mut self) -> Result<(), String> {
         self.model.reset()
     }
+
+    /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own. Null for a model that holds all its experts,
+    /// and before any route was counted.
+    fn warm_state(&mut self) -> Result<Value, String> {
+        if !self.model.partial {
+            return Ok(Value::Null);
+        }
+        let run = self.model.route_counts()?;
+        let earlier = self.earlier.clone().unwrap_or_else(|| Routes::new(ROUTED_LAYERS, ROUTED_EXPERTS));
+        let kept = earlier.aged_with(&run);
+        Ok(if kept.total() == 0 { Value::Null } else { kept.to_state() })
+    }
+
+    fn warm_in_background(engine: &Arc<Mutex<Engine>>, state: &Value) -> Result<(), String> {
+        let began = Instant::now();
+        let (start, requests) = {
+            let mut engine = engine.lock().unwrap();
+            match engine.warm_begin(state)? {
+                Some(start) => (start, engine.requests),
+                None => return Ok(()),
+            }
+        };
+        let weak = Arc::downgrade(engine);
+        std::thread::Builder::new().name("straydog-warm".into()).spawn(move || warm_start(&weak, start, requests, began))
+            .map(drop).map_err(|exc| exc.to_string())
+    }
+}
+
+/// Swaps one step of a warm start's slot fill may issue (about 64 MB of experts at IQ1_M, which the device's copy thread issues without the engine's
+/// compute thread waiting), and the pause between steps that lets a request take the engine.
+const WARM_SWAPS: u64 = 64;
+const WARM_PAUSE: Duration = Duration::from_millis(2);
+/// The longest the slot fill goes on: it ends when the slots hold what the scores want, well within this.
+const WARM_LONGEST: Duration = Duration::from_secs(120);
+
+impl Engine {
+    /// The first step of a warm start with `state`, under the engine's lock ([`straydog_engine::model::Model::warm_start`]): the earlier counts it keeps
+    /// to save with the next state, the scores it sets, and what it plans. None for a model that holds all its experts. A state of another kind, format or
+    /// model is refused and the model starts as it would without.
+    fn warm_begin(&mut self, state: &Value) -> Result<Option<WarmStart>, String> {
+        if !self.model.partial {
+            return Ok(None);
+        }
+        let prior = Routes::from_state(state, ROUTED_LAYERS, ROUTED_EXPERTS)?;
+        let start = self.model.warm_start(&prior)?;
+        self.earlier = Some(prior);
+        Ok(Some(start))
+    }
+}
+
+/// How a warm start's slot fill ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Filled {
+    /// The slots hold what the scores want.
+    Done,
+    /// A request began: its own routes and its rebalance take the slots from there.
+    CutShort,
+    Failed(String),
+    /// The engine is gone (the worker ended).
+    Gone,
+}
+
+/// Step `step` under the engine's lock (it says whether more is wanted), pausing between steps so that a request takes the lock, until it has nothing
+/// more to do, the engine's request count moves from `began`, `longest` passes, or the engine is gone. The lock is only held in steps, and a request
+/// that has it ends the fill: it is the request's slots by then.
+fn fill_slots<S>(engine: &Weak<Mutex<S>>, began: u64, requests: impl Fn(&S) -> u64, mut step: impl FnMut(&mut S) -> Result<bool, String>,
+                 pause: Duration, longest: Duration) -> Filled {
+    let started = Instant::now();
+    loop {
+        let Some(alive) = engine.upgrade() else { return Filled::Gone };
+        {
+            let Ok(mut guard) = alive.lock() else { return Filled::Gone };
+            if requests(&guard) != began {
+                return Filled::CutShort;
+            }
+            match step(&mut guard) {
+                Ok(true) if started.elapsed() < longest => {}
+                Ok(true) | Ok(false) => return Filled::Done,
+                Err(message) => return Filled::Failed(message),
+            }
+        }
+        drop(alive);
+        std::thread::sleep(pause);
+    }
+}
+
+/// A warm start's background work, after `warm_in_background`, on two threads at once, for the slots' copies and the OS's reads share the drive: one asks the
+/// OS for the bank pages planned (each request a few hundred MB of the likeliest experts, the engine kept alive while the OS reads its mapping, no lock held),
+/// the other fills the expert slots by the scores the first step set, a bounded number of swaps at a time. One line in the log says what it did and how long
+/// it took.
+fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, began: Instant) {
+    let mut fill = None;
+    let (asked, refused, asking, filled) = std::thread::scope(|scope| {
+        let asking = scope.spawn(|| {
+            let (mut asked, mut refused) = (0u64, None);
+            for request in &start.hints.requests {
+                let Some(alive) = engine.upgrade() else { break };
+                match straydog_engine::host::prefetch(&request.ranges) {
+                    Ok(()) => asked += request.bytes,
+                    Err(message) => {
+                        refused = Some(message);
+                        break;
+                    }
+                }
+                drop(alive);
+            }
+            (asked, refused, began.elapsed())
+        });
+        let filled = fill_slots(engine, requests, |engine: &Engine| engine.requests, |engine: &mut Engine| {
+            let step = engine.model.warm_fill(WARM_SWAPS)?;
+            fill = Some(step);
+            Ok(step.pending > 0)
+        }, WARM_PAUSE, WARM_LONGEST);
+        let (asked, refused, asking) = asking.join().unwrap_or_else(|_| (0, Some("its thread failed".to_string()), began.elapsed()));
+        (asked, refused, asking, filled)
+    });
+    let (swapped, held, slots) = fill.map_or((0, start.held, start.slots), |fill| (fill.swapped.saturating_sub(start.swapped), fill.held, fill.slots));
+    let note = match (&filled, &refused) {
+        (Filled::CutShort, _) => " (a request began, and its own routes took the slots from there)".to_string(),
+        (Filled::Failed(message), _) => format!(" (the slot fill stopped: {message})"),
+        (_, Some(message)) => format!(" (the OS stopped a read-ahead: {message})"),
+        _ => String::new(),
+    };
+    eprintln!("Straydog warm start: {swapped} expert slots filled ({held} of {slots} held), the OS asked for {} MB of bank pages ({} experts) in {:.1} s, \
+               the slots done in {:.1} s{note}", asked >> 20, start.hints.experts, asking.as_secs_f64(), began.elapsed().as_secs_f64());
 }
 
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
@@ -173,7 +313,9 @@ fn warm_up(model: &mut Model) -> Result<(), String> {
             model.generate(&prompt, 2, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {})?;
         }
     }
-    model.reset()
+    model.reset()?;
+    // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
+    model.clear_route_counts()
 }
 
 /// How long a GPU's memory held by another process is waited for.
@@ -386,7 +528,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "load_seconds": seconds,
         "gpu": model.info()?,
     }));
-    serve(Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new() })), text, output)
+    serve(Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0 })), text, output)
 }
 
 /// A placement's refusal under `auto`, which no one chose the budget of: what it took and what to do.
@@ -494,8 +636,8 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
             Some("warm") => {
                 let state = request.get("state").and_then(|state| serde_json::from_str(&pyjson::dumps(state)).ok())
                     .unwrap_or(Value::Null);
-                if let Err(message) = engine.lock().unwrap().warm(&state) {
-                    eprintln!("Straydog could not warm up: {message}");
+                if let Err(message) = S::warm_in_background(&engine, &state) {
+                    eprintln!("Straydog cannot warm up: {message}");
                 }
             }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
@@ -807,6 +949,80 @@ mod tests {
         assert_eq!(auto_budget(false, 6000 * MIB, 6144 * MIB), 5376 * MIB);
         assert_eq!(auto_budget(true, 5344 * MIB, 6144 * MIB), 4288 * MIB);
         assert_eq!(auto_budget(true, 500 * MIB, 6144 * MIB), 0);
+    }
+
+    /// A model's side of a warm start's slot fill: its request count, and the swaps it still wants.
+    struct Slots {
+        requests: u64,
+        wanted: u64,
+        steps: u64,
+    }
+
+    fn fill(engine: &Arc<Mutex<Slots>>, longest: Duration, mut after: impl FnMut(&mut Slots)) -> Filled {
+        fill_slots(&Arc::downgrade(engine), 0, |slots: &Slots| slots.requests, |slots: &mut Slots| {
+            slots.steps += 1;
+            slots.wanted = slots.wanted.saturating_sub(1);
+            after(slots);
+            Ok(slots.wanted > 0)
+        }, Duration::ZERO, longest)
+    }
+
+    /// Decides: the fill steps until the slots want nothing more, and a model that wants none is not stepped twice.
+    #[test]
+    fn the_slot_fill_steps_until_nothing_is_wanted() {
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: 5, steps: 0 }));
+        assert_eq!(fill(&engine, Duration::from_secs(30), |_| {}), Filled::Done);
+        assert_eq!(engine.lock().unwrap().steps, 5);
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: 0, steps: 0 }));
+        assert_eq!(fill(&engine, Duration::from_secs(30), |_| {}), Filled::Done);
+        assert_eq!(engine.lock().unwrap().steps, 1);
+    }
+
+    /// Decides: a request that began before, or between two steps, ends the fill before the next step; a step that fails ends it with its reason; a
+    /// fill that wants more for longer than it may is over; and a worker that ended (nobody holds the engine) is the end of it.
+    #[test]
+    fn a_request_a_failure_the_time_and_the_engine_ending_each_end_the_slot_fill() {
+        let engine = Arc::new(Mutex::new(Slots { requests: 1, wanted: 5, steps: 0 }));
+        assert_eq!(fill(&engine, Duration::from_secs(30), |_| {}), Filled::CutShort);
+        assert_eq!(engine.lock().unwrap().steps, 0, "a request that began first leaves the slots to itself");
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: 50, steps: 0 }));
+        assert_eq!(fill(&engine, Duration::from_secs(30), |slots| if slots.steps == 3 { slots.requests += 1 }), Filled::CutShort);
+        assert_eq!(engine.lock().unwrap().steps, 3, "the steps before it stand, none after");
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: 50, steps: 0 }));
+        let failed = fill_slots(&Arc::downgrade(&engine), 0, |slots: &Slots| slots.requests, |_: &mut Slots| Err("the device said no".to_string()),
+                                Duration::ZERO, Duration::from_secs(30));
+        assert_eq!(failed, Filled::Failed("the device said no".into()));
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: u64::MAX, steps: 0 }));
+        assert_eq!(fill(&engine, Duration::from_millis(20), |_| std::thread::sleep(Duration::from_millis(5))), Filled::Done);
+        let steps = engine.lock().unwrap().steps;
+        assert!((1..100).contains(&steps), "{steps} steps in 20 ms");
+        let weak = Arc::downgrade(&engine);
+        drop(engine);
+        assert_eq!(fill_slots(&weak, 0, |slots: &Slots| slots.requests, |_: &mut Slots| Ok(true), Duration::ZERO, Duration::from_secs(30)), Filled::Gone);
+    }
+
+    /// Decides: a request that comes while the fill steps takes the engine between two of them (the fill holds it for a step at a time) and ends the fill.
+    #[test]
+    fn a_request_that_comes_meanwhile_gets_the_engine_between_steps() {
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: u64::MAX, steps: 0 }));
+        let filling = {
+            let weak = Arc::downgrade(&engine);
+            std::thread::spawn(move || fill_slots(&weak, 0, |slots: &Slots| slots.requests, |slots: &mut Slots| {
+                slots.steps += 1;
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(true)
+            }, Duration::from_millis(1), Duration::from_secs(60)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let waited = Instant::now();
+        {
+            let mut engine = engine.lock().unwrap();
+            engine.requests += 1;
+        }
+        let waited = waited.elapsed();
+        assert_eq!(filling.join().unwrap(), Filled::CutShort);
+        assert!(waited < Duration::from_secs(2), "the request waited {waited:?} for the engine");
+        assert!(engine.lock().unwrap().steps >= 1);
     }
 
     #[test]

@@ -543,6 +543,13 @@ int sd_hybrid_assist(void* handle, uint32_t assist, uint64_t* mapped);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);
+/* Warm start: a partially resident layer's decode and verification rows routed to each of its experts since the last clear, to the device (the expert held a slot) then to the host, into `out` (room for `room` values); the experts counted (0: a plan of another kind, -1: failure); `clear` zeroes them after. */
+int sd_hybrid_routes(void* handle, void* plan, uint32_t* out, uint64_t room, int clear);
+/* The layer's experts' scores set from `rates`, the routes a token to each of `experts`, as the moving average they come to at that rate. */
+int sd_hybrid_seed(void* handle, void* plan, const double* rates, uint64_t experts);
+/* One bounded refresh of the expert slots by those scores, never waiting for its copies: the swaps still on their way after it (0: none wanted), the pool's size and its occupation. */
+int sd_hybrid_refresh(void* handle, uint64_t max_swaps, uint64_t* pending, uint64_t* slots, uint64_t* held);
+int sd_hybrid_slots(void* handle, uint64_t* slots, uint64_t* held);
 
 /* CPU experts and formats */
 const char* sd_cpu_error(void);
