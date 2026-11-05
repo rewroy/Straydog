@@ -1007,7 +1007,18 @@ layer (§6.2).
   Q8_0) take the Q8 kernels: each 32 values of a row's input are quantized to INT8 with one F32
   scale, staged once per block, and a unit's dots are exact in INT32 before scaling. A layer's
   qkv, gate, beta and alpha stay one launch: a block owns one matrix, and the BF16 ones read the
-  F32 input. `STRAYDOG_Q8=0` keeps every projection on F32.
+  F32 input. `STRAYDOG_Q8=0` keeps every projection on F32. On CUDA the same kernels run with
+  `__dp4a` (gpu/gemv.hpp: the quantization, the units and the order of every sum are the RDNA4
+  kernels'; only the integer dot is the device's, and the lanes are twice the F32 plan's). They
+  replace F32 kernels that were held by their load instructions and L1 wavefronts, not by the
+  memory: on an RTX 5070 Ti the dense front of a DeltaNet layer (qkv, gate, beta, alpha) takes 40
+  microseconds where it took 56 (the card streams that much in 38), the 2560 x 6144 out
+  projections 14.6 and 19.3 where they took 31 and 39. A Q8 row's sum does not depend on what
+  shares its launch, so a verification pass still equals token-by-token decode, but it is the
+  quantized input's sum, not the F32 kernels': KL mean 1.1e-3, p99 1.2e-2 against them (UD-IQ1_S,
+  356 decode steps). DeepSeek-V4.1's dense GEMVs stay on the F32 kernels on CUDA (its Q8 switch,
+  `DS41_Q8`, has no CUDA kernels behind it yet: the dense kernels take its formats, but turning
+  them on there is a change to `sd_decode_options` and a quality run on a DeepSeek bundle).
 - **HyperConnections in Q8_0.** The HyperConnections' down and up projections (BF16 in the bundle,
   1.26 GB of the 5.2 GB a row reads) go up quantized to Q8_0 at load, as llama.cpp quantizes:
   each 32 values' scale max |x| / 127. A decode pass reads half their bytes (plain decode

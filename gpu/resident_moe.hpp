@@ -220,7 +220,7 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     const int routed=weights[down ? 2 : 0].kind;
     const auto in=[](int kind,std::initializer_list<int> kinds) { return std::find(kinds.begin(),kinds.end(),kind)!=kinds.end(); };
     bool kind=in(routed,{12,13,14,18,20,21,22,23,42}) && (down || weights[1].kind==routed) && (!down || !with_shared ||
-              in(weights[shared+2].kind,{8,20})) && (down || d.q8_wide);
+              in(weights[shared+2].kind,{8,20})) && (down || (d.q8_wide && d.rdna4));
     size_t waves=0;
     for (size_t r=0;r<roles;++r) {
         const size_t role=down ? 2 : r;
@@ -574,7 +574,7 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     }
     // (with the shared expert's gate and up formed, the routed gate and up and the product in one launch; Q6_K's pairs spill)
     const int routed=plan.weights[0].kind;
-    const unsigned lanes=together && plan.weights[1].kind==routed && routed!=14 && !plan.mapped[0] && d.q8_wide ?
+    const unsigned lanes=together && plan.weights[1].kind==routed && routed!=14 && !plan.mapped[0] && d.q8_wide && d.rdna4 ?
         resident_lanes(plan.weights,0,input,4) : 0;
     // (only the formats it is compiled for: IQ2_XS's experts have others among them)
     bool listed=false;
