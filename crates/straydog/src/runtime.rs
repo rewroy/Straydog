@@ -349,11 +349,11 @@ fn start_failure(reason: &str, why: Option<&str>) -> String {
 fn worker_environment() -> Vec<(OsString, OsString)> {
     // On Windows the launcher passes on what the worker needs (and gives it its own TEMP).
     #[cfg(windows)]
-    let keep: &[&str] = &straydog_isolation::WORKER_VARIABLES;
+    let system: &[&str] = &straydog_isolation::WORKER_VARIABLES;
     #[cfg(not(windows))]
-    // (DS41_PROFILE as well: the engines' phase timing, which a request's log line then reports; and
-    // the controls of DeepSeek-V4.1's drafts: DS41_DRAFTS, DS41_DSPARK and DS41_DSPARK_RESIDENT)
-    let keep: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT", "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8"];
+    let system: &[&str] = &["PATH", "HOME", "USER", "LANG", "TZ", "TERM"];
+    // (and the engine's switches: the containment passes the same list on, bubblewrap and the AppContainer alike)
+    let keep: Vec<&str> = system.iter().chain(&straydog_isolation::ENGINE_VARIABLES).copied().collect();
     std::env::vars_os()
         .filter(|(name, _)| keep.iter().any(|kept| name.to_string_lossy().eq_ignore_ascii_case(kept)))
         .collect()
