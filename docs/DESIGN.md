@@ -175,6 +175,34 @@ The engine is built in layers:
     of its slots). It never evicts and ends when the stores are full, and the fill's experts are
     older than the old state's in the LRU order. `Warm` (`arch/warm.rs`) drives all of it; between
     requests the worker makes room (and copies checkpoints) before it takes a warm-up step.
+- **A partially resident model** (Qwen3.8's expert slots in VRAM, the rest of its routed experts
+  computed by the CPU from the mapped banks) keeps route counts instead, in the same directory and
+  saved at the same moments (`<model>-<provider>-<quant>-<key>.json`: the key hashes the pinned
+  shards, with a domain of its own, so that Unsloth's UD-IQ1_M of the two models never meets). The
+  first request after a start is its slowest: the VRAM slots hold what the start-up's own passes
+  left, and the banks' pages are not in memory.
+  - **`counts`** (`routes.rs`) are `[layer, expert, GPU routes, host routes]` for each of the 48
+    layers and the drafter's, by where the route went: to an expert in a slot, or to one the CPU
+    computed (or the GPU read over the bus). Decode and verification rows are counted, once in a
+    layer's native plan (`hybrid_host_experts`: a counter array, nothing allocated per token); a
+    prompt's are not, as it streams nearly every expert. The earlier counts age by the rule of the
+    expert stores' (`arch::warm::kept_share`).
+  - **A start with a state of its bundle** (kind, format and geometry are checked; any other is
+    refused and the start is as it was) sets the slots' scores from the counts at once, then does
+    the rest in the background, after ready, with no request waiting for more than a step.
+    - The scores a layer's experts are ranked by (the moving average of its routes) are set to what
+      it comes to at the counted rate (`sd_hybrid_seed`), so a request's own rebalance already ranks
+      with them, over the start-up's leftovers; a prompt of a few dozen tokens then moves little.
+    - The OS is asked for the bank pages of the likeliest experts after the first as many as there
+      are slots, of layers that are not page-locked, up to the physical memory available less
+      `host::left_free`, in requests of 512 MiB with each request's ranges joined and in address
+      order (`host::prefetch`: `PrefetchVirtualMemory` on Windows, `madvise(WILLNEED)` in 128 KiB
+      steps on Linux). Nothing is locked and no commit is taken: the pages wait in memory for a soft
+      fault.
+    - The slots fill, 64 swaps a step under the engine's lock with a pause between, by the same
+      rebalance a request's own uses, until they hold what the scores want. A request that begins
+      ends it: its routes and its own rebalance take the slots from there.
+    - One line in the log: slots filled, MB asked of the OS, seconds.
 
 ### 4.2 Row tables
 

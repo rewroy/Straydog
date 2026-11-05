@@ -2037,6 +2037,53 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_rebalance(self.handle, max_swaps) }).map(drop)
     }
 
+    /// The layer a partially resident plan is of, from its prefix ("blk.12.").
+    fn routed_layer(prefix: &str) -> Option<usize> {
+        prefix.strip_prefix("blk.")?.strip_suffix('.')?.parse().ok()
+    }
+
+    /// The decode and verification rows each partially resident layer routed to each of its experts since the last clear (`clear` zeroes the counts
+    /// as they are read): (layer, routes to each expert on the device, routes to each on the host).
+    pub fn route_counts(&self, clear: bool) -> Result<Vec<(usize, Vec<u32>, Vec<u32>)>> {
+        let mut counted = Vec::new();
+        for (prefix, &plan) in &self.plans {
+            let Some(layer) = Self::routed_layer(prefix) else { continue };
+            let mut out = vec![0u32; 2 * 512];
+            // SAFETY: a live handle and plan, and room for the counts of 512 experts on each side (a plan has no more).
+            let experts = check(unsafe { ffi::sd_hybrid_routes(self.handle, plan, out.as_mut_ptr(), out.len() as u64, c_int::from(clear)) })? as usize;
+            if experts > 0 {
+                counted.push((layer, out[..experts].to_vec(), out[experts..2 * experts].to_vec()));
+            }
+        }
+        Ok(counted)
+    }
+
+    /// Set the scores a partially resident layer's experts are ranked by from `rates`, the routes a token to each (the moving average they come to
+    /// at that rate); whether this device has the layer.
+    pub fn seed_scores(&mut self, layer: usize, rates: &[f64]) -> Result<bool> {
+        let Some(&plan) = self.plans.get(&format!("blk.{layer}.")) else { return Ok(false) };
+        // SAFETY: a live handle and plan, and a rate for each of its experts (checked there).
+        check(unsafe { ffi::sd_hybrid_seed(self.handle, plan, rates.as_ptr(), rates.len() as u64) })?;
+        Ok(true)
+    }
+
+    /// One bounded refresh of the expert slots by their experts' scores, never waiting for its copies: the swaps still on their way after it (0: none
+    /// wanted), the pool's size and what it holds.
+    pub fn refresh_slots(&mut self, max_swaps: u64) -> Result<(u64, u64, u64)> {
+        let (mut pending, mut slots, mut held) = (0, 0, 0);
+        // SAFETY: a live handle and out-parameters.
+        check(unsafe { ffi::sd_hybrid_refresh(self.handle, max_swaps, &mut pending, &mut slots, &mut held) })?;
+        Ok((pending, slots, held))
+    }
+
+    /// The expert pool's size and what it holds.
+    pub fn slots(&self) -> Result<(u64, u64)> {
+        let (mut slots, mut held) = (0, 0);
+        // SAFETY: a live handle and out-parameters.
+        check(unsafe { ffi::sd_hybrid_slots(self.handle, &mut slots, &mut held) })?;
+        Ok((slots, held))
+    }
+
     pub fn enable_assist(&mut self, routes: u32) -> Result<u64> {
         let mut mapped = 0;
         // SAFETY: a live handle and an out-parameter.

@@ -206,6 +206,8 @@ void hybrid_host_experts(Device& d, ResidentMoe& plan, const float* exported, fl
         if (!(raw >= 0 && raw < float(plan.experts))) throw std::runtime_error("invalid hybrid expert route");
         const size_t expert = size_t(raw);
         selected[route] = expert;
+        // (the counts a later start warms up from: where the route went, an assisted one to the host's side)
+        ++(exported[2592 + route] == 1.0f ? plan.routed_gpu : plan.routed_host)[expert];
         if (exported[2592 + route] != 0) { ++(exported[2592 + route] > 1.5f ? d.assisted_experts : d.gpu_experts); continue; }
         // (speed first: a CPU route below the floor's weight is left out, sd_hybrid_route_floor)
         if (exported[16 + route] < d.route_floor) { ++d.dropped_experts; continue; }

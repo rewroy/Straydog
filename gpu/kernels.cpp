@@ -196,6 +196,8 @@ struct ResidentMoe {
     std::vector<int32_t> slot_of;
     uint8_t slot_group=0;   // the slots its experts take (expert_slots_carve)
     std::vector<double> usage;
+    // The decode and verification rows routed to each expert, to one in a slot and not (hybrid_host_experts): the warm-up state's counts.
+    std::vector<uint32_t> routed_gpu, routed_host;
     const uint8_t* mapped[3]{};   // device view of page-locked host banks (zero-copy assist)
     std::vector<uint32_t> host_read;   // the token each expert was last read on the host (hybrid_host_experts)
     uint32_t host_token=0;
@@ -1820,6 +1822,66 @@ int sd_hybrid_counts(void* handle,uint64_t* gpu,uint64_t* cpu,uint64_t* streamed
         size_t occupied=0;
         for (const auto& owner : d.slots.owner) occupied+=owner.first!=nullptr;
         *gpu=d.gpu_experts; *cpu=d.cpu_experts; *streamed=d.streamed_experts; *cached=occupied;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// A partially resident layer's plan: the decode and verification rows routed to each of its experts since the last clear, to the device (the expert
+// held a slot) and to the host. `out` (room for `room` values) takes the device's counts, then the host's. The experts counted: 0 for a plan of
+// another kind; `clear` zeroes the counts after they are read.
+int sd_hybrid_routes(void* handle,void* plan,uint32_t* out,uint64_t room,int clear) {
+    try {
+        auto& d=device(handle);
+        const auto found=d.resident.find(plan);
+        if (found==d.resident.end()) throw std::runtime_error("invalid hybrid plan");
+        ResidentMoe& moe=*found->second;
+        if (!moe.hybrid) return 0;
+        if (!out || room<2*moe.experts) throw std::runtime_error("invalid hybrid route counts");
+        std::copy(moe.routed_gpu.begin(),moe.routed_gpu.end(),out);
+        std::copy(moe.routed_host.begin(),moe.routed_host.end(),out+moe.experts);
+        if (clear) {
+            std::fill(moe.routed_gpu.begin(),moe.routed_gpu.end(),0u);
+            std::fill(moe.routed_host.begin(),moe.routed_host.end(),0u);
+        }
+        return int(moe.experts);
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The scores a partially resident layer's experts are ranked by (hybrid_rebalance), set from `rates`, the routes a token to each expert: what the moving
+// average of the routes (hybrid_observe_token) comes to when they keep that rate. A warm start sets them before the first request, so that the slots fill
+// with the experts an earlier run used most rather than with what the start-up's own passes left.
+int sd_hybrid_seed(void* handle,void* plan,const double* rates,uint64_t experts) {
+    try {
+        auto& d=device(handle);
+        const auto found=d.resident.find(plan);
+        if (found==d.resident.end() || !found->second->hybrid || !rates || experts!=found->second->experts)
+            throw std::runtime_error("invalid hybrid scores");
+        for (size_t expert=0;expert<size_t(experts);++expert)
+            if (!(rates[expert]>=0)) throw std::runtime_error("invalid hybrid scores");
+        for (size_t expert=0;expert<size_t(experts);++expert)
+            found->second->usage[expert]=rates[expert]/(1-hybrid_token_decay);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// One bounded refresh of the expert slots by those scores that never waits for its copies (sd_hybrid_rebalance with max_swaps > 0): `*pending` is the
+// swaps still on their way after it (0: the slots hold what the scores want), and the pool's size and occupation are `*slots` and `*held`.
+int sd_hybrid_refresh(void* handle,uint64_t max_swaps,uint64_t* pending,uint64_t* slots,uint64_t* held) {
+    try {
+        if (!max_swaps || !pending || !slots || !held) throw std::runtime_error("invalid hybrid refresh");
+        auto& d=device(handle);
+        hybrid_rebalance(d,size_t(max_swaps),false);
+        size_t occupied=0;
+        for (const auto& owner : d.slots.owner) occupied+=owner.first!=nullptr;
+        *pending=d.slots.pending.size(); *slots=d.slots.cache; *held=occupied;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The pool's size and occupation, as sd_hybrid_refresh reports them.
+int sd_hybrid_slots(void* handle,uint64_t* slots,uint64_t* held) {
+    try {
+        if (!slots || !held) throw std::runtime_error("invalid hybrid slots");
+        auto& d=device(handle);
+        size_t occupied=0;
+        for (const auto& owner : d.slots.owner) occupied+=owner.first!=nullptr;
+        *slots=d.slots.cache; *held=occupied;
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }

@@ -2103,6 +2103,39 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_routes(
+        handle: *mut ::std::os::raw::c_void,
+        plan: *mut ::std::os::raw::c_void,
+        out: *mut u32,
+        room: u64,
+        clear: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_seed(
+        handle: *mut ::std::os::raw::c_void,
+        plan: *mut ::std::os::raw::c_void,
+        rates: *const f64,
+        experts: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_refresh(
+        handle: *mut ::std::os::raw::c_void,
+        max_swaps: u64,
+        pending: *mut u64,
+        slots: *mut u64,
+        held: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_slots(
+        handle: *mut ::std::os::raw::c_void,
+        slots: *mut u64,
+        held: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_cpu_error() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
