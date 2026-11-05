@@ -1894,11 +1894,10 @@ constexpr uint32_t hybrid_assist_cap=4;
 #else
 constexpr uint32_t hybrid_assist_cap=2;
 #endif
-// A layer's assist level is baked into its captured graphs (hybrid_assist is passed to the layer's kernels by value, in decode's
-// graphs and in verification's alike): a change of level drops every hybrid layer graph, whose replay would keep the old level, and
-// the next pass captures them again at the new one. Graphs of other tags hold no level.
-void hybrid_set_assist(Device& d,uint32_t level) {
-    if (level==d.assist) return;
+// A layer's assist level and the banks it reads in place are baked into its captured graphs (hybrid_assist is passed to the layer's
+// kernels by value, in decode's graphs and in verification's alike): a change of level, or of the plans whose banks are mapped, drops
+// every hybrid layer graph, whose replay would keep the old, and the next pass captures them again. Graphs of other tags hold no level.
+void hybrid_drop_graphs(Device& d) {
     check(hipStreamSynchronize(d.stream));
     for (auto graph=d.graphs.begin();graph!=d.graphs.end();) {
         if (graph->first.compare(0,7,"hybrid-")==0) {
@@ -1907,20 +1906,29 @@ void hybrid_set_assist(Device& d,uint32_t level) {
             graph=d.graphs.erase(graph);
         } else ++graph;
     }
+}
+void hybrid_set_assist(Device& d,uint32_t level) {
+    if (level==d.assist) return;
+    hybrid_drop_graphs(d);
     d.assist=level;
 }
 } // extern "C++"
 uint32_t sd_hybrid_assist_cap(void) { return hybrid_assist_cap; }
 // Let the GPU read the first `assist` absent routes of a layer straight from
 // page-locked host banks while the CPU evaluates the rest. Returns plans mapped.
+// It may be called again as more banks are page-locked (the engine locks them behind "ready", a layer at a time): a plan already mapped
+// stays so (its banks stay locked until the device ends), those now locked are mapped, and the layers' graphs are captured anew if
+// any were, since a graph captured before holds the plan's banks as they were.
 int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
     try {
         if (!mapped || assist>10) throw std::runtime_error("invalid hybrid assist");
         auto& d=device(handle);
         *mapped=0;
+        bool changed=false;
         for (auto& item : d.resident) {
             ResidentMoe& plan=*item.second;
             if (!plan.hybrid) continue;
+            if (plan.mapped[0]) { ++*mapped; continue; }
             void* views[3]{};
             bool ok=true;
             for (size_t role=0;role<3 && ok;++role)
@@ -1928,7 +1936,9 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
             (void)hipGetLastError();   // clear the failed lookup
             for (size_t role=0;role<3;++role) plan.mapped[role]=ok ? static_cast<const uint8_t*>(views[role]) : nullptr;
             *mapped+=ok;
+            changed|=ok;
         }
+        if (changed) hybrid_drop_graphs(d);
         d.hint_experts=*mapped==0;
 #if defined(__HIPCC__)
         hybrid_set_assist(d,assist);
@@ -1962,6 +1972,14 @@ int sd_host_register(void* pointer,uint64_t bytes) {
         std::lock_guard<std::mutex> lock(registered_mutex);
         registered[reinterpret_cast<uintptr_t>(pointer)]={size_t(bytes),false};
         return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_host_register from a thread that is not the device's own (the engine's locking behind "ready"): the thread's current device is set to
+// `ordinal` first, so that no context opens on another device. Page locks are portable: every device sees them.
+int sd_host_register_on(int ordinal,void* pointer,uint64_t bytes) {
+    try {
+        check(hipSetDevice(ordinal));
+        return sd_host_register(pointer,bytes);
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Page-lock host memory that devices may also write (downloads into it).

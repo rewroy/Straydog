@@ -952,9 +952,14 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.set_assist_level(level))
     }
 
-    /// Page locks are process-wide; one backend performs them.
-    pub fn register_host(&mut self, range: &[u8]) -> Result<()> {
-        self.backends[0].register_host(range)
+    /// Page locks are process-wide; one backend holds them: the device whose context a thread that makes them uses ([`crate::gpu::lock_host_range`]).
+    pub fn host_ordinal(&self) -> usize {
+        self.backends[0].ordinal
+    }
+
+    /// Take the page lock of a range made by [`crate::gpu::lock_host_range`], as the backend's that holds them.
+    pub fn adopt_host(&mut self, range: &[u8]) {
+        self.backends[0].adopt_host(range)
     }
 
     fn owned_layers(&self, index: usize, drafter: bool) -> Vec<usize> {

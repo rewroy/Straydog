@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::assist;
+use crate::banks::{BankLocks, Locked};
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
@@ -579,6 +580,11 @@ pub struct Model {
     banks_bytes: u64,
     /// The layers whose banks are page-locked (resident until the process ends): a warm start asks the OS for no others' pages.
     locked_layers: Vec<usize>,
+    /// The layers the start planned to page-lock behind "ready" and that are not locked yet, in the order they are taken ([`Model::bank_locks`]):
+    /// a warm start asks the OS for none of their pages either.
+    lock_pending: Vec<usize>,
+    /// A bank that did not match the file's tree when it was locked behind "ready": no request is served from here on.
+    bank_failure: Option<String>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -720,6 +726,8 @@ impl Model {
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
             locked_layers: Vec::new(),
+            lock_pending: Vec::new(),
+            bank_failure: None,
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -769,8 +777,10 @@ impl Model {
         let mut two_drafts = false;
         if model.partial {
             let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
-            model.lock_host_banks(pinned)?;
-            crate::host::commit_note("banks locked");
+            // (the banks are locked behind "ready", by the worker: [`Model::bank_locks`]; the slots below are sized as they were with
+            // the locks taken, and the plan has left the commit the locks need out of what the VRAM takes)
+            model.plan_host_banks(pinned)?;
+            crate::host::commit_note("banks planned");
             let slots = model.group.create_expert_slots()?;
             let experts = 48 * model.weights.tensor("blk.0.ffn_gate_exps.weight")?.dims.last().copied().unwrap_or(0) as u64;
             two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_SHARE * experts as f64;
@@ -1095,7 +1105,7 @@ impl Model {
     }
 
     /// Partial residency: pin every dense operand and bind the host expert banks for the CPU
-    /// engine and prefill streaming (page-locked once read, see [`Model::lock_host_banks`]).
+    /// engine and prefill streaming (page-locked behind "ready", see [`Model::bank_locks`]).
     fn prepare_hybrid_moe(&mut self, cpu_threads: u32) -> Result<bool> {
         if !self.group.hybrid_supported()? {
             return Ok(false);
@@ -1189,7 +1199,8 @@ impl Model {
         }
         let (slots, held) = self.group.slots()?;
         let banks = |layer: usize| -> Option<Banks> {
-            if self.locked_layers.contains(&layer) || (layer >= 48 && !self.weights.drafter) {
+            // (a layer to be locked has its pages read by the locking, which a hint would only compete with)
+            if self.locked_layers.contains(&layer) || self.lock_pending.contains(&layer) || (layer >= 48 && !self.weights.drafter) {
                 return None;
             }
             let banks = Self::host_banks(&self.weights, layer).ok()?;
@@ -1210,32 +1221,136 @@ impl Model {
         Ok(WarmFill { pending, slots, held, swapped: self.group.swapped_experts()? })
     }
 
-    /// Let the GPU assist from the page-locked banks, from the most a layer is given: the plans mapped (none, and nothing is tuned, when
-    /// no bank is page-locked).
+    /// Let the GPU assist from the page-locked banks, from the most a layer is given at first: the plans mapped (none, and nothing is tuned,
+    /// when no bank is page-locked). Called again as layers are locked, it maps those that are new, at the level in force.
     fn start_assist(&mut self) -> Result<u64> {
         let cap = crate::gpu::Backend::assist_cap();
-        let mapped = self.group.enable_assist(cap)?;
-        if mapped > 0 {
+        let level = self.assist.as_ref().map_or(cap, assist::Tuner::level);
+        let mapped = self.group.enable_assist(level)?;
+        if mapped > 0 && self.assist.is_none() {
             self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
         }
         Ok(mapped)
+    }
+
+    /// The page locks for `layers`, to be taken one layer at a time ([`BankLocks::lock_next`]).
+    fn lock_job(&self, layers: &[usize]) -> Result<BankLocks> {
+        let mut planned = Vec::with_capacity(layers.len());
+        for &layer in layers {
+            let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
+            planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
+        }
+        Ok(BankLocks::new(planned, self.group.host_ordinal()))
+    }
+
+    /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then
+    /// [`Model::banks_locked`] for each, then [`Model::banks_lock_ended`]): none for a model that has none to lock. With an earlier run's counts
+    /// (`prior`) the layers the host ran most routes of come first, since locking a layer lets the GPU take some of its absent routes from the CPU;
+    /// without, they keep the order the plan had (from the last layer).
+    pub fn bank_locks(&mut self, prior: Option<&Routes>) -> Option<BankLocks> {
+        if self.lock_pending.is_empty() {
+            return None;
+        }
+        if let Some(prior) = prior.filter(|prior| prior.total() > 0) {
+            crate::banks::order_by_host_routes(&mut self.lock_pending, |layer| prior.host_routes(layer));
+        }
+        match self.lock_job(&self.lock_pending) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                eprintln!("WARN Straydog host banks: no layer is page-locked ({error})");
+                self.lock_pending.clear();
+                None
+            }
+        }
+    }
+
+    /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
+    /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
+    /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
+    pub fn banks_locked(&mut self, locked: Locked) -> Result<u64> {
+        let layer = locked.layer;
+        for bank in Self::host_banks(&self.weights, layer)? {
+            self.group.adopt_host(bank);
+        }
+        self.lock_pending.retain(|pending| *pending != layer);
+        self.locked_layers.push(layer);
+        let mapped = self.start_assist()?;
+        // (what a round measured was of the layers locked then)
+        if self.assist_tuning() {
+            if let Some(tuner) = self.assist.as_mut() {
+                tuner.restart();
+            }
+        }
+        Ok(mapped)
+    }
+
+    /// How many layers' banks are page-locked and mapped for the GPU's assist now.
+    pub fn locked_layers(&self) -> usize {
+        self.locked_layers.len()
+    }
+
+    /// The locking behind "ready" is over, with every layer taken or not (`failure`: a bank did not match the file's tree, which ends the model's
+    /// service): what is left is left to the page cache, and the working set's limit, which follows what is free, is kept from here on.
+    pub fn banks_lock_ended(&mut self, failure: Option<String>) {
+        self.lock_pending.clear();
+        if failure.is_some() {
+            self.bank_failure = failure;
+        }
+        self.hold_banks();
+    }
+
+    /// Keep the working set's limit ([`crate::host::keep_resident`]) from here on, now and as memory moves. It comes once the banks that are to be
+    /// locked are: locked pages are not trimmed, but the mapped pages around them are, and a limit that came first would have trimmed what
+    /// the locking reads next.
+    fn hold_banks(&mut self) {
+        let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        if !self.watching_memory {
+            self.watching_memory = true;
+            crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes);
+        }
+    }
+
+    /// Page-lock every layer the start planned, here and now, as the worker does behind "ready" (for what is not served: examples and tools).
+    pub fn lock_banks_now(&mut self) -> Result<()> {
+        let Some(mut job) = self.bank_locks(None) else { return Ok(()) };
+        let mut failure = None;
+        // SAFETY: the plan is of this model's own weights, which it keeps mapped.
+        while let Some(next) = unsafe { job.lock_next() } {
+            match next {
+                Ok(locked) => {
+                    self.banks_locked(locked)?;
+                }
+                Err(stop) => {
+                    eprintln!("Straydog host banks: locking stopped because {}", stop.message());
+                    failure = matches!(stop, crate::banks::Stop::Unverified { .. }).then(|| stop.message());
+                    break;
+                }
+            }
+        }
+        self.banks_lock_ended(failure.clone());
+        failure.map_or(Ok(()), Err)
     }
 
     /// Tests only: page-lock the banks of `layers` whatever the commit left says (as the start does for the layers it can) and let the GPU
     /// assist from them. The plans mapped.
     #[doc(hidden)]
     pub fn lock_layers_for_test(&mut self, layers: &[usize]) -> Result<u64> {
-        for &layer in layers {
-            // (a layer the start page-locked already: registering its banks again would fail)
-            if self.locked_layers.contains(&layer) {
-                continue;
-            }
-            for bank in Self::host_banks(&self.weights, layer)? {
-                self.group.register_host(bank)?;
-            }
-            self.locked_layers.push(layer);
+        // (a layer already locked: registering its banks again would fail)
+        let wanted: Vec<usize> = layers.iter().copied().filter(|layer| !self.locked_layers.contains(layer)).collect();
+        let mut job = self.lock_job(&wanted)?;
+        // SAFETY: the plan is of this model's own weights, which it keeps mapped.
+        while let Some(next) = unsafe { job.lock_next() } {
+            self.banks_locked(next.map_err(|stop| stop.message())?)?;
         }
         self.start_assist()
+    }
+
+    /// Tests only: a plan for `layers` to lock the way the worker does, off the model's thread ([`BankLocks::lock_next`], then
+    /// [`Model::banks_locked`]).
+    #[doc(hidden)]
+    pub fn lock_job_for_test(&self, layers: &[usize]) -> Result<BankLocks> {
+        self.lock_job(layers)
     }
 
     /// Tests only: the assist level of each next decode pass of one row, the last going on, in place of the tuner's rounds. The first is in
@@ -1270,104 +1385,56 @@ impl Model {
         Ok([bank("gate")?, bank("up")?, bank("down")?])
     }
 
-    /// Partial residency, once the banks are authenticated: page-lock whole layers within the
-    /// lock budget and hand absent experts to the CPU engine.
-    fn lock_host_banks(&mut self, pinned_state: u64) -> Result<()> {
-        let layer_banks = (0..48).map(|layer| Self::host_banks(&self.weights, layer)).collect::<Result<Vec<_>>>()?;
-        let banks_total = layer_banks.iter().flatten().map(|bank| bank.len() as u64).sum();
+    /// Partial residency, once the banks are authenticated: plan which whole layers to page-lock within the lock budget, and hand absent experts to
+    /// the CPU engine. The locking is not done here: it reads the banks from the drive, a third of a start on a machine that locks most of them, and
+    /// the worker does it behind "ready" ([`Model::bank_locks`]). The plan is made at the point it always was, before the expert slots are placed,
+    /// so that what it leaves of the commit for the locks is out of what the slots' VRAM will take.
+    fn plan_host_banks(&mut self, pinned_state: u64) -> Result<()> {
+        let sizes = (0..48)
+            .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
+            .collect::<Result<Vec<_>>>()?;
+        let banks_total = sizes.iter().sum();
         let (vram_used, vram_budget) = self.group.memory()?;
         let vram_room = vram_budget.saturating_sub(vram_used);
         let (by_memory, by_free) = (lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state),
                                     crate::host::lockable(self.weights.host_memory_bytes, vram_room));
         let budget = by_memory.min(by_free);
-        // Whole layers from the last: reading went through those most recently, so they are the
-        // likeliest to be cached; the rest of the locked range is read ahead meanwhile.
-        let (mut layers, mut locked) = (Vec::new(), 0u64);
-        for layer in (0..48).rev() {
-            let size: u64 = layer_banks[layer].iter().map(|bank| bank.len() as u64).sum();
-            if locked + size > budget {
-                break;
-            }
-            layers.push(layer);
-            locked += size;
-        }
-        let mut registered = 0;
-        // The layer whose banks the runtime would not page-lock, and why.
-        let mut refused: Option<(usize, String)> = None;
-        if !layers.is_empty() {
-            let weights = &self.weights;
-            let ranges: Vec<(String, (u64, u64))> = layers
-                .iter()
-                .flat_map(|layer| ["gate", "up", "down"].map(|role| format!("blk.{layer}.ffn_{role}_exps.weight")))
-                .map(|name| {
-                    let tensor = weights.tensor(&name).unwrap();
-                    (name, (tensor.offset, tensor.bytes))
-                })
-                .collect();
-            let group = &mut self.group;
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    for (name, range) in &ranges {
-                        if let Ok(file) = weights.file_of(name) {
-                            crate::digest::will_need(file, std::slice::from_ref(range));
-                        }
-                    }
-                });
-                for layer in &layers {
-                    if let Some(error) = layer_banks[*layer].iter().find_map(|bank| group.register_host(bank).err()) {
-                        refused = Some((*layer, error));
-                        break;
-                    }
-                    registered += 1;
-                }
-            });
-            // Locked, the banks' pages stay as they are now: with the shards' verity trees, check
-            // them (they may have been read again since loading verified their chunks).
-            for layer in &layers[..registered] {
-                for role in ["gate", "up", "down"] {
-                    weights.verify_mapped(&format!("blk.{layer}.ffn_{role}_exps.weight"))?;
-                }
-            }
-        }
-        // What the start did with the banks and why it did no more, for a log that says where the CPU's experts are read from.
+        // Whole layers from the last: reading went through those most recently, so they are the likeliest to be cached.
+        let layers = crate::banks::layers_within(&sizes, budget);
+        // What the start planned and why it planned no more, for a log that says where the CPU's experts are read from.
         let gib = |bytes: u64| if bytes == u64::MAX { "no bound".to_string() } else { format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64) };
-        let locked = layers[..registered].iter().map(|layer| layer_banks[*layer].iter().map(|bank| bank.len() as u64).sum::<u64>()).sum::<u64>();
+        let planned = layers.iter().map(|layer| sizes[*layer]).sum::<u64>();
         let free = crate::host::left_free(self.weights.host_memory_bytes);
         // (on Windows the commit, which locked memory and VRAM are charged to 1 to 1, can bind before the physical memory does)
         let commit = crate::host::commit_left();
-        let why = match &refused {
-            Some((layer, error)) => format!("registering layer {layer}'s banks failed ({error})"),
-            None if registered == 48 => "none left".to_string(),
-            None if by_memory <= by_free => format!("the lock budget of {} was used", gib(by_memory)),
-            None if commit.is_some_and(|(available, commit)| commit < available) => {
-                format!("the commit left allows {} (host::lockable: less the VRAM slots to come and {} kept free)", gib(by_free), gib(free))
-            }
-            None => format!("the available memory allows {} (host::lockable: less {} kept free)", gib(by_free), gib(free)),
+        let why = if layers.len() == 48 {
+            "none left".to_string()
+        } else if by_memory <= by_free {
+            format!("the lock budget of {} was used", gib(by_memory))
+        } else if commit.is_some_and(|(available, commit)| commit < available) {
+            format!("the commit left allows {} (host::lockable: less the VRAM slots to come and {} kept free)", gib(by_free), gib(free))
+        } else {
+            format!("the available memory allows {} (host::lockable: less {} kept free)", gib(by_free), gib(free))
         };
         let (available, commit) = match commit {
             Some((available, commit)) => (gib(available), format!(", commit left {}", gib(commit))),
             None => (crate::host::memory_note().map_or("unknown".to_string(), |(_, available, _)| gib(available)), String::new()),
         };
-        eprintln!("Straydog host banks: {registered} of 48 layers page-locked, {} of {}; stopped because {why}; lock_budget {}, lockable {}, \
-                   host memory {}, available {available}{commit}, VRAM slots to come {}", gib(locked), gib(banks_total), gib(by_memory),
-                  gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
+        eprintln!("Straydog host banks: {} of 48 layers planned to be page-locked behind ready, {} of {}; no more planned because {why}; lock_budget {}, \
+                   lockable {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
+                  gib(by_memory), gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
-        self.locked_layers = layers[..registered].to_vec();
-        crate::host::keep_resident(self.weights.host_memory_bytes, pinned_state, banks_total);
+        self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
-        if !self.watching_memory {
-            self.watching_memory = true;
-            crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), banks_total);
+        // (with nothing to lock the limit comes now; else when the locking is over: `Model::banks_lock_ended`)
+        if self.lock_pending.is_empty() {
+            self.hold_banks();
         }
-        if registered > 0 {
-            // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest,
-            // up to 5 of every 12 (expert_source). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
-            // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the
-            // layers up (7 in 12: 33.7). CUDA takes two, staged (sd_hybrid_assist). That is the most a
-            // layer is given: how many it is worth on this machine, the engine measures in decode
-            // (crate::assist), from the most at the start.
-            self.start_assist()?;
-        }
+        // The GPU reads a few absent experts per layer over PCIe while the CPU computes the rest, up to 5 of every 12 (expert_source), from the
+        // banks that are page-locked, as they are locked ([`Model::banks_locked`]). On an R9700 at 6 GiB beside a Ryzen 5 7500F: 1 route
+        // a layer 30.7 tokens/s, 2 33.7, 3 35.7, 4 36.7; a higher share than 5 in 12 holds the layers up (7 in 12: 33.7). CUDA takes two,
+        // staged (sd_hybrid_assist). That is the most a layer is given: how many it is worth on this machine, the engine measures in decode
+        // (crate::assist), from the most at the first layer locked.
         // Speed first (STRAYDOG_EXPERT_FLOOR, a router weight from 0 to 1): the CPU's routes below it are left out.
         if let Some(floor) = expert_floor()? {
             self.group.route_floor(floor)?;
@@ -1893,7 +1960,10 @@ impl Model {
         }
         let capacity = self.kv_capacity_for(positions)?;
         let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
-        crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        // (the limit waits for the locking behind "ready", whose reads it would cut short)
+        if self.lock_pending.is_empty() {
+            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        }
         self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
         self.kv_capacity = capacity;
         self.hold_memory();
@@ -2977,7 +3047,7 @@ impl Model {
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated, "cpu_phases_ms": cpu_phases,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
-                "assist": self.assist.as_ref().map(assist::Tuner::level),
+                "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
                 "slots": info["cached_experts"], "streamed": spent("streamed_experts"),
                 "passes": self.pass_counts, "pass_ms": [1e3 * self.pass_seconds[0], 1e3 * self.pass_seconds[1]],
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
@@ -3024,6 +3094,10 @@ impl Model {
         }
         sampling.check()?;
         self.weights.check_unchanged()?;
+        // (banks locked behind "ready" that did not match the file's tree: nothing more is served from these bytes)
+        if let Some(failure) = &self.bank_failure {
+            return Err(failure.clone());
+        }
         self.group.ensure_slots()?;
         let parking = Instant::now();
         let parked = self.park_or_restore(tokens)?;

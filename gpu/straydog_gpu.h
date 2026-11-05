@@ -45,6 +45,7 @@ int sd_zero(void* handle, void* pointer);
 int sd_download(void* handle, void* pointer, void* output, uint64_t bytes);
 int sd_copy_allocation(void* handle, void* target, const void* source);
 int sd_host_register(void* pointer, uint64_t bytes);
+int sd_host_register_on(int ordinal, void* pointer, uint64_t bytes);
 int sd_host_unregister(void* pointer);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
