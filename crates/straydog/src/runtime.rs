@@ -400,8 +400,10 @@ pub fn ready_summary(ready: &Value) -> String {
     } else {
         names.join(" + ")
     };
+    let engram = ready["engram"]["precision"].as_str()
+        .map_or_else(String::new, |precision| format!(", engram {precision} ({})", ready["engram"]["file"].as_str().unwrap_or("-")));
     format!(
-        "Straydog ready: {}, context {}, {residency}, {}, K/V in {}, prefill batch {}; {devices} using {:.1} of {:.1} GiB",
+        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}; {devices} using {:.1} of {:.1} GiB",
         ready["quantization"].as_str().unwrap_or("-"),
         ready["context"],
         if drafts > 0 { format!("MTP {drafts}") } else { "no speculation".into() },

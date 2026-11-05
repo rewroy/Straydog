@@ -107,6 +107,9 @@ pub struct Options {
     /// The bundle's quantization: Qwen3.8-Flash-Next's Q2_0, IQ2_XS, IQ3_XXS, IQ3_S (ISTA-DASLab) and UD-IQ1_M (Unsloth), DeepSeek-V4.1-Flash-1017's IQ2_XS, IQ2_XXS (ISTA-DASLab), UD-IQ2_XXS and UD-IQ1_M (Unsloth) [default: detected from its files]
     #[arg(long, env = "STRAYDOG_QUANT", value_name = "NAME")]
     pub quant: Option<String>,
+    /// Unsloth's Qwen3.8 bundles: the engram table to read, BF16, Q8_0, Q5_1 or IQ4_NL (the bundle's own), from the bundle's folder or an engram folder beside it [default: the bundle's own, else the most exact there]
+    #[arg(long, env = "STRAYDOG_ENGRAM", value_name = "PRECISION")]
+    pub engram: Option<String>,
     /// Qwen3.8-Flash-Next's MTP drafter: its directory or its GGUF file (also -md). DeepSeek-V4.1's DSpark drafter takes no option: it drafts when its files sit beside the bundle (`straydog setup` puts them there; DS41_DSPARK=0 leaves it out)
     #[arg(long = "model-draft", env = "STRAYDOG_MODEL_DRAFT", value_name = "PATH")]
     pub model_draft: Option<PathBuf>,
@@ -206,6 +209,8 @@ pub struct Settings {
     pub model: PathBuf,
     /// The pinned bundle in `model`: its model, provider and quantization.
     pub bundle: bundle::Id,
+    /// The engram table named (its precision), which the server and its worker read ([`bundle::table_in`]).
+    pub engram: Option<String>,
     pub model_draft: Option<PathBuf>,
     /// Qwen3.8's projector, given or found: the worker checks it, and images are refused with the reason if it is not the pinned file.
     pub model_vision: Option<PathBuf>,
@@ -348,7 +353,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
             options
         }};
     }
-    let options = merge!(model, model_name, provider, quant, model_draft, model_vision, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
+    let options = merge!(model, model_name, provider, quant, engram, model_draft, model_vision, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose,
                          data_dir, expert_ram);
@@ -448,6 +453,14 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     // The shards' verity trees and the warm-up state: beside the model unless given elsewhere
     // (made there by the server, never by its worker). A bundle read on demand has no MTP drafter.
     let on_demand = id.is_on_demand();
+    // (a table named must be one the bundle reads, there)
+    let engram = match options.engram.as_deref().filter(|precision| !precision.is_empty()) {
+        Some(precision) => match bundle::table_in_with(&model, id, Some(precision))? {
+            Some((table, _)) => Some(table.precision),
+            None => return Err(format!("the {id} bundle has no engram table to choose")),
+        },
+        None => None,
+    };
     let data_dir = match options.data_dir {
         Some(dir) => dir.canonicalize().map_err(|exc| format!("data directory {}: {exc}", dir.display()))?,
         None => bundle::default_data_dir(&model),
@@ -558,6 +571,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     Ok(Settings {
         model,
         bundle: id,
+        engram,
         model_draft,
         model_vision,
         draft_max,
@@ -601,6 +615,7 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("model_name", settings.bundle.model.to_string()),
         ("provider", settings.bundle.provider.to_string()),
         ("quant", settings.bundle.quant.to_string()),
+        ("engram", settings.engram.clone().unwrap_or_else(|| "(the bundle's own)".into())),
         ("model_draft", path(&settings.model_draft)),
         ("model_vision", path(&settings.model_vision)),
         ("draft_max", settings.draft_max.to_string()),
@@ -839,6 +854,13 @@ mod tests {
         let error = parse(&unsloth, &["--provider", "ISTA-DASLab"]).unwrap_err();
         assert!(error.contains("holds no pinned bundle"), "{error}");
         assert!(parse(&unsloth, &["--provider", "ISTA-DASLab", "--quant", "UD-IQ1_M"]).unwrap_err().contains("unknown bundle UD-IQ1_M"));
+        // an engram table by name: the bundle's own, or one there; none for a bundle without a table of its own
+        assert_eq!(parse(&unsloth, &["--engram", "iq4_nl"]).unwrap().engram.as_deref(), Some("IQ4_NL"));
+        assert!(parse(&unsloth, &["--engram", "Q8_0"]).unwrap_err().contains("engram Q8_0: no such table"));
+        assert_eq!(parse(&unsloth, &[]).unwrap().engram, None);
+        let ista_qwen = bundle_directory(qwen("IQ2_XS"));
+        assert!(parse(&ista_qwen, &["--engram", "Q8_0"]).unwrap_err().contains("has no engram table"));
+        std::fs::remove_dir_all(ista_qwen).unwrap();
         // 0.1.3's settings: DeepSeek-V4.1's ISTA-DASLab bundle by its GSQ-RCO name
         let ista = bundle_directory(id(bundle::DEEPSEEK, "IQ2_XXS"));
         assert_eq!(parse(&ista, &["--quant", "GSQ-RCO-IQ2_XXS"]).unwrap().bundle, id(bundle::DEEPSEEK, "IQ2_XXS"));

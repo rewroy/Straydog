@@ -376,6 +376,9 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "speculative_drafts": model.speculative,
         "speculation": if model.speculative > 0 { json!([{"kind": "mtp", "drafts": model.speculative}]) } else { json!([]) },
         "vision": vision.is_ok(),
+        // (the engram table read: its precision and file, Unsloth's Qwen3.8)
+        "engram": straydog_engine::bundle::table_in(&args.model, id).ok().flatten()
+            .map(|(table, path)| json!({"precision": table.precision, "file": path.file_name().map(|name| name.to_string_lossy().into_owned())})),
         "vision_refusal": vision.as_ref().err(),
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,

@@ -14,6 +14,8 @@ pub struct Settings {
     pub model_name: String,
     pub provider: String,
     pub quant: String,
+    /// The engram table it was set up with instead of its own (Unsloth's Qwen3.8), named for the server to read.
+    pub engram: Option<String>,
     /// The MTP drafter's directory, when the model has one.
     pub model_draft: Option<PathBuf>,
     /// GPU ordinals, when not just the first.
@@ -37,7 +39,7 @@ pub struct Written {
 }
 
 const HEADER: &str = "# Written by `straydog setup`; a plain `straydog` reads it. Options and STRAYDOG_* variables\n\
-                      # beat it. Setup changes model, model_name, provider, quant, model_draft, gpu and data_dir, lowers ctx_size to what the model\n\
+                      # beat it. Setup changes model, model_name, provider, quant, engram, model_draft, gpu and data_dir, lowers ctx_size to what the model\n\
                       # starts with, and keeps the rest.\n";
 
 fn text(path: &Path) -> Result<Value, String> {
@@ -55,6 +57,7 @@ fn merged(old: Table, settings: &Settings) -> Result<Table, String> {
         ("model_draft", settings.model_draft.as_deref().map(text).transpose()?),
         ("gpu", settings.gpu.as_ref().map(|gpu| Value::Array(gpu.iter().map(|&ordinal| Value::Integer(ordinal as i64)).collect()))),
         ("data_dir", settings.data_dir.as_deref().map(text).transpose()?),
+        ("engram", settings.engram.clone().map(Value::String)),
     ] {
         match value {
             Some(value) => table.insert(key.into(), value),
@@ -124,7 +127,7 @@ mod tests {
 
     fn settings() -> Settings {
         Settings { model: "/models/DeepSeek-V4.1-Flash-1017/ISTA-DASLab-IQ2_XXS".into(), model_name: "DeepSeek-V4.1-Flash-1017".into(), provider: "ISTA-DASLab".into(),
-                   quant: "IQ2_XXS".into(), model_draft: None, gpu: Some(vec![0, 1]), ctx_size: None, data_dir: None }
+                   quant: "IQ2_XXS".into(), engram: None, model_draft: None, gpu: Some(vec![0, 1]), ctx_size: None, data_dir: None }
     }
 
     /// What the server reads back is what setup chose; a file's other settings stay, the model's own

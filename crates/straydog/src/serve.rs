@@ -53,6 +53,12 @@ fn drafter_clause(settings: &config::Settings) -> String {
 pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool) -> Result<(), String> {
     let (options, sources) = config::load(matches, config_file)?;
     let settings = config::resolve(options)?;
+    // (the engram table named, from an option or the settings file as well as the variable: what the server's checks and
+    // its worker, which keeps the variable, read; set before any thread starts)
+    match &settings.engram {
+        Some(precision) => std::env::set_var("STRAYDOG_ENGRAM", precision),
+        None => std::env::remove_var("STRAYDOG_ENGRAM"),
+    }
     if print_config {
         for line in config::describe(&settings, &sources) {
             println!("{line}");
