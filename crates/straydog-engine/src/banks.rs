@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::host::{Lowered, Priority};
 use crate::verity::{self, Verifier};
 
 /// One bank (a layer's gate, up or down experts) as a thread that does not hold the weights sees it: its file's mapping, its place in
@@ -48,16 +49,26 @@ impl Bank {
         unsafe { std::slice::from_raw_parts(self.map.add(self.offset as usize), self.bytes as usize) }
     }
 
-    /// Check the bank's bytes against the file's tree, block by block on every core: `Ok(false)` when the file has no tree.
+    /// Check the bank's bytes against the file's tree, block by block on the threads `priority` allows ([`check_threads`]), which work at that
+    /// priority: `Ok(false)` when the file has no tree.
     ///
     /// # Safety
     /// The mapping must be alive, and the bank page-locked (its bytes cannot change under the check).
-    unsafe fn verify(&self) -> Result<bool, String> {
+    unsafe fn verify(&self, priority: Priority) -> Result<bool, String> {
         let Some(verifier) = &self.verifier else { return Ok(false) };
-        let threads = std::thread::available_parallelism().map_or(8, |count| count.get());
+        let threads = check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get()));
         // SAFETY: the caller's.
         let map = unsafe { std::slice::from_raw_parts(self.map, self.map_len) };
-        verity::verify_mapped(map, verifier, self.offset, self.bytes, threads).map(|()| true)
+        verity::verify_mapped_at(map, verifier, self.offset, self.bytes, threads, priority).map(|()| true)
+    }
+}
+
+/// The threads that check a layer's banks on a machine of `cores`: every core for a locking that nothing waits behind, and at most a quarter of them
+/// (one at least) for the locking behind "ready", which leaves the rest to the request's CPU experts and the memory bandwidth they use.
+pub(crate) fn check_threads(priority: Priority, cores: usize) -> usize {
+    match priority {
+        Priority::Normal => cores.max(1),
+        Priority::Background => (cores / 4).max(1),
     }
 }
 
@@ -129,13 +140,36 @@ impl BankLocks {
 
     /// Page-lock the next layer's banks and check them against the file's tree, holding nothing of the model: None when no layer is left.
     /// The next layer's pages are asked of the drive meanwhile (a hint: nothing is locked or taken), so that reading them overlaps this layer's
-    /// check.
+    /// check. The thread and the check's threads keep their priority and the check uses every core: for a locking that nothing runs beside (examples and
+    /// tools); behind "ready" it is [`BankLocks::lock_next_behind`].
     ///
     /// # Safety
     /// The weights the plan was made from must stay alive, and mapped, for the whole call and until the layer returned is taken or
     /// unlocked: the caller holds a strong reference to the structure the model is in.
     pub unsafe fn lock_next(&mut self) -> Option<Result<Locked, Stop>> {
+        // SAFETY: the caller's.
+        unsafe { self.lock_at(Priority::Normal) }
+    }
+
+    /// [`BankLocks::lock_next`] for the locking behind "ready", which gives way to a request: the calling thread works at a lower priority for the
+    /// layer's turn (Windows ends it after, Linux keeps it, [`Lowered`]), so do the threads of the check, and there are at most a quarter as many
+    /// of them as cores ([`check_threads`]). Reading the layer from the drive, registering its pages and hashing them take the cores and the
+    /// memory bandwidth that the CPU's experts of a request need.
+    ///
+    /// # Safety
+    /// As [`BankLocks::lock_next`].
+    pub unsafe fn lock_next_behind(&mut self) -> Option<Result<Locked, Stop>> {
+        // SAFETY: the caller's.
+        unsafe { self.lock_at(Priority::Background) }
+    }
+
+    /// One layer's turn at `priority`.
+    ///
+    /// # Safety
+    /// As [`BankLocks::lock_next`].
+    unsafe fn lock_at(&mut self, priority: Priority) -> Option<Result<Locked, Stop>> {
         let (layer, banks) = self.layers.pop_front()?;
+        let _lowered = Lowered::begin(priority);
         if let Some((_, next)) = self.layers.front() {
             // SAFETY: the caller's.
             let ranges: Vec<(usize, usize)> = next.iter().map(|bank| unsafe { bank.range() }).map(|range| (range.as_ptr() as usize, range.len())).collect();
@@ -154,7 +188,7 @@ impl BankLocks {
         // loading verified their chunks).
         for bank in &banks {
             // SAFETY: the caller's, and the bank is locked above.
-            if let Err(error) = unsafe { bank.verify() } {
+            if let Err(error) = unsafe { bank.verify(priority) } {
                 Self::release(&banks);
                 return Some(Err(Stop::Unverified { layer, error }));
             }
@@ -196,6 +230,25 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: the check behind "ready" has at most a quarter of the cores and at least one, and the load's check, and a locking nothing runs beside,
+    /// has every core.
+    #[test]
+    fn the_check_behind_ready_has_a_quarter_of_the_cores_and_the_load_all_of_them() {
+        for cores in [1, 2, 3, 4, 7, 8, 12, 16, 24, 32, 64] {
+            let behind = check_threads(Priority::Background, cores);
+            assert!(behind >= 1 && behind <= cores.div_ceil(4).max(1), "{behind} threads behind ready on {cores} cores");
+            assert_eq!(check_threads(Priority::Normal, cores), cores, "every core for the load's check on {cores} cores");
+            if cores >= 2 {
+                assert!(behind < cores, "{behind} threads behind ready on {cores} cores are not fewer than the cores");
+            }
+        }
+        assert_eq!((check_threads(Priority::Background, 16), check_threads(Priority::Background, 8), check_threads(Priority::Background, 2)), (4, 2, 1));
+        // (this machine's own count: what `Bank::verify` takes)
+        let cores = std::thread::available_parallelism().map_or(8, |count| count.get());
+        assert!(check_threads(Priority::Background, cores) <= check_threads(Priority::Normal, cores));
+        assert_eq!(check_threads(Priority::Normal, 0), 1);
+    }
 
     #[test]
     fn whole_layers_from_the_last_within_the_budget() {

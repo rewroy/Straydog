@@ -17,6 +17,8 @@ use std::sync::{Condvar, Mutex};
 
 use sha2::{Digest, Sha256};
 
+use crate::host::Priority;
+
 pub const BLOCK: usize = 4096;
 const FAN: u64 = (BLOCK / 32) as u64;
 /// Data blocks hashed per work item while building: whole level-0 blocks (128 data blocks).
@@ -212,6 +214,12 @@ pub fn read_verified(map: &[u8], verifier: &Verifier, offset: u64, length: u64) 
 /// them, in pieces on up to `threads` threads: for memory that cannot change under the check
 /// (page-locked, or used only after a copy). A last partial block is checked zero-padded.
 pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, threads: usize) -> Result<(), String> {
+    verify_mapped_at(map, verifier, offset, length, threads, Priority::Normal)
+}
+
+/// [`verify_mapped`] with the priority the threads it starts work at (the calling thread keeps its own, which it uses when `threads` is 1 or the
+/// range is one piece): the check of the banks behind "ready" gives way to a request's work, the load's does not.
+pub fn verify_mapped_at(map: &[u8], verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority) -> Result<(), String> {
     const PIECE: u64 = 16 << 20;
     let size = map.len() as u64;
     if offset.checked_add(length).is_none_or(|end| end > size) {
@@ -236,20 +244,7 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
             failure.lock().unwrap().get_or_insert(error);
         }
     };
-    if pieces.len() > 1 && threads > 1 {
-        let next = AtomicU64::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads.min(pieces.len()) {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed) as usize;
-                    let Some(piece) = pieces.get(index) else { return };
-                    check(*piece);
-                });
-            }
-        });
-    } else {
-        pieces.into_iter().for_each(check);
-    }
+    run_pieces(&pieces, threads, priority, check);
     if end > whole_end && whole_end < size {
         let mut last = vec![0u8; BLOCK];
         last[..(size - whole_end) as usize].copy_from_slice(&map[whole_end as usize..]);
@@ -260,6 +255,28 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
     match failure.into_inner().unwrap() {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// Run `check` on every piece, on the calling thread when there is one piece or one thread, else on `threads` threads (as many as there are pieces
+/// at most) started here, each at `priority` for as long as it works.
+fn run_pieces(pieces: &[(u64, u64)], threads: usize, priority: Priority, check: impl Fn((u64, u64)) + Sync) {
+    if pieces.len() > 1 && threads > 1 {
+        let next = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(pieces.len()) {
+                scope.spawn(|| {
+                    let _lowered = crate::host::Lowered::begin(priority);
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                        let Some(piece) = pieces.get(index) else { return };
+                        check(*piece);
+                    }
+                });
+            }
+        });
+    } else {
+        pieces.iter().copied().for_each(check);
     }
 }
 
@@ -568,6 +585,74 @@ mod pool_tests {
         assert!(with_mapped_checks(&[], |_| true).unwrap());
         let invalid = MappedRange { map: &data, verifier: &verifier, offset: size as u64, length: 1 };
         assert!(with_mapped_checks(&[invalid], |_| ()).is_err());
+        drop(verifier);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_file(tree).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod piece_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    /// The threads `run_pieces` ran 24 pieces of 10 ms on, with the pieces it ran, for `threads` allowed.
+    fn ran_on(threads: usize, priority: Priority) -> (HashSet<ThreadId>, Vec<(u64, u64)>) {
+        let pieces: Vec<(u64, u64)> = (0..24).map(|index| (index * 100, index * 100 + 100)).collect();
+        let seen = Mutex::new((HashSet::new(), Vec::new()));
+        run_pieces(&pieces, threads, priority, |piece| {
+            std::thread::sleep(Duration::from_millis(10));
+            let mut seen = seen.lock().unwrap();
+            seen.0.insert(std::thread::current().id());
+            seen.1.push(piece);
+        });
+        let (ids, mut done) = seen.into_inner().unwrap();
+        done.sort_unstable();
+        assert_eq!(done, pieces, "every piece ran once");
+        (ids, done)
+    }
+
+    /// Decides: the threads a check starts are as many as it was given (and not more than the pieces), none when there is one thread or one
+    /// piece (the calling thread does the work), at either priority.
+    #[test]
+    fn a_check_starts_as_many_threads_as_it_was_given() {
+        let here = std::thread::current().id();
+        for priority in [Priority::Normal, Priority::Background] {
+            for threads in [2, 3, 4] {
+                let (ids, _) = ran_on(threads, priority);
+                assert_eq!(ids.len(), threads, "{threads} threads asked for at {priority:?}");
+                assert!(!ids.contains(&here));
+            }
+            assert_eq!(ran_on(1, priority).0, HashSet::from([here]), "one thread is the caller's");
+            assert_eq!(ran_on(100, priority).0.len(), 24, "no more threads than pieces");
+        }
+        let one_piece = Mutex::new(HashSet::new());
+        run_pieces(&[(0, 10)], 8, Priority::Background, |_| {
+            one_piece.lock().unwrap().insert(std::thread::current().id());
+        });
+        assert_eq!(one_piece.into_inner().unwrap(), HashSet::from([here]));
+    }
+
+    /// Decides: a check at the lower priority still finds a changed byte and passes bytes that are as they were, on the threads it starts.
+    #[test]
+    fn a_check_at_the_lower_priority_checks_the_same() {
+        let size = (40 << 20) + 321;
+        let mut data: Vec<u8> = (0..size).map(|at| (at * 31 % 253) as u8).collect();
+        let file = std::env::temp_dir().join(format!("straydog-auth-priority-{}.data", std::process::id()));
+        let tree = file.with_extension("tree");
+        std::fs::write(&file, &data).unwrap();
+        let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+        let verifier = Verifier::open(&tree, size as u64, &digest, 4 * BLOCK).unwrap();
+        for priority in [Priority::Normal, Priority::Background] {
+            verify_mapped_at(&data, &verifier, 100_000, 38 << 20, 3, priority).unwrap();
+            for at in [20 << 20, size - 2] {
+                data[at] ^= 1;
+                assert!(verify_mapped_at(&data, &verifier, 0, size as u64, 3, priority).is_err(), "a changed byte at {at} under {priority:?}");
+                data[at] ^= 1;
+            }
+        }
         drop(verifier);
         std::fs::remove_file(file).unwrap();
         std::fs::remove_file(tree).unwrap();
