@@ -627,8 +627,8 @@ struct Engine {
     bool lanes = false;   // the Q2_0 kernel takes activations in lane_position order
     const char* isa = "scalar";
     // Activations rounded to 8-bit integers and integer dot products for the formats that have them (cpu_int8.hpp).
-    bool int8 = false;   // on where int_level is 2, unless STRAYDOG_CPU_INT8=0
-    int int_level = 0;   // the integer kernels: 2 = AVX-512 with VBMI, 0 = scalar
+    bool int8 = false;   // on where int_level is 1 or 2, unless STRAYDOG_CPU_INT8=0
+    int int_level = 0;   // the integer kernels: 2 = AVX-512 with VBMI, 1 = AVX2, 0 = scalar
     std::vector<Q8K> x_int;
     std::vector<Q8S> products_int;
     std::vector<float> gate_up, products, x_lanes, down_rows;
@@ -749,21 +749,23 @@ void* sd_cpu_experts_create(uint32_t threads) {
         if (threads > 256) throw std::runtime_error("invalid Straydog CPU expert thread count");
         auto engine = std::make_unique<Engine>();
 #ifdef SD_X86
-        if (cpu_has("avx512")) {
+        // (STRAYDOG_CPU_AVX512=0: the kernels of a CPU without AVX-512, to measure them on one with it)
+        const char* wide = std::getenv("STRAYDOG_CPU_AVX512");
+        const bool avx512 = cpu_has("avx512") && !(wide && wide[0] == '0');
+        if (avx512) {
             engine->kernel = row_avx512; engine->decoded = decoded_avx512; engine->lanes = true; engine->isa = "avx512-f32";
             engine->level = 2;
         } else if (cpu_has("avx2")) {
             engine->kernel = row_avx2; engine->decoded = decoded_avx2; engine->isa = "avx2-fma"; engine->level = 1;
         }
-#endif
-#ifdef SD_X86
-        if (cpu_has("avx512") && cpu_has("avx512vbmi")) engine->int_level = 2;
+        if (avx512 && cpu_has("avx512vbmi")) engine->int_level = 2;
+        else if (cpu_has("avx2")) engine->int_level = 1;
 #endif
         // The integer path where its wide kernels run (they are faster than the F32 ones there; its scalar kernels are the reference, not a
         // path). STRAYDOG_CPU_INT8=0 keeps the F32 path (a comparison's other side).
         const char* int8 = std::getenv("STRAYDOG_CPU_INT8");
-        engine->int8 = engine->int_level >= 2 && !(int8 && int8[0] == '0');
-        if (engine->int8) engine->isa = "avx512-int8";
+        engine->int8 = engine->int_level >= 1 && !(int8 && int8[0] == '0');
+        if (engine->int8) engine->isa = engine->int_level >= 2 ? "avx512-int8" : "avx2-int8";
         engine->workers = std::make_unique<Workers>(threads);
         return engine.release();
     } catch (const std::exception& e) { cpu_error = e.what(); return nullptr; }
@@ -811,13 +813,13 @@ int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out) {
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 // Test hook: count rows (stride bytes apart) of one format against x through the integer path (x rounded as the engine rounds it):
-// the scalar kernels at level 0, AVX-512 (with VBMI) at 2, and at 3 without GFNI. An error for a format without integer kernels or a
+// the scalar kernels at level 0, AVX2 at 1, AVX-512 (with VBMI) at 2, and at 3 without GFNI. An error for a format without integer kernels or a
 // level not here.
 int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out) {
     try {
         if (!row || !x || !out || !count || !cols) throw std::runtime_error("invalid Straydog integer rows");
 #ifdef SD_X86
-        if (level == 1 || level > 3 || (level >= 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi"))))
+        if (level > 3 || (level >= 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi"))) || (level == 1 && !cpu_has("avx2")))
             throw std::runtime_error("no such integer kernels here");
 #endif
         if (GateKernel gate = gate_int_kernel(kind, level)) {

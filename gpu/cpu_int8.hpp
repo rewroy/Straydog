@@ -364,6 +364,127 @@ void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t bl
     if constexpr (N > 2) out[2] = total512(acc2);
     if constexpr (N > 3) out[3] = total512(acc3);
 }
+// --- AVX2 kernels: the AVX-512 kernels' sixteen lanes as two 256-bit halves (lanes 0-7 and 8-15), the same integers and the same F32
+// operations in the same order, so the same bits. For CPUs without AVX-512 (Intel's 12th to 14th generation, Zen 3 and before) ---
+
+// A block of IQ2_XXS or IQ2_S prepared for one row: its 32 grid rows' byte offsets, sign bytes, and the 16 group scales (2 ls + 1, a
+// 16-value group each).
+struct Avx2Prepared {
+    uint16_t offset[32];
+    uint8_t sign[32];
+    int16_t scale[16];
+};
+inline void prepare_avx2_iq2_xxs(const uint8_t* block, Avx2Prepared& p) {
+    for (int g = 0; g < 8; ++g) {
+        const uint32_t aux = load32(block + 2 + 8 * g + 4);
+        for (int l = 0; l < 4; ++l) {
+            p.offset[4 * g + l] = uint16_t(8 * block[2 + 8 * g + l]);
+            p.sign[4 * g + l] = sign_table.value[(aux >> (7 * l)) & 127];
+        }
+        p.scale[2 * g] = p.scale[2 * g + 1] = int16_t(2 * (aux >> 28) + 1);
+    }
+}
+inline void prepare_avx2_iq2_s(const uint8_t* block, Avx2Prepared& p) {
+    for (int g = 0; g < 8; ++g)
+        for (int l = 0; l < 4; ++l)
+            p.offset[4 * g + l] = uint16_t(8 * (block[2 + 4 * g + l] | ((unsigned(block[66 + g]) << (8 - 2 * l)) & 0x300)));
+    std::memcpy(p.sign, block + 34, 32);
+    for (int g = 0; g < 16; ++g) p.scale[g] = int16_t(2 * ((block[74 + g / 2] >> (4 * (g % 2))) & 15) + 1);
+}
+// Four grid rows' eight bytes each, as 32 bytes.
+SD_TARGET("avx2,fma,f16c")
+inline __m256i grid32(const uint8_t* grid, const uint16_t* offset) {
+    return _mm256_set_epi64x(int64_t(grid_row(grid, offset[3])), int64_t(grid_row(grid, offset[2])), int64_t(grid_row(grid, offset[1])),
+                             int64_t(grid_row(grid, offset[0])));
+}
+// x's 32 values against four grid rows: each value's sign from its row's sign byte, the rows' two 16-value groups' scales, eight lanes.
+SD_TARGET("avx2,fma,f16c")
+inline __m256i half_lanes(const uint8_t* grid, const Avx2Prepared& p, unsigned first_row, unsigned first_group, __m256i q, __m256i lanes) {
+    // (each sign byte to its row's eight bytes, then one bit a byte: 0xFF where the value is negative)
+    uint32_t signs; std::memcpy(&signs, p.sign + first_row, 4);
+    const __m256i spread = _mm256_shuffle_epi8(_mm256_set1_epi32(int(signs)),
+                                               _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
+    const __m256i bit = _mm256_set1_epi64x(int64_t(0x8040201008040201ull));
+    const __m256i negative = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit);
+    const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, negative), negative);
+    const __m256i scales = _mm256_set_m128i(_mm_set1_epi16(p.scale[first_group + 1]), _mm_set1_epi16(p.scale[first_group]));
+    return _mm256_add_epi32(lanes, _mm256_madd_epi16(_mm256_maddubs_epi16(grid32(grid, p.offset + first_row), signed_q), scales));
+}
+template<int kind, int N>
+SD_TARGET("avx2,fma,f16c")
+void iq2_int_rows256(const uint8_t* row, size_t stride, const Q8K* x, size_t blocks, float* out) {
+    constexpr size_t bytes = kind == 16 ? 66 : 82;
+    const uint8_t* grid = iq_table(kind);
+    __m256 low0 = _mm256_setzero_ps(), low1 = low0, low2 = low0, low3 = low0, high0 = low0, high1 = low0, high2 = low0, high3 = low0;
+    Avx2Prepared prepared[N];
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<bytes, N>(row, stride, b);
+        for (int r = 0; r < N; ++r) {
+            if constexpr (kind == 16) prepare_avx2_iq2_xxs(row + size_t(r) * stride + b * bytes, prepared[r]);
+            else prepare_avx2_iq2_s(row + size_t(r) * stride + b * bytes, prepared[r]);
+        }
+        __m256i l0 = _mm256_setzero_si256(), l1 = l0, l2 = l0, l3 = l0, h0 = l0, h1 = l0, h2 = l0, h3 = l0;
+        for (unsigned c = 0; c < 4; ++c) {
+            const __m256i ql = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q + 64 * c));
+            const __m256i qh = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q + 64 * c + 32));
+#define SD_IQ2_HALVES(r, l, h) \
+            l = half_lanes(grid, prepared[r], 8 * c, 4 * c, ql, l); \
+            h = half_lanes(grid, prepared[r], 8 * c + 4, 4 * c + 2, qh, h);
+            SD_IQ2_HALVES(0, l0, h0)
+            if constexpr (N > 1) { SD_IQ2_HALVES(1, l1, h1) }
+            if constexpr (N > 2) { SD_IQ2_HALVES(2, l2, h2) }
+            if constexpr (N > 3) { SD_IQ2_HALVES(3, l3, h3) }
+#undef SD_IQ2_HALVES
+        }
+        const float d = x[b].d * 0.125f;
+        const uint8_t* block = row + b * bytes;
+#define SD_IQ2_SCALE(r, l, h, low, high) { \
+            const __m256 scale = _mm256_set1_ps(half_f16c(block + (r) * stride) * d); \
+            low = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l), scale, low); high = _mm256_fmadd_ps(_mm256_cvtepi32_ps(h), scale, high); }
+        SD_IQ2_SCALE(0, l0, h0, low0, high0)
+        if constexpr (N > 1) SD_IQ2_SCALE(1, l1, h1, low1, high1)
+        if constexpr (N > 2) SD_IQ2_SCALE(2, l2, h2, low2, high2)
+        if constexpr (N > 3) SD_IQ2_SCALE(3, l3, h3, low3, high3)
+#undef SD_IQ2_SCALE
+    }
+    out[0] = total256(low0, high0);
+    if constexpr (N > 1) out[1] = total256(low1, high1);
+    if constexpr (N > 2) out[2] = total256(low2, high2);
+    if constexpr (N > 3) out[3] = total256(low3, high3);
+}
+// Q2_0's down: the 16 code bytes in both 128-bit halves, each 128 bits m taking bits 2m and 2m + 1 (a 32-bit shift: what crosses a
+// byte lands above the two bits kept).
+template<int N>
+SD_TARGET("avx2,fma,f16c")
+void q2_0_int_rows256(const uint8_t* row, size_t stride, const Q8S* x, size_t blocks, float* out) {
+    const __m256i shift_low = _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2), shift_high = _mm256_setr_epi32(4, 4, 4, 4, 6, 6, 6, 6);
+    const __m256i three = _mm256_set1_epi8(3), ones = _mm256_set1_epi16(1);
+    __m256 low0 = _mm256_setzero_ps(), low1 = low0, low2 = low0, low3 = low0, high0 = low0, high1 = low0, high2 = low0, high3 = low0;
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<18, N>(row, stride, b);
+        const __m256i ql = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q));
+        const __m256i qh = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].q + 32));
+        const __m256i bias_low = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].lanes));
+        const __m256i bias_high = _mm256_load_si256(reinterpret_cast<const __m256i*>(x[b].lanes + 8));
+        const uint8_t* block = row + 18 * b;
+#define SD_Q2_INT256(r, low, high) { \
+            const uint8_t* at = block + (r) * stride; \
+            const __m256i codes = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(at + 2))); \
+            const __m256i cl = _mm256_and_si256(_mm256_srlv_epi32(codes, shift_low), three), ch = _mm256_and_si256(_mm256_srlv_epi32(codes, shift_high), three); \
+            const __m256 scale = _mm256_set1_ps(half_f16c(at) * x[b].d); \
+            low = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(cl, ql), ones), bias_low)), scale, low); \
+            high = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(ch, qh), ones), bias_high)), scale, high); }
+        SD_Q2_INT256(0, low0, high0)
+        if constexpr (N > 1) SD_Q2_INT256(1, low1, high1)
+        if constexpr (N > 2) SD_Q2_INT256(2, low2, high2)
+        if constexpr (N > 3) SD_Q2_INT256(3, low3, high3)
+#undef SD_Q2_INT256
+    }
+    out[0] = total256(low0, high0);
+    if constexpr (N > 1) out[1] = total256(low1, high1);
+    if constexpr (N > 2) out[2] = total256(low2, high2);
+    if constexpr (N > 3) out[3] = total256(low3, high3);
+}
 // `count` rows four at a time, then the rest.
 template<typename Rows>
 inline void by_fours(const uint8_t* row, size_t stride, size_t count, float* out, Rows rows) {
@@ -388,10 +509,19 @@ void q2_0_int_avx512(const uint8_t* row, size_t stride, size_t count, const Q8S*
 void q2_0_int_gfni(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
     by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value, true>(rows, stride, x, blocks, o); });
 }
+void iq2_xxs_int_avx2(const uint8_t* row, size_t stride, size_t count, const Q8K* x, size_t blocks, float* out) {
+    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { iq2_int_rows256<16, decltype(n)::value>(rows, stride, x, blocks, o); });
+}
+void iq2_s_int_avx2(const uint8_t* row, size_t stride, size_t count, const Q8K* x, size_t blocks, float* out) {
+    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { iq2_int_rows256<22, decltype(n)::value>(rows, stride, x, blocks, o); });
+}
+void q2_0_int_avx2(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
+    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows256<decltype(n)::value>(rows, stride, x, blocks, o); });
+}
 #endif
 
 // The integer row kernels of `kind` at `level` (2: AVX-512 with VBMI, and GFNI where the CPU has it; 3: the same without GFNI, for the
-// tests; else the scalar reference), or null where the format has none.
+// tests; 1: AVX2; else the scalar reference), or null where the format has none.
 using GateKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, size_t, float*);
 using DownKernel = void (*)(const uint8_t*, size_t, size_t, const Q8S*, size_t, float*);
 GateKernel gate_int_kernel(int kind, int level) {
@@ -399,6 +529,10 @@ GateKernel gate_int_kernel(int kind, int level) {
     if (level >= 2) {
         if (kind == 16) return iq2_xxs_int_avx512;
         if (kind == 22) return iq2_s_int_avx512;
+    }
+    if (level == 1) {
+        if (kind == 16) return iq2_xxs_int_avx2;
+        if (kind == 22) return iq2_s_int_avx2;
     }
 #endif
     (void)level;
@@ -412,6 +546,7 @@ DownKernel down_int_kernel(int kind, int level) {
         static const bool gfni = cpu_has("gfni");
         return level == 2 && gfni ? q2_0_int_gfni : q2_0_int_avx512;
     }
+    if (level == 1 && kind == 42) return q2_0_int_avx2;
 #endif
     (void)level;
     return kind == 42 ? q2_0_int_scalar : nullptr;
