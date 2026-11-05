@@ -4,6 +4,9 @@ pub mod config;
 pub mod dashboard;
 pub mod frames;
 pub mod monitor;
+pub mod prefix;
+#[cfg(windows)]
+pub mod prefix_store;
 pub mod progress;
 pub mod runtime;
 pub mod setup;

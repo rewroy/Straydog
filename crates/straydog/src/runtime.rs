@@ -19,6 +19,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{Gemm, Settings, SplitMode};
+use crate::prefix::{Cache, Due, Restored};
 use crate::worker::FRAME_BYTES;
 
 /// Generations accepted at once: the running one and three waiting.
@@ -752,6 +753,26 @@ impl Process {
     async fn read(&mut self) -> Result<Value, String> {
         self.stdout.read().await
     }
+
+    /// A frame that carries bytes ([`crate::frames`]): `header` (its `bytes` set to `body`'s length), then `body`.
+    async fn send_with_body(&mut self, header: &pyjson::Value, body: &[u8]) -> Result<(), String> {
+        let mut header = header.clone();
+        if let pyjson::Value::Object(entries) = &mut header {
+            entries.retain(|(key, _)| key != "bytes");
+            entries.push(("bytes".to_string(), pyjson::Value::Int(body.len() as i128)));
+        }
+        let mut line = pyjson::dumps(&header).into_bytes();
+        line.push(b'\n');
+        self.stdin.write_all(&line).await.map_err(|exc| exc.to_string())?;
+        self.stdin.write_all(body).await.map_err(|exc| exc.to_string())?;
+        self.stdin.flush().await.map_err(|exc| exc.to_string())
+    }
+
+    /// The `count` bytes that follow a header the worker sent. A body that is short or over its limit leaves the pipe out of step: the caller ends
+    /// the worker.
+    async fn read_body(&mut self, count: u64) -> Result<Vec<u8>, String> {
+        crate::frames::read_body_async(&mut self.stdout.reader, count).await
+    }
 }
 
 fn frame(entries: Vec<(&str, pyjson::Value)>) -> pyjson::Value {
@@ -805,6 +826,8 @@ impl Runtime {
             warm_directory: Some(settings.data_dir.join("warm")),
             cancel_patience,
             refusal,
+            prefix: Cache::new(settings),
+            saves: Mutex::new(Vec::new()),
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
@@ -867,6 +890,10 @@ struct Driver {
     cancel_patience: Duration,
     /// Why the OS refused a worker that failed to start with "access denied".
     refusal: Refusal,
+    /// What the run keeps of its system block's state, for the next start (Windows).
+    prefix: Cache,
+    /// The saves under way, each on a thread of its own: the server waits for them before it ends.
+    saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// The name of the file that keeps a bundle's warm-up state, in the data directory's `warm`. The key hashes the bundle's pinned shards. A bundle read on
@@ -916,7 +943,8 @@ impl Driver {
         let holders = match launched {
             Ok(mut process) => {
                 let warming = self.restore_warm_state(&mut process).await;
-                let changed = self.serve(&mut process, &mut jobs, &mut controls, warming).await;
+                let restoring = self.ready_frame().and_then(|ready| self.prefix.restore(&ready));
+                let changed = self.serve(&mut process, &mut jobs, &mut controls, warming, restoring).await;
                 if changed {
                     self.save_warm_state(&mut process).await;
                 }
@@ -934,6 +962,11 @@ impl Driver {
                 holders
             }
         };
+        // (a state being sealed is written whole, or not at all: the end waits for it)
+        let saves = std::mem::take(&mut *self.saves.lock().unwrap());
+        for save in saves {
+            let _ = save.await;
+        }
         // The worker is gone: every queued generation fails instead of waiting forever.
         jobs.close();
         while let Some(job) = jobs.recv().await {
@@ -957,12 +990,15 @@ impl Driver {
     /// by itself: its state is saved at the end, whole (what it had not read yet kept), even when no
     /// request came.
     async fn serve(&self, process: &mut Process, jobs: &mut mpsc::UnboundedReceiver<Job>,
-                   controls: &mut mpsc::UnboundedReceiver<Control>, warming: bool) -> bool {
+                   controls: &mut mpsc::UnboundedReceiver<Control>, warming: bool,
+                   mut restoring: Option<tokio::task::JoinHandle<Option<Restored>>>) -> bool {
         let mut changed = warming;
         let mut save = tokio::time::interval(WARM_SAVE);
         save.tick().await;
         loop {
             let job = tokio::select! {
+                // (a request that is there goes first: the system block's state never holds one up)
+                biased;
                 job = jobs.recv() => match job { Some(job) => job, None => return changed },
                 status = process.child.wait() => {
                     let status = status.map_or_else(|exc| exc.to_string(), |status| status.to_string());
@@ -974,7 +1010,16 @@ impl Driver {
                     changed = false;
                     continue;
                 }
+                restored = async { restoring.as_mut().unwrap().await }, if restoring.is_some() => {
+                    restoring = None;
+                    if let Ok(Some(restored)) = restored {
+                        self.hand_prefix(process, restored).await;
+                    }
+                    continue;
+                }
             };
+            // (once a request has begun the worker holds a sequence of its own, which a state handed now would only displace)
+            restoring = None;
             changed = true;
             let skipped = self.shared.cancelled.lock().unwrap().remove(&job.id);
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
@@ -992,7 +1037,66 @@ impl Driver {
                 return false;
             }
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
+            // (the reply is with its client: what the run keeps of its system block is done after it, never ahead of it)
+            if let Err(message) = self.after_reply(process).await {
+                let message = format!("{message}; restart the server");
+                tracing::error!("{message}");
+                self.set(Phase::Failed(message.split_once(": ").map_or(message.clone(), |(head, _)| format!("{head}; restart the server"))));
+                self.shared.failure.send_replace(Some(message));
+                process.end(Duration::from_secs(5)).await;
+                return false;
+            }
         }
+    }
+
+    /// Hand the worker the state of a system block an earlier run saved, which is opened by now: in the background, a request that comes
+    /// first never waits for it (the worker takes it only while no request has had the engine), and the worker's own line says what became of it.
+    async fn hand_prefix(&self, process: &mut Process, restored: Restored) {
+        if restored.state().len() as u64 > crate::frames::BODY_LIMIT {
+            return;
+        }
+        tracing::debug!("Straydog prefix: handing its worker {} MB, opened in {:.2} s", restored.state().len() >> 20, restored.seconds);
+        let header = frame(vec![("id", pyjson::Value::Str("prefix".into())), ("command", pyjson::Value::Str("prefix".into())),
+                                ("read_seconds", pyjson::Value::Float(restored.seconds))]);
+        if let Err(message) = process.send_with_body(&header, restored.state()).await {
+            tracing::warn!("Straydog could not hand its worker the system block's state: {message}");
+        }
+    }
+
+    /// After a reply: save the state of the system block its request made the root of, if it is due. Err only when the worker is unusable.
+    async fn after_reply(&self, process: &mut Process) -> Result<(), String> {
+        let Some(due) = self.ready_frame().and_then(|ready| self.prefix.due(&ready)) else { return Ok(()) };
+        self.save_prefix(process, due).await
+    }
+
+    /// Ask the worker for the state of the root `due` names, and have it sealed and written on a thread of its own. A worker that has none, or
+    /// another, is no failure; a frame that is short is: the pipe is out of step.
+    async fn save_prefix(&self, process: &mut Process, due: Due) -> Result<(), String> {
+        let request = frame(vec![("id", pyjson::Value::Str("prefix-state".into())), ("command", pyjson::Value::Str("prefix_state".into()))]);
+        process.send(&request).await?;
+        let header = tokio::time::timeout(Duration::from_secs(60), process.read()).await
+            .map_err(|_| "Straydog's worker gave no prefix state within 60 s".to_string())??;
+        if header["id"] != "prefix-state" {
+            return Err("Straydog prefix state reply id mismatch".into());
+        }
+        if header["event"] != "prefix_state" {
+            tracing::warn!("Straydog's worker gave no prefix state ({})", header["message"].as_str().unwrap_or("unexpected reply"));
+            return Ok(());
+        }
+        let bytes = header["bytes"].as_u64().unwrap_or(0);
+        if bytes == 0 {
+            tracing::debug!("Straydog's worker holds no prefix state to give");
+            return Ok(());
+        }
+        // (the body is read whatever the header names: the pipe stays in step)
+        let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
+            .map_err(|_| "Straydog's worker did not finish its prefix state within 120 s".to_string())??;
+        if header["digest"].as_str() != Some(due.digest.as_str()) {
+            tracing::debug!("Straydog's worker gave the state of another block than the one asked for");
+            return Ok(());
+        }
+        self.saves.lock().unwrap().push(due.save(state));
+        Ok(())
     }
 
     /// The file that keeps the model's warm-up state: one per model (its shards), whatever the
@@ -1147,7 +1251,7 @@ impl Driver {
                 let text = String::from_utf8_lossy(&line);
                 // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
                 // account of the host banks a partially resident model page-locked, and when it pages or no longer)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first"]
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix"]
                     .iter().any(|start| text.starts_with(start));
                 if verbose || warm {
                     tracing::info!("worker: {text}");
@@ -1295,6 +1399,7 @@ impl Driver {
                     let kind = event["event"].as_str().unwrap_or("").to_string();
                     if kind == "done" {
                         tracing::info!("{}", request_summary(&event, client_request_id(&job.body)));
+                        self.prefix.note_done(&event);
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
