@@ -310,10 +310,18 @@ pub fn engram_directories(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         .into_iter().flatten().collect()
 }
 
-/// The table a bundle in `root` reads, and where: of those there, the most exact ([`TABLE_PRECISIONS`]), its own shard
-/// before a file of the same precision; with `STRAYDOG_ENGRAM` set, the one of that precision (an error when it is not
-/// there). None for a bundle without a table of its own, or when none is there.
+/// The table a bundle in `root` reads, and where: the one `STRAYDOG_ENGRAM` names ([`table_in_with`]).
 pub fn table_in(root: &std::path::Path, id: Id) -> Result<Option<(Table, std::path::PathBuf)>, String> {
+    let named = std::env::var("STRAYDOG_ENGRAM").ok().filter(|precision| !precision.is_empty());
+    table_in_with(root, id, named.as_deref())
+}
+
+/// The table a bundle in `root` reads, and where: the one of `precision` when one is named (an error when it is not
+/// there), else its own last shard, else the most exact of the model's engram files there ([`TABLE_PRECISIONS`]: a bundle
+/// set up with one in its own shard's place). A larger table is read by choice alone: on a machine short of memory its rows
+/// cost the experts' banks room (Q5_1 decoded a tenth slower than the shard's IQ4_NL on 62 GiB with 30 held by other
+/// programs). None for a bundle without a table of its own, or when none is there.
+pub fn table_in_with(root: &std::path::Path, id: Id, precision: Option<&str>) -> Result<Option<(Table, std::path::PathBuf)>, String> {
     let tables = tables(id)?;
     if tables.is_empty() {
         return Ok(None);
@@ -326,11 +334,11 @@ pub fn table_in(root: &std::path::Path, id: Id) -> Result<Option<(Table, std::pa
             found.push((table, path));
         }
     }
-    found.sort_by_key(|(table, _)| (rank(table), !table.bundled));
-    if let Some(precision) = std::env::var("STRAYDOG_ENGRAM").ok().filter(|precision| !precision.is_empty()) {
-        return found.into_iter().find(|(table, _)| table.precision.eq_ignore_ascii_case(&precision)).map(Some)
-            .ok_or_else(|| format!("STRAYDOG_ENGRAM={precision}: no such engram table for {id} in {} or its engram directories", root.display()));
+    if let Some(precision) = precision {
+        return found.into_iter().find(|(table, _)| table.precision.eq_ignore_ascii_case(precision)).map(Some)
+            .ok_or_else(|| format!("engram {precision}: no such table for {id} in {} or its engram directories", root.display()));
     }
+    found.sort_by_key(|(table, _)| (!table.bundled, rank(table)));
     Ok(found.into_iter().next())
 }
 
@@ -888,11 +896,11 @@ mod tests {
         }
     }
 
-    /// Unsloth's Qwen3.8 bundles read the most exact engram table there is: their own last shard (IQ4_NL), or one of the
-    /// model's engram files in the bundle's directory, its engram directory or the one beside it, the shard before a file of
-    /// its precision. Bundles without a table shard of their own have none.
+    /// Unsloth's Qwen3.8 bundles read their own table shard unless another table is named; without the shard, the most exact
+    /// of the model's engram files in the bundle's directory, its engram directory or the one beside it. Bundles without a table
+    /// shard of their own have none.
     #[test]
-    fn a_bundle_reads_the_most_exact_engram_table_there_is() {
+    fn a_bundle_reads_its_own_table_or_the_one_named() {
         let id = Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" };
         let offered: Vec<(String, bool)> = tables(id).unwrap().into_iter().map(|table| (table.precision, table.bundled)).collect();
         assert_eq!(offered, [("IQ4_NL".into(), true), ("BF16".into(), false), ("Q8_0".into(), false), ("Q5_1".into(), false)]);
@@ -900,24 +908,26 @@ mod tests {
         let family = std::env::temp_dir().join(format!("straydog-bundle-engram-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&family);
         let root = family.join("Unsloth-UD-IQ1_M");
-        std::fs::create_dir_all(&root).unwrap();
-        let precision = || table_in(&root, id).unwrap().map(|(table, path)| (table.precision, path));
-        assert_eq!(precision(), None);
-        let shard = bundle(id).unwrap().shards[2].name.clone();
-        std::fs::write(root.join(&shard), b"").unwrap();
-        assert_eq!(precision(), Some(("IQ4_NL".into(), root.join(&shard))));
-        // the model's engram directory beside the bundle's, which its bundles share
         std::fs::create_dir_all(family.join(ENGRAM_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let read = |named: Option<&str>| table_in_with(&root, id, named).map(|found| found.map(|(table, path)| (table.precision, path)));
+        assert_eq!(read(None), Ok(None));
+        // without its shard (set up with another table), the most exact file there: the model's engram directory, or its own
         let q5 = family.join(ENGRAM_DIRECTORY).join("Qwen3.8-Flash-Next-engram-Q5_1.gguf_file");
         std::fs::write(&q5, b"").unwrap();
-        assert_eq!(precision(), Some(("Q5_1".into(), q5)));
-        // a more exact one in the bundle's own directory
+        assert_eq!(read(None), Ok(Some(("Q5_1".into(), q5.clone()))));
         let q8 = root.join("Qwen3.8-Flash-Next-engram-Q8_0.gguf_file");
         std::fs::write(&q8, b"").unwrap();
-        assert_eq!(precision(), Some(("Q8_0".into(), q8.clone())));
+        assert_eq!(read(None), Ok(Some(("Q8_0".into(), q8.clone()))));
+        // its own shard, there, unless another is named
+        let shard = bundle(id).unwrap().shards[2].name.clone();
+        std::fs::write(root.join(&shard), b"").unwrap();
+        assert_eq!(read(None), Ok(Some(("IQ4_NL".into(), root.join(&shard)))));
+        assert_eq!(read(Some("q5_1")), Ok(Some(("Q5_1".into(), q5))));
+        assert!(read(Some("BF16")).unwrap_err().contains("engram BF16: no such table"));
         // the files whose trees the server builds: the table read, in the last shard's place
         let files = verity_files_in(&root, id).unwrap();
-        assert!(files.iter().any(|(path, ..)| *path == q8) && !files.iter().any(|(path, ..)| path.ends_with(&shard)), "{files:?}");
+        assert!(files.iter().any(|(path, ..)| path.ends_with(&shard)) && !files.iter().any(|(path, ..)| *path == q8), "{files:?}");
         std::fs::remove_dir_all(family).unwrap();
     }
 
