@@ -76,7 +76,7 @@ impl Layout {
     pub fn new(files: &[File], layers: Vec<Option<Vec<Role>>>, verifier: Option<Verifier>) -> Result<Layout> {
         let files = files.iter().map(|file| match storage::direct(file) {
             Some(direct) => Ok((Arc::new(direct), true)),
-            None => file.try_clone().map(|clone| (Arc::new(clone), false)).map_err(|exc| exc.to_string()),
+            None => storage::reader(file).map(|reader| (Arc::new(reader), false)).map_err(|exc| exc.to_string()),
         }).collect::<Result<Vec<_>>>()?;
         for role in layers.iter().flatten().flatten() {
             if role.file >= files.len() {
@@ -369,15 +369,12 @@ fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<()
     Ok(())
 }
 
-/// Fill `target` from `offset`; a direct handle reads whole aligned blocks into an aligned target.
+/// Fill `target` from `offset`, through `storage`'s read; a direct handle reads whole aligned blocks into an aligned target.
 /// A read past the file's end leaves the rest zero (the tail of the last block).
 fn read_fully(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()> {
     let mut done = 0usize;
     while done < target.len() {
-        #[cfg(unix)]
-        let count = std::os::unix::fs::FileExt::read_at(file, &mut target[done..], offset + done as u64)?;
-        #[cfg(windows)]
-        let count = std::os::windows::fs::FileExt::seek_read(file, &mut target[done..], offset + done as u64)?;
+        let count = storage::read_partial(file, &mut target[done..], offset + done as u64)?;
         if count == 0 {
             // Past the file's end: only the last block's tail, which holds no expert bytes.
             target[done..].fill(0);
@@ -2732,6 +2729,29 @@ mod reader_tests {
         ReadJob { file: file.clone(), offset: 0, len: target.len() as u64, target: HostPointer(target.as_mut_ptr()),
             verifier: verifier.map(|verify| (verify, 0)), done: done.clone(), slot,
             chunk: Chunk { host: 0, vram: 0, bytes: target.len() as u64, head }, latency: false, cancelled: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// A direct read ends at the file's end, whether inside a block (the file's tail) or on a block boundary, and leaves the rest of the
+    /// target zero, as it did with std's `seek_read`.
+    #[cfg(windows)]
+    #[test]
+    fn a_direct_read_past_the_files_end_leaves_the_rest_zero() {
+        for size in [3 * ALIGN + 100, 3 * ALIGN] {
+            let path = std::env::temp_dir().join(format!("straydog-reader-end-{}-{size}", std::process::id()));
+            let data: Vec<u8> = (0..size).map(|index| (index % 251) as u8 + 1).collect();
+            File::create(&path).unwrap().write_all(&data).unwrap();
+            let file = File::open(&path).unwrap();
+            let direct = storage::direct(&file).expect("a direct handle");
+            for (offset, blocks) in [(ALIGN, 3), (2 * ALIGN, 2), (3 * ALIGN, 1), (0, 4)] {
+                let mut target = storage::Buffer::new(blocks * ALIGN);
+                target.as_mut_slice().fill(9);
+                read_fully(&direct, offset as u64, target.as_mut_slice()).unwrap();
+                let expected: Vec<u8> = (offset..offset + blocks * ALIGN).map(|index| data.get(index).copied().unwrap_or(0)).collect();
+                assert!(target.as_slice() == &expected[..], "{blocks} blocks at {offset} of {size} bytes");
+            }
+            drop((direct, file));
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     struct Unblock(Arc<(Mutex<bool>, Condvar)>);

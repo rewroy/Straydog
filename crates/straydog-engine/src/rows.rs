@@ -176,6 +176,7 @@ struct Counts {
 }
 
 struct Table {
+    /// A handle for the pool's reads through the page cache, which run at once (`storage::reader`).
     file: File,
     /// A handle reading past the page cache, and a mapping that tells which blocks the page
     /// cache holds (those are read through it, without touching the drive).
@@ -297,7 +298,7 @@ impl RowTable {
             }
             None => None,
         };
-        let table = Table { file: file.try_clone()?, direct, base, width, rows, size,
+        let table = Table { file: storage::reader(file)?, direct, base, width, rows, size,
                             cache: Mutex::new(cache), arrived: Condvar::new(), counts: Counts::default(), verifier };
         Ok(RowTable { table: Arc::new(table), pool })
     }
