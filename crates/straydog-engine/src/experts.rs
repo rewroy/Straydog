@@ -384,6 +384,13 @@ fn read_fully(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()
             return Ok(());
         }
         done += count;
+        // A direct handle on Windows refuses (ERROR_INVALID_PARAMETER) a read at an offset that is not a whole block, where Linux answers
+        // 0 at the end of the file: a read that ended inside a block ended at the file's end, and the rest of the block is its tail.
+        #[cfg(windows)]
+        if done < target.len() && !done.is_multiple_of(ALIGN) {
+            target[done..].fill(0);
+            return Ok(());
+        }
     }
     Ok(())
 }
