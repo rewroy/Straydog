@@ -48,6 +48,7 @@ fn settings() -> Settings {
         verbose: false,
         data_dir: PathBuf::from("/nonexistent/.straydog"),
         expert_ram: None,
+        prefix_cache: false,
     }
 }
 

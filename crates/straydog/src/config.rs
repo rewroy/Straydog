@@ -204,6 +204,13 @@ pub struct Options {
     /// Host memory for routed experts outside VRAM, in GiB, for a bundle read on demand [default: what Straydog's other host memory leaves of 85% of the host memory]
     #[arg(long, env = "STRAYDOG_EXPERT_RAM", value_name = "GIB")]
     pub expert_ram: Option<f64>,
+    /// Windows: keep the state of the first request's system block (the system prompt with its tools), sealed for the user, in the data directory, and take the next start's first request from it [default: true; `prefix_cache = false` in the config file, or --no-prefix-cache]
+    #[arg(skip)]
+    pub prefix_cache: Option<bool>,
+    /// Keep no state of the system block on the drive (see `prefix_cache`)
+    #[arg(long = "no-prefix-cache")]
+    #[serde(skip)]
+    pub no_prefix_cache: bool,
 }
 
 /// The settings in effect, every derived value filled in.
@@ -252,6 +259,8 @@ pub struct Settings {
     pub data_dir: PathBuf,
     /// Unset: planned from the host memory.
     pub expert_ram: Option<f64>,
+    /// Windows: the first request's system block's state is kept sealed in the data directory and handed to the next start (`straydog::prefix`).
+    pub prefix_cache: bool,
 }
 
 /// llama.cpp's multi-letter short options, as their long forms (clap's short options are one letter).
@@ -361,7 +370,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
     let options = merge!(model, model_name, provider, quant, engram, expert_floor, model_draft, model_vision, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose,
-                         data_dir, expert_ram);
+                         data_dir, expert_ram, prefix_cache, no_prefix_cache);
     Ok((options, sources))
 }
 
@@ -612,6 +621,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         verbose: options.verbose,
         data_dir,
         expert_ram: options.expert_ram,
+        prefix_cache: !options.no_prefix_cache && options.prefix_cache.unwrap_or(true),
     })
 }
 
@@ -657,15 +667,16 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("verbose", settings.verbose.to_string()),
         ("data_dir", settings.data_dir.display().to_string()),
         ("expert_ram", settings.expert_ram.map_or_else(|| "(planned)".into(), |gib| gib.to_string())),
+        ("prefix_cache", settings.prefix_cache.to_string()),
     ];
     values
         .into_iter()
         .map(|(name, value)| {
             let derived = ["model_name", "provider", "quant", "draft_max", "batch_size", "state_ram", "alias", "api_key"].contains(&name);
-            let source = sources
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map_or(if derived { "derived" } else { "default" }, |(_, source)| source.as_str());
+            let named = |wanted: &str| sources.iter().find(|(key, _)| *key == wanted);
+            // (`--no-prefix-cache` is the option that sets prefix_cache, and it wins over the file)
+            let found = if name == "prefix_cache" { named("no_prefix_cache").or_else(|| named(name)) } else { named(name) };
+            let source = found.map_or(if derived { "derived" } else { "default" }, |(_, source)| source.as_str());
             format!("{name:<16} {value}  [{source}]")
         })
         .collect()
@@ -948,6 +959,44 @@ mod tests {
         let lines = describe(&settings, &sources);
         assert!(lines.iter().any(|line| line.starts_with("model ") && line.ends_with(&format!("[config {}]", file.display()))));
         assert!(lines.iter().any(|line| line.starts_with("port ") && line.ends_with("[option --port]")));
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    /// The state of the first request's system block is kept by default; `prefix_cache = false` in the config file turns it off, and so does
+    /// `--no-prefix-cache`, which is named as its source; the file's `true` does not undo the option.
+    #[test]
+    fn the_prefix_cache_is_on_unless_the_file_or_the_option_turns_it_off() {
+        let model = bundle_directory(qwen("IQ3_S"));
+        let setting = |file: Option<&str>, args: &[&str]| {
+            let config = file.map(|text| {
+                let path = model.join("prefix.toml");
+                std::fs::write(&path, format!("model = {:?}
+{text}
+", model.display())).unwrap();
+                path
+            });
+            let mut all = vec!["-m", model.to_str().unwrap()];
+            all.extend_from_slice(args);
+            let matches = command().try_get_matches_from(all).unwrap();
+            let (options, sources) = load(&matches, config.as_deref()).unwrap();
+            let settings = resolve(options).unwrap();
+            let line = describe(&settings, &sources).into_iter().find(|line| line.starts_with("prefix_cache ")).unwrap();
+            (settings.prefix_cache, line)
+        };
+        assert_eq!(setting(None, &[]), (true, "prefix_cache     true  [default]".to_string()));
+        let (off, line) = setting(Some("prefix_cache = false"), &[]);
+        assert!(!off && line.starts_with("prefix_cache     false  [config "), "{line}");
+        assert!(setting(Some("prefix_cache = true"), &[]).0);
+        let (off, line) = setting(None, &["--no-prefix-cache"]);
+        assert!(!off && line.ends_with("[option --no-prefix-cache]"), "{line}");
+        assert!(!setting(Some("prefix_cache = true"), &["--no-prefix-cache"]).0);
+        // (it is not a key the file may spell the other way round)
+        let path = model.join("wrong.toml");
+        std::fs::write(&path, format!("model = {:?}
+no_prefix_cache = true
+", model.display())).unwrap();
+        let matches = command().try_get_matches_from(["-m", model.to_str().unwrap()]).unwrap();
+        assert!(load(&matches, Some(&path)).is_err());
         std::fs::remove_dir_all(model).unwrap();
     }
 
