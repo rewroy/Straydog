@@ -713,10 +713,12 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                 eprintln!("Straydog cannot warm up: {message}");
             }
         }
-        behind::lock_behind(&weak, |engine: &Engine| engine.requests, job,
+        behind::lock_behind(&weak, |engine: &Engine| engine.requests, behind::YIELDING, job,
+            |job| job.remaining() > 0,
             |job| {
                 // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
-                let next = unsafe { job.lock_next() }?;
+                // (the turn works at a lower priority, on fewer cores: a request that generates meanwhile needs them)
+                let next = unsafe { job.lock_next_behind() }?;
                 Some(match next {
                     Ok(locked) => {
                         let (layer, bytes) = (locked.layer, locked.bytes);
@@ -737,8 +739,11 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                 let (after, gib) = (ready_at.elapsed().as_secs_f64(), locking.bytes as f64 / (1u64 << 30) as f64);
                 let ran = if locking.requests == 0 { "no request ran meanwhile".to_string() } else { format!("{} request(s) ran meanwhile", locking.requests) };
                 let stopped = locking.stopped.as_ref().map(|why| format!(", stopped because {why}")).unwrap_or_default();
+                // (the turns wait for a request that has the engine: how long in all, and whether a wait reached the guard's time)
+                let guard = if locking.guard_fired { "fired" } else { "did not fire" };
+                let waited = format!("waited {:.1} s for requests, the {} s guard {guard}", locking.waited.as_secs_f64(), behind::YIELDING.at_most.as_secs());
                 if locking.layers > 0 || locking.stopped.is_some() {
-                    eprintln!("Straydog host banks locked behind ready: {} layers, {gib:.1} GiB, in {:.1} s, {after:.1} s after ready; {ran}{stopped}",
+                    eprintln!("Straydog host banks locked behind ready: {} layers, {gib:.1} GiB, in {:.1} s, {after:.1} s after ready; {ran}; {waited}{stopped}",
                               locking.layers, locking.seconds);
                 }
             });

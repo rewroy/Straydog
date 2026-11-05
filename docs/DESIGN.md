@@ -172,13 +172,21 @@ The engine is built in layers:
     (a locked page cannot change under the check; an unlocked bank's pages may be read from the drive again after the load verified them), and
     a layer that cannot be locked ends the locking where it is, its reason in the log, the layers before it kept. Only then does it take the
     engine's lock, for the moment it takes to register the layers it has locked with the device and map their banks for the GPU's assist (the
-    one way the GPU reads a bank in place). A request is never waited for and never waits for a layer's turn: the turns go on whoever has the
-    engine, and the layers locked meanwhile are registered together at the first moment the engine is free, or when the last is locked, which
-    waits for a request that has it (a locking that waited for the engine to be idle never finished under requests that follow one another). A layer
+    one way the GPU reads a bank in place). A request never waits for a layer's turn, and a turn is not begun while a request has the engine: the
+    reads, the hashing and the registration take the cores and the memory bandwidth that a generating request's CPU experts need (on the Linux
+    machine, 17.6 s of locking while a request generated took it from 47.6 to 29.8 tok/s, its CPU from 9.7 to 17.9 ms a token). So before each
+    turn the thread looks every 5 ms for a request that has the engine, and waits while there is one, for 20 s at the most since its last layer;
+    after that it takes the turn as it did before it waited at all. The gap between the requests of an agent (a tool runs) holds a turn, so the wait
+    is for the engine to be free, not idle (a locking that waited for the engine to be idle never finished under requests that follow one another).
+    A turn that has begun is not stopped. The thread and the threads that check the banks work at a lower priority (Windows: the thread's
+    background mode, for the turn only; Linux: nice 19 and the idle I/O class, kept), and the check uses at most a quarter of the cores (one at
+    least) where the load's check uses all. The layers locked while a request had the engine are registered together at the first moment the
+    engine is free after a turn, or when the last is locked, which waits for a request that has it. A layer
     whose bytes do not match the tree is unlocked, never registered, and every later request fails with the error. The assist and its
     tuner turn on with the first layer, take each one as it comes (the layers' captured graphs are dropped and made again), and time their levels
     anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
-    after ready, whether a request ran meanwhile, and why it stopped if it did.
+    after ready, whether a request ran meanwhile, how long the turns waited for requests in all and whether the 20 s guard fired, and why it
+    stopped if it did.
 - **Warm-up.** Every two minutes after requests, and at shutdown (also when no request came but
   the worker was handed a state to warm up with), the runtime asks the worker
   which experts its stores hold, least recently used first, and keeps the list in the data
