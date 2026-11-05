@@ -1045,9 +1045,10 @@ impl Model {
 
     /// The first step of a warm start of a partially resident model from an earlier run's counts, before its first request: the scores the slots are ranked
     /// by are set from them (so that the slots fill with the experts used most, and a request's own routes then weigh in on top), and the bank pages of the
-    /// next likeliest experts, those after the first as many as there are slots and of layers that are not page-locked, are planned for the OS, as far as the
-    /// physical memory available allows less [`crate::host::left_free`]. The slots fill by [`Model::warm_fill`] and the pages are asked for by
-    /// [`crate::host::prefetch`], both in the background.
+    /// likeliest experts of layers that are not page-locked are planned for the OS, as far as the physical memory available allows less
+    /// [`crate::host::left_free`]. The slots fill by [`Model::warm_fill`] and the pages are asked for by [`crate::host::prefetch`], both in the background.
+    /// The pages begin at the likeliest expert, those the slots will take too: a slot is copied from its bank's pages, and a prompt streams every expert
+    /// the slots do not hold yet, so the likeliest are the first that are read, by the fill or the prompt, whichever comes first.
     pub fn warm_start(&mut self, prior: &Routes) -> Result<WarmStart> {
         if !self.partial {
             return Err("a model that holds all its experts has no slots to warm up".into());
@@ -1073,7 +1074,7 @@ impl Model {
         };
         let memory = self.weights.host_memory_bytes;
         let budget = crate::host::within_free(u64::MAX, 0, crate::host::available_bytes(), memory);
-        let hints = routes::plan_hints(&prior.ranked(), slots as usize, budget, &banks);
+        let hints = routes::plan_hints(&prior.ranked(), 0, budget, &banks);
         Ok(WarmStart { slots, held, swapped: self.group.swapped_experts()?, hints })
     }
 

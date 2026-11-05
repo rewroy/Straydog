@@ -193,16 +193,28 @@ The engine is built in layers:
     - The scores a layer's experts are ranked by (the moving average of its routes) are set to what
       it comes to at the counted rate (`sd_hybrid_seed`), so a request's own rebalance already ranks
       with them, over the start-up's leftovers; a prompt of a few dozen tokens then moves little.
-    - The OS is asked for the bank pages of the likeliest experts after the first as many as there
-      are slots, of layers that are not page-locked, up to the physical memory available less
-      `host::left_free`, in requests of 512 MiB with each request's ranges joined and in address
-      order (`host::prefetch`: `PrefetchVirtualMemory` on Windows, `madvise(WILLNEED)` in 128 KiB
-      steps on Linux). Nothing is locked and no commit is taken: the pages wait in memory for a soft
-      fault.
+    - The OS is asked for the bank pages of the likeliest experts of layers that are not
+      page-locked, up to the physical memory available less `host::left_free`, in requests of
+      512 MiB with each request's ranges joined and in address order (`host::prefetch`:
+      `PrefetchVirtualMemory` on Windows, `madvise(WILLNEED)` in 128 KiB steps on Linux). It begins
+      at the likeliest expert, the slots' too: a slot is copied from its bank's pages, and a
+      prompt streams every expert the slots do not hold yet. Nothing is locked and no commit is
+      taken: the pages wait in memory (Windows' standby list, outside the working set) for a soft
+      fault, which the page-fault count of a request still counts.
     - The slots fill, 64 swaps a step under the engine's lock with a pause between, by the same
       rebalance a request's own uses, until they hold what the scores want. A request that begins
       ends it: its routes and its own rebalance take the slots from there.
     - One line in the log: slots filled, MB asked of the OS, seconds.
+  - **What it gains** (Qwen3.8 UD-IQ1_M on an RTX 5070 Ti with 61.6 GiB, no bank page-locked as the
+    commit left allowed none, the OS's file cache pushed out before each start, a state from an
+    earlier run of the same three questions, one run each): the first reply asked 12 s after ready
+    took its first token in 2.8 s against 4.0, prefilled 36.9 tok/s against 26.1 and decoded 38.5
+    against 34.8; the warm start took 1.8 s (3339 slots, 2762 swapped in; 12.2 GB asked of the OS).
+    Asked within a second of ready, the first reply gains little (34.6 tok/s against 32.1-34.8, the
+    first token at 4.06 s as without): its prompt streams 8,400 experts, about 11 GB, from the drive
+    at the drive's speed, the same pages the hints read. A request's page-fault count does not
+    fall with the hints: a page the OS read ahead is a soft fault at its first touch, and the
+    count has those too.
 
 ### 4.2 Row tables
 

@@ -208,6 +208,8 @@ impl Served for Engine {
 /// compute thread waiting), and the pause between steps that lets a request take the engine.
 const WARM_SWAPS: u64 = 64;
 const WARM_PAUSE: Duration = Duration::from_millis(2);
+/// How long a step waits for the engine before it takes it to be a request's.
+const WARM_PATIENCE: Duration = Duration::from_millis(100);
 /// The longest the slot fill goes on: it ends when the slots hold what the scores want, well within this.
 const WARM_LONGEST: Duration = Duration::from_secs(120);
 
@@ -240,14 +242,23 @@ enum Filled {
 
 /// Step `step` under the engine's lock (it says whether more is wanted), pausing between steps so that a request takes the lock, until it has nothing
 /// more to do, the engine's request count moves from `began`, `longest` passes, or the engine is gone. The lock is only held in steps, and a request
-/// that has it ends the fill: it is the request's slots by then.
+/// that has it ends the fill: it is the request's slots by then, so a lock held for `patience` (a step is milliseconds) is a request's, and the fill is over
+/// without waiting for the request to end.
 fn fill_slots<S>(engine: &Weak<Mutex<S>>, began: u64, requests: impl Fn(&S) -> u64, mut step: impl FnMut(&mut S) -> Result<bool, String>,
-                 pause: Duration, longest: Duration) -> Filled {
+                 pause: Duration, patience: Duration, longest: Duration) -> Filled {
     let started = Instant::now();
     loop {
         let Some(alive) = engine.upgrade() else { return Filled::Gone };
         {
-            let Ok(mut guard) = alive.lock() else { return Filled::Gone };
+            let asked = Instant::now();
+            let mut guard = loop {
+                match alive.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Filled::Gone,
+                    Err(std::sync::TryLockError::WouldBlock) if asked.elapsed() >= patience => return Filled::CutShort,
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            };
             if requests(&guard) != began {
                 return Filled::CutShort;
             }
@@ -288,7 +299,7 @@ fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, beg
             let step = engine.model.warm_fill(WARM_SWAPS)?;
             fill = Some(step);
             Ok(step.pending > 0)
-        }, WARM_PAUSE, WARM_LONGEST);
+        }, WARM_PAUSE, WARM_PATIENCE, WARM_LONGEST);
         let (asked, refused, asking) = asking.join().unwrap_or_else(|_| (0, Some("its thread failed".to_string()), began.elapsed()));
         (asked, refused, asking, filled)
     });
@@ -964,7 +975,7 @@ mod tests {
             slots.wanted = slots.wanted.saturating_sub(1);
             after(slots);
             Ok(slots.wanted > 0)
-        }, Duration::ZERO, longest)
+        }, Duration::ZERO, Duration::from_millis(100), longest)
     }
 
     /// Decides: the fill steps until the slots want nothing more, and a model that wants none is not stepped twice.
@@ -990,7 +1001,7 @@ mod tests {
         assert_eq!(engine.lock().unwrap().steps, 3, "the steps before it stand, none after");
         let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: 50, steps: 0 }));
         let failed = fill_slots(&Arc::downgrade(&engine), 0, |slots: &Slots| slots.requests, |_: &mut Slots| Err("the device said no".to_string()),
-                                Duration::ZERO, Duration::from_secs(30));
+                                Duration::ZERO, Duration::from_millis(100), Duration::from_secs(30));
         assert_eq!(failed, Filled::Failed("the device said no".into()));
         let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: u64::MAX, steps: 0 }));
         assert_eq!(fill(&engine, Duration::from_millis(20), |_| std::thread::sleep(Duration::from_millis(5))), Filled::Done);
@@ -998,7 +1009,8 @@ mod tests {
         assert!((1..100).contains(&steps), "{steps} steps in 20 ms");
         let weak = Arc::downgrade(&engine);
         drop(engine);
-        assert_eq!(fill_slots(&weak, 0, |slots: &Slots| slots.requests, |_: &mut Slots| Ok(true), Duration::ZERO, Duration::from_secs(30)), Filled::Gone);
+        assert_eq!(fill_slots(&weak, 0, |slots: &Slots| slots.requests, |_: &mut Slots| Ok(true), Duration::ZERO, Duration::from_millis(100),
+                              Duration::from_secs(30)), Filled::Gone);
     }
 
     /// Decides: a request that comes while the fill steps takes the engine between two of them (the fill holds it for a step at a time) and ends the fill.
@@ -1011,7 +1023,7 @@ mod tests {
                 slots.steps += 1;
                 std::thread::sleep(Duration::from_millis(2));
                 Ok(true)
-            }, Duration::from_millis(1), Duration::from_secs(60)))
+            }, Duration::from_millis(1), Duration::from_millis(100), Duration::from_secs(60)))
         };
         std::thread::sleep(Duration::from_millis(50));
         let waited = Instant::now();
@@ -1023,6 +1035,19 @@ mod tests {
         assert_eq!(filling.join().unwrap(), Filled::CutShort);
         assert!(waited < Duration::from_secs(2), "the request waited {waited:?} for the engine");
         assert!(engine.lock().unwrap().steps >= 1);
+    }
+
+    /// Decides: a request that holds the engine (for seconds, as one does) ends the fill after the patience it was given, not when the request ends.
+    #[test]
+    fn a_request_that_keeps_the_engine_ends_the_fill_without_waiting_for_it() {
+        let engine = Arc::new(Mutex::new(Slots { requests: 0, wanted: u64::MAX, steps: 0 }));
+        let held = engine.lock().unwrap();
+        let waited = Instant::now();
+        let filled = fill_slots(&Arc::downgrade(&engine), 0, |slots: &Slots| slots.requests, |_: &mut Slots| Ok(true), Duration::ZERO,
+                                Duration::from_millis(50), Duration::from_secs(60));
+        assert_eq!(filled, Filled::CutShort);
+        assert!(waited.elapsed() < Duration::from_secs(2), "{:?}", waited.elapsed());
+        drop(held);
     }
 
     #[test]
