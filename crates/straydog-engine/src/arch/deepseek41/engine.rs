@@ -417,10 +417,13 @@ struct Shard {
     tap: Option<Buffer>,
 }
 
-/// VRAM a device keeps a prompt pass's FP16 attention weights in (Backend::keep_expansions), for its
-/// batches after a layer's first (ATTENTION_ROWS): a layer's on two GPUs take ~170 MB. Expanded for
-/// every batch, they held a GPU ~0.23 s of an agent's 1.6K-token turn (2.9 s).
-pub const EXPANSIONS: u64 = 192 << 20;
+/// VRAM a device keeps for the FP16 weights of one prompt-pass layer, reused by that layer's later
+/// batches ([`Backend::keep_expansions`]). On DeepSeek-V4.1-Flash with two devices, one layer of
+/// dense products (attention, indexer, compressor, router and the shared expert) is at most 187 MiB.
+/// `engram_kv` is 300 MiB, so a ring that holds only the layer refuses it and every attention batch
+/// expands it again. 512 MiB holds `engram_kv` and that layer together (about 496 MiB at the fullest
+/// layer); the next layer starts over the ring.
+pub const EXPANSIONS: u64 = 512 << 20;
 /// Passes of a width before its layers' graphs start to be recorded, one layer a pass.
 const GRAPHS_AFTER: usize = 64;
 
