@@ -2364,7 +2364,8 @@ impl CpuExperts {
         Ok(())
     }
 
-    /// The kernels the engine took: avx512-int8 (8-bit activations, integer products), avx512-f32, avx2-fma or scalar.
+    /// The kernels the engine took: avx512-vnni-int8 or avx512-int8 (8-bit activations, integer products; with VNNI's dot
+    /// instructions or without), avx2-vnni-int8 or avx2-int8, avx512-f32, avx2-fma or scalar.
     pub fn isa(&self) -> String {
         // SAFETY: a live engine; the name is a static string.
         unsafe { std::ffi::CStr::from_ptr(ffi::sd_cpu_experts_isa(self.handle)) }.to_string_lossy().into_owned()
