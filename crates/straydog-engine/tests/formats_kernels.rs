@@ -197,8 +197,8 @@ fn cpu_rows_int8(kind: u32, level: i32, rows: &[u8], count: usize, x: &[f32]) ->
 }
 
 /// The integer CPU path (gpu/cpu_int8.hpp) on the formats it has kernels for, at Qwen3.8's expert shapes: x rounded to 8-bit integers a
-/// block (256 values for gate and up, 64 for Q2_0's down), the products summed exactly in integers. The AVX-512 kernels equal the scalar ones
-/// bit for bit. Against F64 sums of the decoded rows with x itself, the error is x's rounding (at most half a block's step a value, times
+/// block (256 values for gate and up, 64 for Q2_0's down), the products summed exactly in integers. The AVX-512 kernels, with GFNI
+/// and without, equal the scalar ones bit for bit. Against F64 sums of the decoded rows with x itself, the error is x's rounding (at most half a block's step a value, times
 /// the row's weights) and a few F32 roundings a block.
 #[test]
 fn cpu_integer_rows_equal_their_scalar_kernels_and_err_by_the_rounding_of_x_alone() {
@@ -213,7 +213,7 @@ fn cpu_integer_rows_equal_their_scalar_kernels_and_err_by_the_rounding_of_x_alon
         let weights = decode(kind, &data);
         let x: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
         let scalar = cpu_rows_int8(kind, 0, &data, rows, &x).unwrap();
-        for level in [(2, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
+        for level in [(2, avx512), (3, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
             let wide = cpu_rows_int8(kind, level, &data, rows, &x).unwrap();
             assert_eq!(wide.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                        "kind {kind} level {level}");

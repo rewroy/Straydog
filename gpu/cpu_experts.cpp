@@ -139,11 +139,13 @@ bool cpu_has(const char* feature) {
     const bool ymm = (xcr0 & 6) == 6, zmm = (xcr0 & 0xE6) == 0xE6;
     if (!std::strcmp(feature, "avx512")) return f && bw && f16c && zmm;
     if (!std::strcmp(feature, "avx512vbmi")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 1)) && zmm; }
+    if (!std::strcmp(feature, "gfni")) { int leaf[4]; __cpuidex(leaf, 7, 0); return (leaf[2] & (1 << 8)) && zmm; }
     return avx2 && fma && f16c && ymm;
 #else
     __builtin_cpu_init();
     if (!std::strcmp(feature, "avx512")) return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("f16c");
     if (!std::strcmp(feature, "avx512vbmi")) return __builtin_cpu_supports("avx512vbmi");
+    if (!std::strcmp(feature, "gfni")) return __builtin_cpu_supports("gfni");
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
 }
@@ -809,12 +811,14 @@ int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out) {
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 // Test hook: count rows (stride bytes apart) of one format against x through the integer path (x rounded as the engine rounds it):
-// the scalar kernels at level 0, AVX-512 (with VBMI) at 2. An error for a format without integer kernels or a level not here.
+// the scalar kernels at level 0, AVX-512 (with VBMI) at 2, and at 3 without GFNI. An error for a format without integer kernels or a
+// level not here.
 int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out) {
     try {
         if (!row || !x || !out || !count || !cols) throw std::runtime_error("invalid Straydog integer rows");
 #ifdef SD_X86
-        if (level == 1 || (level == 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi")))) throw std::runtime_error("no such integer kernels here");
+        if (level == 1 || level > 3 || (level >= 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi"))))
+            throw std::runtime_error("no such integer kernels here");
 #endif
         if (GateKernel gate = gate_int_kernel(kind, level)) {
             if (cols % 256) throw std::runtime_error("invalid Straydog integer rows");

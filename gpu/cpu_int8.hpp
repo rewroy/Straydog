@@ -280,6 +280,9 @@ inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p
     const __m512i scales = _mm512_permutexvar_epi16(_mm512_load_si512(chunk_groups[c]), _mm512_load_si512(p.scale));
     return _mm512_add_epi32(lanes, _mm512_madd_epi16(_mm512_maddubs_epi16(weights, signed_q), scales));
 }
+// A block's integer lanes times its F32 scale, added to the row's F32 lanes.
+SD_TARGET("avx512f,avx512bw,avx2")
+inline __m512 scaled_lanes(__m512i lanes, float scale, __m512 acc) { return _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes), _mm512_set1_ps(scale), acc); }
 template<int kind, int N>
 SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,f16c")
 void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blocks, float* out) {
@@ -289,8 +292,9 @@ void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
     const uint16_t* codes = kind == 16 ? iq2_xxs_codes() : nullptr;
     CodeTable table;
     if (codes) for (int k = 0; k < 8; ++k) table.part[k] = _mm512_loadu_si512(codes + 32 * k);
-    __m512 acc[N];
-    for (int r = 0; r < N; ++r) acc[r] = _mm512_setzero_ps();
+    // (the accumulators are separate locals, not arrays: GCC kept an array of them in memory, four 512-bit stores every block, and
+    // cl.exe does the same: rows512)
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     IntPrepared prepared[N];
     for (size_t b = 0; b < blocks; ++b) {
         prefetch_next<bytes, N>(row, stride, b);
@@ -299,48 +303,66 @@ void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
             if constexpr (kind == 16) prepare_iq2_xxs(block, prepared[r], low, high, codes ? &table : nullptr);
             else prepare_iq2_s(block, prepared[r]);
         }
-        __m512i lanes[N];
-        for (int r = 0; r < N; ++r) lanes[r] = _mm512_setzero_si512();
+        __m512i lanes0 = _mm512_setzero_si512(), lanes1 = lanes0, lanes2 = lanes0, lanes3 = lanes0;
         for (unsigned c = 0; c < 4; ++c) {
             const __m512i q = _mm512_load_si512(x[b].q + 64 * c);
-            for (int r = 0; r < N; ++r) lanes[r] = chunk_lanes(grid, codes != nullptr, prepared[r], c, q, lanes[r]);
+            lanes0 = chunk_lanes(grid, codes != nullptr, prepared[0], c, q, lanes0);
+            if constexpr (N > 1) lanes1 = chunk_lanes(grid, codes != nullptr, prepared[1], c, q, lanes1);
+            if constexpr (N > 2) lanes2 = chunk_lanes(grid, codes != nullptr, prepared[2], c, q, lanes2);
+            if constexpr (N > 3) lanes3 = chunk_lanes(grid, codes != nullptr, prepared[3], c, q, lanes3);
         }
-        for (int r = 0; r < N; ++r) {
-            const float scale = half_f16c(row + size_t(r) * stride + b * bytes) * x[b].d * 0.125f;
-            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes[r]), _mm512_set1_ps(scale), acc[r]);
-        }
+        const float d = x[b].d * 0.125f;
+        const uint8_t* block = row + b * bytes;
+        acc0 = scaled_lanes(lanes0, half_f16c(block) * d, acc0);
+        if constexpr (N > 1) acc1 = scaled_lanes(lanes1, half_f16c(block + stride) * d, acc1);
+        if constexpr (N > 2) acc2 = scaled_lanes(lanes2, half_f16c(block + 2 * stride) * d, acc2);
+        if constexpr (N > 3) acc3 = scaled_lanes(lanes3, half_f16c(block + 3 * stride) * d, acc3);
     }
-    for (int r = 0; r < N; ++r) {
-        alignas(64) float lane[16];
-        _mm512_store_ps(lane, acc[r]);
-        out[r] = reduce16(lane);
+    out[0] = total512(acc0);
+    if constexpr (N > 1) out[1] = total512(acc1);
+    if constexpr (N > 2) out[2] = total512(acc2);
+    if constexpr (N > 3) out[3] = total512(acc3);
+}
+// Q2_0's 2-bit codes, each 128 bits m = 0..3 taking bits 2m and 2m + 1 of the block's 16 code bytes: a 16-bit variable shift and a
+// mask, or (GFNI) one affine transform whose matrix in each 64 bits moves those two bits down (3 uops on Intel against 1).
+template<bool gfni>
+SD_TARGET("avx512f,avx512bw,gfni")
+inline __m512i q2_int_codes(const uint8_t* block) {
+    const __m512i bytes = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2)));
+    if constexpr (gfni) {
+        // (row 7 - i of a byte's matrix picks its output bit i: bit 0 <- bit 2m, bit 1 <- bit 2m + 1)
+        const __m512i matrix = _mm512_setr_epi64(0x0102000000000000, 0x0102000000000000, 0x0408000000000000, 0x0408000000000000,
+                                                 0x1020000000000000, 0x1020000000000000, 0x4080000000000000, 0x4080000000000000);
+        return _mm512_gf2p8affine_epi64_epi8(bytes, matrix, 0);
+    } else {
+        const __m512i shifts = _mm512_setr_epi64(0, 0, 0x0002000200020002, 0x0002000200020002, 0x0004000400040004, 0x0004000400040004,
+                                                 0x0006000600060006, 0x0006000600060006);
+        return _mm512_and_si512(_mm512_srlv_epi16(bytes, shifts), _mm512_set1_epi8(3));
     }
 }
-template<int N>
-SD_TARGET("avx512f,avx512bw,avx2,f16c")
+template<int N, bool gfni>
+SD_TARGET("avx512f,avx512bw,avx2,f16c,gfni")
 void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t blocks, float* out) {
-    // (each 128 bits m = 0..3 takes the codes shifted down by 2m)
-    const __m512i shifts = _mm512_setr_epi64(0, 0, 0x0002000200020002, 0x0002000200020002, 0x0004000400040004, 0x0004000400040004,
-                                             0x0006000600060006, 0x0006000600060006);
-    const __m512i three = _mm512_set1_epi8(3), ones = _mm512_set1_epi16(1);
-    __m512 acc[N];
-    for (int r = 0; r < N; ++r) acc[r] = _mm512_setzero_ps();
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
     for (size_t b = 0; b < blocks; ++b) {
         prefetch_next<18, N>(row, stride, b);
         const __m512i q = _mm512_load_si512(x[b].q);
         const __m512i bias = _mm512_load_si512(x[b].lanes);
-        for (int r = 0; r < N; ++r) {
-            const uint8_t* block = row + size_t(r) * stride + 18 * b;
-            const __m512i codes = _mm512_and_si512(_mm512_srlv_epi16(_mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 2))), shifts), three);
-            const __m512i lanes = _mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(codes, q), ones), bias);
-            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lanes), _mm512_set1_ps(half_f16c(block) * x[b].d), acc[r]);
-        }
+        const uint8_t* block = row + 18 * b;
+#define SD_Q2_INT(r, acc) \
+        acc = scaled_lanes(_mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(q2_int_codes<gfni>(block + (r) * stride), q), ones), bias), \
+                           half_f16c(block + (r) * stride) * x[b].d, acc);
+        SD_Q2_INT(0, acc0)
+        if constexpr (N > 1) { SD_Q2_INT(1, acc1) }
+        if constexpr (N > 2) { SD_Q2_INT(2, acc2) }
+        if constexpr (N > 3) { SD_Q2_INT(3, acc3) }
+#undef SD_Q2_INT
     }
-    for (int r = 0; r < N; ++r) {
-        alignas(64) float lane[16];
-        _mm512_store_ps(lane, acc[r]);
-        out[r] = reduce16(lane);
-    }
+    out[0] = total512(acc0);
+    if constexpr (N > 1) out[1] = total512(acc1);
+    if constexpr (N > 2) out[2] = total512(acc2);
+    if constexpr (N > 3) out[3] = total512(acc3);
 }
 // `count` rows four at a time, then the rest.
 template<typename Rows>
@@ -361,11 +383,15 @@ void iq2_s_int_avx512(const uint8_t* row, size_t stride, size_t count, const Q8K
     by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { iq2_int_rows512<22, decltype(n)::value>(rows, stride, x, blocks, o); });
 }
 void q2_0_int_avx512(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
-    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value>(rows, stride, x, blocks, o); });
+    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value, false>(rows, stride, x, blocks, o); });
+}
+void q2_0_int_gfni(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
+    by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value, true>(rows, stride, x, blocks, o); });
 }
 #endif
 
-// The integer row kernels of `kind` at `level` (2: AVX-512 with VBMI; else the scalar reference), or null where the format has none.
+// The integer row kernels of `kind` at `level` (2: AVX-512 with VBMI, and GFNI where the CPU has it; 3: the same without GFNI, for the
+// tests; else the scalar reference), or null where the format has none.
 using GateKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, size_t, float*);
 using DownKernel = void (*)(const uint8_t*, size_t, size_t, const Q8S*, size_t, float*);
 GateKernel gate_int_kernel(int kind, int level) {
@@ -382,7 +408,10 @@ GateKernel gate_int_kernel(int kind, int level) {
 }
 DownKernel down_int_kernel(int kind, int level) {
 #ifdef SD_X86
-    if (level >= 2 && kind == 42) return q2_0_int_avx512;
+    if (level >= 2 && kind == 42) {
+        static const bool gfni = cpu_has("gfni");
+        return level == 2 && gfni ? q2_0_int_gfni : q2_0_int_avx512;
+    }
 #endif
     (void)level;
     return kind == 42 ? q2_0_int_scalar : nullptr;
