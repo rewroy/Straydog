@@ -242,7 +242,12 @@ fn begin_warm_start(engine: &Arc<Mutex<Engine>>, state: &Value) -> Result<(), St
             None => return Ok(()),
         }
     };
-    let weak = Arc::downgrade(engine);
+    spawn_warm_start(&Arc::downgrade(engine), start, requests, began)
+}
+
+/// The background work of a warm start whose first step is done ([`Engine::warm_begin`]).
+fn spawn_warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, began: Instant) -> Result<(), String> {
+    let weak = engine.clone();
     std::thread::Builder::new().name("straydog-warm".into()).spawn(move || warm_start(&weak, start, requests, began))
         .map(drop).map_err(|exc| exc.to_string())
 }
@@ -666,9 +671,34 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
     let weak = Arc::downgrade(engine);
     let spawned = std::thread::Builder::new().name("straydog-behind".into()).spawn(move || {
         let began = Instant::now();
-        let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| warm_up(&mut engine.model, cancelled));
-        // (a warm start that was asked for meanwhile begins now, so that the layers it counts the host's routes of are locked first)
-        let pending = behind::warm_up_over();
+        // What is made of the engine while it is in hand: a warm start asked for meanwhile begins, so that the layers it counts the host's routes of
+        // are locked first, and the locking is planned. Both are done under the lock the warm-up holds, so that no request takes the engine first
+        // and the locking, which a request would otherwise keep waiting for the plan, begins as soon as the warm-up ends.
+        let plan = |engine: &mut Engine, state: Option<Value>| {
+            let started = state.and_then(|state| match engine.warm_begin(&state) {
+                Ok(start) => start.map(|start| (start, engine.requests)),
+                Err(message) => {
+                    eprintln!("Straydog cannot warm up: {message}");
+                    None
+                }
+            });
+            (started, engine.model.bank_locks(engine.earlier.as_ref()).map(|job| (job, engine.requests)))
+        };
+        let mut planned = (None, None);
+        let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| {
+            let result = warm_up(&mut engine.model, cancelled);
+            planned = plan(engine, behind::warm_up_over());
+            result
+        });
+        if outcome == behind::WarmedUp::Skipped {
+            // (a request had the engine first, and is waited for: the plan is made when it lets go)
+            let state = behind::warm_up_over();
+            if let Some(alive) = weak.upgrade() {
+                if let Ok(mut engine) = alive.lock() {
+                    planned = plan(&mut engine, state);
+                }
+            }
+        }
         let (seconds, after) = (began.elapsed().as_secs_f64(), ready_at.elapsed().as_secs_f64());
         match &outcome {
             behind::WarmedUp::Done => eprintln!("Straydog warm-up: done in {seconds:.1} s, {after:.1} s after ready"),
@@ -677,13 +707,13 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
             behind::WarmedUp::Failed(message) => eprintln!("WARN Straydog warm-up failed after {seconds:.1} s: {message}"),
             behind::WarmedUp::Gone => return,
         }
-        if let (Some(state), Some(engine)) = (pending, weak.upgrade()) {
-            if let Err(message) = begin_warm_start(&engine, &state) {
+        let (started, job) = planned;
+        if let Some((start, requests)) = started {
+            if let Err(message) = spawn_warm_start(&weak, start, requests, Instant::now()) {
                 eprintln!("Straydog cannot warm up: {message}");
             }
         }
-        let locking = behind::lock_behind(&weak, |engine: &Engine| engine.requests,
-            |engine: &mut Engine| engine.model.bank_locks(engine.earlier.as_ref()),
+        behind::lock_behind(&weak, |engine: &Engine| engine.requests, job,
             |job| {
                 // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
                 let next = unsafe { job.lock_next() }?;
@@ -712,7 +742,6 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                               locking.layers, locking.seconds);
                 }
             });
-        let _ = locking;
     });
     if let Err(error) = spawned {
         behind::warm_up_over();
