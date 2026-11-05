@@ -164,8 +164,10 @@ The engine is built in layers:
     from the last layer. A layer's turn holds nothing of the engine: it page-locks the three banks, then checks them against the file's tree
     (a locked page cannot change under the check; an unlocked bank's pages may be read from the drive again after the load verified them), and
     a layer that cannot be locked ends the locking where it is, its reason in the log, the layers before it kept. Only then does it take the
-    engine's lock, for the moment it takes to register the layer's locks with the device and map its banks for the GPU's assist (the one way
-    the GPU reads a bank in place), where a request that has the engine is waited for; between layers it waits until no request has it. A layer
+    engine's lock, for the moment it takes to register the layers it has locked with the device and map their banks for the GPU's assist (the
+    one way the GPU reads a bank in place). A request is never waited for and never waits for a layer's turn: the turns go on whoever has the
+    engine, and the layers locked meanwhile are registered together at the first moment the engine is free, or when the last is locked, which
+    waits for a request that has it (a locking that waited for the engine to be idle never finished under requests that follow one another). A layer
     whose bytes do not match the tree is unlocked, never registered, and every later request fails with the error. The assist and its
     tuner turn on with the first layer, take each one as it comes (the layers' captured graphs are dropped and made again), and time their levels
     anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
