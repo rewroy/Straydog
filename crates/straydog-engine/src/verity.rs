@@ -102,6 +102,9 @@ pub fn build(file: &File, tree: &Path, progress: &(dyn Fn(u64) + Sync)) -> std::
     // Level 0 goes to the tree file as it is made; the hashes of its blocks stay in memory
     // (1/128 of level 0) to build the levels above.
     let blocks = size.div_ceil(BLOCK as u64);
+    // (the threads below read the file at once: through a handle that lets them)
+    let concurrent = crate::storage::concurrent(file);
+    let file = concurrent.as_ref().unwrap_or(file);
     let level0_blocks = geometry.levels[0];
     let mut parents = vec![[0u8; 32]; level0_blocks as usize];
     let next = AtomicU64::new(0);
@@ -166,10 +169,7 @@ pub fn build(file: &File, tree: &Path, progress: &(dyn Fn(u64) + Sync)) -> std::
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     let mut done = 0;
     while done < buffer.len() {
-        #[cfg(unix)]
-        let count = std::os::unix::fs::FileExt::read_at(file, &mut buffer[done..], offset + done as u64)?;
-        #[cfg(windows)]
-        let count = std::os::windows::fs::FileExt::seek_read(file, &mut buffer[done..], offset + done as u64)?;
+        let count = crate::storage::read_partial(file, &mut buffer[done..], offset + done as u64)?;
         if count == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its tree"));
         }
@@ -425,6 +425,8 @@ impl Verifier {
         }
         let level0 = expected;
         let capacity = (cache_bytes / BLOCK).max(1);
+        // (verifications on many threads read its blocks at once)
+        let tree = crate::storage::concurrent(&tree).unwrap_or(tree);
         Ok(Verifier {
             geometry, tree, digest: *digest, level0,
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),

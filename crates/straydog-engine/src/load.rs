@@ -52,6 +52,8 @@ type Range = (u64, u64, Target);
 struct Source<'a> {
     name: &'a str,
     file: &'a File,
+    /// A handle for the workers' reads through the page cache, which run at once (`storage::concurrent`; `file` where it is None).
+    concurrent: Option<File>,
     direct: Option<File>,
     map: &'a [u8],
     digests: &'a [String],
@@ -64,6 +66,13 @@ struct Source<'a> {
 
 // The targets' uploads hold device addresses the fillers copy to; nothing dereferences them here.
 unsafe impl Sync for Source<'_> {}
+
+impl Source<'_> {
+    /// The handle to read through the page cache with.
+    fn reader(&self) -> &File {
+        self.concurrent.as_ref().unwrap_or(self.file)
+    }
+}
 
 /// Authenticate every chunk of the weights' files, filling the pending uploads (one list per
 /// device of `group`) and keeping host copies of the tensors in `keep` that no upload holds
@@ -258,7 +267,7 @@ pub fn verify_file(name: &str, file: &File, digests: &[String]) -> Result<(), St
         return Err(format!("Straydog chunk digests do not match {name}"));
     }
     let direct = storage::direct(file);
-    let source = Source { name, file, direct, map: &map, digests, mapped: vec![false; chunks],
+    let source = Source { name, file, concurrent: storage::concurrent(file), direct, map: &map, digests, mapped: vec![false; chunks],
                           pieces: vec![Vec::new(); chunks], checked: None };
     let workers = std::thread::available_parallelism().map_or(4, |count| count.get()).min(chunks).max(1);
     stream(std::slice::from_ref(&source), (0..workers).map(|_| Host).collect(), &[], map.len() as u64, &|_, _, _| {})
@@ -303,7 +312,8 @@ fn sources<'a>(weights: &'a Weights, ranges: &[Vec<Range>]) -> Result<Vec<Source
             }
         }
         let direct = if bypass { storage::direct(file) } else { None };
-        sources.push(Source { name, file, direct, map, digests, mapped, pieces, checked: checked[index].map(|verifier| &**verifier) });
+        sources.push(Source { name, file, concurrent: storage::concurrent(file), direct, map, digests, mapped, pieces,
+                              checked: checked[index].map(|verifier| &**verifier) });
     }
     Ok(sources)
 }
@@ -345,7 +355,7 @@ fn stream<W: Worker>(sources: &[Source], workers: Vec<W>, copies: &[(String, Mut
                                 crate::digest::will_need(source.file, &[(base + at as u64, part as u64)]);
                                 for from in (0..part).step_by(CHECKED_SLOT) {
                                     let piece = (part - from).min(CHECKED_SLOT);
-                                    storage::read_into(source.file, base + (at + from) as u64, &mut slot, 0, piece, false)
+                                    storage::read_into(source.reader(), base + (at + from) as u64, &mut slot, 0, piece, false)
                                         .map_err(|error| format!("{}: {error}", source.name))?;
                                     count(piece as u64);
                                     let bytes = &slot.as_slice()[..piece];
@@ -401,7 +411,7 @@ fn read_chunk(source: &Source, chunk: usize, slot: &mut Buffer) -> Result<usize,
     let mut done = 0;
     while done < length {
         let part = if direct.is_some() { PIECE } else { CACHED_PIECE }.min(length - done);
-        storage::read_into(direct.unwrap_or(source.file), offset + done as u64, slot, done, part, direct.is_some())
+        storage::read_into(direct.unwrap_or(source.reader()), offset + done as u64, slot, done, part, direct.is_some())
             .map_err(|exc| format!("{}: {exc}", source.name))?;
         digest.update(&slot.as_slice()[done..done + part]);
         done += part;

@@ -145,6 +145,10 @@ The engine is built in layers:
   - A cached chunk is read from the page cache. When the files fit in three quarters of host
     memory, an uncached one is read through the page cache, so a restart finds it; otherwise it
     is read around it (direct reads).
+  - On Windows the I/O manager runs the reads issued on a synchronous handle one at a time, however many
+    threads issue them. The handles that threads read through at once (the direct ones, and a
+    second one per file for the page cache) are opened for overlapped I/O, and each read waits for
+    itself alone.
 - **A model read on demand** (DeepSeek-V4.1) opens its shards against their verity
   trees. The routed experts are not read whole at the start: the expert store fills from the
   files as tokens route to them, and the drive blocks they come from are checked against the
