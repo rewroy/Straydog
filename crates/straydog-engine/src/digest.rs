@@ -100,10 +100,7 @@ fn read_range(file: &File, offset: u64, length: u64, buffer: &mut [u8], sink: &m
     let mut done = 0;
     while done < length {
         let want = buffer.len().min((length - done) as usize);
-        #[cfg(unix)]
-        let count = std::os::unix::fs::FileExt::read_at(file, &mut buffer[..want], offset + done)?;
-        #[cfg(windows)]
-        let count = std::os::windows::fs::FileExt::seek_read(file, &mut buffer[..want], offset + done)?;
+        let count = crate::storage::read_partial(file, &mut buffer[..want], offset + done)?;
         if count == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its size"));
         }

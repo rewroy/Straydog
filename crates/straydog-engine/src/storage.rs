@@ -6,6 +6,13 @@
 //! Direct reads are DMA into the caller's buffer: no kernel copy and no cached pages
 //! evicting others, at the price of reading from the device again next time. Random row
 //! reads of a table larger than memory use the same handles (4 KiB-aligned offsets).
+//!
+//! On Windows the I/O manager runs the reads issued on a synchronous handle (one opened without
+//! `FILE_FLAG_OVERLAPPED`, which is what `File::open` makes) one at a time, however many threads
+//! issue them, and a duplicate of the handle (`try_clone`) is the same file object. So the handles
+//! that threads read at once through are opened for overlapped I/O ([`direct`], [`concurrent`]),
+//! and every positional read goes through [`read_partial`], which waits for its own read alone.
+//! Std's `seek_read` is not used on them: see [`read_partial`].
 
 use std::fs::File;
 use std::ptr::NonNull;
@@ -75,7 +82,9 @@ impl Drop for Buffer {
 
 /// A second handle on an open file whose reads bypass the page cache (O_DIRECT), reopened
 /// through /proc so that it is the same file, not whatever its path names now; None where
-/// unsupported.
+/// unsupported. On Windows it is opened for overlapped I/O (`FILE_FLAG_NO_BUFFERING |
+/// FILE_FLAG_OVERLAPPED`): read it only through this module's functions, from as many threads as
+/// there are reads to run at once.
 pub fn direct(file: &File) -> Option<File> {
     #[cfg(target_os = "linux")]
     {
@@ -91,21 +100,36 @@ pub fn direct(file: &File) -> Option<File> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::Storage::FileSystem::{ReOpenFile, FILE_FLAG_NO_BUFFERING, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
-        // SAFETY: a live handle; the result is a new handle on the same file, or invalid.
-        let handle = unsafe {
-            ReOpenFile(file.as_raw_handle() as _, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING)
-        };
-        // SAFETY: a handle this call owns.
-        (handle != INVALID_HANDLE_VALUE).then(|| unsafe { File::from_raw_handle(handle as _) })
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
+        overlapped::reopen(file, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = file;
         None
     }
+}
+
+/// A second handle on an open file for positional reads ([`read_at`], [`read_into`]) from many
+/// threads at once, through the page cache. On Windows, a handle opened for overlapped I/O, made
+/// once per file (None if the system refuses one); elsewhere None, as the file's own handle
+/// already reads concurrently. The file's own handle stays what maps it and does the rest.
+pub fn concurrent(file: &File) -> Option<File> {
+    #[cfg(windows)]
+    {
+        overlapped::reopen(file, windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// An owned handle on `file` for the positional reads of many threads: [`concurrent`]'s, or else a
+/// clone.
+pub fn reader(file: &File) -> std::io::Result<File> {
+    concurrent(file).map_or_else(|| file.try_clone(), Ok)
 }
 
 /// The fraction of a mapped range's pages in the page cache (0 where unknown).
@@ -166,14 +190,120 @@ pub fn read_into(file: &File, offset: u64, buffer: &mut Buffer, at: usize, len: 
 
 /// One read: at least a byte, or an error at the end of the file.
 fn read_some(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(unix)]
-    let count = std::os::unix::fs::FileExt::read_at(file, buffer, offset)?;
-    #[cfg(windows)]
-    let count = std::os::windows::fs::FileExt::seek_read(file, buffer, offset)?;
+    let count = read_partial(file, buffer, offset)?;
     if count == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its size"));
     }
     Ok(count)
+}
+
+/// One positional read of `file` at `offset`: the bytes it got (0 at the end of the file), without
+/// relying on the handle's position. This is the only way to read a handle of [`direct`] or
+/// [`concurrent`], and serves any other handle too (on a synchronous handle on Windows the reads
+/// still run one at a time).
+///
+/// On Windows it is `ReadFile` with an `OVERLAPPED` that holds the offset and an event of the
+/// calling thread's own, then a wait for that read alone (`GetOverlappedResult`). Std's `seek_read`
+/// cannot do this on an overlapped handle: it calls `NtReadFile` with a status block on its stack
+/// and no event, and when the read is pending waits on the file handle itself, which any read
+/// completing on the handle signals. With reads in flight on one handle it can return when another
+/// thread's read completes and then, finding its own still pending, aborts the process (or have
+/// left the kernel writing into a frame that is gone).
+pub fn read_partial(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+    }
+    #[cfg(windows)]
+    {
+        overlapped::read_at(file, buffer, offset)
+    }
+}
+
+#[cfg(windows)]
+mod overlapped {
+    use std::fs::File;
+    use std::io::{Error, Result};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{ReOpenFile, ReadFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+
+    /// The most one `ReadFile` takes, a whole number of blocks.
+    const MOST: usize = (u32::MAX as usize) & !(super::ALIGN - 1);
+
+    /// A new handle on the same file, read-only, opened with `flags`; None if the system refuses.
+    pub fn reopen(file: &File, flags: u32) -> Option<File> {
+        // SAFETY: a live handle; the result is a new handle on the same file, or invalid.
+        let handle = unsafe {
+            ReOpenFile(file.as_raw_handle() as _, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, flags)
+        };
+        // SAFETY: a handle this call owns.
+        (handle != INVALID_HANDLE_VALUE).then(|| unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    /// A manual-reset event of one thread, which waits on it for its own reads, one at a time.
+    struct Event(HANDLE);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: an event this thread created and nothing else uses.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    thread_local! {
+        /// The thread's event, or the error code of making it.
+        static EVENT: std::result::Result<Event, i32> = {
+            // SAFETY: no security attributes and no name: an event only this thread knows.
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() { Err(unsafe { GetLastError() } as i32) } else { Ok(Event(event)) }
+        };
+    }
+
+    /// One read of `buffer` at `offset`: the bytes got, 0 at the end of the file. It returns only
+    /// when the read has finished (the kernel writes into `buffer` and the `OVERLAPPED` until then).
+    pub fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        EVENT.with(|event| {
+            let event = event.as_ref().map_err(|&code| Error::from_raw_os_error(code))?;
+            // SAFETY: all zero is a valid OVERLAPPED (no event, offset 0).
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            overlapped.Anonymous.Anonymous.Offset = offset as u32;
+            overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+            overlapped.hEvent = event.0;
+            let handle = file.as_raw_handle() as HANDLE;
+            let mut count = 0u32;
+            // SAFETY: `buffer` and `overlapped` outlive the read: a pending read is waited for below, and
+            // nothing between the two can unwind.
+            let started = unsafe {
+                ReadFile(handle, buffer.as_mut_ptr().cast(), buffer.len().min(MOST) as u32, &mut count, &mut overlapped)
+            };
+            if started == 0 {
+                // SAFETY: reads the thread's last error.
+                match unsafe { GetLastError() } {
+                    ERROR_HANDLE_EOF => return Ok(0),
+                    ERROR_IO_PENDING => {
+                        // SAFETY: the read above is this OVERLAPPED's; waiting on it waits on its event alone.
+                        if unsafe { GetOverlappedResult(handle, &overlapped, &mut count, 1) } == 0 {
+                            // SAFETY: as above.
+                            return match unsafe { GetLastError() } {
+                                ERROR_HANDLE_EOF => Ok(0),
+                                code => Err(Error::from_raw_os_error(code as i32)),
+                            };
+                        }
+                    }
+                    code => return Err(Error::from_raw_os_error(code as i32)),
+                }
+            }
+            Ok(count as usize)
+        })
+    }
 }
 
 /// Start reading the pages under these ranges of a mapped file in the background: just their
@@ -201,6 +331,184 @@ pub fn read_ahead<'a>(ranges: impl Iterator<Item = &'a [u8]>) {
         if !entries.is_empty() {
             // SAFETY: entries describe pages of live mappings; prefetching only reads them in.
             unsafe { PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const THREADS: usize = 16;
+    const READS: usize = 300;
+
+    /// The byte at `index` of the test files: unlike a repeating pattern, a read from the wrong place shows.
+    fn byte(index: u64) -> u8 {
+        (index.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8
+    }
+
+    /// A xorshift generator, one per thread.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, limit: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % limit
+        }
+    }
+
+    /// A temporary file of `blocks` blocks and `tail` bytes more, byte `i` being `byte(i)`; removed with it.
+    struct Temp {
+        path: std::path::PathBuf,
+        file: File,
+        size: u64,
+    }
+
+    impl Temp {
+        fn new(blocks: u64, tail: u64) -> Temp {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("straydog-storage-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let size = blocks * ALIGN as u64 + tail;
+            let data: Vec<u8> = (0..size).map(byte).collect();
+            File::create(&path).unwrap().write_all(&data).unwrap();
+            Temp { file: File::open(&path).unwrap(), path, size }
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn assert_bytes(bytes: &[u8], start: u64) {
+        for (index, &found) in bytes.iter().enumerate() {
+            assert_eq!(found, byte(start + index as u64), "byte {index} of a read at {start}");
+        }
+    }
+
+    /// Every thread makes `READS` reads of random ranges of a file of `size` bytes with `read`, which is given the start and the length
+    /// and returns the bytes; whole blocks from a block boundary when `aligned`.
+    fn threads_read(size: u64, aligned: bool, read: &(dyn Fn(u64, usize) -> Vec<u8> + Sync)) {
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                scope.spawn(move || {
+                    let mut random = Random(thread as u64 * 7919 + 1);
+                    for _ in 0..READS {
+                        let (start, most) = if aligned {
+                            (random.below(size.div_ceil(ALIGN as u64)) * ALIGN as u64, 8 * ALIGN as u64)
+                        } else {
+                            (random.below(size), 100_000)
+                        };
+                        let mut len = (random.below(most) + 1).min(size - start) as usize;
+                        if aligned {
+                            len = len.next_multiple_of(ALIGN).min((size - start) as usize);
+                        }
+                        assert_bytes(&read(start, len), start);
+                    }
+                });
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn many_threads_read_random_blocks_through_one_direct_handle() {
+        // Eight MiB and a block cut short by the end of the file, which a read of it stops at.
+        let temp = Temp::new(2048, 1000);
+        let direct = direct(&temp.file).expect("a direct handle");
+        threads_read(temp.size, true, &|start, len| {
+            let mut buffer = Buffer::new(8 * ALIGN);
+            read_into(&direct, start, &mut buffer, 0, len, true).unwrap();
+            buffer.as_slice()[..len].to_vec()
+        });
+    }
+
+    #[test]
+    fn many_threads_read_random_ranges_through_every_kind_of_handle() {
+        let temp = Temp::new(300, 123);
+        let concurrent = reader(&temp.file).unwrap();
+        for file in [&temp.file, &concurrent] {
+            threads_read(temp.size, false, &|start, len| {
+                let mut bytes = vec![0u8; len];
+                read_at(file, start, &mut bytes).unwrap();
+                bytes
+            });
+        }
+    }
+
+    #[test]
+    fn a_read_at_the_end_of_the_file_gets_what_is_there_and_fails_as_before() {
+        let temp = Temp::new(2, 100);
+        let (concurrent, direct) = (concurrent(&temp.file), direct(&temp.file));
+        let mut handles = vec![(&temp.file, false)];
+        handles.extend(concurrent.iter().map(|file| (file, false)));
+        handles.extend(direct.iter().map(|file| (file, true)));
+        let mut block = Buffer::new(ALIGN);
+        let end = 2 * ALIGN as u64;
+        for (file, direct) in handles {
+            // Across the end: the bytes up to it. At it and past it: none.
+            assert_eq!(read_partial(file, block.as_mut_slice(), end).unwrap(), 100);
+            if !direct {
+                assert_eq!(read_partial(file, block.as_mut_slice(), end + 100).unwrap(), 0);
+            }
+            assert_eq!(read_partial(file, block.as_mut_slice(), end + ALIGN as u64).unwrap(), 0);
+            // `read_into` takes the short last block, and fails past the end as `read_at` does.
+            read_into(file, end, &mut block, 0, 100, direct).unwrap();
+            assert_bytes(&block.as_slice()[..100], end);
+            let error = read_into(file, end + ALIGN as u64, &mut block, 0, 100, direct).unwrap_err();
+            assert_eq!((error.kind(), error.to_string().as_str()), (std::io::ErrorKind::UnexpectedEof, "file shorter than its size"));
+        }
+        let mut bytes = vec![0u8; 200];
+        let error = read_at(&temp.file, end, &mut bytes).unwrap_err();
+        assert_eq!((error.kind(), error.to_string().as_str()), (std::io::ErrorKind::UnexpectedEof, "file shorter than its size"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_direct_read_must_be_aligned() {
+        let temp = Temp::new(2, 0);
+        let direct = direct(&temp.file).expect("a direct handle");
+        let mut block = Buffer::new(2 * ALIGN);
+        for (offset, at) in [(1, 0), (0, 1)] {
+            let error = read_into(&direct, offset, &mut block, at, ALIGN, true).unwrap_err();
+            assert_eq!(error.to_string(), "misaligned Straydog direct read");
+        }
+    }
+
+    /// Offsets past 4 GiB take their high half through `OVERLAPPED.OffsetHigh`: a sparse file with one block there.
+    #[cfg(windows)]
+    #[test]
+    fn reads_at_offsets_past_four_gib_get_their_bytes() {
+        use std::os::windows::fs::FileExt;
+        use std::os::windows::io::AsRawHandle;
+        let temp = Temp::new(0, 0);
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&temp.path).unwrap();
+        let mut returned = 0u32;
+        // SAFETY: a live handle; FSCTL_SET_SPARSE takes no buffers (without one it marks the whole file).
+        let sparse = unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(file.as_raw_handle() as _, 0x0009_00C4, std::ptr::null(), 0,
+                                                            std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut())
+        };
+        if sparse == 0 {
+            eprintln!("skipped: the temporary directory's file system has no sparse files");
+            return;
+        }
+        let start = (5u64 << 30) + ALIGN as u64;
+        file.set_len(start + 2 * ALIGN as u64).unwrap();
+        let data: Vec<u8> = (0..ALIGN as u64).map(|index| byte(start + index)).collect();
+        assert_eq!(file.seek_write(&data, start).unwrap(), ALIGN);
+        let mut block = Buffer::new(ALIGN);
+        for (handle, direct) in [(Some(File::open(&temp.path).unwrap()), false), (concurrent(&file), false), (direct(&file), true)]
+            .into_iter().filter_map(|(handle, direct)| handle.map(|handle| (handle, direct)))
+        {
+            block.as_mut_slice().fill(0);
+            read_into(&handle, start, &mut block, 0, ALIGN, direct).unwrap();
+            assert_bytes(block.as_slice(), start);
         }
     }
 }
