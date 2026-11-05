@@ -416,6 +416,7 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
         model_name: entry.id.model.to_string(),
         provider: entry.id.provider.to_string(),
         quant: entry.id.quant.to_string(),
+        engram: entry.table.clone(),
         model_draft,
         gpu: (gpus != [0]).then_some(gpus),
         ctx_size: (*context < DEFAULT_CONTEXT).then_some(*context as u32),

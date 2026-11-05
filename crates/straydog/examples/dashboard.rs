@@ -45,6 +45,7 @@ fn main() {
     let settings = Settings {
         model: PathBuf::from("/simulated").join(quant),
         bundle: straydog_engine::bundle::Id::find(Some(if deepseek() { straydog_engine::bundle::DEEPSEEK } else { straydog_engine::bundle::MODEL }), None, quant).unwrap(),
+        engram: None,
         model_draft,
         model_vision: None,
         draft_max,

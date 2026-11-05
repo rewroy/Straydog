@@ -115,14 +115,15 @@ Unsloth's bundles come first: `straydog setup` recommends from them before ISTA-
 Qwen3.8 bundles share their engram (PLE) table, the last shard of each: setup takes it from a bundle
 beside it rather than downloading it again.
 
-Unsloth's Qwen3.8 bundles read their engram table, 51.2 billion values read a few rows a token, at
-the most exact precision there is: their own last shard (IQ4_NL, 28.8 GB), or one of Unsloth's
-engram files, BF16 (102.4 GB, lossless), Q8_0 (54.4 GB) or Q5_1 (38.4 GB), in the bundle's folder or
-an `engram` folder beside it, which the model's bundles share. `straydog setup --engram Q8_0` fetches
-that file there instead of the bundle's own table shard; `STRAYDOG_ENGRAM=IQ4_NL` makes the server read
-a given one. On two R9700s the precision changes no speed; against BF16 over six prompts' greedy
-continuations (UD-IQ1_M), the KL of Q8_0 averaged 0.0015 (p99 0.016), Q5_1's 0.0021 (0.019) and
-IQ4_NL's 0.0020 (0.038).
+Unsloth's Qwen3.8 bundles read their engram table, 51.2 billion values read a few rows a token, from
+their own last shard (IQ4_NL, 28.8 GB) unless another is named: one of Unsloth's engram files, BF16
+(102.4 GB, lossless), Q8_0 (54.4 GB) or Q5_1 (38.4 GB), in the bundle's folder or an `engram` folder
+beside it, which the model's bundles share. `straydog setup --engram Q8_0` fetches that file there instead
+of the bundle's own table shard and names it in the settings; `--engram` (`STRAYDOG_ENGRAM`) names one
+for the server. On two R9700s the precision changes no speed; on a machine short of memory a larger table
+costs some (Q5_1 a tenth on 62 GB with half of it held by other programs). Against BF16 over six prompts'
+greedy continuations (UD-IQ1_M), the KL of Q8_0 averaged 0.0015 (p99 0.016), Q5_1's 0.0021 (0.019) and
+IQ4_NL's 0.0020 (0.038). The server's ready line names the table it reads.
 
 Settings files of 0.1.3 and before name DeepSeek-V4.1's ISTA-DASLab bundles by their files'
 names (GSQ-RCO-IQ2_XXS, GSQ-RCO-IQ2_XS) and the model DeepSeek-V4.1-Flash: they are read as these.
