@@ -7,7 +7,8 @@
 //!   bits of its matrix alone, for one to four vectors.
 //!
 //! cargo test --release -p straydog-engine --features hip --test q8_wide_gpu, under the GPU lock.
-#![cfg(any(feature = "hip", feature = "cuda"))]
+// (RDNA4's kernels: kernels.cpp takes them only on an RDNA4 device, and a CUDA build runs these ops in F32, with nothing of theirs to compare)
+#![cfg(feature = "hip")]
 
 use straydog_engine::formats;
 use straydog_engine::gpu::Backend;
