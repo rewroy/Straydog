@@ -312,6 +312,16 @@ void cleanup(hipError_t error) noexcept {
     if (error != hipSuccess) std::fprintf(stderr, "Straydog GPU cleanup: %s\n", hipGetErrorString(error));
 }
 
+// Page-locked host memory for what a request asks (a K/V growth, the MTP rows' staging, a read's buffer). Tests make the next
+// `refuse_host_allocations` of these answer as a machine short of memory does (sd_test_refuse_host).
+std::atomic<uint64_t> refuse_host_allocations{0};
+hipError_t host_allocate(void** pointer, size_t bytes, unsigned int flags) {
+    uint64_t left = refuse_host_allocations.load();
+    while (left && !refuse_host_allocations.compare_exchange_weak(left, left - 1)) {}
+    if (left) { *pointer = nullptr; return hipErrorOutOfMemory; }
+    return hipHostMalloc(pointer, bytes, flags);
+}
+
 // A BLAS handle for F32 products whose kernel choice is the same in every process. On ROCm,
 // rocBLAS hands GEMMs to hipBLASLt, whose ranking of F32 kernels changes with the process's
 // address layout on RDNA4 (one process in five to thirty ranks them otherwise, for every shape
@@ -512,6 +522,7 @@ struct Device {
     float* mtp_staging[2] = {nullptr, nullptr};
     hipEvent_t mtp_staged[2] = {nullptr, nullptr};
     size_t mtp_staging_floats = 0;
+    size_t mtp_staging_refused = 0;   // the size (floats) the system refused to page-lock last: not asked for again at or over it
     unsigned mtp_turn = 0;
     uint64_t gemm_calls = 0, gemm_vectors = 0;
     std::unordered_map<void*, size_t> allocations;
@@ -548,6 +559,8 @@ struct Device {
     hipEvent_t parts_read = nullptr;    // sd_op_sum_devices: this device has read the others' parts
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
+    bool readback_pinned = true;   // false: pageable (the system refused to page-lock it), held in readback_pageable
+    std::vector<uint8_t> readback_pageable;
     hipEvent_t readback_done = nullptr;
     size_t readback_bytes = 0;
     // Allocations that live in mapped, page-locked host memory (sd_host_state): device pointer -> host pointer.
@@ -651,7 +664,7 @@ struct Device {
         if (exchange) cleanup(hipHostFree(exchange));
         if (prompt_host && prompt_host_pinned) cleanup(hipHostFree(prompt_host));
         if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));
-        if (readback) cleanup(hipHostFree(readback));
+        if (readback && readback_pinned) cleanup(hipHostFree(readback));
         if (route_mailbox) cleanup(hipHostFree(route_mailbox));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
@@ -1514,15 +1527,26 @@ int sd_mtp_embed(void* handle,const float* embeddings,uint64_t count,void* targe
         if (!embeddings || !count) throw std::runtime_error("invalid MTP embeddings");
         float* device_rows=mtp_allocation(d,target,size_t(count)*2560);
         const size_t floats=size_t(count)*2560;
-        if (floats>d.mtp_staging_floats) {
+        if (floats>d.mtp_staging_floats && (!d.mtp_staging_refused || floats<d.mtp_staging_refused)) {
             for (int i=0;i<2;++i) {
                 if (!d.mtp_staged[i]) check(hipEventCreateWithFlags(&d.mtp_staged[i],hipEventDisableTiming));
                 check(hipEventSynchronize(d.mtp_staged[i]));
                 if (d.mtp_staging[i]) { check(hipHostFree(d.mtp_staging[i])); d.mtp_staging[i]=nullptr; }
             }
             d.mtp_staging_floats=0;
-            for (int i=0;i<2;++i) check(hipHostMalloc(reinterpret_cast<void**>(&d.mtp_staging[i]),floats*4,hipHostMallocDefault));
-            d.mtp_staging_floats=floats;
+            bool pinned=true;
+            for (int i=0;i<2 && pinned;++i) pinned=host_allocate(reinterpret_cast<void**>(&d.mtp_staging[i]),floats*4,hipHostMallocDefault)==hipSuccess;
+            if (pinned) d.mtp_staging_floats=floats;
+            else {
+                // (a machine short of memory: the rows go straight from the caller's, which the driver stages)
+                (void)hipGetLastError();
+                for (int i=0;i<2;++i) if (d.mtp_staging[i]) { cleanup(hipHostFree(d.mtp_staging[i])); d.mtp_staging[i]=nullptr; }
+                d.mtp_staging_refused=floats;
+            }
+        }
+        if (floats>d.mtp_staging_floats) {
+            check(hipMemcpyAsync(device_rows,embeddings,floats*4,hipMemcpyHostToDevice,d.stream));
+            return 0;
         }
         const unsigned slot=d.mtp_turn++%2;
         check(hipEventSynchronize(d.mtp_staged[slot]));
@@ -1975,6 +1999,33 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The GPU stops reading a layer's page-locked banks in place: the plan whose gate bank is at `gate` has its banks as it had them before
+// sd_hybrid_assist mapped them, so the slots' copies and the CPU's experts read them as they read any layer's that is not locked. The copies
+// of the banks' experts that were in flight are waited for, and so are the layers' graphs that hold the view (they are dropped, and the next
+// pass captures them again). `found` is 1 where this device holds the plan. The caller unregisters the banks after: the engine gives
+// locked layers back when a K/V growth finds no memory (Model::give_back).
+int sd_hybrid_unmap(void* handle,const void* gate,uint64_t* found) {
+    try {
+        if (!gate || !found) throw std::runtime_error("invalid hybrid unmap");
+        auto& d=device(handle);
+        *found=0;
+        for (auto& item : d.resident) {
+            ResidentMoe& plan=*item.second;
+            if (!plan.hybrid || plan.host[0]!=gate) continue;
+            *found=1;
+            if (!plan.mapped[0]) break;
+            if (d.copier) d.copier->wait();
+            if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+            hybrid_drop_graphs(d);   // (it waits for the stream: no kernel is still reading the banks)
+            for (size_t role=0;role<3;++role) plan.mapped[role]=nullptr;
+            break;
+        }
+        bool any=false;
+        for (const auto& item : d.resident) any|=item.second->hybrid && item.second->mapped[0];
+        d.hint_experts=!any;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The assist level alone, once sd_hybrid_assist has mapped the banks (mapping them again is the dear part of that call). A level past
 // the cap is refused.
 int sd_hybrid_assist_level(void* handle,uint32_t assist) {
@@ -2023,6 +2074,11 @@ int sd_host_unregister(void* pointer) {
         registered.erase(reinterpret_cast<uintptr_t>(pointer));
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Development: the next `count` page-locked host allocations a request makes are refused (0: none; host_allocate).
+int sd_test_refuse_host(uint64_t count) {
+    refuse_host_allocations.store(count);
+    return 0;
 }
 int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host,uint64_t bytes) {
     try {
@@ -2602,8 +2658,9 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         check(hipStreamSynchronize(d.stream));
         if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
         void* grown = nullptr;
-        // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory).
-        if (hipHostMalloc(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+        // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
+        // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
+        if (host_allocate(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped) != hipSuccess) {
             (void)hipGetLastError();
             throw std::runtime_error(kv_no_memory);
         }
@@ -2625,6 +2682,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             check(hipMemcpy(grown_index ? grown_index : plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
             // The layers' one scratch, once: it holds nothing between uses.
             if (plan.states[2] && d.allocations.at(plan.states[2]) < 256 * pool * 4) grown_scratch = allocate(d, 256 * pool * 4);
+        } catch (const std::bad_alloc&) {
+            // (the indexer's blocks go through host memory: a few tens of MB a layer; the growth is refused as when the K/V found none)
+            cleanup(hipHostFree(grown));
+            throw std::runtime_error(kv_no_memory);
         } catch (...) { cleanup(hipHostFree(grown)); throw; }
         // Every captured graph holds the old K/V or the old pitches.
         kv_clear_graphs(d);
@@ -3031,7 +3092,13 @@ int sd_buffer_read_start(void* handle, const void* buffer, uint64_t offset, uint
         if (!bytes || bytes > readback_capacity || offset > UINT64_MAX - bytes) throw std::runtime_error("invalid Straydog read");
         op_span(value, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes), "a read buffer");
         if (!value.readback) {
-            check(hipHostMalloc(reinterpret_cast<void**>(&value.readback), readback_capacity, hipHostMallocDefault));
+            if (host_allocate(reinterpret_cast<void**>(&value.readback), readback_capacity, hipHostMallocDefault) != hipSuccess) {
+                // (a machine short of memory: a pageable buffer, which a copy to it fills before it returns)
+                (void)hipGetLastError();
+                value.readback_pageable.resize(readback_capacity);
+                value.readback = value.readback_pageable.data();
+                value.readback_pinned = false;
+            }
             check(hipEventCreateWithFlags(&value.readback_done, hipEventDisableTiming));
         }
         check(hipMemcpyAsync(value.readback, static_cast<const uint8_t*>(buffer) + offset, size_t(bytes), hipMemcpyDeviceToHost,

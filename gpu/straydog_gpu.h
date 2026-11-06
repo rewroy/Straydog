@@ -47,6 +47,9 @@ int sd_copy_allocation(void* handle, void* target, const void* source);
 int sd_host_register(void* pointer, uint64_t bytes);
 int sd_host_register_on(int ordinal, void* pointer, uint64_t bytes);
 int sd_host_unregister(void* pointer);
+/* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
+   refused as a machine short of memory refuses them; 0 ends it. */
+int sd_test_refuse_host(uint64_t count);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
 // A decoder layer's host K/V grown to `capacity` positions, its `valid` positions kept, and its indexer laid out for them in
@@ -548,6 +551,10 @@ uint32_t sd_hybrid_assist_cap(void);
 /* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
    captured graphs, which carry the level, and the next pass captures them again. */
 int sd_hybrid_assist_level(void* handle, uint32_t assist);
+/* The GPU stops reading the page-locked banks of the layer whose gate bank is at `gate` in place (the plan has its banks as it had them
+   before sd_hybrid_assist mapped them): copies of its experts that were in flight, and the layers' graphs that hold the view, are waited
+   for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */
+int sd_hybrid_unmap(void* handle, const void* gate, uint64_t* found);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);

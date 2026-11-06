@@ -2250,6 +2250,27 @@ impl Backend {
         self.registered.push(range.as_ptr().cast_mut().cast());
     }
 
+    /// Stop this device's assist reading the layer whose gate bank is `gate` in place (the copies of its experts that were in flight and the graphs
+    /// that hold the view are waited for, the graphs dropped): whether this device holds the layer. Its banks are then read as any layer's that is
+    /// not page-locked; [`Backend::release_host`] gives the locks up.
+    pub fn unmap_banks(&mut self, gate: &[u8]) -> Result<bool> {
+        let mut found = 0;
+        // SAFETY: a live handle, an address that is only compared, and an out-parameter.
+        check(unsafe { ffi::sd_hybrid_unmap(self.handle, gate.as_ptr().cast(), &mut found) })?;
+        Ok(found != 0)
+    }
+
+    /// Give up the page lock of a range this device adopted ([`Backend::adopt_host`]), after [`Backend::unmap_banks`]: the pages are the system's
+    /// to page again and the commit they held is given back. A range that was not adopted is left alone.
+    pub fn release_host(&mut self, range: &[u8]) -> Result<()> {
+        let start: *mut c_void = range.as_ptr().cast_mut().cast();
+        let Some(at) = self.registered.iter().position(|&held| held == start) else { return Ok(()) };
+        // SAFETY: registered by `lock_host_range` and adopted; the mapping is alive (the caller holds the weights).
+        check(unsafe { ffi::sd_host_unregister(start) })?;
+        self.registered.swap_remove(at);
+        Ok(())
+    }
+
     pub fn hybrid_counts(&self) -> Result<[u64; 9]> {
         let mut values = [0u64; 9];
         let [a, b, c, d, e, f, g, h, i] = &mut values;
@@ -2288,6 +2309,14 @@ impl Backend {
 pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// Tests only: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are refused as a
+/// machine short of memory refuses them; 0 ends it.
+#[doc(hidden)]
+pub fn refuse_host_allocations(count: u64) {
+    // SAFETY: a plain value.
+    unsafe { ffi::sd_test_refuse_host(count) };
 }
 
 /// Give up a lock of [`lock_host_range`] that no device has adopted.

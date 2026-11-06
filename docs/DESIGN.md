@@ -869,6 +869,12 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked
     sequence does not survive a growth; the live one and its checkpoints do.
+  - The page locks give way to the K/V: they are an optimisation of the CPU's experts, and a conversation's K/V is not. A growth that
+    the memory refuses (`KV_NO_MEMORY`) ends the locking behind ready if it is under way, takes locked layers back newest first
+    (`Model::give_back`: as many as their bytes cover what the memory available lacks, and at least one), and asks again; only with
+    no layer left does the request fail. A layer given back is taken out of the assist (its plan reads the bank in place no more, the
+    layers' graphs that held the view are captured anew), its banks are unregistered, and the CPU's experts and the slots read it as
+    they read any layer that is not locked. One line in the log says what was given.
   - Page-locked banks let the GPU take some of a layer's absent experts over the bus (`assist`). On
     CUDA a kernel first copies them into VRAM's staging slots with every thread at once
     (`hybrid_stage_assist`), two a layer: read in place they outlast the CPU's. At

@@ -17,12 +17,17 @@
 //! Until step 2 the layer is what every layer that is not page-locked is: the CPU's experts read its pages from the mapping and the slots'
 //! copies read them as they are. No path that takes a bank's bytes to the GPU, the assist apart, depends on the lock.
 //!
+//! The locks are an optimisation and the K/V of a conversation is not, so the locks give way to it: when a K/V growth finds no memory,
+//! [`Model::give_back`](crate::model::Model::give_back) takes locked layers back, newest first ([`give_back_count`]), and ends the locking
+//! ([`BankLocks`] stops when the model says so, and a layer it locked meanwhile is let go).
+//!
 //! The pages of the layers not yet locked are in memory only if the page cache holds them, and a request that comes before the locking is done
 //! reads the rest by faulting, one fault after another (Linux, a cold page cache: 28 to 31 tok/s with 218,547 page faults against 49.4 tok/s after
 //! the locking). [`BankLocks::read_ahead`] hands out the plan's banks as [`Piece`]s in the order the layers are locked, for a thread of the worker to ask the
 //! system for at a low priority ([`Piece::ask`], [`Piece::resident`]), a few hundred MB at a time, so that the locking and a request find them in memory.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::host::{Lowered, Priority};
@@ -133,6 +138,8 @@ pub struct BankLocks {
     ordinal: usize,
     /// The physical memory the plan keeps free ([`crate::host::left_free`]): a read-ahead stops when less than this is available.
     margin: u64,
+    /// Set by the model when it gives locked layers back to a request ([`Model::give_back`](crate::model::Model::give_back)): the plan locks no more.
+    halt: Arc<AtomicBool>,
 }
 
 // SAFETY: the banks hold the address of the weights' mappings, which the thread that uses them keeps alive ([`BankLocks::lock_next`]).
@@ -140,7 +147,13 @@ unsafe impl Send for BankLocks {}
 
 impl BankLocks {
     pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
-        BankLocks { layers: layers.into(), ordinal, margin }
+        BankLocks { layers: layers.into(), ordinal, margin, halt: Arc::default() }
+    }
+
+    /// The plan tied to a model: it stops when `halt` is set.
+    pub(crate) fn tied_to(mut self, halt: Arc<AtomicBool>) -> BankLocks {
+        self.halt = halt;
+        self
     }
 
     /// The physical memory the plan keeps free: what the system must have available for a read-ahead of the banks to go on.
@@ -148,19 +161,28 @@ impl BankLocks {
         self.margin
     }
 
-    /// The layers still to lock.
+    /// Whether the model has ended the locking to give its layers back.
+    pub fn halted(&self) -> bool {
+        self.halt.load(Ordering::SeqCst)
+    }
+
+    /// The layers still to lock (none once the model has ended the locking).
     pub fn remaining(&self) -> usize {
-        self.layers.len()
+        if self.halted() { 0 } else { self.layers.len() }
     }
 
     /// The layer [`BankLocks::lock_next`] takes next.
     pub fn next_layer(&self) -> Option<usize> {
-        self.layers.front().map(|(layer, _)| *layer)
+        if self.halted() { None } else { self.layers.front().map(|(layer, _)| *layer) }
     }
+
 
     /// The plan's banks as pieces for a read-ahead, in the order the layers are taken ([`pieces_of`], [`AHEAD_PIECE`]); every byte of the banks still to lock
     /// and no other. Addresses in the weights' mappings, which whoever asks the system for them keeps alive.
     pub fn read_ahead(&self) -> Vec<Piece> {
+        if self.halted() {
+            return Vec::new();
+        }
         let layers: Vec<(usize, [(usize, u64); 3])> = self.layers.iter()
             .map(|(layer, banks)| (*layer, [0, 1, 2].map(|role| (banks[role].map as usize + banks[role].offset as usize, banks[role].bytes))))
             .collect();
@@ -197,6 +219,9 @@ impl BankLocks {
     /// # Safety
     /// As [`BankLocks::lock_next`].
     unsafe fn lock_at(&mut self, priority: Priority) -> Option<Result<Locked, Stop>> {
+        if self.halted() {
+            return None;
+        }
         let (layer, banks) = self.layers.pop_front()?;
         let _lowered = turn_lowered(priority);
         if let Some((_, next)) = self.layers.front() {
@@ -233,6 +258,47 @@ impl BankLocks {
             crate::gpu::unlock_host_range(unsafe { bank.range() });
         }
     }
+}
+
+/// How many of the locked layers a K/V growth (or another request's allocation) that is `shortfall` bytes short of memory takes back, newest first:
+/// `locked` is the layers in the order they were locked, with their bytes. As many of the newest as their bytes cover the shortfall, and at least one
+/// where any is locked (the allocation was refused: whatever the system says is available did not give it).
+pub fn give_back_count(locked: &[(usize, u64)], shortfall: u64) -> usize {
+    let (mut count, mut bytes) = (0, 0u64);
+    for &(_, layer_bytes) in locked.iter().rev() {
+        if count > 0 && bytes >= shortfall {
+            break;
+        }
+        count += 1;
+        bytes = bytes.saturating_add(layer_bytes);
+    }
+    count
+}
+
+/// What a give-back took, for its one line in the log ([`give_back_line`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GaveBack {
+    /// The layers given back, newest first, and their bytes.
+    pub layers: Vec<usize>,
+    pub bytes: u64,
+    /// The layers that stay locked, and their bytes.
+    pub left: usize,
+    pub left_bytes: u64,
+    /// What asked for it, the bytes it asked for, and the memory available when it did (None: not known).
+    pub asked_by: String,
+    pub wanted: u64,
+    pub available: Option<u64>,
+}
+
+/// The one line a give-back leaves in the log.
+pub fn give_back_line(gave: &GaveBack) -> String {
+    let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let layers = gave.layers.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    let available = gave.available.map_or("not known".to_string(), gib);
+    let stay = if gave.left == 1 { "layer stays" } else { "layers stay" };
+    format!("Straydog host banks given back: {} layer{} ({layers}), {} of page locks, for {} (it asked for {}, {available} available); {} {stay} locked, {}",
+            gave.layers.len(), plural(gave.layers.len()), gib(gave.bytes), gave.asked_by, gib(gave.wanted), gave.left, gib(gave.left_bytes))
 }
 
 /// The bytes of one request of a read-ahead: a few hundred MB, so that the read can be followed and stopped between two (the size of a chunk of the pinned
@@ -391,6 +457,68 @@ mod tests {
         };
         order_by_host_routes(&mut layers, counts);
         assert_eq!(layers, vec![45, 46, 44, 47], "most first, equal counts in the order given, none last");
+    }
+
+    /// Decides: a give-back takes the layers that were locked last, one by one, until their bytes cover what the request is short of, and at least one where
+    /// any is locked (a refused allocation that the system's own numbers called affordable); never more than are locked.
+    #[test]
+    fn a_give_back_takes_the_newest_layers_until_their_bytes_cover_the_shortfall() {
+        const GIB: u64 = 1 << 30;
+        // the order they were locked in: 40 first, 44 last; 1 GiB each but 42, which is 3
+        let locked = [(40, GIB), (41, GIB), (42, 3 * GIB), (43, GIB), (44, GIB)];
+        assert_eq!(give_back_count(&[], GIB), 0, "nothing is locked: nothing is given back");
+        assert_eq!(give_back_count(&locked, 0), 1, "at least one, though nothing is short by the system's numbers");
+        assert_eq!(give_back_count(&locked, 1), 1);
+        assert_eq!(give_back_count(&locked, GIB), 1, "44 covers a GiB");
+        assert_eq!(give_back_count(&locked, GIB + 1), 2, "44 and 43 cover 2 GiB");
+        assert_eq!(give_back_count(&locked, 2 * GIB), 2);
+        assert_eq!(give_back_count(&locked, 2 * GIB + 1), 3, "42's 3 GiB come with it whole");
+        assert_eq!(give_back_count(&locked, 5 * GIB), 3);
+        assert_eq!(give_back_count(&locked, 5 * GIB + 1), 4);
+        assert_eq!(give_back_count(&locked, 7 * GIB), 5);
+        assert_eq!(give_back_count(&locked, u64::MAX), 5, "all of them, and no more");
+        // (the layers it names are the last of the list: the caller takes them from the end)
+        let count = give_back_count(&locked, 2 * GIB + 1);
+        assert_eq!(locked[locked.len() - count..].iter().map(|layer| layer.0).collect::<Vec<_>>(), vec![42, 43, 44]);
+    }
+
+    /// Decides: the line a give-back leaves says the layers (newest first), their bytes, what asked, how much and what was available, and what stays.
+    #[test]
+    fn the_give_back_line_says_what_was_given_why_and_what_stays() {
+        const GIB: u64 = 1 << 30;
+        let gave = GaveBack { layers: vec![44, 43], bytes: 3 * GIB / 2, left: 36, left_bytes: 23 * GIB, asked_by: "a K/V growth to 65536 positions".into(),
+                              wanted: 4 * GIB, available: Some(GIB * 5 / 2) };
+        assert_eq!(give_back_line(&gave),
+                   "Straydog host banks given back: 2 layers (44, 43), 1.5 GiB of page locks, for a K/V growth to 65536 positions (it asked for 4.0 GiB, \
+                    2.5 GiB available); 36 layers stay locked, 23.0 GiB");
+        let last = GaveBack { layers: vec![47], bytes: GIB, left: 1, left_bytes: GIB, available: None, ..gave };
+        assert_eq!(give_back_line(&last),
+                   "Straydog host banks given back: 1 layer (47), 1.0 GiB of page locks, for a K/V growth to 65536 positions (it asked for 4.0 GiB, \
+                    not known available); 1 layer stays locked, 1.0 GiB");
+    }
+
+    /// Decides: a plan whose model ended the locking takes no layer, shows none left, and has nothing to read ahead; one that was not ended is as it was.
+    #[test]
+    fn a_plan_the_model_ended_locks_no_more() {
+        let path = std::env::temp_dir().join(format!("straydog-halt-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![7u8; 8 << 20]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a file of this test's own, which nothing changes while it is mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let bank = |index: u64| Bank::new(map.as_ptr(), map.len(), index << 20, 1 << 20, None);
+        let halt = Arc::new(AtomicBool::new(false));
+        let mut locks = BankLocks::new(vec![(47, [bank(0), bank(1), bank(2)]), (46, [bank(3), bank(4), bank(5)])], 0, 3 << 30).tied_to(halt.clone());
+        assert_eq!((locks.remaining(), locks.next_layer(), locks.halted()), (2, Some(47), false));
+        assert_eq!(locks.read_ahead().len(), 6);
+        halt.store(true, Ordering::SeqCst);
+        assert_eq!((locks.remaining(), locks.next_layer(), locks.halted()), (0, None, true));
+        assert!(locks.read_ahead().is_empty());
+        // SAFETY: nothing is locked: the plan is ended before it touches a bank.
+        assert!(unsafe { locks.lock_next() }.is_none());
+        assert!(unsafe { locks.lock_next_behind() }.is_none());
+        drop(map);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Decides: a plan's banks are cut into pieces in the order of the layers and of the banks in a layer, at page boundaries, none of them over the limit,

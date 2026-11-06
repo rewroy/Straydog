@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::assist;
-use crate::banks::{BankLocks, Locked};
+use crate::banks::{BankLocks, GaveBack, Locked};
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
@@ -585,6 +585,10 @@ pub struct Model {
     lock_pending: Vec<usize>,
     /// A bank that did not match the file's tree when it was locked behind "ready": no request is served from here on.
     bank_failure: Option<String>,
+    /// Set when locked layers were given back to a request ([`Model::give_back`]): the locking behind "ready" locks no more (its plan holds this too).
+    lock_halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What the engine has given back to requests since it started, in order.
+    pub gave_back: Vec<GaveBack>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -728,6 +732,8 @@ impl Model {
             locked_layers: Vec::new(),
             lock_pending: Vec::new(),
             bank_failure: None,
+            lock_halt: Default::default(),
+            gave_back: Vec::new(),
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -1240,7 +1246,7 @@ impl Model {
             let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)))
+        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)).tied_to(self.lock_halt.clone()))
     }
 
     /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then
@@ -1268,6 +1274,12 @@ impl Model {
     /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
     /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
     pub fn banks_locked(&mut self, locked: Locked) -> Result<u64> {
+        if self.lock_halt.load(std::sync::atomic::Ordering::SeqCst) {
+            // (its locks were given back to a request while this layer's turn ran: the layer is let go, not taken)
+            // SAFETY: the model keeps its weights mapped.
+            unsafe { locked.unlock() };
+            return Err("its page locks were given back to a K/V growth".into());
+        }
         let layer = locked.layer;
         for bank in Self::host_banks(&self.weights, layer)? {
             self.group.adopt_host(bank);
@@ -1927,6 +1939,81 @@ impl Model {
         }
     }
 
+    /// The least the K/V grows to for `positions`: what the sequence needs and a little more, whole thousands of positions.
+    fn kv_least(&self, positions: usize) -> usize {
+        (positions + 4096).div_ceil(4096).saturating_mul(4096).min(self.context)
+    }
+
+    /// The bytes a growth of the K/V to `capacity` positions asks of the memory: the layers' new positions, a layer's old K/V and new one both held while
+    /// it is copied, and the margin the commit keeps.
+    fn kv_growth_cost(&self, capacity: usize) -> u64 {
+        let position = attention_layers(self.weights.drafter) * 4096;
+        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * 4096 + KV_COMMIT_MARGIN
+    }
+
+    /// A request found no memory for `wanted` bytes of what it asks (`asked_by` says what): the page locks of the expert banks give way. The locking
+    /// behind "ready" ends first if it is under way (it must not lock again what is given back, and a layer its thread has locked meanwhile is let go by
+    /// [`Model::banks_locked`]); then locked layers are taken back, newest first, as many as their bytes cover what the memory available now lacks
+    /// ([`crate::banks::give_back_count`]) and at least one. Each is taken out of the GPU's assist (its plan reads the bank in place no more, and the layers'
+    /// graphs that held the view are captured again), its banks unregistered, and it is counted no more in [`Model::locked_layers`]: the CPU's experts and
+    /// the slots read it as they read any layer that is not locked. One line in the log says what was given. None when there is nothing left to give back
+    /// (no layer is locked and the locking was ended already): the request is refused as before.
+    fn give_back(&mut self, wanted: u64, asked_by: &str) -> Result<Option<GaveBack>> {
+        if self.locked_layers.is_empty() && self.lock_pending.is_empty() {
+            return Ok(None);
+        }
+        self.lock_halt.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.lock_pending.clear();
+        let available = crate::host::room_now();
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        let mut gave = GaveBack { layers: Vec::new(), bytes: 0, left: 0, left_bytes: 0, asked_by: asked_by.into(), wanted, available };
+        if self.locked_layers.is_empty() {
+            // (the locking was under way and the model had taken no layer of it: ending it is all there is to give, once)
+            eprintln!("Straydog host banks: the locking behind ready ended with no layer taken, for {asked_by} (it asked for {}, {} available)",
+                      gib(wanted), available.map_or("not known".to_string(), gib));
+            return Ok(Some(gave));
+        }
+        let mut sizes = Vec::with_capacity(self.locked_layers.len());
+        for &layer in &self.locked_layers {
+            sizes.push((layer, Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>()));
+        }
+        // (what the memory available lacks of what is asked; where it is not known, all of it)
+        let shortfall = available.map_or(wanted, |available| wanted.saturating_sub(available));
+        let count = crate::banks::give_back_count(&sizes, shortfall);
+        for &(layer, bytes) in sizes.iter().rev().take(count) {
+            self.group.release_host(Self::host_banks(&self.weights, layer)?)?;
+            self.locked_layers.retain(|locked| *locked != layer);
+            gave.layers.push(layer);
+            gave.bytes += bytes;
+        }
+        gave.left = self.locked_layers.len();
+        gave.left_bytes = sizes.iter().filter(|(layer, _)| self.locked_layers.contains(layer)).map(|(_, bytes)| bytes).sum();
+        if self.locked_layers.is_empty() {
+            // (no bank is mapped: nothing is assisted or tuned, as before the first layer was locked)
+            self.assist = None;
+        } else if self.assist_tuning() {
+            // (what a round measured was of the layers locked then)
+            if let Some(tuner) = self.assist.as_mut() {
+                tuner.restart();
+            }
+        }
+        eprintln!("{}", crate::banks::give_back_line(&gave));
+        self.gave_back.push(gave.clone());
+        Ok(Some(gave))
+    }
+
+    /// Tests only: room in the K/V for `positions`, as a request asks for it.
+    #[doc(hidden)]
+    pub fn ensure_kv_for_test(&mut self, positions: usize) -> Result<()> {
+        self.ensure_kv(positions)
+    }
+
+    /// Tests only: the positions the K/V holds now.
+    #[doc(hidden)]
+    pub fn kv_positions(&self) -> usize {
+        self.kv_capacity
+    }
+
     /// The K/V's next size for `positions`: twice over where the commit and the memory have room for that, else a quarter more, else what the
     /// sequence needs, which only the commit can refuse: a sequence at 66K locked 6 GiB for 131072 positions. The commit is read
     /// with the slots' VRAM still charged to it: they give it up for the growth and take it back after, so what the growth takes of it
@@ -1935,9 +2022,8 @@ impl Model {
         let doubled = (positions + 4096).next_power_of_two().min(self.context);
         let Some((free, left)) = crate::host::commit_left() else { return Ok(doubled) };
         let position = attention_layers(self.weights.drafter) * 4096;
-        // (a layer's old K/V and new one are both held while it is copied)
-        let cost = |capacity: usize| (capacity - self.kv_capacity) as u64 * position + capacity as u64 * 4096 + KV_COMMIT_MARGIN;
-        let least = (positions + 4096).div_ceil(4096).saturating_mul(4096).min(self.context);
+        let cost = |capacity: usize| self.kv_growth_cost(capacity);
+        let least = self.kv_least(positions);
         let quarter = least.max((self.kv_capacity + self.kv_capacity / 4).div_ceil(4096) * 4096).min(self.context);
         let spare = free.saturating_sub(crate::host::left_free(self.weights.host_memory_bytes));
         for capacity in [doubled, quarter] {
@@ -1963,6 +2049,9 @@ impl Model {
 
     /// Room in the K/V for `positions`. A parked sequence's copies have the old pitches and go; the
     /// live sequence and the checkpoints below it stay.
+    ///
+    /// A growth that finds no memory gives locked layers back and asks again ([`Model::give_back`]): the page locks are an optimisation of the CPU's
+    /// experts and the K/V of a conversation is not. Only with no layer left to give back does the request fail, with [`KV_NO_MEMORY`].
     fn ensure_kv(&mut self, positions: usize) -> Result<()> {
         if positions <= self.kv_capacity {
             return Ok(());
@@ -1970,13 +2059,29 @@ impl Model {
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
         }
-        let capacity = self.kv_capacity_for(positions)?;
-        let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
-        // (the limit waits for the locking behind "ready", whose reads it would cut short)
-        if self.lock_pending.is_empty() {
-            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
-        }
-        self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
+        // The size a growth that has begun is for: a layer is grown or it is not, and asking again finishes what was begun (a layer grown is skipped,
+        // and layers of two sizes would be left if the size were chosen anew).
+        let mut begun: Option<usize> = None;
+        let capacity = loop {
+            let attempt = begun.map_or_else(|| self.kv_capacity_for(positions), Ok).and_then(|capacity| {
+                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
+                // (the limit waits for the locking behind "ready", whose reads it would cut short)
+                if self.lock_pending.is_empty() {
+                    crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+                }
+                begun = Some(capacity);
+                self.group.grow_kv(capacity as u64, self.history.len() as u64).map(|()| capacity)
+            });
+            let refused = match attempt {
+                Ok(capacity) => break capacity,
+                Err(error) if error.ends_with(KV_NO_MEMORY) => error,
+                Err(error) => return Err(error),
+            };
+            let capacity = begun.unwrap_or_else(|| self.kv_least(positions));
+            if self.give_back(self.kv_growth_cost(capacity), &format!("a K/V growth to {capacity} positions"))?.is_none() {
+                return Err(refused);
+            }
+        };
         self.kv_capacity = capacity;
         self.hold_memory();
         // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
