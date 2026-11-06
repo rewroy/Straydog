@@ -404,6 +404,48 @@ __global__ void __launch_bounds__(moe_tile_threads) moe_device_tiles(const MoeGr
     if (t==moe_tile_threads-1) *count=blocks[t];
 }
 #endif
+// The experts of `missing` (a batch's rows each in `counts`) the CPU takes instead of the bus: the GPU streams an expert whatever
+// its rows, the CPU computes a route at a time, so those with the fewest rows go to the CPU while its time for their routes stays
+// under its share (Device::prompt_scale) of the GPU's for the experts left to stream (each cost from the last batches,
+// Device::prompt_stream_ns and prompt_cpu_ns; before any, a 16 GB/s bus and 60 us a route). They leave `missing`.
+inline std::vector<size_t> prompt_cpu_share(const Device& d,const ResidentMoe& plan,const unsigned* counts,std::vector<size_t>& missing) {
+    std::vector<size_t> taken;
+    if (!d.prompt_cpu || !d.cpu || !plan.host[0] || missing.empty()) return taken;
+    const double stream=d.prompt_stream_ns>0 ? d.prompt_stream_ns : double(expert_slot_bytes(plan))/16.0;
+    const double route=d.prompt_cpu_ns>0 ? d.prompt_cpu_ns : 60000.0;
+    std::vector<size_t> order(missing);
+    std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) { return counts[a]<counts[b]; });
+    double cpu=0;
+    size_t left=missing.size();
+    for (size_t expert : order) {
+        const double next=cpu+route*counts[expert];
+        if (next>d.prompt_scale*stream*double(left-1)) break;
+        cpu=next; --left; taken.push_back(expert);
+    }
+    if (taken.empty()) return taken;
+    std::vector<bool> gone(plan.experts,false);
+    for (size_t expert : taken) gone[expert]=true;
+    missing.erase(std::remove_if(missing.begin(),missing.end(),[&](size_t expert) { return bool(gone[expert]); }),missing.end());
+    return taken;
+}
+// One CPU route's output row (blockIdx.x of `rows`) to its route's row of the outputs.
+__global__ void prompt_cpu_scatter(const float* rows,const int32_t* routes,float* outputs) {
+    const float* from=rows+size_t(blockIdx.x)*2560;
+    float* to=outputs+size_t(routes[blockIdx.x])*2560;
+    for (unsigned i=threadIdx.x;i<2560;i+=256) to[i]=from[i];
+}
+inline void prompt_cost(double& average,double sample) { average=average>0 ? 0.7*average+0.3*sample : sample; }
+// Room for `floats` in the pinned prompt buffer (between batches: no copy reads it).
+inline float* prompt_host(Device& d,size_t floats) {
+    if (d.prompt_host_floats<floats) {
+        if (d.prompt_host) check(hipHostFree(d.prompt_host));
+        d.prompt_host=nullptr; d.prompt_host_floats=0;
+        check(hipHostMalloc(reinterpret_cast<void**>(&d.prompt_host),floats*4,hipHostMallocDefault));
+        d.prompt_host_floats=floats;
+    }
+    if (!d.prompt_rows) check(hipEventCreateWithFlags(&d.prompt_rows,hipEventDisableTiming));
+    return d.prompt_host;
+}
 void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t experts,size_t steps,const int32_t* selected,
                             int32_t* positions,unsigned* cursors,const float* input,float* scratch,float* outputs) {
     const size_t routes=steps*11, groups_count=experts+1;
@@ -447,10 +489,37 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     if (plan.part)
         for (size_t group=0;group<groups_count;++group) absent[group]=plan.weights[group*3].data==nullptr;
     if (plan.batch_table) absent[experts]=true;
+    std::vector<size_t> on_cpu;
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
         for (size_t expert=0;expert<experts;++expert)
             if (host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
+        on_cpu=prompt_cpu_share(d,plan,host_counts.data(),missing);
+    }
+    // The CPU's routes, expert by expert (before the GPU's work is queued: a download waits for it), and the rows of their tokens
+    // (queued before the GPU's work: they come over while the bus takes the experts the other way).
+    std::vector<int32_t> cpu_routes;
+    std::vector<uint32_t> cpu_experts;   // each CPU route's expert
+    float* cpu_rows=nullptr;
+    float* cpu_results=nullptr;
+    if (!on_cpu.empty()) {
+        std::vector<int32_t> chosen(steps*10);
+        download(d,chosen.data(),selected,steps*10*4);
+        std::vector<std::vector<int32_t>> by_expert(experts);
+        std::vector<bool> taken(experts,false);
+        for (size_t expert : on_cpu) taken[expert]=true;
+        for (size_t route=0;route<steps*10;++route)
+            if (taken[size_t(chosen[route])]) by_expert[size_t(chosen[route])].push_back(int32_t(route));
+        for (size_t expert : on_cpu) {
+            cpu_routes.insert(cpu_routes.end(),by_expert[expert].begin(),by_expert[expert].end());
+            cpu_experts.insert(cpu_experts.end(),by_expert[expert].size(),uint32_t(expert));
+        }
+        const size_t n=cpu_routes.size();
+        cpu_rows=prompt_host(d,steps*2560+n*2561);
+        cpu_results=cpu_rows+steps*2560;
+        std::memcpy(cpu_results+n*2560,cpu_routes.data(),n*4);
+        check(hipMemcpyAsync(cpu_rows,input,steps*2560*4,hipMemcpyDeviceToHost,d.stream));
+        check(hipEventRecord(d.prompt_rows,d.stream));
     }
     size_t first=0;
     for (size_t group=0;group<groups_count;++group) { host_firsts[group]=uint32_t(first); first+=host_counts[group]; }
@@ -512,7 +581,58 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         check(hipGetLastError());
     };
     launch(0,resident_tiles);
-    hybrid_stream_missing(d,plan,missing,[&](size_t begin,size_t count) { launch(offsets[begin],offsets[begin+count]); });
+    // Meanwhile the CPU computes its routes (one row a route, weight 1: the combine weighs them) and they go to their output rows
+    // through the gate/up scratch, after the GPU's GEMMs (stream order).
+    uint64_t cpu_ns=0,compute_ns=0;
+    auto meanwhile=[&]() {
+        const size_t n=cpu_routes.size();
+        if (!n) return;
+        const auto began=std::chrono::steady_clock::now();
+        check(hipEventSynchronize(d.prompt_rows));
+        const auto computing=std::chrono::steady_clock::now();
+        std::vector<const uint8_t*> gate(n),up(n),down(n);
+        std::vector<const float*> xs(n);
+        std::vector<float*> outs(n);
+        std::vector<float> weights(n,1.0f);
+        std::vector<uint32_t> counts(n,1);
+        for (size_t i=0;i<n;++i) {
+            const size_t expert=cpu_experts[i];
+            gate[i]=plan.host[0]+expert*plan.host_bytes[0];
+            up[i]=plan.host[1]+expert*plan.host_bytes[1];
+            down[i]=plan.host[2]+expert*plan.host_bytes[2];
+            xs[i]=cpu_rows+size_t(cpu_routes[i])/10*2560;
+            outs[i]=cpu_results+i*2560;
+        }
+        const int kinds[3]={plan.weights[0].kind,plan.weights[1].kind,plan.weights[2].kind};
+        if (sd_cpu_experts_run_prompt(d.cpu,kinds,uint32_t(n),counts.data(),gate.data(),up.data(),down.data(),weights.data(),2560,640,
+                                    xs.data(),outs.data()))
+            throw std::runtime_error(std::string("Straydog CPU experts: ")+sd_cpu_error());
+        const auto done=std::chrono::steady_clock::now();
+        cpu_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-began).count());
+        compute_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-computing).count());
+        d.prompt_cpu_routes+=n;
+        // (the gate/up scratch and the product after it: routes*1920 floats, a staged row and its route each)
+        const size_t room=routes*1920/(2560+1);
+        const auto* routes_host=reinterpret_cast<const int32_t*>(cpu_results+n*2560);
+        for (size_t at=0;at<n;at+=room) {
+            const size_t part=std::min(room,n-at);
+            auto* staged_routes=reinterpret_cast<int32_t*>(scratch+part*2560);
+            check(hipMemcpyAsync(scratch,cpu_results+at*2560,part*2560*4,hipMemcpyHostToDevice,d.stream));
+            check(hipMemcpyAsync(staged_routes,routes_host+at,part*4,hipMemcpyHostToDevice,d.stream));
+            prompt_cpu_scatter<<<unsigned(part),256,0,d.stream>>>(scratch,staged_routes,outputs);
+            check(hipGetLastError());
+        }
+    };
+    const uint64_t stream_ns=hybrid_stream_missing(d,plan,missing,[&](size_t begin,size_t count) { launch(offsets[begin],offsets[begin+count]); },
+                                                   meanwhile);
+    if (missing.size()>=16) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
+    if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
+    // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last).
+    if (!cpu_routes.empty()) {
+        const double ratio=stream_ns ? double(cpu_ns)/double(stream_ns) : 2.0;
+        d.prompt_scale=std::clamp(d.prompt_scale*std::clamp(0.9/ratio,0.6,1.2),0.05,2.0);
+    }
+
     // Host vectors reach the device through the staging arena, so resident experts need no wait
     // here and the caller can queue the next work (the peer's half, the next layer) at once.
     if (plan.hybrid) check(hipStreamSynchronize(d.stream));

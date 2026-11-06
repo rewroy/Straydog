@@ -909,12 +909,14 @@ int sd_cpu_experts_stats(void* handle, uint64_t* values) {
 // sum is what a call of its own makes (the same kernels on the same rows, the routes added in their order). An expert that rows
 // share is worked by one worker for all of them at once, so its weights come from memory once, and the phases hand over once a
 // pass rather than once a row.
-int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate,
-                            const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden,
-                            uint64_t inter, const float* const* xs, float* const* outs) {
+namespace {
+// sd_cpu_experts_run_rows; `timed`: the engine's phase timers and counts take the call (decode's; a prompt batch's are not).
+int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate, const uint8_t* const* up,
+             const uint8_t* const* down, const float* weights, uint64_t hidden, uint64_t inter, const float* const* xs, float* const* outs,
+             bool timed) {
     try {
         auto* engine = static_cast<Engine*>(handle);
-        if (!engine || !kinds || !rows || rows > 16 || !counts || !gate || !up || !down || !weights || !xs || !outs || !hidden ||
+        if (!engine || !kinds || !rows || rows > 65536 || !counts || !gate || !up || !down || !weights || !xs || !outs || !hidden ||
             !inter || hidden > 65536 || inter > 65536)
             throw std::runtime_error("invalid Straydog CPU expert request");
         size_t count = 0;
@@ -940,7 +942,8 @@ int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const
         for (uint32_t r = 0, i = 0; r < rows; ++r)
             for (uint32_t k = 0; k < counts[r]; ++k) row_of[i++] = r;
         for (size_t i = 0; i < count; ++i) {
-            size_t u = 0;
+            // (a prompt batch's routes come expert by expert: the last expert first)
+            size_t u = !distinct.empty() && gate[distinct.back()] == gate[i] ? distinct.size() - 1 : 0;
             while (u < distinct.size() && gate[distinct[u]] != gate[i]) ++u;
             if (u == distinct.size()) distinct.push_back(uint32_t(i));
             expert_of[i] = uint32_t(u);
@@ -1036,7 +1039,7 @@ int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const
                 row = end;
             }
         });
-        engine->projection_ns += elapsed_ns(phase);
+        if (timed) engine->projection_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
         const size_t product_count = count * inter;
         const bool ordered = lanes && kinds[2] == 42 && !down_int;   // inter is then a multiple of 64
@@ -1062,7 +1065,7 @@ int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const
                 }
             });
         }
-        engine->product_ns += elapsed_ns(phase);
+        if (timed) engine->product_ns += elapsed_ns(phase);
         phase = std::chrono::steady_clock::now();
         engine->down_rows.resize(count * hidden);
         float* down_rows = engine->down_rows.data();
@@ -1087,10 +1090,24 @@ int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const
                 for (uint32_t k = 0; k < counts[r]; ++k, ++i) add_weighted(level, out + begin, down_rows + i * hidden + begin, weights[i], last - begin);
             }
         });
-        engine->down_ns += elapsed_ns(phase);
-        ++engine->calls; engine->experts += count;
+        if (timed) {
+            engine->down_ns += elapsed_ns(phase);
+            ++engine->calls; engine->experts += count;
+        }
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+}  // namespace
+
+int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate,
+                            const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden,
+                            uint64_t inter, const float* const* xs, float* const* outs) {
+    return run_rows(handle, kinds, rows, counts, gate, up, down, weights, hidden, inter, xs, outs, true);
+}
+int sd_cpu_experts_run_prompt(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate,
+                              const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden,
+                              uint64_t inter, const float* const* xs, float* const* outs) {
+    return run_rows(handle, kinds, rows, counts, gate, up, down, weights, hidden, inter, xs, outs, false);
 }
 
 // out[hidden] = sum_i weights[i] * down_i(silu(gate_i x) * up_i x): one row's routes (sd_cpu_experts_run_rows of one row).

@@ -1332,6 +1332,12 @@ impl Model {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Whether a prompt batch's experts beyond the slots with the fewest rows go to the CPU (on unless STRAYDOG_PROMPT_CPU=0). Off, a
+    /// partially resident prompt is computed alike from run to run; on, which experts go to the CPU depends on timing.
+    pub fn prompt_share(&mut self, on: bool) -> Result<()> {
+        self.group.prompt_share(on)
+    }
+
     /// Tests only: page-lock the banks of `layers` whatever the commit left says (as the start does for the layers it can) and let the GPU
     /// assist from them. The plans mapped.
     #[doc(hidden)]
@@ -1439,6 +1445,12 @@ impl Model {
         if let Some(floor) = expert_floor()? {
             self.group.route_floor(floor)?;
             eprintln!("Straydog speed first: the CPU's routes below a router weight of {floor} are left out");
+        }
+        // A prompt batch's experts beyond the slots with the fewest rows go to the CPU while the bus streams the rest (resident_moe.hpp,
+        // prompt_cpu_share). STRAYDOG_PROMPT_CPU=0 streams them all (a comparison's other side).
+        if std::env::var("STRAYDOG_PROMPT_CPU").is_ok_and(|value| value == "0") {
+            self.group.prompt_share(false)?;
+            eprintln!("Straydog prompt batches: every expert beyond the slots streams over the bus (STRAYDOG_PROMPT_CPU=0)");
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
         cpu.watch_paging(&crate::host::PAGING)?;
@@ -3048,7 +3060,7 @@ impl Model {
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
-                "slots": info["cached_experts"], "streamed": spent("streamed_experts"),
+                "slots": info["cached_experts"], "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
                 "passes": self.pass_counts, "pass_ms": [1e3 * self.pass_seconds[0], 1e3 * self.pass_seconds[1]],
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),

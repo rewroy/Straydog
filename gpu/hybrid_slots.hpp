@@ -463,11 +463,18 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     if (wait) { hybrid_settle(d, true); check(hipStreamSynchronize(d.stream)); }
 }
 
-// compute(first, count) launches the expert GEMMs for missing[first, first+count).
-template<class Compute>
-void hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<size_t>& missing, Compute&& compute) {
-    if (missing.empty()) return;
+// compute(first, count) launches the expert GEMMs for missing[first, first+count); meanwhile() runs on this thread while they
+// stream, before they are waited for. The GPU's time from the first copy to the last expert's GEMMs, in ns (0 with none missing).
+template<class Compute, class Meanwhile>
+uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<size_t>& missing, Compute&& compute, Meanwhile&& meanwhile) {
+    if (missing.empty()) { meanwhile(); return 0; }
     if (d.copier) d.copier->wait();   // the copy stream and read-ahead state are this thread's again
+    struct Span {
+        hipEvent_t began = nullptr, ended = nullptr;
+        ~Span() { if (began) cleanup(hipEventDestroy(began)); if (ended) cleanup(hipEventDestroy(ended)); }
+    } span;
+    check(hipEventCreate(&span.began)); check(hipEventCreate(&span.ended));
+    check(hipEventRecord(span.began, d.copy_stream));
     prefetch_experts(d, plan, missing.data(), missing.size());
     const size_t half = std::min(d.slots.stage / 2, hybrid_point_limit);
     // Pageable banks: the CPU workers gather each chunk into the page-locked mirror while the GPU
@@ -503,7 +510,12 @@ void hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<size_
         check(hipEventRecord(events.used[buffer], d.stream));
         d.streamed_experts += count;
     }
+    check(hipEventRecord(span.ended, d.stream));
+    meanwhile();
     hybrid_point_experts(d, plan, missing.data(), missing.size(), nullptr);
     check(hipStreamSynchronize(d.copy_stream));
     check(hipStreamSynchronize(d.stream));
+    float ms = 0;
+    check(hipEventElapsedTime(&ms, span.began, span.ended));
+    return uint64_t(double(ms) * 1e6);
 }

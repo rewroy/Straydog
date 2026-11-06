@@ -50,7 +50,11 @@ fn open(model_root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, quantization: &
         cpu_threads: 0,
         row_cache_bytes: None,
     };
-    Model::new(weights, group, &settings, &|_, _, _| {}).unwrap()
+    let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+    // (a partially resident prompt's experts all stream, so its logits are the same from run to run: which go to the CPU depends on
+    // timing, and prompt_cpu_gpu checks that share)
+    model.prompt_share(false).unwrap();
+    model
 }
 
 /// A request's greedy tokens and logits digests.

@@ -83,7 +83,7 @@ sees only what isolation exposes:
 - the pinned model and drafter files;
 - the GPU device nodes;
 - a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
-  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_DIRECT`), one list for bubblewrap and
   the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
 
 ```
@@ -821,6 +821,17 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     (IQ2_XXS layers), 84.9 -> 59.0 us (IQ2_S), the down alone 18.7 -> 10.0 (one thread 93 -> 32); served at 5.5 GiB, 42.1 -> 48.4
     tok/s. Formats
     without integer kernels, and CPUs without AVX2, keep F32; `STRAYDOG_CPU_INT8=0` keeps it everywhere.
+  - A prompt batch streams each expert the slots do not hold over the bus, whatever its rows; the CPU computes a route at a time.
+    So the experts with the fewest rows go to the CPU (`prompt_cpu_share`, `gpu/resident_moe.hpp`): while the bus streams the rest,
+    the CPU computes their routes from the batch's rows (copied back as the experts go the other way), and their results reach their
+    routes' output rows after the GPU's GEMMs. It takes them while its time for their routes stays under a share of the GPU's for
+    what is left, each cost measured in the last batches; the share moves each batch toward the CPU finishing at nine tenths of
+    the GPU's time. Which experts go where depends on timing, so a partially resident prompt is not bit-reproducible from run to
+    run either; `STRAYDOG_PROMPT_CPU=0` (or `Model::prompt_share(false)`, as the golden test does) streams them all. Radeon AI PRO
+    R9700 (PCIe 5.0 x16) beside a Ryzen 5 7500F, Qwen3.8 UD-IQ1_S at 5.5 GiB, two runs each: a 2,101-token prompt 2183 / 2087 ->
+    1717 / 1711 ms, 2,397 tokens 2081 / 2088 -> 1714 / 1703, 3,394 tokens 2393 / 2395 -> 2119 / 2131 (a third of the streamed
+    experts left, 22,600-25,600 routes to the CPU). A narrower bus (a PCIe 4.0 x8 card) makes a streamed expert dearer, and the
+    CPU's share larger.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked

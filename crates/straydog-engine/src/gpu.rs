@@ -2165,6 +2165,12 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_route_floor(self.handle, floor) }).map(drop)
     }
 
+    /// Whether a prompt batch's experts beyond the slots with the fewest rows go to the CPU instead of over the bus (on unless turned off).
+    pub fn prompt_share(&mut self, on: bool) -> Result<()> {
+        // SAFETY: a live handle and a plain value.
+        check(unsafe { ffi::sd_hybrid_prompt_share(self.handle, i32::from(on)) }).map(drop)
+    }
+
     /// Cache the highest-scoring experts by recent routing; 0 refreshes everything and waits.
     pub fn rebalance(&mut self, max_swaps: u64) -> Result<()> {
         // SAFETY: a live handle.
@@ -2244,12 +2250,13 @@ impl Backend {
         self.registered.push(range.as_ptr().cast_mut().cast());
     }
 
-    pub fn hybrid_counts(&self) -> Result<[u64; 8]> {
-        let mut values = [0u64; 8];
-        let [a, b, c, d, e, f, g, h] = &mut values;
-        // SAFETY: four out-parameters each.
+    pub fn hybrid_counts(&self) -> Result<[u64; 9]> {
+        let mut values = [0u64; 9];
+        let [a, b, c, d, e, f, g, h, i] = &mut values;
+        // SAFETY: four out-parameters each, then one.
         check(unsafe { ffi::sd_hybrid_counts(self.handle, a, b, c, d) })?;
         check(unsafe { ffi::sd_hybrid_timing(self.handle, e, f, g, h) })?;
+        check(unsafe { ffi::sd_hybrid_prompt_cpu(self.handle, i) })?;
         Ok(values)
     }
 
@@ -2289,8 +2296,8 @@ pub fn unlock_host_range(range: &[u8]) {
     unsafe { ffi::sd_host_unregister(range.as_ptr().cast_mut().cast()) };
 }
 
-pub const HYBRID_COUNTERS: [&str; 8] = ["gpu_experts", "cpu_experts", "streamed_experts", "cached_experts", "wait_ns",
-                                        "cpu_ns", "swapped_experts", "assisted_experts"];
+pub const HYBRID_COUNTERS: [&str; 9] = ["gpu_experts", "cpu_experts", "streamed_experts", "cached_experts", "wait_ns",
+                                        "cpu_ns", "swapped_experts", "assisted_experts", "prompt_cpu_routes"];
 
 impl Drop for Backend {
     fn drop(&mut self) {

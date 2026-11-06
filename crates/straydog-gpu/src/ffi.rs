@@ -2038,6 +2038,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_prompt_share(
+        handle: *mut ::std::os::raw::c_void,
+        on: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_moe_create(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,
@@ -2119,6 +2125,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_prompt_cpu(
+        handle: *mut ::std::os::raw::c_void,
+        routes: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_routes(
         handle: *mut ::std::os::raw::c_void,
         plan: *mut ::std::os::raw::c_void,
@@ -2187,6 +2199,22 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_cpu_experts_run_rows(
+        handle: *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        rows: u32,
+        counts: *const u32,
+        gate: *const *const u8,
+        up: *const *const u8,
+        down: *const *const u8,
+        weights: *const f32,
+        hidden: u64,
+        inter: u64,
+        xs: *const *const f32,
+        outs: *const *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_cpu_experts_run_prompt(
         handle: *mut ::std::os::raw::c_void,
         kinds: *const ::std::os::raw::c_int,
         rows: u32,
