@@ -1864,6 +1864,16 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_decode_head(
+        handle: *mut ::std::os::raw::c_void,
+        pointers: *const *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        vocabulary: u64,
+        input: *const f32,
+        logits: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_mtp_prologue(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,

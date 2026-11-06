@@ -507,6 +507,9 @@ int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
 // input null: the rows of layer `layer`'s decoder workspace, handed back in `rows`.
 int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits, float* confidence, uint64_t top, float* best, uint64_t layer, float* rows);
 int sd_output_head_split(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, uint64_t split, void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence, uint64_t top, float* best, uint64_t layer, float* rows);
+// A decode row's head: the four head operands (the HyperConnection's norm, down and up, and the vocabulary matrix), the row of 10240 and the
+// `vocabulary` logits, in one wait; an error where one is not finite. `logits` has room for vocabulary + 64 floats (the device's verdicts follow them).
+int sd_decode_head(void* handle, void* const* pointers, const int* kinds, uint64_t vocabulary, const float* input, float* logits);
 int sd_mtp_prologue(void* handle, void* const* pointers, const int* kinds, uint64_t steps, const float* embeddings, const float* hidden, float* output);
 int sd_verify_queue(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input);
 int sd_ple_front(void* handle, void* const* pointers, const int* kinds, void* history, void* snapshot, void* kept, uint64_t layer, uint64_t steps, const float* embeddings, float* first, float* hidden);

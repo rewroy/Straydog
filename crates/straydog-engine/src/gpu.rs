@@ -52,6 +52,8 @@ pub const VERIFY_MAX: usize = 8;
 pub const VOCABULARY: u64 = 248320;
 pub const WIDTH: usize = 10240;
 pub const HIDDEN: usize = 2560;
+/// The floats after a decode head's logits that the device fills with its non-finite checks' verdicts.
+const DECODE_HEAD_FLAGS: u64 = 64;
 
 /// The workspace of the fully resident decoder's spans for a prefill capacity.
 pub fn decoder_workspace_bytes(capacity: u64) -> u64 {
@@ -1371,6 +1373,32 @@ impl Backend {
         }
         Self::finite(&output, "HyperConnection values")?;
         Ok(output)
+    }
+
+    /// A decode step's head in one wait: the HyperConnection mix of the row `values` (the head's norm, down and up, then the
+    /// vocabulary matrix) and the projection of the mixed row, as [`Backend::hyperconnection`] and [`Backend::project_many`]
+    /// give them, with no host round trip for the mixed row, the logits checked on the device. The logits replace `logits`'
+    /// contents (its allocation is kept).
+    pub fn decode_head(&mut self, operands: &[Operand], values: &[f32], logits: &mut Vec<f32>) -> Result<()> {
+        let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
+        if operands.len() != 4 || values.len() != WIDTH || (operands[0].rows, operands[0].cols) != (1, WIDTH as u64)
+            || operands[3].cols != HIDDEN as u64 || !(1..=VOCABULARY).contains(&vocabulary)
+            || vocabulary + DECODE_HEAD_FLAGS > self.output_capacity || !values.iter().all(|value| value.is_finite())
+        {
+            return Err("invalid Straydog decode head".into());
+        }
+        let norm = Operand { key: "@norm:output_hc".into(), ..operands[0].clone() };
+        let (pointers, kinds) = self.operands(&[norm, operands[1].clone(), operands[2].clone(), operands[3].clone()])?;
+        logits.clear();
+        logits.reserve((vocabulary + DECODE_HEAD_FLAGS) as usize);
+        // SAFETY: four operands on this device, a row of WIDTH in, room for the logits and the device's flags out (the logits
+        // are the vocabulary's first values, which are set once written).
+        check(unsafe {
+            ffi::sd_decode_head(self.handle, pointers.as_ptr(), kinds.as_ptr(), vocabulary, values.as_ptr(), logits.as_mut_ptr())
+        })?;
+        // SAFETY: the call wrote `vocabulary` values, and found them finite.
+        unsafe { logits.set_len(vocabulary as usize) };
+        Ok(())
     }
 
     /// Matrix-vector products in one launch: each operand times its input vector.
