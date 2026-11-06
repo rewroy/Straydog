@@ -138,6 +138,10 @@ struct Engine {
     earlier: Option<Routes>,
     /// The requests this run has begun: a warm start's slot fill ends with the first ([`fill_slots`]).
     requests: u64,
+    /// The handle the request loop shares, for a locking that memory freed since the start allows ([`Engine::lock_more`]).
+    me: Weak<Mutex<Engine>>,
+    /// The GPUs' budgets were `auto`: GPU memory freed since the start is taken too ([`Engine::more_vram`]).
+    vram_auto: bool,
 }
 
 /// Bytes of image rows kept for the turns after ([`Engine::encoded`]): about 40 full screens (1440x900 is 1260 rows of 2560 values).
@@ -152,6 +156,8 @@ pub(crate) trait Served: Send {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure>;
     fn reset(&mut self) -> Result<(), String>;
+    /// After a request's last frame was sent, if the engine is still free: what the engine does between requests.
+    fn after_request(&mut self) {}
 
     /// What a later start warms up with (the expert store's contents), or null.
     fn warm_state(&mut self) -> Result<Value, String> {
@@ -196,6 +202,12 @@ impl Served for Engine {
 
     fn reset(&mut self) -> Result<(), String> {
         self.model.reset()
+    }
+
+    /// Memory freed since the start: GPU memory to the expert slots, host memory to more page-locked layers.
+    fn after_request(&mut self) {
+        self.more_vram();
+        self.lock_more();
     }
 
     /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own. Null for a model that holds all its experts,
@@ -262,6 +274,48 @@ const WARM_PATIENCE: Duration = Duration::from_millis(100);
 const WARM_LONGEST: Duration = Duration::from_secs(120);
 
 impl Engine {
+    /// GPU memory that other programs freed since the start goes to the expert slots, under `auto`: the budget `auto` would take now, counting
+    /// this worker's own allocations back as free ([`auto_budget`]), where it is at least 512 MiB over the budget held. Asked after each
+    /// request's last frame ([`Served::after_request`]), with the slots placed again then ([`Model::raise_vram`]); a line in the log says what it took.
+    fn more_vram(&mut self) {
+        if !self.vram_auto || !self.model.partial {
+            return;
+        }
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        for (index, (ordinal, used, budget)) in self.model.vram_budgets().unwrap_or_default().into_iter().enumerate() {
+            let Ok(free) = self.model.vram_free(index) else { continue };
+            let Ok((_, _, total)) = straydog_gpu::device_info(ordinal) else { continue };
+            let wanted = auto_budget(cfg!(windows), free + used, total);
+            if wanted < budget + (512 << 20) {
+                continue;
+            }
+            match self.model.raise_vram(index, wanted) {
+                Ok((before, after)) => eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.1} -> {:.1} GiB, memory other programs freed since the start \
+                                                  ({:.1} GiB free); expert slots {before} -> {after}", gib(budget), gib(wanted), gib(free)),
+                Err(error) => eprintln!("WARN Straydog VRAM: GPU {ordinal}'s budget stays {:.1} GiB: {error}", gib(budget)),
+            }
+        }
+    }
+
+    /// Memory freed since the start page-locks more layers ([`Model::more_bank_locks`]), on a thread of its own behind the requests as the start's
+    /// locking is ([`lock_banks_behind`]): asked after each request's last frame ([`Served::after_request`]).
+    fn lock_more(&mut self) {
+        if !self.model.partial {
+            return;
+        }
+        // (this run's routes with the earlier runs' aged by them, as a warm state keeps them)
+        let earlier = self.earlier.clone();
+        let prior = |model: &Model| model.route_counts().ok().map(|run| earlier.as_ref().map_or_else(|| run.clone(), |earlier| earlier.aged_with(&run)));
+        let Some(job) = self.model.more_bank_locks(prior) else { return };
+        let (weak, requests) = (self.me.clone(), self.requests);
+        let spawned = std::thread::Builder::new().name("straydog-relock".into())
+            .spawn(move || lock_banks_behind(&weak, Some((job, requests)), Instant::now(), "behind the requests", "after the plan"));
+        if let Err(error) = spawned {
+            eprintln!("WARN Straydog cannot lock more banks behind the requests: {error}");
+            self.model.banks_lock_ended(None);
+        }
+    }
+
     /// The first step of a warm start with `state`, under the engine's lock ([`straydog_engine::model::Model::warm_start`]): the earlier counts it keeps
     /// to save with the next state, the scores it sets, and what it plans. None for a model that holds all its experts. A state of another kind, format or
     /// model is refused and the model starts as it would without.
@@ -658,7 +712,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "load_seconds": seconds,
         "gpu": model.info()?,
     });
-    let engine = Arc::new(Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0 }));
+    let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0, me: me.clone(),
+                                                       vram_auto: args.vram_bytes == "auto" }));
     output.send(&ready);
     let ready_at = Instant::now();
     behind_ready(&engine, ready_at);
@@ -713,63 +768,70 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
                 eprintln!("Straydog cannot warm up: {message}");
             }
         }
-        // The pages of the layers to be locked are read meanwhile, ahead of the locking, so that a request that comes before the locking is done finds them
-        // in memory ([`behind::read_ahead_behind`]).
-        let progress = Arc::new(behind::Progress::default());
-        if let Some((job, _)) = &job {
-            spawn_read_ahead(&weak, job, &progress, ready_at);
-        }
-        behind::lock_behind(&weak, |engine: &Engine| engine.requests, behind::YIELDING, job,
-            |job| job.remaining() > 0,
-            // (the memory available now, less the layer: the plan's margin and the K/V the first 64K tokens have yet to grow stay free)
-            |job| job.room_for_next(straydog_engine::host::available_bytes()).map(|short| short.message()),
-            |job| {
-                // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
-                // (the turn works at a lower priority, on fewer cores: a request that generates meanwhile needs them)
-                let next = unsafe { job.lock_next_behind() };
-                // (the read-ahead follows the locking: a turn done, or the locking over)
-                match &next {
-                    Some(Ok(_)) => {
-                        progress.turns.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => progress.over.store(true, Ordering::SeqCst),
-                }
-                let next = next?;
-                Some(match next {
-                    Ok(locked) => {
-                        let (layer, bytes) = (locked.layer, locked.bytes);
-                        Ok((locked, layer, bytes))
-                    }
-                    Err(stop) => Err(behind::Stopped {
-                        unverified: matches!(stop, straydog_engine::banks::Stop::Unverified { .. }), message: stop.message(),
-                    }),
-                })
-            },
-            |engine: &mut Engine, locked| engine.model.banks_locked(locked).map(drop),
-            |locked| {
-                // SAFETY: as above, the engine is held while a layer that was locked is given up.
-                unsafe { locked.unlock() }
-            },
-            |engine: &mut Engine, locking| engine.model.banks_lock_ended(locking.unverified.then(|| locking.stopped.clone()).flatten()),
-            |locking| {
-                let (after, gib) = (ready_at.elapsed().as_secs_f64(), locking.bytes as f64 / (1u64 << 30) as f64);
-                let ran = if locking.requests == 0 { "no request ran meanwhile".to_string() } else { format!("{} request(s) ran meanwhile", locking.requests) };
-                let stopped = locking.stopped.as_ref().map(|why| format!(", stopped because {why}")).unwrap_or_default();
-                // (the turns wait for a request that has the engine: how long in all, and whether a wait reached the guard's time)
-                let guard = if locking.guard_fired { "fired" } else { "did not fire" };
-                let waited = format!("waited {:.1} s for requests, the {} s guard {guard}", locking.waited.as_secs_f64(), behind::YIELDING.at_most.as_secs());
-                if locking.layers > 0 || locking.stopped.is_some() {
-                    eprintln!("Straydog host banks locked behind ready: {} layers, {gib:.1} GiB, in {:.1} s, {after:.1} s after ready; {ran}; {waited}{stopped}",
-                              locking.layers, locking.seconds);
-                }
-            });
-        // (whatever ended it, the pages ahead of it are not wanted)
-        progress.over.store(true, Ordering::SeqCst);
+        lock_banks_behind(&weak, job, ready_at, "behind ready", "after ready");
     });
     if let Err(error) = spawned {
         behind::warm_up_over();
         eprintln!("WARN Straydog cannot warm up or lock the banks behind ready: {error}");
     }
+}
+
+/// Lock the banks of `job` layer by layer behind the requests ([`behind::lock_behind`]), with their pages read ahead of the locking: the start's plan
+/// behind "ready", or the layers that memory freed since allows ([`Engine::lock_more`]). The log's line says `what` it was, and the seconds
+/// since `ready_at` (`since`).
+fn lock_banks_behind(weak: &Weak<Mutex<Engine>>, job: Option<(straydog_engine::banks::BankLocks, u64)>, ready_at: Instant, what: &str, since: &str) {
+    // The pages of the layers to be locked are read meanwhile, ahead of the locking, so that a request that comes before the locking is done finds them
+    // in memory ([`behind::read_ahead_behind`]).
+    let progress = Arc::new(behind::Progress::default());
+    if let Some((job, _)) = &job {
+        spawn_read_ahead(weak, job, &progress, ready_at);
+    }
+    behind::lock_behind(weak, |engine: &Engine| engine.requests, behind::YIELDING, job,
+        |job| job.remaining() > 0,
+        // (the memory available now, less the layer: the plan's margin and the K/V the first 64K tokens have yet to grow stay free)
+        |job| job.room_for_next(straydog_engine::host::available_bytes()).map(|short| short.message()),
+        |job| {
+            // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
+            // (the turn works at a lower priority, on fewer cores: a request that generates meanwhile needs them)
+            let next = unsafe { job.lock_next_behind() };
+            // (the read-ahead follows the locking: a turn done, or the locking over)
+            match &next {
+                Some(Ok(_)) => {
+                    progress.turns.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => progress.over.store(true, Ordering::SeqCst),
+            }
+            let next = next?;
+            Some(match next {
+                Ok(locked) => {
+                    let (layer, bytes) = (locked.layer, locked.bytes);
+                    Ok((locked, layer, bytes))
+                }
+                Err(stop) => Err(behind::Stopped {
+                    unverified: matches!(stop, straydog_engine::banks::Stop::Unverified { .. }), message: stop.message(),
+                }),
+            })
+        },
+        |engine: &mut Engine, locked| engine.model.banks_locked(locked).map(drop),
+        |locked| {
+            // SAFETY: as above, the engine is held while a layer that was locked is given up.
+            unsafe { locked.unlock() }
+        },
+        |engine: &mut Engine, locking| engine.model.banks_lock_ended(locking.unverified.then(|| locking.stopped.clone()).flatten()),
+        |locking| {
+            let (after, gib) = (ready_at.elapsed().as_secs_f64(), locking.bytes as f64 / (1u64 << 30) as f64);
+            let ran = if locking.requests == 0 { "no request ran meanwhile".to_string() } else { format!("{} request(s) ran meanwhile", locking.requests) };
+            let stopped = locking.stopped.as_ref().map(|why| format!(", stopped because {why}")).unwrap_or_default();
+            // (the turns wait for a request that has the engine: how long in all, and whether a wait reached the guard's time)
+            let guard = if locking.guard_fired { "fired" } else { "did not fire" };
+            let waited = format!("waited {:.1} s for requests, the {} s guard {guard}", locking.waited.as_secs_f64(), behind::YIELDING.at_most.as_secs());
+            if locking.layers > 0 || locking.stopped.is_some() {
+                eprintln!("Straydog host banks locked {what}: {} layers, {gib:.1} GiB, in {:.1} s, {after:.1} s {since}; {ran}; {waited}{stopped}",
+                          locking.layers, locking.seconds);
+            }
+        });
+    // (whatever ended it, the pages ahead of it are not wanted)
+    progress.over.store(true, Ordering::SeqCst);
 }
 
 /// Read the banks the locking is planned for, ahead of it, on a thread of its own ([`behind::read_ahead_behind`]): the pieces of the plan in the order they will be
@@ -965,6 +1027,13 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                     let terminal = generate(&engine, &text, &output, &id, &body, &cancel);
                     *active.lock().unwrap() = None;
                     output.send(&terminal);
+                    // (after what the runtime asks at once of a request that ended, as its prefix state, which takes the engine first;
+                    // a request that comes meanwhile waits for it: it costs nothing unless memory was freed)
+                    if terminal["event"] == "done" {
+                        if let Ok(mut engine) = engine.lock() {
+                            engine.after_request();
+                        }
+                    }
                 }).map_err(|exc| exc.to_string())?);
             }
             _ => break Err("unsupported Straydog command".into()),
