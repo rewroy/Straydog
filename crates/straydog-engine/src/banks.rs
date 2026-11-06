@@ -17,7 +17,9 @@
 //! Until step 2 the layer is what every layer that is not page-locked is: the CPU's experts read its pages from the mapping and the slots'
 //! copies read them as they are. No path that takes a bank's bytes to the GPU, the assist apart, depends on the lock.
 //!
-//! The locks are an optimisation and the K/V of a conversation is not, so the locks give way to it: when a K/V growth finds no memory,
+//! The locks are an optimisation and the K/V of a conversation is not, so the locks give way to it, in two ways. The locking leaves room: before a
+//! layer's turn it looks at the memory available then, and stops when the layer would leave less than the plan's margin and the K/V the context's
+//! first 64K tokens still have to grow ([`locking_room`]). And when a K/V growth finds no memory anyway,
 //! [`Model::give_back`](crate::model::Model::give_back) takes locked layers back, newest first ([`give_back_count`]), and ends the locking
 //! ([`BankLocks`] stops when the model says so, and a layer it locked meanwhile is let go).
 //!
@@ -27,7 +29,7 @@
 //! system for at a low priority ([`Piece::ask`], [`Piece::resident`]), a few hundred MB at a time, so that the locking and a request find them in memory.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::host::{Lowered, Priority};
@@ -140,6 +142,8 @@ pub struct BankLocks {
     margin: u64,
     /// Set by the model when it gives locked layers back to a request ([`Model::give_back`](crate::model::Model::give_back)): the plan locks no more.
     halt: Arc<AtomicBool>,
+    /// The bytes of K/V that the context's first 64K tokens still have to grow, which the model keeps up as its K/V grows ([`locking_room`]).
+    kv_ahead: Arc<AtomicU64>,
 }
 
 // SAFETY: the banks hold the address of the weights' mappings, which the thread that uses them keeps alive ([`BankLocks::lock_next`]).
@@ -147,12 +151,12 @@ unsafe impl Send for BankLocks {}
 
 impl BankLocks {
     pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
-        BankLocks { layers: layers.into(), ordinal, margin, halt: Arc::default() }
+        BankLocks { layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default() }
     }
 
-    /// The plan tied to a model: it stops when `halt` is set.
-    pub(crate) fn tied_to(mut self, halt: Arc<AtomicBool>) -> BankLocks {
-        self.halt = halt;
+    /// The plan tied to a model: it stops when `halt` is set, and `kv_ahead` says what K/V is still to grow ([`locking_room`]).
+    pub(crate) fn tied_to(mut self, halt: Arc<AtomicBool>, kv_ahead: Arc<AtomicU64>) -> BankLocks {
+        (self.halt, self.kv_ahead) = (halt, kv_ahead);
         self
     }
 
@@ -174,6 +178,13 @@ impl BankLocks {
     /// The layer [`BankLocks::lock_next`] takes next.
     pub fn next_layer(&self) -> Option<usize> {
         if self.halted() { None } else { self.layers.front().map(|(layer, _)| *layer) }
+    }
+
+    /// Whether the next layer's turn would leave the machine too little memory with `available` bytes available now, and if so why
+    /// ([`locking_room`]): the plan's margin and the K/V still to grow are kept free. None when it fits, and when no layer is left.
+    pub fn room_for_next(&self, available: u64) -> Option<Short> {
+        let layer_bytes = self.layers.front().filter(|_| !self.halted()).map(|(_, banks)| banks.iter().map(|bank| bank.bytes).sum::<u64>())?;
+        locking_room(available, layer_bytes, self.margin, self.kv_ahead.load(Ordering::Relaxed)).err()
     }
 
 
@@ -257,6 +268,42 @@ impl BankLocks {
             // SAFETY: the mapping is alive for the call that took the locks and for the one that gives them up.
             crate::gpu::unlock_host_range(unsafe { bank.range() });
         }
+    }
+}
+
+/// The positions of K/V that the locking behind "ready" leaves room for: the context's first 64K tokens (all of it if the context is smaller). A
+/// conversation that reaches further is served by the give-back ([`give_back_count`]), which takes the layers locked last back for its K/V; room for
+/// the whole of a 262144-token context (12 GiB) would leave a machine with 63 GiB of memory 12 GiB fewer locked layers for the many conversations that
+/// never reach it, and the first 64K are where nearly all of them end.
+pub const KV_ROOM_POSITIONS: usize = 65536;
+
+/// Why a layer's turn would leave the machine too little memory ([`locking_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Short {
+    /// The memory available now, the layer's banks, what the plan keeps free, and the K/V still to grow.
+    pub available: u64,
+    pub layer_bytes: u64,
+    pub margin: u64,
+    pub kv_ahead: u64,
+}
+
+impl Short {
+    /// The reason, as the log's line of the locking says it.
+    pub fn message(&self) -> String {
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        format!("{:.1} GiB of memory was available, and the next layer's {:.1} GiB would have left less than the {:.1} GiB kept free and the {:.1} GiB \
+                 of K/V that the context's first {KV_ROOM_POSITIONS} tokens still have to grow",
+                gib(self.available), gib(self.layer_bytes), gib(self.margin), gib(self.kv_ahead))
+    }
+}
+
+/// Whether a layer of `layer_bytes` can be locked with `available` bytes of memory available now: it must leave the plan's `margin` and the `kv_ahead`
+/// bytes of K/V that the context's first 64K tokens still have to grow ([`KV_ROOM_POSITIONS`]) available.
+pub fn locking_room(available: u64, layer_bytes: u64, margin: u64, kv_ahead: u64) -> Result<(), Short> {
+    if available.saturating_sub(layer_bytes) >= margin.saturating_add(kv_ahead) {
+        Ok(())
+    } else {
+        Err(Short { available, layer_bytes, margin, kv_ahead })
     }
 }
 
@@ -497,6 +544,60 @@ mod tests {
                     not known available); 1 layer stays locked, 1.0 GiB");
     }
 
+    /// Decides: a layer is locked only where it leaves the plan's margin and the K/V the context's first 64K tokens still have to grow available: the
+    /// edge is exact, no K/V left to grow asks the margin alone, and a layer larger than the memory available is never taken (no wrap-around).
+    #[test]
+    fn a_layer_is_locked_only_where_it_leaves_the_margin_and_the_k_v_still_to_grow() {
+        const GIB: u64 = 1 << 30;
+        // a machine of 63.6 GiB keeps 8 GiB free; a K/V at 32768 positions has 12 layers x 32768 x 4096 bytes = 1.5 GiB to grow to 65536
+        let (margin, kv) = (8 * GIB, 3 * GIB / 2);
+        assert!(locking_room(33 * GIB, 7 * GIB / 10, margin, kv).is_ok(), "plenty");
+        assert!(locking_room(margin + kv + GIB, GIB, margin, kv).is_ok(), "exactly what is kept free and the K/V leave");
+        let short = locking_room(margin + kv + GIB - 1, GIB, margin, kv).unwrap_err();
+        assert_eq!(short, Short { available: margin + kv + GIB - 1, layer_bytes: GIB, margin, kv_ahead: kv }, "a byte short");
+        assert!(locking_room(margin + GIB, GIB, margin, 0).is_ok(), "no K/V to grow: the margin alone");
+        assert!(locking_room(margin + GIB - 1, GIB, margin, 0).is_err());
+        assert!(locking_room(GIB / 2, GIB, margin, kv).is_err(), "a layer larger than what is available");
+        assert!(locking_room(u64::MAX, GIB, u64::MAX, u64::MAX).is_err(), "nothing wraps");
+        let text = short.message();
+        for part in ["10.5 GiB of memory was available", "next layer's 1.0 GiB", "8.0 GiB kept free", "1.5 GiB of K/V", "first 65536 tokens"] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+    }
+
+    /// Decides: a plan asks the room rule before each layer with the memory available then (here a stand-in), with the K/V still to grow as the model keeps
+    /// it up, and says nothing once its model has ended the locking or no layer is left.
+    #[test]
+    fn a_plan_asks_the_room_rule_of_its_next_layer_with_the_memory_available_now() {
+        const GIB: u64 = 1 << 30;
+        let path = std::env::temp_dir().join(format!("straydog-room-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![7u8; 8 << 20]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a file of this test's own, which nothing changes while it is mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let bank = |index: u64| Bank::new(map.as_ptr(), map.len(), index << 20, 1 << 20, None);
+        let (halt, kv) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(2 * GIB)));
+        let locks = BankLocks::new(vec![(47, [bank(0), bank(1), bank(2)]), (46, [bank(3), bank(4), bank(5)])], 0, 3 * GIB).tied_to(halt.clone(), kv.clone());
+        let layer = 3 << 20;
+        // (3 GiB kept free and 2 GiB of K/V to grow: a layer of 3 MiB needs 5 GiB and 3 MiB)
+        assert_eq!(locks.room_for_next(6 * GIB), None);
+        assert_eq!(locks.room_for_next(5 * GIB + layer), None);
+        assert_eq!(locks.room_for_next(5 * GIB + layer - 1), Some(Short { available: 5 * GIB + layer - 1, layer_bytes: layer, margin: 3 * GIB, kv_ahead: 2 * GIB }));
+        // the K/V grew meanwhile: less of it is to come
+        kv.store(0, Ordering::Relaxed);
+        assert_eq!(locks.room_for_next(3 * GIB + layer), None);
+        assert!(locks.room_for_next(3 * GIB + layer - 1).is_some());
+        kv.store(2 * GIB, Ordering::Relaxed);
+        assert!(locks.room_for_next(3 * GIB + layer).is_some());
+        halt.store(true, Ordering::SeqCst);
+        assert_eq!(locks.room_for_next(0), None, "the locking is ended: there is no turn to ask for");
+        let empty = BankLocks::new(Vec::new(), 0, 3 * GIB);
+        assert_eq!(empty.room_for_next(0), None, "no layer is left");
+        drop(map);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Decides: a plan whose model ended the locking takes no layer, shows none left, and has nothing to read ahead; one that was not ended is as it was.
     #[test]
     fn a_plan_the_model_ended_locks_no_more() {
@@ -507,7 +608,8 @@ mod tests {
         let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
         let bank = |index: u64| Bank::new(map.as_ptr(), map.len(), index << 20, 1 << 20, None);
         let halt = Arc::new(AtomicBool::new(false));
-        let mut locks = BankLocks::new(vec![(47, [bank(0), bank(1), bank(2)]), (46, [bank(3), bank(4), bank(5)])], 0, 3 << 30).tied_to(halt.clone());
+        let mut locks = BankLocks::new(vec![(47, [bank(0), bank(1), bank(2)]), (46, [bank(3), bank(4), bank(5)])], 0, 3 << 30)
+            .tied_to(halt.clone(), Arc::default());
         assert_eq!((locks.remaining(), locks.next_layer(), locks.halted()), (2, Some(47), false));
         assert_eq!(locks.read_ahead().len(), 6);
         halt.store(true, Ordering::SeqCst);
