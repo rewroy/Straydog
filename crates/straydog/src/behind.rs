@@ -145,11 +145,13 @@ pub(crate) struct Stopped {
 /// together (`take`, under the lock) at the first moment the engine is free after a turn, or when the last is locked, which waits for a request
 /// that has it. So requests that follow one another at once, as an agent's do, find the layers registered at the first gap between them.
 /// `job` is the plan, made under the engine's lock before a request could take it, with the engine's request count then (None: nothing is to be
-/// locked), and `more` says whether it has a layer left (no wait comes before a turn that will not be). `give_up` lets a layer go that the model will not take. `ended` is told how it went, under the lock, when it is over. `report` says it,
-/// at once.
+/// locked), and `more` says whether it has a layer left (no wait comes before a turn that will not be). `room` is asked after the wait, with the memory
+/// available then, for the layer about to be locked: it says why that layer would leave the machine too little ([`straydog_engine::banks::locking_room`]),
+/// and the locking then stops there, as it does at a layer that cannot be locked, with that reason. `give_up` lets a layer go that the model will not take.
+/// `ended` is told how it went, under the lock, when it is over. `report` says it, at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S) -> u64, pacing: Yielding, job: Option<(J, u64)>,
-                                   more: impl Fn(&J) -> bool,
+                                   more: impl Fn(&J) -> bool, room: impl Fn(&J) -> Option<String>,
                                    mut lock: impl FnMut(&mut J) -> Option<Result<(L, usize, u64), Stopped>>,
                                    mut take: impl FnMut(&mut S, L) -> Result<(), String>, give_up: impl Fn(L),
                                    ended: impl FnOnce(&mut S, &Locking), report: impl FnOnce(&Locking)) -> Locking {
@@ -205,6 +207,11 @@ pub(crate) fn lock_behind<S, J, L>(engine: &Weak<Mutex<S>>, requests: impl Fn(&S
         }
         if blocked {
             done.waited += wait_began.elapsed();
+        }
+        // (the memory available now, after the wait: a request that ran meanwhile may have grown its K/V)
+        if let Some(reason) = room(&job) {
+            done.stopped = Some(reason);
+            break;
         }
         // (held while a layer's turn runs, so that the weights it reads stay mapped)
         let Some(alive) = engine.upgrade() else { done.gone = true; break };
@@ -418,7 +425,7 @@ pub(crate) fn ahead_line(done: &Ahead, after: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Arc;
 
     /// A short poll and a guard that the tests which are not about it do not reach.
@@ -438,6 +445,23 @@ mod tests {
         refuse: usize,
         unverified: bool,
         locked: Arc<Mutex<Vec<usize>>>,
+        /// A stand-in for the machine's memory, which the room rule is asked of (None: always room).
+        memory: Option<Memory>,
+    }
+
+    /// What is available now (bytes), which each layer locked takes `layer_bytes` of, and the rule's margin and K/V still to grow.
+    struct Memory {
+        available: Arc<AtomicU64>,
+        layer_bytes: u64,
+        margin: u64,
+        kv_ahead: u64,
+    }
+
+    impl Memory {
+        /// The reason the next layer cannot be locked, if it cannot.
+        fn room_for(&self) -> Option<String> {
+            straydog_engine::banks::locking_room(self.available.load(Ordering::SeqCst), self.layer_bytes, self.margin, self.kv_ahead).err().map(|short| short.message())
+        }
     }
 
     fn drive(engine: &Arc<Mutex<Model>>, plan: Plan, between: impl Fn(usize) + Send + 'static) -> Locking {
@@ -448,6 +472,7 @@ mod tests {
         let locked_log = plan.locked.clone();
         lock_behind(&Arc::downgrade(engine), |model: &Model| model.requests, pacing, Some((plan, 0)),
                     |plan: &Plan| !plan.layers.is_empty(),
+                    |plan: &Plan| plan.layers.first().and_then(|_| plan.memory.as_ref().and_then(Memory::room_for)),
                     |plan: &mut Plan| {
                         if plan.layers.is_empty() {
                             return None;
@@ -459,6 +484,9 @@ mod tests {
                             return Some(Err(Stopped { message: format!("layer {layer} refused"), unverified: plan.unverified }));
                         }
                         locked_log.lock().unwrap().push(layer);
+                        if let Some(memory) = &plan.memory {
+                            memory.available.fetch_sub(memory.layer_bytes, Ordering::SeqCst);
+                        }
                         Some(Ok((layer, layer, 100)))
                     },
                     |model: &mut Model, layer| {
@@ -471,7 +499,53 @@ mod tests {
     }
 
     fn plan(layers: &[usize], refuse: usize) -> Plan {
-        Plan { layers: layers.to_vec(), refuse, unverified: false, locked: Arc::new(Mutex::new(Vec::new())) }
+        Plan { layers: layers.to_vec(), refuse, unverified: false, locked: Arc::new(Mutex::new(Vec::new())), memory: None }
+    }
+
+    /// A plan of `layers` with a stand-in for the machine's memory: `available` GiB, 4 GiB a layer, 3 GiB kept free and 2 GiB of K/V still to grow.
+    fn plan_with_memory(layers: &[usize], available: u64) -> (Plan, Arc<AtomicU64>) {
+        const GIB: u64 = 1 << 30;
+        let available = Arc::new(AtomicU64::new(available * GIB));
+        let mut plan = plan(layers, usize::MAX);
+        plan.memory = Some(Memory { available: available.clone(), layer_bytes: 4 * GIB, margin: 3 * GIB, kv_ahead: 2 * GIB });
+        (plan, available)
+    }
+
+    /// Decides: the locking asks the room rule before each layer's turn with the memory available then, and stops at the first layer that would leave
+    /// the margin and the K/V still to grow short, with the reason in the result and told to the model; the layers locked before it are taken.
+    #[test]
+    fn the_locking_stops_at_the_layer_that_would_leave_too_little_memory() {
+        let engine = Arc::new(Mutex::new(Model::default()));
+        // 20 GiB, 4 a layer: 16, 12, 8 are left after three layers, and a fourth would leave 4, under the 5 that are kept
+        let (plan, available) = plan_with_memory(&[47, 46, 45, 44, 43], 20);
+        let locking = drive(&engine, plan, |_| {});
+        assert_eq!((locking.layers, locking.unverified, locking.gone), (3, false, false));
+        let why = locking.stopped.clone().expect("it stopped");
+        assert!(why.contains("8.0 GiB of memory was available") && why.contains("next layer's 4.0 GiB") && why.contains("3.0 GiB kept free")
+                && why.contains("2.0 GiB of K/V"), "{why}");
+        assert_eq!(available.load(Ordering::SeqCst), 8 << 30, "the layer that would not fit was not locked");
+        let model = engine.lock().unwrap();
+        assert_eq!(model.taken, vec![47, 46, 45]);
+        assert_eq!(model.ended, Some((3, Some(why))));
+    }
+
+    /// Decides: the memory a request took while the locking waited is seen at the next turn, not the memory of the plan's start; with room for every
+    /// layer nothing stops it.
+    #[test]
+    fn memory_a_request_took_meanwhile_is_seen_at_the_next_turn() {
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let (plan, available) = plan_with_memory(&[47, 46, 45, 44], 40);
+        // (layer 46's turn runs while a request grows its K/V and takes 12 GiB: 40 - 4 - 12 = 24 is left for the next turn, which needs 5 + 4)
+        let between = { let available = available.clone(); move |layer: usize| if layer == 46 { available.fetch_sub(12 << 30, Ordering::SeqCst); } };
+        let locking = drive(&engine, plan, between);
+        assert_eq!((locking.layers, locking.stopped), (4, None), "24 GiB left is room for the rest");
+        let engine = Arc::new(Mutex::new(Model::default()));
+        let (plan, available) = plan_with_memory(&[47, 46, 45, 44], 40);
+        let between = { let available = available.clone(); move |layer: usize| if layer == 46 { available.fetch_sub(30 << 30, Ordering::SeqCst); } };
+        let locking = drive(&engine, plan, between);
+        assert_eq!(locking.layers, 2, "40 - 4 - 4 - 30 = 2 GiB is left after layer 46: layer 45 would not fit");
+        assert!(locking.stopped.is_some_and(|why| why.contains("2.0 GiB of memory was available")));
+        assert_eq!(engine.lock().unwrap().taken, vec![47, 46]);
     }
 
     /// Decides: every layer is locked and then taken, in the order planned, and the model is told when it is over.
@@ -551,7 +625,7 @@ mod tests {
             let (at_46, proceed) = (at_46.0, Mutex::new(proceed.1));
             std::thread::spawn(move || {
                 lock_behind(&engine, |model: &Model| model.requests, QUICK, Some((vec![47, 46, 45], 0)),
-                            |layers: &Vec<usize>| !layers.is_empty(),
+                            |layers: &Vec<usize>| !layers.is_empty(), |_: &Vec<usize>| None,
                             |layers: &mut Vec<usize>| {
                                 let layer = layers.remove(0);
                                 if layer == 46 {
@@ -722,7 +796,7 @@ mod tests {
         let engine = Arc::new(Mutex::new(Model::default()));
         let weak = Arc::downgrade(&engine);
         drop(engine);
-        let locking = lock_behind(&weak, |model: &Model| model.requests, QUICK, Some(((), 0)), |_: &()| true, |_: &mut ()| Some(Ok(((), 0, 0))), |_: &mut Model, ()| Ok(()), |()| {},
+        let locking = lock_behind(&weak, |model: &Model| model.requests, QUICK, Some(((), 0)), |_: &()| true, |_: &()| None, |_: &mut ()| Some(Ok(((), 0, 0))), |_: &mut Model, ()| Ok(()), |()| {},
                                   |_: &mut Model, _| panic!("no engine to tell"), |_| {});
         assert!(locking.gone);
     }
@@ -731,7 +805,7 @@ mod tests {
     #[test]
     fn nothing_planned_locks_nothing() {
         let engine = Arc::new(Mutex::new(Model::default()));
-        let locking = lock_behind(&Arc::downgrade(&engine), |model: &Model| model.requests, QUICK, None::<((), u64)>, |_: &()| true, |_: &mut ()| None::<Result<((), usize, u64), Stopped>>,
+        let locking = lock_behind(&Arc::downgrade(&engine), |model: &Model| model.requests, QUICK, None::<((), u64)>, |_: &()| true, |_: &()| None, |_: &mut ()| None::<Result<((), usize, u64), Stopped>>,
                                   |_: &mut Model, ()| Ok(()), |()| {}, |_: &mut Model, _| panic!("nothing was begun"), |_| {});
         assert_eq!((locking.layers, locking.gone), (0, false));
         assert!(engine.lock().unwrap().ended.is_none());

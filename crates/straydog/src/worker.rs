@@ -721,6 +721,8 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         }
         behind::lock_behind(&weak, |engine: &Engine| engine.requests, behind::YIELDING, job,
             |job| job.remaining() > 0,
+            // (the memory available now, less the layer: the plan's margin and the K/V the first 64K tokens have yet to grow stay free)
+            |job| job.room_for_next(straydog_engine::host::available_bytes()).map(|short| short.message()),
             |job| {
                 // SAFETY: `lock_behind` calls this with a strong reference to the engine held, which keeps the weights the plan was made from mapped.
                 // (the turn works at a lower priority, on fewer cores: a request that generates meanwhile needs them)

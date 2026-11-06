@@ -587,6 +587,8 @@ pub struct Model {
     bank_failure: Option<String>,
     /// Set when locked layers were given back to a request ([`Model::give_back`]): the locking behind "ready" locks no more (its plan holds this too).
     lock_halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The bytes of host K/V that the context's first 64K tokens still have to grow into (see [`Model::refresh_kv_ahead`]): the locking behind "ready" leaves them.
+    kv_ahead: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the engine has given back to requests since it started, in order.
     pub gave_back: Vec<GaveBack>,
     /// The group's counters when the request began (a request's partial residency counts).
@@ -733,6 +735,7 @@ impl Model {
             lock_pending: Vec::new(),
             bank_failure: None,
             lock_halt: Default::default(),
+            kv_ahead: Default::default(),
             gave_back: Vec::new(),
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
@@ -827,6 +830,7 @@ impl Model {
         model.speculative = if drafting && model.weights.drafter { drafts } else { 0 };
         // (a partially resident model's rows cost it far more: as many as it drafts)
         model.copy_drafts = if model.partial || model.speculative == 0 { model.speculative } else { VERIFY_ROWS - 1 };
+        model.refresh_kv_ahead();
         Ok(model)
     }
 
@@ -1241,12 +1245,13 @@ impl Model {
 
     /// The page locks for `layers`, to be taken one layer at a time ([`BankLocks::lock_next`]).
     fn lock_job(&self, layers: &[usize]) -> Result<BankLocks> {
+        self.refresh_kv_ahead();
         let mut planned = Vec::with_capacity(layers.len());
         for &layer in layers {
             let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)).tied_to(self.lock_halt.clone()))
+        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)).tied_to(self.lock_halt.clone(), self.kv_ahead.clone()))
     }
 
     /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then
@@ -1939,6 +1944,18 @@ impl Model {
         }
     }
 
+    /// What the locking behind "ready" leaves room for: the host K/V of the context's first 64K tokens ([`crate::banks::KV_ROOM_POSITIONS`], all of the context
+    /// if it is smaller) that is not yet grown, in bytes. Kept up for the locking's thread as the K/V grows; none where the K/V is in the VRAM.
+    fn refresh_kv_ahead(&self) {
+        let ahead = if self.host_kv {
+            let reach = self.context.min(crate::banks::KV_ROOM_POSITIONS);
+            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * 4096
+        } else {
+            0
+        };
+        self.kv_ahead.store(ahead, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The least the K/V grows to for `positions`: what the sequence needs and a little more, whole thousands of positions.
     fn kv_least(&self, positions: usize) -> usize {
         (positions + 4096).div_ceil(4096).saturating_mul(4096).min(self.context)
@@ -2084,6 +2101,7 @@ impl Model {
         };
         self.kv_capacity = capacity;
         self.hold_memory();
+        self.refresh_kv_ahead();
         // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
         for checkpoint in self.checkpoints.values_mut() {
             if let Some(history) = checkpoint.history.as_mut() {
