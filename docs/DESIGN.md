@@ -444,8 +444,26 @@ target, and each row's logits equal what token-by-token decode would compute, bi
 Three drafters:
 
 - **Qwen3.8's MTP drafter** (`-md`, `--draft-max`, default 3). It drafts while the product of
-  the drafts' probabilities under the drafter stays at 0.6 or more. Partially resident, it drafts
-  one token a pass, or two when the slots hold at least 15% of the routed experts at load (HIP).
+  the drafts' probabilities under the drafter stays at 0.6 or more. Partially resident, how many
+  drafts a pass takes (0 to `--draft-max`, at most three) is the engine's to choose, by what its
+  passes cost this machine (`width.rs`): a pass reads the layers' dense weights once whatever its
+  rows, so where the GPU's part of a layer is the longer a second and third row cost little and
+  drafts pay, and where the CPU's experts are it each row doubles their routes and one draft gains
+  next to nothing. It starts with one draft (two on HIP when the slots hold at least 15% of the
+  routed experts at load, where that was measured) and keeps, as windows of the latest passes, the
+  seconds of a pass by its rows, the share of passes whose chain of drafts reached each position
+  (the drawn-draft cut ends a chain where the drafter is unsure, whatever the width) and the share
+  of drafts offered at it that were kept. From those the seconds a token takes at each width
+  follow: the cost of the rows a pass of that width has, weighted by how often, over one plus the
+  drafts kept; with no cut, the cost of k+1 rows over one plus the shares kept at the first k
+  positions. A width replaces the one in force only if 3% faster and by more than two and a half
+  times the error of the difference (the assist level asks for 2: passes vary by a quarter, and
+  here a decision comes at every probe). The widths not in force are probed in turn, a stretch of
+  24 passes at each with the cut in force as in any pass, so that their rows and positions stay
+  timed: 3% of the passes, and none before the 256th of a run, when a machine's memory has filled.
+  The drawn-draft cut of a sampled request weighs each draft's row by what that row costs. The log
+  says each width's milliseconds a token, the shares kept and the passes' costs, at the first
+  choice and at each change, and the request line the drafts in force.
 - **DeepSeek-V4.1's DSpark** (§7.4). It needs no option: it is used when its file sits beside the
   bundle.
 - **An n-gram lookup of the sequence's own text** (`drafts.rs`), for both models. A match of eight
