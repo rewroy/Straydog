@@ -898,6 +898,10 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.route_floor(floor))
     }
 
+    pub fn prompt_share(&mut self, on: bool) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.prompt_share(on))
+    }
+
     pub fn rebalance(&mut self, max_swaps: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.rebalance(max_swaps))
     }
