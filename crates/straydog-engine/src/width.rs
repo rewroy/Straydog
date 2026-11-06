@@ -49,8 +49,11 @@ pub const PROBE_SHARE: f64 = 0.03;
 /// The passes after which the first probe may begin: a request that ends sooner is run as the width in force asks, and what a machine's
 /// first passes cost (its memory still filling with the model's experts) is not what it costs.
 pub const FIRST_PROBE_AFTER: u64 = 256;
-/// A row that fewer passes than this share have is costed from its neighbour where its window is thin.
+/// A row that fewer passes than this share have is costed from its neighbour where its window is empty. Where it holds only a few passes
+/// ([`FEW_SAMPLES`] or more) they cost it, with at least [`FEW_DOUBT`] of the cost as the error.
 const MINOR_ROW: f64 = 0.05;
+const FEW_SAMPLES: usize = 3;
+const FEW_DOUBT: f64 = 0.15;
 
 /// Normal passes between the end of a probe and the start of the next, so that probes (the pass at the start of a stretch, which is not
 /// timed, included) take [`PROBE_SHARE`] of the passes.
@@ -81,13 +84,18 @@ impl Window {
         self.values.clear();
     }
 
-    /// Seconds: the mean without the slowest eighth, and its standard error (a stall says nothing of a pass's rows: `assist::trimmed_mean`).
-    fn seconds(&self) -> Option<(f64, f64)> {
-        if self.values.len() < LEAST_SAMPLES {
+    /// Seconds: the mean without the slowest eighth, and its standard error (a stall says nothing of a pass's rows: `assist::trimmed_mean`),
+    /// if the window holds `least` values.
+    fn seconds_from(&self, least: usize) -> Option<(f64, f64)> {
+        if self.values.len() < least {
             return None;
         }
         let values: Vec<f64> = self.values.iter().copied().collect();
         Some(assist::trimmed_mean(&values))
+    }
+
+    fn seconds(&self) -> Option<(f64, f64)> {
+        self.seconds_from(LEAST_SAMPLES)
     }
 
     /// A share of ones among values of 0 and 1, and its standard error: from a share one count shy of all or none, so that a window of
@@ -327,13 +335,14 @@ impl Chooser {
         };
         let mut cost: Vec<(f64, f64)> = Vec::with_capacity(drafts + 1);
         for rows in 1..=drafts + 1 {
-            match self.pass_seconds(rows) {
-                Some(measured) => cost.push(measured),
-                None if before(rows - 1) - before(rows) < MINOR_ROW => {
+            match (self.pass_seconds(rows), self.cost[rows - 1].seconds_from(FEW_SAMPLES)) {
+                (Some(measured), _) => cost.push(measured),
+                (None, Some((mean, error))) => cost.push((mean, error.max(FEW_DOUBT * mean))),
+                (None, None) if before(rows - 1) - before(rows) < MINOR_ROW => {
                     let near = (rows + 1..=drafts + 1).chain((1..rows).rev()).find_map(|other| self.pass_seconds(other))?;
                     cost.push((near.0, 0.2 * near.0));
                 }
-                None => return None,
+                (None, None) => return None,
             }
         }
         let values = |parts: &[(f64, f64)]| parts.iter().map(|part| part.0).collect::<Vec<f64>>();
@@ -862,6 +871,41 @@ mod tests {
         assert!((rate(&[59.0, 78.0], &[0.0], &[0.9]) - 59.0).abs() < 1e-9);
         // a share that rises with the position is the chain's chance: it is taken as no more than the one before
         assert_eq!(rate(&[10.0, 20.0, 30.0], &[0.5, 0.9], &[1.0, 1.0]), rate(&[10.0, 20.0, 30.0], &[0.5, 0.5], &[1.0, 1.0]));
+    }
+
+    /// Where a cut ends nearly every chain at the first draft, the rows past it are seldom seen: a row that a tenth of the passes have is
+    /// costed from the few that were (three or more), and one that none have from its neighbour, so that the width is told all the same;
+    /// a row a tenth have and two were seen is not told.
+    #[test]
+    fn a_row_few_passes_have_is_costed_from_them() {
+        let filled = |wide: usize| {
+            let mut chooser = Chooser::new(3, 1);
+            for _ in 0..20 {
+                chooser.bare.push(0.020);
+                chooser.cost[0].push(0.021);
+                chooser.cost[1].push(0.030);
+                chooser.reach[0].push(1.0);
+                chooser.reach[2].push(0.0);
+                chooser.kept[0].push(1.0);
+            }
+            for at in 0..20 {
+                chooser.reach[1].push(f64::from(at < 2));
+                chooser.kept[1].push(1.0);
+            }
+            for _ in 0..wide {
+                chooser.cost[2].push(0.045);
+            }
+            chooser
+        };
+        // (one draft: two rows, the passes of a row of three hardly come into it)
+        assert!(filled(0).estimate(1).is_some());
+        let told = filled(4).estimate(2).expect("a row seen four times costs its width");
+        // (a tenth of the passes cost 45 ms, nine tenths 30: over 1 + 1.0 + 0.1 tokens, with a 15% doubt on the 45)
+        assert!((told.seconds - (0.9 * 0.030 + 0.1 * 0.045) / 2.1).abs() < 1e-9, "{}", told.seconds);
+        assert!(told.error > 0.0);
+        assert!(filled(2).estimate(2).is_none(), "two passes do not tell a row that a tenth of the passes have");
+        // (past the chains' reach nothing weighs: the width is told from the row before it)
+        assert!(filled(4).estimate(3).is_some());
     }
 
     /// Pinned, the width stays and nothing is probed.
