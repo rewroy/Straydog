@@ -1134,6 +1134,14 @@ layer (§6.2).
   64.5 to 67.3 tok/s; a 1-row pass 16.8 to 16.2 ms at 20K, a 4-row one 27.2 to 26.5 ms), greedy
   tokens part from the F32 run about as early as before, and 0.6 GB of VRAM comes free.
   `STRAYDOG_HC_Q8=0` keeps them BF16.
+- **The decode head in one wait (CUDA).** A plain decode step's head was the HyperConnection mix (a launch, a wait and the mixed row
+  copied to the host), then the projection (the row copied back, a launch, a wait, and 248320 logits into a vector the host zeroed,
+  scanned for non-finite values and copied again): 1.11 ms a token on an RTX 5070 Ti, of which the Q6_K head's GEMV is 0.63 (521 MB
+  at 829 GB/s, as fast as a plain streaming kernel reads the same bytes: the kernel was never what held it). `sd_decode_head`
+  launches the mix, the projection and a non-finite check of the logits one after the other and waits once: 0.89 ms, the logits the
+  two calls' bits (`decode_head_gpu`). The rest is the launches' and the two copies' latency under WDDM, about 150 us, and the copy of
+  the logits out of the staging memory into the vector, 50 us; the vector is the step before's, given back by the draw. HIP keeps
+  the two calls. `examples/head_bench.rs` times the GEMV alone.
 - **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 2048:
   4096 rows took the first token of a 20K and a 60K prompt 7-12% longer (5.7 to 6.5 s, 15.8 to
   17.2 s), so the derived batch for the resident models is 2048 where it was 4096.

@@ -733,6 +733,16 @@ impl Group {
         self.backends[owner].hyperconnection(prefix, values, norm, matrices)
     }
 
+    /// [`Backend::decode_head`] on the last device, where the head's mix and matrix live; false (nothing run) where they are
+    /// not on one device.
+    pub fn decode_head(&mut self, operands: &[Operand], values: &[f32], logits: &mut Vec<f32>) -> Result<bool> {
+        let last = self.backends.len() - 1;
+        if operands.len() != 4 || self.index("output_hc") != last || self.index(&operands[3].key) != last {
+            return Ok(false);
+        }
+        self.backends[last].decode_head(operands, values, logits).map(|()| true)
+    }
+
     /// Projections on the devices owning their weights, in the callers' order.
     pub fn project_many(&mut self, requests: &[(Operand, &[f32])]) -> Result<Vec<Vec<f32>>> {
         let mut results: Vec<Option<Vec<f32>>> = vec![None; requests.len()];
