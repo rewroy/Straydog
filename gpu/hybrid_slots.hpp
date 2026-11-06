@@ -392,6 +392,10 @@ void restore_expert_slots(Device& d, size_t cache) {
     }
     d.used += bytes;
     expert_slots_carve(d, cache * d.slots.bytes);
+    // The pool is at another address now, and its arena another size: the staging slots (base + arena, CUDA's assist) that the hybrid
+    // layers' captured graphs hold by value are gone, and a replay would read and write freed memory. A K/V growth has dropped them
+    // already (sd_kv_grow); a raised budget and a long prompt's end have not. Restores are rare: capturing again costs little.
+    kv_clear_graphs(d);
 }
 
 // Bounded swaps (max_swaps > 0) never block the compute stream: victims are
