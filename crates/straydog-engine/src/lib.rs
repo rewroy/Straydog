@@ -33,3 +33,4 @@ pub mod transfer;
 pub mod verity;
 pub mod vision;
 pub mod weights;
+pub mod width;
