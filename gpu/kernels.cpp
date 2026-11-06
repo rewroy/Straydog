@@ -611,8 +611,10 @@ struct Device {
     double prompt_stream_ns=0, prompt_cpu_ns=0;
     double prompt_scale=0.7;   // the CPU's share of the GPU's time it is given: moved by how the last batches' CPU and GPU finished
     double prompt_gather_ns=0;   // what gathering an expert from pageable banks into pinned memory cost in the last batches (ns)
-    float* prompt_host=nullptr;   // pinned: a batch's rows to the CPU, its routes' results and their routes back
+    float* prompt_host=nullptr;   // pinned (or pageable where pinning was refused): a batch's rows to the CPU, its routes' results back
     size_t prompt_host_floats=0;
+    bool prompt_host_pinned=false;
+    std::vector<float> prompt_pageable;
     hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
@@ -647,7 +649,7 @@ struct Device {
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (exchange) cleanup(hipHostFree(exchange));
-        if (prompt_host) cleanup(hipHostFree(prompt_host));
+        if (prompt_host && prompt_host_pinned) cleanup(hipHostFree(prompt_host));
         if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));
         if (readback) cleanup(hipHostFree(readback));
         if (route_mailbox) cleanup(hipHostFree(route_mailbox));
