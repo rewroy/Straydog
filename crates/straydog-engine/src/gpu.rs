@@ -451,6 +451,27 @@ impl Backend {
         Ok((used, budget))
     }
 
+    /// Raise the budget to `budget` and place the expert slots again at what fits then, with the experts that use them most (as after a K/V
+    /// growth, [`Backend::grow_kv`]): GPU memory that other programs freed since the start, under `auto`. The slots before and after; a device
+    /// with no slots placed, or in a long prompt's prefill, only takes the budget.
+    pub fn raise_budget(&mut self, budget: u64) -> Result<(u64, u64)> {
+        let (before, (_, was)) = (self.hybrid_counts()?[3], self.memory()?);
+        // SAFETY: a live handle and plain values (both here and below).
+        check(unsafe { ffi::sd_set_budget(self.handle, budget) })?;
+        if self.slot_stage > 0 && self.long_prefill.is_none() {
+            // SAFETY: a live handle, between requests.
+            check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+            if let Err(error) = self.slots_back() {
+                // (the memory was taken again before the slots were: the pool goes back to the budget it had)
+                check(unsafe { ffi::sd_set_budget(self.handle, was) })?;
+                check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+                self.slots_back()?;
+                return Err(error);
+            }
+        }
+        Ok((before, self.hybrid_counts()?[3]))
+    }
+
     /// The device's free memory as the runtime reports it (the card's, other programs' included).
     pub fn free_bytes(&self) -> Result<u64> {
         straydog_gpu::device_info(self.ordinal).map(|(_, free, _)| free).map_err(|error| error.to_string())
