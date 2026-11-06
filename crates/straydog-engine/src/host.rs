@@ -151,6 +151,21 @@ pub fn available_bytes() -> u64 {
     0
 }
 
+/// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
+/// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
+/// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
+pub fn room_now() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let (available, commit) = windows_available();
+        Some(if commit > 0 { commit } else { available }).filter(|room| *room > 0)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(available_bytes()).filter(|room| *room > 0)
+    }
+}
+
 /// This process's memory for a request's log line: resident bytes, the bytes available on the machine, and its page faults so far.
 pub fn memory_note() -> Option<(u64, u64, u64)> {
     #[cfg(windows)]

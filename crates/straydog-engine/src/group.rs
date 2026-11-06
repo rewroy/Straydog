@@ -966,6 +966,22 @@ impl Group {
         self.backends[0].adopt_host(range)
     }
 
+    /// Give back the page locks of a layer's three banks that [`Group::adopt_host`] took: every device stops reading them in place first (the layer is
+    /// on one of them), then the locks are given up. The banks are the system's to page again, and what they held of the commit is given back.
+    pub fn release_host(&mut self, banks: [&[u8]; 3]) -> Result<()> {
+        let mut held = false;
+        for backend in &mut self.backends {
+            held |= backend.unmap_banks(banks[0])?;
+        }
+        if !held {
+            return Err("no device holds the layer whose banks are given back".into());
+        }
+        for bank in banks {
+            self.backends[0].release_host(bank)?;
+        }
+        Ok(())
+    }
+
     fn owned_layers(&self, index: usize, drafter: bool) -> Vec<usize> {
         (0..if drafter { 49 } else { 48 }).filter(|layer| self.owner(*layer) == index || self.parted(&format!("blk.{layer}."))).collect()
     }
