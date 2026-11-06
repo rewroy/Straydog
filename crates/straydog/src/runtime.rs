@@ -450,6 +450,37 @@ fn prefill_summary(usage: &Value, timings: &Value) -> String {
     }
 }
 
+/// An exit status as the log gives it: on Windows a failure code in hex, with those of memory and crashes named (STATUS_NO_MEMORY is
+/// what a refused allocation ends a process with, STATUS_COMMITMENT_LIMIT the system's commit charge at its limit).
+fn exit_status(status: &std::process::ExitStatus) -> String {
+    #[cfg(windows)]
+    if let Some(code) = status.code().map(|code| code as u32).filter(|code| *code >= 0x8000_0000) {
+        let name = match code {
+            0xC000_0017 => " STATUS_NO_MEMORY: out of memory",
+            0xC000_012D => " STATUS_COMMITMENT_LIMIT: the system's commit charge reached its limit",
+            0xC000_0005 => " STATUS_ACCESS_VIOLATION",
+            0xC000_0409 => " STATUS_STACK_BUFFER_OVERRUN: a fail-fast abort",
+            0xC000_00FD => " STATUS_STACK_OVERFLOW",
+            _ => "",
+        };
+        return format!("exit code 0x{code:08X}{name}");
+    }
+    #[cfg(unix)]
+    if std::os::unix::process::ExitStatusExt::signal(status) == Some(9) {
+        return format!("{status}; the system may have stopped it for memory");
+    }
+    status.to_string()
+}
+
+/// The worker's last lines on stderr (an allocation that failed, a GPU error, a panic), for the log line that says it stopped: empty
+/// when it wrote none.
+fn worker_said(tail: &[u8]) -> String {
+    let text = String::from_utf8_lossy(tail);
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let last = &lines[lines.len().saturating_sub(6)..];
+    if last.is_empty() { String::new() } else { format!("; its last lines: {}", last.join(" | ")) }
+}
+
 /// A partially resident request's breakdown: a generated token's wait for the GPU and the CPU experts' time, where its routes ran, its passes,
 /// the experts its prompt streamed over the bus (and the routes of others the CPU computed), and the memory it ended with.
 fn partial_summary(detail: &Value, timings: &Value) -> String {
@@ -1008,8 +1039,11 @@ impl Driver {
                 biased;
                 job = jobs.recv() => match job { Some(job) => job, None => return changed },
                 status = process.child.wait() => {
-                    let status = status.map_or_else(|exc| exc.to_string(), |status| status.to_string());
-                    self.fail(format!("Straydog's worker exited ({status}); restart the server"));
+                    let status = status.map_or_else(|exc| exc.to_string(), |status| exit_status(&status));
+                    // (the worker's last lines, which name the cause, arrive after its exit)
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let said = worker_said(&self.shared.stderr_tail.lock().unwrap());
+                    self.fail(format!("Straydog's worker exited ({status}){said}; restart the server"));
                     return false;
                 }
                 _ = save.tick(), if changed => {
@@ -1032,7 +1066,15 @@ impl Driver {
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
             self.shared.activity.lock().unwrap().live = None;
             if let Err(message) = result {
-                let message = format!("{message}; restart the server");
+                // (a worker that died mid-request, as one the system stopped for memory, says why only on its stderr)
+                let died = match process.child.try_wait() {
+                    Ok(Some(status)) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        format!(" (the worker exited: {}{})", exit_status(&status), worker_said(&self.shared.stderr_tail.lock().unwrap()))
+                    }
+                    _ => String::new(),
+                };
+                let message = format!("{message}{died}; restart the server");
                 let _ = job.events.send(json!({"event": "error", "message": message, "fatal": true})).await;
                 self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
                 // (the reason goes to the client it failed for and to the server's last line; other clients see that it failed)
@@ -1569,6 +1611,21 @@ impl Engine for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among
+    /// them), at most six, and nothing when it wrote none; a worker the system killed says the system may have stopped it for memory.
+    #[test]
+    fn a_worker_that_stopped_is_logged_with_its_last_lines() {
+        let tail = b"Straydog ready\n\nline 1\nline 2\nline 3\nline 4\nline 5\nmemory allocation of 1073741824 bytes failed\n";
+        assert_eq!(worker_said(tail), "; its last lines: line 1 | line 2 | line 3 | line 4 | line 5 | memory allocation of 1073741824 bytes failed");
+        assert_eq!(worker_said(b"\n \n"), "");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(exit_status(&std::process::ExitStatus::from_raw(9)).ends_with("the system may have stopped it for memory"));
+            assert_eq!(exit_status(&std::process::ExitStatus::from_raw(1 << 8)), "exit status: 1");
+        }
+    }
 
     /// Decides: a bundle read on demand keeps its warm-up state under the name it always had, a partially resident one's route counts under a name of
     /// the bundle's three labels and a key of their own, and the two never meet: not by name, not by the prefix an earlier version's file is searched by
