@@ -2151,6 +2151,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_gpu_timing(
+        handle: *mut ::std::os::raw::c_void,
+        layer_ns: *mut u64,
+        experts_ns: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_routes(
         handle: *mut ::std::os::raw::c_void,
         plan: *mut ::std::os::raw::c_void,
