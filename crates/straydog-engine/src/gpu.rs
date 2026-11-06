@@ -2302,13 +2302,14 @@ impl Backend {
         Ok(())
     }
 
-    pub fn hybrid_counts(&self) -> Result<[u64; 9]> {
-        let mut values = [0u64; 9];
-        let [a, b, c, d, e, f, g, h, i] = &mut values;
-        // SAFETY: four out-parameters each, then one.
+    pub fn hybrid_counts(&self) -> Result<[u64; 11]> {
+        let mut values = [0u64; 11];
+        let [a, b, c, d, e, f, g, h, i, j, k] = &mut values;
+        // SAFETY: four out-parameters each, then one, then two.
         check(unsafe { ffi::sd_hybrid_counts(self.handle, a, b, c, d) })?;
         check(unsafe { ffi::sd_hybrid_timing(self.handle, e, f, g, h) })?;
         check(unsafe { ffi::sd_hybrid_prompt_cpu(self.handle, i) })?;
+        check(unsafe { ffi::sd_hybrid_gpu_timing(self.handle, j, k) })?;
         Ok(values)
     }
 
@@ -2395,8 +2396,8 @@ pub fn unlock_host_range(range: &[u8]) {
     unsafe { ffi::sd_host_unregister(range.as_ptr().cast_mut().cast()) };
 }
 
-pub const HYBRID_COUNTERS: [&str; 9] = ["gpu_experts", "cpu_experts", "streamed_experts", "cached_experts", "wait_ns",
-                                        "cpu_ns", "swapped_experts", "assisted_experts", "prompt_cpu_routes"];
+pub const HYBRID_COUNTERS: [&str; 11] = ["gpu_experts", "cpu_experts", "streamed_experts", "cached_experts", "wait_ns",
+                                         "cpu_ns", "swapped_experts", "assisted_experts", "prompt_cpu_routes", "layer_ns", "gpu_experts_ns"];
 
 impl Drop for Backend {
     fn drop(&mut self) {

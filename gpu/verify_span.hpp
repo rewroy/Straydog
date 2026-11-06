@@ -151,7 +151,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             hybrid_stage<<<dim3(1,unsigned(steps - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1), d.cpu_partial + 2560);
 #endif
         hybrid_finish<<<dim3(40,unsigned(steps)),256,0,d.stream>>>(v.hidden, v.mixed, 2564, v.branch, stage ? d.cpu_partial : d.exchange_device + hybrid_result_at(0),
-                                                                   stage ? 2560 : hybrid_row_floats);
+                                                                   stage ? 2560 : hybrid_row_floats, hybrid_clock(d));
     };
     auto launch = [&](size_t layer) {
         DecoderLayer& plan = d.decoder.find(layer)->second;
@@ -161,7 +161,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             if (finish) finish_previous();
             verify_layer_front(d, plan, steps, v);
             hybrid_route_export(d, experts, v.mixed, steps);
-            hybrid_tick<<<1,1,0,d.stream>>>(d.flags + 1, reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot));
+            hybrid_tick<<<1,1,0,d.stream>>>(d.flags + 1, reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot), hybrid_clock(d), finish);
             hybrid_resident_experts(d, experts, v.mixed, v.branch, steps);
             check(hipGetLastError());
         };
@@ -204,6 +204,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         if (ahead && !before) launch_after(layer);
     }
     if (!ahead) finish_previous();
+    d.hybrid_layers += end - begin; d.hybrid_timed_layers += end - begin - 1;
     check(hipGetLastError());
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;
     if (output) download(d, output, v.hidden, steps * 10240 * 4);

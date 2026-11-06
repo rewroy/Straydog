@@ -1,8 +1,21 @@
 // Single-token hybrid MoE: GPU part and the host CPU-expert step (see hybrid_slots.hpp).
 // blockIdx.y a row, in every kernel of this file that takes one.
+__device__ inline uint64_t await_clock() {
+#if defined(__HIPCC__)
+    return wall_clock64();
+#else
+    uint64_t now; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)); return now;
+#endif
+}
+// Where the host's wait for a layer's export goes, on the GPU's own clock, in device memory (d.flags + 8, read by
+// sd_hybrid_gpu_timing when a request ends): [0] the layer's start, once the previous layer's CPU result is in
+// (hybrid_finish), [1] its export (hybrid_tick), [2] start to export summed, [3] export to the resident experts'
+// combine summed. One thread's store in kernels that run anyway: nothing crosses the bus for it.
+inline uint64_t* hybrid_clock(Device& d) { return reinterpret_cast<uint64_t*>(d.flags + 8); }
 __global__ void hybrid_combine(const float* outputs, const float* probabilities, const int32_t* selected,
-                               const MoeGroup* groups, ExpertGemv plan, float* result) { SD_KERNEL_ACQUIRE;
+                               const MoeGroup* groups, ExpertGemv plan, float* result, uint64_t* clock) { SD_KERNEL_ACQUIRE;
     const size_t column = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (column == 0 && blockIdx.y == 0) clock[3] += await_clock() - clock[1];
     if (column >= 2560) return;
     outputs += size_t(blockIdx.y) * 11 * 2560; probabilities += size_t(blockIdx.y) * 11; selected += size_t(blockIdx.y) * 10;
     result += size_t(blockIdx.y) * 2560;
@@ -28,23 +41,22 @@ __global__ void hybrid_export(const int32_t* selected, const float* probabilitie
 }
 // Graph-safe completion signal: each replay advances a device counter and copies
 // it after the exported data, so the host waits for exactly this layer's export.
-__global__ void hybrid_tick(uint32_t* counter, volatile uint32_t* published) { SD_KERNEL_ACQUIRE;
+// `timed`: the layer has a start in clock[0] (the span's first layer has none).
+__global__ void hybrid_tick(uint32_t* counter, volatile uint32_t* published, uint64_t* clock, bool timed) { SD_KERNEL_ACQUIRE;
+    const uint64_t now = await_clock();
+    if (timed) clock[2] += now - clock[0];
+    clock[1] = now;
     __threadfence_system();
     *published = ++*counter;
     __threadfence_system();
 }
-__global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_stride, const float* gpu, const float* cpu, size_t cpu_stride) { SD_KERNEL_ACQUIRE;
+__global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_stride, const float* gpu, const float* cpu, size_t cpu_stride,
+                              uint64_t* clock) { SD_KERNEL_ACQUIRE;
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (i == 0 && blockIdx.y == 0) clock[0] = await_clock();
     hidden += size_t(blockIdx.y) * 10240; mixed += size_t(blockIdx.y) * mixed_stride; gpu += size_t(blockIdx.y) * 2560;
     cpu += size_t(blockIdx.y) * cpu_stride;
     if (i < 10240) hidden[i] += mixed[2560 + i / 2560] * (gpu[i % 2560] + cpu[i % 2560]);
-}
-__device__ inline uint64_t await_clock() {
-#if defined(__HIPCC__)
-    return wall_clock64();
-#else
-    uint64_t now; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)); return now;
-#endif
 }
 // Graph-safe wait for the host's CPU result of the previous layer (one block): each
 // replay advances the awaited count in pinned memory and spins until the host has
@@ -188,7 +200,8 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
     resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes);
     moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, routes, s.product);
     resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, rows, 11 * 640, 11 * 2560, false, stage, d.slots.bytes);
-    hybrid_combine<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial);
+    hybrid_combine<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial,
+                                                                    hybrid_clock(d));
     check(hipGetLastError());
 }
 

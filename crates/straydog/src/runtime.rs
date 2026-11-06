@@ -512,7 +512,11 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     });
     // (a prompt batch's experts with the fewest rows: the CPU computes their routes instead of the bus streaming them)
     let prompt_cpu = Some(number("prompt_cpu_routes")).filter(|routes| *routes >= 0.5).map_or_else(String::new, |routes| format!(" and the CPU {routes:.0} routes"));
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
+    // (the wait by the GPU's own clock: its layer work from the CPU's result to the export, the rest of the wait launching and handing
+    // over; and its resident experts, which run beside the CPU)
+    let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
+        .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1739,6 +1743,19 @@ mod tests {
         // (no page-locked layer: no level to say)
         let without = request_summary(&event(Value::Null), None);
         assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
+    }
+
+    /// The GPU wait is followed by what the GPU's clock says of it: the layer work, and the resident experts beside the CPU; a build or
+    /// path that timed none reads as before.
+    #[test]
+    fn a_partial_request_line_splits_the_gpu_wait_by_the_gpus_clock() {
+        let detail = |layer: f64| json!({"wait_ms": 34.0, "cpu_ms": 15.0, "layer_ms": layer, "gpu_experts_ms": 1.1, "gpu_routes": 200.0,
+                                         "cpu_routes": 180.0, "assisted_routes": 0.0, "swaps": 3.0, "slots": 900, "passes": [10, 0], "pass_ms": [55.0, 0.0]});
+        let event = |layer: f64| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 1e3 / 55.0, "partial_detail": detail(layer)}});
+        let line = request_summary(&event(14.2), None);
+        assert!(line.contains("ms a token: GPU wait 34.0 (the GPU's layer work 14.2, its experts 1.1 beside the CPU), CPU 15.0, other 6.0;"), "{line}");
+        let untimed = request_summary(&event(0.0), None);
+        assert!(untimed.contains("ms a token: GPU wait 34.0, CPU 15.0, other 6.0;"), "{untimed}");
     }
 
     /// The CPU's time is followed by the engine's phases where it reports them: gate and up, the products, down with the weighted sum.
