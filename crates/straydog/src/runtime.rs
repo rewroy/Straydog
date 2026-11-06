@@ -472,6 +472,16 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
     status.to_string()
 }
 
+/// Whether a line the worker wrote on stderr is in the log without --verbose. The warm-up's own account stays: how long it took, and what it
+/// placed; so does the account of the host banks a partially resident model page-locked, and when it pages or no longer; of the GPU memory
+/// freed after the start that the expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its
+/// passes cost, at the first choice and at each change.
+fn stays_in_the_log(line: &str) -> bool {
+    ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first",
+     "Straydog prefix", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+        .iter().any(|start| line.starts_with(start))
+}
+
 /// The worker's last lines on stderr (an allocation that failed, a GPU error, a panic), for the log line that says it stopped: empty
 /// when it wrote none.
 fn worker_said(tail: &[u8]) -> String {
@@ -487,8 +497,13 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     let number = |key: &str| detail[key].as_f64().unwrap_or(0.0);
     let decode = timings["decode_tokens_per_second"].as_f64().map_or(0.0, |rate| 1e3 / rate.max(1e-9));
     let (wait, cpu) = (number("wait_ms"), number("cpu_ms"));
-    let passes = detail["passes"].as_array().map_or((0, 0), |counts| (counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
-    let pass_ms = detail["pass_ms"].as_array().map_or((0.0, 0.0), |ms| (ms[0].as_f64().unwrap_or(0.0), ms[1].as_f64().unwrap_or(0.0)));
+    // (the passes by rows, a pass of one row and of two always, and of more where there were some: the drafts a pass offers go up to three)
+    let pass_rows = |rows: usize| (detail["passes"][rows - 1].as_u64().unwrap_or(0), detail["pass_ms"][rows - 1].as_f64().unwrap_or(0.0));
+    let passes = (pass_rows(1), pass_rows(2));
+    let wider: String = (3..=4).map(pass_rows).zip(3..).filter(|((count, _), _)| *count > 0)
+        .map(|((count, ms), rows)| format!(", {count} of {rows} ({ms:.1} ms)")).collect();
+    // (where a drafter is: the drafts a pass offered at the end of the request, which the engine chooses by what its passes cost)
+    let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
         _ => String::new(),
@@ -516,9 +531,9 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
-            passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
+            passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
 
 /// The id the client named its request by (the worker request's `request_id`, see [`straydog_api::WorkerRequest`]).
@@ -1302,13 +1317,7 @@ impl Driver {
                 let excess = tail.len().saturating_sub(STDERR_TAIL);
                 tail.drain(..excess);
                 let text = String::from_utf8_lossy(&line);
-                // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
-                // account of the host banks a partially resident model page-locked, and when it pages or no longer; and of the GPU
-                // memory freed after the start that the expert slots took, or could not)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix", "Straydog CPU experts",
-                            "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks"]
-                    .iter().any(|start| text.starts_with(start));
-                if verbose || warm {
+                if verbose || stays_in_the_log(&text) {
                     tracing::info!("worker: {text}");
                 } else {
                     tracing::debug!("worker: {text}");
@@ -1745,6 +1754,37 @@ mod tests {
         // (no page-locked layer: no level to say)
         let without = request_summary(&event(Value::Null), None);
         assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
+    }
+
+    /// The engine's account of the drafts a pass offers is in the log without --verbose, as its other accounts of how it chose; its other lines
+    /// are not.
+    #[test]
+    fn the_drafts_a_pass_offers_are_said_in_the_log() {
+        assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
+        assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
+        assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
+        assert!(!stays_in_the_log("some other line"));
+    }
+
+    /// A partially resident request's line gives its passes by rows up to four, the wider ones where there were some, and the drafts the engine
+    /// had in force at its end where a drafter is placed (none, as with no drafter, says nothing).
+    #[test]
+    fn a_partial_request_line_has_the_drafts_in_force_and_the_wider_passes() {
+        let detail = |passes: Value, pass_ms: Value, drafts: Value| json!({"wait_ms": 8.0, "cpu_ms": 20.0, "gpu_routes": 200.0, "cpu_routes": 180.0,
+                                                                          "assisted_routes": 70.0, "swaps": 3.0, "slots": 900, "passes": passes,
+                                                                          "pass_ms": pass_ms, "drafts": drafts});
+        let event = |detail: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 14.0, "partial_detail": detail}});
+        let wide = request_summary(&event(detail(json!([12, 40, 400, 0]), json!([30.1, 41.5, 60.2, 0.0]), json!(2))), None);
+        assert!(wide.contains("; passes: 12 of 1 row (30.1 ms), 40 of 2 (41.5 ms), 400 of 3 (60.2 ms); drafts in force: 2; prompt streamed"), "{wide}");
+        let all = request_summary(&event(detail(json!([1, 2, 3, 4]), json!([30.0, 40.0, 50.0, 60.0]), json!(3))), None);
+        assert!(all.contains("1 of 1 row (30.0 ms), 2 of 2 (40.0 ms), 3 of 3 (50.0 ms), 4 of 4 (60.0 ms); drafts in force: 3;"), "{all}");
+        // (no drafter: the passes of one row, as before, and no drafts to say)
+        let plain = request_summary(&event(detail(json!([463, 0, 0, 0]), json!([30.9, 0.0, 0.0, 0.0]), Value::Null)), None);
+        assert!(plain.contains("; passes: 463 of 1 row (30.9 ms), 0 of 2 (0.0 ms); prompt streamed"), "{plain}");
+        // (a worker that reports two counts alone: as before)
+        let old = request_summary(&event(detail(json!([10, 3]), json!([20.0, 25.0]), Value::Null)), None);
+        assert!(old.contains("; passes: 10 of 1 row (20.0 ms), 3 of 2 (25.0 ms); prompt streamed"), "{old}");
     }
 
     /// The GPU wait is followed by what the GPU's clock says of it: the layer work, and the resident experts beside the CPU; a build or
