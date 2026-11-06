@@ -1303,8 +1303,10 @@ impl Driver {
                 tail.drain(..excess);
                 let text = String::from_utf8_lossy(&line);
                 // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
-                // account of the host banks a partially resident model page-locked, and when it pages or no longer)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix", "Straydog CPU experts"]
+                // account of the host banks a partially resident model page-locked, and when it pages or no longer; and of the GPU
+                // memory freed after the start that the expert slots took, or could not)
+                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix", "Straydog CPU experts",
+                            "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks"]
                     .iter().any(|start| text.starts_with(start));
                 if verbose || warm {
                     tracing::info!("worker: {text}");
