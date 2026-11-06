@@ -494,6 +494,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     // (cached ones pay an extra pass through host memory); the experts then copy by DMA.
     // Page-locked (registered) banks copy directly.
     const bool gather = d.slots.host && d.cpu && !plan.mapped[0];
+    uint64_t gathered_ns = 0;
     StreamEvents events;
     std::vector<uint8_t*> targets;
     for (size_t first = 0, chunk = 0; first < missing.size(); first += half, ++chunk) {
@@ -505,7 +506,9 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
             if (chunk >= 2) check(hipEventSynchronize(events.loaded[buffer]));
             targets.clear();
             for (size_t i = 0; i < count; ++i) targets.push_back(host + i * d.slots.bytes);
+            const auto began = std::chrono::steady_clock::now();
             hybrid_gather(d, plan, missing.data() + first, count, targets.data());
+            gathered_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
         }
         if (chunk >= 2) check(hipStreamWaitEvent(d.copy_stream, events.used[buffer], 0));
         // Straight from the banks, a chunk's matrices land role by role, so a run of consecutive experts is one copy a role: three copies
@@ -539,5 +542,10 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     check(hipStreamSynchronize(d.stream));
     float ms = 0;
     check(hipEventElapsedTime(&ms, span.began, span.ended));
+    // (what a gathered expert cost the CPU's workers: prompt_cpu_share weighs a route against it)
+    if (gather && missing.size() >= 16) {
+        const double sample = double(gathered_ns) / double(missing.size());
+        d.prompt_gather_ns = d.prompt_gather_ns > 0 ? 0.7 * d.prompt_gather_ns + 0.3 * sample : sample;
+    }
     return uint64_t(double(ms) * 1e6);
 }
