@@ -1391,6 +1391,14 @@ int sd_output_head_split(void* handle,void* const* pointers,const int* kinds,uin
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// One decode row's head (verify_span.hpp: decode_head): the four head operands, the row of 10240, the vocabulary's logits.
+int sd_decode_head(void* handle,void* const* pointers,const int* kinds,uint64_t vocabulary,const float* input,float* logits) {
+    try {
+        if (!pointers || !kinds) throw std::runtime_error("invalid Straydog decode head");
+        decode_head(device(handle),pointers,kinds,size_t(vocabulary),input,logits);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t steps,
                     const float* embeddings,const float* hidden,float* output) {
     try {

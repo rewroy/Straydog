@@ -545,6 +545,8 @@ pub struct Model {
     pub logits_digests: Option<Vec<String>>,
     /// When set, every logits vector the model returns (validation tooling).
     pub logits_capture: Option<Vec<Vec<f32>>>,
+    /// A logits vector the draw is done with, for the next step's head to fill (no allocation, no fresh pages to fault in).
+    logits_spare: Vec<f32>,
     /// When set, a speculative decode verifies a known sequence at given widths, with no drafter (see [`ForcedRows`]).
     pub forced_rows: Option<ForcedRows>,
     /// Inside a pipelined prefill: batches before the last return no rows.
@@ -713,6 +715,7 @@ impl Model {
             last_metrics: Map::new(),
             logits_digests: None,
             logits_capture: None,
+            logits_spare: Vec::new(),
             forced_rows: None,
             deferred: false,
             mtp_kept: 0,
@@ -2254,15 +2257,22 @@ impl Model {
             return Ok(Some(None));
         }
         let mut clock = Instant::now();
-        let row = last_row(&hidden).to_vec();
-        let mixed = self.with_operands(
-            |model| Ok(model.head_operands()?[..3].to_vec()),
-            |group, operands| group.hyperconnection("output_hc", &row, operands[0].clone(), &operands[1..]),
-        )?;
-        let output = self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
-            group.project_many(&[(operands[0].clone(), &mixed[..])])
-        })?;
-        let logits = output.into_iter().next().unwrap();
+        let row = last_row(&hidden);
+        // (CUDA: the head's mix and projection in one wait, into the last step's allocation; elsewhere a wait and a copy to the host
+        // between them)
+        let mut logits = std::mem::take(&mut self.logits_spare);
+        let fused = cfg!(feature = "cuda")
+            && self.with_operands(Model::head_operands, |group, operands| group.decode_head(operands, row, &mut logits))?;
+        if !fused {
+            let mixed = self.with_operands(
+                |model| Ok(model.head_operands()?[..3].to_vec()),
+                |group, operands| group.hyperconnection("output_hc", row, operands[0].clone(), &operands[1..]),
+            )?;
+            let output = self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
+                group.project_many(&[(operands[0].clone(), &mixed[..])])
+            })?;
+            logits = output.into_iter().next().unwrap();
+        }
         if tokens.len() == 1 {
             self.phase("step: head", &mut clock);
             if let Some(profile) = self.profile.as_mut() {
@@ -3360,7 +3370,7 @@ impl Model {
             if index + 1 < max_new {
                 let decode_started = Instant::now();
                 let Some(next) = self.forward(&[token], true, &|| false)? else { return Ok(()) };
-                logits = next.unwrap();
+                self.logits_spare = std::mem::replace(&mut logits, next.unwrap());
                 let seconds = decode_started.elapsed().as_secs_f64();
                 self.metric_add("decode_seconds", seconds);
                 if let Some(profile) = self.profile.as_mut() {

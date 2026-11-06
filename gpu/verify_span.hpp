@@ -667,6 +667,49 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     download_pieces(d, pieces, count);
 }
 
+// The non-finite values among `count` floats: each block's verdict into flags[block].
+__global__ void __launch_bounds__(256) head_nonfinite(const float* values, size_t count, uint32_t* flags) {
+    unsigned bad = 0;
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < count; i += size_t(gridDim.x) * 256)
+        bad |= (__float_as_uint(values[i]) & 0x7f800000u) == 0x7f800000u;
+    __shared__ unsigned any;
+    if (threadIdx.x == 0) any = 0;
+    __syncthreads();
+    if (bad) atomicOr(&any, 1u);
+    __syncthreads();
+    if (threadIdx.x == 0) flags[blockIdx.x] = any;
+}
+constexpr size_t decode_head_flags = 64;
+
+// A decode step's head: the HyperConnection mix of one row of 10240 and the vocabulary projection of the mixed row, both launched
+// before the host waits (the mix was a launch, a wait and a copy to the host, and the projection a copy back, a launch and a wait),
+// the logits checked for non-finite values on the device (the host's pass over them took 100 us), then read back in the one wait,
+// followed by the checks' flags. The arithmetic is output_head's one row's, which is sd_hyperconnection's mix and
+// sd_matvec_batch's product. `logits` has room for vocabulary + decode_head_flags floats.
+void decode_head(Device& d, void* const* pointers, const int* kinds, size_t vocabulary, const float* input, float* logits) {
+    if (!input || !logits || !vocabulary || vocabulary + decode_head_flags > d.output_capacity || 10240 + 2564 > d.input_capacity)
+        throw std::runtime_error("invalid Straydog decode head");
+    Matrix hc[4];
+    hc_operands(pointers, kinds, hc);
+    const Matrix head{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),vocabulary,2560,0,0,0,kinds[3]};
+    for (size_t i = 0; i < 3; ++i) {
+        auto found = d.allocations.find(pointers[i]);
+        if (found == d.allocations.end() || found->second != hc[i].rows * hc[i].row_bytes) throw std::runtime_error("invalid head operand");
+    }
+    auto found = d.allocations.find(pointers[3]);
+    if (found == d.allocations.end() || found->second != vocabulary * head.row_bytes) throw std::runtime_error("invalid head operand");
+    float* rows = d.input; float* mixed = rows + 10240;
+    upload(d, rows, input, 10240 * 4);
+    hc_decode(d, hc, false, rows, d.output, mixed, 1, 2564);
+    gemv(d, &head, 1, mixed, d.output, 1, 2564, vocabulary);
+    head_nonfinite<<<unsigned(decode_head_flags), 256, 0, d.stream>>>(d.output, vocabulary, reinterpret_cast<uint32_t*>(d.output + vocabulary));
+    check(hipGetLastError());
+    download(d, logits, d.output, (vocabulary + decode_head_flags) * 4);
+    const auto* flags = reinterpret_cast<const uint32_t*>(logits + vocabulary);
+    for (size_t i = 0; i < decode_head_flags; ++i)
+        if (flags[i]) throw std::runtime_error("Straydog GPU produced non-finite values");
+}
+
 // The vocabulary head split by rows across two linked GPUs: the peer evaluates
 // rows [0, split) from the mixed rows this device sends it, this device rows [split, vocabulary).
 // Every logit is formed as on one GPU, and the first maximum of the whole row is the lower
