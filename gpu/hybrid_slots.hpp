@@ -209,11 +209,19 @@ void copy_expert(Device& d, const ResidentMoe& plan, size_t expert, uint8_t* bas
 // stream while earlier chunks compute. Device table entries are switched by a
 // kernel in stream order (no host round trip) and restored afterwards.
 constexpr size_t hybrid_point_limit = 64;
-struct ExpertPointers { int32_t expert[hybrid_point_limit]; const uint8_t* base[hybrid_point_limit]; uint32_t count; uint64_t gate, up; };
+// (with `region` set, a chunk's matrices lie role by role: the gate of its i-th expert at region[0] + (index + i) * stride[0], and so on)
+struct ExpertPointers {
+    int32_t expert[hybrid_point_limit]; const uint8_t* base[hybrid_point_limit]; uint32_t count; uint64_t gate, up;
+    const uint8_t* region[3]; uint64_t stride[3]; uint32_t index;
+};
 __global__ void hybrid_point(MoeGroup* groups, ExpertPointers list) {
     const uint32_t i = threadIdx.x;
     if (i >= list.count) return;
     MoeGroup& group = groups[list.expert[i]];
+    if (list.region[0]) {
+        for (int role = 0; role < 3; ++role) group.weights[role].data = list.region[role] + size_t(list.index + i) * list.stride[role];
+        return;
+    }
     const uint8_t* base = list.base[i];
     group.weights[0].data = base;
     group.weights[1].data = base ? base + list.gate : nullptr;
@@ -248,11 +256,15 @@ void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, si
     if (sd_cpu_gather(d.cpu, sources.data(), targets.data(), bytes.data(), uint32_t(sources.size())))
         throw std::runtime_error(std::string("Straydog CPU gather: ") + sd_cpu_error());
 }
-void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, const uint8_t* base) {
+void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, const uint8_t* base,
+                          uint8_t* const* regions = nullptr) {
     for (size_t first = 0; first < count; first += hybrid_point_limit) {
         ExpertPointers list{};
         list.count = uint32_t(std::min(hybrid_point_limit, count - first));
         list.gate = plan.host_bytes[0]; list.up = plan.host_bytes[1];
+        if (regions)
+            for (int role = 0; role < 3; ++role) { list.region[role] = regions[role]; list.stride[role] = plan.host_bytes[role]; }
+        list.index = uint32_t(first);
         for (uint32_t i = 0; i < list.count; ++i) {
             list.expert[i] = int32_t(experts[first + i]);
             list.base[i] = base ? base + (first + i) * d.slots.bytes : nullptr;
@@ -496,16 +508,26 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
             hybrid_gather(d, plan, missing.data() + first, count, targets.data());
         }
         if (chunk >= 2) check(hipStreamWaitEvent(d.copy_stream, events.used[buffer], 0));
-        for (size_t i = 0; i < count; ++i) {
-            uint8_t* target = base + i * d.slots.bytes;
-            if (gather)
-                check(hipMemcpyAsync(target, host + i * d.slots.bytes, expert_slot_bytes(plan), hipMemcpyHostToDevice,
+        // Straight from the banks, a chunk's matrices land role by role, so a run of consecutive experts is one copy a role: three copies
+        // an expert, each a third of a megabyte, kept the bus at 19 GB/s (22 so) on a Radeon AI PRO R9700.
+        uint8_t* regions[3] = {base, base + half * plan.host_bytes[0], base + half * (plan.host_bytes[0] + plan.host_bytes[1])};
+        if (gather) {
+            for (size_t i = 0; i < count; ++i)
+                check(hipMemcpyAsync(base + i * d.slots.bytes, host + i * d.slots.bytes, expert_slot_bytes(plan), hipMemcpyHostToDevice,
                                      d.copy_stream));
-            else copy_expert(d, plan, missing[first + i], target, d.copy_stream);
+        } else {
+            for (size_t i = 0; i < count;) {
+                size_t j = i + 1;
+                while (j < count && missing[first + j] == missing[first + j - 1] + 1) ++j;
+                for (size_t role = 0; role < 3; ++role)
+                    check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], plan.host[role] + missing[first + i] * plan.host_bytes[role],
+                                         (j - i) * plan.host_bytes[role], hipMemcpyHostToDevice, d.copy_stream));
+                i = j;
+            }
         }
         check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         check(hipStreamWaitEvent(d.stream, events.loaded[buffer], 0));
-        hybrid_point_experts(d, plan, missing.data() + first, count, base);
+        hybrid_point_experts(d, plan, missing.data() + first, count, base, gather ? nullptr : regions);
         compute(first, count);
         check(hipEventRecord(events.used[buffer], d.stream));
         d.streamed_experts += count;
