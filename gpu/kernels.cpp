@@ -634,6 +634,7 @@ struct Device {
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
     uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
+    uint64_t hybrid_layers=0, hybrid_timed_layers=0;   // layers decoded hybrid, and of them those with a start on the GPU clock (hybrid_clock)
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
     uint64_t hybrid_verify_balanced=0;   // hybrid_tokens at a verification's last swaps
@@ -1864,6 +1865,26 @@ int sd_hybrid_timing(void* handle,uint64_t* wait_ns,uint64_t* cpu_ns,uint64_t* s
         *assisted=d.assisted_experts; return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The GPU's side of the hybrid layers (hybrid_clock), in ns: its layer work from the CPU result's arrival to the export,
+// over every layer (the span's first has no start: the timed layers' mean stands for it), and its resident experts.
+int sd_hybrid_gpu_timing(void* handle,uint64_t* layer_ns,uint64_t* experts_ns) {
+    try {
+        if (!layer_ns || !experts_ns) throw std::runtime_error("invalid hybrid timers");
+        auto& d=device(handle);
+        uint64_t clock[4];
+        download(d,clock,hybrid_clock(d),sizeof(clock));
+#if defined(__HIPCC__)
+        int rate=0;
+        check(hipDeviceGetAttribute(&rate,hipDeviceAttributeWallClockRate,d.ordinal));
+        const double ns=rate>0 ? 1e6/rate : 0;
+#else
+        const double ns=1;   // %globaltimer counts nanoseconds
+#endif
+        *layer_ns=d.hybrid_timed_layers ? uint64_t(double(clock[2])*ns*double(d.hybrid_layers)/double(d.hybrid_timed_layers)) : 0;
+        *experts_ns=uint64_t(double(clock[3])*ns);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_hybrid_prompt_cpu(void* handle,uint64_t* routes) {
     try {
         if (!routes) throw std::runtime_error("invalid hybrid counters");
@@ -2354,6 +2375,7 @@ void* sd_create(int ordinal, uint64_t budget) {
         check(hipMalloc(reinterpret_cast<void**>(&value->output), value->output_capacity * 4));
         check(hipMalloc(reinterpret_cast<void**>(&value->matrices), value->batch_capacity * sizeof(GemvItem)));
         check(hipMalloc(reinterpret_cast<void**>(&value->flags), 256));
+        check(hipMemset(value->flags, 0, 256));   // (hybrid_clock sums from zero)
         value->used = workspace_bytes + 256;
         if (budget >= 256 * 1024 * 1024) {
             check(hipMalloc(reinterpret_cast<void**>(&value->expanded), gemm_elements * 4));

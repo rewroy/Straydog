@@ -148,7 +148,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     const float* cpu_result=stage_cpu_result ? d.cpu_partial : d.exchange_device+hybrid_result_at(0);
     auto finish_previous=[&]() {
         if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout);
-        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,cpu_result,0);
+        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,cpu_result,0,hybrid_clock(d));
     };
     // One captured graph per layer: the previous layer's residual (adding the CPU
     // result), this layer up to routing, the export to pinned memory and its
@@ -170,7 +170,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
             decoder_residual<<<40,256,0,d.stream>>>(hidden,mixed,branch);
             hyperconnection(d,pointers+4+attention,kinds+4+attention,1,true,hidden,mixed,true);
             hybrid_route_export(d,experts,mixed);
-            hybrid_tick<<<1,1,0,d.stream>>>(d.flags+1,reinterpret_cast<uint32_t*>(d.exchange_device+hybrid_sequence_slot));
+            hybrid_tick<<<1,1,0,d.stream>>>(d.flags+1,reinterpret_cast<uint32_t*>(d.exchange_device+hybrid_sequence_slot),hybrid_clock(d),finish);
             hybrid_resident_experts(d,experts,mixed,branch);
             check(hipGetLastError());
         };
@@ -202,6 +202,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         if (ahead && !before) launch_after(layer);
     }
     if (!ahead) finish_previous();
+    d.hybrid_layers+=end-begin; d.hybrid_timed_layers+=end-begin-1;
     check(hipGetLastError());
     download(d,output,hidden,10240*4);
     if (ahead) await.check_failed();

@@ -563,6 +563,9 @@ int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);
 /* The routes of prompt batches' experts beyond the slots that the CPU computed instead of the bus streaming the experts. */
 int sd_hybrid_prompt_cpu(void* handle, uint64_t* routes);
+/* The GPU's side of the hybrid layers in ns, timed on its own clock: its layer work from the previous layer's CPU result to the export
+   (of the host's wait for the export, the rest is launching and handing over), and its resident experts, which run beside the CPU's. */
+int sd_hybrid_gpu_timing(void* handle, uint64_t* layer_ns, uint64_t* experts_ns);
 /* Warm start: a partially resident layer's decode and verification rows routed to each of its experts since the last clear, to the device (the expert held a slot) then to the host, into `out` (room for `room` values); the experts counted (0: a plan of another kind, -1: failure); `clear` zeroes them after. */
 int sd_hybrid_routes(void* handle, void* plan, uint32_t* out, uint64_t room, int clear);
 /* The layer's experts' scores set from `rates`, the routes a token to each of `experts`, as the moving average they come to at that rate. */

@@ -3235,6 +3235,7 @@ impl Model {
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated, "cpu_phases_ms": cpu_phases,
+                "layer_ms": spent("layer_ns") / 1e6 / generated, "gpu_experts_ms": spent("gpu_experts_ns") / 1e6 / generated,
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
