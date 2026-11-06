@@ -22,6 +22,8 @@ int sd_device_pci(int ordinal, int* domain, int* bus, int* device);
 void* sd_create(int ordinal, uint64_t budget);
 void sd_destroy(void* handle);
 int sd_memory(void* handle, uint64_t* used, uint64_t* budget);
+/* Raise the budget while serving (GPU memory freed by other programs since the start, under `auto`); never below what is allocated. */
+int sd_set_budget(void* handle, uint64_t budget);
 
 /* Allocations and transfers */
 void* sd_upload(void* handle, const void* data, uint64_t bytes);

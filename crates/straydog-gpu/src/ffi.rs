@@ -40,6 +40,10 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_set_budget(handle: *mut ::std::os::raw::c_void, budget: u64)
+        -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_upload(
         handle: *mut ::std::os::raw::c_void,
         data: *const ::std::os::raw::c_void,

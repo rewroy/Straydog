@@ -590,6 +590,10 @@ pub struct Model {
     lock_pending: Vec<usize>,
     /// A bank that did not match the file's tree when it was locked behind "ready": no request is served from here on.
     bank_failure: Option<String>,
+    /// The start's plan was handed out (or found nothing to lock), and a plan is out that has not ended ([`Model::bank_locks`],
+    /// [`Model::more_bank_locks`], [`Model::banks_lock_ended`]): one locking at a time, and more only after the start's.
+    locks_planned: bool,
+    locking: bool,
     /// Set when locked layers were given back to a request ([`Model::give_back`]): the locking behind "ready" locks no more (its plan holds this too).
     lock_halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The bytes of host K/V that the context's first 64K tokens still have to grow into (see [`Model::refresh_kv_ahead`]): the locking behind "ready" leaves them.
@@ -740,6 +744,8 @@ impl Model {
             locked_layers: Vec::new(),
             lock_pending: Vec::new(),
             bank_failure: None,
+            locks_planned: false,
+            locking: false,
             lock_halt: Default::default(),
             kv_ahead: Default::default(),
             gave_back: Vec::new(),
@@ -1265,20 +1271,100 @@ impl Model {
     /// (`prior`) the layers the host ran most routes of come first, since locking a layer lets the GPU take some of its absent routes from the CPU;
     /// without, they keep the order the plan had (from the last layer).
     pub fn bank_locks(&mut self, prior: Option<&Routes>) -> Option<BankLocks> {
-        if self.lock_pending.is_empty() {
+        self.locks_planned = true;
+        if self.lock_pending.is_empty() || self.locking {
             return None;
         }
         if let Some(prior) = prior.filter(|prior| prior.total() > 0) {
             crate::banks::order_by_host_routes(&mut self.lock_pending, |layer| prior.host_routes(layer));
         }
         match self.lock_job(&self.lock_pending) {
-            Ok(job) => Some(job),
+            Ok(job) => {
+                self.locking = true;
+                Some(job)
+            }
             Err(error) => {
                 eprintln!("WARN Straydog host banks: no layer is page-locked ({error})");
                 self.lock_pending.clear();
                 None
             }
         }
+    }
+
+    /// Each GPU's ordinal, allocated bytes and budget, in the group's order.
+    pub fn vram_budgets(&self) -> Result<Vec<(usize, u64, u64)>> {
+        self.group.backends.iter().map(|backend| backend.memory().map(|(used, budget)| (backend.ordinal, used, budget))).collect()
+    }
+
+    /// The free memory of the group's `index`th GPU, other programs' share counted out.
+    pub fn vram_free(&self, index: usize) -> Result<u64> {
+        self.group.backends.get(index).ok_or("no such Straydog GPU")?.free_bytes()
+    }
+
+    /// Raise the group's `index`th GPU's budget to `budget`, its expert slots placed again at what fits ([`crate::gpu::Backend::raise_budget`]):
+    /// the slots before and after.
+    pub fn raise_vram(&mut self, index: usize, budget: u64) -> Result<(u64, u64)> {
+        self.group.backends.get_mut(index).ok_or("no such Straydog GPU")?.raise_budget(budget)
+    }
+
+    /// The layers that memory freed since the start's plan ([`Model::plan_host_banks`]) has room for: a program that let go of its memory, or a
+    /// previous worker that still held its banks when the start looked (RTX 4060, 63.6 GiB: 38 of 48 layers planned with 33.1 GiB available).
+    /// Planned as the start's are, within the lock budget and what the commit left allows (`host::lockable`), each layer leaving the margin and
+    /// the K/V still to grow ([`crate::banks::locking_room`]) of the memory available now; taken the same way, behind the requests. The layers
+    /// the host ran most routes of (`prior`, asked only when a layer fits) come first. None while a plan is out, before the start's was, and while
+    /// not one more layer fits; a line in the log says what was planned and why.
+    pub fn more_bank_locks(&mut self, prior: impl FnOnce(&Model) -> Option<Routes>) -> Option<BankLocks> {
+        if !self.partial || !self.locks_planned || self.locking || self.bank_failure.is_some() || self.locked_layers.len() >= 48 {
+            return None;
+        }
+        let sizes = (0..48)
+            .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
+            .collect::<Result<Vec<_>>>().ok()?;
+        let memory = self.weights.host_memory_bytes;
+        let locked = self.locked_layers.iter().map(|&layer| sizes[layer]).sum::<u64>();
+        let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
+        let by_memory = lock_budget(memory, sizes.iter().sum(), pinned).saturating_sub(locked);
+        let mut budget = by_memory.min(crate::host::lockable(memory, 0));
+        let mut left: Vec<usize> = (0..48).rev().filter(|layer| sizes[*layer] > 0 && !self.locked_layers.contains(layer)).collect();
+        self.refresh_kv_ahead();
+        let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let available = crate::host::available_bytes();
+        // (the least of them first: on most requests' ends nothing fits, and the routes are not asked for)
+        let least = left.iter().map(|&layer| sizes[layer]).min()?;
+        if least > budget || crate::banks::locking_room(available, least, margin, kv_ahead).is_err() {
+            return None;
+        }
+        if let Some(prior) = prior(self).filter(|prior| prior.total() > 0) {
+            crate::banks::order_by_host_routes(&mut left, |layer| prior.host_routes(layer));
+        }
+        let mut room = available;
+        let mut layers = Vec::new();
+        for layer in left {
+            if sizes[layer] > budget || crate::banks::locking_room(room, sizes[layer], margin, kv_ahead).is_err() {
+                break;
+            }
+            budget -= sizes[layer];
+            room -= sizes[layer];
+            layers.push(layer);
+        }
+        if layers.is_empty() {
+            return None;
+        }
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        eprintln!("Straydog host banks: {} more of 48 layers planned to be page-locked behind the requests, {}, with {} available ({} kept free, K/V to \
+                   grow {}); {} locked already", layers.len(), gib(available - room), gib(available), gib(margin), gib(kv_ahead), self.locked_layers.len());
+        // (a give-back's halt was for the plan it stopped)
+        self.lock_halt = Default::default();
+        let job = match self.lock_job(&layers) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("WARN Straydog host banks: no more layers are page-locked ({error})");
+                return None;
+            }
+        };
+        self.lock_pending = layers;
+        self.locking = true;
+        Some(job)
     }
 
     /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
@@ -1316,6 +1402,7 @@ impl Model {
     /// service): what is left is left to the page cache, and the working set's limit, which follows what is free, is kept from here on.
     pub fn banks_lock_ended(&mut self, failure: Option<String>) {
         self.lock_pending.clear();
+        self.locking = false;
         if failure.is_some() {
             self.bank_failure = failure;
         }

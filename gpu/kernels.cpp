@@ -2399,6 +2399,16 @@ void* sd_create(int ordinal, uint64_t budget) {
 
 void sd_destroy(void* handle) { delete static_cast<Device*>(handle); }
 
+// A budget raised while serving: GPU memory that other programs freed since the start, under `auto`. The expert slots take it when
+// they are placed again (sd_expert_slots_release, sd_expert_slots_restore). Never below what is allocated.
+int sd_set_budget(void* handle, uint64_t budget) {
+    try {
+        auto& value = device(handle);
+        if (budget < value.used || budget > SIZE_MAX) throw std::runtime_error("invalid Straydog VRAM budget");
+        value.budget = size_t(budget);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
 int sd_memory(void* handle, uint64_t* used, uint64_t* budget) {
     try {
         auto& value = device(handle);
