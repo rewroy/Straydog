@@ -35,6 +35,17 @@ pub enum Scores {
     Top(Vec<Vec<(f32, u32)>>),
 }
 pub type Head = (Vec<i32>, Option<Scores>, Option<Vec<f32>>);
+/// The floats a row of the host exchange holds before its CPU result (gpu/hybrid_slots.hpp hybrid_row_floats).
+pub const ROUTE_ROW_FLOATS: usize = 2608 + 2560;
+/// A layer's router run two ways ([`Backend::route_check`]): each result holds the separate kernels' copy and then the one kernel's.
+pub struct RouteCheck {
+    /// Whether the one kernel took these shapes (else the second copies are zeros).
+    pub fused: bool,
+    pub scores: Vec<f32>,
+    pub selected: Vec<i32>,
+    pub probabilities: Vec<f32>,
+    pub exported: Vec<f32>,
+}
 
 /// Where a head's rows are: on the host, or in a decoder layer's workspace on the head's device.
 #[derive(Clone, Copy)]
@@ -2209,6 +2220,33 @@ impl Backend {
     pub fn attach_cpu(&mut self, engine: &CpuExperts) -> Result<()> {
         // SAFETY: a live CPU expert engine; the model drops its devices first.
         check(unsafe { ffi::sd_hybrid_attach_cpu(self.handle, engine.handle()) }).map(drop)
+    }
+
+    /// Development (tests/router_gpu.rs): a partially resident layer's router, `experts` rows of 2560 values of GGML kind 30 (BF16) or 0 (F32), and
+    /// its shared expert's one-row gate, run on `input` (rows of 2560) by the separate kernels and by the one kernel that replaces them; with `assist`
+    /// more than 0 the GPU assists that many absent routes of a row, as the export marks them.
+    pub fn route_check(&mut self, router: (&[u8], u32), gate: (&[u8], u32), experts: u64, input: &[f32], repeats: u32, assist: u32) -> Result<RouteCheck> {
+        if input.is_empty() || input.len() % 2560 != 0 {
+            return Err("a router check takes whole rows of 2560 values".into());
+        }
+        let rows = input.len() / 2560;
+        let experts_usize = experts as usize;
+        let mut fused: c_int = 0;
+        let mut out = RouteCheck {
+            fused: false,
+            scores: vec![0.0; 2 * rows * (experts_usize + 1)],
+            selected: vec![0; 2 * rows * 10],
+            probabilities: vec![0.0; 2 * rows * 11],
+            exported: vec![0.0; 2 * rows * ROUTE_ROW_FLOATS],
+        };
+        // SAFETY: a live handle; the buffers hold the sizes sd_hybrid_route_check documents for these rows and experts.
+        check(unsafe {
+            ffi::sd_hybrid_route_check(self.handle, router.0.as_ptr().cast(), router.1 as c_int, gate.0.as_ptr().cast(), gate.1 as c_int, experts,
+                                       rows as u64, input.as_ptr(), repeats, assist, &mut fused, out.scores.as_mut_ptr(), out.selected.as_mut_ptr(),
+                                       out.probabilities.as_mut_ptr(), out.exported.as_mut_ptr())
+        })?;
+        out.fused = fused != 0;
+        Ok(out)
     }
 
     /// Speed first: a route the CPU would run, of a router weight below `floor`, is left out of its token (0: none).

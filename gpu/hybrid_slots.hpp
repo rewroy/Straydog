@@ -13,6 +13,8 @@ constexpr size_t hybrid_exchange_floats = hybrid_sequence_slot + 16;
 // From hybrid_sequence_slot, as uint32: +1 CPU results published by the host, +2 results
 // awaited by the GPU (hybrid_await), +3 nonzero once an await gave up.
 constexpr size_t hybrid_published_slot = 1, hybrid_awaited_slot = 2, hybrid_await_failed_slot = 3;
+// Device::flags[16 + row]: the blocks of a row that hybrid_router has counted in (zero between launches, from create_hybrid_moe on).
+constexpr size_t hybrid_router_counters = 16;
 
 size_t expert_slot_bytes(const ResidentMoe& plan) {
     return plan.host_bytes[0] + plan.host_bytes[1] + plan.host_bytes[2];
@@ -100,6 +102,7 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
     void* table = nullptr; check(hipMalloc(&table, bytes));
     try {
         upload(d, table, groups.data(), bytes);
+        check(hipMemsetAsync(d.flags + hybrid_router_counters, 0, hybrid_rows * sizeof(unsigned), d.stream));
         check(hipStreamSynchronize(d.stream));
     } catch (...) { cleanup(hipFree(table)); throw; }
     d.allocations.emplace(table, bytes); d.used += bytes; plan->table = table;
