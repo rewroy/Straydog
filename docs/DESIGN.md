@@ -303,6 +303,15 @@ conversation has met.
   - Reads start as soon as the tokens are known: the next prompt batch's while the current one
     runs, a sampled token's and its drafts' before the pass that uses them. Decode waits only for
     rows still on their way, at the layer that gathers them.
+- **Windows.** Unbuffered reads of a file that has a data section (it is mapped, or has pages in
+  the system cache) are each preceded by a flush of their range that NTFS runs one at a time on
+  the file: 128 threads read 4 KiB blocks at the rate of one, 11K a second where the drive does
+  650K, and a 2K-token prompt waited 1 to 1.8 s for its PLE rows. The table's file holds that
+  table alone, so `Weights::cache_rows` lets go of it before the table reads: it drops the
+  mapping and the handle, opens the file for unbuffered reads alone (which, with nothing else
+  open on it, makes NTFS drop its cached pages), and opens it again. The CPU engine keeps no
+  handle on it. The same wait is 30 to 60 ms. A row table must not map its file or read it through
+  the cache while it runs.
 - **Verification.** Each block is checked against the shard's fs-verity tree between its read
   and its use. A block that fails fails its read; a later use reads it again.
 - **Memory pressure.** DeepSeek-V4.1 decode waits 0.1-0.4 ms a token on Engram rows. If the

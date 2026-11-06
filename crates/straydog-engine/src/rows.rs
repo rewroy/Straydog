@@ -15,6 +15,13 @@
 //! Every read is of whole, aligned 4 KiB blocks of the file: the unit a Merkle tree over the
 //! file (fs-verity's format, [`crate::verity`]) hashes, so a verifier checks each block between
 //! its read and the rows' use.
+//!
+//! On Windows the drive's speed is reached only if the file has no data section: while a file is
+//! mapped, or has pages in the system cache, NTFS flushes the range of every unbuffered read before
+//! it, one read at a time on the file, and a deep queue of random 4 KiB reads runs at the rate of
+//! one (11K reads a second where the drive does 650K). So the table's file is not mapped here, and
+//! [`crate::weights::Weights::cache_rows`] lets go of the mapping and the cached pages of the file
+//! it hands over.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -178,9 +185,10 @@ struct Counts {
 struct Table {
     /// A handle for the pool's reads through the page cache, which run at once (`storage::reader`).
     file: File,
-    /// A handle reading past the page cache, and a mapping that tells which blocks the page
-    /// cache holds (those are read through it, without touching the drive).
-    direct: Option<(File, Mmap)>,
+    /// A handle reading past the page cache, and where the platform can tell it, a mapping that
+    /// tells which blocks the page cache holds (those are read through it, without touching the
+    /// drive).
+    direct: Option<(File, Option<Mmap>)>,
     /// File offset of row 0, bytes per row, rows.
     base: u64,
     width: usize,
@@ -208,7 +216,7 @@ impl Table {
         }
         let length = (end.min(self.size) - start) as usize;
         let read = match &self.direct {
-            Some((_, map)) if storage::resident(&map[start as usize..start as usize + length]) >= 1.0 => {
+            Some((_, Some(map))) if storage::resident(&map[start as usize..start as usize + length]) >= 1.0 => {
                 storage::read_into(&self.file, start, buffer, 0, length, false)
             }
             direct => {
@@ -293,8 +301,11 @@ impl RowTable {
         };
         let direct = match storage::direct(file) {
             Some(handle) => {
+                // Only Linux can say from a mapping which blocks the page cache holds; elsewhere the mapping would
+                // only slow every direct read (see the module's notes).
                 // SAFETY: a read-only mapping, used only to probe the page cache.
-                Some((handle, unsafe { Mmap::map(file) }?))
+                let map = if cfg!(target_os = "linux") { Some(unsafe { Mmap::map(file) }?) } else { None };
+                Some((handle, map))
             }
             None => None,
         };
