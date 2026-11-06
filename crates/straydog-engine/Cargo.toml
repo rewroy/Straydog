@@ -53,6 +53,10 @@ name = "formats_bench"
 required-features = ["gpu"]
 
 [[example]]
+name = "head_bench"
+required-features = ["gpu"]
+
+[[example]]
 name = "op_latency"
 required-features = ["gpu"]
 
