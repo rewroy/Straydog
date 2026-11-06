@@ -404,6 +404,8 @@ __global__ void __launch_bounds__(moe_tile_threads) moe_device_tiles(const MoeGr
     if (t==moe_tile_threads-1) *count=blocks[t];
 }
 #endif
+// Whether a prompt batch's streamed experts of `plan` are gathered by the CPU's workers (banks not page-locked; hybrid_stream_missing).
+inline bool prompt_gathered(const Device& d,const ResidentMoe& plan) { return d.slots.host && d.cpu && !plan.mapped[0]; }
 // The experts of `missing` (a batch's rows each in `counts`) the CPU takes instead of the bus: the GPU streams an expert whatever
 // its rows, the CPU computes a route at a time, so those with the fewest rows go to the CPU while its time for their routes stays
 // under its share (Device::prompt_scale) of the GPU's for the experts left to stream (each cost from the last batches,
@@ -415,12 +417,23 @@ inline std::vector<size_t> prompt_cpu_share(const Device& d,const ResidentMoe& p
     const double route=d.prompt_cpu_ns>0 ? d.prompt_cpu_ns : 60000.0;
     std::vector<size_t> order(missing);
     std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) { return counts[a]<counts[b]; });
-    double cpu=0;
-    size_t left=missing.size();
-    for (size_t expert : order) {
-        const double next=cpu+route*counts[expert];
-        if (next>d.prompt_scale*stream*double(left-1)) break;
-        cpu=next; --left; taken.push_back(expert);
+    if (prompt_gathered(d,plan)) {
+        // Banks not page-locked: the CPU's workers gather each streamed expert into pinned memory before the bus takes it, and the
+        // CPU's own routes wait behind those gathers on the same workers, so the CPU's time is the layer's. An expert goes to the CPU
+        // only when its routes cost less than its gather (before any measurement, a gather at 8 GB/s).
+        const double gather=d.prompt_gather_ns>0 ? d.prompt_gather_ns : double(expert_slot_bytes(plan))/8.0;
+        for (size_t expert : order) {
+            if (route*counts[expert]>0.9*gather) break;
+            taken.push_back(expert);
+        }
+    } else {
+        double cpu=0;
+        size_t left=missing.size();
+        for (size_t expert : order) {
+            const double next=cpu+route*counts[expert];
+            if (next>d.prompt_scale*stream*double(left-1)) break;
+            cpu=next; --left; taken.push_back(expert);
+        }
     }
     if (taken.empty()) return taken;
     std::vector<bool> gone(plan.experts,false);
@@ -627,8 +640,9 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
                                                    meanwhile);
     if (missing.size()>=16) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
     if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
-    // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last).
-    if (!cpu_routes.empty()) {
+    // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last); a gathered
+    // layer's CPU time is its gathers' too, and its share is set otherwise (prompt_cpu_share).
+    if (!cpu_routes.empty() && !prompt_gathered(d,plan)) {
         const double ratio=stream_ns ? double(cpu_ns)/double(stream_ns) : 2.0;
         d.prompt_scale=std::clamp(d.prompt_scale*std::clamp(0.9/ratio,0.6,1.2),0.05,2.0);
     }

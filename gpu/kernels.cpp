@@ -610,6 +610,7 @@ struct Device {
     uint64_t prompt_cpu_routes=0;
     double prompt_stream_ns=0, prompt_cpu_ns=0;
     double prompt_scale=0.7;   // the CPU's share of the GPU's time it is given: moved by how the last batches' CPU and GPU finished
+    double prompt_gather_ns=0;   // what gathering an expert from pageable banks into pinned memory cost in the last batches (ns)
     float* prompt_host=nullptr;   // pinned: a batch's rows to the CPU, its routes' results and their routes back
     size_t prompt_host_floats=0;
     hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host

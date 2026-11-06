@@ -846,7 +846,11 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     the CPU computes their routes from the batch's rows (copied back as the experts go the other way), and their results reach their
     routes' output rows after the GPU's GEMMs. It takes them while its time for their routes stays under a share of the GPU's for
     what is left, each cost measured in the last batches; the share moves each batch toward the CPU finishing at nine tenths of
-    the GPU's time. Which experts go where depends on timing, so a partially resident prompt is not bit-reproducible from run to
+    the GPU's time. On a layer whose banks are not page-locked the CPU's workers first gather each streamed expert into pinned
+    memory, and its own routes wait behind those gathers on the same workers: there an expert goes to the CPU only when its
+    routes cost less than its gather (measured). On the R9700 at 5.5 GiB in a 40 GiB memory scope (27 of 48 layers locked), two
+    runs each: 2,100 tokens 2407 / 2228 -> 2048 / 2066 ms, 4,158 tokens 3428 / 3353 -> 3080 / 3059, 10,611 tokens 7566 / 7615 ->
+    6538 / 6688. Which experts go where depends on timing, so a partially resident prompt is not bit-reproducible from run to
     run either; `STRAYDOG_PROMPT_CPU=0` (or `Model::prompt_share(false)`, as the golden test does) streams them all. Radeon AI PRO
     R9700 (PCIe 5.0 x16) beside a Ryzen 5 7500F, Qwen3.8 UD-IQ1_S at 5.5 GiB, two runs each: a 2,101-token prompt 2183 / 2087 ->
     1717 / 1711 ms, 2,397 tokens 2081 / 2088 -> 1714 / 1703, 3,394 tokens 2393 / 2395 -> 2119 / 2131 (a third of the streamed
