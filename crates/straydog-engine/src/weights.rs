@@ -116,7 +116,10 @@ pub struct Weights {
     /// Per file: its asset name, handle, mapping, pinned chunk digests and signature.
     assets: Vec<String>,
     files: Vec<File>,
-    maps: Vec<Mmap>,
+    /// Per file: where it lies (to open it again, [`Weights::cache_rows`]).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    paths: Vec<PathBuf>,
+    maps: Vec<Mapped>,
     chunk_digests: Vec<Vec<String>>,
     signatures: Vec<Signature>,
     tensors: HashMap<String, Tensor>,
@@ -140,6 +143,17 @@ pub struct Weights {
 
 /// A file's size and modification time, compared before each generation.
 type Signature = (u64, Option<SystemTime>);
+
+/// A shard's read-only mapping, or nothing where the shard was let go of ([`Weights::cache_rows`]): then it reads as an empty slice.
+struct Mapped(Option<Mmap>);
+
+impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
 
 fn signature(file: &File) -> std::io::Result<Signature> {
     let metadata = file.metadata()?;
@@ -276,6 +290,7 @@ impl Weights {
             drafter_names: HashSet::new(),
             assets: Vec::new(),
             files: Vec::new(),
+            paths: Vec::new(),
             maps: Vec::new(),
             chunk_digests: Vec::new(),
             signatures: Vec::new(),
@@ -305,9 +320,15 @@ impl Weights {
             }
             None => open_pinned(&root, &pins.shards, "open", progress)?,
         };
+        // (where each file lies: the engram table where it was found, the drafter in its directory, the shards in the model's)
+        let mut paths: Vec<PathBuf> = files.iter().enumerate().map(|(index, asset)| match &table {
+            Some((_, path)) if index == shards - 1 => path.clone(),
+            _ => root.join(&asset.name),
+        }).collect();
         if let Some(directory) = drafter {
             let directory = absolute_directory(directory)?;
             opened.extend(open_pinned(&directory, std::slice::from_ref(&pins.drafter), "drafter", progress)?);
+            paths.push(directory.join(&pins.drafter.name));
         }
         // Each header's chunk is read and hashed on a thread of its own.
         let assets: Vec<&Asset> = files.iter().chain([&pins.drafter]).collect();
@@ -320,7 +341,7 @@ impl Weights {
         for (index, (((file, pieces), header), asset)) in opened.into_iter().zip(headers).zip(assets).enumerate() {
             let header = header?;
             if index == shards {
-                weights.add_drafter(asset, file, pieces, header)?;
+                weights.add_drafter(asset, &paths[index], file, pieces, header)?;
                 continue;
             }
             // (an engram file is a file of one: its table alone, where the last shard's was)
@@ -341,7 +362,7 @@ impl Weights {
             }
             weights.add_tensors(index, &header.tensors)?;
             weights.integer_arrays.extend(header.integer_arrays.clone());
-            weights.map(&asset.name, file, pieces)?;
+            weights.map(&asset.name, &paths[index], file, pieces)?;
             if index == shards - 1 && weights.tensors.len() != TENSOR_COUNT {
                 return Err(error("Straydog model tensor count mismatch"));
             }
@@ -421,7 +442,7 @@ impl Weights {
     }
 
     /// Map an opened file, refusing one that changed since it was opened.
-    fn map(&mut self, name: &str, (file, before): (File, Signature), pieces: Vec<String>) -> Result<(), String> {
+    fn map(&mut self, name: &str, path: &Path, (file, before): (File, Signature), pieces: Vec<String>) -> Result<(), String> {
         // SAFETY: the mapping is read-only and the file is checked unchanged before every
         // generation; the files are pinned assets nothing is expected to write.
         let map = unsafe { Mmap::map(&file) }.map_err(|exc| exc.to_string())?;
@@ -431,12 +452,13 @@ impl Weights {
         self.assets.push(name.to_string());
         self.signatures.push(before);
         self.files.push(file);
-        self.maps.push(map);
+        self.paths.push(path.to_path_buf());
+        self.maps.push(Mapped(Some(map)));
         self.chunk_digests.push(pieces);
         Ok(())
     }
 
-    fn add_drafter(&mut self, pin: &Asset, file: (File, Signature), pieces: Vec<String>,
+    fn add_drafter(&mut self, pin: &Asset, path: &Path, file: (File, Signature), pieces: Vec<String>,
                    header: straydog_gguf::ModelHeader) -> Result<(), String> {
         let names: HashSet<String> = header.tensors.iter().map(|tensor| tensor.name.clone()).collect();
         let expected: HashSet<String> = DRAFTER_TENSORS.iter().map(|name| name.to_string()).collect();
@@ -447,7 +469,7 @@ impl Weights {
             return Err(error("duplicate tensor across Straydog drafter and model"));
         }
         self.add_tensors(self.files.len(), &header.tensors)?;
-        self.map(&pin.name, file, pieces)?;
+        self.map(&pin.name, path, file, pieces)?;
         self.drafter_names = names;
         self.drafter = true;
         Ok(())
@@ -513,10 +535,13 @@ impl Weights {
             .collect()
     }
 
-    /// Every mapping with its file.
+    /// Every mapping with its file, but a row table's file of its own, which is let go of ([`Weights::cache_rows`]) and holds no
+    /// expert: a handle the CPU engine kept on it would keep it from being let go of.
     #[cfg(windows)]
     pub(crate) fn mapped_files(&self) -> impl Iterator<Item = (&[u8], &File)> {
-        self.maps.iter().map(|map| &map[..]).zip(&self.files)
+        self.maps.iter().map(|map| &map[..]).zip(&self.files).enumerate()
+            .filter(|(index, _)| !self.file_holds_only(*index, "per_layer_token_embd.weight"))
+            .map(|(_, mapped)| mapped)
     }
 
     /// The file and offset of mapped bytes (an operand's address), if they are mapped.
@@ -611,6 +636,12 @@ impl Weights {
     pub fn cache_rows(&mut self, name: &str, budget: u64) -> Result<(), String> {
         let tensor = self.tensor(name)?;
         let [_, count] = tensor.dims[..] else { return Err(format!("{name} is not a table of rows")) };
+        // (Windows: a file that is mapped, or has pages in the system cache, is read past it a block at a time)
+        #[cfg(windows)]
+        if budget > 0 && self.file_holds_only(tensor.file, name) {
+            self.let_go_of(tensor.file)?;
+        }
+        let tensor = self.tensor(name)?;
         let pool = Arc::new(ReadPool::new(crate::rows::THREADS));
         let verifier = self.verifier_of(tensor.file).cloned().map(|verifier| -> crate::rows::Verifier {
             Arc::new(move |offset: u64, data: &[u8]| {
@@ -621,6 +652,40 @@ impl Weights {
                                   verifier)
             .map_err(|exc| format!("{name}: {exc}"))?;
         self.row_tables.insert(name.to_string(), table);
+        Ok(())
+    }
+
+    /// Whether a file holds the tensor `name` and no other (a table's file of its own).
+    #[cfg(windows)]
+    fn file_holds_only(&self, file: usize, name: &str) -> bool {
+        self.tensors.get(name).is_some_and(|tensor| tensor.file == file)
+            && self.tensors.iter().all(|(other, tensor)| tensor.file != file || other == name)
+    }
+
+    /// Let go of a file the weights have mapped and read through the system cache, and open it again for reads past the cache alone:
+    /// its mapping and handle are dropped, and with nothing else open on it a read of it for unbuffered access (opening it so, then
+    /// closing it) makes NTFS drop the file's cached pages. While the file has a data section, from a mapping or cached pages, NTFS
+    /// flushes the range of every unbuffered read before it, and one such flush runs at a time on a file: reads of 4 KiB from 128
+    /// threads then run at 11K a second where the drive does 650K ([`crate::rows`]). If something else has the file open the pages stay,
+    /// and the table reads at that rate, no worse than before.
+    #[cfg(windows)]
+    fn let_go_of(&mut self, file: usize) -> Result<(), String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const NO_BUFFERING: u32 = 0x2000_0000;
+        // (the first file's handle stands in for this one's while it is closed; it is never the table's)
+        if file == 0 {
+            return Ok(());
+        }
+        let path = self.paths[file].clone();
+        self.maps[file] = Mapped(None);
+        let stand_in = self.files[0].try_clone().map_err(|exc| exc.to_string())?;
+        drop(std::mem::replace(&mut self.files[file], stand_in));
+        drop(std::fs::OpenOptions::new().read(true).custom_flags(NO_BUFFERING).open(&path));
+        let reopened = File::open(&path).map_err(|exc| format!("{}: {exc}", path.display()))?;
+        if signature(&reopened).map_err(|exc| exc.to_string())? != self.signatures[file] {
+            return Err(error("Straydog asset changed during authentication"));
+        }
+        self.files[file] = reopened;
         Ok(())
     }
 
@@ -641,6 +706,11 @@ impl Weights {
             crate::storage::read_ahead(indices.iter().map(|&index| &table[index as usize * bytes..(index as usize + 1) * bytes]));
         }
         Ok(())
+    }
+
+    /// A table's row cache, see [`Weights::cache_rows`].
+    pub fn row_table(&self, name: &str) -> Option<&RowTable> {
+        self.row_tables.get(name)
     }
 
     /// A row-cached table's (rows asked for, rows read, blocks read), see [`Weights::cache_rows`].
@@ -684,7 +754,9 @@ impl Weights {
         {
             return Err(error("invalid Straydog embedding row batch"));
         }
-        let (table, kind) = self.raw(name, 0, None)?;
+        // (a row-cached table's file may have been let go of: its rows come from the cache)
+        let table: &[u8] = if self.row_tables.contains_key(name) { &[] } else { self.raw(name, 0, None)?.0 };
+        let kind = tensor.kind;
         let row_bytes = (tensor.bytes / count) as usize;
         let width = width as usize;
         // The rows' bytes: through the table's row cache when it has one (see `crate::rows`),
