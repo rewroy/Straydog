@@ -51,6 +51,9 @@ pub struct SetupArgs {
     /// Leave out the MTP drafter (Qwen3.8)
     #[arg(long)]
     pub no_mtp: bool,
+    /// Get the MTP drafter (Qwen3.8) even where this machine's VRAM would leave it out by default
+    #[arg(long, conflicts_with = "no_mtp")]
+    pub mtp: bool,
     /// Unsloth's Qwen3.8 bundles: the engram table to read, BF16 (102.4 GB, lossless), Q8_0 (54.4 GB), Q5_1 (38.4 GB) or IQ4_NL
     /// (28.8 GB, the bundle's own), fetched into the model's engram folder, which its bundles share [default: the bundle's own]
     #[arg(long, value_name = "PRECISION")]
@@ -345,6 +348,8 @@ pub fn run(args: &SetupArgs, machine: &Machine, entries: &[Entry], defaults: &De
         let purpose = if pays { sidecar.purpose } else { "no faster at this VRAM" };
         let wanted = if left_out {
             false
+        } else if sidecar.kind == Extra::Mtp && args.mtp {
+            true
         } else if ask && !args.offline {
             talk.confirm(&format!("Also get the {} ({}, {})?", sidecar.label, purpose, gb(sidecar.download)), pays)?
         } else {
@@ -748,6 +753,12 @@ mod tests {
         // the extras left out by option
         let outcome = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XS".into()), no_dspark: true, no_vision: true, ..SetupArgs::default() }, &two_r9700s()).unwrap();
         assert!(outcome.extras.is_empty());
+        // the MTP drafter on a card whose budget leaves it out by default (4.75 GiB here, under the 5 GiB bar), and with --mtp
+        let tight = machine_of(1, (5 << 30) + (256 << 20), 32 << 30);
+        let default = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), ..SetupArgs::default() }, &tight).unwrap();
+        assert!(!default.extras.contains(&Extra::Mtp), "{:?}", default.extras);
+        let asked = ask(SetupArgs { model_name: Some("qwen3.8-flash-next".into()), mtp: true, ..SetupArgs::default() }, &tight).unwrap();
+        assert!(asked.extras.contains(&Extra::Mtp), "{:?}", asked.extras);
         // a bundle this machine cannot run, a bundle nobody pinned, a model and bundle that disagree, no machine at all
         let error = ask(SetupArgs { quant: Some("GSQ-RCO-IQ2_XXS".into()), ..SetupArgs::default() }, &small).unwrap_err();
         assert!(error.contains("cannot run") && error.contains("12 GiB"), "{error}");

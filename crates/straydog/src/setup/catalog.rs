@@ -499,10 +499,12 @@ fn row_cache(entry: &Entry, ram: u64, state: u64) -> u64 {
     if ram < 2 * entry.footprint.experts { budget.min(SCARCE_ROW_CACHE) } else { budget }
 }
 
-/// Whether the budgets `auto` takes here leave a Qwen3.8 drafter worth having: at --vram 5 it cost 1.4% on an
-/// RTX 5070 Ti (IQ2_XS, 8 requests a side), at 6 it gained 3.4%, and below about 4.75 the placement drops it.
+/// Whether the budgets `auto` takes here leave a Qwen3.8 drafter worth having. On an RTX 5070 Ti with UD-IQ1_S (0.1.6, warm-up and two
+/// runs a side): at --vram 5.5 41.9-49.1 tok/s without it, 53.9-60.0 with it; at 5.0 48.0-54.3 and 47.3-57.6 (its slots 672 -> 526). On
+/// 2026-11-03, before the CPU's int8 experts, it had cost 1.4% at 5; below about 4.75 the placement drops it. An 8 GB card whose desktop
+/// holds 1.3 GB leaves 5.4 GiB here, under the 5.5 this was before.
 pub fn drafter_pays(machine: &Machine) -> bool {
-    machine.gpus.iter().map(|gpu| auto_budget(cfg!(windows), free_for_auto(gpu), gpu.total)).sum::<u64>() >= (11 << 30) / 2
+    machine.gpus.iter().map(|gpu| auto_budget(cfg!(windows), free_for_auto(gpu), gpu.total)).sum::<u64>() >= 5 << 30
 }
 
 /// The largest context in [`CONTEXTS`] at which `entry` runs on `machine`, with how; when it runs at
@@ -908,6 +910,8 @@ pub(crate) mod tests {
         // (the budgets depend on the platform's margin: 6 GB under Windows leaves about 4.2 GiB, elsewhere 4.5)
         assert!(!drafter_pays(&windows_pc(6144, DESKTOP, RAM_32)));
         assert!(drafter_pays(&windows_pc(8188, DESKTOP, RAM_32)));
+        // (an 8 GB card whose desktop and browser hold 1.3 GB: 5.4 GiB, which once fell under the bar)
+        assert!(drafter_pays(&windows_pc(8188, 1300 << 20, RAM_32)));
         assert!(drafter_pays(&two_r9700s()));
     }
 
