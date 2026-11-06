@@ -404,6 +404,7 @@ __global__ void __launch_bounds__(moe_tile_threads) moe_device_tiles(const MoeGr
     if (t==moe_tile_threads-1) *count=blocks[t];
 }
 #endif
+constexpr size_t prompt_cpu_routes_max=4096;
 // Whether a prompt batch's streamed experts of `plan` are gathered by the CPU's workers (banks not page-locked; hybrid_stream_missing).
 inline bool prompt_gathered(const Device& d,const ResidentMoe& plan) { return d.slots.host && d.cpu && !plan.mapped[0]; }
 // The experts of `missing` (a batch's rows each in `counts`) the CPU takes instead of the bus: the GPU streams an expert whatever
@@ -417,13 +418,16 @@ inline std::vector<size_t> prompt_cpu_share(const Device& d,const ResidentMoe& p
     const double route=d.prompt_cpu_ns>0 ? d.prompt_cpu_ns : 60000.0;
     std::vector<size_t> order(missing);
     std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) { return counts[a]<counts[b]; });
+    // (at most prompt_cpu_routes_max routes a batch: the CPU's buffers and the batch's pinned results stay within some tens of MB)
+    size_t routes_taken=0;
     if (prompt_gathered(d,plan)) {
         // Banks not page-locked: the CPU's workers gather each streamed expert into pinned memory before the bus takes it, and the
         // CPU's own routes wait behind those gathers on the same workers, so the CPU's time is the layer's. An expert goes to the CPU
         // only when its routes cost less than its gather (before any measurement, a gather at 8 GB/s).
         const double gather=d.prompt_gather_ns>0 ? d.prompt_gather_ns : double(expert_slot_bytes(plan))/8.0;
         for (size_t expert : order) {
-            if (route*counts[expert]>0.9*gather) break;
+            if (route*counts[expert]>0.9*gather || routes_taken+counts[expert]>prompt_cpu_routes_max) break;
+            routes_taken+=counts[expert];
             taken.push_back(expert);
         }
     } else {
@@ -431,7 +435,8 @@ inline std::vector<size_t> prompt_cpu_share(const Device& d,const ResidentMoe& p
         size_t left=missing.size();
         for (size_t expert : order) {
             const double next=cpu+route*counts[expert];
-            if (next>d.prompt_scale*stream*double(left-1)) break;
+            if (next>d.prompt_scale*stream*double(left-1) || routes_taken+counts[expert]>prompt_cpu_routes_max) break;
+            routes_taken+=counts[expert];
             cpu=next; --left; taken.push_back(expert);
         }
     }
@@ -449,14 +454,24 @@ __global__ void prompt_cpu_scatter(const float* rows,const int32_t* routes,float
 }
 inline void prompt_cost(double& average,double sample) { average=average>0 ? 0.7*average+0.3*sample : sample; }
 // Room for `floats` in the pinned prompt buffer (between batches: no copy reads it).
+// Pinned memory, or where the system refuses it (a machine short of memory) pageable memory, whose copies the driver stages; null
+// when even that is refused: the batch then streams the CPU's experts as well (grouped_expert_prefill).
 inline float* prompt_host(Device& d,size_t floats) {
-    if (d.prompt_host_floats<floats) {
-        if (d.prompt_host) check(hipHostFree(d.prompt_host));
-        d.prompt_host=nullptr; d.prompt_host_floats=0;
-        check(hipHostMalloc(reinterpret_cast<void**>(&d.prompt_host),floats*4,hipHostMallocDefault));
-        d.prompt_host_floats=floats;
-    }
     if (!d.prompt_rows) check(hipEventCreateWithFlags(&d.prompt_rows,hipEventDisableTiming));
+    if (d.prompt_host_floats>=floats) return d.prompt_host;
+    if (d.prompt_host && d.prompt_host_pinned) check(hipHostFree(d.prompt_host));
+    d.prompt_host=nullptr; d.prompt_host_floats=0; d.prompt_host_pinned=false;
+    std::vector<float>().swap(d.prompt_pageable);
+    void* pinned=nullptr;
+    if (hipHostMalloc(&pinned,floats*4,hipHostMallocDefault)==hipSuccess) {
+        d.prompt_host=static_cast<float*>(pinned); d.prompt_host_pinned=true;
+    } else {
+        (void)hipGetLastError();   // (the refusal is not the stream's error)
+        try { d.prompt_pageable.resize(floats); }
+        catch (const std::bad_alloc&) { return nullptr; }
+        d.prompt_host=d.prompt_pageable.data();
+    }
+    d.prompt_host_floats=floats;
     return d.prompt_host;
 }
 void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t experts,size_t steps,const int32_t* selected,
@@ -529,10 +544,17 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         }
         const size_t n=cpu_routes.size();
         cpu_rows=prompt_host(d,steps*2560+n*2561);
-        cpu_results=cpu_rows+steps*2560;
-        std::memcpy(cpu_results+n*2560,cpu_routes.data(),n*4);
-        check(hipMemcpyAsync(cpu_rows,input,steps*2560*4,hipMemcpyDeviceToHost,d.stream));
-        check(hipEventRecord(d.prompt_rows,d.stream));
+        if (cpu_rows) {
+            cpu_results=cpu_rows+steps*2560;
+            std::memcpy(cpu_results+n*2560,cpu_routes.data(),n*4);
+            check(hipMemcpyAsync(cpu_rows,input,steps*2560*4,hipMemcpyDeviceToHost,d.stream));
+            check(hipEventRecord(d.prompt_rows,d.stream));
+        } else {
+            // (no host memory for the rows: the CPU's experts are streamed with the rest)
+            missing.insert(missing.end(),on_cpu.begin(),on_cpu.end());
+            std::sort(missing.begin(),missing.end());
+            on_cpu.clear(); cpu_routes.clear(); cpu_experts.clear();
+        }
     }
     size_t first=0;
     for (size_t group=0;group<groups_count;++group) { host_firsts[group]=uint32_t(first); first+=host_counts[group]; }
