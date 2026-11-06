@@ -148,8 +148,154 @@ ExpertGemv hybrid_assist(const Device& d, const ResidentMoe& plan) {
     assist.assist = plan.mapped[0] ? d.assist : 0;
     return assist;
 }
+#if !defined(__HIPCC__)
+// A layer's router in one launch (CUDA): the router (experts rows of 2560, BF16 or F32) and the shared expert's gate (one row), each on the
+// lanes and in the order gemv() gives it, then the routing and the export in the last block to finish: every block stores its rows, fences
+// and counts itself in, and the last block (which resets the count: a graph replays the launch) forms the top-10 and the softmax and
+// exports them. The scores land in d.output as the separate kernels leave them, and every value is the one those compute
+// (hybrid_route_export_separate: gemv(), resident_route and hybrid_export), as tests/router_gpu.rs checks bit for bit.
+struct HybridRouter { Matrix scores, gate; unsigned scores_lanes, gate_lanes, scores_waves; };
+// gemv_rows<kind, 1> with a lane's units loaded all at once (ten at a time) and then summed in the order gemv_rows sums them: the loads of a
+// row are independent, so the row costs a memory latency or two in place of one for every two units; every dot and every addition is the same.
+template<int kind>
+__device__ __forceinline__ void hybrid_router_rows(const Matrix& matrix, size_t first_row, unsigned lanes, const float* x, float* y) {
+    const unsigned lane = threadIdx.x % 32, sub = lane % lanes;
+    const size_t row = first_row + lane / lanes;
+    const size_t units = matrix.cols / GemvFormat<kind>::elements;
+    constexpr int batch = 10;
+    float sum = 0;
+    for (size_t first = sub; first < units; first += size_t(batch) * lanes) {
+        float dots[batch];
+        #pragma unroll
+        for (int j = 0; j < batch; ++j) {
+            const size_t unit = first + size_t(j) * lanes;
+            dots[j] = 0;
+            if (row < matrix.rows && unit < units) {
+                float one[1];
+                GemvFormat<kind>::template dots<1>(matrix.data + row * matrix.row_bytes, unit, x, 0, one);
+                dots[j] = one[0];
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < batch; ++j)
+            if (row < matrix.rows && first + size_t(j) * lanes < units) sum += dots[j];
+    }
+    for (unsigned offset = lanes / 2; offset; offset /= 2) sum += __shfl_xor(sum, offset, 32);
+    if (sub == 0 && row < matrix.rows) gemv_store(matrix, row, 0, sum, y, 0, GemvResidual{});
+}
+__device__ __forceinline__ void hybrid_router_wave(const Matrix& matrix, size_t first_row, unsigned lanes, const float* x, float* y) {
+    if (matrix.kind == 30) hybrid_router_rows<30>(matrix, first_row, lanes, x, y);
+    else hybrid_router_rows<0>(matrix, first_row, lanes, x, y);
+}
+// blockIdx.y a row; 8 waves a block, the router's waves and then the gate's. The last block to finish takes the row's top-10 as resident_route does,
+// by rank in place of rounds: a wave's 64 scores each count the scores of the wave that beat them (higher, or equal and a lower expert) and the
+// ten with fewer than ten are its candidates, in order; the 80 candidates count each other in the same way. Experts are ordered totally (no two
+// alike), so the ten and their order are the ones resident_route's rounds find; then the same softmax (every exp, the sum in order, every division).
+__global__ void __launch_bounds__(256) hybrid_router(HybridRouter router, const float* input, size_t input_stride, float* scores,
+                                                     int32_t* selected, float* probabilities, const MoeGroup* groups, ExpertGemv plan,
+                                                     volatile float* target, uint32_t* counters) { SD_KERNEL_ACQUIRE;
+    __shared__ uint32_t last;
+    __shared__ float candidate_value[80], top_value[10], weight[10];
+    __shared__ int candidate_index[80], below[3][80], top_index[10];
+    const size_t row = blockIdx.y, experts = router.scores.rows, stride = experts + 1;
+    const size_t wave = size_t(blockIdx.x) * 8 + threadIdx.x / 32;
+    const float* x = input + row * input_stride;
+    float* y = scores + row * stride;
+    // (candidates no score takes, as resident_route's masked ones)
+    if (threadIdx.x < 80) { candidate_value[threadIdx.x] = -INFINITY; candidate_index[threadIdx.x] = 0x7fffffff; }
+    if (threadIdx.x < 10) { top_value[threadIdx.x] = -INFINITY; top_index[threadIdx.x] = 0x7fffffff; }
+    if (wave < router.scores_waves) hybrid_router_wave(router.scores, wave * (32 / router.scores_lanes), router.scores_lanes, x, y);
+    else hybrid_router_wave(router.gate, (wave - router.scores_waves) * (32 / router.gate_lanes), router.gate_lanes, x, y);
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) {
+        const bool done = atomicAdd(counters + row, 1u) == gridDim.x - 1;
+        if (done) { counters[row] = 0; __threadfence(); }
+        last = done;
+    }
+    __syncthreads();
+    // (the activation to the host: the grid's first threads, a value each, as hybrid_export did)
+    target += row * hybrid_row_floats;
+    const auto activation = [&]() {
+        for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < 2560; i += size_t(gridDim.x) * 256) target[32 + i] = x[i];
+    };
+    if (!last) { activation(); return; }
+    const unsigned lane = threadIdx.x % 32, own = threadIdx.x / 32;
+    // a wave's 64 scores, two a lane (the scores another block stored: read at L2)
+    const int index0 = int(own * 64 + lane), index1 = index0 + 32;
+    const float value0 = size_t(index0) < experts ? __ldcg(scores + row * stride + index0) : -INFINITY;
+    const float value1 = size_t(index1) < experts ? __ldcg(scores + row * stride + index1) : -INFINITY;
+    int rank0 = 0, rank1 = 0;
+    #pragma unroll 8
+    for (unsigned s = 0; s < 32; ++s) {
+        const float other0 = __shfl_sync(0xffffffffu, value0, s), other1 = __shfl_sync(0xffffffffu, value1, s);
+        const int at0 = int(own * 64 + s), at1 = at0 + 32;
+        rank0 += int(route_better(other0, at0, value0, index0)) + int(route_better(other1, at1, value0, index0));
+        rank1 += int(route_better(other0, at0, value1, index1)) + int(route_better(other1, at1, value1, index1));
+    }
+    if (rank0 < 10) { candidate_value[own * 10 + rank0] = value0; candidate_index[own * 10 + rank0] = index0; }
+    if (rank1 < 10) { candidate_value[own * 10 + rank1] = value1; candidate_index[own * 10 + rank1] = index1; }
+    __syncthreads();
+    // the 80 candidates, each counted by three threads over a third of them
+    if (threadIdx.x < 240) {
+        const unsigned who = threadIdx.x % 80, part = threadIdx.x / 80;
+        const float mine = candidate_value[who]; const int at = candidate_index[who];
+        int beat = 0;
+        for (unsigned j = part; j < 80; j += 3) beat += int(route_better(candidate_value[j], candidate_index[j], mine, at));
+        below[part][who] = beat;
+    }
+    __syncthreads();
+    if (threadIdx.x < 80) {
+        const int rank = below[0][threadIdx.x] + below[1][threadIdx.x] + below[2][threadIdx.x];
+        if (rank < 10) { top_value[rank] = candidate_value[threadIdx.x]; top_index[rank] = candidate_index[threadIdx.x]; }
+    }
+    __syncthreads();
+    // the softmax over the ten
+    if (threadIdx.x < 10) weight[threadIdx.x] = expf(top_value[threadIdx.x] - top_value[0]);
+    __syncthreads();
+    selected += row * 10; probabilities += row * 11;
+    const size_t i = threadIdx.x;
+    if (i < 10) {
+        float sum = 0;
+        for (size_t k = 0; k < 10; ++k) sum += weight[k];
+        const int expert = top_index[i] < int(experts) ? top_index[i] : int(i);
+        const float probability = weight[i] / sum;
+        selected[i] = expert; probabilities[i] = probability;
+        target[i] = float(expert); target[16 + i] = probability;
+    } else if (i == 10) {
+        const float gate = hc_sigmoid(__ldcg(scores + row * stride + experts));
+        probabilities[10] = gate; target[26] = gate;
+    }
+    __syncthreads();
+    if (i < 10) target[2592 + i] = groups[selected[i]].weights[0].data ? 1.0f : expert_source(groups, selected, i, 0, plan) ? 2.0f : 0.0f;
+    activation();
+}
+// The launch of hybrid_router for the router and the gate of `plan`; false (nothing launched) where gemv() would not run them as it does
+// (other formats or shapes, misaligned input), and the separate kernels do.
+bool hybrid_router_launch(Device& d, ResidentMoe& plan, const HybridScratch& s, const float* input, size_t rows, size_t input_stride) {
+    const size_t experts = plan.experts;
+    HybridRouter router{plan.weights[(experts + 1) * 3], plan.weights[(experts + 1) * 3 + 1], 0, 0, 0};
+    router.gate.output_offset = experts;
+    const Matrix& scores = router.scores;
+    const Matrix& gate = router.gate;
+    if ((scores.kind != 30 && scores.kind != 0) || (gate.kind != 30 && gate.kind != 0) || scores.rows != experts || experts > 512 || gate.rows != 1 ||
+        scores.cols != 2560 || gate.cols != 2560 || scores.input_offset || gate.input_offset || scores.output_offset ||
+        !rows || rows > hybrid_rows || input_stride % 4)
+        return false;
+    router.scores_lanes = gemv_q8_lanes(d, scores, gemv_lanes(scores, input));
+    router.gate_lanes = gemv_q8_lanes(d, gate, gemv_lanes(gate, input));
+    if (!router.scores_lanes || !router.gate_lanes) return false;
+    router.scores_waves = unsigned(gemv_waves(scores, router.scores_lanes));
+    const size_t waves = router.scores_waves + gemv_waves(gate, router.gate_lanes);
+    hybrid_router<<<dim3(unsigned((waves + 7) / 8), unsigned(rows)), 256, 0, d.stream>>>(
+        router, input, input_stride, d.output, s.selected, s.probabilities, static_cast<const MoeGroup*>(plan.table), hybrid_assist(d, plan),
+        d.exchange_device, d.flags + hybrid_router_counters);
+    check(hipGetLastError());
+    return true;
+}
+#endif
 // The rows' routes and activations to the host: every row in one launch of each kernel, as moe_tokens_experts.
-void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, size_t rows = 1, size_t input_stride = 2564) {
+void hybrid_route_export_separate(Device& d, ResidentMoe& plan, const float* input, size_t rows = 1, size_t input_stride = 2564) {
     const size_t experts = plan.experts;
     const HybridScratch s = hybrid_scratch(plan, rows);
     Matrix projections[2] = {plan.weights[(experts + 1) * 3], plan.weights[(experts + 1) * 3 + 1]};
@@ -160,6 +306,13 @@ void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, size_
                                                                  static_cast<const MoeGroup*>(plan.table), hybrid_assist(d, plan),
                                                                  d.exchange_device);
     check(hipGetLastError());
+}
+// (one kernel where the router's shapes allow it: CUDA's hybrid_router, else the three above)
+void hybrid_route_export(Device& d, ResidentMoe& plan, const float* input, size_t rows = 1, size_t input_stride = 2564) {
+#if !defined(__HIPCC__)
+    if (hybrid_router_launch(d, plan, hybrid_scratch(plan, rows), input, rows, input_stride)) return;
+#endif
+    hybrid_route_export_separate(d, plan, input, rows, input_stride);
 }
 #if !defined(__HIPCC__)
 // The experts a layer's GPU takes over the bus, copied into VRAM's staging slots by every thread at once. A kernel reads host

@@ -52,6 +52,11 @@ int sd_host_unregister(void* pointer);
 /* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
    refused as a machine short of memory refuses them; 0 ends it. */
 int sd_test_refuse_host(uint64_t count);
+/* Development (tests/router_gpu.rs): a partially resident layer's router (`experts` rows of 2560 values of kind 30 or 0, and a one-row gate) run
+   by the separate kernels and by the one kernel, for `rows` input rows; the results hold both, the separate kernels' first. See kernels.cpp. */
+int sd_hybrid_route_check(void* handle, const void* router, int router_kind, const void* gate, int gate_kind, uint64_t experts, uint64_t rows,
+                          const float* input, uint32_t repeats, uint32_t assist, int* fused, float* scores, int32_t* selected,
+                          float* probabilities, float* exported);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
 // A decoder layer's host K/V grown to `capacity` positions, its `valid` positions kept, and its indexer laid out for them in

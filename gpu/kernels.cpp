@@ -2109,6 +2109,82 @@ int sd_test_refuse_host(uint64_t count) {
     refuse_host_allocations.store(count);
     return 0;
 }
+// Development (tests/router_gpu.rs): a partially resident layer's router on the given weights, once as the separate kernels run it and then as
+// the one kernel (hybrid_router) runs it, `repeats` launches of a captured graph with the buffers cleared between them. `router` is `experts` rows of
+// 2560 values and `gate` one row, of kind 30 (BF16) or 0 (F32); `input` is `rows` rows of 2560 floats. Every result holds two copies, the separate
+// kernels' and then the one kernel's: scores (rows x (experts + 1)), selected (rows x 10), probabilities (rows x 11) and exported (rows x
+// hybrid_row_floats, as the host reads it). With `assist` more than 0 the layer's GPU assists that many absent routes (as sd_hybrid_assist_level does), where
+// the export marks them. *fused is 0, and the second copy left alone, where the one kernel does not take these (HIP, other shapes).
+int sd_hybrid_route_check(void* handle, const void* router, int router_kind, const void* gate, int gate_kind, uint64_t experts, uint64_t rows,
+                          const float* input, uint32_t repeats, uint32_t assist, int* fused, float* scores, int32_t* selected,
+                          float* probabilities, float* exported) {
+    try {
+        auto& d = device(handle);
+        if (!router || !gate || !input || !fused || !scores || !selected || !probabilities || !exported || experts < 10 || experts > 512 ||
+            !rows || rows > hybrid_rows || !repeats || (router_kind != 0 && router_kind != 30) || (gate_kind != 0 && gate_kind != 30))
+            throw std::runtime_error("invalid hybrid router check");
+        const size_t E = size_t(experts), R = size_t(rows), stride = 2564;
+        std::vector<void*> buffers;
+        struct Release {
+            std::vector<void*>& all; Device& device; float* exchange; uint32_t assist;
+            ~Release() { device.exchange_device = exchange; device.assist = assist; for (void* pointer : all) cleanup(hipFree(pointer)); }
+        } release{buffers, d, d.exchange_device, d.assist};
+        const auto allocate = [&](size_t bytes) { void* pointer = nullptr; check(hipMalloc(&pointer, bytes)); buffers.push_back(pointer); return pointer; };
+        const size_t router_row = 2560 * (router_kind == 30 ? 2 : 4), gate_row = 2560 * (gate_kind == 30 ? 2 : 4);
+        void* device_router = allocate(E * router_row); upload(d, device_router, router, E * router_row);
+        void* device_gate = allocate(gate_row); upload(d, device_gate, gate, gate_row);
+        std::vector<float> rows_in(R * stride, 0.0f);
+        for (size_t r = 0; r < R; ++r) std::copy(input + r * 2560, input + (r + 1) * 2560, rows_in.begin() + r * stride);
+        auto* device_input = static_cast<float*>(allocate(rows_in.size() * 4)); upload(d, device_input, rows_in.data(), rows_in.size() * 4);
+        ResidentMoe plan;
+        plan.experts = E; plan.hybrid = true;
+        if (assist) {   // (the banks the GPU reads in place: any address, a byte each)
+            for (size_t role = 0; role < 3; ++role) { plan.mapped[role] = static_cast<const uint8_t*>(device_router); plan.host_bytes[role] = 1; }
+            d.assist = assist;
+        }
+        plan.weights.assign((E + 1) * 3 + 2, Matrix{});
+        plan.weights[(E + 1) * 3] = {static_cast<const uint8_t*>(device_router), router_row, E, 2560, 0, 0, 0, router_kind};
+        plan.weights[(E + 1) * 3 + 1] = {static_cast<const uint8_t*>(device_gate), gate_row, 1, 2560, 0, 0, 0, gate_kind};
+        // (every third expert is resident: any address stands for its data)
+        std::vector<MoeGroup> groups(E + 1, MoeGroup{});
+        for (size_t e = 0; e < E; e += 3) groups[e].weights[0].data = static_cast<const uint8_t*>(device_router);
+        plan.table = allocate(groups.size() * sizeof(MoeGroup)); upload(d, plan.table, groups.data(), groups.size() * sizeof(MoeGroup));
+        const size_t workspace_bytes = R * 11 * 4500 * 4, exported_bytes = R * hybrid_row_floats * 4, output_bytes = R * (E + 1) * 4;
+        plan.workspace = static_cast<float*>(allocate(workspace_bytes));
+        auto* exchange = static_cast<float*>(allocate(exported_bytes));
+        d.exchange_device = exchange;
+        const HybridScratch s = hybrid_scratch(plan, R);
+        const auto clear = [&]() {
+            check(hipMemsetAsync(plan.workspace, 0, workspace_bytes, d.stream));
+            check(hipMemsetAsync(exchange, 0, exported_bytes, d.stream));
+            check(hipMemsetAsync(d.output, 0, output_bytes, d.stream));
+        };
+        const auto collect = [&](size_t copy) {
+            download(d, scores + copy * R * (E + 1), d.output, output_bytes);
+            download(d, selected + copy * R * 10, s.selected, R * 10 * 4);
+            download(d, probabilities + copy * R * 11, s.probabilities, R * 11 * 4);
+            download(d, exported + copy * R * hybrid_row_floats, exchange, exported_bytes);
+        };
+        clear();
+        hybrid_route_export_separate(d, plan, device_input, R, stride);
+        collect(0);
+        *fused = 0;
+#if !defined(__HIPCC__)
+        clear();
+        if (hybrid_router_launch(d, plan, s, device_input, R, stride)) {   // (the shapes it takes: once as ever, then as the graph's replays)
+            static std::atomic<size_t> variants{0};
+            const size_t variant = ++variants;
+            for (uint32_t launch = 0; launch < repeats; ++launch) {
+                clear();
+                run_graph(d, "hybrid-router-check", nullptr, 0, variant, [&]() { hybrid_router_launch(d, plan, s, device_input, R, stride); });
+            }
+            collect(1);
+            *fused = 1;
+        }
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host,uint64_t bytes) {
     try {
         auto& d=device(handle);

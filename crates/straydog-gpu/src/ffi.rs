@@ -141,6 +141,25 @@ unsafe extern "C" {
     pub fn sd_test_refuse_host(count: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_route_check(
+        handle: *mut ::std::os::raw::c_void,
+        router: *const ::std::os::raw::c_void,
+        router_kind: ::std::os::raw::c_int,
+        gate: *const ::std::os::raw::c_void,
+        gate_kind: ::std::os::raw::c_int,
+        experts: u64,
+        rows: u64,
+        input: *const f32,
+        repeats: u32,
+        assist: u32,
+        fused: *mut ::std::os::raw::c_int,
+        scores: *mut f32,
+        selected: *mut i32,
+        probabilities: *mut f32,
+        exported: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_host_state(
         handle: *mut ::std::os::raw::c_void,
         bytes: u64,
