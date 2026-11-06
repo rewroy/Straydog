@@ -604,6 +604,15 @@ struct Device {
     float* cpu_partial=nullptr;   // device copy of the CPU expert result
     float* exchange_device=nullptr;   // the pinned exchange as seen by kernels
     uint64_t cpu_experts=0, gpu_experts=0, assisted_experts=0, streamed_experts=0, swapped_experts=0, hybrid_tokens=0;
+    // A prompt batch's experts beyond the slots that the CPU took (prompt_cpu_share), and what a streamed expert and a CPU route
+    // cost in the last batches (ns, a moving average; 0 before the first measurement)
+    bool prompt_cpu=true;   // sd_hybrid_prompt_share
+    uint64_t prompt_cpu_routes=0;
+    double prompt_stream_ns=0, prompt_cpu_ns=0;
+    double prompt_scale=0.7;   // the CPU's share of the GPU's time it is given: moved by how the last batches' CPU and GPU finished
+    float* prompt_host=nullptr;   // pinned: a batch's rows to the CPU, its routes' results and their routes back
+    size_t prompt_host_floats=0;
+    hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
@@ -637,6 +646,8 @@ struct Device {
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (exchange) cleanup(hipHostFree(exchange));
+        if (prompt_host) cleanup(hipHostFree(prompt_host));
+        if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));
         if (readback) cleanup(hipHostFree(readback));
         if (route_mailbox) cleanup(hipHostFree(route_mailbox));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
@@ -1780,6 +1791,9 @@ int sd_hybrid_route_floor(void* handle, float floor) {
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
+int sd_hybrid_prompt_share(void* handle, int on) {
+    try { device(handle).prompt_cpu = on != 0; return 0; } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
 int sd_hybrid_supported(void* handle) {
     try { const Device& d=device(handle); return int(d.expert_prefill && d.half_gemm); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -1813,6 +1827,13 @@ int sd_hybrid_timing(void* handle,uint64_t* wait_ns,uint64_t* cpu_ns,uint64_t* s
         if (!wait_ns || !cpu_ns || !swapped || !assisted) throw std::runtime_error("invalid hybrid timers");
         auto& d=device(handle); *wait_ns=d.hybrid_wait_ns; *cpu_ns=d.hybrid_cpu_ns; *swapped=d.swapped_experts;
         *assisted=d.assisted_experts; return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_hybrid_prompt_cpu(void* handle,uint64_t* routes) {
+    try {
+        if (!routes) throw std::runtime_error("invalid hybrid counters");
+        *routes=device(handle).prompt_cpu_routes;
+        return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_hybrid_counts(void* handle,uint64_t* gpu,uint64_t* cpu,uint64_t* streamed,uint64_t* cached) {

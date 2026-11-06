@@ -532,6 +532,8 @@ int sd_peer_direct(void* handle);
 int sd_hybrid_supported(void* handle);
 /* Speed first: CPU routes of a router weight below `floor` (0 to 1; 0 none) are left out of their token. */
 int sd_hybrid_route_floor(void* handle, float floor);
+/* Whether a prompt batch's experts beyond the slots with the fewest rows go to the CPU (on by default; prompt_cpu_share). */
+int sd_hybrid_prompt_share(void* handle, int on);
 void* sd_hybrid_moe_create(void* handle, void* const* pointers, const int* kinds, const int* routed_kinds, uint64_t experts, const uint8_t* const* host, void* workspace, uint64_t capacity);
 int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes);
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
@@ -549,6 +551,8 @@ int sd_hybrid_assist_level(void* handle, uint32_t assist);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);
+/* The routes of prompt batches' experts beyond the slots that the CPU computed instead of the bus streaming the experts. */
+int sd_hybrid_prompt_cpu(void* handle, uint64_t* routes);
 /* Warm start: a partially resident layer's decode and verification rows routed to each of its experts since the last clear, to the device (the expert held a slot) then to the host, into `out` (room for `room` values); the experts counted (0: a plan of another kind, -1: failure); `clear` zeroes them after. */
 int sd_hybrid_routes(void* handle, void* plan, uint32_t* out, uint64_t room, int clear);
 /* The layer's experts' scores set from `rates`, the routes a token to each of `experts`, as the moving average they come to at that rate. */
@@ -565,6 +569,8 @@ const char* sd_cpu_experts_isa(void* handle);
 int sd_cpu_experts_stats(void* handle, uint64_t* values);
 int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint32_t count, uint64_t hidden, uint64_t inter, const float* x, float* out);
 int sd_cpu_experts_run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden, uint64_t inter, const float* const* xs, float* const* outs);
+/* A prompt batch's routes: sd_cpu_experts_run_rows outside the engine's phase timers and counts (which time decode). */
+int sd_cpu_experts_run_prompt(void* handle, const int* kinds, uint32_t rows, const uint32_t* counts, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* const* down, const float* weights, uint64_t hidden, uint64_t inter, const float* const* xs, float* const* outs);
 int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* targets, const uint64_t* bytes, uint32_t count);
 int sd_cpu_gather_file(void* handle, const uint8_t* base, uint64_t bytes, void* file);
 int sd_cpu_paging(void* handle, const uint8_t* flag);

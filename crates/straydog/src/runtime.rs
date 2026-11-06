@@ -451,7 +451,7 @@ fn prefill_summary(usage: &Value, timings: &Value) -> String {
 }
 
 /// A partially resident request's breakdown: a generated token's wait for the GPU and the CPU experts' time, where its routes ran, its passes,
-/// the experts its prompt streamed over the bus, and the memory it ended with.
+/// the experts its prompt streamed over the bus (and the routes of others the CPU computed), and the memory it ended with.
 fn partial_summary(detail: &Value, timings: &Value) -> String {
     let number = |key: &str| detail[key].as_f64().unwrap_or(0.0);
     let decode = timings["decode_tokens_per_second"].as_f64().map_or(0.0, |rate| 1e3 / rate.max(1e-9));
@@ -479,7 +479,9 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         let ms: Vec<f64> = ms.iter().map(|value| value.as_f64().unwrap_or(0.0)).collect();
         format!(" (gate and up {:.1}, products {:.1}, down {:.1})", ms[0], ms[1], ms[2])
     });
-    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts; graphs {} ({} replays){read_aheads}{memory}",
+    // (a prompt batch's experts with the fewest rows: the CPU computes their routes instead of the bus streaming them)
+    let prompt_cpu = Some(number("prompt_cpu_routes")).filter(|routes| *routes >= 0.5).map_or_else(String::new, |routes| format!(" and the CPU {routes:.0} routes"));
+    format!("; ms a token: GPU wait {wait:.1}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }

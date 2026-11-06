@@ -40,6 +40,8 @@ fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>, u64) {
     let settings = Settings { context: 8192, state_budget_bytes: 4 << 30, prefill_batch_size: 256, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial, "the model must be partially resident at this budget");
+    // (the prompt's experts all stream: the runs compared begin alike; prompt_cpu_gpu checks the CPU's share of a prompt)
+    model.prompt_share(false).unwrap();
     let mapped = model.lock_layers_for_test(&LOCKED).unwrap();
     assert!(mapped >= LOCKED.len() as u64, "{mapped} plans mapped of {}", LOCKED.len());
     (model, prompt, mapped)
