@@ -48,9 +48,11 @@ fn open(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>) -> (Model, Ve
     // (64K of context: the K/V of that is over a quarter of the budget, so it stays in host memory, and it starts at 32K positions)
     let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256, speculative: if drafter.is_some() { 3 } else { 0 },
                               cpu_threads: 0, row_cache_bytes: None };
-    let model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+    let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial, "the model must be partially resident at this budget");
     assert!(model.host_kv, "its K/V must be in host memory");
+    // (the prompt's experts all stream: the fresh models compared begin alike; prompt_cpu_gpu checks the CPU's share of a prompt)
+    model.prompt_share(false).unwrap();
     (model, prompt)
 }
 
