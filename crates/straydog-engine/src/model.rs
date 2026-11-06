@@ -21,7 +21,7 @@ use crate::assist;
 use crate::banks::{BankLocks, GaveBack, Locked};
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
-use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, WIDTH};
+use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, HOST_NO_MEMORY, WIDTH};
 use crate::group::{row_count, Group, Positions};
 use crate::qwen_vision::{self, ImageSpan, IMAGE_PAD};
 use crate::routes::{self, Banks, Hints, Routes};
@@ -109,6 +109,9 @@ pub const IMAGE_REFUSED: &str = "(a request with an image, refused)";
 pub const SCARCE_ROW_CACHE: u64 = 1 << 30;
 /// The commit a K/V growth leaves the machine.
 const KV_COMMIT_MARGIN: u64 = 2 << 30;
+/// What a copy of a conversation's state into host memory leaves the machine: the stacks, heaps and page-locked buffers the rest of the engine
+/// asks for as it goes are charged to the same commit, and a process that finds it gone ends there, whatever it was doing (Windows: STATUS_NO_MEMORY).
+const COPY_COMMIT_MARGIN: u64 = KV_COMMIT_MARGIN;
 /// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
 /// whole context take from a small machine what the expert banks need, and few sequences reach it.
 pub const STARTING_KV: usize = 32768;
@@ -1571,13 +1574,35 @@ impl Model {
     /// its recurrent state (in `slot`). For the live sequence a restored one replaces, whose
     /// positions the restore overwrites at once.
     fn park(&mut self, from: usize, slot: usize) -> Result<Parked> {
-        let positions = self.group.save_positions(from as u64, self.history.len() as u64, true)?;
+        let positions = self.save_positions(from, self.history.len(), true)?;
         if let Err(error) = self.group.checkpoint(slot, true) {
             let _ = self.group.release_positions(positions);
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: None,
                     saved: vec![positions], covered: Some((from, self.history.len())), root: false })
+    }
+
+    /// `group.save_positions` of `from..to`, with the room for the copy asked first: host memory (pageable, charged to the commit) for hundreds of MB to
+    /// some GB. Where the system charges the commit (Windows) and what it has left is less than the copy and [`COPY_COMMIT_MARGIN`], or where it refuses the
+    /// copy's memory ([`HOST_NO_MEMORY`]), locked layers are given back for it, newest first ([`Model::give_back`]), as for a K/V growth; with none left the
+    /// error is [`HOST_NO_MEMORY`], which the caller survives by going without the copy.
+    fn save_positions(&mut self, from: usize, to: usize, history: bool) -> Result<Positions> {
+        let wanted = to.saturating_sub(from) as u64 * self.group.position_bytes() + COPY_COMMIT_MARGIN;
+        loop {
+            let short = crate::host::commit_left().is_some_and(|(_, left)| left < wanted);
+            let refused = if short {
+                HOST_NO_MEMORY.to_string()
+            } else {
+                match self.group.save_positions(from as u64, to as u64, history) {
+                    Err(error) if error.ends_with(HOST_NO_MEMORY) => error,
+                    other => return other,
+                }
+            };
+            if self.give_back(wanted, "a copy of the earlier conversation")?.is_none() {
+                return Err(refused);
+            }
+        }
     }
 
     /// Park the live sequence as a prompt departs from it: its recurrent state (in `slot`) and its
@@ -1645,12 +1670,18 @@ impl Model {
         let started = Instant::now();
         let mut saved = Vec::new();
         for (low, high) in &pieces {
-            match self.group.save_positions(*low as u64, *high as u64, false) {
+            match self.save_positions(*low, *high, false) {
                 Ok(positions) => saved.push(positions),
                 Err(error) => {
                     // (the coverage stays as it was: nothing writes past it)
                     for positions in saved {
                         let _ = self.group.release_positions(positions);
+                    }
+                    if error.ends_with(HOST_NO_MEMORY) {
+                        // No memory to keep the parked sequence's positions that the prompt overwrites: it is dropped, as when its copies would outgrow the budget.
+                        eprintln!("Straydog: the earlier conversation is dropped, there is no host memory to keep the part of it that this request overwrites");
+                        let parked = self.parked.take().unwrap();
+                        return self.discard(parked);
                     }
                     return Err(error);
                 }
@@ -1699,6 +1730,11 @@ impl Model {
                 let swapped = if self.parkable(common) && self.parkable(from) {
                     match self.park(from, slot) {
                         Ok(swapped) => Some(swapped),
+                        Err(error) if error.ends_with(HOST_NO_MEMORY) => {
+                            // (no memory to keep the live sequence beside the parked one it gives way to: it is overwritten, as when it does not fit the budget)
+                            eprintln!("Straydog: the live conversation is not kept, there is no host memory for a copy of it");
+                            None
+                        }
                         Err(error) => {
                             // (nothing overwritten yet: the parked sequence stays parked)
                             self.parked = Some(parked);
@@ -1745,7 +1781,16 @@ impl Model {
                 }
                 None => PARK_SLOTS[0],
             };
-            self.parked = Some(if self.park_whole { self.park(0, slot)? } else { self.depart(slot)? });
+            let parked = if self.park_whole { self.park(0, slot) } else { self.depart(slot) };
+            match parked {
+                Ok(parked) => self.parked = Some(parked),
+                Err(error) if error.ends_with(HOST_NO_MEMORY) => {
+                    // (no memory to keep what the prompt leaves of the live sequence: the prompt overwrites it, and no copy of it is kept)
+                    eprintln!("Straydog: the live conversation is not kept, there is no host memory for a copy of it");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
             return Ok(Some("saved"));
         }
         // (a parked sequence keeps the positions this prompt overwrites below its copies: the

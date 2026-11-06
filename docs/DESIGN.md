@@ -874,7 +874,11 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     (`Model::give_back`: as many as their bytes cover what the memory available lacks, and at least one), and asks again; only with
     no layer left does the request fail. A layer given back is taken out of the assist (its plan reads the bank in place no more, the
     layers' graphs that held the view are captured anew), its banks are unregistered, and the CPU's experts and the slots read it as
-    they read any layer that is not locked. One line in the log says what was given.
+    they read any layer that is not locked. One line in the log says what was given. The locking leaves room: before each layer's turn
+    it looks at the memory available then and stops, saying why, when the layer would leave less than the plan's margin and the K/V
+    that the context's first 64K tokens have yet to grow; past 64K the give-back covers it. The copies of a parked sequence's positions
+    (pageable, charged to the commit like the locks) ask for room the same way, and where there is none even with every layer given back
+    the sequence is not kept: the request runs without it, where an allocation that fails in a Rust `vec!` would end the process.
   - Page-locked banks let the GPU take some of a layer's absent experts over the bus (`assist`). On
     CUDA a kernel first copies them into VRAM's staging slots with every thread at once
     (`hybrid_stage_assist`), two a layer: read in place they outlast the CPU's. At

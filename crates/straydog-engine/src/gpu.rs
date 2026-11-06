@@ -1884,10 +1884,13 @@ impl Backend {
                 let count = part.width * part.height;
                 if in_vram {
                     part.device = Some(self.buffer_unset(count * 4)?);
+                    self.state_copy(part, true)?;
                 } else {
-                    part.data = vec![0f32; count as usize];
+                    // (a run of a parked sequence's positions is hundreds of MB: a machine short of memory refuses it, which the request survives)
+                    part.data = (!copy_refused(count * 4)).then(|| zeroed_floats(count as usize)).flatten().ok_or(HOST_NO_MEMORY)?;
+                    // (the driver stages a copy into pageable memory through buffers of its own, which it may fail to get as well)
+                    self.state_copy(part, true).map_err(|error| if error.contains("out of memory") { HOST_NO_MEMORY.to_string() } else { error })?;
                 }
-                self.state_copy(part, true)?;
             }
             Ok(())
         })();
@@ -2311,6 +2314,45 @@ pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
 }
 
+/// The end of the error of a copy of a conversation's state into host memory that the system had none for (see [`Backend::save_positions`]): the devices
+/// are sound, the request goes on without the copy or fails, and the engine stays.
+pub const HOST_NO_MEMORY: &str = "not enough host memory to keep a copy of the conversation";
+
+/// Tests only: the next `count` copies of a conversation's state into host memory of a MiB or more find none ([`HOST_NO_MEMORY`]); 0 ends it.
+static REFUSE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn refuse_host_copies(count: u64) {
+    REFUSE_COPIES.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a copy of `bytes` is one of those [`refuse_host_copies`] refuses (and if so, it is counted).
+fn copy_refused(bytes: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut left = REFUSE_COPIES.load(Ordering::SeqCst);
+    while bytes >= 1 << 20 && left > 0 {
+        match REFUSE_COPIES.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+    false
+}
+
+/// `count` zeroed floats, or None where the system has no memory for them (`vec![0f32; count]` ends the process there).
+pub fn zeroed_floats(count: usize) -> Option<Vec<f32>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<f32>(count).ok()?;
+    // SAFETY: a layout of a nonzero size; a null return is the system's refusal. All-zero bytes are 0.0, and the vector is made of this very allocation
+    // with the layout it was allocated with (the global allocator's, which frees it).
+    unsafe {
+        let pointer = std::alloc::alloc_zeroed(layout).cast::<f32>();
+        (!pointer.is_null()).then(|| Vec::from_raw_parts(pointer, count, count))
+    }
+}
+
 /// Tests only: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are refused as a
 /// machine short of memory refuses them; 0 ends it.
 #[doc(hidden)]
@@ -2484,4 +2526,19 @@ fn floats_of(bytes: &[u8]) -> Vec<f32> {
 fn bytemuck_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: an f32 slice reinterpreted as its bytes, same length in bytes and alignment 1.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Decides: zeroed floats come zeroed and in the number asked for, and a size no machine has is refused where `vec![0f32; n]` would end the process.
+    #[test]
+    fn zeroed_floats_are_zero_and_a_size_no_machine_has_is_refused() {
+        let floats = super::zeroed_floats(1 << 20).unwrap();
+        assert_eq!(floats.len(), 1 << 20);
+        assert!(floats.iter().all(|value| *value == 0.0));
+        assert!(super::zeroed_floats(0).unwrap().is_empty());
+        assert!(super::zeroed_floats(usize::MAX / 2).is_none(), "a layout that overflows");
+        // (the result goes through black_box: an allocation that is only checked for null may be assumed to succeed, and never made)
+        assert!(std::hint::black_box(super::zeroed_floats(std::hint::black_box(1 << 46))).is_none(), "a valid layout of 256 TiB, more than a process can address");
+    }
 }
