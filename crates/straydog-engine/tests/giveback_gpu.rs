@@ -213,3 +213,47 @@ fn a_give_back_ends_the_locking_and_a_layer_locked_meanwhile_is_let_go() {
     assert_eq!(assist_level(&model), None);
     assert!(model.kv_positions() >= GROWN, "the K/V grew to {}", model.kv_positions());
 }
+
+/// A text of about `tokens` tokens, the same for the same `seed`: sentences of a sort that continue each other, so that two texts begin alike only when
+/// they are given the same beginning.
+fn text_of(text: &Text, seed: &str, tokens: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut n = 0;
+    while out.len() < tokens {
+        out.extend(text.encode(&format!("{seed} number {n}: the harbour clerk wrote down every ship that came in before the tide turned. ")).unwrap());
+        n += 1;
+    }
+    out.truncate(tokens);
+    out
+}
+
+/// What a parked sequence's copies need of host memory is refused: the request that overwrites the parked sequence's positions still runs. Layers locked
+/// are given back for the copy first, newest first, all of them where it stays refused; the parked sequence is then dropped, and the engine goes on.
+#[test]
+fn a_copy_the_system_refuses_gives_back_the_locks_and_then_is_gone_without() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut model, _) = open(&root);
+    let tokenizer = {
+        let bundle = straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "UD-IQ1_S").unwrap();
+        let weights = Weights::open(&PathBuf::from(&root), bundle, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap()
+    };
+    model.lock_layers_for_test(&LOCKED).unwrap();
+    // a first request of 2000 tokens, then one that begins alike for 100 and goes on otherwise: the first sequence is parked, and its positions are copied
+    // out as the second overwrites them
+    let first = text_of(&tokenizer, "first", 2000);
+    let mut second = first[..100].to_vec();
+    second.extend(text_of(&tokenizer, "second", 2000));
+    let go = |model: &mut Model, prompt: &[u32]| model.generate(prompt, 4, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {});
+    go(&mut model, &first).unwrap();
+    straydog_engine::gpu::refuse_host_copies(1000);
+    go(&mut model, &second).expect("a request survives the refusal of the memory to keep the sequence it overwrites");
+    straydog_engine::gpu::refuse_host_copies(0);
+    assert_eq!(model.locked_layers(), 0, "every locked layer was given back for the copy before it was given up");
+    let layers: Vec<usize> = model.gave_back.iter().flat_map(|gave| gave.layers.iter().copied()).collect();
+    assert_eq!(layers, vec![47, 46, 45, 44], "newest first");
+    assert!(model.gave_back.iter().all(|gave| gave.asked_by.contains("copy")), "{:?}", model.gave_back);
+    // and the next request runs
+    go(&mut model, &first).expect("the engine serves the next request");
+}
