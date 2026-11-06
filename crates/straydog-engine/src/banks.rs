@@ -77,6 +77,14 @@ pub(crate) fn check_threads(priority: Priority, cores: usize) -> usize {
     }
 }
 
+/// What a layer's turn works at: [`Lowered::begin_reading`], the CPU and I/O priority of `priority` and, on Windows, the thread's normal memory priority. The turn
+/// asks the system for the next layer's pages while it locks this one, and a page that is read in waits in the standby list at the memory priority of the thread that
+/// read it: at background mode's 1 it is the first the system takes back for the next page, the next layer's own among them, and the turn after found it gone and read
+/// it from the drive again.
+fn turn_lowered(priority: Priority) -> Lowered {
+    Lowered::begin_reading(priority)
+}
+
 /// A layer whose banks were page-locked and checked, and whose locks are the caller's until [`Model::banks_locked`](crate::model::Model::banks_locked)
 /// takes them.
 pub struct Locked {
@@ -173,9 +181,9 @@ impl BankLocks {
     }
 
     /// [`BankLocks::lock_next`] for the locking behind "ready", which gives way to a request: the calling thread works at a lower priority for the
-    /// layer's turn (Windows ends it after, Linux keeps it, [`Lowered`]), so do the threads of the check, and there are at most a quarter as many
-    /// of them as cores ([`check_threads`]). Reading the layer from the drive, registering its pages and hashing them take the cores and the
-    /// memory bandwidth that the CPU's experts of a request need.
+    /// layer's turn (Windows ends it after, Linux keeps it, [`Lowered`]; the memory priority stays normal on Windows, [`turn_lowered`]), so do the threads
+    /// of the check, and there are at most a quarter as many of them as cores ([`check_threads`]). Reading the layer from the drive, registering its pages
+    /// and hashing them take the cores and the memory bandwidth that the CPU's experts of a request need.
     ///
     /// # Safety
     /// As [`BankLocks::lock_next`].
@@ -190,7 +198,7 @@ impl BankLocks {
     /// As [`BankLocks::lock_next`].
     unsafe fn lock_at(&mut self, priority: Priority) -> Option<Result<Locked, Stop>> {
         let (layer, banks) = self.layers.pop_front()?;
-        let _lowered = Lowered::begin(priority);
+        let _lowered = turn_lowered(priority);
         if let Some((_, next)) = self.layers.front() {
             // SAFETY: the caller's.
             let ranges: Vec<(usize, usize)> = next.iter().map(|bank| unsafe { bank.range() }).map(|range| (range.as_ptr() as usize, range.len())).collect();
@@ -326,6 +334,36 @@ mod tests {
         let cores = std::thread::available_parallelism().map_or(8, |count| count.get());
         assert!(check_threads(Priority::Background, cores) <= check_threads(Priority::Normal, cores));
         assert_eq!(check_threads(Priority::Normal, 0), 1);
+    }
+
+    /// Decides: a layer's turn behind "ready" works in background mode for the CPU and the drive but keeps its thread's normal memory priority on Windows, so
+    /// that the pages it asks the system for ahead are not the first the system reuses; the load's turn, and a thread that was not lowered, are unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn a_turn_behind_ready_keeps_its_memory_priority() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadInformation, ThreadMemoryPriority, MEMORY_PRIORITY_INFORMATION};
+        fn memory_priority() -> u32 {
+            let mut information = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
+            // SAFETY: the calling thread's pseudo handle and an initialized structure of the size passed.
+            let read = unsafe {
+                GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, std::ptr::from_mut(&mut information).cast(),
+                                     std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32)
+            };
+            assert_ne!(read, 0, "{}", std::io::Error::last_os_error());
+            information.MemoryPriority
+        }
+        let (before, behind, load, after) = std::thread::spawn(|| {
+            let before = memory_priority();
+            let held = turn_lowered(Priority::Background);
+            let behind = memory_priority();
+            drop(held);
+            let load = {
+                let _held = turn_lowered(Priority::Normal);
+                memory_priority()
+            };
+            (before, behind, load, memory_priority())
+        }).join().unwrap();
+        assert_eq!((behind, load, after), (before, before, before), "the memory priority is normal in a turn, and as it was after it");
     }
 
     #[test]
