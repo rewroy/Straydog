@@ -1,14 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/icon-dark.png">
-    <img src="assets/icon.png" alt="Straydog" width="96">
-  </picture>
-</p>
-
-<p align="center">
-  <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-wordmark-dark.png">
-    <img src="assets/logo-wordmark.png" alt="Straydog" width="280">
+    <img src="assets/logo-wordmark.png" alt="Straydog" width="240">
   </picture>
 </p>
 
