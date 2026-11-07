@@ -52,6 +52,21 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
     float* injection = low + steps * 320;
     float* projected = injection + steps * 4;
     const bool cast = batch_half(d, steps);
+    if (cast) {
+        // (the values as halves only, for the projections; the denominators where the floats would have been)
+        const float* norm = static_cast<const float*>(pointers[0]);
+        float* denominators = normalized;
+        hc_normalize_half<<<unsigned(steps * 4), 256, 0, d.stream>>>(hidden, norm, half, denominators);
+        batch_project(d, down, steps, nullptr, half, low);
+        batch_project(d, inject, steps, nullptr, half, injection);
+        hc_activate_low<<<unsigned((steps * 320 + 255) / 256), 256, 0, d.stream>>>(low, steps * 320);
+        batch_cast(d, low, half, steps * 320);
+        batch_project(d, up, steps, low, half, projected);
+        hc_finish_hidden<<<unsigned((steps * 2560 + 255) / 256), 256, 0, d.stream>>>(hidden, norm, denominators, projected, injection,
+                                                                                    steps, mixed);
+        check(hipGetLastError());
+        return;
+    }
     hc_normalize<<<unsigned(steps * 4), 256, 0, d.stream>>>(hidden, static_cast<const float*>(pointers[0]), normalized);
     if (cast) batch_cast(d, normalized, half, steps * 10240);
     batch_project(d, down, steps, normalized, half, low);
