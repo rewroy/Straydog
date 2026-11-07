@@ -324,10 +324,10 @@ __device__ unsigned qsa_rows_scan(unsigned value, unsigned* partial, unsigned& t
     return before + inclusive - value;
 }
 
-// Past the stage, kv_for_prefill hands back the host K/V, and every token of a qsa_flash batch would read
-// its 2052 selected rows over the bus (12 times slower on an RTX 4060 past 47K tokens). Instead the union of
-// the batch's selected blocks is copied into the stage once, in block order, and each selection renumbered
-// to it: a token reads the same keys and values in the same order, so its output is the same bits.
+// Past the stage, kv_for_prefill hands back the host K/V, and every token (qsa_flash) or group of tokens
+// (qsa_flash_wmma) would read its selected rows over the bus (12 times slower on an RTX 4060 past 47K tokens).
+// Instead the union of a batch's selected blocks is copied into the stage once, in block order, and each
+// selection renumbered to it: a token reads the same keys and values in the same order, so the same bits.
 // marks[block] = 1 for every block a selection of tokens [first, first + gridDim.x) touches.
 template<int P = 1>
 __global__ void qsa_mark_selection(const float* packed, size_t steps, size_t selected, size_t first, uint32_t* marks) {
@@ -335,6 +335,15 @@ __global__ void qsa_mark_selection(const float* packed, size_t steps, size_t sel
     const float* indices = packed + index_start + token * selected;
     const size_t count = std::min(selected, size_t(packed[index_start + steps * selected + token]));
     for (size_t i = threadIdx.x; i < count; i += 256) marks[size_t(indices[i]) / 4] = 1u;
+}
+// The span's union from its groups' marks (qsa_mark_blocks), groups [first, last).
+__global__ void qsa_union_of_groups(const uint32_t* group_marks, size_t stride, size_t first, size_t last, size_t end,
+                                    uint32_t* marks) {
+    const size_t block = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (block >= end) return;
+    uint32_t any = 0;
+    for (size_t group = first; group < last; ++group) any |= group_marks[group * stride + block];
+    marks[block] = any != 0;
 }
 // The union's places: marks[block] becomes the count of marked blocks before it, blocks[place] the
 // block in that place, and marks[end] their count. One block of 1024 threads, each a run of blocks.
@@ -479,11 +488,12 @@ template<int P = 1>
 __global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const kv_t* state, size_t capacity, size_t base,
                                                                  size_t steps, const __half* half_queries,
                                                                  const uint32_t* union_blocks, const uint32_t* union_masks,
-                                                                 const uint32_t* union_counts, float* output) {
+                                                                 const uint32_t* union_counts, float* output,
+                                                                 const uint32_t* places = nullptr, unsigned first_group = 0) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr unsigned threads = qsa_group * 48, keys_per_tile = qsa_flash_blocks * 4;
     constexpr unsigned loads = keys_per_tile * 64, staged_per_thread = (loads + threads - 1) / threads;
-    const unsigned group = blockIdx.x, kv = blockIdx.y, t = threadIdx.x, lane = t % 32, half = lane / 16;
+    const unsigned group = first_group + blockIdx.x, kv = blockIdx.y, t = threadIdx.x, lane = t % 32, half = lane / 16;
     const unsigned wave = __builtin_amdgcn_readfirstlane(t / 32), pair = wave / 2, side = wave % 2;
     const unsigned row = pair * 16 + lane % 16, local = row / 12, head = row % 12;
     const size_t token = size_t(group) * qsa_group + local, position = base + token;
@@ -518,9 +528,11 @@ __global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const kv_t* sta
             for (unsigned j = 0; j < staged_per_thread; ++j) {
                 const unsigned i = t + j * threads, slot = i / 256;
                 staged[which][j] = uint2{0, 0};
-                if (i < loads && first + slot < count)
-                    staged[which][j] = *reinterpret_cast<const uint2*>(
-                        rows[which] + (size_t(blocks[first + slot]) * 4 + i / 64 % 4) * 256 + i % 64 * 4);
+                if (i < loads && first + slot < count) {
+                    // (gathered: the block's place in the stage, see qsa_gather_union)
+                    const uint32_t block = places ? places[blocks[first + slot]] : blocks[first + slot];
+                    staged[which][j] = *reinterpret_cast<const uint2*>(rows[which] + (size_t(block) * 4 + i / 64 % 4) * 256 + i % 64 * 4);
+                }
             }
     };
     auto store = [&](size_t first) {
