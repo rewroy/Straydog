@@ -2624,6 +2624,9 @@ impl Model {
                 group.mtp_prompt_kept(operands, (row + offset) as u64, offset as u64, count, (first + offset) as u64)
             })?;
         }
+        if self.group.mtp_parts() {
+            self.group.mtp_prompt_layer(first as u64, following.len() as u64)?;
+        }
         Ok(())
     }
 

@@ -1629,10 +1629,12 @@ int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void*
         check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded,size_t(count)*2560*4,hipMemcpyDeviceToDevice,d.stream));
         mtp_prologue_device(d,pointers,kinds,size_t(count));
         auto target=d.decoder.find(size_t(layer));
-        // (a layer in parts: its rows into the workspace, the host running the layer on both devices)
+        // (a layer in parts: its rows into the workspace at the pairs' offset, the host running the layer on both devices once
+        // over the batch's pairs)
         if (target!=d.decoder.end() && target->second.parts==2) {
-            if (count>target->second.capacity) throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
-            check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+            if (offset+count>target->second.capacity) throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
+            check(hipMemcpyAsync(target->second.workspace+size_t(offset)*10240,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,
+                                 d.stream));
             return 0;
         }
         if (count==1) {
