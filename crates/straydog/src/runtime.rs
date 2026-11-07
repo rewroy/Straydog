@@ -403,8 +403,10 @@ pub fn ready_summary(ready: &Value) -> String {
     };
     let engram = ready["engram"]["precision"].as_str()
         .map_or_else(String::new, |precision| format!(", engram {precision} ({})", ready["engram"]["file"].as_str().unwrap_or("-")));
+    // (what the placement's first choice would have needed: a little more VRAM, a faster start)
+    let note = placement["note"].as_str().map_or_else(String::new, |note| format!(" ({note})"));
     format!(
-        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}; {devices} using {:.1} of {:.1} GiB",
+        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}{note}; {devices} using {:.1} of {:.1} GiB",
         ready["quantization"].as_str().unwrap_or("-"),
         ready["context"],
         if drafts > 0 { format!("MTP {drafts}") } else { "no speculation".into() },
@@ -1809,6 +1811,20 @@ mod tests {
         let mut plain = ready.clone();
         plain["placement"]["dspark"] = Value::Null;
         assert!(!ready_summary(&plain).contains("DSpark"));
+    }
+
+    /// The ready line says what the placement's first choice would have needed, when the VRAM did not hold it.
+    #[test]
+    fn the_ready_line_says_what_the_first_placement_needed() {
+        let ready = json!({"quantization": "q", "context": 1, "gpu": {"name": "g"}, "speculative_drafts": 3,
+                           "placement": {"resident": true, "host_kv": true, "prefill_batch_size": 2048,
+                                         "note": "K/V in VRAM, prefill batch 4096, MTP drafter would need 1.3 GiB more VRAM"}});
+        assert!(ready_summary(&ready).contains(
+            "K/V in host memory, prefill batch 2048 (K/V in VRAM, prefill batch 4096, MTP drafter would need 1.3 GiB more VRAM);"),
+            "{}", ready_summary(&ready));
+        let mut first = ready.clone();
+        first["placement"]["note"] = Value::Null;
+        assert!(ready_summary(&first).contains("prefill batch 2048; "), "{}", ready_summary(&first));
     }
 
     /// `/props` counts DSpark's drafts as it counts MTP's: a model that drafts is not reported as one that does not.

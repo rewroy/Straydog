@@ -115,6 +115,9 @@ fn main() -> Result<(), String> {
     };
     let corpus = text.encode(&corpus).map_err(|exc| exc.0)?;
     eprintln!("resident {} host_kv {} batch {}", model.resident, model.host_kv, model.prefill_batch_size);
+    if let Some(note) = &model.placement_note {
+        eprintln!("placement: {note}");
+    }
     for &device in &devices {
         if let Ok((_, free, total)) = straydog_gpu::device_info(device) {
             eprintln!("GPU {device}: {:.2} GiB free of {:.2} GiB after loading (budget {:.2} GiB)", free as f64 / (1u64 << 30) as f64,
