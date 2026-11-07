@@ -152,6 +152,24 @@ void kv_after_prefill(Device& d, const KvView& view, void* state, size_t context
     kv_copy_rows(d,static_cast<kv_t*>(state),context,view.kv,view.capacity,base,count,kv_planes_of(d,state));
     if (view.kv==kv_stage_rows(d) && d.kv_stage_owner==state) d.kv_stage_valid=base+count;
 }
+// Whether a batch's attention reads the union of its selections from the stage (qsa_gather_union): the
+// host K/V past the stage, not a decode view.
+bool kv_gathers(const Device& d, const KvView& view, void* state, size_t count) {
+    return count>1 && !view.staged && !view.mirror && d.kv_stage && d.host_states.count(state);
+}
+// The stage about to hold a union: what it held, a prefix or the decode mirrors, is gone.
+void kv_stage_overwritten(Device& d) {
+    kv_stage_settle(d);
+    for (auto& entry : d.kv_mirrors) entry.second.valid=0;
+    d.kv_stage_owner=nullptr; d.kv_stage_valid=0;
+}
+// The union's count of blocks (qsa_place_union's marks[end]): the host decides how many tokens to gather for.
+size_t kv_union_count(Device& d, const uint32_t* count) {
+    uint32_t found=0;
+    check(hipMemcpyAsync(&found,count,4,hipMemcpyDeviceToHost,d.stream));
+    check(hipStreamSynchronize(d.stream));
+    return found;
+}
 // The layer map is fully registered before decode. Preparing here, rather than
 // in qsa_decode_attend, also covers graphs reused after prefill or state restore.
 void kv_prepare_span(Device& d, size_t begin, size_t end, size_t base, size_t count=1) {
