@@ -363,7 +363,7 @@ void gated_delta(Device& d, void* const* pointers, const int* kinds, void* conv,
     gdn_pack_values<<<unsigned((steps*6144+255)/256),256,0,d.stream>>>(qkv,beta,alpha,
         static_cast<const float*>(pointers[6]),static_cast<const float*>(pointers[7]),steps,d.input);
     if (d.rdna4 && steps>1)
-        delta_split_sequence<<<48,1024,0,d.stream>>>(static_cast<float*>(recurrent),steps,d.input,qkv);
+        delta_split_sequence<<<delta_split_blocks(),delta_columns*8,0,d.stream>>>(static_cast<float*>(recurrent),steps,d.input,qkv);
     else delta_register_sequence<<<48,128,0,d.stream>>>(static_cast<float*>(recurrent),48,steps,d.input,qkv);
     gdn_post<<<unsigned(steps*48),128,0,d.stream>>>(qkv,gate,static_cast<const float*>(pointers[8]),d.input);
     }
