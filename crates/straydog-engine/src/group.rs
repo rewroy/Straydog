@@ -579,22 +579,29 @@ impl Group {
         self.backends[mtp].mtp_embed(embeddings)
     }
 
+    /// With the MTP layer in parts, only the prologue: each device leaves the pairs in its part's workspace at `offset`, and
+    /// [`Group::mtp_prompt_layer`] runs the layer once over the batch's pairs.
     pub fn mtp_prompt_kept(&mut self, operands: &[Operand], row: u64, offset: u64, count: u64, position: u64)
                            -> Result<()> {
         if self.mtp_parts {
-            // (each device's prologue leaves the pairs in its part's workspace; the layer then runs on both)
             for backend in &mut self.backends {
                 backend.mtp_prompt_kept(operands, row, offset, count, position)?;
             }
-            if count > 1 {
-                return self.prefill_layers(48, 49, None, position, count, 0).map(drop);
-            }
-            self.on_both(|backend| backend.verify_queue_rows(48, 49, None, 1, position),
-                         |backend| backend.verify_queue_rows(48, 49, None, 1, position))?;
-            return crate::gpu::parts_settle(&self.backends[0], &self.backends[1]);
+            return Ok(());
         }
         let mtp = self.owner(48);
         self.backends[mtp].mtp_prompt_kept(operands, row, offset, count, position)
+    }
+
+    /// The MTP layer in parts over a batch's `count` pairs from `position`, which [`Group::mtp_prompt_kept`]'s prologues left in
+    /// the workspaces: the layer reads the prompt in its batches, not in the prologue's pieces of 512 rows.
+    pub fn mtp_prompt_layer(&mut self, position: u64, count: u64) -> Result<()> {
+        if count > 1 {
+            return self.prefill_layers(48, 49, None, position, count, 0).map(drop);
+        }
+        self.on_both(|backend| backend.verify_queue_rows(48, 49, None, 1, position),
+                     |backend| backend.verify_queue_rows(48, 49, None, 1, position))?;
+        crate::gpu::parts_settle(&self.backends[0], &self.backends[1])
     }
 
     /// Deferred prefill on every device (see [`Backend::prefill_defer`]).
