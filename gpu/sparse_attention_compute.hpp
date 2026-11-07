@@ -158,9 +158,9 @@ __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selec
 constexpr size_t qsa_flash_chunk=64;
 template<int P=1>
 __global__ void __launch_bounds__(256) qsa_flash(const kv_t* state,size_t context,size_t base,size_t steps,
-                                                 size_t selected,const float* input,float* output) {
+                                                 size_t selected,const float* input,float* output,size_t first_token=0) {
     using H=QwenHeads<P>;
-    const size_t token=blockIdx.x,kv=blockIdx.y,t=threadIdx.x,lane=t%32,wave=t/32;
+    const size_t token=first_token+blockIdx.x,kv=blockIdx.y,t=threadIdx.x,lane=t%32,wave=t/32;
     const size_t index_start=steps*H::packed;
     const size_t count=size_t(input[index_start+steps*selected+token]);
     const size_t limit=base+token;
@@ -322,6 +322,58 @@ __device__ unsigned qsa_rows_scan(unsigned value, unsigned* partial, unsigned& t
     const unsigned before = wave ? partial[wave - 1] : 0;
     __syncthreads();
     return before + inclusive - value;
+}
+
+// Past the stage, kv_for_prefill hands back the host K/V, and every token of a qsa_flash batch would read
+// its 2052 selected rows over the bus (12 times slower on an RTX 4060 past 47K tokens). Instead the union of
+// the batch's selected blocks is copied into the stage once, in block order, and each selection renumbered
+// to it: a token reads the same keys and values in the same order, so its output is the same bits.
+// marks[block] = 1 for every block a selection of tokens [first, first + gridDim.x) touches.
+template<int P = 1>
+__global__ void qsa_mark_selection(const float* packed, size_t steps, size_t selected, size_t first, uint32_t* marks) {
+    const size_t token = first + blockIdx.x, index_start = steps * QwenHeads<P>::packed;
+    const float* indices = packed + index_start + token * selected;
+    const size_t count = std::min(selected, size_t(packed[index_start + steps * selected + token]));
+    for (size_t i = threadIdx.x; i < count; i += 256) marks[size_t(indices[i]) / 4] = 1u;
+}
+// The union's places: marks[block] becomes the count of marked blocks before it, blocks[place] the
+// block in that place, and marks[end] their count. One block of 1024 threads, each a run of blocks.
+__global__ void __launch_bounds__(1024) qsa_place_union(uint32_t* marks, size_t end, uint32_t* blocks) {
+    __shared__ unsigned partial[32];
+    const size_t per = (end + 1023) / 1024, from = std::min(end, size_t(threadIdx.x) * per), to = std::min(end, from + per);
+    unsigned own = 0;
+    for (size_t block = from; block < to; ++block) own += marks[block] != 0;
+    unsigned total = 0;
+    unsigned at = qsa_rows_scan<32>(own, partial, total);
+    for (size_t block = from; block < to; ++block) {
+        const bool marked = marks[block] != 0;
+        marks[block] = at;
+        if (marked) blocks[at++] = uint32_t(block);
+    }
+    if (threadIdx.x == 0) marks[end] = total;
+}
+// Union place p's four rows of every plane, from the host K/V into rows 4p .. 4p + 3 of the stage.
+__global__ void __launch_bounds__(256) qsa_gather_union(const kv_t* state, size_t context, size_t planes, const uint32_t* blocks,
+                                                        kv_t* stage, size_t capacity) {
+    constexpr size_t pieces = 256 * sizeof(kv_t) / 16;   // a row in 16-byte pieces
+    const size_t place = blockIdx.x, block = blocks[place];
+    for (size_t i = threadIdx.x; i < planes * 4 * pieces; i += 256) {
+        const size_t plane = i / (4 * pieces), row = i / pieces % 4, piece = i % pieces, position = block * 4 + row;
+        if (position >= context) continue;
+        reinterpret_cast<uint4*>(stage + (plane * capacity + place * 4 + row) * 256)[piece] =
+            reinterpret_cast<const uint4*>(state + (plane * context + position) * 256)[piece];
+    }
+}
+// Tokens [first, first + gridDim.x)'s selections renumbered to the union's places.
+template<int P = 1>
+__global__ void qsa_renumber_selection(float* packed, size_t steps, size_t selected, size_t first, const uint32_t* places) {
+    const size_t token = first + blockIdx.x, index_start = steps * QwenHeads<P>::packed;
+    float* indices = packed + index_start + token * selected;
+    const size_t count = std::min(selected, size_t(packed[index_start + steps * selected + token]));
+    for (size_t i = threadIdx.x; i < count; i += 256) {
+        const size_t index = size_t(indices[i]);
+        indices[i] = float(size_t(places[index / 4]) * 4 + index % 4);
+    }
 }
 
 // Batched prefill attention (RDNA4). Nearby tokens select overlapping blocks, so groups of
