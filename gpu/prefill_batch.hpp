@@ -196,11 +196,10 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         uint32_t* union_masks = union_blocks + groups * qsa_group_capacity;
         uint32_t* union_counts = union_masks + groups * qsa_group_capacity;
         const KvView kv = kv_for_prefill(d, kv_state, context, base + span, span_rows);
-        // (a gathered batch's union in the attention scratch: its blocks' places, then the blocks in place order. The host waits for
-        // the union's size, which a part must not: its exchanges wait for the other part's layer, queued after this one returns.
-        // RDNA4's batched attention reads its groups' unions from the host K/V still.)
-        const bool gathered = P == 1 && !batched && kv_gathers(d, kv, kv_state, span_rows);
-        uint32_t* places = marks;
+        // (the union of a gathered batch: its blocks' places and the blocks in place order, after the marks. The host waits for the
+        // union's size, which a part must not: its exchanges wait for the other part's layer, queued after this one returns.)
+        const bool gathered = P == 1 && kv_gathers(d, kv, kv_state, span_rows);
+        uint32_t* places = batched ? union_counts + groups : marks;
         uint32_t* placed = places + stride + 1;
         if ((batched ? groups * (stride + 2 * qsa_group_capacity) + groups : 0) + (gathered ? 2 * (stride + 1) : 0) > attention_score_bytes / 4)
             throw std::runtime_error("QSA prefill marks exceed the attention scratch");
@@ -244,8 +243,31 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
 #if defined(__HIPCC__)
         if (batched) {
             qsa_union_blocks<<<unsigned(groups), 256, 0, d.stream>>>(marks, stride, base + span, span_rows, union_blocks, union_masks, union_counts);
-            qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
-                base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
+            if (gathered) {
+                // As many groups at a time as the stage holds the union of (qsa_attention_gathered).
+                const size_t end = (base + span + span_rows - 1) / 4 + 1, capacity = kv_stage_capacity(d, kv_state);
+                kv_stage_overwritten(d);
+                for (size_t first = 0; first < groups;) {
+                    size_t count = groups - first, total = 0;
+                    for (;;) {
+                        qsa_union_of_groups<<<unsigned((end + 255) / 256), 256, 0, d.stream>>>(marks, stride, first, first + count, end, places);
+                        qsa_place_union<<<1, 1024, 0, d.stream>>>(places, end, placed);
+                        total = kv_union_count(d, places + end);
+                        if (total * 4 <= capacity || count == 1) break;
+                        count = (count + 1) / 2;
+                    }
+                    const bool fits = total * 4 <= capacity;
+                    if (fits)
+                        qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(static_cast<const kv_t*>(kv_state), context,
+                                                                                 kv_planes_of(d, kv_state), placed, kv_stage_rows(d), capacity);
+                    qsa_flash_wmma<P><<<dim3(unsigned(count), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(
+                        fits ? kv_stage_rows(d) : kv.kv, fits ? capacity : kv.capacity, base + span, span_rows, half + span * Q, union_blocks,
+                        union_masks, union_counts, attended + span * Q, fits ? places : nullptr, unsigned(first));
+                    first += count;
+                }
+            } else
+                qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
+                    base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
         }
 #endif
         kv_after_prefill(d, kv, kv_state, context, base + span, span_rows);
