@@ -756,6 +756,9 @@ file beside the bundle.
 - It is pinned like the shards, with its repository and revision.
 - It lies in the model's `dspark` directory or in one beside the model's, so a model's
   quantizations share it. `straydog fetch` and `setup` download it.
+- Every bundle of the model uses it, whatever its provider and quantization: it only proposes
+  and every draft is verified, so no bundle needs a test of its own for its answers; how many
+  drafts are kept is what differs.
 - Its tensor names are the model's own, so it opens apart from the shards (every tensor
   verifies when taken), and its layout is checked against the model's header.
 - Absent, the server runs without it. `DS41_DSPARK=0` leaves it out; `DS41_DRAFTS=0` turns off
