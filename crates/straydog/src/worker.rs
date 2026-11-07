@@ -708,7 +708,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "vision_refusal": vision.as_ref().err(),
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
-                      "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" }},
+                      "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" },
+                      "note": model.placement_note},
         "load_seconds": seconds,
         "gpu": model.info()?,
     });

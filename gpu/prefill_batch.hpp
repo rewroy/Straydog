@@ -43,15 +43,36 @@ Matrix batch_matrix(void* const* pointers, const int* kinds, size_t index, size_
 
 // Scratch: normalized 10240 + half 5120 + low 320 + injection 4 + up 10240 floats per row.
 constexpr size_t hc_batch_floats = 10240 + 5120 + 324 + 10240;
-void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* hidden, float* mixed, float* scratch) {
+// Where hc_prefill's FP16 path keeps a batch's halves in its scratch; the row streams' denominators are at its start, where the
+// F32 path's normalized floats are.
+inline __half* hc_scratch_half(float* scratch, size_t steps) { return reinterpret_cast<__half*>(scratch + steps * 10240); }
+// `prenormalized`: the halves and denominators are in the scratch already (a scatter's residual update normalized the rows,
+// qwen_scatter_residual_normalize); with FP16 projections only.
+void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* hidden, float* mixed, float* scratch,
+                bool prenormalized = false) {
     const Matrix down = batch_matrix(pointers, kinds, 1, 320, 10240), up = batch_matrix(pointers, kinds, 2, 10240, 320);
     const Matrix inject = batch_matrix(pointers, kinds, 3, 4, 10240);
     float* normalized = scratch;
-    auto* half = reinterpret_cast<__half*>(normalized + steps * 10240);
+    __half* half = hc_scratch_half(scratch, steps);
     float* low = normalized + steps * (10240 + 5120);
     float* injection = low + steps * 320;
     float* projected = injection + steps * 4;
     const bool cast = batch_half(d, steps);
+    if (cast) {
+        // (the values as halves only, for the projections; the denominators where the floats would have been)
+        const float* norm = static_cast<const float*>(pointers[0]);
+        float* denominators = normalized;
+        if (!prenormalized) hc_normalize_half<<<unsigned(steps * 4), 256, 0, d.stream>>>(hidden, norm, half, denominators);
+        batch_project(d, down, steps, nullptr, half, low);
+        batch_project(d, inject, steps, nullptr, half, injection);
+        hc_activate_low<<<unsigned((steps * 320 + 255) / 256), 256, 0, d.stream>>>(low, steps * 320);
+        batch_cast(d, low, half, steps * 320);
+        batch_project(d, up, steps, low, half, projected);
+        hc_finish_hidden<<<unsigned((steps * 2560 + 255) / 256), 256, 0, d.stream>>>(hidden, norm, denominators, projected, injection,
+                                                                                    steps, mixed);
+        check(hipGetLastError());
+        return;
+    }
     hc_normalize<<<unsigned(steps * 4), 256, 0, d.stream>>>(hidden, static_cast<const float*>(pointers[0]), normalized);
     if (cast) batch_cast(d, normalized, half, steps * 10240);
     batch_project(d, down, steps, normalized, half, low);
@@ -97,7 +118,7 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
             alpha + first * H::value, static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
         // Every qkv row of this chunk is packed before the recurrence overwrites the chunk's rows.
         if (d.rdna4 && count > 1)
-            delta_split_sequence<P><<<unsigned(H::value), 1024, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
+            delta_split_sequence<P><<<delta_split_blocks<P>(), delta_columns * 8, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
         else delta_register_sequence<<<unsigned(H::value), 128, 0, d.stream>>>(static_cast<float*>(recurrent), H::value, count, d.input, rows);
         gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
             post + first * H::gate);

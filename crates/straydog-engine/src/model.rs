@@ -87,9 +87,12 @@ const VOCABULARY: usize = 248320;
 /// attention layer's (the MTP layer's too, `drafting`) QSA K/V, pooled indexer keys and the
 /// indexer's rolling history (eight inputs), DeltaNet state and convolution, PLE history.
 pub fn context_state_bytes(context: u64, drafting: bool) -> u64 {
-    let state = attention_layers(drafting) * (context * 2 * 2 * 256 + (context / 4 + 1) * 128 + 8 * 128) * 4;
+    let state = attention_layers(drafting) * (context * 4 * crate::gpu::KV_ROW_FLOATS + (context / 4 + 1) * 128 + 8 * 128) * 4;
     state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4
 }
+
+/// A whole attention layer's K/V bytes a position: four planes of KV_ROW_FLOATS.
+const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS * 4;
 
 /// The layers with QSA attention: twelve, and the MTP layer when drafting.
 fn attention_layers(drafting: bool) -> u64 {
@@ -532,6 +535,8 @@ pub struct Model {
     pub resident: bool,
     pub partial: bool,
     pub host_kv: bool,
+    /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
+    pub placement_note: Option<String>,
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
     checkpoints: IndexMap<&'static str, Checkpoint>,
@@ -660,26 +665,30 @@ impl Model {
         let context64 = context as u64;
         let mut state_bytes = context_state_bytes(context64, drafting);
         let attention_capable = group.batch_capacity() == 256;
-        let kv_bytes = attention_layers(drafting) * context64 * 1024 * 4;
+        let kv_bytes = attention_layers(drafting) * context64 * KV_POSITION_BYTES;
         let fits = attention_capable && kv_bytes <= group.memory()?.1 / 4;
         let host_capable = attention_capable && group.host_state_supported()?;
         let recurrent_bytes = 36 * 48 * 128 * 128 * 4;
         // K/V beyond a quarter of the VRAM budget stays in mapped host memory, which the
         // GPU kernels read over the bus.
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
+        let mut placement_note = None;
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
             // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
-            let mut placed = None;
+            let mut placed = (None, None);
             if group.enable_parts()? {
                 placed = resident_placement(&weights, &group, context64, settings.prefill_batch_size, drafting, fits)?;
-                if placed.is_none() {
+                if placed.0.is_none() {
                     group.disable_parts()?;
                 }
             }
-            if placed.is_none() {
-                placed = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+            if placed.0.is_none() {
+                // (none fitting either way, the note stays the parts' when they were tried: the placement a little more VRAM gives)
+                let split = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+                placed = (split.0, if split.0.is_some() { split.1 } else { placed.1.or(split.1) });
             }
-            if let Some((_, resident_host, resident_batch)) = placed {
+            placement_note = placed.1;
+            if let Some((_, resident_host, resident_batch)) = placed.0 {
                 (host, batch) = (resident_host, resident_batch);
             }
         }
@@ -710,6 +719,7 @@ impl Model {
             resident: false,
             partial: false,
             host_kv: host,
+            placement_note,
             history: Vec::new(),
             final_hidden: None,
             checkpoints: IndexMap::new(),
@@ -797,7 +807,7 @@ impl Model {
         }
         let mut two_drafts = false;
         if model.partial {
-            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * 4096 } else { 0 };
+            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * KV_POSITION_BYTES } else { 0 };
             // (the banks are locked behind "ready", by the worker: [`Model::bank_locks`]; the slots below are sized as they were with
             // the locks taken, and the plan has left the commit the locks need out of what the VRAM takes)
             model.plan_host_banks(pinned)?;
@@ -2074,7 +2084,7 @@ impl Model {
     /// The working set's limit, which follows what is free ([`crate::host::watch_working_set`]), after what a K/V growth has just locked.
     fn hold_memory(&self) {
         if self.partial {
-            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * 4096;
+            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * KV_POSITION_BYTES;
             self.pinned_now.store(pinned, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -2084,7 +2094,7 @@ impl Model {
     fn refresh_kv_ahead(&self) {
         let ahead = if self.host_kv {
             let reach = self.context.min(crate::banks::KV_ROOM_POSITIONS);
-            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * 4096
+            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * KV_POSITION_BYTES
         } else {
             0
         };
@@ -2099,8 +2109,8 @@ impl Model {
     /// The bytes a growth of the K/V to `capacity` positions asks of the memory: the layers' new positions, a layer's old K/V and new one both held while
     /// it is copied, and the margin the commit keeps.
     fn kv_growth_cost(&self, capacity: usize) -> u64 {
-        let position = attention_layers(self.weights.drafter) * 4096;
-        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * 4096 + KV_COMMIT_MARGIN
+        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
+        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * KV_POSITION_BYTES + KV_COMMIT_MARGIN
     }
 
     /// A request found no memory for `wanted` bytes of what it asks (`asked_by` says what): the page locks of the expert banks give way. The locking
@@ -2173,7 +2183,7 @@ impl Model {
     fn kv_capacity_for(&self, positions: usize) -> Result<usize> {
         let doubled = (positions + 4096).next_power_of_two().min(self.context);
         let Some((free, left)) = crate::host::commit_left() else { return Ok(doubled) };
-        let position = attention_layers(self.weights.drafter) * 4096;
+        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
         let cost = |capacity: usize| self.kv_growth_cost(capacity);
         let least = self.kv_least(positions);
         let quarter = least.max((self.kv_capacity + self.kv_capacity / 4).div_ceil(4096) * 4096).min(self.context);
@@ -2216,7 +2226,7 @@ impl Model {
         let mut begun: Option<usize> = None;
         let capacity = loop {
             let attempt = begun.map_or_else(|| self.kv_capacity_for(positions), Ok).and_then(|capacity| {
-                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * 4096;
+                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * KV_POSITION_BYTES;
                 // (the limit waits for the locking behind "ready", whose reads it would cut short)
                 if self.lock_pending.is_empty() {
                     crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
@@ -2623,6 +2633,9 @@ impl Model {
             self.with_operands(Model::mtp_operands, |group, operands| {
                 group.mtp_prompt_kept(operands, (row + offset) as u64, offset as u64, count, (first + offset) as u64)
             })?;
+        }
+        if self.group.mtp_parts() {
+            self.group.mtp_prompt_layer(first as u64, following.len() as u64)?;
         }
         Ok(())
     }
@@ -3486,17 +3499,18 @@ const EVEN_SPLIT: usize = 25;
 /// The layer split and its full-residency placement (see [`resident_placement`]): the split
 /// balancing bytes moves toward [`EVEN_SPLIT`] while the placement stays as good.
 fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
-                 -> Result<Option<(bool, bool, usize)>> {
+                 -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
     let placed = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
-    let (Some(baseline), Some(balanced)) = (placed, group.split()) else { return Ok(placed) };
+    let (Some(baseline), Some(balanced)) = (placed.0, group.split()) else { return Ok(placed) };
     if !group.expert_parallel()? || balanced <= EVEN_SPLIT {
         return Ok(placed);
     }
     let as_good = |(keep, host, batch): (bool, bool, usize)| keep >= baseline.0 && (!host || baseline.1) && batch >= baseline.2;
     for split in EVEN_SPLIT..balanced {
         group.set_split(split)?;
-        if let Some(placement) = resident_placement(weights, group, context, prefill, drafting, vram_kv)?.filter(|p| as_good(*p)) {
-            return Ok(Some(placement));
+        let placement = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
+        if placement.0.is_some_and(as_good) {
+            return Ok(placement);
         }
     }
     group.set_split(balanced)?;
@@ -3506,8 +3520,12 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
 /// (drafter kept, K/V in host memory, prefill batch) that lets every weight live on the GPUs,
 /// if any. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
 /// keeping the drafter wins over one that drops it; the configured batch and VRAM K/V first.
+/// The first placement that fits, of: K/V in VRAM (when it is at most a quarter of the budget) at the asked batch, then K/V in host
+/// memory at batches halved to 1024; with the MTP drafter, then without. With it, what the first choice lacked, when it was not taken:
+/// a placement depends on the VRAM left, and the start's line says what a little more would have bought. None fitting, the note says
+/// what the least of them (the last) lacked: what full residency needs.
 fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
-                      -> Result<Option<(bool, bool, usize)>> {
+                      -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
     let mut batches = vec![prefill];
     while *batches.last().unwrap() > 1024 {
         batches.push((batches.last().unwrap() / 2).max(1024));
@@ -3515,16 +3533,25 @@ fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: u
     let mut candidates: Vec<(bool, usize)> = if vram_kv { vec![(false, prefill)] } else { Vec::new() };
     candidates.extend(batches.iter().map(|batch| (true, *batch)));
     let keeps: &[bool] = if drafting { &[true, false] } else { &[false] };
+    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
     for keep in keeps {
         for (host, batch) in &candidates {
             let planned = group.planned_state_bytes(context, *batch as u64, drafting, *host)?;
             let requirements = weights.resident_requirements(*keep && weights.drafter);
-            if group.can_pin_model(&requirements, Some(&planned))? {
-                return Ok(Some((*keep, *host, *batch)));
+            let lack = group.pin_lack_model(&requirements, Some(&planned))?;
+            if lack == 0 {
+                return Ok((Some((*keep, *host, *batch)), first));
+            }
+            last = (lack != u64::MAX).then(|| {
+                format!("K/V in {}, prefill batch {batch}{} would need {:.1} GiB more VRAM", if *host { "host memory" } else { "VRAM" },
+                        if *keep && weights.drafter { ", MTP drafter" } else { "" }, lack as f64 / (1u64 << 30) as f64)
+            });
+            if first.is_none() {
+                first = last.clone();
             }
         }
     }
-    Ok(None)
+    Ok((None, last.map(|least| format!("fully resident: {least}"))))
 }
 
 fn validate_geometry(weights: &Weights) -> Result<()> {
