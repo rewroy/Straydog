@@ -1075,6 +1075,15 @@ impl Backend {
     /// the decoder workspace), leaving max(512 MiB, 3%) for what the runtime allocates
     /// outside the budget (driver, BLAS, graphs: ~0.9 GiB on an R9700).
     pub fn can_pin(&self, required: u64, reserved: Option<u64>) -> Result<bool> {
+        Ok(self.pin_lack(required, reserved)? == 0)
+    }
+
+    /// The VRAM [`can_pin`](Self::can_pin) finds missing for `required` (zero: it fits; u64::MAX: this device takes no
+    /// resident layers).
+    pub fn pin_lack(&self, required: u64, reserved: Option<u64>) -> Result<u64> {
+        if self.batch_capacity != 256 {
+            return Ok(u64::MAX);
+        }
         let (used, budget) = self.memory()?;
         let reserved = reserved.unwrap_or(if self.states.contains_key("@scratch:decoder") {
             0
@@ -1082,8 +1091,8 @@ impl Backend {
             decoder_workspace_bytes(self.prefill_capacity)
         });
         let slack = Self::slack(budget);
-        Ok(self.batch_capacity == 256
-            && i128::from(required) + i128::from(reserved) <= i128::from(budget) - i128::from(used) - i128::from(slack))
+        let lack = i128::from(required) + i128::from(reserved) - (i128::from(budget) - i128::from(used) - i128::from(slack));
+        Ok(lack.max(0) as u64)
     }
 
     fn moe_workspace(&mut self, helper: bool) -> Result<(Entry, u64)> {

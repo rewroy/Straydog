@@ -286,6 +286,11 @@ impl Group {
     /// Whether these weights fit each device, beside `reserved` VRAM per device (a
     /// placement's planned state) or by default the decoder workspace.
     pub fn can_pin_model(&self, requirements: &[(String, u64)], reserved: Option<&[u64]>) -> Result<bool> {
+        Ok(self.pin_lack_model(requirements, reserved)? == 0)
+    }
+
+    /// The VRAM the device shortest of it lacks for [`can_pin_model`](Self::can_pin_model) (zero: the model fits).
+    pub fn pin_lack_model(&self, requirements: &[(String, u64)], reserved: Option<&[u64]>) -> Result<u64> {
         let mut groups = vec![0u64; self.backends.len()];
         let parallel = self.expert_parallel()?;
         for (key, size) in requirements {
@@ -308,12 +313,11 @@ impl Group {
                 groups[0] += size / 2;   // the lower vocabulary half the first GPU evaluates
             }
         }
+        let mut lack = 0;
         for (index, (backend, required)) in self.backends.iter().zip(groups).enumerate() {
-            if !backend.can_pin(required, reserved.map(|reserved| reserved[index]))? {
-                return Ok(false);
-            }
+            lack = lack.max(backend.pin_lack(required, reserved.map(|reserved| reserved[index]))?);
         }
-        Ok(true)
+        Ok(lack)
     }
 
     /// Pin each layer's expert banks on its owner, or half of them on each GPU. The MTP
