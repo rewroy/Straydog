@@ -535,6 +535,8 @@ pub struct Model {
     pub resident: bool,
     pub partial: bool,
     pub host_kv: bool,
+    /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
+    pub placement_note: Option<String>,
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
     checkpoints: IndexMap<&'static str, Checkpoint>,
@@ -670,19 +672,23 @@ impl Model {
         // K/V beyond a quarter of the VRAM budget stays in mapped host memory, which the
         // GPU kernels read over the bus.
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
+        let mut placement_note = None;
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
             // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
-            let mut placed = None;
+            let mut placed = (None, None);
             if group.enable_parts()? {
                 placed = resident_placement(&weights, &group, context64, settings.prefill_batch_size, drafting, fits)?;
-                if placed.is_none() {
+                if placed.0.is_none() {
                     group.disable_parts()?;
                 }
             }
-            if placed.is_none() {
-                placed = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+            if placed.0.is_none() {
+                // (none fitting either way, the note stays the parts' when they were tried: the placement a little more VRAM gives)
+                let split = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+                placed = (split.0, if split.0.is_some() { split.1 } else { placed.1.or(split.1) });
             }
-            if let Some((_, resident_host, resident_batch)) = placed {
+            placement_note = placed.1;
+            if let Some((_, resident_host, resident_batch)) = placed.0 {
                 (host, batch) = (resident_host, resident_batch);
             }
         }
@@ -713,6 +719,7 @@ impl Model {
             resident: false,
             partial: false,
             host_kv: host,
+            placement_note,
             history: Vec::new(),
             final_hidden: None,
             checkpoints: IndexMap::new(),
@@ -3492,17 +3499,18 @@ const EVEN_SPLIT: usize = 25;
 /// The layer split and its full-residency placement (see [`resident_placement`]): the split
 /// balancing bytes moves toward [`EVEN_SPLIT`] while the placement stays as good.
 fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
-                 -> Result<Option<(bool, bool, usize)>> {
+                 -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
     let placed = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
-    let (Some(baseline), Some(balanced)) = (placed, group.split()) else { return Ok(placed) };
+    let (Some(baseline), Some(balanced)) = (placed.0, group.split()) else { return Ok(placed) };
     if !group.expert_parallel()? || balanced <= EVEN_SPLIT {
         return Ok(placed);
     }
     let as_good = |(keep, host, batch): (bool, bool, usize)| keep >= baseline.0 && (!host || baseline.1) && batch >= baseline.2;
     for split in EVEN_SPLIT..balanced {
         group.set_split(split)?;
-        if let Some(placement) = resident_placement(weights, group, context, prefill, drafting, vram_kv)?.filter(|p| as_good(*p)) {
-            return Ok(Some(placement));
+        let placement = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
+        if placement.0.is_some_and(as_good) {
+            return Ok(placement);
         }
     }
     group.set_split(balanced)?;
@@ -3512,8 +3520,12 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
 /// (drafter kept, K/V in host memory, prefill batch) that lets every weight live on the GPUs,
 /// if any. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
 /// keeping the drafter wins over one that drops it; the configured batch and VRAM K/V first.
+/// The first placement that fits, of: K/V in VRAM (when it is at most a quarter of the budget) at the asked batch, then K/V in host
+/// memory at batches halved to 1024; with the MTP drafter, then without. With it, what the first choice lacked, when it was not taken:
+/// a placement depends on the VRAM left, and the start's line says what a little more would have bought. None fitting, the note says
+/// what the least of them (the last) lacked: what full residency needs.
 fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
-                      -> Result<Option<(bool, bool, usize)>> {
+                      -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
     let mut batches = vec![prefill];
     while *batches.last().unwrap() > 1024 {
         batches.push((batches.last().unwrap() / 2).max(1024));
@@ -3521,16 +3533,25 @@ fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: u
     let mut candidates: Vec<(bool, usize)> = if vram_kv { vec![(false, prefill)] } else { Vec::new() };
     candidates.extend(batches.iter().map(|batch| (true, *batch)));
     let keeps: &[bool] = if drafting { &[true, false] } else { &[false] };
+    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
     for keep in keeps {
         for (host, batch) in &candidates {
             let planned = group.planned_state_bytes(context, *batch as u64, drafting, *host)?;
             let requirements = weights.resident_requirements(*keep && weights.drafter);
-            if group.can_pin_model(&requirements, Some(&planned))? {
-                return Ok(Some((*keep, *host, *batch)));
+            let lack = group.pin_lack_model(&requirements, Some(&planned))?;
+            if lack == 0 {
+                return Ok((Some((*keep, *host, *batch)), first));
+            }
+            last = (lack != u64::MAX).then(|| {
+                format!("K/V in {}, prefill batch {batch}{} would need {:.1} GiB more VRAM", if *host { "host memory" } else { "VRAM" },
+                        if *keep && weights.drafter { ", MTP drafter" } else { "" }, lack as f64 / (1u64 << 30) as f64)
+            });
+            if first.is_none() {
+                first = last.clone();
             }
         }
     }
-    Ok(None)
+    Ok((None, last.map(|least| format!("fully resident: {least}"))))
 }
 
 fn validate_geometry(weights: &Weights) -> Result<()> {
