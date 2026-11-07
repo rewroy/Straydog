@@ -291,6 +291,11 @@ constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1
 // A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
 // verify_max) leave what it reads in place, with nothing to copy again.
 constexpr size_t kv_mirror_margin = 8;
+// Qwen3.8's attention K/V (its planes of `context` positions, each K/V head's keys, then each one's values) holds FP16 values: a
+// plane's row of a position is 256 halves, 128 of its allocation's floats. The prompt's flash rounded the keys and values to FP16
+// already; decode and verification read them as such. (Copies, stage and mirrors count in these elements.)
+typedef __half kv_t;
+constexpr size_t kv_row_floats = 256 * sizeof(kv_t) / 4;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
@@ -404,7 +409,7 @@ private:
 // A K/V's newest rows in VRAM, a ring of Device::kv_mirror_rows rows (position % rows): rows [oldest, valid) are there. A token selects
 // recent rows: IQ3_XXS on an RTX 5070 Ti at --vram 8.5, a 15K-token conversation, a mirror of 2901 rows of the same VRAM held 3-10% of the
 // rows the 12 K/V layers selected when it was their first rows and holds 32-44% as their newest; a K/V layer 480 -> 350 us, 39 -> 44 tok/s.
-struct KvMirror { float* data; size_t valid; size_t oldest = 0; };
+struct KvMirror { kv_t* data; size_t valid; size_t oldest = 0; };
 // A host exchange (host_exchange.hpp): its page-locked host memory, the device's view of it, and the
 // device's count of exports (an allocation of the device).
 struct ExchangeArea {
@@ -962,30 +967,33 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
     if (index < count) output[index] = __float2half(input[index]);
 }
 
+// A K/V value as it is held (kv_t), and as it is read.
+__device__ __forceinline__ kv_t kv_value(float value) { return __float2half_rn(value); }
+__device__ __forceinline__ float kv_load(const kv_t* at) { return __half2float(*at); }
+
 // values (optional) holds the rows' values instead of the packed input. A layer's K/V is
 // 2 * QwenHeads<P>::kv planes of `context` rows: each K/V head's keys, then each one's values.
 template<int P=1>
-__global__ void write_attention_kv(float* state, size_t context, size_t base, size_t steps, const float* input,
+__global__ void write_attention_kv(kv_t* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
-                                   float* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
+                                   kv_t* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
     constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
     if (position) base=*position;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= steps * width) return;
     const size_t step = index / width, head = (index % width) / 256, column = index % 256;
     const size_t keys_start = steps * QwenHeads<P>::query * 256;
-    state[(head * context + base + step) * 256 + column] = input[keys_start + index];
-    state[context * width + (head * context + base + step) * 256 + column] =
-        values ? values[index] : input[keys_start + steps * width + index];
+    const kv_t key = kv_value(input[keys_start + index]), value = kv_value(values ? values[index] : input[keys_start + steps * width + index]);
+    state[(head * context + base + step) * 256 + column] = key;
+    state[context * width + (head * context + base + step) * 256 + column] = value;
     if (mirror_rows) {
         const size_t slot=unsigned(base+step)%unsigned(mirror_rows);
-        mirror[(head*mirror_rows+slot)*256+column]=input[keys_start+index];
-        mirror[((K+head)*mirror_rows+slot)*256+column]=
-            values ? values[index] : input[keys_start+steps*width+index];
+        mirror[(head*mirror_rows+slot)*256+column]=key;
+        mirror[((K+head)*mirror_rows+slot)*256+column]=value;
     }
 }
 
-__global__ void attention_scores(const float* state, size_t context, size_t base, size_t steps,
+__global__ void attention_scores(const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, float* scores, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24;
@@ -999,7 +1007,7 @@ __global__ void attention_scores(const float* state, size_t context, size_t base
                 const size_t token = size_t(raw);
                 result = 0;
                 for (size_t column = 0; column < 256; ++column)
-                    result += state[((head / 12) * context + token) * 256 + column]
+                    result += kv_load(&state[((head / 12) * context + token) * 256 + column])
                             * input[item * 256 + column];
                 result *= 0.0625f;
             }
@@ -1008,7 +1016,7 @@ __global__ void attention_scores(const float* state, size_t context, size_t base
     }
 }
 
-__global__ void attention_reduce(const float* state, size_t context, size_t base, size_t steps,
+__global__ void attention_reduce(const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, const float* scores, float* output, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24, column = threadIdx.x;
@@ -1046,7 +1054,7 @@ __global__ void attention_reduce(const float* state, size_t context, size_t base
         if (raw >= 0 && raw <= float(base + step) && raw < float(context)) {
             const size_t token = size_t(raw);
             result += probabilities[slot]
-                    * state[context * 512 + ((head / 12) * context + token) * 256 + column];
+                    * kv_load(&state[context * 512 + ((head / 12) * context + token) * 256 + column]);
         }
     }
     output[item * 256 + column] = result;
@@ -1107,42 +1115,92 @@ __global__ void delta_register_sequence(float* state, size_t heads, size_t steps
     for (unsigned key = 0; key < 128; ++key) state[(head * 128 + key) * 128 + col] = memory[key];
 }
 
-// Split each recurrent column across eight lanes. More independent threads
-// keep the fixed 48-head scan occupied without changing the delta-rule equation.
-template<int P=1>
-__global__ void delta_split_sequence(float* state,size_t steps,const float* packed,float* output) {
-    constexpr size_t heads=48/P;
-    const size_t head=blockIdx.x,col=threadIdx.x/8,split=threadIdx.x%8,elements=steps*heads*128;
+// The delta rule's scan over a chunk's tokens, each column of a head's state split across eight lanes (16 of its 128 keys each).
+// The columns are independent, so a block takes 32 of them and a head spreads over four blocks (24 or 48 heads: 96 or 192 blocks,
+// where one block a head kept 24 or 48 CUs busy); each block stages 16 tokens' q, k, v, decay and beta in LDS while it loads the
+// next 16 (one barrier per 16 tokens, not two per token). The sums are explicit FMAs in the order the one-block-a-head scan
+// compiled to: its outputs and state bit for bit, 1.9x faster on an R9700 (24 heads, 512 tokens: 0.446 -> 0.236 ms).
+constexpr unsigned delta_columns = 32, delta_staged = 16;
+template<int P, unsigned COLS, unsigned T, unsigned QK, unsigned V>
+__device__ __forceinline__ void delta_stage_load(const float* packed, size_t steps, size_t elements, size_t heads, size_t head,
+                                                 size_t first_col, size_t base, float (&q)[QK], float (&k)[QK], float (&v)[V],
+                                                 float& decay, float& beta) {
+    constexpr unsigned threads = COLS * 8;
+    #pragma unroll
+    for (unsigned j = 0; j < QK; ++j) {
+        const unsigned e = threadIdx.x + j * threads, t = e / 128;
+        if (e < T * 128 && base + t < steps) {
+            const size_t at = ((base + t) * heads + head) * 128 + e % 128;
+            q[j] = packed[at]; k[j] = packed[elements + at];
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < V; ++j) {
+        const unsigned e = threadIdx.x + j * threads, t = e / COLS;
+        if (e < T * COLS && base + t < steps) v[j] = packed[2 * elements + ((base + t) * heads + head) * 128 + first_col + e % COLS];
+    }
+    if (threadIdx.x < T && base + threadIdx.x < steps) {
+        decay = packed[3 * elements + (base + threadIdx.x) * heads + head];
+        beta = packed[3 * elements + steps * heads + (base + threadIdx.x) * heads + head];
+    }
+}
+template<int P = 1>
+__global__ void __launch_bounds__(delta_columns * 8) delta_split_sequence(float* state, size_t steps, const float* packed, float* output) {
+    constexpr size_t heads = 48 / P, groups = 128 / delta_columns;
+    constexpr unsigned COLS = delta_columns, T = delta_staged, threads = COLS * 8;
+    constexpr unsigned QK = (T * 128 + threads - 1) / threads, V = (T * COLS + threads - 1) / threads;
+    const size_t head = blockIdx.x / groups, first_col = (blockIdx.x % groups) * COLS, col = first_col + threadIdx.x / 8;
+    const size_t split = threadIdx.x % 8, elements = steps * heads * 128;
     float memory[16];
     #pragma unroll
-    for (size_t i=0;i<16;++i) memory[i]=state[(head*128+split+i*8)*128+col];
-    __shared__ float query[128],keys[128];
-    for (size_t step=0;step<steps;++step) {
-        const size_t offset=(step*heads+head)*128;
-        if (threadIdx.x<128) {
-            query[threadIdx.x]=packed[offset+threadIdx.x];
-            keys[threadIdx.x]=packed[elements+offset+threadIdx.x];
-        }
-        __syncthreads();
-        const float factor=packed[3*elements+step*heads+head],beta=packed[3*elements+steps*heads+step*heads+head];
-        float prediction=0;
+    for (size_t i = 0; i < 16; ++i) memory[i] = state[(head * 128 + split + i * 8) * 128 + col];
+    __shared__ float sq[2][T][128], sk[2][T][128], sv[2][T][COLS], sd[2][T], sb[2][T];
+    float q[QK], k[QK], v[V], decay = 0, beta = 0;
+    auto stage = [&](unsigned b) {
         #pragma unroll
-        for (size_t i=0;i<16;++i) prediction+=(memory[i]*factor)*keys[split+i*8];
-        for (unsigned offset=1;offset<8;offset*=2) prediction+=__shfl_xor(prediction,offset,8);
-        const float correction=(packed[2*elements+offset+col]-prediction)*beta;
-        float result=0;
-        #pragma unroll
-        for (size_t i=0;i<16;++i) {
-            memory[i]=memory[i]*factor+keys[split+i*8]*correction;
-            result+=memory[i]*query[split+i*8];
+        for (unsigned j = 0; j < QK; ++j) {
+            const unsigned e = threadIdx.x + j * threads;
+            if (e < T * 128) { sq[b][e / 128][e % 128] = q[j]; sk[b][e / 128][e % 128] = k[j]; }
         }
-        for (unsigned offset=1;offset<8;offset*=2) result+=__shfl_xor(result,offset,8);
-        if (split==0) output[offset+col]=result;
+        #pragma unroll
+        for (unsigned j = 0; j < V; ++j) {
+            const unsigned e = threadIdx.x + j * threads;
+            if (e < T * COLS) sv[b][e / COLS][e % COLS] = v[j];
+        }
+        if (threadIdx.x < T) { sd[b][threadIdx.x] = decay; sb[b][threadIdx.x] = beta; }
+    };
+    delta_stage_load<P, COLS, T>(packed, steps, elements, heads, head, first_col, 0, q, k, v, decay, beta);
+    stage(0);
+    __syncthreads();
+    for (size_t base = 0, round = 0; base < steps; base += T, ++round) {
+        const unsigned b = round & 1;
+        if (base + T < steps) delta_stage_load<P, COLS, T>(packed, steps, elements, heads, head, first_col, base + T, q, k, v, decay, beta);
+        const size_t count = steps - base < T ? steps - base : T;
+        for (size_t t = 0; t < count; ++t) {
+            const float factor = sd[b][t], scale = sb[b][t];
+            float decayed[16], prediction = 0;
+            #pragma unroll
+            for (size_t i = 0; i < 16; ++i) { decayed[i] = memory[i] * factor; prediction = fmaf(decayed[i], sk[b][t][split + i * 8], prediction); }
+            for (unsigned lanes = 1; lanes < 8; lanes *= 2) prediction += __shfl_xor(prediction, lanes, 8);
+            const float correction = (sv[b][t][threadIdx.x / 8] - prediction) * scale;
+            float result = 0;
+            #pragma unroll
+            for (size_t i = 0; i < 16; ++i) {
+                memory[i] = fmaf(sk[b][t][split + i * 8], correction, decayed[i]);
+                result = fmaf(memory[i], sq[b][t][split + i * 8], result);
+            }
+            for (unsigned lanes = 1; lanes < 8; lanes *= 2) result += __shfl_xor(result, lanes, 8);
+            if (split == 0) output[((base + t) * heads + head) * 128 + col] = result;
+        }
+        if (base + T < steps) stage(b ^ 1);
         __syncthreads();
     }
     #pragma unroll
-    for (size_t i=0;i<16;++i) state[(head*128+split+i*8)*128+col]=memory[i];
+    for (size_t i = 0; i < 16; ++i) state[(head * 128 + split + i * 8) * 128 + col] = memory[i];
 }
+// delta_split_sequence's grid: four blocks a head.
+template<int P = 1>
+inline unsigned delta_split_blocks() { return unsigned((48 / P) * (128 / delta_columns)); }
 
 size_t matrix_row_bytes(int kind, uint64_t cols) {
     if (kind == 0) return size_t(cols) * 4;
@@ -1579,10 +1637,12 @@ int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void*
         check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded,size_t(count)*2560*4,hipMemcpyDeviceToDevice,d.stream));
         mtp_prologue_device(d,pointers,kinds,size_t(count));
         auto target=d.decoder.find(size_t(layer));
-        // (a layer in parts: its rows into the workspace, the host running the layer on both devices)
+        // (a layer in parts: its rows into the workspace at the pairs' offset, the host running the layer on both devices once
+        // over the batch's pairs)
         if (target!=d.decoder.end() && target->second.parts==2) {
-            if (count>target->second.capacity) throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
-            check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
+            if (offset+count>target->second.capacity) throw std::runtime_error("MTP prompt rows have no compatible MTP layer");
+            check(hipMemcpyAsync(target->second.workspace+size_t(offset)*10240,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,
+                                 d.stream));
             return 0;
         }
         if (count==1) {
@@ -2776,7 +2836,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown = nullptr;
         // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
         // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (host_allocate(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+        if (host_allocate(&grown, to * 1024 * sizeof(kv_t) + allocation_tail, hipHostMallocMapped) != hipSuccess) {
             (void)hipGetLastError();
             throw std::runtime_error(kv_no_memory);
         }
@@ -2784,9 +2844,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown_index = nullptr;
         void* grown_scratch = nullptr;
         try {
-            std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
+            std::memset(grown, 0, to * 1024 * sizeof(kv_t) + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
-                std::memcpy(static_cast<float*>(grown) + plane * to * 256, static_cast<const float*>(host->second) + plane * from * 256, valid * 1024);
+                std::memcpy(static_cast<kv_t*>(grown) + plane * to * 256, static_cast<const kv_t*>(host->second) + plane * from * 256,
+                            valid * 256 * sizeof(kv_t));
             check(hipHostGetDevicePointer(&pointer, grown, 0));
             // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
             std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
@@ -2807,7 +2868,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         kv_clear_graphs(d);
         check(hipHostFree(host->second));
         d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
-        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * 4);
+        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * sizeof(kv_t));
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
         plan.states[0] = pointer; plan.context = to;
         if (grown_index) {
@@ -3000,7 +3061,7 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
             !steps || steps > max_batch || base > context || steps > context - base || !selected || selected > 2052)
             throw std::runtime_error("invalid Straydog attention dimensions");
         auto found = value.allocations.find(state);
-        if (found == value.allocations.end() || found->second != context * 1024 * 4)
+        if (found == value.allocations.end() || found->second != context * 1024 * sizeof(kv_t))
             throw std::runtime_error("Straydog attention state size mismatch");
         if (input_count != steps * (24 * 256 + 1024 + selected + 1) || output_count != steps * 24 * 256 ||
             input_count > value.input_capacity || output_count > value.output_capacity)
@@ -3014,11 +3075,11 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
         }
         upload(value, value.input, input, size_t(input_count) * 4);
         kv_invalidate_write(value,state,size_t(base));
-        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<float*>(state),
+        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), value.input);
-        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<float*>(state),
+        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores);
-        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<float*>(state),
+        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores, value.output);
         check(hipGetLastError());
         download(value, output, value.output, size_t(output_count) * 4);

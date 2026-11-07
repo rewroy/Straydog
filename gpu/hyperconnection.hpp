@@ -41,6 +41,51 @@ __global__ void hc_finish(const float* normalized, const float* up, const float*
         output[steps * 2560 + token * 4 + col] = 2.0f * hc_sigmoid(injection[token * 4 + col] / 4.0f);
 }
 
+// A prompt batch's HyperConnection in FP16 projections (hc_prefill): hc_normalize's values go to the projections as halves,
+// and each row stream's denominator is kept for hc_finish_hidden, which computes the values again from the rows rather than
+// reading them back as floats (the same arithmetic: the mixed rows are bit for bit hc_finish's).
+// A float as the F32 value it is: a product rounded to FP16 right after would otherwise become one fused rounding
+// (v_fma_mixlo_f16), not hc_normalize's store and cast_half's (rare values would differ by one FP16 step).
+__device__ __forceinline__ float hc_f32(float value) {
+#if defined(__HIPCC__)
+    asm volatile("" : "+v"(value));
+#endif
+    return value;
+}
+// (the squares' sums as explicit FMAs, as hc_normalize's compile to, so a fused kernel's sums can match them)
+__global__ void hc_normalize_half(const float* input, const float* norm, __half* output, float* denominators) {
+    const size_t base = size_t(blockIdx.x) * 2560;
+    __shared__ float sum[256];
+    float total = 0;
+    for (size_t col = threadIdx.x; col < 2560; col += 256) {
+        const float x = input[base + col]; total = fmaf(x, x, total);
+    }
+    sum[threadIdx.x] = total;
+    __syncthreads();
+    for (unsigned stride = 128; stride; stride /= 2) {
+        if (threadIdx.x < stride) sum[threadIdx.x] += sum[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float denominator = sqrtf(sum[0] / 2560.0f + 1e-6f);
+    if (threadIdx.x == 0) denominators[blockIdx.x] = denominator;
+    for (size_t col = threadIdx.x; col < 2560; col += 256)
+        output[base + col] = __float2half(hc_f32(input[base + col] / denominator * norm[(base + col) % 10240]));
+}
+__global__ void hc_finish_hidden(const float* input, const float* norm, const float* denominators, const float* up,
+                                 const float* injection, size_t steps, float* output) {
+    const size_t index = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (index >= steps * 2560) return;
+    const size_t token = index / 2560, col = index % 2560;
+    float sum = 0;
+    for (size_t stream = 0; stream < 4; ++stream) {
+        const size_t source = token * 10240 + stream * 2560 + col;
+        const float normalized = input[source] / denominators[token * 4 + stream] * norm[stream * 2560 + col];
+        sum += hc_sigmoid(up[source]) * normalized;
+    }
+    output[index] = sum / 4.0f;
+    if (col < 4) output[steps * 2560 + token * 4 + col] = 2.0f * hc_sigmoid(injection[token * 4 + col] / 4.0f);
+}
+
 void hc_project(Device& d, const Matrix& matrix, size_t steps, const float* input, float* output,
                 Matrix* descriptors) {
     if (d.blas && steps >= d.gemm_min_batch) {
