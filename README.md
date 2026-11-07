@@ -8,9 +8,9 @@ are not supported.
 
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
-  operands in prompt batches; for DeepSeek-V4.1 also INT8 and FP16 inputs in decode and
-  BF16 compressed K/V) are listed under [Numerics](#numerics), each with its switch where
-  it has one. Speculative decoding never changes an answer.
+  operands in prompt batches; Qwen3.8's K/V in FP16; for DeepSeek-V4.1 also INT8 and FP16
+  inputs in decode and BF16 compressed K/V) are listed under [Numerics](#numerics), each with
+  its switch where it has one. Speculative decoding never changes an answer.
 - **Isolated.** The engine runs in a worker without network access (bubblewrap on
   Linux, its own AppContainer on Windows). Every model and drafter file is pinned by
   SHA-256 and authenticated when it is downloaded.
@@ -83,6 +83,15 @@ the bundle's directory or the one above it, or named by `--mmproj`.
 Each GPU's VRAM budget is its free memory less a margin (512 MiB or 3%; on Windows, where the
 desktop shares the GPU, an eighth of a small card and 256 MiB, and 2 GiB from 16 GB up) unless `--vram` gives
 one (`--vram 28`) or one per GPU (`--vram 30,10` for a 32 GB and a 12 GB card).
+
+The budget decides the placement, and with it the speed: Qwen3.8 takes the first of full residency
+with its K/V in VRAM, then with the K/V in host memory at prefill batches of 4096 down to 1024, with
+its MTP drafter and then without, and below that partial residency. On two R9700s at 262144 tokens,
+UD-IQ3_XXS reads a 95K-token prompt in 22.4 s fully resident; at `--vram 26` it is partially resident
+and an 8K prompt takes 6.0 s instead of 2.5. The ready line says which placement a start took and,
+when the first choice did not fit, what it would have needed: `prefill batch 4096 (K/V in VRAM,
+prefill batch 4096, MTP drafter would need 2.6 GiB more VRAM)`, or for a partial placement
+`(fully resident: K/V in host memory, prefill batch 1024 would need 2.3 GiB more VRAM)`.
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
@@ -181,7 +190,7 @@ Where it rounds, and how to turn it off:
 | Qwen products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm fp32` |
 | Qwen's long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
 | Qwen decode and speculative verification: the inputs of the dense Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 projections (RDNA4 and CUDA) | INT8 per 32 values with an F32 scale; the dots exact in INT32, then scaled in F32. A row's sum does not depend on what shares its launch, so a verification is still the tokens fed one at a time; the bits are no longer the F32 kernels' (CUDA, UD-IQ1_S, 356 decode steps: KL mean 1.1e-3, p99 1.2e-2; greedy continuations part after 19, 23 and 30 tokens in three of six prompts and agree for 128 in the others) | `STRAYDOG_Q8=0` |
-| Qwen's K/V cache | F32 | |
+| Qwen's K/V cache | FP16, rounded to nearest. A long prompt's attention on RDNA4 rounded keys and values to FP16 already; decode and verification now read them so (UD-IQ3_XXS on two R9700s, each row's logits on F32 replies of 255 tokens: KL mean 3.6e-4 / 4.6e-4 / 6.6e-4 at 8K / 32K / 95K, the same top token on 762 of 765 rows, the others near ties). Half the memory of F32 in VRAM and in host memory | none |
 | DeepSeek products over prompt passes of at least 32 rows (FFN, attention, index, router and Engram projections; more than 4 rows per expert) | FP16 operands, F32 sums and output | `--gemm fp32` |
 | DeepSeek decode and verification: the inputs of the Q8_0 and Q5_K projections and of the IQ2 experts' gate and up | INT8 per 32 values with an F32 scale; the dots exact in INT32, then scaled in F32 | none in the server (`DS41_Q8=0` in the examples) |
 | DeepSeek decode and verification: the attention's and the indexer's scores | FP16 operands, F32 sums | `--gemm fp32` |
