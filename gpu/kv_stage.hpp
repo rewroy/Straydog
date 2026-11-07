@@ -1,28 +1,31 @@
 // One allocation, two layouts: prefill stages one layer; decode mirrors every
-// registered host state's newest rows. All copies preserve the state's F32 planes (each K/V head's
+// registered host state's newest rows. All copies preserve the state's planes of kv_t (each K/V head's
 // keys, then each one's values: four for a whole layer, two for a GPU's part, Device::kv_planes).
 struct KvView {
-    float* kv; size_t capacity; bool staged;
-    float* mirror = nullptr; size_t mirror_rows = 0;
+    kv_t* kv; size_t capacity; bool staged;
+    kv_t* mirror = nullptr; size_t mirror_rows = 0;
 };
+// The stage's allocation as K/V rows.
+inline kv_t* kv_stage_rows(Device& d) { return reinterpret_cast<kv_t*>(d.kv_stage); }
 size_t kv_planes_of(const Device& d, const void* state) {
     auto found=d.kv_planes.find(state);
     return found==d.kv_planes.end() ? 4 : found->second;
 }
 // Positions of `state`'s planes the stage holds in its one-layer (prefill) layout.
-size_t kv_stage_capacity(const Device& d, const void* state) { return d.kv_stage_floats/(256*kv_planes_of(d,state)); }
-void kv_copy_rows(Device& d, float* to, size_t to_capacity, const float* from, size_t from_capacity,
+size_t kv_stage_capacity(const Device& d, const void* state) { return d.kv_stage_floats/(kv_row_floats*kv_planes_of(d,state)); }
+void kv_copy_rows(Device& d, kv_t* to, size_t to_capacity, const kv_t* from, size_t from_capacity,
                   size_t first, size_t count, size_t planes, hipStream_t stream=nullptr) {
     for (size_t segment=0;count && segment<planes;++segment)
-        check(hipMemcpyAsync(to+(segment*to_capacity+first)*256,from+(segment*from_capacity+first)*256,count*256*4,
+        check(hipMemcpyAsync(to+(segment*to_capacity+first)*256,from+(segment*from_capacity+first)*256,count*256*sizeof(kv_t),
                              hipMemcpyDefault,stream ? stream : d.stream));
 }
 // Rows [first, first+count) of the K/V to their places in its ring of `rows` rows.
-void kv_copy_ring(Device& d, float* ring, size_t rows, const float* from, size_t context, size_t first, size_t count, size_t planes) {
+void kv_copy_ring(Device& d, kv_t* ring, size_t rows, const kv_t* from, size_t context, size_t first, size_t count, size_t planes) {
     while (count) {
         const size_t slot=first%rows, run=std::min(count,rows-slot);
         for (size_t segment=0;segment<planes;++segment)
-            check(hipMemcpyAsync(ring+(segment*rows+slot)*256,from+(segment*context+first)*256,run*256*4,hipMemcpyDefault,d.stream));
+            check(hipMemcpyAsync(ring+(segment*rows+slot)*256,from+(segment*context+first)*256,run*256*sizeof(kv_t),hipMemcpyDefault,
+                                 d.stream));
         first+=run; count-=run;
     }
 }
@@ -33,11 +36,11 @@ void kv_layout(Device& d) {
     if (!d.kv_stage || d.host_states.empty()) return;
     size_t planes = 0;
     for (const auto& state : d.host_states) planes += kv_planes_of(d,state.first);
-    d.kv_mirror_rows = d.kv_stage_floats/(256*planes);
+    d.kv_mirror_rows = d.kv_stage_floats/(kv_row_floats*planes);
     if (d.kv_mirror_rows<=2*kv_mirror_margin) { d.kv_mirror_rows=0; return; }
     size_t at = 0;
     for (const auto& state : d.host_states) {
-        d.kv_mirrors.emplace(state.first,KvMirror{d.kv_stage+at,0});
+        d.kv_mirrors.emplace(state.first,KvMirror{kv_stage_rows(d)+at,0});
         at += d.kv_mirror_rows*256*kv_planes_of(d,state.first);
     }
 }
@@ -65,7 +68,7 @@ void kv_prefetch(Device& d, void* state, size_t context, size_t base) {
     // After the stage's last reader and the host rows' last writer on the device stream.
     check(hipEventRecord(d.kv_released,d.stream));
     check(hipStreamWaitEvent(d.kv_stream,d.kv_released,0));
-    kv_copy_rows(d,d.kv_stage,kv_stage_capacity(d,state),static_cast<const float*>(state),context,d.kv_stage_valid,
+    kv_copy_rows(d,kv_stage_rows(d),kv_stage_capacity(d,state),static_cast<const kv_t*>(state),context,d.kv_stage_valid,
                  base-d.kv_stage_valid,kv_planes_of(d,state),d.kv_stream);
     check(hipEventRecord(d.kv_prefetched,d.kv_stream));
     d.kv_prefetching=true;
@@ -101,8 +104,8 @@ void kv_clear_graphs(Device& d) {
 }
 KvView kv_decode_view(Device& d, void* state, size_t context) {
     auto found=d.kv_mirrors.find(state);
-    if (found==d.kv_mirrors.end()) return {static_cast<float*>(state),context,false};
-    return {static_cast<float*>(state),context,false,found->second.data,d.kv_mirror_rows};
+    if (found==d.kv_mirrors.end()) return {static_cast<kv_t*>(state),context,false};
+    return {static_cast<kv_t*>(state),context,false,found->second.data,d.kv_mirror_rows};
 }
 // Called OUTSIDE capture, once per span (also on graph replay). The same stream
 // orders fills after old writes and before attention. Rewrites truncate validity;
@@ -135,19 +138,19 @@ KvView kv_for_prefill(Device& d, void* state, size_t context, size_t base, size_
     }
     kv_invalidate_write(d,state,base);
     if (!d.kv_stage || base+count>kv_stage_capacity(d,state) || !d.host_states.count(state))
-        return {static_cast<float*>(state),context,false};
+        return {static_cast<kv_t*>(state),context,false};
     // The prefill layout overwrites every layer's decode mirror.
     for (auto& entry : d.kv_mirrors) entry.second.valid=0;
     if (d.kv_stage_owner!=state) { d.kv_stage_owner=state; d.kv_stage_valid=0; }
     const size_t valid=std::min(d.kv_stage_valid,base);
     const size_t capacity=kv_stage_capacity(d,state);
-    kv_copy_rows(d,d.kv_stage,capacity,static_cast<const float*>(state),context,valid,base-valid,kv_planes_of(d,state));
-    return {d.kv_stage,capacity,true};
+    kv_copy_rows(d,kv_stage_rows(d),capacity,static_cast<const kv_t*>(state),context,valid,base-valid,kv_planes_of(d,state));
+    return {kv_stage_rows(d),capacity,true};
 }
 void kv_after_prefill(Device& d, const KvView& view, void* state, size_t context, size_t base, size_t count) {
     if (!view.staged) return;
-    kv_copy_rows(d,static_cast<float*>(state),context,view.kv,view.capacity,base,count,kv_planes_of(d,state));
-    if (view.kv==d.kv_stage && d.kv_stage_owner==state) d.kv_stage_valid=base+count;
+    kv_copy_rows(d,static_cast<kv_t*>(state),context,view.kv,view.capacity,base,count,kv_planes_of(d,state));
+    if (view.kv==kv_stage_rows(d) && d.kv_stage_owner==state) d.kv_stage_valid=base+count;
 }
 // The layer map is fully registered before decode. Preparing here, rather than
 // in qsa_decode_attend, also covers graphs reused after prefill or state restore.

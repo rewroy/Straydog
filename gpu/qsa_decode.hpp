@@ -37,7 +37,7 @@ void qsa_decode_attend(Device& d,void* const* pointers,void* kv,void* index,void
     constexpr size_t selected=2052;
     qsa_select_rows<1024><<<1,1024,0,d.stream>>>(static_cast<float*>(scratch),pool,0,1,selected,d.input,position);
     const KvView view=kv_decode_view(d,kv,context);
-    write_attention_kv<<<2,256,0,d.stream>>>(static_cast<float*>(kv),context,0,1,d.input,position,value,
+    write_attention_kv<<<2,256,0,d.stream>>>(static_cast<kv_t*>(kv),context,0,1,d.input,position,value,
                                            view.mirror,view.mirror_rows);
     qsa_attention(d,kv,context,0,1,selected,d.input,attended,position,view.mirror,view.mirror_rows);
     qsa_gate<<<24,256,0,d.stream>>>(attended,qgate,6144);
@@ -85,8 +85,8 @@ __device__ void qsa_pool_rows_block(const float* incoming,size_t stride,const fl
 // turn) by one more block: three launches in one, the same values.
 template<int P=1>
 __global__ void qsa_normalize_rows(float* projections,size_t stride,const float* qnorm,const float* knorm,const float* iqnorm,
-                                   float* target,size_t steps,const uint32_t* positions,const uint32_t* ropes,float* state,size_t context,
-                                   float* mirror,size_t mirror_rows,const float* pool_norm,size_t pool,float* blocks,float* history) { SD_KERNEL_ACQUIRE;
+                                   float* target,size_t steps,const uint32_t* positions,const uint32_t* ropes,kv_t* state,size_t context,
+                                   kv_t* mirror,size_t mirror_rows,const float* pool_norm,size_t pool,float* blocks,float* history) { SD_KERNEL_ACQUIRE;
     using H=QwenHeads<P>;
     constexpr size_t keys=H::query*512, values=keys+H::kv*256, index=keys+H::kv*512;
     const size_t block=blockIdx.x,row=blockIdx.y,pos=positions[row],rope=ropes[row];
@@ -97,7 +97,7 @@ __global__ void qsa_normalize_rows(float* projections,size_t stride,const float*
         float* normalized=target+steps*H::query*256+row*H::kv*256;
         qsa_normalize_block(own+keys,knorm,head,256,256,rope,normalized,256);
         constexpr size_t width=H::kv*256;
-        const float key=normalized[head*256+column], value=own[values+head*256+column];
+        const kv_t key=kv_value(normalized[head*256+column]), value=kv_value(own[values+head*256+column]);
         state[(head*context+pos)*256+column]=key;
         state[context*width+(head*context+pos)*256+column]=value;
         if (mirror_rows) {
@@ -120,7 +120,7 @@ void qsa_decode_attend_rows(Device& d,void* const* pointers,void* kv,void* index
     const KvView view=kv_decode_view(d,kv,context);
     qsa_normalize_rows<P><<<dim3(unsigned(H::query+H::kv+5),unsigned(steps)),256,0,d.stream>>>(projections,stride,
         static_cast<const float*>(pointers[6]),static_cast<const float*>(pointers[7]),static_cast<const float*>(pointers[8]),d.input,
-        steps,positions,ropes,static_cast<float*>(kv),context,view.mirror,view.mirror_rows,static_cast<const float*>(pointers[9]),pool,
+        steps,positions,ropes,static_cast<kv_t*>(kv),context,view.mirror,view.mirror_rows,static_cast<const float*>(pointers[9]),pool,
         blocks,blocks+pool*128);
     qsa_block_scores<<<dim3(unsigned((pool+255)/256),unsigned(steps)),256,0,d.stream>>>(projections+queries,blocks,pool,0,steps,
         static_cast<float*>(scratch),positions,stride);
