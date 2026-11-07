@@ -153,6 +153,59 @@ __global__ void qwen_scatter_residual(const float* part, size_t steps, size_t fi
         *at = value;
     }
 }
+// The next HyperConnection's normalize folded into a scatter's residual update (hc_prefill's FP16 path, `normalized`): where
+// hc_normalize_half's halves and denominators of this device's rows go, and the norm it reads.
+struct HcNext { const float* norm; __half* half; float* denominators; };
+inline HcNext hc_next(const float* norm, float* scratch, size_t steps) { return {norm, hc_scratch_half(scratch, steps), scratch}; }
+// A half of this device's inbox.
+__device__ inline float qwen_inbox_half(const __half* at) {
+#if defined(__HIPCC__)
+    return __half2float(__ushort_as_half(__hip_atomic_load(reinterpret_cast<const uint16_t*>(at), __ATOMIC_RELAXED,
+                                                           __HIP_MEMORY_SCOPE_SYSTEM)));
+#else
+    return __half2float(__ushort_as_half(*reinterpret_cast<const volatile uint16_t*>(at)));
+#endif
+}
+// qwen_scatter_residual with hc_normalize_half after it, on the updated rows still in registers: a block a row, its threads the
+// columns t + 256k of the four streams, each stream's sum of squares in hc_normalize_half's order (the same bits as the two).
+__global__ void __launch_bounds__(256) qwen_scatter_residual_normalize(const float* part, size_t steps, size_t first, size_t count,
+                                                                       const uint32_t* state, const __half* inbox, size_t capacity,
+                                                                       const float* mixed, float* hidden, HcNext next) {
+    const size_t local = blockIdx.x, row = first + local, t = threadIdx.x;
+    const __half* theirs = inbox + size_t(state[0] & 1) * capacity + local * 2560;
+    const float* mixes = mixed + steps * 2560 + row * 4;
+    const float mix[4] = {mixes[0], mixes[1], mixes[2], mixes[3]};
+    float* streams = hidden + row * 10240;
+    float values[4][10], totals[4] = {0, 0, 0, 0};
+    for (size_t k = 0; k < 10; ++k) {
+        const size_t column = t + 256 * k;
+        const float total = __half2float(__float2half_rn(part[row * 2560 + column])) + qwen_inbox_half(theirs + column);
+        for (size_t stream = 0; stream < 4; ++stream) {
+            // (explicit FMAs: the residual's as qwen_scatter_residual's compile to, the squares' as hc_normalize_half's)
+            const float value = fmaf(mix[stream], total, streams[stream * 2560 + column]);
+            streams[stream * 2560 + column] = value;
+            values[stream][k] = value;
+            totals[stream] = fmaf(value, value, totals[stream]);
+        }
+    }
+    __shared__ float sum[4][256];
+    for (size_t stream = 0; stream < 4; ++stream) sum[stream][t] = totals[stream];
+    __syncthreads();
+    for (unsigned stride = 128; stride; stride /= 2) {
+        if (t < stride)
+            for (size_t stream = 0; stream < 4; ++stream) sum[stream][t] += sum[stream][t + stride];
+        __syncthreads();
+    }
+    for (size_t stream = 0; stream < 4; ++stream) {
+        const float denominator = sqrtf(sum[stream][0] / 2560.0f + 1e-6f);
+        if (t == 0) next.denominators[local * 4 + stream] = denominator;
+        for (size_t k = 0; k < 10; ++k) {
+            const size_t column = t + 256 * k;
+            next.half[local * 10240 + stream * 2560 + column] =
+                __float2half(hc_f32(values[stream][k] / denominator * next.norm[stream * 2560 + column]));
+        }
+    }
+}
 // A HyperConnection's mixed rows of this device's rows (`local`: their 2560-value rows, then their four mixes each) into the
 // batch's layout, rounded to FP16 as they go to the other's inbox slot (the rows' halves, then the mixes as floats).
 __global__ void qwen_gather_send(const float* local, size_t steps, size_t first, size_t count, float* mixed, __half* peer_inbox,
@@ -202,7 +255,9 @@ void qwen_sum_rows(Device& d, const float* part, size_t steps, float* hidden, co
 #endif
 }
 // This device's rows of a batch's sum into their streams (reduce-scatter).
-void qwen_scatter_prefill(Device& d, const float* part, size_t steps, BatchRows own, BatchRows other, float* hidden, const float* mixed) {
+// `next`: the residual update also normalizes the rows for the next HyperConnection (qwen_scatter_residual_normalize).
+void qwen_scatter_prefill(Device& d, const float* part, size_t steps, BatchRows own, BatchRows other, float* hidden, const float* mixed,
+                          const HcNext* next = nullptr) {
     SumLink& link = d.sums;
     // (an inbox slot of `capacity` floats holds twice as many halves; whole 32 bytes, for the 16-byte stores and loads)
     if (!link.peer || !steps || std::max(own.count, other.count) * 2560 > link.capacity * 2 || link.capacity % 8)
@@ -210,8 +265,13 @@ void qwen_scatter_prefill(Device& d, const float* part, size_t steps, BatchRows 
     qwen_scatter_send<<<unsigned(std::min<size_t>((other.count * 320 + 255) / 256, 1024)), 256, 0, d.stream>>>(
         part, other.first, other.count, reinterpret_cast<__half*>(link.peer_inbox), link.state, link.capacity * 2);
     link_signal_kernel<<<1, 1, 0, d.stream>>>(link.state, link.peer_flag, d.await_timeout);
-    qwen_scatter_residual<<<unsigned((own.count * 640 + 255) / 256), 256, 0, d.stream>>>(
-        part, steps, own.first, own.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed, hidden);
+    if (next)
+        qwen_scatter_residual_normalize<<<unsigned(own.count), 256, 0, d.stream>>>(
+            part, steps, own.first, own.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed, hidden,
+            *next);
+    else
+        qwen_scatter_residual<<<unsigned((own.count * 640 + 255) / 256), 256, 0, d.stream>>>(
+            part, steps, own.first, own.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed, hidden);
     check(hipGetLastError());
 }
 // A HyperConnection's mixed rows of every row of the batch, from this device's rows' (`local`, hc_prefill's layout) and the other's.
@@ -346,7 +406,10 @@ void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const Verify
 
 // A prefill batch through a layer's part: prefill_span's steps, the HyperConnections and residual updates of this device's rows
 // (BatchRows), each output a part of a sum.
-void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, float* hidden, float* mixed, float* branch) {
+// `normalized`: the layer before's last scatter normalized the rows for this layer's first HyperConnection; `next`: this layer's
+// last scatter does so for the next layer's.
+void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, float* hidden, float* mixed, float* branch,
+                        bool normalized = false, bool next = false) {
     const auto& plan = d.decoder.find(layer)->second;
     auto* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
     const auto& experts = *d.resident.find(plan.moe)->second;
@@ -355,8 +418,10 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
         throw std::runtime_error("prefill batch exceeds the resident expert workspace");
     const bool linear = decoder_linear(layer);
     const BatchRows own = batch_rows(steps, plan.part), other = batch_rows(steps, 1 - plan.part);
+    // (with FP16 projections, each scatter's residual update normalizes the rows for the HyperConnection after it)
+    const bool fold = batch_half(d, own.count);
     // (the HyperConnections' rows in `branch` before they are gathered: the last sum has read the branch there)
-    hc_prefill(d, pointers, kinds, own.count, hidden + own.first * 10240, branch, scratch);
+    hc_prefill(d, pointers, kinds, own.count, hidden + own.first * 10240, branch, scratch, fold && normalized);
     qwen_gather_mixed(d, branch, steps, own, other, mixed);
     if (linear) {
         const size_t chunk = d.input_capacity >= 16 * 1024 * 1024 ? 512 : 128;
@@ -366,8 +431,10 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
                        branch, scratch);
         if (steps > 1) kv_prefetch_from(d, layer + 1, position);
     }
-    qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed);
-    hc_prefill(d, pointers + 4 + (linear ? 9 : 10), kinds + 4 + (linear ? 9 : 10), own.count, hidden + own.first * 10240, branch, scratch);
+    void* const* second = pointers + 4 + (linear ? 9 : 10);
+    const HcNext second_next = hc_next(static_cast<const float*>(second[0]), scratch, own.count);
+    qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed, fold ? &second_next : nullptr);
+    hc_prefill(d, second, kinds + 4 + (linear ? 9 : 10), own.count, hidden + own.first * 10240, branch, scratch, fold);
     qwen_gather_mixed(d, branch, steps, own, other, mixed);
     const StepMoe moe = step_moe(d, plan.moe, steps);
     moe_steps_route(d, moe, steps, mixed);
@@ -376,7 +443,14 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     if (half) moe_half_batch(d, moe, steps, mixed);
     moe_part_partial<<<dim3(10, unsigned(steps)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, steps,
                                                                      true, moe.plan->shared || half, branch);
-    qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed);
+    if (fold && next) {
+        const auto& following = d.decoder.find(layer + 1)->second;
+        const HcNext first_next = hc_next(static_cast<const float*>(following.pointers[0]),
+                                          d.resident.find(following.moe)->second->workspace, own.count);
+        qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed, &first_next);
+    } else {
+        qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed);
+    }
 }
 
 // Layers [begin, end) of a prompt's batch on both devices, layer by layer (each device queues a layer before the other device's
@@ -414,7 +488,7 @@ void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t p
         for (size_t side = 0; side < 2; ++side) {
             Device& d = *sides[side];
             float* hidden = workspaces[side]; float* mixed = hidden + steps * 10240; float* branch = mixed + steps * 2564;
-            on_device(d.ordinal, [&]() { prefill_layer_part(d, layer, position, steps, hidden, mixed, branch); });
+            on_device(d.ordinal, [&]() { prefill_layer_part(d, layer, position, steps, hidden, mixed, branch, layer > begin, layer + 1 < end); });
         }
     const bool whole = end == 1 || end == 48 || output_rows;
     for (size_t side = 0; side < 2; ++side) {
