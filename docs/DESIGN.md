@@ -324,7 +324,10 @@ conversation has met.
 There is no `-ngl`. Placement measures what fits, in this order:
 
 1. **Full residency.** Every weight in VRAM, the K/V too.
-2. **Host K/V,** then a smaller prefill batch (Qwen3.8).
+2. **Host K/V,** then a smaller prefill batch (Qwen3.8), with the MTP drafter, then without.
+   The first choice that fits is taken; when it is not the first, the placement notes what the first
+   would have needed, and with partial residency what full residency would (`resident_placement`),
+   and the ready line says so: a few hundred MB decide the batch and the K/V's place.
 3. **Partial residency.** Dense weights and sequence state in VRAM; routed experts in an expert
    store of VRAM slots over a page-locked host tier over the files.
 
@@ -920,6 +923,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   their selected blocks, so each key and value is read once per group.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
+- The K/V holds FP16 values (`kv_t`): a plane's row of a position is 256 halves, half the bytes of
+  F32 in VRAM, in host memory, in the stage and its mirrors (which then hold twice the positions),
+  and in a sequence's saved positions. The flash rounded keys and values to FP16 already, so a
+  prompt reads the same values; decode and verification read the rounded ones (KL against F32
+  replies 3.6e-4 to 6.6e-4 at 8K to 95K, §Numerics in the README).
+- A DeltaNet layer's scan (`delta_split_sequence`) gives each column of a head's state eight lanes
+  and a block 32 columns, four blocks a head (the columns are independent), and stages 16 tokens'
+  q, k, v, decay and beta in LDS a barrier at a time; its sums are explicit FMAs in the order the
+  one-block-a-head scan compiled to, the same bits at 1.9x its speed.
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
@@ -949,7 +961,13 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   to the other device (all-gather) and a layer's output parts are added only for each device's rows
   (reduce-scatter), both in FP16 (each device rounds its own as the other's arrive, so both read the
   same values): the bus carries what an all-reduce of F32 halves would, and the HyperConnections, run
-  by both on every row, had been a fifth of a 60K prompt. Both hold every row after the first layer
+  by both on every row, had been a fifth of a 60K prompt. The exchanges store 16 bytes a thread into
+  the other's inbox and read 8 from their own. A scatter's residual update also normalizes the rows
+  for the HyperConnection after it, whose FP16 projections then read halves only (its finish
+  computes the normalized values again from the rows rather than reading floats back); a product
+  is kept an F32 before its FP16 cast (an asm barrier: the compiler would round it once with
+  v_fma_mixlo_f16), so the bits are the two kernels'. On a 95K prompt (UD-IQ3_XXS, batch 2048) these
+  and the DeltaNet scan took the prefill from 25.5 to 23.3 s. Both hold every row after the first layer
   (the PLE layer's input) and the last. Against the F32 reference a prompt's first logits are as far
   as with whole layers (KL 1.3e-3, 5.8e-5, 2.4e-3 at 600, 2500, 5000 tokens; whole: 3.7e-4, 1.3e-3,
   2.9e-3).
@@ -964,7 +982,8 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
 - **The MTP layer** is in parts as well (`STRAYDOG_MTP_PARTS=0` keeps it whole on the second GPU). A
   draft step queues the prologue (on both: its rows are both devices') and the layer's part on each
   device from two threads, then the head on the second's rows (`sd_draft_queue`, `sd_draft_head`); a
-  prompt's pairs run the prologue on both, from the rows each keeps, and the layer in parts. Its float
+  prompt's pairs run the prologue on both, from the rows each keeps, in pieces of 512 rows into the
+  workspace, and the layer in parts once over the batch. Its float
   projections go up as Q8_0 as when whole (Data::QuantizeGather: a deferred upload quantizes its piece
   of the verified bytes in crate::load, as it does a whole tensor), its shared expert's half as the
   other layers'. A part's K/V is two planes, so at 32768 tokens `two-gpu-experts-mtp`'s K/V now fits
