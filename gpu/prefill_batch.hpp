@@ -118,7 +118,7 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
             alpha + first * H::value, static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
         // Every qkv row of this chunk is packed before the recurrence overwrites the chunk's rows.
         if (d.rdna4 && count > 1)
-            delta_split_sequence<P><<<unsigned(H::value), 1024, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
+            delta_split_sequence<P><<<delta_split_blocks<P>(), delta_columns * 8, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
         else delta_register_sequence<<<unsigned(H::value), 128, 0, d.stream>>>(static_cast<float*>(recurrent), H::value, count, d.input, rows);
         gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
             post + first * H::gate);
