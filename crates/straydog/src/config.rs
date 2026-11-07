@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(settings.bundle, qwen("IQ3_S"));
         assert_eq!(settings.batch_size, Some(2048));   // 2 x 30 GiB of GPU budget
         assert_eq!(settings.ctx_size, 32768);
-        assert_eq!(settings.state_ram, 2.0);     // what 32768 tokens of state need, rounded up
+        assert_eq!(settings.state_ram, 1.0);     // what 32768 tokens of state need (FP16 K/V), rounded up
         assert_eq!(settings.alias, "Qwen3.8-Flash-Next-ISTA-DASLab-IQ3_S");
         assert_eq!(settings.draft_max, 0);
         let lines = describe(&settings, &sources);
