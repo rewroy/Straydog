@@ -2,20 +2,6 @@
   "schema": 1,
   "model": "DeepSeek-V4.1-Flash-1017",
   "architecture": "deepseek41",
-  "bundles": [
-    {
-      "provider": "ISTA-DASLab",
-      "quant": "IQ2_XS"
-    },
-    {
-      "provider": "ISTA-DASLab",
-      "quant": "IQ2_XXS"
-    },
-    {
-      "provider": "Unsloth",
-      "quant": "UD-IQ1_M"
-    }
-  ],
   "dspark": {
     "kind": "dspark",
     "name": "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
