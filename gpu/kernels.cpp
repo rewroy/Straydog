@@ -457,6 +457,14 @@ struct PeerLink {
     bool direct=false;           // inbox and flag in this device's VRAM (peer access), else host memory
     void* host=nullptr;          // the page-locked allocation when !direct
 };
+// Two page-locked buffers for rows a stream copies in turn (stage_rows).
+struct RowStaging {
+    float* host[2] = {nullptr, nullptr};
+    hipEvent_t staged[2] = {nullptr, nullptr};
+    size_t floats = 0;
+    size_t refused = 0;   // the size (floats) the system refused to page-lock last: not asked for again at or over it
+    unsigned turn = 0;
+};
 struct Device {
     int ordinal;
     size_t budget = 0, used = 0;
@@ -522,13 +530,11 @@ struct Device {
     std::thread host_prefetch;
     std::vector<std::pair<size_t, void*>> host_ready;
     std::string host_prefetch_error;
-    // Page-locked staging for a deferred prompt's MTP embeddings, two batches deep
-    // (sd_mtp_embed): a batch's copy waits only for the copy two batches before.
-    float* mtp_staging[2] = {nullptr, nullptr};
-    hipEvent_t mtp_staged[2] = {nullptr, nullptr};
-    size_t mtp_staging_floats = 0;
-    size_t mtp_staging_refused = 0;   // the size (floats) the system refused to page-lock last: not asked for again at or over it
-    unsigned mtp_turn = 0;
+    // Page-locked staging for a prompt batch's rows, two batches deep (stage_rows): a batch's copy waits only for the copy two
+    // batches before, not for the stream (upload's arena waits for everything queued when it wraps, which emptied both GPUs
+    // between a long prompt's batches). The MTP layer's embeddings (sd_mtp_embed), the first layer's (sd_prefill_embed) and the
+    // PLE layer's (sd_prefill_ple).
+    RowStaging mtp_rows, prefill_rows, ple_rows;
     uint64_t gemm_calls = 0, gemm_vectors = 0;
     std::unordered_map<void*, size_t> allocations;
     // `allocations` by address, for the ops' range checks (ops.hpp: op_span); rebuilt when stale.
@@ -690,10 +696,11 @@ struct Device {
         if (flags) cleanup(hipFree(flags));
         if (rope_rows) cleanup(hipFree(rope_rows));
         if (handoff) cleanup(hipEventDestroy(handoff));
-        for (int i = 0; i < 2; ++i) {
-            if (mtp_staged[i]) { cleanup(hipEventSynchronize(mtp_staged[i])); cleanup(hipEventDestroy(mtp_staged[i])); }
-            if (mtp_staging[i]) cleanup(hipHostFree(mtp_staging[i]));
-        }
+        for (RowStaging* staging : {&mtp_rows, &prefill_rows, &ple_rows})
+            for (int i = 0; i < 2; ++i) {
+                if (staging->staged[i]) { cleanup(hipEventSynchronize(staging->staged[i])); cleanup(hipEventDestroy(staging->staged[i])); }
+                if (staging->host[i]) cleanup(hipHostFree(staging->host[i]));
+            }
         for (auto entry : allocations) {
             const auto host = host_states.find(entry.first);
             cleanup(host == host_states.end() ? hipFree(entry.first) : hipHostFree(host->second));
@@ -1588,38 +1595,43 @@ int sd_mtp_keep(void* handle,uint64_t layer,uint64_t steps,void* rows,uint64_t p
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // `count` embedding rows into `target`, staged without waiting for the device's stream.
+// `floats` rows from the host into `device` on the stream, through one of `staging`'s two page-locked buffers: the host waits only
+// for that buffer's copy before (two batches back), never for the stream. Pinned at the size first asked, grown when asked more;
+// a machine short of memory copies straight from the caller's memory, which the driver stages.
+void stage_rows(Device& d, RowStaging& staging, float* device, const float* host, size_t floats) {
+    if (floats > staging.floats && (!staging.refused || floats < staging.refused)) {
+        for (int i = 0; i < 2; ++i) {
+            if (!staging.staged[i]) check(hipEventCreateWithFlags(&staging.staged[i], hipEventDisableTiming));
+            check(hipEventSynchronize(staging.staged[i]));
+            if (staging.host[i]) { check(hipHostFree(staging.host[i])); staging.host[i] = nullptr; }
+        }
+        staging.floats = 0;
+        bool pinned = true;
+        for (int i = 0; i < 2 && pinned; ++i)
+            pinned = host_allocate(reinterpret_cast<void**>(&staging.host[i]), floats * 4, hipHostMallocDefault) == hipSuccess;
+        if (pinned) staging.floats = floats;
+        else {
+            (void)hipGetLastError();
+            for (int i = 0; i < 2; ++i) if (staging.host[i]) { cleanup(hipHostFree(staging.host[i])); staging.host[i] = nullptr; }
+            staging.refused = floats;
+        }
+    }
+    if (floats > staging.floats) {
+        check(hipMemcpyAsync(device, host, floats * 4, hipMemcpyHostToDevice, d.stream));
+        return;
+    }
+    const unsigned slot = staging.turn++ % 2;
+    check(hipEventSynchronize(staging.staged[slot]));
+    StagingCopier::instance().copy(reinterpret_cast<uint8_t*>(staging.host[slot]), reinterpret_cast<const uint8_t*>(host), floats * 4);
+    check(hipMemcpyAsync(device, staging.host[slot], floats * 4, hipMemcpyHostToDevice, d.stream));
+    check(hipEventRecord(staging.staged[slot], d.stream));
+}
 int sd_mtp_embed(void* handle,const float* embeddings,uint64_t count,void* target) {
     try {
         Device& d=device(handle);
         if (!embeddings || !count) throw std::runtime_error("invalid MTP embeddings");
         float* device_rows=mtp_allocation(d,target,size_t(count)*2560);
-        const size_t floats=size_t(count)*2560;
-        if (floats>d.mtp_staging_floats && (!d.mtp_staging_refused || floats<d.mtp_staging_refused)) {
-            for (int i=0;i<2;++i) {
-                if (!d.mtp_staged[i]) check(hipEventCreateWithFlags(&d.mtp_staged[i],hipEventDisableTiming));
-                check(hipEventSynchronize(d.mtp_staged[i]));
-                if (d.mtp_staging[i]) { check(hipHostFree(d.mtp_staging[i])); d.mtp_staging[i]=nullptr; }
-            }
-            d.mtp_staging_floats=0;
-            bool pinned=true;
-            for (int i=0;i<2 && pinned;++i) pinned=host_allocate(reinterpret_cast<void**>(&d.mtp_staging[i]),floats*4,hipHostMallocDefault)==hipSuccess;
-            if (pinned) d.mtp_staging_floats=floats;
-            else {
-                // (a machine short of memory: the rows go straight from the caller's, which the driver stages)
-                (void)hipGetLastError();
-                for (int i=0;i<2;++i) if (d.mtp_staging[i]) { cleanup(hipHostFree(d.mtp_staging[i])); d.mtp_staging[i]=nullptr; }
-                d.mtp_staging_refused=floats;
-            }
-        }
-        if (floats>d.mtp_staging_floats) {
-            check(hipMemcpyAsync(device_rows,embeddings,floats*4,hipMemcpyHostToDevice,d.stream));
-            return 0;
-        }
-        const unsigned slot=d.mtp_turn++%2;
-        check(hipEventSynchronize(d.mtp_staged[slot]));
-        std::memcpy(d.mtp_staging[slot],embeddings,floats*4);
-        check(hipMemcpyAsync(device_rows,d.mtp_staging[slot],floats*4,hipMemcpyHostToDevice,d.stream));
-        check(hipEventRecord(d.mtp_staged[slot],d.stream));
+        stage_rows(d,d.mtp_rows,device_rows,embeddings,size_t(count)*2560);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1800,7 +1812,7 @@ int sd_prefill_embed(void* handle,uint64_t layer,const float* embeddings,uint64_
             throw std::runtime_error("prefill embeddings have no compatible resident layer");
         // The rows land after the hidden rows (where a span's mixed rows go) and are tiled from there.
         float* hidden=found->second.workspace; float* rows=hidden+size_t(steps)*10240;
-        upload(d,rows,embeddings,size_t(steps)*2560*4);
+        stage_rows(d,d.prefill_rows,rows,embeddings,size_t(steps)*2560);
         prefill_tile<<<unsigned((size_t(steps)*10240+255)/256),256,0,d.stream>>>(rows,size_t(steps),hidden);
         check(hipGetLastError());
         return 0;
@@ -1813,9 +1825,14 @@ int sd_prefill_ple(void* handle,void* const* pointers,const int* kinds,void* his
         auto found=d.decoder.find(size_t(layer));
         if (found==d.decoder.end() || !steps || steps>found->second.capacity)
             throw std::runtime_error("PLE has no compatible resident decoder workspace");
+        // (the batch's rows staged at once where the first layer's were, the rows after the hidden ones, which the spans after it
+        // overwrite only once it has read them: 256-row uploads wrapped upload's arena, which waits for the stream. Nothing reads
+        // the layer's rows on the host, and what follows is queued on the stream: no wait at its end either.)
+        float* rows=found->second.workspace+size_t(steps)*10240;
+        stage_rows(d,d.ple_rows,rows,embeddings,size_t(steps)*2560);
         for (size_t first=0;first<steps;first+=256) {
             const size_t count=std::min<size_t>(256,size_t(steps)-first);
-            ple(d,pointers,kinds,history,count,embeddings+first*2560,nullptr,nullptr,found->second.workspace+first*10240);
+            ple(d,pointers,kinds,history,count,rows+first*2560,nullptr,nullptr,found->second.workspace+first*10240,false,false,true);
         }
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
