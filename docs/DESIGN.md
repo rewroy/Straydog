@@ -941,6 +941,12 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   their selected blocks, so each key and value is read once per group.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
+- Past the stage's positions (a 64th of the budget, grown into what the slots leave: some 45K at 6 GiB),
+  a qsa_flash batch copies only the union of its tokens' selected blocks into the stage and renumbers
+  the selections to it (`qsa_attention_gathered`): the same keys in the same order, so the same bits,
+  where each token read its 2052 rows over the bus before (RTX 5070 Ti, 52K tokens: 119.4 s to 61.0 s).
+  As many tokens at a time as the union fits for; the host reads the union's size, so a layer split in
+  parts keeps reading host memory. RDNA4's batched attention reads its groups' unions from host memory still.
 - The K/V holds FP16 values (`kv_t`): a plane's row of a position is 256 halves, half the bytes of
   F32 in VRAM, in host memory, in the stage and its mirrors (which then hold twice the positions),
   and in a sequence's saved positions. The flash rounded keys and values to FP16 already, so a
