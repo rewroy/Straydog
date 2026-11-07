@@ -291,6 +291,11 @@ constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1
 // A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
 // verify_max) leave what it reads in place, with nothing to copy again.
 constexpr size_t kv_mirror_margin = 8;
+// Qwen3.8's attention K/V (its planes of `context` positions, each K/V head's keys, then each one's values) holds FP16 values: a
+// plane's row of a position is 256 halves, 128 of its allocation's floats. The prompt's flash rounded the keys and values to FP16
+// already; decode and verification read them as such. (Copies, stage and mirrors count in these elements.)
+typedef __half kv_t;
+constexpr size_t kv_row_floats = 256 * sizeof(kv_t) / 4;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
@@ -404,7 +409,7 @@ private:
 // A K/V's newest rows in VRAM, a ring of Device::kv_mirror_rows rows (position % rows): rows [oldest, valid) are there. A token selects
 // recent rows: IQ3_XXS on an RTX 5070 Ti at --vram 8.5, a 15K-token conversation, a mirror of 2901 rows of the same VRAM held 3-10% of the
 // rows the 12 K/V layers selected when it was their first rows and holds 32-44% as their newest; a K/V layer 480 -> 350 us, 39 -> 44 tok/s.
-struct KvMirror { float* data; size_t valid; size_t oldest = 0; };
+struct KvMirror { kv_t* data; size_t valid; size_t oldest = 0; };
 // A host exchange (host_exchange.hpp): its page-locked host memory, the device's view of it, and the
 // device's count of exports (an allocation of the device).
 struct ExchangeArea {
@@ -962,30 +967,33 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
     if (index < count) output[index] = __float2half(input[index]);
 }
 
+// A K/V value as it is held (kv_t), and as it is read.
+__device__ __forceinline__ kv_t kv_value(float value) { return __float2half_rn(value); }
+__device__ __forceinline__ float kv_load(const kv_t* at) { return __half2float(*at); }
+
 // values (optional) holds the rows' values instead of the packed input. A layer's K/V is
 // 2 * QwenHeads<P>::kv planes of `context` rows: each K/V head's keys, then each one's values.
 template<int P=1>
-__global__ void write_attention_kv(float* state, size_t context, size_t base, size_t steps, const float* input,
+__global__ void write_attention_kv(kv_t* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
-                                   float* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
+                                   kv_t* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
     constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
     if (position) base=*position;
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= steps * width) return;
     const size_t step = index / width, head = (index % width) / 256, column = index % 256;
     const size_t keys_start = steps * QwenHeads<P>::query * 256;
-    state[(head * context + base + step) * 256 + column] = input[keys_start + index];
-    state[context * width + (head * context + base + step) * 256 + column] =
-        values ? values[index] : input[keys_start + steps * width + index];
+    const kv_t key = kv_value(input[keys_start + index]), value = kv_value(values ? values[index] : input[keys_start + steps * width + index]);
+    state[(head * context + base + step) * 256 + column] = key;
+    state[context * width + (head * context + base + step) * 256 + column] = value;
     if (mirror_rows) {
         const size_t slot=unsigned(base+step)%unsigned(mirror_rows);
-        mirror[(head*mirror_rows+slot)*256+column]=input[keys_start+index];
-        mirror[((K+head)*mirror_rows+slot)*256+column]=
-            values ? values[index] : input[keys_start+steps*width+index];
+        mirror[(head*mirror_rows+slot)*256+column]=key;
+        mirror[((K+head)*mirror_rows+slot)*256+column]=value;
     }
 }
 
-__global__ void attention_scores(const float* state, size_t context, size_t base, size_t steps,
+__global__ void attention_scores(const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, float* scores, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24;
@@ -999,7 +1007,7 @@ __global__ void attention_scores(const float* state, size_t context, size_t base
                 const size_t token = size_t(raw);
                 result = 0;
                 for (size_t column = 0; column < 256; ++column)
-                    result += state[((head / 12) * context + token) * 256 + column]
+                    result += kv_load(&state[((head / 12) * context + token) * 256 + column])
                             * input[item * 256 + column];
                 result *= 0.0625f;
             }
@@ -1008,7 +1016,7 @@ __global__ void attention_scores(const float* state, size_t context, size_t base
     }
 }
 
-__global__ void attention_reduce(const float* state, size_t context, size_t base, size_t steps,
+__global__ void attention_reduce(const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, const float* scores, float* output, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24, column = threadIdx.x;
@@ -1046,7 +1054,7 @@ __global__ void attention_reduce(const float* state, size_t context, size_t base
         if (raw >= 0 && raw <= float(base + step) && raw < float(context)) {
             const size_t token = size_t(raw);
             result += probabilities[slot]
-                    * state[context * 512 + ((head / 12) * context + token) * 256 + column];
+                    * kv_load(&state[context * 512 + ((head / 12) * context + token) * 256 + column]);
         }
     }
     output[item * 256 + column] = result;
@@ -2828,7 +2836,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown = nullptr;
         // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
         // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (host_allocate(&grown, to * 1024 * 4 + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+        if (host_allocate(&grown, to * 1024 * sizeof(kv_t) + allocation_tail, hipHostMallocMapped) != hipSuccess) {
             (void)hipGetLastError();
             throw std::runtime_error(kv_no_memory);
         }
@@ -2836,9 +2844,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown_index = nullptr;
         void* grown_scratch = nullptr;
         try {
-            std::memset(grown, 0, to * 1024 * 4 + allocation_tail);
+            std::memset(grown, 0, to * 1024 * sizeof(kv_t) + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
-                std::memcpy(static_cast<float*>(grown) + plane * to * 256, static_cast<const float*>(host->second) + plane * from * 256, valid * 1024);
+                std::memcpy(static_cast<kv_t*>(grown) + plane * to * 256, static_cast<const kv_t*>(host->second) + plane * from * 256,
+                            valid * 256 * sizeof(kv_t));
             check(hipHostGetDevicePointer(&pointer, grown, 0));
             // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
             std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
@@ -2859,7 +2868,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         kv_clear_graphs(d);
         check(hipHostFree(host->second));
         d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
-        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * 4);
+        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * sizeof(kv_t));
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
         plan.states[0] = pointer; plan.context = to;
         if (grown_index) {
@@ -3052,7 +3061,7 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
             !steps || steps > max_batch || base > context || steps > context - base || !selected || selected > 2052)
             throw std::runtime_error("invalid Straydog attention dimensions");
         auto found = value.allocations.find(state);
-        if (found == value.allocations.end() || found->second != context * 1024 * 4)
+        if (found == value.allocations.end() || found->second != context * 1024 * sizeof(kv_t))
             throw std::runtime_error("Straydog attention state size mismatch");
         if (input_count != steps * (24 * 256 + 1024 + selected + 1) || output_count != steps * 24 * 256 ||
             input_count > value.input_capacity || output_count > value.output_capacity)
@@ -3066,11 +3075,11 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
         }
         upload(value, value.input, input, size_t(input_count) * 4);
         kv_invalidate_write(value,state,size_t(base));
-        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<float*>(state),
+        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), value.input);
-        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<float*>(state),
+        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores);
-        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<float*>(state),
+        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores, value.output);
         check(hipGetLastError());
         download(value, output, value.output, size_t(output_count) * 4);
