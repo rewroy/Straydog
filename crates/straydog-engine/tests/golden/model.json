@@ -25416,7 +25416,7 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 3,
+      "drafted_tokens": 2,
       "accepted_tokens": 2
      },
      "logits": [
@@ -86396,7 +86396,7 @@
       "generated_tokens": 1,
       "decode_forward_tokens": 0,
       "speculative_passes": 1,
-      "drafted_tokens": 3,
+      "drafted_tokens": 2,
       "accepted_tokens": 2
      },
      "logits": [
