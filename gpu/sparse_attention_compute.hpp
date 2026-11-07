@@ -1,5 +1,16 @@
 // QSA attention over each token's explicit selection. The KV state stores keys
-// then values, both token-major per KV head: [kv][token][256].
+// then values, both token-major per KV head: [kv][token][256], as kv_t.
+
+// Eight K/V values from 16 bytes (four of their pairs), as floats.
+__device__ __forceinline__ void kv_unpack8(uint4 words, float* out) {
+    const uint32_t w[4] = {words.x, words.y, words.z, words.w};
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        __half2 pair;
+        memcpy(&pair, &w[i], 4);
+        out[2 * i] = __low2float(pair); out[2 * i + 1] = __high2float(pair);
+    }
+}
 // Single-token flash decoding over the explicit causal selection. Each block
 // owns 32 selected keys of one KV head and all twelve query heads sharing it;
 // partial softmax statistics are merged exactly in F32 afterwards.
@@ -8,9 +19,9 @@
 // rows (steps = 1: the layout of one token).
 constexpr size_t qsa_decode_chunk=32;
 template<bool mirrored=false,int P=1>
-__global__ void qsa_decode_parts(const float* state,size_t context,size_t base,size_t selected,size_t chunks,
+__global__ void qsa_decode_parts(const kv_t* state,size_t context,size_t base,size_t selected,size_t chunks,
                                  const float* input,float* partial,const uint32_t* position=nullptr,
-                                 const float* mirror=nullptr,size_t mirror_rows=0,size_t steps=1) { SD_KERNEL_ACQUIRE;
+                                 const kv_t* mirror=nullptr,size_t mirror_rows=0,size_t steps=1) { SD_KERNEL_ACQUIRE;
     using H=QwenHeads<P>;
     const size_t chunk=blockIdx.x,kv=blockIdx.y,row=blockIdx.z,t=threadIdx.x,lane=t%32,wave=t/32;
     const size_t index_start=steps*H::packed;
@@ -45,15 +56,12 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
             int slot=-1;
             if constexpr (mirrored) slot=slots[lane];
             const bool cached=slot>=0;
-            const float* source=cached ? mirror : state;
+            const kv_t* source=cached ? mirror : state;
             const size_t capacity=cached ? mirror_rows : context;
-            const float4* keys=reinterpret_cast<const float4*>(source+(kv*capacity+size_t(cached ? slot : token))*256+wave*32);
+            const uint4* keys=reinterpret_cast<const uint4*>(source+(kv*capacity+size_t(cached ? slot : token))*256+wave*32);
             float k[32];
             #pragma unroll
-            for (size_t d=0;d<8;++d) {
-                const float4 four=keys[d];
-                k[4*d]=four.x; k[4*d+1]=four.y; k[4*d+2]=four.z; k[4*d+3]=four.w;
-            }
+            for (size_t d=0;d<4;++d) kv_unpack8(keys[d],k+8*d);
             #pragma unroll
             for (size_t d=0;d<32;++d) {
                 #pragma unroll
@@ -87,17 +95,17 @@ __global__ void qsa_decode_parts(const float* state,size_t context,size_t base,s
     __syncthreads();
     // Values: each thread owns one dimension for all twelve heads.
     float accumulator[12]={};
-    const float* values=state+context*H::kv*256+kv*context*256+t;
+    const kv_t* values=state+context*H::kv*256+kv*context*256+t;
     float v[qsa_decode_chunk];
     #pragma unroll
     for (size_t key=0;key<qsa_decode_chunk;++key) {
         const int token=tokens[key];
         if constexpr (mirrored) {
-            const float* cached_values=mirror+(H::kv+kv)*mirror_rows*256+t;
+            const kv_t* cached_values=mirror+(H::kv+kv)*mirror_rows*256+t;
             const int slot=slots[key];
-            v[key]=token<0 ? 0.0f : slot>=0 ? cached_values[size_t(slot)*256] : values[size_t(token)*256];
+            v[key]=token<0 ? 0.0f : slot>=0 ? kv_load(&cached_values[size_t(slot)*256]) : kv_load(&values[size_t(token)*256]);
         } else
-            v[key]=token<0 ? 0.0f : values[size_t(token)*256];
+            v[key]=token<0 ? 0.0f : kv_load(&values[size_t(token)*256]);
     }
     #pragma unroll
     for (size_t key=0;key<qsa_decode_chunk;++key) {
@@ -149,7 +157,7 @@ __global__ void qsa_decode_merge(const float* partial,size_t chunks,size_t selec
 // softmax, reusing every key and value for the twelve query heads.
 constexpr size_t qsa_flash_chunk=64;
 template<int P=1>
-__global__ void __launch_bounds__(256) qsa_flash(const float* state,size_t context,size_t base,size_t steps,
+__global__ void __launch_bounds__(256) qsa_flash(const kv_t* state,size_t context,size_t base,size_t steps,
                                                  size_t selected,const float* input,float* output) {
     using H=QwenHeads<P>;
     const size_t token=blockIdx.x,kv=blockIdx.y,t=threadIdx.x,lane=t%32,wave=t/32;
@@ -164,8 +172,8 @@ __global__ void __launch_bounds__(256) qsa_flash(const float* state,size_t conte
     for (size_t i=t;i<12*256;i+=256) query[i]=input[(token*H::query+kv*12)*256+i];
     if (t<12) { running[t]=-INFINITY; running[12+t]=0; }
     float accumulator[12]={};
-    const float* keys_base=state+kv*context*256+wave*32;
-    const float* values_base=state+context*H::kv*256+kv*context*256+t;
+    const kv_t* keys_base=state+kv*context*256+wave*32;
+    const kv_t* values_base=state+context*H::kv*256+kv*context*256+t;
     for (size_t first=0;first<count;first+=qsa_flash_chunk) {
         if (t<qsa_flash_chunk) {
             const size_t slot=first+t;
@@ -181,12 +189,12 @@ __global__ void __launch_bounds__(256) qsa_flash(const float* state,size_t conte
         {
             const int key0=tokens[lane],key1=tokens[32+lane];
             float p0[12]={},p1[12]={};
-            const float* k0=keys_base+size_t(key0<0 ? 0 : key0)*256;
-            const float* k1=keys_base+size_t(key1<0 ? 0 : key1)*256;
+            const kv_t* k0=keys_base+size_t(key0<0 ? 0 : key0)*256;
+            const kv_t* k1=keys_base+size_t(key1<0 ? 0 : key1)*256;
             #pragma unroll 2
             for (size_t d=0;d<32;d+=4) {
-                const float4 four0=*reinterpret_cast<const float4*>(k0+d), four1=*reinterpret_cast<const float4*>(k1+d);
-                const float a[4]={four0.x,four0.y,four0.z,four0.w}, b[4]={four1.x,four1.y,four1.z,four1.w};
+                const float a[4]={kv_load(k0+d),kv_load(k0+d+1),kv_load(k0+d+2),kv_load(k0+d+3)};
+                const float b[4]={kv_load(k1+d),kv_load(k1+d+1),kv_load(k1+d+2),kv_load(k1+d+3)};
                 #pragma unroll
                 for (size_t h=0;h<12;++h) {
                     const float4 q=*reinterpret_cast<const float4*>(&query[h*256+wave*32+d]);
@@ -237,7 +245,7 @@ __global__ void __launch_bounds__(256) qsa_flash(const float* state,size_t conte
             #pragma unroll
             for (int j=0;j<4;++j) {
                 const int index=tokens[key+j];
-                v[j]=index<0 ? 0.0f : values_base[size_t(index)*256];
+                v[j]=index<0 ? 0.0f : kv_load(&values_base[size_t(index)*256]);
             }
             #pragma unroll
             for (size_t h=0;h<12;++h) {
@@ -253,20 +261,20 @@ __global__ void __launch_bounds__(256) qsa_flash(const float* state,size_t conte
 template<int P=1>
 void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,size_t selected,
                     const float* input,float* output,const uint32_t* position=nullptr,
-                    const float* mirror=nullptr,size_t mirror_rows=0) {
+                    const kv_t* mirror=nullptr,size_t mirror_rows=0) {
     using H=QwenHeads<P>;
     if (steps>1) {
-        qsa_flash<P><<<dim3(unsigned(steps),unsigned(H::kv)),256,0,d.stream>>>(static_cast<float*>(kv),context,base,steps,selected,input,output);
+        qsa_flash<P><<<dim3(unsigned(steps),unsigned(H::kv)),256,0,d.stream>>>(static_cast<const kv_t*>(kv),context,base,steps,selected,input,output);
         return;
     }
     const size_t chunks=(selected+qsa_decode_chunk-1)/qsa_decode_chunk;
     if (chunks>256) throw std::runtime_error("QSA decode selection exceeds the merge capacity");
     if (mirror)
         qsa_decode_parts<true,P><<<dim3(unsigned(chunks),unsigned(H::kv)),256,0,d.stream>>>(
-            static_cast<float*>(kv),context,base,selected,chunks,input,d.attention_scores,position,mirror,mirror_rows);
+            static_cast<const kv_t*>(kv),context,base,selected,chunks,input,d.attention_scores,position,mirror,mirror_rows);
     else
         qsa_decode_parts<false,P><<<dim3(unsigned(chunks),unsigned(H::kv)),256,0,d.stream>>>(
-            static_cast<float*>(kv),context,base,selected,chunks,input,d.attention_scores,position);
+            static_cast<const kv_t*>(kv),context,base,selected,chunks,input,d.attention_scores,position);
     qsa_decode_merge<P><<<unsigned(H::query),256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output);
 }
 // qsa_attention's single-token arithmetic for `steps` consecutive tokens in one launch of each kernel
@@ -275,17 +283,17 @@ void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,si
 template<int P=1>
 void qsa_attention_rows(Device& d,void* kv,size_t context,size_t steps,size_t selected,
                         const float* input,float* output,const uint32_t* position,
-                        const float* mirror=nullptr,size_t mirror_rows=0,const float* gates=nullptr,size_t gate_stride=0) {
+                        const kv_t* mirror=nullptr,size_t mirror_rows=0,const float* gates=nullptr,size_t gate_stride=0) {
     using H=QwenHeads<P>;
     const size_t chunks=(selected+qsa_decode_chunk-1)/qsa_decode_chunk;
     if (chunks>256 || steps*H::query*chunks*258*4>attention_score_bytes)
         throw std::runtime_error("QSA decode selection exceeds the merge capacity");
     if (mirror)
         qsa_decode_parts<true,P><<<dim3(unsigned(chunks),unsigned(H::kv),unsigned(steps)),256,0,d.stream>>>(
-            static_cast<float*>(kv),context,0,selected,chunks,input,d.attention_scores,position,mirror,mirror_rows,steps);
+            static_cast<const kv_t*>(kv),context,0,selected,chunks,input,d.attention_scores,position,mirror,mirror_rows,steps);
     else
         qsa_decode_parts<false,P><<<dim3(unsigned(chunks),unsigned(H::kv),unsigned(steps)),256,0,d.stream>>>(
-            static_cast<float*>(kv),context,0,selected,chunks,input,d.attention_scores,position,nullptr,0,steps);
+            static_cast<const kv_t*>(kv),context,0,selected,chunks,input,d.attention_scores,position,nullptr,0,steps);
     qsa_decode_merge<P><<<dim3(unsigned(H::query),unsigned(steps)),256,0,d.stream>>>(d.attention_scores,chunks,selected,input,output,steps,
                                                                                    gates,gate_stride);
 }
@@ -416,7 +424,7 @@ __global__ void __launch_bounds__(256) qsa_union_blocks(const uint32_t* marks, s
 // same F32 online softmax. A pair skips keys none of its tokens selected.
 constexpr unsigned qsa_flash_blocks = 8;
 template<int P = 1>
-__global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const float* state, size_t capacity, size_t base,
+__global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const kv_t* state, size_t capacity, size_t base,
                                                                  size_t steps, const __half* half_queries,
                                                                  const uint32_t* union_blocks, const uint32_t* union_masks,
                                                                  const uint32_t* union_counts, float* output) {
@@ -448,18 +456,18 @@ __global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const float* st
     const size_t count = union_counts[group];
     const uint32_t* blocks = union_blocks + size_t(group) * qsa_group_capacity;
     const uint32_t* marks = union_masks + size_t(group) * qsa_group_capacity;
-    const float* rows[2] = {state + kv * capacity * 256, state + capacity * H::kv * 256 + kv * capacity * 256};
-    // Keys then values of a tile: blocks x 4 keys x 64 float4 each.
-    float4 staged[2][staged_per_thread];
+    const kv_t* rows[2] = {state + kv * capacity * 256, state + capacity * H::kv * 256 + kv * capacity * 256};
+    // Keys then values of a tile: blocks x 4 keys x 64 groups of four values (8 bytes) each, already FP16.
+    uint2 staged[2][staged_per_thread];
     auto load = [&](size_t first) {
         #pragma unroll
         for (unsigned which = 0; which < 2; ++which)
             #pragma unroll
             for (unsigned j = 0; j < staged_per_thread; ++j) {
                 const unsigned i = t + j * threads, slot = i / 256;
-                staged[which][j] = float4{0, 0, 0, 0};
+                staged[which][j] = uint2{0, 0};
                 if (i < loads && first + slot < count)
-                    staged[which][j] = *reinterpret_cast<const float4*>(
+                    staged[which][j] = *reinterpret_cast<const uint2*>(
                         rows[which] + (size_t(blocks[first + slot]) * 4 + i / 64 % 4) * 256 + i % 64 * 4);
             }
     };
@@ -473,10 +481,11 @@ __global__ void __launch_bounds__(qsa_group * 48) qsa_flash_wmma(const float* st
         for (unsigned j = 0; j < staged_per_thread; ++j) {
             const unsigned i = t + j * threads, key = i / 64, column = i % 64 * 4;
             if (i >= loads) break;
-            const float4 k = staged[0][j], v = staged[1][j];
-            *reinterpret_cast<half4*>(&keys[key][column]) = half4{_Float16(k.x), _Float16(k.y), _Float16(k.z), _Float16(k.w)};
-            values[column][key] = _Float16(v.x); values[column + 1][key] = _Float16(v.y);
-            values[column + 2][key] = _Float16(v.z); values[column + 3][key] = _Float16(v.w);
+            half4 k, v;
+            memcpy(&k, &staged[0][j], 8); memcpy(&v, &staged[1][j], 8);
+            *reinterpret_cast<half4*>(&keys[key][column]) = k;
+            values[column][key] = v.x; values[column + 1][key] = v.y;
+            values[column + 2][key] = v.z; values[column + 3][key] = v.w;
         }
     };
     load(0);

@@ -293,6 +293,10 @@ pub struct Entry {
     pub cols: u64,
 }
 
+/// Qwen3.8's attention K/V holds FP16 values: a plane's row of a position is 256 halves, this many of its state's floats (each layer
+/// state `@qsa:` has its planes' rows of this width; `kv_row_floats` natively).
+pub const KV_ROW_FLOATS: u64 = 128;
+
 /// Floats of a sequence state copied out: `height` runs of `width` floats, `pitch` floats apart
 /// in the state, from float `offset`; `first` the first position they hold. They lie in `device`
 /// when it is given (a VRAM copy, freed by [`Backend::release_positions`]), else in `data`.
@@ -791,7 +795,7 @@ impl Backend {
                     plan.push((format!("@conv:blk.{layer}."), 4, WIDTH as u64 / parts, false));
                 }
             } else {
-                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, 256, host_attention));
+                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, KV_ROW_FLOATS, host_attention));
                 plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + INDEX_HISTORY, 1, false));
             }
         }
@@ -1024,8 +1028,9 @@ impl Backend {
     /// 4 to 8 ms a four-row pass where the sixteenth of the budget mirrors 37K to 43K of them).
     pub fn grow_kv_stage(&mut self, context: u64) -> Result<()> {
         let Some(stage) = self.states.get("@kv:stage").copied() else { return Ok(()) };
-        // (rows of a whole layer's four planes: a part's position takes its two)
-        let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:")).map(|key| self.kv_planes(key) * context / 4).sum();
+        // (in the stage's rows of 1024 floats: a position takes a row of KV_ROW_FLOATS a plane, four planes for a whole layer, a part's two)
+        let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:"))
+            .map(|key| (self.kv_planes(key) * context * KV_ROW_FLOATS).div_ceil(1024)).sum();
         let (used, budget) = self.memory()?;
         let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
         let rows = (stage.rows / 4 + free / 4096).min(needed);
@@ -1070,6 +1075,15 @@ impl Backend {
     /// the decoder workspace), leaving max(512 MiB, 3%) for what the runtime allocates
     /// outside the budget (driver, BLAS, graphs: ~0.9 GiB on an R9700).
     pub fn can_pin(&self, required: u64, reserved: Option<u64>) -> Result<bool> {
+        Ok(self.pin_lack(required, reserved)? == 0)
+    }
+
+    /// The VRAM [`can_pin`](Self::can_pin) finds missing for `required` (zero: it fits; u64::MAX: this device takes no
+    /// resident layers).
+    pub fn pin_lack(&self, required: u64, reserved: Option<u64>) -> Result<u64> {
+        if self.batch_capacity != 256 {
+            return Ok(u64::MAX);
+        }
         let (used, budget) = self.memory()?;
         let reserved = reserved.unwrap_or(if self.states.contains_key("@scratch:decoder") {
             0
@@ -1077,8 +1091,8 @@ impl Backend {
             decoder_workspace_bytes(self.prefill_capacity)
         });
         let slack = Self::slack(budget);
-        Ok(self.batch_capacity == 256
-            && i128::from(required) + i128::from(reserved) <= i128::from(budget) - i128::from(used) - i128::from(slack))
+        let lack = i128::from(required) + i128::from(reserved) - (i128::from(budget) - i128::from(used) - i128::from(slack));
+        Ok(lack.max(0) as u64)
     }
 
     fn moe_workspace(&mut self, helper: bool) -> Result<(Entry, u64)> {
@@ -1838,7 +1852,7 @@ impl Backend {
     /// Bytes [`save_positions`](Self::save_positions) copies per position.
     pub fn position_bytes(&self) -> u64 {
         self.states.keys().map(|key| {
-            if key.starts_with("@qsa:") { self.kv_planes(key) * 1024 } else if key.starts_with("@indexer:") { 128 } else { 0 }
+            if key.starts_with("@qsa:") { self.kv_planes(key) * KV_ROW_FLOATS * 4 } else if key.starts_with("@indexer:") { 128 } else { 0 }
         }).sum()
     }
 
@@ -1877,10 +1891,11 @@ impl Backend {
         for (key, entry) in &self.states {
             let floats = entry.rows * entry.cols;
             if key.starts_with("@qsa:") {
-                // Four planes (each head's keys, then each head's values; a part's two), a position's 256 values a row.
+                // Four planes (each head's keys, then each head's values; a part's two), a position's KV_ROW_FLOATS a row.
                 let planes = self.kv_planes(key);
                 let context = entry.rows / planes;
-                parts.push(StatePart { key: key.clone(), offset: from * 256, pitch: context * 256, width: (to - from) * 256,
+                parts.push(StatePart { key: key.clone(), offset: from * KV_ROW_FLOATS, pitch: context * KV_ROW_FLOATS,
+                                       width: (to - from) * KV_ROW_FLOATS,
                                        height: planes, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
@@ -1997,11 +2012,11 @@ impl Backend {
                 for low in (0..to).step_by(RUN as usize) {
                     let high = (low + RUN).min(to);
                     parts.push((format!("{key} rows {low}..{high}"),
-                                part(low * 256, entry.rows / planes * 256, (high - low) * 256, planes)));
+                                part(low * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, (high - low) * KV_ROW_FLOATS, planes)));
                 }
                 // (and the last few one by one: where a sequence's writes end)
                 for row in to.saturating_sub(8)..to {
-                    parts.push((format!("{key} row {row}"), part(row * 256, entry.rows / planes * 256, 256, planes)));
+                    parts.push((format!("{key} row {row}"), part(row * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, KV_ROW_FLOATS, planes)));
                 }
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
