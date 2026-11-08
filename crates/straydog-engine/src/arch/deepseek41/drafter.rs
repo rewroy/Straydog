@@ -54,11 +54,13 @@ const RANKING: [[u8; EXPERTS]; 3] = [
     [19, 58, 97, 98, 81, 127, 103, 16, 9, 17, 78, 38, 102, 12, 116, 6, 52, 101, 39, 83, 53, 27, 118, 45, 122, 88, 21, 120, 84, 67, 96, 93, 47, 110, 14, 51, 111, 61, 13, 80, 54, 85, 40, 15, 82, 49, 59, 77, 11, 66, 79, 94, 5, 91, 119, 112, 0, 1, 2, 3, 4, 7, 8, 10, 18, 20, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 41, 42, 43, 44, 46, 48, 50, 55, 56, 57, 60, 62, 63, 64, 65, 68, 69, 70, 71, 72, 73, 74, 75, 76, 86, 87, 89, 90, 92, 95, 99, 100, 104, 105, 106, 107, 108, 109, 113, 114, 115, 117, 121, 123, 124, 125, 126]
 ];
 
-/// The routed experts each stage keeps resident unless told otherwise: their first 87, 50 and 29 of
-/// [`RANKING`], the experts of 98% of its routes. Of the 7.2 GB of routed experts that is 3.1 GB, and
-/// DSpark's acceptance is what it is with all of them (1.554 against 1.562 tokens of a draft of three
-/// accepted, teacher forced); a decode with the drafter ran 11% faster for the slots it freed.
-pub const RESIDENT: [usize; 3] = [87, 50, 29];
+/// The routed experts each stage keeps resident unless told otherwise: their first 48, 28 and 16 of
+/// [`RANKING`], 1.7 of the 7.2 GB of routed experts. The first 87, 50 and 29 (98% of its routes, 3.1 GB)
+/// left the acceptance as it was with all of them, but their VRAM is the target's expert slots: served
+/// (2026-11-08, both R9700s), Unsloth UD-IQ2_XXS's code went from 51.7 to 55.7 tokens/s and five agent
+/// turns from 26.6 to 25.5 s with 48/28/16 (a code draft's tokens kept 81-82% where 85-89%), and
+/// UD-IQ1_M's were the same within their spread (code 76.7 and 78.5, the turns 18.9 and 19.3 s).
+pub const RESIDENT: [usize; 3] = [48, 28, 16];
 
 /// How many of each stage's routed experts are kept: [`RESIDENT`], or with DS41_DSPARK_RESIDENT=A,B,C
 /// each stage's first A, B, C of [`RANKING`], or `all` for all of them.
@@ -1092,7 +1094,7 @@ mod tests {
 
     #[test]
     fn the_resident_experts_are_a_default_a_list_or_all() {
-        assert_eq!(parse_counts(None).unwrap(), [87, 50, 29]);
+        assert_eq!(parse_counts(None).unwrap(), [48, 28, 16]);
         assert_eq!(parse_counts(Some("all")).unwrap(), [128; 3]);
         assert_eq!(parse_counts(Some(" 128, 3 ,10")).unwrap(), [128, 3, 10]);
         for wrong in ["", "87,50", "87,50,29,1", "2,50,29", "87,50,129", "a,b,c", "-1,50,29"] {
@@ -1121,11 +1123,11 @@ mod tests {
         assert!(whole > file && whole < file + (100 << 20), "{whole} for a file of {file}");
         let slot = 3 * 1152 * (5120 / 32 * 17) as u64;
         let (all, kept) = (footprint(0, 2, vocabulary, [EXPERTS; 3]), footprint(0, 2, vocabulary, RESIDENT));
-        assert_eq!(all - kept, (3 * 128 - 166) * slot);
+        assert_eq!(all - kept, (3 * 128 - 92) * slot);
         // (the first device also holds the Markov heads and the logits)
         let second = footprint(1, 2, vocabulary, RESIDENT);
         assert!(kept > second && kept - second > 2 * 256 * vocabulary as u64 * 2, "{kept} {second}");
-        assert!(kept < 2200 << 20 && second > 1800 << 20, "{kept} {second}");
+        assert!(kept < 1500 << 20 && second > 1200 << 20, "{kept} {second}");
         assert!(splits(1) && splits(2) && !splits(0) && !splits(3) && !splits(16));
     }
 

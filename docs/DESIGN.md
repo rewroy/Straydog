@@ -787,9 +787,12 @@ file beside the bundle.
     argmax is kept with p(argmax) alone;
   - with a cut or a penalty the draft stays the argmax, a point proposal.
 
-**Its VRAM.** Each stage keeps its most used routed experts resident: 87, 50 and 29 of 128 (3.1 of
-7.2 GB). They cover 98% of its routes and leave its acceptance as it was. The router's bias keeps
-the others out of a draft's top three. `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
+**Its VRAM.** Each stage keeps its most used routed experts resident: 48, 28 and 16 of 128 (1.7 of
+7.2 GB). The router's bias keeps the others out of a draft's top three. The first 87, 50 and 29 (98% of
+its routes) left its acceptance as it was, but what the drafter keeps is the target's expert slots: with
+48/28/16 a draft's tokens are kept a little less often (a code reply's 81-82% where 85-89%), and a bundle
+short of slots runs faster (UD-IQ2_XXS: code 51.7 to 55.7 tokens/s, five agent turns 26.6 to 25.5 s;
+UD-IQ1_M the same within its spread). `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
 
 **The width policy** (`drafter::Policy`). After each sampled token the drafter drafts three tokens
 (~2.3 ms), and the policy picks how many a verify pass checks. It picks the width with the most
