@@ -12,7 +12,7 @@
 #[cfg(windows)]
 use std::path::PathBuf;
 #[cfg(windows)]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -100,9 +100,8 @@ pub struct Cache {
 struct On {
     settings: Settings,
     directory: PathBuf,
-    /// The executable's hash, being made by a thread of its own (the server's start is not held up by it), and once made.
-    building: Mutex<Option<std::thread::JoinHandle<Result<[u8; 32], String>>>>,
-    build: OnceLock<Result<[u8; 32], String>>,
+    /// The executable's hash, made by a thread of its own.
+    build: Arc<crate::prefix_store::Build>,
     state: Mutex<State>,
 }
 
@@ -135,18 +134,10 @@ pub struct Due {
 
 #[cfg(windows)]
 impl On {
-    /// The executable's hash: waited for if it is still being made.
-    fn build(&self) -> &Result<[u8; 32], String> {
-        self.build.get_or_init(|| match self.building.lock().unwrap().take() {
-            Some(thread) => thread.join().unwrap_or_else(|_| Err("its thread failed".into())),
-            None => Err("it was not made".into()),
-        })
-    }
-
     /// The identity of this start: its store, and the prefix of its keys. None when the worker offers no states, or the executable could not
     /// be read.
     fn identity(&self, ready: &Value) -> Option<Identity> {
-        let build = match self.build() {
+        let build = match self.build.get() {
             Ok(build) => *build,
             Err(message) => {
                 tracing::debug!("Straydog prefix: no state kept, the executable cannot be read ({message})");
@@ -178,8 +169,7 @@ impl Cache {
             Arc::new(On {
                 settings: settings.clone(),
                 directory: settings.data_dir.join("prefix"),
-                building: Mutex::new(Some(std::thread::spawn(crate::prefix_store::build_id))),
-                build: OnceLock::new(),
+                build: crate::prefix_store::shared_build(),
                 state: Mutex::new(State::default()),
             })
         });

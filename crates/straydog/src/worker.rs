@@ -175,6 +175,13 @@ pub(crate) trait Served: Send {
         Ok(None)
     }
 
+    /// The state of the conversation the held sequence is, at the place its last reply began, as bytes, and what names it: none when the model keeps
+    /// none or holds no conversation worth keeping. `limit` is the most bytes the server has room for: a state over it is no state given, and the
+    /// reason is the error.
+    fn conversation_state(&mut self, _limit: u64) -> Result<Option<(Value, Vec<u8>)>, String> {
+        Ok(None)
+    }
+
     /// Take a system block's state an earlier run saved, in the background, never ahead of a request. `read_seconds` is what the server
     /// spent getting it, `arrived` when its frame began.
     fn prefix_in_background(_engine: &Arc<Mutex<Self>>, _state: Vec<u8>, _read_seconds: f64, _arrived: Instant)
@@ -224,6 +231,14 @@ impl Served for Engine {
 
     fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
         Ok(self.model.export_prefix()?.map(|prefix| (json!({"tokens": prefix.tokens, "digest": prefix.digest}), prefix.bytes)))
+    }
+
+    fn conversation_state(&mut self, limit: u64) -> Result<Option<(Value, Vec<u8>)>, String> {
+        let Some((tokens, size)) = self.model.conversation_size() else { return Ok(None) };
+        if size > limit {
+            return Err(format!("the state of {tokens} tokens is {} MB, and there is room for {} MB", size >> 20, limit >> 20));
+        }
+        Ok(self.model.export_conversation()?.map(|state| (json!({"tokens": state.tokens, "digest": state.digest}), state.bytes)))
     }
 
     fn prefix_in_background(engine: &Arc<Mutex<Engine>>, state: Vec<u8>, read_seconds: f64, arrived: Instant) {
@@ -465,6 +480,105 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
     match engine.model.install_prefix(image, state) {
         Ok(tokens) => eprintln!("Straydog prefix: restored {tokens} tokens ({} MB) in {:.1} s", state.len() >> 20, read_seconds + arrived.elapsed().as_secs_f64()),
         Err(message) => not_restored(&message),
+    }
+}
+
+/// The conversation an earlier run kept ([`crate::conversation`]), as this run knows it: the tokens its state is held at, which the server read from the
+/// file without the state, and where the state will arrive if a request has asked for it. A static, for the request loop that reads the frames and the
+/// request that waits for one are different threads, and the engine is behind the lock the request holds.
+struct KeptConversation {
+    tokens: Option<Vec<u32>>,
+    waiting: Option<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
+}
+
+static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: None, waiting: None });
+
+fn kept() -> std::sync::MutexGuard<'static, KeptConversation> {
+    KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How long a request waits for the server to read the kept state and send it.
+const KEPT_PATIENCE: Duration = Duration::from_secs(120);
+/// The host memory a load of the kept state leaves free besides its copies: the commit the rest of the engine asks for as it goes.
+const KEPT_MARGIN: u64 = 2 << 30;
+
+/// The server named the tokens of the conversation its last run kept: this run takes the first request that begins with them from there.
+fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(format!("{} bytes are no list of tokens", bytes.len()));
+    }
+    let tokens = straydog_engine::prefix::tokens_of(bytes, bytes.len() / 4);
+    if tokens.iter().any(|token| u64::from(*token) >= straydog_engine::gpu::VOCABULARY) {
+        return Err("a token outside the vocabulary".into());
+    }
+    kept().tokens = Some(tokens);
+    Ok(())
+}
+
+/// The kept conversation's state, if the prompt begins with the tokens it is held at and the model holds no more of it than they: asked of the
+/// server, which reads it from the drive, and handed to the model, which takes the request from there. The seconds it took, or None when the prompt
+/// does not begin with them, or the state could not be had (one line in the log says why, and the file is left as it is for a later request).
+fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
+    let wanted = {
+        let kept = kept();
+        let tokens = kept.tokens.as_ref()?;
+        // (the prompt begins with all of them, and a token is left to run)
+        (prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..]).then_some(tokens.len())?
+    };
+    let not_loaded = |why: String| eprintln!("Straydog conversation: not loaded ({why})");
+    if engine.model.held_prefix(prompt) >= wanted {
+        // (the model holds this much of it already: the state would add nothing)
+        kept().tokens = None;
+        return None;
+    }
+    // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
+    let size = engine.model.state_size(wanted, straydog_engine::gpu::WIDTH);
+    if let Some((_, left)) = straydog_engine::host::commit_left() {
+        if left < 3 * size + KEPT_MARGIN {
+            not_loaded(format!("the state of {wanted} tokens is {} MB, and the host memory left for it is {} MB", size >> 20, left >> 20));
+            return None;
+        }
+    }
+    let started = Instant::now();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    kept().waiting = Some(sender);
+    output.send(&json!({"id": id, "event": "conversation_wanted", "tokens": wanted}));
+    let arrived = loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(arrived) => break arrived,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if cancel.load(Ordering::SeqCst) || started.elapsed() > KEPT_PATIENCE => {
+                // (what arrives later is read and dropped by the request loop)
+                kept().waiting = None;
+                if !cancel.load(Ordering::SeqCst) {
+                    not_loaded(format!("the server sent nothing in {} s", KEPT_PATIENCE.as_secs()));
+                }
+                return None;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    };
+    let state = match arrived {
+        Ok(state) => state,
+        Err(why) => {
+            // (the file is gone or cannot be read: asking again would only ask the same)
+            kept().tokens = None;
+            not_loaded(why);
+            return None;
+        }
+    };
+    match engine.model.import_conversation(&state, prompt.len() + 1) {
+        Ok(tokens) => {
+            kept().tokens = None;
+            let seconds = started.elapsed().as_secs_f64();
+            eprintln!("Straydog conversation: loaded {tokens} tokens ({} MB) in {seconds:.1} s", state.len() >> 20);
+            Some(seconds)
+        }
+        Err(why) => {
+            kept().tokens = None;
+            not_loaded(why);
+            None
+        }
     }
 }
 
@@ -990,6 +1104,55 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                     Err(message) => output.send(&json!({"id": id, "event": "error", "message": message, "fatal": false})),
                 }
             }
+            Some("conversation_state") => {
+                behind::ARRIVED.store(true, Ordering::SeqCst);
+                if active.lock().unwrap().is_some() {
+                    output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
+                    continue;
+                }
+                let limit = match request.get("limit") {
+                    Some(pyjson::Value::Int(limit)) if *limit >= 0 => (*limit as u64).min(crate::frames::BODY_LIMIT),
+                    _ => crate::frames::BODY_LIMIT,
+                };
+                let state = engine.lock().unwrap().conversation_state(limit);
+                match state {
+                    Ok(Some((mut header, bytes))) => {
+                        header["id"] = id.clone().into();
+                        header["event"] = "conversation_state".into();
+                        output.send_with_body(&header, &bytes);
+                    }
+                    Ok(None) => output.send(&json!({"id": id, "event": "conversation_state", "bytes": 0, "reason": "the model holds no conversation to keep"})),
+                    Err(message) => output.send(&json!({"id": id, "event": "conversation_state", "bytes": 0, "reason": message})),
+                }
+            }
+            Some("conversation_tokens") => {
+                let count = match request.get("bytes") {
+                    Some(pyjson::Value::Int(count)) if *count >= 0 => *count as u64,
+                    _ => break Err("Straydog conversation frame has no byte count".into()),
+                };
+                let body = match crate::frames::read_body(&mut reader, count) {
+                    Ok(body) => body,
+                    Err(message) => break Err(message),
+                };
+                if let Err(message) = keep_tokens(&body) {
+                    eprintln!("Straydog conversation: not kept ({message})");
+                }
+            }
+            Some("conversation") => {
+                let count = match request.get("bytes") {
+                    Some(pyjson::Value::Int(count)) if *count >= 0 => *count as u64,
+                    _ => break Err("Straydog conversation frame has no byte count".into()),
+                };
+                // (the body is read whatever it is for: the pipe stays in step)
+                let body = match crate::frames::read_body(&mut reader, count) {
+                    Ok(body) => body,
+                    Err(message) => break Err(message),
+                };
+                let reason = request.get("reason").and_then(pyjson::Value::as_str).unwrap_or("the server sent no state").to_string();
+                if let Some(waiting) = kept().waiting.take() {
+                    let _ = waiting.send(if count > 0 { Ok(body) } else { Err(reason) });
+                }
+            }
             Some("prefix") => {
                 let arrived = Instant::now();
                 let count = match request.get("bytes") {
@@ -1242,6 +1405,8 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         start, grid: prepared[index].prepared.grid(), rows: image_rows[index].clone().unwrap_or_default(),
     }).collect());
     let max_new = max_new.min(context - agreed.len());
+    // (a conversation an earlier run kept, which this prompt goes on from)
+    let kept_seconds = take_kept(engine, output, id, cancel, &agreed);
     let result = engine.model.generate_constrained(
         &agreed, max_new, &sampling, seed, &cancelled,
         &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -1288,6 +1453,9 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     if !spans.is_empty() {
         timings.insert("images".into(), json!(spans.len()));
         timings.insert("image_seconds".into(), json!(image_seconds));
+    }
+    if let Some(seconds) = kept_seconds {
+        timings.insert("kept_seconds".into(), json!(seconds));
     }
     timings.insert("first_text_seconds".into(), json!(first_text));
     timings.insert("request_seconds".into(), json!(started.elapsed().as_secs_f64()));

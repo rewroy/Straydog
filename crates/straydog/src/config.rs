@@ -211,6 +211,14 @@ pub struct Options {
     #[arg(long = "no-prefix-cache")]
     #[serde(skip)]
     pub no_prefix_cache: bool,
+    /// Windows: when the server stops on purpose (Ctrl+C, Windows ending the session, or a stop asked for with --stop-on-stdin), keep the state of the conversation the engine held last, sealed for the user, in the data directory, and take the next start's first request that goes on from it from there, instead of reading it all again [default: off; `keep_conversation = true` in the config file, or --keep-conversation]
+    #[arg(long)]
+    #[serde(default)]
+    pub keep_conversation: bool,
+    /// Stop on a line `stop` on standard input, as Ctrl+C stops (for a program that starts the server with no console to send it to; nothing else on standard input is read)
+    #[arg(long)]
+    #[serde(skip)]
+    pub stop_on_stdin: bool,
 }
 
 /// The settings in effect, every derived value filled in.
@@ -261,6 +269,11 @@ pub struct Settings {
     pub expert_ram: Option<f64>,
     /// Windows: the first request's system block's state is kept sealed in the data directory and handed to the next start (`straydog::prefix`).
     pub prefix_cache: bool,
+    /// Windows: the state of the conversation held last is kept sealed in the data directory when the server stops on purpose, and a request of the
+    /// next start that goes on from it is taken from there (`straydog::conversation`). Off unless asked for.
+    pub keep_conversation: bool,
+    /// A line `stop` on standard input stops the server (`--stop-on-stdin`).
+    pub stop_on_stdin: bool,
 }
 
 /// llama.cpp's multi-letter short options, as their long forms (clap's short options are one letter).
@@ -370,7 +383,7 @@ pub fn load(matches: &ArgMatches, config: Option<&Path>) -> Result<(Options, Sou
     let options = merge!(model, model_name, provider, quant, engram, expert_floor, model_draft, model_vision, draft_max, ctx_size, batch_size, gpu, split_mode, vram,
                          state_ram, row_cache, gemm, gemm_min_batch, host, port, api_key, api_key_file, alias, temp, top_k,
                          top_p, min_p, presence_penalty, seed, reasoning_effort, startup_timeout, log_file, verbose,
-                         data_dir, expert_ram, prefix_cache, no_prefix_cache);
+                         data_dir, expert_ram, prefix_cache, no_prefix_cache, keep_conversation, stop_on_stdin);
     Ok((options, sources))
 }
 
@@ -622,6 +635,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         data_dir,
         expert_ram: options.expert_ram,
         prefix_cache: !options.no_prefix_cache && options.prefix_cache.unwrap_or(true),
+        keep_conversation: options.keep_conversation,
+        stop_on_stdin: options.stop_on_stdin,
     })
 }
 
@@ -668,6 +683,8 @@ pub fn describe(settings: &Settings, sources: &Sources) -> Vec<String> {
         ("data_dir", settings.data_dir.display().to_string()),
         ("expert_ram", settings.expert_ram.map_or_else(|| "(planned)".into(), |gib| gib.to_string())),
         ("prefix_cache", settings.prefix_cache.to_string()),
+        ("keep_conversation", settings.keep_conversation.to_string()),
+        ("stop_on_stdin", settings.stop_on_stdin.to_string()),
     ];
     values
         .into_iter()
@@ -997,6 +1014,49 @@ no_prefix_cache = true
 ", model.display())).unwrap();
         let matches = command().try_get_matches_from(["-m", model.to_str().unwrap()]).unwrap();
         assert!(load(&matches, Some(&path)).is_err());
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    /// The conversation's state is not kept unless it is asked for: off by default, on with `keep_conversation = true` in the file or with
+    /// `--keep-conversation`, each named as its source; the stop on standard input is an option and no key of the file's.
+    #[test]
+    fn the_conversation_is_kept_only_when_asked_for() {
+        let model = bundle_directory(qwen("IQ3_S"));
+        let setting = |file: Option<&str>, args: &[&str]| {
+            let config = file.map(|text| {
+                let path = model.join("keep.toml");
+                std::fs::write(&path, format!("model = {:?}
+{text}
+", model.display())).unwrap();
+                path
+            });
+            let mut all = vec!["-m", model.to_str().unwrap()];
+            all.extend_from_slice(args);
+            let matches = command().try_get_matches_from(all).unwrap();
+            let (options, sources) = load(&matches, config.as_deref()).unwrap();
+            let settings = resolve(options).unwrap();
+            let line = describe(&settings, &sources).into_iter().find(|line| line.starts_with("keep_conversation ")).unwrap();
+            (settings.keep_conversation, line)
+        };
+        assert_eq!(setting(None, &[]), (false, "keep_conversation false  [default]".to_string()));
+        let (on, line) = setting(Some("keep_conversation = true"), &[]);
+        assert!(on && line.starts_with("keep_conversation true  [config "), "{line}");
+        assert!(!setting(Some("keep_conversation = false"), &[]).0);
+        let (on, line) = setting(None, &["--keep-conversation"]);
+        assert!(on && line.ends_with("[option --keep-conversation]"), "{line}");
+        // the stop on standard input: an option, off by default, and not a key of the file's
+        let stops = |args: &[&str]| {
+            let mut all = vec!["-m", model.to_str().unwrap()];
+            all.extend_from_slice(args);
+            let (options, _) = load(&command().try_get_matches_from(all).unwrap(), None).unwrap();
+            resolve(options).unwrap().stop_on_stdin
+        };
+        assert!(!stops(&[]) && stops(&["--stop-on-stdin"]));
+        let path = model.join("wrong.toml");
+        std::fs::write(&path, format!("model = {:?}
+stop_on_stdin = true
+", model.display())).unwrap();
+        assert!(load(&command().try_get_matches_from(["-m", model.to_str().unwrap()]).unwrap(), Some(&path)).is_err());
         std::fs::remove_dir_all(model).unwrap();
     }
 

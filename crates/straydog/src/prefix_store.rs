@@ -94,7 +94,7 @@ impl Wrap for Dpapi {
 }
 
 /// SHA-256 of `parts` one after the other.
-fn hash(parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hash(parts: &[&[u8]]) -> [u8; 32] {
     let mut hash = Sha256::new();
     for part in parts {
         hash.update(part);
@@ -413,6 +413,33 @@ impl Store {
         }
         Ok((path, (header.len() + state.len() + TAG) as u64))
     }
+}
+
+/// The executable's hash ([`build_id`]), being made by a thread of its own (the server's start is not held up by it), and once made. What the system
+/// block's state and the kept conversation both key on, made once.
+pub struct Build {
+    building: std::sync::Mutex<Option<std::thread::JoinHandle<Result<[u8; 32], String>>>>,
+    build: std::sync::OnceLock<Result<[u8; 32], String>>,
+}
+
+impl Build {
+    pub fn start() -> std::sync::Arc<Build> {
+        std::sync::Arc::new(Build { building: std::sync::Mutex::new(Some(std::thread::spawn(build_id))), build: std::sync::OnceLock::new() })
+    }
+
+    /// The executable's hash: waited for if it is still being made.
+    pub fn get(&self) -> &Result<[u8; 32], String> {
+        self.build.get_or_init(|| match self.building.lock().unwrap().take() {
+            Some(thread) => thread.join().unwrap_or_else(|_| Err("its thread failed".into())),
+            None => Err("it was not made".into()),
+        })
+    }
+}
+
+/// The process's one [`Build`], started by whoever asks first.
+pub fn shared_build() -> std::sync::Arc<Build> {
+    static BUILD: std::sync::OnceLock<std::sync::Arc<Build>> = std::sync::OnceLock::new();
+    BUILD.get_or_init(Build::start).clone()
 }
 
 /// A hash of the running executable, which is what an engine's build is: states of another build are never read.

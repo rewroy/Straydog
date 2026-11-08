@@ -1,6 +1,9 @@
 //! The pieces of the `straydog` command: settings, the server's runtime and the worker.
 
 pub mod config;
+pub mod conversation;
+#[cfg(windows)]
+pub mod conversation_store;
 pub mod dashboard;
 pub mod frames;
 pub mod monitor;
