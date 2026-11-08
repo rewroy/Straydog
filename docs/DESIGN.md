@@ -946,6 +946,8 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   function, and what is over goes to the expert slots.
 - **Partial residency:** the CPU computes experts beyond VRAM from the host tier. Which
   experts run where depends on timing, so decode is not bit-reproducible from run to run.
+  The PLE and output-head operands join the authenticated load before the expert pool is sized,
+  so those fixed dense weights are counted before the pool takes the remaining VRAM.
   - On a CPU with AVX-512 and VBMI, or AVX2, the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
     down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
     the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
@@ -981,6 +983,18 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     1717 / 1711 ms, 2,397 tokens 2081 / 2088 -> 1714 / 1703, 3,394 tokens 2393 / 2395 -> 2119 / 2131 (a third of the streamed
     experts left, 22,600-25,600 routes to the CPU). A narrower bus (a PCIe 4.0 x8 card) makes a streamed expert dearer, and the
     CPU's share larger.
+  - A long prompt can borrow expert-slot VRAM to widen its batches, up to 4096 rows. On one GPU
+    the threshold is the smaller of 1536 new tokens and two original batches; the cache then
+    gives way to the staging pool. With several GPUs the threshold is 65536 new tokens: each
+    device keeps the cache that fits beside its wider workspaces, and the smallest supported
+    batch limits the group. A batch already at 4096 rows skips borrowing. Completion and
+    cancellation run the same workspace/cache restoration path; the restored pool uses what
+    fits at that point.
+  - An arriving request can interrupt startup before any expert slots are filled. When the
+    selected devices have positive cache capacity but no occupied slots, prefill observes at
+    least one batch of routing and fills the cache once if more tokens remain and the request
+    has not been cancelled. Later batches can reuse those experts. A cache already holding
+    any experts keeps its existing policy, as does a staging-only pool with no cache capacity.
   - Its host K/V starts at 32768 positions and doubles as a sequence reaches them (`sd_kv_grow`):
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked
@@ -1482,6 +1496,33 @@ with a model of its own reads no file it was not given.
     process and GPU sensors.
   - It reads `GET /dashboard/logs?after=N`, and chats through `/v1/chat/completions`.
   - Sensors are read only while a dashboard is open: amdgpu's sysfs, or NVML in CUDA builds.
+
+### 10.1 Timing and cache fields
+
+`timings` is engine-specific; clients must allow fields to be absent. Qwen3.8 reports the
+following prefill measurements. Times are seconds, and setup, restoration and early cache
+filling are already included in `prefill_seconds`.
+
+| Field | Meaning |
+| --- | --- |
+| `prefill_seconds` | Time spent prefilling this request's new prompt tokens, including its setup, restoration and queued work settling. |
+| `prefill_prepare_seconds` | Long-prefill setup: up-front K/V growth and borrowing of expert-slot VRAM. |
+| `prefill_restore_seconds` | Restoring the original prefill workspaces and rebuilding the expert pool after borrowed prefill. |
+| `prefill_cache_fill_seconds` | Filling an initially empty expert cache between prompt batches; absent when no such fill ran. |
+| `prefill_batch_rows` | The selected batch row limit. Checkpoints and the prompt's end can make a chunk smaller. |
+| `rebalance_seconds` | Choosing and filling expert slots after successful prefill, before decode. This is outside `prefill_seconds`. |
+| `partial_detail.slot_capacity` | Total expert-cache entries allocated across the selected GPUs, excluding staging slots. |
+| `partial_detail.slots_held` | Cache entries assigned to experts, including fills still pending. The legacy `partial_detail.slots` also reports occupancy. |
+
+Capacity and occupancy are separate: a newly allocated cache can have capacity without holding
+experts. A restored pool can change capacity when K/V, workspaces or available memory change.
+`usage.prompt_tokens_details.cached_tokens` counts reused prompt positions; it is independent
+of this expert-weight cache.
+
+The engine's `ttft_seconds` includes work after prefill, such as its final rebalance. A client's
+time to first visible text can also include startup warm-up waiting, queueing and transport.
+Compare the same backend, quantization, context, GPU budget and batch, and record the initial
+expert-cache state and page-locked layer count when comparing startup with a warm request.
 
 ## 11. Build and distribution
 
