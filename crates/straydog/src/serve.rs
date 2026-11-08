@@ -154,9 +154,28 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         monitor.stop().await;
         drop(monitor);
         // The router and the sampler are gone; the worker exits, and its GPU memory is free,
-        // before the server does.
-        if let Some(engine) = Arc::into_inner(engine) {
+        // before the server does. A connection that has just closed may still be letting go of its
+        // handle on the engine: it is waited for a moment, for an engine left open ends the worker
+        // by killing it, and the conversation it holds is not kept (`keep_conversation`).
+        let mut engine = engine;
+        let began = std::time::Instant::now();
+        let owned = loop {
+            match Arc::try_unwrap(engine) {
+                Ok(owned) => break Some(owned),
+                Err(shared) if began.elapsed() < std::time::Duration::from_secs(10) => {
+                    engine = shared;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(_) => break None,
+            }
+        };
+        if let Some(engine) = owned {
+            if began.elapsed() > std::time::Duration::from_millis(5) {
+                tracing::debug!("Straydog: the engine was let go of after {} ms", began.elapsed().as_millis());
+            }
             engine.close().await;
+        } else {
+            tracing::warn!("Straydog: something still holds the engine after 10 s, so it is not closed in order");
         }
         served?;
         let failure = failure.lock().unwrap().take();

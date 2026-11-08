@@ -27,13 +27,24 @@ fn buffer(count: usize) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+/// The size of the reads a body is taken in. A pipe holds 4 KiB, and `read_to_end` sizes its reads by what the last one returned: it never asks for more than
+/// a page or two, and a gigabyte then crosses in a quarter of a million reads (7.5 s, for a kept conversation's 1084 MB). A read that asks for megabytes is
+/// answered by the writer's write at once.
+const READ_CHUNK: usize = 4 << 20;
+
 /// Exactly `count` bytes from `reader` (blocking), an error if it ends before them.
 pub fn read_body(reader: &mut impl Read, count: u64) -> Result<Vec<u8>, String> {
     let count = body_length(count)?;
     let mut body = buffer(count)?;
-    let read = reader.by_ref().take(count as u64).read_to_end(&mut body).map_err(|error| error.to_string())?;
-    if read != count {
-        return Err(format!("Straydog frame body ended after {read} of {count} bytes"));
+    let mut chunk = vec![0u8; count.min(READ_CHUNK)];
+    while body.len() < count {
+        let wanted = (count - body.len()).min(chunk.len());
+        match reader.read(&mut chunk[..wanted]) {
+            Ok(0) => return Err(format!("Straydog frame body ended after {} of {count} bytes", body.len())),
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Ok(body)
 }
@@ -82,6 +93,34 @@ mod tests {
         let mut next = String::new();
         reader.read_line(&mut next).unwrap();
         assert_eq!(next, "{\"id\":\"b\"}\n", "the frame after the body is read whole");
+    }
+
+    /// A body arrives whole from a reader that gives a few bytes a read, as a pipe does, and one that is interrupted goes on.
+    #[test]
+    fn a_body_is_taken_from_a_reader_that_gives_a_little_at_a_time() {
+        struct Dribble<'a> {
+            data: &'a [u8],
+            calls: usize,
+        }
+        impl Read for Dribble<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls % 5 == 0 {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let n = out.len().min(self.data.len()).min(1 + self.calls % 4093);
+                out[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                Ok(n)
+            }
+        }
+        let body: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+        let mut reader = Dribble { data: &body, calls: 0 };
+        assert_eq!(read_body(&mut reader, 300_000).unwrap(), body);
+        // (a body longer than one read's chunk, from a reader that gives it all at once)
+        let long: Vec<u8> = (0..=255u8).cycle().take(READ_CHUNK * 2 + 17).collect();
+        assert_eq!(read_body(&mut Cursor::new(long.clone()), long.len() as u64).unwrap(), long);
+        assert_eq!(read_body(&mut Dribble { data: &body[..10], calls: 0 }, 11).unwrap_err(), "Straydog frame body ended after 10 of 11 bytes");
     }
 
     /// A body that ends before its count is an error naming how far it got, and a count over the limit is refused before a byte is read or a
