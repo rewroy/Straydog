@@ -339,7 +339,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         // (no request is made in any of these)
         fetch_dspark(&root, bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap(), true, &quiet).unwrap();
-        fetch_dspark(&root, bundle::Id::find(None, None, "UD-IQ2_XXS").unwrap(), false, &quiet).unwrap();
+        // (Qwen3.8 has no DSpark drafter pinned; every DeepSeek-V4.1 bundle has, Unsloth's UD-IQ2_XXS too)
+        fetch_dspark(&root, bundle::Id::find(Some(bundle::MODEL), None, "UD-IQ1_S").unwrap(), false, &quiet).unwrap();
         assert!(!root.join("dspark").exists() && !scratch.path().join("dspark").exists());
         fs::create_dir_all(scratch.path().join("dspark")).unwrap();
         fs::write(scratch.path().join("dspark").join(&asset.name), b"").unwrap();
