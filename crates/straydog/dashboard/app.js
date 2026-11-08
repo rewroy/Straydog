@@ -27,6 +27,9 @@ const STRINGS = {
     gpus: "GPUs", host: "Host", settings: "Settings", logs: "Service log", filter: "Filter",
     warningsOnly: "Warnings only", follow: "Follow", busy: "busy", power: "power", vram: "VRAM", usage: "usage",
     load: "load", memory: "Memory", used: "used", straydog: "Straydog", swap: "Swap", available: "available",
+    disk: "Disk", diskRead: "disk read", serverReadIo: "Straydog read I/O", allVolumes: "all volumes",
+    diskScope: "physical reads · all apps", ioScope: "I/O may include cached reads", ioScopeLinux: "storage reads by process",
+    ioScopeUnknown: "process I/O", serverResident: "Straydog resident",
     cpu: "CPU", gpu: "GPU", state: "State", placement: "Placement", fullyResident: "fully resident",
     partiallyResident: "GPU + CPU experts", kv: "K/V cache", vramKv: "VRAM", hostMemory: "host memory",
     layers: "Layers", layersValue: "{0}–{1} on GPU {2}", expertSlots: "Experts in VRAM", expertSlotsValue: "{0} slots", expertHost: "Experts in host memory",
@@ -35,7 +38,7 @@ const STRINGS = {
     failedCount: "{0} failed", promptTokens: "Prompt tokens", reused: "Reused", generated: "Generated",
     hostName: "Host name", os: "OS", kernel: "Kernel", architecture: "Architecture", cores: "Cores",
     coresValue: "{0} cores / {1} threads", loadAverage: "Load average", hostUptime: "Host uptime",
-    cpuTemperature: "CPU temperature", serverProcesses: "Straydog processes", serverMemory: "Straydog memory",
+    cpuTemperature: "CPU temperature", serverProcesses: "Straydog processes", serverMemory: "Straydog resident memory",
     serverCpu: "Straydog CPU", model: "Model", quantization: "Quantization", drafter: "MTP drafter", none: "none",
     draftMax: "MTP drafts", devices: "GPUs", vramBudget: "VRAM per GPU", splitMode: "Split",
     stateRam: "Host memory for state", gemm: "GEMM precision", gemmMin: "GEMM from batch", address: "Address",
@@ -67,6 +70,9 @@ const STRINGS = {
     gpus: "GPU", host: "ホスト", settings: "設定", logs: "サービスログ", filter: "絞り込み",
     warningsOnly: "警告のみ", follow: "追従", busy: "使用率", power: "電力", vram: "VRAM", usage: "使用率",
     load: "負荷", memory: "メモリ", used: "使用", straydog: "Straydog", swap: "スワップ", available: "空き",
+    disk: "ディスク", diskRead: "ディスク読み取り", serverReadIo: "Straydog 読取 I/O", allVolumes: "全ボリューム",
+    diskScope: "実ディスク読取・全アプリ", ioScope: "I/O はキャッシュ読取も含む", ioScopeLinux: "プロセスによる実ストレージ読取",
+    ioScopeUnknown: "プロセス I/O", serverResident: "Straydog 常駐",
     cpu: "CPU", gpu: "GPU", state: "状態", placement: "配置", fullyResident: "全常駐",
     partiallyResident: "GPU + CPU エキスパート", kv: "K/V キャッシュ", vramKv: "VRAM", hostMemory: "ホストメモリ",
     layers: "層", layersValue: "{0}–{1}（GPU {2}）", expertSlots: "VRAM のエキスパート", expertSlotsValue: "{0} スロット", expertHost: "ホストメモリのエキスパート",
@@ -75,7 +81,7 @@ const STRINGS = {
     failedCount: "失敗 {0}", promptTokens: "プロンプト", reused: "再利用", generated: "生成",
     hostName: "ホスト名", os: "OS", kernel: "カーネル", architecture: "アーキテクチャ", cores: "コア",
     coresValue: "{0} コア / {1} スレッド", loadAverage: "ロードアベレージ", hostUptime: "ホスト稼働時間",
-    cpuTemperature: "CPU 温度", serverProcesses: "Straydog のプロセス", serverMemory: "Straydog のメモリ",
+    cpuTemperature: "CPU 温度", serverProcesses: "Straydog のプロセス", serverMemory: "Straydog の常駐メモリ",
     serverCpu: "Straydog の CPU", model: "モデル", quantization: "量子化", drafter: "MTP drafter", none: "なし",
     draftMax: "MTP ドラフト", devices: "GPU", vramBudget: "GPU ごとの VRAM", splitMode: "分割",
     stateRam: "系列状態のホストメモリ", gemm: "GEMM 精度", gemmMin: "GEMM 開始バッチ", address: "アドレス",
@@ -132,6 +138,7 @@ function number(value, digits = 0) {
   return numberFormats.get(digits).format(value);
 }
 const gib = (bytes) => number(bytes / 2 ** 30, 1);
+const mibRate = (bytes) => (Number.isFinite(bytes) ? bytes / 2 ** 20 : null);
 const percent = (part, whole) => (whole > 0 && Number.isFinite(part) ? (100 * part) / whole : null);
 const clock = (seconds) => new Date(seconds * 1000).toLocaleTimeString(LANG, { hour12: false });
 const celsius = (value) => (Number.isFinite(value) ? `${number(value)}°C` : "");
@@ -457,7 +464,7 @@ function gpuList(engine, host) {
 }
 
 let hardwareKey = "";
-const hardware = { gpus: [], cpu: null, memory: null };
+const hardware = { gpus: [], cpu: null, memory: null, disk: null };
 
 function metric(className, label, unit) {
   const node = element("div", `metric ${className}`);
@@ -539,7 +546,7 @@ function buildHardware(gpus) {
   const memory = deviceCard(t("memory"), [["prefill", t("used")], ["decode", t("straydog")]]);
   memory.used = metric("memory", t("used"), "%");
   memory.amount = metric("", t("used"), "GiB");
-  memory.server = metric("primary", t("straydog"), "GiB");
+  memory.server = metric("primary", t("serverResident"), "GiB");
   memory.metrics.append(memory.used.node, memory.amount.node, memory.server.node);
   memory.bar = element("div", "bar");
   memory.serverBar = element("span", "used");
@@ -553,7 +560,23 @@ function buildHardware(gpus) {
   container.append(memory.card);
   hardware.memory = memory;
 
-  container.style.setProperty("--cards", String(gpus.length + 2));
+  const disk = deviceCard(t("disk"), [["decode", t("diskRead")], ["prefill", t("serverReadIo")]]);
+  disk.card.classList.add("disk");
+  disk.name.textContent = t("allVolumes");
+  disk.read = metric("primary", t("diskRead"), "MiB/s");
+  disk.server = metric("memory", t("serverReadIo"), "MiB/s");
+  disk.metrics.append(disk.read.node, disk.server.node);
+  disk.timechart = new TimeChart(disk.chart, [
+    { key: "read", color: "decode", axis: "left", fill: true, glow: true },
+    { key: "server", color: "prefill", axis: "left", width: 1.6 },
+  ], { left: { max: "auto", floor: 1 } });
+  disk.footLeft.textContent = t("diskScope");
+  disk.footRight.textContent = t("ioScope");
+  disk.card.append(disk.foot);
+  container.append(disk.card);
+  hardware.disk = disk;
+
+  container.style.setProperty("--cards", String(gpus.length + 3));
   charts.add(speedChart);
 }
 
@@ -569,6 +592,8 @@ function feed(sample) {
   hardware.cpu?.timechart.push("temp", sample.time, sample.cpu_temperature);
   hardware.memory?.timechart.push("used", sample.time, sample.memory);
   hardware.memory?.timechart.push("server", sample.time, sample.server_memory);
+  hardware.disk?.timechart.push("read", sample.time, sample.disk_read);
+  hardware.disk?.timechart.push("server", sample.time, sample.server_read_io);
   speedChart.push("decode", sample.time, sample.decode);
   speedChart.push("prefill", sample.time, sample.prefill);
 }
@@ -635,6 +660,10 @@ function renderHardware(engine, host) {
   memory.otherBar.style.setProperty("width", `${percent(Math.max(0, used - host.server.memory), host.memory_total) ?? 0}%`);
   memory.footLeft.textContent = `${t("available")} ${gib(host.memory_available)} GiB`;
   memory.footRight.textContent = `${t("swap")} ${gib(host.swap_used)} / ${gib(host.swap_total)} GiB`;
+  hardware.disk.read.value.textContent = number(mibRate(host.disk_read_bytes_per_second), 1);
+  hardware.disk.server.value.textContent = number(mibRate(host.server_read_io_bytes_per_second), 1);
+  hardware.disk.footRight.textContent = t(host.server_read_io_source === "proc_read_bytes" ? "ioScopeLinux"
+    : host.server_read_io_source === "io_counters" ? "ioScope" : "ioScopeUnknown");
   return rebuilt;
 }
 
@@ -883,6 +912,8 @@ function renderEnvironment(engine, host, server) {
       [t("hostUptime"), duration(host.uptime_seconds)],
       [t("serverProcesses"), `${number(host.server.processes)} (PID ${host.server.pid})`],
       [t("serverMemory"), `${gib(host.server.memory)} GiB`],
+      [t("diskRead"), `${number(mibRate(host.disk_read_bytes_per_second), 1)} MiB/s`],
+      [t("serverReadIo"), `${number(mibRate(host.server_read_io_bytes_per_second), 1)} MiB/s`],
       [t("serverCpu"), `${number(host.server.cpu_usage)}%`],
     ]);
     const gpus = gpuList(engine, host);
@@ -1213,6 +1244,7 @@ document.getElementById("lang-button").addEventListener("click", () => {
   try { localStorage.setItem(LANG_STORAGE, LANG); } catch { /* storage unavailable */ }
   numberFormats.clear();
   translatePage();
+  hardwareKey = "";
   poll();
 });
 
