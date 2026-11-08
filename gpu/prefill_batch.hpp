@@ -128,6 +128,38 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     check(hipGetLastError());
 }
 
+// qsa_attention for a batch whose host K/V is past the stage: tokens [0, steps) of the selections in d.input
+// attend over their blocks' union copied into the stage (qsa_gather_union), as many tokens at a time as
+// the stage holds the union of. `places` and `blocks`: scratch of (base + steps + 3) / 4 + 1 words each.
+template<int P = 1>
+void qsa_attention_gathered(Device& d, void* state, size_t context, size_t base, size_t steps, size_t selected, float* output,
+                            uint32_t* places, uint32_t* blocks) {
+    using H = QwenHeads<P>;
+    const size_t end = (base + steps - 1) / 4 + 1, planes = kv_planes_of(d, state), capacity = kv_stage_capacity(d, state);
+    kv_stage_overwritten(d);
+    for (size_t first = 0; first < steps;) {
+        size_t count = steps - first, total = 0;
+        for (;;) {
+            check(hipMemsetAsync(places, 0, end * 4, d.stream));
+            qsa_mark_selection<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, steps, selected, first, places);
+            qsa_place_union<<<1, 1024, 0, d.stream>>>(places, end, blocks);
+            total = kv_union_count(d, places + end);
+            if (total * 4 <= capacity || count == 1) break;
+            count = (count + 1) / 2;
+        }
+        if (total * 4 <= capacity) {
+            qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(static_cast<const kv_t*>(state), context, planes, blocks,
+                                                                     kv_stage_rows(d), capacity);
+            qsa_renumber_selection<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, steps, selected, first, places);
+            qsa_flash<P><<<dim3(unsigned(count), unsigned(H::kv)), 256, 0, d.stream>>>(kv_stage_rows(d), capacity, base, steps, selected,
+                                                                                     d.input, output, first);
+        } else   // (a stage too small for one token's selection)
+            qsa_flash<P><<<dim3(1, unsigned(H::kv)), 256, 0, d.stream>>>(static_cast<const kv_t*>(state), context, base, steps, selected,
+                                                                       d.input, output, first);
+        first += count;
+    }
+}
+
 // Scratch: q/gate 12288 + k/v/index-q 1536 + index-k 128 + attended 6144 + half 3072 floats per row (a part's fewer).
 constexpr size_t qsa_batch_floats = 12288 + 1536 + 128 + 6144 + 3072;
 template<int P = 1>
@@ -163,12 +195,15 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         uint32_t* union_blocks = marks + groups * stride;
         uint32_t* union_masks = union_blocks + groups * qsa_group_capacity;
         uint32_t* union_counts = union_masks + groups * qsa_group_capacity;
-        if (batched) {
-            if ((groups * (stride + 2 * qsa_group_capacity) + groups) * 4 > attention_score_bytes)
-                throw std::runtime_error("QSA prefill marks exceed the attention scratch");
-            check(hipMemsetAsync(marks, 0, groups * stride * 4, d.stream));
-        }
         const KvView kv = kv_for_prefill(d, kv_state, context, base + span, span_rows);
+        // (the union of a gathered batch: its blocks' places and the blocks in place order, after the marks. The host waits for the
+        // union's size, which a part must not: its exchanges wait for the other part's layer, queued after this one returns.)
+        const bool gathered = P == 1 && kv_gathers(d, kv, kv_state, span_rows);
+        uint32_t* places = batched ? union_counts + groups : marks;
+        uint32_t* placed = places + stride + 1;
+        if ((batched ? groups * (stride + 2 * qsa_group_capacity) + groups : 0) + (gathered ? 2 * (stride + 1) : 0) > attention_score_bytes / 4)
+            throw std::runtime_error("QSA prefill marks exceed the attention scratch");
+        if (batched) check(hipMemsetAsync(marks, 0, groups * stride * 4, d.stream));
         for (size_t first = span; first < span + span_rows; first += 256) {
             const size_t count = std::min<size_t>(256, span + span_rows - first), position = base + first;
             const size_t selected = std::min(position + count, size_t(2052));
@@ -201,14 +236,38 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             if (batched) {
                 cast_half<<<unsigned((count * Q + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * Q, count * Q);
                 qsa_mark_blocks<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
-            } else qsa_attention<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q, nullptr, kv.mirror,
-                                    kv.mirror_rows);
+            } else if (gathered) qsa_attention_gathered<P>(d, kv_state, context, position, count, selected, attended + first * Q, places, placed);
+            else qsa_attention<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q, nullptr, kv.mirror,
+                                  kv.mirror_rows);
         }
 #if defined(__HIPCC__)
         if (batched) {
             qsa_union_blocks<<<unsigned(groups), 256, 0, d.stream>>>(marks, stride, base + span, span_rows, union_blocks, union_masks, union_counts);
-            qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
-                base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
+            if (gathered) {
+                // As many groups at a time as the stage holds the union of (qsa_attention_gathered).
+                const size_t end = (base + span + span_rows - 1) / 4 + 1, capacity = kv_stage_capacity(d, kv_state);
+                kv_stage_overwritten(d);
+                for (size_t first = 0; first < groups;) {
+                    size_t count = groups - first, total = 0;
+                    for (;;) {
+                        qsa_union_of_groups<<<unsigned((end + 255) / 256), 256, 0, d.stream>>>(marks, stride, first, first + count, end, places);
+                        qsa_place_union<<<1, 1024, 0, d.stream>>>(places, end, placed);
+                        total = kv_union_count(d, places + end);
+                        if (total * 4 <= capacity || count == 1) break;
+                        count = (count + 1) / 2;
+                    }
+                    const bool fits = total * 4 <= capacity;
+                    if (fits)
+                        qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(static_cast<const kv_t*>(kv_state), context,
+                                                                                 kv_planes_of(d, kv_state), placed, kv_stage_rows(d), capacity);
+                    qsa_flash_wmma<P><<<dim3(unsigned(count), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(
+                        fits ? kv_stage_rows(d) : kv.kv, fits ? capacity : kv.capacity, base + span, span_rows, half + span * Q, union_blocks,
+                        union_masks, union_counts, attended + span * Q, fits ? places : nullptr, unsigned(first));
+                    first += count;
+                }
+            } else
+                qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
+                    base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
         }
 #endif
         kv_after_prefill(d, kv, kv_state, context, base + span, span_rows);

@@ -28,6 +28,7 @@ use crate::routes::{self, Banks, Hints, Routes};
 use crate::sampling::{self, Generated, Sampling};
 use crate::vision::IMAGE_TOKEN;
 use crate::weights::{ngram_rows, Progress, Weights, CONTEXT_LIMIT};
+use crate::width;
 
 /// The most drafts a pass can verify. MTP drafts stay at three (--draft-max): at 20K, 2048 tokens greedy 154.8 tok/s at three, 153.9
 /// at four and five, 153.3 at seven; sampled 141.2 at three, 137.6 at five, 125.9 at seven. The rows past four are for drafts
@@ -138,11 +139,12 @@ pub fn expert_floor() -> Result<Option<f32>> {
     }
 }
 
-/// The share of the routed experts the slots hold at load from which a partially resident model drafts two tokens a pass. Routing is uneven:
-/// IQ3_S on an R9700, the slots of `--vram 24` (30% at load, 39% once the K/V has settled) serve 87% of the routes, and the second draft
+/// The share of the routed experts the slots hold at load from which a partially resident model on HIP starts with two drafts a pass, not one
+/// ([`width::Chooser`] takes it from there, by what its passes cost: the starting width is where today's rule was measured right). Routing is
+/// uneven: IQ3_S on an R9700, the slots of `--vram 24` (30% at load, 39% once the K/V has settled) serve 87% of the routes, and the second draft
 /// costs less CPU. Two drafts against one, same seeds, tok/s of a second and third request: `--vram 24` 69.5, 70.5 / 67.7, 61.4; 16 (17%) 58.7,
-/// 57.3 / 57.4, 56.6; 12 (under 15%) 50.1, 49.1 / 50.7, 48.0. HIP only: CUDA has not been measured.
-const TWO_DRAFTS_SHARE: f64 = 0.15;
+/// 57.3 / 57.4, 56.6; 12 (under 15%) 50.1, 49.1 / 50.7, 48.0.
+const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
@@ -200,6 +202,16 @@ fn decode_part(phase: &str) -> Option<&'static str> {
         "step: layers (first device)" | "step: layers (second device)" => "layers",
         _ => return None,
     })
+}
+
+/// [`Model::partial_drawn_cut`] of the draft at position `at` (1 the first) from the running means of a pass's seconds by rows (0: none yet).
+fn drawn_cut(pass_seconds: &[f64], at: usize) -> f32 {
+    let seconds = |rows: usize| pass_seconds.get(rows - 1).copied().filter(|seconds| *seconds > 0.0);
+    match (seconds(1), seconds(at), seconds(at + 1)) {
+        (Some(one), Some(before), Some(after)) => (2.75 * ((after - before) / one) - 1.125).clamp(0.0, 0.9) as f32,
+        _ if at > 1 => drawn_cut(pass_seconds, at - 1),
+        _ => PARTIAL_DRAFT_CUT,
+    }
 }
 
 /// Seconds per phase of a request's decode, and of its passes by rows (count, seconds, phases): every
@@ -275,6 +287,9 @@ struct Parked {
     covered: Option<(usize, usize)>,
     /// The state of a system block held at its root, imported ([`Model::import_prefix`]): once restored, the sequence is the root's too.
     root: bool,
+    /// The state of a conversation held at one of its checkpoints, imported ([`Model::import_conversation`]): once restored, the sequence is
+    /// the checkpoint's too.
+    kept: bool,
 }
 
 impl Parked {
@@ -529,6 +544,7 @@ pub struct Model {
     pub context: usize,
     pub prefill_batch_size: usize,
     pub state_bytes: u64,
+    /// The most drafts a pass offers (a partially resident model offers as many as [`Model::drafts`] has in force).
     pub speculative: usize,
     /// The most drafts a long match's copy verifies (drafts::Policy, by the match's length).
     pub copy_drafts: usize,
@@ -565,15 +581,22 @@ pub struct Model {
     /// Seconds each step of loading took, in order.
     pub load_seconds: Vec<(&'static str, f64)>,
     profile: Option<Profile>,
-    /// Running means of a decode pass's seconds with one row and with two (0: none yet), for [`Model::partial_drawn_cut`].
-    pass_seconds: [f64; 2],
+    /// Running means of a decode pass's seconds by its rows (0: none yet), for [`Model::partial_drawn_cut`] and the request line.
+    pass_seconds: [f64; PARTIAL_ROWS],
     passes_with_draft: u32,
+    /// The drafts a pass offers now: `speculative` where the whole model is resident, else the width in force of `width`.
+    drafts: usize,
+    /// A partially resident model with a drafter chooses how many drafts a pass offers by what its passes cost ([`width`]); `speculative` is
+    /// the most.
+    width: Option<width::Chooser>,
+    /// Tests only: the seconds a pass is taken to have taken by its rows, in place of the clock ([`Model::script_pass_seconds`]).
+    pass_clock: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
     /// The assist level's tuner, where banks are page-locked and the GPU can take some of the CPU's routes ([`crate::assist`]).
     assist: Option<assist::Tuner>,
     /// Tests only: the levels the decode passes of one row are to run at, in place of the tuner's rounds ([`Model::assist_script`]).
     assist_script: Option<AssistScript>,
     /// This request's passes by rows, and this process's memory as it began, for its log line.
-    pass_counts: [u64; 2],
+    pass_counts: [u64; PARTIAL_ROWS],
     memory_before: Option<(u64, u64, u64)>,
     /// The CPU engine's read-ahead hints (taken, left) when the request began.
     read_aheads_before: (u64, u64),
@@ -738,11 +761,14 @@ impl Model {
             draft_pending: Vec::new(),
             load_seconds: Vec::new(),
             profile: std::env::var_os("DS41_PROFILE").map(|_| Profile::new(true)),
-            pass_seconds: [0.0; 2],
+            pass_seconds: [0.0; PARTIAL_ROWS],
             passes_with_draft: 0,
+            drafts: 0,
+            width: None,
+            pass_clock: None,
             assist: None,
             assist_script: None,
-            pass_counts: [0; 2],
+            pass_counts: [0; PARTIAL_ROWS],
             memory_before: None,
             read_aheads_before: (0, 0),
             cpu_phases_before: [0; 3],
@@ -814,7 +840,7 @@ impl Model {
             crate::host::commit_note("banks planned");
             let slots = model.group.create_expert_slots()?;
             let experts = 48 * model.weights.tensor("blk.0.ffn_gate_exps.weight")?.dims.last().copied().unwrap_or(0) as u64;
-            two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_SHARE * experts as f64;
+            two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_START * experts as f64;
             crate::host::commit_note("expert slots");
         }
         if drafting && model.resident && model.weights.drafter
@@ -845,13 +871,17 @@ impl Model {
         load_seconds.push(("plans", lap(&mut clock)));
         crate::host::commit_note("plans");
         model.load_seconds = load_seconds;
-        // A partially resident model drafts one token a pass: IQ2_XS --vram 12 on an R9700, 64 tok/s without drafts, 70 with one,
-        // 64 with two and 65 with three. The widest pass costs far more than the rest (16 ms for one row, 24 for two, 53 for four).
-        // Two once the slots hold enough ([`TWO_DRAFTS_SHARE`]).
-        let drafts = if model.partial { settings.speculative.min(if two_drafts { 2 } else { 1 }) } else { settings.speculative };
-        model.speculative = if drafting && model.weights.drafter { drafts } else { 0 };
+        // A partially resident model starts at one draft a pass: IQ2_XS --vram 12 on an R9700, 64 tok/s without drafts, 70 with one,
+        // 64 with two and 65 with three. The widest pass costs far more than the rest there (16 ms for one row, 24 for two, 53 for four),
+        // and far less on a machine whose GPU is the limit of a layer: how many drafts pay is for the passes to say ([`width::Chooser`]).
+        // It starts with two once the slots hold enough on HIP ([`TWO_DRAFTS_START`]).
+        let most = if drafting && model.weights.drafter { settings.speculative } else { 0 };
+        let (most, start) = if model.partial { (most.min(PARTIAL_ROWS - 1), most.min(if two_drafts { 2 } else { 1 })) } else { (most, most) };
+        model.speculative = most;
+        model.drafts = start;
+        model.width = (model.partial && most > 0).then(|| width::Chooser::new(most, start));
         // (a partially resident model's rows cost it far more: as many as it drafts)
-        model.copy_drafts = if model.partial || model.speculative == 0 { model.speculative } else { VERIFY_ROWS - 1 };
+        model.copy_drafts = if model.partial || most == 0 { start } else { VERIFY_ROWS - 1 };
         model.refresh_kv_ahead();
         Ok(model)
     }
@@ -859,6 +889,26 @@ impl Model {
     /// The most rows a pass of this placement takes.
     pub fn pass_rows(&self) -> usize {
         if self.partial { PARTIAL_ROWS } else { VERIFY_ROWS }
+    }
+
+    /// The drafts a pass offers now: a partially resident model's width in force ([`width::Chooser`]).
+    pub fn drafts(&self) -> usize {
+        self.drafts
+    }
+
+    /// Tests only: hold the drafts a partially resident model offers at `drafts` (None: choose by the passes' costs again).
+    pub fn pin_drafts(&mut self, drafts: Option<usize>) {
+        if let Some(chooser) = self.width.as_mut() {
+            chooser.pin(drafts);
+            self.drafts = chooser.drafts();
+            self.copy_drafts = self.drafts;
+        }
+    }
+
+    /// Tests only: take a decode pass of `rows` rows to have cost `seconds(rows)`, in place of its time (None: the clock again). The chooser
+    /// of the drafts and the cut of drawn drafts then read the script's costs, with the acceptance as it was.
+    pub fn script_pass_seconds(&mut self, seconds: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>) {
+        self.pass_clock = seconds;
     }
 
     pub fn info(&self) -> Result<Value> {
@@ -1680,7 +1730,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: None,
-                    saved: vec![positions], covered: Some((from, self.history.len())), root: false })
+                    saved: vec![positions], covered: Some((from, self.history.len())), root: false, kept: false })
     }
 
     /// `group.save_positions` of `from..to`, with the room for the copy asked first: host memory (pageable, charged to the commit) for hundreds of MB to
@@ -1715,7 +1765,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: Some(history),
-                    saved: Vec::new(), covered: None, root: false })
+                    saved: Vec::new(), covered: None, root: false, kept: false })
     }
 
     /// Free what a parked sequence holds (once nothing restores it).
@@ -1821,7 +1871,7 @@ impl Model {
             let common = shared(&self.history, &parked.tokens);
             if back > live && resumable && common >= parked.from() {
                 let mut parked = self.parked.take().unwrap();
-                let root = parked.root;
+                let (root, kept) = (parked.root, parked.kept);
                 let slot = if parked.slot == PARK_SLOTS[0] { PARK_SLOTS[1] } else { PARK_SLOTS[0] };
                 // The live sequence whole over what the restore overwrites: from the lowest copy too
                 // (the same tokens below `common`, but perhaps not the same bits once rewritten), or
@@ -1862,13 +1912,16 @@ impl Model {
                 if root {
                     // (the sequence is a system block at its root again: its checkpoint, which the prompt that made the state would have left)
                     self.save_checkpoint("root")?;
+                } else if kept {
+                    // (and a conversation at the place its reply began: the checkpoint the request that made the state would have left)
+                    self.save_checkpoint("turn")?;
                 }
-                return Ok(Some(if root { "prefix" } else { "restored" }));
+                return Ok(Some(if root { "prefix" } else if kept { "kept" } else { "restored" }));
             }
         }
         // A system block's imported state that this prompt does not begin with is of no use to it, and holds its host memory until something
         // takes its place.
-        if self.parked.as_ref().is_some_and(|parked| parked.root && shared(&parked.tokens, &tokens[..limit]) < parked.tokens.len()) {
+        if self.parked.as_ref().is_some_and(|parked| (parked.root || parked.kept) && shared(&parked.tokens, &tokens[..limit]) < parked.tokens.len()) {
             let parked = self.parked.take().unwrap();
             self.discard(parked)?;
         }
@@ -2437,7 +2490,12 @@ impl Model {
     /// sequence still has as the root left them), and the MTP layer's indexer history. None unless the root exists and the held sequence still
     /// begins with its tokens.
     pub fn export_prefix(&mut self) -> Result<Option<Prefix>> {
-        let Some(root) = self.checkpoints.get("root") else { return Ok(None) };
+        self.export_checkpoint("root")
+    }
+
+    /// The state a checkpoint of the held sequence is, as bytes: [`export_prefix`](Self::export_prefix)'s, of the checkpoint `kind`.
+    fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
+        let Some(root) = self.checkpoints.get(kind) else { return Ok(None) };
         let tokens = root.tokens.len();
         if tokens == 0 || tokens % 4 != 0 || shared(&self.history, &root.tokens) < tokens || (self.speculative > 0) != root.history.is_some() {
             return Ok(None);
@@ -2456,6 +2514,43 @@ impl Model {
             return Err(format!("Straydog prefix state is {} bytes where its layout has {size}", bytes.len()));
         }
         Ok(Some(Prefix { tokens, digest: crate::prefix::tokens_digest(&root.tokens), bytes }))
+    }
+
+    /// The checkpoint of the held conversation that is worth keeping for the next start: the deepest of the places a reply began (the last user
+    /// message's, the one before's, the last tool result's) that the held sequence still begins with, at least [`PARK_MINIMUM`] tokens in. The
+    /// next prompt of the same conversation begins with it, whatever the reply was.
+    fn conversation_checkpoint(&self) -> Option<&'static str> {
+        ["turn", "step", "prior"].into_iter()
+            .filter_map(|kind| self.checkpoints.get(kind).map(|checkpoint| (kind, checkpoint)))
+            .filter(|(_, checkpoint)| checkpoint.tokens.len() >= PARK_MINIMUM && shared(&self.history, &checkpoint.tokens) == checkpoint.tokens.len())
+            // (a conversation with an image in it is not kept: the rows of the image are not among the tokens, and a state read back could not tell them)
+            .filter(|(_, checkpoint)| checkpoint.tokens.iter().all(|token| (*token as usize) < VOCABULARY))
+            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len())
+            .map(|(kind, _)| kind)
+    }
+
+    /// The tokens, and the bytes, of the state [`export_conversation`](Self::export_conversation) would give: None when the held conversation has
+    /// no checkpoint worth keeping. For a caller that decides, before the copy is made, whether the room for it is there.
+    pub fn conversation_size(&self) -> Option<(usize, u64)> {
+        let checkpoint = self.checkpoints.get(self.conversation_checkpoint()?)?;
+        Some((checkpoint.tokens.len(), self.state_size(checkpoint.tokens.len(), checkpoint.final_hidden.as_ref().map_or(0, Vec::len))))
+    }
+
+    /// The bytes of a state of `tokens` tokens and a `hidden`-float hidden state: its header and sections.
+    pub fn state_size(&self, tokens: usize, hidden: usize) -> u64 {
+        let plan = self.prefix_sections(tokens, hidden);
+        crate::prefix::header(tokens, hidden, &plan).len() as u64 + plan.iter().map(|(_, bytes)| *bytes).sum::<u64>()
+    }
+
+    /// The state of the conversation the model holds, at its last checkpoint ([`crate::prefix`], the same bytes as a system block's): the tokens
+    /// up to the place the last reply began, and the sequence's recurrent state, K/V and indexer's blocks there. A later start that is handed it
+    /// ([`import_conversation`](Self::import_conversation)) takes the next request of the conversation from there, whatever the reply was. None
+    /// when the model holds no conversation with such a checkpoint.
+    pub fn export_conversation(&mut self) -> Result<Option<Prefix>> {
+        match self.conversation_checkpoint() {
+            Some(kind) => self.export_checkpoint(kind),
+            None => Ok(None),
+        }
     }
 
     /// What an import of a state of `tokens` tokens and a `hidden`-float hidden state needs of this model, to be taken at once, under the lock that
@@ -2479,6 +2574,10 @@ impl Model {
     /// request's `resumed_from` is `prefix`), and one that does not drops it. Refused, with nothing changed, if the K/V grew since the plan was made
     /// (the places of its parts changed with it). The tokens held.
     pub fn install_prefix(&mut self, image: PrefixImage, bytes: &[u8]) -> Result<usize> {
+        self.install_state(image, bytes, false)
+    }
+
+    fn install_state(&mut self, image: PrefixImage, bytes: &[u8], kept: bool) -> Result<usize> {
         if image.capacity != self.kv_capacity {
             return Err("Straydog prefix state refused: the K/V grew while it was read".into());
         }
@@ -2489,7 +2588,7 @@ impl Model {
         }
         self.group.write_recurrent(PARK_SLOTS[0], bytes, &image.recurrent)?;
         self.parked = Some(Parked { tokens: image.ids, final_hidden: image.final_hidden, slot: PARK_SLOTS[0], history: image.kept, saved: vec![image.saved],
-                                    covered: Some((0, tokens)), root: true });
+                                    covered: Some((0, tokens)), root: !kept, kept });
         Ok(tokens)
     }
 
@@ -2500,6 +2599,39 @@ impl Model {
         let parsed = crate::prefix::parse(bytes)?;
         let image = self.prefix_plan(parsed.tokens, parsed.hidden)?.decode(&parsed)?;
         self.install_prefix(image, bytes)
+    }
+
+    /// Take a state [`export_conversation`](Self::export_conversation) made, as the sequence the next request that begins with its tokens
+    /// continues (its `resumed_from` is `kept`): checked against this model's own layout to the byte, and refused with nothing changed if it
+    /// differs by one. The K/V first has room for the state and for `positions` (the prompt that is to go on from it), so that the request does not
+    /// grow it again and drop the state with its old places. The tokens held. Whatever the model held is parked, as for any request.
+    pub fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize> {
+        let parsed = crate::prefix::parse(bytes)?;
+        if parsed.tokens == 0 || parsed.tokens % 4 != 0 || parsed.tokens + 1 >= self.context || positions >= self.context {
+            return Err(format!("Straydog prefix state refused: {} tokens do not fit this model's context", parsed.tokens));
+        }
+        let plan = self.prefix_plan_for(parsed.tokens, parsed.hidden, positions)?;
+        let image = plan.decode(&parsed)?;
+        self.install_state(image, bytes, true)
+    }
+
+    /// [`prefix_plan`](Self::prefix_plan) with the K/V grown to `positions` first, where it is short of them.
+    fn prefix_plan_for(&mut self, tokens: usize, hidden: usize, positions: usize) -> Result<PrefixPlan> {
+        if tokens <= self.kv_capacity && positions <= self.kv_capacity {
+            return self.prefix_plan(tokens, hidden);
+        }
+        // (a check of what the K/V's size does not decide, before it is grown for the state)
+        if hidden != 0 && hidden != WIDTH {
+            return Err(format!("Straydog prefix state refused: a hidden state of {hidden} floats"));
+        }
+        self.ensure_kv(tokens.max(positions))?;
+        self.prefix_plan(tokens, hidden)
+    }
+
+    /// Of `tokens`, how many the model holds already, in the live sequence or the parked one.
+    pub fn held_prefix(&self, tokens: &[u32]) -> usize {
+        let parked = self.parked.as_ref().map_or(&[][..], |parked| &parked.tokens[..]);
+        shared(&self.history, tokens).max(shared(parked, tokens))
     }
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
@@ -2706,15 +2838,24 @@ impl Model {
         Ok(())
     }
 
-    /// The cut of a partially resident model's drawn draft, from what a second row costs this machine at this budget, measured: one
-    /// pass with a draft costs c passes without. A draft is kept with the overlap of the two distributions, which 2319 rows of a served
-    /// run put near 0.45 + 0.4 * the drawn distribution's greatest probability (0.95 past 0.9). Weighing that overlap against c - 1 at the
-    /// rate a pass already earns gives the line below, and the sweeps agree, tok/s by cut (0, 0.3, 0.45, 0.6): R9700 at --vram 8, c 1.36:
-    /// 67.4, 67.1, 65.6, 64.4; at --vram 5, c 1.5: 52.1, 53.4, 52.9, 52.2; RTX 5070 Ti at --vram 12, c 1.65: 66.6, 68.1 at 0.4, 69.1 at 0.6.
-    fn partial_drawn_cut(&self) -> f32 {
-        match self.pass_seconds {
-            [one, two] if one > 0.0 && two > 0.0 => (2.75 * (two / one - 1.0) - 1.125).clamp(0.0, 0.9) as f32,
-            _ => PARTIAL_DRAFT_CUT,
+    /// The cut of a partially resident model's drawn draft at position `at` (1 the first), from what the row it adds costs this machine at
+    /// this budget, measured: for the first, one pass with a draft costs c passes without. A draft is kept with the overlap of the two
+    /// distributions, which 2319 rows of a served run put near 0.45 + 0.4 * the drawn distribution's greatest probability (0.95 past 0.9).
+    /// Weighing that overlap against c - 1 at the rate a pass already earns gives the line below, and the sweeps agree, tok/s by cut (0, 0.3,
+    /// 0.45, 0.6): R9700 at --vram 8, c 1.36: 67.4, 67.1, 65.6, 64.4; at --vram 5, c 1.5: 52.1, 53.4, 52.9, 52.2; RTX 5070 Ti at --vram 12,
+    /// c 1.65: 66.6, 68.1 at 0.4, 69.1 at 0.6. A later draft's row costs what the pass of one row more costs over the one before it, in
+    /// passes of one row (c - 1 is that for the first); until that is known it is cut as the draft before it.
+    fn partial_drawn_cut(&self, at: usize) -> f32 {
+        drawn_cut(&self.pass_seconds, at)
+    }
+
+    /// The cut of the draft at position `at` (1 the first): the chain of drafts ends before one whose product of probabilities falls below it.
+    fn draft_cut(&self, drawn: bool, at: usize) -> f32 {
+        match (drawn, self.partial) {
+            (true, true) => self.partial_drawn_cut(at),
+            (true, false) => DRAWN_DRAFT_CUT,
+            (false, true) => PARTIAL_DRAFT_CUT,
+            (false, false) => DRAFT_CUT,
         }
     }
 
@@ -2765,12 +2906,7 @@ impl Model {
         self.phase("draft: catch-up and first draft", &mut clock);
         let Some(step) = step else { return Ok((Vec::new(), Vec::new())) };
         let Some((token, mut chain)) = take(step, rng)? else { return Ok((Vec::new(), Vec::new())) };
-        let cut = match (top > 0, self.partial) {
-            (true, true) => self.partial_drawn_cut(),
-            (true, false) => DRAWN_DRAFT_CUT,
-            (false, true) => PARTIAL_DRAFT_CUT,
-            (false, false) => DRAFT_CUT,
-        };
+        let cut = self.draft_cut(top > 0, 1);
         // (at a cut of 0 no pass would run alone, and what a lone row costs would never be measured again)
         if chain < cut || (self.partial && self.passes_with_draft >= PASSES_BETWEEN_LONE_ROWS) {
             return Ok((Vec::new(), Vec::new()));
@@ -2785,7 +2921,7 @@ impl Model {
             let Some((token, probability)) = take(step, rng)? else { break };
             self.phase("draft: next draft", &mut clock);
             chain *= probability;
-            if chain < cut {
+            if chain < self.draft_cut(top > 0, drafts.len() + 1) {
                 break;
             }
             drafts.push(token);
@@ -3135,6 +3271,9 @@ impl Model {
         let mut ngrams = Ngrams::new();
         ngrams.extend(&self.history);
         let mut policy = Policy::new(self.copy_drafts + 1);
+        if let Some(chooser) = self.width.as_mut() {
+            chooser.begin_request();
+        }
         while produced < max_new {
             if cancelled() {
                 break;
@@ -3142,13 +3281,19 @@ impl Model {
             let pass_started = Instant::now();
             // (while a round of the assist's tuner times decode passes of one row, none has drafts: crate::assist)
             let probing = self.assist_probing();
-            let limit = if probing { 0 } else { self.speculative.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            // How many drafts this pass offers: the width in force, or a stretch of a probe that keeps what the windows hold of the others
+            // current. The passes of a verified known sequence and of an assist round are not the chooser's.
+            let plan = match self.width.as_mut() {
+                Some(chooser) if !probing && self.forced_rows.is_none() => chooser.plan(),
+                _ => width::Plan { drafts: self.drafts, probe: false },
+            };
+            let limit = if probing { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let copy_limit = if probing { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            let copy_limit = if probing || plan.probe { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
@@ -3217,11 +3362,26 @@ impl Model {
             self.metric_count("accepted_tokens", accepted as u64);
             self.metric_add("decode_seconds", pass_started.elapsed().as_secs_f64());
             let seconds = pass_started.elapsed().as_secs_f64();
+            let seconds = self.pass_clock.as_ref().map_or(seconds, |clock| clock(rows.len()));
             if let Some(mean) = self.pass_seconds.get_mut(rows.len().wrapping_sub(1)) {
                 // (a pass that waited for the drive says nothing of a row's cost)
                 *mean = if *mean > 0.0 { *mean + (seconds.min(3.0 * *mean) - *mean) / 16.0 } else { seconds };
             }
             self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
+            // What the pass cost and kept goes to the windows the drafts are chosen by; the end of a probe may change them.
+            if !probing && !copied && self.forced_rows.is_none() {
+                let outcome = self.width.as_mut().and_then(|chooser| chooser.record(plan, limit, rows.len(), accepted, seconds));
+                if let Some(outcome) = outcome {
+                    if outcome.worth_saying() {
+                        eprintln!("{}", outcome.line());
+                    }
+                    if outcome.chosen != self.drafts {
+                        self.drafts = outcome.chosen;
+                        self.copy_drafts = outcome.chosen;
+                        policy.set_rows(self.copy_drafts + 1);
+                    }
+                }
+            }
             self.assist_tokens(emitted.len() as u64);
             if let Some(count) = self.pass_counts.get_mut(rows.len().wrapping_sub(1)) {
                 *count += 1;
@@ -3293,7 +3453,7 @@ impl Model {
         self.ple_wait = 0.0;
         if self.partial {
             self.hybrid_counts = self.group.info().unwrap_or_default();
-            self.pass_counts = [0; 2];
+            self.pass_counts = [0; PARTIAL_ROWS];
             self.memory_before = crate::host::memory_note();
             self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             self.cpu_phases_before = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
@@ -3340,7 +3500,8 @@ impl Model {
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
                 "slots": info["cached_experts"], "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
-                "passes": self.pass_counts, "pass_ms": [1e3 * self.pass_seconds[0], 1e3 * self.pass_seconds[1]],
+                "passes": self.pass_counts, "pass_ms": self.pass_seconds.map(|seconds| 1e3 * seconds),
+                "drafts": (self.speculative > 0).then_some(self.drafts),
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
                 "page_faults": faults,
@@ -3395,7 +3556,10 @@ impl Model {
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
         // (the sequence a start was handed, and this prompt began with)
-        let resumed = if parked == Some("prefix") { "prefix" } else { resumed };
+        let resumed = match parked {
+            Some(origin @ ("prefix" | "kept")) => origin,
+            _ => resumed,
+        };
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
             "parked": parked, "park_seconds": park_seconds, "park_copied_positions": 0,
@@ -3631,6 +3795,44 @@ mod profile_tests {
         for other in ["verify: head", "verify: layers (first device)", "draft: embeddings", "accept", "PLE prefetch", "commit: DeltaNet replay"] {
             assert_eq!(decode_part(other), None, "{other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::{drawn_cut, PARTIAL_DRAFT_CUT};
+
+    /// The first draft's cut is the one the second row's cost has always given, in passes of one row: c 1.5 gives a quarter, c 1.65 two
+    /// thirds, c 1.36 (or less, a row nearly free) none.
+    #[test]
+    fn the_first_drafts_cut_is_that_of_the_second_rows_cost() {
+        let cut = |one: f64, two: f64| drawn_cut(&[one, two, 0.0, 0.0], 1);
+        assert!((cut(20.0, 30.0) - 0.25).abs() < 1e-6, "{}", cut(20.0, 30.0));
+        assert!((cut(20.0, 33.0) - 0.6625).abs() < 1e-6, "{}", cut(20.0, 33.0));
+        assert_eq!(cut(20.0, 27.2), 0.0);
+        assert_eq!(cut(20.0, 20.0), 0.0);
+        assert_eq!(cut(20.0, 60.0), 0.9);
+    }
+
+    /// A later draft is cut by what its own row costs over the row before it, in passes of one row.
+    #[test]
+    fn a_later_drafts_cut_is_that_of_its_own_rows_cost() {
+        // 20 ms a pass of one row, 30 of two (the first draft's row costs half a pass), 32 of three (the second's a tenth), 52 of four (a whole one)
+        let seconds = [20.0, 30.0, 32.0, 52.0];
+        assert!((drawn_cut(&seconds, 1) - 0.25).abs() < 1e-6);
+        assert_eq!(drawn_cut(&seconds, 2), 0.0);
+        assert_eq!(drawn_cut(&seconds, 3), 0.9);
+    }
+
+    /// Until a draft's row has been timed it is cut as the draft before it, and the first as the fixed cut.
+    #[test]
+    fn a_draft_whose_row_is_not_timed_is_cut_as_the_one_before() {
+        assert_eq!(drawn_cut(&[0.0; 4], 1), PARTIAL_DRAFT_CUT);
+        assert_eq!(drawn_cut(&[20.0, 0.0, 0.0, 0.0], 1), PARTIAL_DRAFT_CUT);
+        assert_eq!(drawn_cut(&[20.0, 0.0, 0.0, 0.0], 3), PARTIAL_DRAFT_CUT);
+        let seconds = [20.0, 30.0, 0.0, 0.0];
+        assert_eq!(drawn_cut(&seconds, 2), drawn_cut(&seconds, 1));
+        assert_eq!(drawn_cut(&seconds, 3), drawn_cut(&seconds, 1));
     }
 }
 

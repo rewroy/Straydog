@@ -142,10 +142,10 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         // its failure, so that whatever runs it can start it again.
         let failure = Arc::new(std::sync::Mutex::new(None));
         let stop = {
-            let (failed, failure) = (engine.failed(), failure.clone());
+            let (failed, failure, stop_on_stdin) = (engine.failed(), failure.clone(), settings.stop_on_stdin);
             async move {
                 tokio::select! {
-                    () = shutdown() => {}
+                    () = shutdown(stop_on_stdin) => {}
                     message = failed => *failure.lock().unwrap() = Some(message),
                 }
             }
@@ -154,9 +154,28 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         monitor.stop().await;
         drop(monitor);
         // The router and the sampler are gone; the worker exits, and its GPU memory is free,
-        // before the server does.
-        if let Some(engine) = Arc::into_inner(engine) {
+        // before the server does. A connection that has just closed may still be letting go of its
+        // handle on the engine: it is waited for a moment, for an engine left open ends the worker
+        // by killing it, and the conversation it holds is not kept (`keep_conversation`).
+        let mut engine = engine;
+        let began = std::time::Instant::now();
+        let owned = loop {
+            match Arc::try_unwrap(engine) {
+                Ok(owned) => break Some(owned),
+                Err(shared) if began.elapsed() < std::time::Duration::from_secs(10) => {
+                    engine = shared;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(_) => break None,
+            }
+        };
+        if let Some(engine) = owned {
+            if began.elapsed() > std::time::Duration::from_millis(5) {
+                tracing::debug!("Straydog: the engine was let go of after {} ms", began.elapsed().as_millis());
+            }
             engine.close().await;
+        } else {
+            tracing::warn!("Straydog: something still holds the engine after 10 s, so it is not closed in order");
         }
         served?;
         let failure = failure.lock().unwrap().take();
@@ -164,21 +183,73 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     })
 }
 
-async fn shutdown() {
+/// Resolves when the server is to stop on purpose: Ctrl+C, SIGTERM (Linux), the console being closed or Windows ending the session, or a line `stop`
+/// on standard input (with `--stop-on-stdin`, for a program that starts the server and has no console to send it Ctrl+C with: a pipe only that program
+/// holds). The conversation the engine holds is kept at such a stop (`keep_conversation`).
+async fn shutdown(stop_on_stdin: bool) {
     let interrupt = tokio::signal::ctrl_c();
+    let asked = stop_asked(stop_on_stdin);
     #[cfg(unix)]
     {
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
-        tokio::select! { _ = interrupt => {}, _ = terminate.recv() => {} }
+        tokio::select! { _ = interrupt => {}, _ = terminate.recv() => {}, () = asked => {} }
     }
-    #[cfg(not(unix))]
-    let _ = interrupt.await;
+    #[cfg(windows)]
+    {
+        tokio::select! { _ = interrupt => {}, () = windows_ends() => {}, () = asked => {} }
+    }
+    #[cfg(not(any(unix, windows)))]
+    tokio::select! { _ = interrupt => {}, () = asked => {} }
     tracing::info!("Straydog stopping");
+}
+
+/// Ctrl+Break, the console closing, the user logging off and Windows shutting down: each ends the process when its handler returns, which tokio holds off
+/// until the server has gone (Windows gives a console process a few seconds more). Never, where none of them can be listened for.
+#[cfg(windows)]
+async fn windows_ends() {
+    use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let (Ok(mut brk), Ok(mut close), Ok(mut logoff), Ok(mut shutdown)) = (ctrl_break(), ctrl_close(), ctrl_logoff(), ctrl_shutdown()) else {
+        return std::future::pending().await;
+    };
+    tokio::select! { _ = brk.recv() => {}, _ = close.recv() => {}, _ = logoff.recv() => {}, _ = shutdown.recv() => {} }
+}
+
+/// Resolves when a line `stop` arrives on standard input, if `enabled`; never otherwise, and never when the input ends (a program that is gone takes
+/// the engine with it by other means). Nothing else on standard input is read as anything.
+async fn stop_asked(enabled: bool) {
+    if !enabled {
+        return std::future::pending().await;
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new().name("straydog-stop".into()).spawn(move || {
+        if stop_is_asked(std::io::stdin().lock()) {
+            let _ = sender.send(());
+        }
+    });
+    if spawned.is_err() || receiver.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Whether a line `stop` comes before `input` ends.
+fn stop_is_asked(input: impl std::io::BufRead) -> bool {
+    input.lines().map_while(Result::ok).any(|line| line.trim().eq_ignore_ascii_case("stop"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::drafter_phrase;
+    use super::{drafter_phrase, stop_is_asked};
+
+    /// A line `stop` on the input stops the server, whatever comes before it and after its line end; an input that ends without one does not.
+    #[test]
+    fn a_line_stop_on_the_input_asks_for_the_stop() {
+        assert!(stop_is_asked(&b"stop\n"[..]));
+        assert!(stop_is_asked(&b"hello\r\n  Stop \r\nmore\n"[..]));
+        assert!(stop_is_asked(&b"stop"[..]), "a last line with no line end");
+        assert!(!stop_is_asked(&b""[..]), "an input that ends: the program is gone");
+        assert!(!stop_is_asked(&b"stopping\nhalt\n"[..]));
+        assert!(!stop_is_asked(&b"\xff\xfe not text, not stop\n"[..]), "bytes that are no text end the reading");
+    }
 
     /// The starting line names the drafter that will be used, and never says there is none when
     /// DSpark's file is there.

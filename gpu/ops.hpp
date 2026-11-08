@@ -2177,7 +2177,13 @@ __device__ __forceinline__ void index_select_block(const float* q, const float* 
         for (int h = 0; h < H; ++h) {
             if (wmma || size_t(h) >= heads) break;
             const float* at = weights + row * heads + h;
+#if defined(__CUDACC__)
+            // nvcc does not honor the Clang pragma above. Round the product as the
+            // separate score kernel's shared-memory store does, before adding it.
+            const float term = __fmul_rn(fmaxf(acc[h], 0.0f), (weights_done ? hc_step_load(const_cast<float*>(at)) : *at));
+#else
             const float term = fmaxf(acc[h], 0.0f) * (weights_done ? hc_step_load(const_cast<float*>(at)) : *at);
+#endif
             total = total + term;
         }
         const float score = g < limit ? total * scale : -INFINITY;

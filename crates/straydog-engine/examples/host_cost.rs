@@ -5,8 +5,6 @@ use std::time::Instant;
 
 use straydog_engine::weights::{ngram_rows, Weights};
 
-#[global_allocator]
-static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::HugePages;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

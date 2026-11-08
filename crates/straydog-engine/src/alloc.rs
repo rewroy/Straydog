@@ -1,45 +1,14 @@
-//! A global allocator for processes that move large host buffers (prompt rows, logits).
+//! Transparent huge pages for the long-lived host buffers ([`crate::storage::Buffer`]: the expert host tier's arenas, the loader's slots).
 //!
-//! Large allocations come from fresh anonymous mappings, so a 160 MB prompt buffer costs
-//! some 40,000 page faults on first touch. As NumPy does, the allocator asks Linux to back
-//! allocations of 4 MiB and more with transparent huge pages (2 MiB faults instead).
-
-use std::alloc::{GlobalAlloc, Layout, System};
-
-pub struct HugePages;
+//! Only those are advised. A process whose every large allocation asked for huge pages (a global allocator did, for a prompt's rows and
+//! logits) had Linux compact memory at those allocations' first touch whenever it was short of free memory, as a long prompt beside a
+//! 102 GiB host tier is; compaction migrated the host tier's small pages, and each migration of a page-locked range stopped every GPU queue
+//! of the process (a KFD eviction): a 93K-token prompt on two R9700s stood still some 10 s of its 67. Huge pages are passed by compaction.
 
 #[cfg(target_os = "linux")]
 const HUGE_THRESHOLD: usize = 4 << 20;
 
-unsafe impl GlobalAlloc for HugePages {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let pointer = unsafe { System.alloc(layout) };
-        advise(pointer, layout.size());
-        pointer
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let pointer = unsafe { System.alloc_zeroed(layout) };
-        advise(pointer, layout.size());
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let pointer = unsafe { System.realloc(pointer, layout, size) };
-        advise(pointer, size);
-        pointer
-    }
-}
-
-/// Ask Linux for transparent huge pages behind an allocation of 4 MiB or more (a hint).
+/// Ask Linux for transparent huge pages behind an allocation of 4 MiB or more (a hint), before its first touch.
 pub fn advise(pointer: *mut u8, size: usize) {
     #[cfg(target_os = "linux")]
     if !pointer.is_null() && size >= HUGE_THRESHOLD {

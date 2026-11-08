@@ -621,7 +621,8 @@ pub(crate) mod tests {
         // Qwen3.8 has the MTP drafter and the vision encoder, and no DSpark
         assert_eq!(entry("Q2_0").default_extras(), [Extra::Mtp, Extra::Vision]);
         assert_eq!((entry("Q2_0").sidecar(Extra::Vision).unwrap().download, entry("Q2_0").sidecar(Extra::Vision).unwrap().tree), (907_543_008, 0));
-        assert_eq!(entry("UD-IQ2_XXS").default_extras(), [Extra::Vision]);
+        // every DeepSeek-V4.1 bundle has the model's DSpark drafter (Unsloth's UD-IQ2_XXS as the others)
+        assert_eq!(entry("UD-IQ2_XXS").default_extras(), [Extra::Dspark, Extra::Vision]);
         // Unsloth's Qwen3.8 UD-IQ1_M: its three shards (68.0 GB) beside the official resources, and Qwen3.8's extras
         let unsloth = Entry::of(Id { model: MODEL, provider: UNSLOTH, quant: "UD-IQ1_M" }).unwrap();
         assert_eq!(unsloth.architecture, "qwen4exp");

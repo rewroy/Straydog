@@ -476,8 +476,8 @@ pub fn dspark_source(id: Id) -> Result<Option<DsparkSource>, String> {
     }
     let pins = on_demand(id)?;
     let manifest: Value = serde_json::from_str(DSPARK_MANIFEST).map_err(|exc| exc.to_string())?;
-    let listed = manifest["bundles"].as_array().is_some_and(|bundles| bundles.iter().any(|bundle| bundle["provider"] == id.provider && bundle["quant"] == id.quant));
-    if manifest["architecture"] != pins.architecture.as_str() || !listed {
+    // (the model's drafter, whatever the bundle's provider and quantization: it only proposes, and every draft is verified)
+    if manifest["architecture"] != pins.architecture.as_str() {
         return Ok(None);
     }
     let dspark = &manifest["dspark"];
@@ -957,17 +957,19 @@ mod tests {
         assert!(footprint(Id { model: MODEL, provider: ISTA, quant: "Q8_0" }).unwrap_err().contains("no footprint"));
     }
 
-    /// DSpark's drafter is pinned for the GSQ-RCO bundles and UD-IQ1_M, as Unsloth's file of a repository at
-    /// a revision, and found in its directory or beside it; when found, its verity tree is among the
-    /// bundle's (from the directory it lies in).
+    /// DSpark's drafter is pinned for every DeepSeek-V4.1 bundle, as Unsloth's file of a repository at a revision,
+    /// and found in its directory or beside it; when found, its verity tree is among the bundle's (from the
+    /// directory it lies in).
     #[test]
-    fn the_dspark_drafter_is_pinned_for_the_gsq_rco_bundle_and_found_in_its_directories() {
+    fn the_dspark_drafter_is_pinned_for_every_deepseek_bundle_and_found_in_its_directories() {
         let source = dspark_source(ds("IQ2_XS")).unwrap().expect("a pinned DSpark");
         assert_eq!((source.asset.sha256.len(), source.verity.len(), source.revision.len()), (64, 64, 40));
         assert_eq!((source.repository.as_str(), source.asset.name.as_str()), ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", source.path.as_str()));
         assert!(!source.asset.name.contains('/') && source.asset.bytes > 7_000_000_000);
-        assert!(dspark_source(ds("UD-IQ2_XXS")).unwrap().is_none() && dspark_source(qw("IQ2_XS")).unwrap().is_none());
-        assert_eq!(dspark_source(ds("IQ2_XXS")).unwrap().unwrap().asset, source.asset);
+        assert!(dspark_source(qw("IQ2_XS")).unwrap().is_none());
+        for quant in ["IQ2_XXS", "UD-IQ1_M", "UD-IQ2_XXS"] {
+            assert_eq!(dspark_source(ds(quant)).unwrap().unwrap().asset, source.asset, "{quant}");
+        }
         let pins = source.pins();
         assert_eq!((pins.architecture.as_str(), pins.shards.len(), pins.verity.len(), pins.sidecars.len()), ("dflash", 1, 1, 0));
 
@@ -991,8 +993,9 @@ mod tests {
         std::fs::create_dir_all(root.join("dspark")).unwrap();
         std::fs::write(root.join("dspark").join(&source.asset.name), b"").unwrap();
         assert_eq!(dspark_in(&root, ds("IQ2_XS")).unwrap().unwrap().1, root.join("dspark").join(&source.asset.name));
-        // no other bundle's model has it
-        assert!(dspark_in(&root, ds("UD-IQ2_XXS")).unwrap().is_none());
+        // another quantization of the model finds the same file; no other model has one
+        assert_eq!(dspark_in(&root, ds("UD-IQ2_XXS")).unwrap().unwrap().1, root.join("dspark").join(&source.asset.name));
+        assert!(dspark_in(&root, qw("IQ2_XS")).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&family);
     }
 }

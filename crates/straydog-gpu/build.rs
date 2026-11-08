@@ -2,7 +2,8 @@
 //! the vendor libraries it needs.
 //!
 //! Environment: STRAYDOG_GPU_ARCHITECTURES (default gfx1201 for HIP, "75-real;86-real;89-real;120"
-//! for CUDA), ROCM_PATH (default /opt/rocm), CUDA_PATH.
+//! for CUDA), ROCM_PATH (default /opt/rocm), CUDA_PATH (where the build finds the toolkit; the executable's
+//! run path on Linux names /usr/local/cuda/lib64 and /usr/local/cuda-13/lib64, whatever CUDA_PATH is).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -66,9 +67,15 @@ fn main() {
     };
     if !windows {
         println!("cargo:rustc-link-lib=dylib=stdc++");
-        // Where the vendor runtime is found at run time: the one built against, then the standard link.
+        // Where the vendor runtime is found at run time. HIP: the one built against, then the standard link. CUDA: the places NVIDIA's
+        // packages and runfile install to (/usr/local/cuda links to the version in use) and not the toolkit this was built with, so that
+        // no build path is in the executable; a runtime that ldconfig knows is found by the loader's cache anyway.
         // Dependents' build scripts read this as DEP_STRAYDOG_GPU_RPATH.
-        let rpath = format!("{}:/opt/rocm/lib", runtime.display());
+        let rpath = if hip {
+            format!("{}:/opt/rocm/lib", runtime.display())
+        } else {
+            "/usr/local/cuda/lib64:/usr/local/cuda-13/lib64".to_string()
+        };
         println!("cargo:rpath={rpath}");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{rpath}");
     }
