@@ -140,7 +140,7 @@ struct ExpertScratch {
     std::vector<std::pair<void*, size_t>> buffers;
     template<class T> T* get(size_t count) {
         const size_t bytes = std::max<size_t>(count * sizeof(T), 16) + allocation_tail;
-        if (bytes > d.budget - d.used) throw std::runtime_error("Straydog VRAM budget exceeded");
+        if (bytes > d.budget - d.used) throw std::runtime_error(budget_exceeded(d, bytes));
         void* pointer = nullptr;
         check(hipMalloc(&pointer, bytes));
         buffers.emplace_back(pointer, bytes);
