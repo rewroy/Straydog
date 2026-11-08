@@ -10,8 +10,8 @@
 A local inference engine with an OpenAI-compatible server, in one executable per GPU
 backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash.
 
-It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). AMD GPUs on Windows
-are not supported.
+It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). Linux with NVIDIA GPUs
+(CUDA) has been run under WSL2 and not yet on native Linux. AMD GPUs on Windows are not supported.
 
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
@@ -37,6 +37,18 @@ ROCM_PATH=/opt/rocm/core-10.0 cargo build --release --features hip
 # other AMD GPUs: STRAYDOG_GPU_ARCHITECTURES="gfx1100;gfx1201"
 ```
 
+Linux with NVIDIA GPUs (the CUDA 13 Toolkit and its host compiler, CMake, make or Ninja, the NVIDIA
+driver and bubblewrap; RTX 20/30/40/50 by default). Name the toolkit in `CUDA_PATH` and put its `bin`
+on `PATH`:
+
+```bash
+CUDA_PATH=/usr/local/cuda-13.3 PATH=/usr/local/cuda-13.3/bin:$PATH cargo build --release --features cuda
+# other GPUs (the default is 75-real;86-real;89-real;120): STRAYDOG_GPU_ARCHITECTURES=89-real
+```
+
+It has been run under WSL2 (the driver is the Windows one and the toolkit the Linux one inside WSL,
+[gpu/README.md](gpu/README.md)), and not yet on native Linux.
+
 Windows, NVIDIA GPUs only (CUDA 13, from an "x64 Native Tools Command Prompt" with Ninja and the
 CUDA Toolkit; RTX 20/30/40/50 by default):
 
@@ -46,9 +58,11 @@ rem other GPUs (the default is 75-real;86-real;89-real;120): set STRAYDOG_GPU_AR
 ```
 
 The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm's
-`libamdhip64` and `libhipblas` on Linux, the NVIDIA driver and `cublas64_13.dll`
-(next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
-bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm only.
+`libamdhip64` and `libhipblas` on Linux with AMD GPUs, the NVIDIA driver and the CUDA 13 runtime
+(`libcublas.so.13` and `libcublasLt.so.13`, in `/usr/local/cuda/lib64` or `/usr/local/cuda-13/lib64`
+or wherever `ldconfig` lists them, as NVIDIA's packages install them) on Linux with NVIDIA GPUs, the
+NVIDIA driver and `cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows.
+Linux also needs bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
 
 ## Run
 
@@ -107,6 +121,36 @@ Every setting is an option; each also reads a `STRAYDOG_*` variable (`STRAYDOG_C
 and `--config FILE` reads them from a TOML file (with no `--config` and no model given, the one
 `setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
 settings in effect and where each came from.
+
+### Keeping a conversation across starts (Windows)
+
+An engine that starts again, as an app's update makes it, holds none of the conversation it held:
+the next request of a long conversation reads all of it again (36,169 tokens took 84 s on an
+RTX 4060 at 5.5 GiB). With `--keep-conversation` (`keep_conversation = true` in the config file) it
+does not.
+- **What is kept.** When the server stops on purpose, once, the state of the conversation the engine
+  held last, at the place its last reply began: the tokens, and the recurrent state, K/V and indexer
+  blocks of its positions. A conversation with an image in it is not kept, nor one under 1024 tokens.
+- **When it is written.** At the stop and at no other time: Ctrl+C, the console closing, Windows
+  ending the session, or a line `stop` on standard input (`--stop-on-stdin`, for a program that
+  starts the server and has no console to send Ctrl+C to). Nothing is written while requests run or
+  per request: the drive sees one write a stop. A state larger than the memory or the drive has room
+  for is not written, and the log says so in one line.
+- **Where, and sealed how.** `<data dir>/conversation`, one file a bundle, a new one replacing the
+  old. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
+  account, as the engine's other saved state is (the system block's, `prefix`): another user cannot
+  open it, and a changed byte refuses it. Its tokens are a sealed part of their own.
+- **At the next start** the file is opened lazily: its tokens are read, and the state stays on the
+  drive until the first request whose prompt begins with them. That request reads it from the file
+  and goes on from there; the request line says `reused 38968 from kept, loaded in 1.8 s`. A
+  request that does not begin with them leaves the file as it is, for a later one. A file of
+  another build, bundle or placement of the engine is deleted, as is one that does not open, and
+  with the option off at the start the file is deleted.
+- **What it costs and saves.** The file is about 28 KB a token (1.0 GB for 36,000 tokens), written
+  in 2 to 2.5 s at the stop (the stop takes 3.5 to 4.7 s). On an RTX 5070 Ti held to 5.5 GiB a
+  conversation of 38,975 tokens was read in 48.9 s from nothing, and in 1.8 s of loading and 2.2 s to
+  the first token from the kept state.
+- **Off by default.** Without the option nothing of a conversation is written to the drive.
 
 A bundle is named by three labels: its model (`--model-name`), its provider, who quantized it
 (`--provider`), and its quantization (`--quant`). Where fewer name one bundle, fewer will do;
@@ -204,7 +248,7 @@ Where it rounds, and how to turn it off:
 | DeepSeek's compressed K/V rows and index keys | BF16, rounded to nearest; the window rows stay F32 | none |
 | DeepSeek's hyper-connection weights | BF16 on the device (F32 in the GGUF) | none |
 | MTP drafter (Qwen3.8) | its experts quantized to Q2_0 when it is built: this changes only how many drafts are accepted, never the output | run without `-md` |
-| DSpark drafter (DeepSeek) | each stage routes among its most used experts (98% of its routes): this changes only how many drafts are accepted | `DS41_DSPARK_RESIDENT=all` (`DS41_DSPARK=0`: no drafter) |
+| DSpark drafter (DeepSeek) | each stage routes among its 48, 28 and 16 most used experts, which leaves the target more expert slots: this changes only how many drafts are accepted | `DS41_DSPARK_RESIDENT=all` (`DS41_DSPARK=0`: no drafter) |
 | Qwen3.8's experts beyond VRAM (partial residency) | the CPU computes them (with activations rounded to 8-bit integers on a CPU with AVX-512 and VBMI or with AVX2, in F32 elsewhere) and prompt batches use the FP16 expert GEMM; which experts run where depends on timing, so decode is not bit-reproducible from run to run | full residency |
 
 How this is checked: Qwen3.8's pinned GPU generations reproduce every greedy token, logits

@@ -1,8 +1,8 @@
 # Straydog — design
 
 Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as one
-executable per GPU backend (HIP on Linux, CUDA on Windows). It serves pinned GGUF bundles of two
-models:
+executable per GPU backend (HIP on Linux, CUDA on Windows and on Linux). It serves pinned GGUF
+bundles of two models:
 
 - **DeepSeek-V4.1-Flash** (748B total, 16B active), the main one;
 - **Qwen3.8-Flash-Next**, with its MTP drafter, also the model for a small GPU (5-6 GB of VRAM)
@@ -11,8 +11,9 @@ models:
 This document describes what the code does now. It does not keep the project's history; git
 does. The roundings are listed in the README's Numerics, which this document does not repeat.
 
-Updated: 2026-11-03. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
-Windows with CUDA; DeepSeek-V4.1 has not.
+Updated: 2026-11-08. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
+Windows with CUDA; DeepSeek-V4.1 has not. Both models have run on Linux with CUDA under WSL2, isolated
+by bubblewrap, and not yet on native Linux.
 
 ## 1. Goals
 
@@ -52,9 +53,11 @@ Windows with CUDA; DeepSeek-V4.1 has not.
     whenever they are opened.
   - The drive is read-only to the engine: no swap, weight or K/V files.
     - The worker never writes.
-    - On Windows the runtime writes one thing derived from conversations: the state of the system
+    - On Windows the runtime writes two things derived from conversations: the state of the system
       block (its tools included), sealed for the user (DPAPI and AES-256-GCM), at most once per
-      run and two per bundle (section 6.4).
+      run and two per bundle (section 6.4); and, only when the person turns on
+      `keep_conversation`, the state of the conversation held last, sealed the same way, once, at a
+      stop on purpose, one file a bundle (section 6.5).
   - Straydog's own secret, its API key, never reaches the worker.
 - **Measurement.**
   - A performance change is judged by alternating A/B runs (base, new, new, base) on the same
@@ -444,8 +447,26 @@ target, and each row's logits equal what token-by-token decode would compute, bi
 Three drafters:
 
 - **Qwen3.8's MTP drafter** (`-md`, `--draft-max`, default 3). It drafts while the product of
-  the drafts' probabilities under the drafter stays at 0.6 or more. Partially resident, it drafts
-  one token a pass, or two when the slots hold at least 15% of the routed experts at load (HIP).
+  the drafts' probabilities under the drafter stays at 0.6 or more. Partially resident, how many
+  drafts a pass takes (0 to `--draft-max`, at most three) is the engine's to choose, by what its
+  passes cost this machine (`width.rs`): a pass reads the layers' dense weights once whatever its
+  rows, so where the GPU's part of a layer is the longer a second and third row cost little and
+  drafts pay, and where the CPU's experts are it each row doubles their routes and one draft gains
+  next to nothing. It starts with one draft (two on HIP when the slots hold at least 15% of the
+  routed experts at load, where that was measured) and keeps, as windows of the latest passes, the
+  seconds of a pass by its rows, the share of passes whose chain of drafts reached each position
+  (the drawn-draft cut ends a chain where the drafter is unsure, whatever the width) and the share
+  of drafts offered at it that were kept. From those the seconds a token takes at each width
+  follow: the cost of the rows a pass of that width has, weighted by how often, over one plus the
+  drafts kept; with no cut, the cost of k+1 rows over one plus the shares kept at the first k
+  positions. A width replaces the one in force only if 3% faster and by more than two and a half
+  times the error of the difference (the assist level asks for 2: passes vary by a quarter, and
+  here a decision comes at every probe). The widths not in force are probed in turn, a stretch of
+  24 passes at each with the cut in force as in any pass, so that their rows and positions stay
+  timed: 3% of the passes, and none before the 256th of a run, when a machine's memory has filled.
+  The drawn-draft cut of a sampled request weighs each draft's row by what that row costs. The log
+  says each width's milliseconds a token, the shares kept and the passes' costs, at the first
+  choice and at each change, and the request line the drafts in force.
 - **DeepSeek-V4.1's DSpark** (§7.4). It needs no option: it is used when its file sits beside the
   bundle.
 - **An n-gram lookup of the sequence's own text** (`drafts.rs`), for both models. A match of eight
@@ -569,6 +590,92 @@ read. The state was saved in 0.3 s after the reply, and the file is 323 MB.
   worker takes the state only while no request has had the engine, and it says in the log what
   became of it (`Straydog prefix: restored 4020 tokens (308 MB) in 0.9 s`).
 - **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`. Linux saves nothing.
+
+### 6.5 The conversation's state across starts (Windows, an option, off by default)
+
+The system block's state (6.4) spares a start the few thousand tokens that open every conversation.
+A long conversation is the larger cost: after an engine restart (an app update, a change of
+settings) the next request of a 36,169-token conversation read all of it again, 84 s on an RTX 4060
+at 5.5 GiB (`prompt 36169 tokens (reused 0 from none)`). With `keep_conversation = true` or
+`--keep-conversation` the conversation's state is sealed on the drive at a stop and taken back by
+the request that goes on from it.
+
+- **What is kept.** The state at a checkpoint (6.1): of the places a reply began, the deepest that
+  the held sequence still begins with and that is at least 1024 tokens in (`turn`, `step`, `prior`).
+  A request of the same conversation begins with those tokens whatever the reply was, which is why
+  the live sequence's end is not what is kept: the reply is written back by the chat template, not
+  as the model wrote it. The bytes are the system block's (6.4, `Model::export_conversation` is
+  `export_prefix` of that checkpoint): the tokens, the last token's hidden state, every device's
+  recurrent state, K/V and indexer blocks, and with MTP the MTP layer's indexer history. A
+  conversation with an image in it (a token past the vocabulary) is not kept.
+- **Import.** `Model::import_conversation` checks the bytes against the model's own layout to the
+  byte, grows the K/V to hold the state and the request that goes on from it (the state is larger
+  than the 32768 positions a partially resident model's K/V starts with, and a growth drops a parked
+  sequence's copies), and installs the state as the parked sequence, marked as a kept conversation.
+  The request that begins with its tokens takes it back as a parked sequence is taken back
+  (`resumed_from` is `kept`), and the place its reply began is a checkpoint again.
+- **Saving** (server, Windows). When the server stops on purpose, after the queue has ended and
+  before the worker is told to shut down, the server asks the worker for the state, with the most
+  bytes it has room for: the drive's free space of the data directory less 2 GiB, and the commit left
+  less 1 GiB. A state over that is not given, and one line in the log says so. The server seals it and
+  writes the file on a thread of its own, and the stop waits for it. A stop is: Ctrl+C, SIGTERM
+  (Linux, where nothing is kept), the console closing, Windows ending the session (the console
+  events `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN`, which tokio holds off the process's end
+  for), or a line `stop` on standard input with `--stop-on-stdin`. A program that starts the server
+  with no console has nothing else to send: that pipe is held by the program alone, which is why it
+  needs no address, no key and no console. Nothing is written per request.
+- **The file.** `<data dir>/conversation/<bundle>.sdconv`, one a bundle, replaced whole (a `.part`
+  file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
+
+  ```
+  0    8   STRAYCNV         56   8   the state's bytes, S
+  8    4   file version     64   4   the wrapped key's bytes, W
+  12   4   state layout     68   W   the wrapped key (DPAPI)
+  16   32  key              ..   12  the tokens' nonce
+  48   8   tokens, T        ..   12  the state's nonce
+                            ..       the tokens sealed (T u32) and their 16-byte tag
+                            ..       the state sealed, and its 16-byte tag
+  ```
+
+  Both parts are sealed under the one random key with a nonce each. The associated data is the
+  header and the part's name, and for the state also the tokens' part as the file holds it: a state
+  opens only beside its tokens, and a byte changed anywhere refuses the file.
+- **The key** is made as the system block's is, from the same facts (the bundle, the engine's
+  version and build, what the worker placed, the numeric settings: `prefix::description`), under a
+  domain of its own, and without the tokens: one file a bundle.
+- **Restoring.**
+  - After `ready` the server opens the file's header and the tokens' part, which are a few hundred
+    kilobytes, and sends the worker the tokens (`conversation_tokens`). The state stays on the
+    drive. A file whose key is not this start's (another build, bundle or placement), or that does
+    not open, is deleted with one warning; with the option off at the start the file is deleted.
+  - The worker compares every prompt with those tokens. The first that begins with all of them,
+    when the model holds none of them already, checks that the host memory has room (three times
+    the state's size: the file's bytes in the server, the same in the worker, and the copies of its
+    parts, and 2 GiB more) and asks the server for the state in the middle of the request
+    (`conversation_wanted`). The server reads and opens it and sends it (`conversation`, a frame
+    that carries bytes, 6.4). A request that does not begin with the tokens leaves the file as it
+    is, for a later one. Where the memory is not there, or the file is gone or damaged, the request
+    goes on without it, and the log says why.
+  - The request line says `reused N from kept, loaded in S s`: the time the server's read, the
+    transfer and the import took.
+- **Measured** on an RTX 5070 Ti held to 5.5 GiB (`--vram 5.5 -c 128000`), UD-IQ1_S, a conversation
+  of 38,975 tokens and then the same plus its reply and a short message (the K/V starts at 32768
+  positions, so the import grows it to 65536):
+  - read from nothing: first token at 48.9 s (798 tokens/s);
+  - stopped with the option on: 38,968 tokens, 1084 MB (28 KB a token, 30 with the MTP layer), kept in
+    2.0 to 2.5 s (the stop takes 3.5 to 4.7 s in all, the worker's own end included);
+  - the next start opens the header and the tokens in under 10 ms;
+  - the request that goes on from it: `reused 38968 from kept, loaded in 1.8 s` (the server's read
+    and opening 0.4 s, the pipe 0.3 s, the import 1.1 s), first token 2.2 s.
+  - A frame's body is read in reads of 4 MiB (`frames::read_body`): `read_to_end` sizes its reads
+    by what the last returned, a pipe gives 4 KiB, and the same bytes took 7.5 s.
+  - The first logits after the import are the same bits as a model that never stopped
+    (`conversation_gpu`, 8,124 and 38,226 tokens, with and without the MTP layer, with
+    `STRAYDOG_PROMPT_CPU=0`). They are not the logits of a model that read the whole request in one
+    go: any request that goes on from a checkpoint reads its tokens in other batches, which moves
+    this quantization's logits by a few percent (4.7% of the logits' norm at 8K), restart or none.
+- **Off.** Without `keep_conversation` nothing of a conversation reaches the drive. Elsewhere than
+  Windows the option is accepted and keeps nothing: a state sealed for the user needs DPAPI.
 
 ## 7. DeepSeek-V4.1-Flash
 
@@ -738,6 +845,9 @@ file beside the bundle.
 - It is pinned like the shards, with its repository and revision.
 - It lies in the model's `dspark` directory or in one beside the model's, so a model's
   quantizations share it. `straydog fetch` and `setup` download it.
+- Every bundle of the model uses it, whatever its provider and quantization: it only proposes
+  and every draft is verified, so no bundle needs a test of its own for its answers; how many
+  drafts are kept is what differs.
 - Its tensor names are the model's own, so it opens apart from the shards (every tensor
   verifies when taken), and its layout is checked against the model's header.
 - Absent, the server runs without it. `DS41_DSPARK=0` leaves it out; `DS41_DRAFTS=0` turns off
@@ -766,9 +876,12 @@ file beside the bundle.
     argmax is kept with p(argmax) alone;
   - with a cut or a penalty the draft stays the argmax, a point proposal.
 
-**Its VRAM.** Each stage keeps its most used routed experts resident: 87, 50 and 29 of 128 (3.1 of
-7.2 GB). They cover 98% of its routes and leave its acceptance as it was. The router's bias keeps
-the others out of a draft's top three. `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
+**Its VRAM.** Each stage keeps its most used routed experts resident: 48, 28 and 16 of 128 (1.7 of
+7.2 GB). The router's bias keeps the others out of a draft's top three. The first 87, 50 and 29 (98% of
+its routes) left its acceptance as it was, but what the drafter keeps is the target's expert slots: with
+48/28/16 a draft's tokens are kept a little less often (a code reply's 81-82% where 85-89%), and a bundle
+short of slots runs faster (UD-IQ2_XXS: code 51.7 to 55.7 tokens/s, five agent turns 26.6 to 25.5 s;
+UD-IQ1_M the same within its spread). `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
 
 **The width policy** (`drafter::Policy`). After each sampled token the drafter drafts three tokens
 (~2.3 ms), and the policy picks how many a verify pass checks. It picks the width with the most
@@ -923,6 +1036,13 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   their selected blocks, so each key and value is read once per group.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
+- Past the stage's positions (a 64th of the budget, grown into what the slots leave: some 45K at 6 GiB),
+  a qsa_flash batch copies only the union of its tokens' selected blocks into the stage and renumbers
+  the selections to it (`qsa_attention_gathered`): the same keys in the same order, so the same bits,
+  where each token read its 2052 rows over the bus before (RTX 5070 Ti, 52K tokens: 119.4 s to 61.0 s).
+  As many tokens at a time as the union fits for; the host reads the union's size, so a layer split in
+  parts keeps reading host memory. RDNA4's batched attention gathers its span's union the same way, its
+  groups reading their blocks at their places in the stage (and as many groups at a time as it fits for).
 - The K/V holds FP16 values (`kv_t`): a plane's row of a position is 256 halves, half the bytes of
   F32 in VRAM, in host memory, in the stage and its mirrors (which then hold twice the positions),
   and in a sequence's saved positions. The flash rounded keys and values to FP16 already, so a
@@ -1256,6 +1376,8 @@ named as llama-server names it where it has the same setting.
 | `--expert-ram GIB` | host tier for experts outside VRAM | 85% of host memory less Straydog's other host memory |
 | `--data-dir DIR` | verity trees and warm-up state | `.straydog` in the model directory |
 | `--no-prefix-cache`, `prefix_cache = false` | Windows: keep no state of the first request's system block on the drive (§6.4) | the state is kept |
+| `--keep-conversation`, `keep_conversation = true` | Windows: when the server stops on purpose, keep the state of the conversation held last, sealed for the user, for the next start (§6.5) | off |
+| `--stop-on-stdin` | stop on a line `stop` on standard input, as Ctrl+C stops (§6.5) | off |
 | `--gemm fp32\|fp16`, `--gemm-min-batch N` | precision of large products, smallest batch that uses GEMM | fp16, 2 |
 | `--host`, `--port` | listen address | 127.0.0.1, 8080 |
 | `--api-key KEY`, `--api-key-file FILE` | a Bearer key the server then requires | none |
@@ -1370,7 +1492,8 @@ with a model of its own reads no file it was not given.
 - Release artifacts: `straydog-linux-x86_64-hip` (needs the ROCm 10 runtime) and
   `straydog-windows-x86_64-cuda.exe` (needs the NVIDIA driver and `cublas64_13.dll`). The
   executable's SHA-256 is published with each release. The model pins are compiled in, so a
-  binary authenticates exactly the bundles it was tested with.
+  binary authenticates exactly the bundles it was tested with. Linux with CUDA is built the same
+  way and is not a release artifact yet.
 
 ## 12. Decisions
 

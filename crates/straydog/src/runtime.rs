@@ -19,6 +19,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{Gemm, Settings, SplitMode};
+use crate::conversation::Keeper;
 use crate::prefix::{Cache, Due, Restored};
 use crate::worker::FRAME_BYTES;
 
@@ -474,6 +475,16 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
     status.to_string()
 }
 
+/// Whether a line the worker wrote on stderr is in the log without --verbose. The warm-up's own account stays: how long it took, and what it
+/// placed; so does the account of the host banks a partially resident model page-locked, and when it pages or no longer; of the GPU memory
+/// freed after the start that the expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its
+/// passes cost, at the first choice and at each change.
+fn stays_in_the_log(line: &str) -> bool {
+    ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first",
+     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+        .iter().any(|start| line.starts_with(start))
+}
+
 /// The worker's last lines on stderr (an allocation that failed, a GPU error, a panic), for the log line that says it stopped: empty
 /// when it wrote none.
 fn worker_said(tail: &[u8]) -> String {
@@ -489,8 +500,13 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     let number = |key: &str| detail[key].as_f64().unwrap_or(0.0);
     let decode = timings["decode_tokens_per_second"].as_f64().map_or(0.0, |rate| 1e3 / rate.max(1e-9));
     let (wait, cpu) = (number("wait_ms"), number("cpu_ms"));
-    let passes = detail["passes"].as_array().map_or((0, 0), |counts| (counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
-    let pass_ms = detail["pass_ms"].as_array().map_or((0.0, 0.0), |ms| (ms[0].as_f64().unwrap_or(0.0), ms[1].as_f64().unwrap_or(0.0)));
+    // (the passes by rows, a pass of one row and of two always, and of more where there were some: the drafts a pass offers go up to three)
+    let pass_rows = |rows: usize| (detail["passes"][rows - 1].as_u64().unwrap_or(0), detail["pass_ms"][rows - 1].as_f64().unwrap_or(0.0));
+    let passes = (pass_rows(1), pass_rows(2));
+    let wider: String = (3..=4).map(pass_rows).zip(3..).filter(|((count, _), _)| *count > 0)
+        .map(|((count, ms), rows)| format!(", {count} of {rows} ({ms:.1} ms)")).collect();
+    // (where a drafter is: the drafts a pass offered at the end of the request, which the engine chooses by what its passes cost)
+    let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
         _ => String::new(),
@@ -518,9 +534,9 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms); prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
-            passes.0, pass_ms.0, passes.1, pass_ms.1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
+            passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
 
 /// The id the client named its request by (the worker request's `request_id`, see [`straydog_api::WorkerRequest`]).
@@ -537,11 +553,13 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: {}prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
+        "Straydog request: {}prompt {} tokens (reused {} from {}{}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
         id.map_or(String::new(), |id| format!("id {id}, ")),
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
+        // (the conversation an earlier run kept, loaded for this request: the time it took)
+        timings["kept_seconds"].as_f64().map_or(String::new(), |seconds| format!(", loaded in {seconds:.1} s")),
         // (a prompt that agreed further than it could reuse: the client changed what came before)
         match timings["agreed_tokens"].as_u64() {
             Some(agreed) if agreed > usage["cached_tokens"].as_u64().unwrap_or(0) => format!(", the same as before for {agreed}"),
@@ -871,6 +889,7 @@ impl Runtime {
             cancel_patience,
             refusal,
             prefix: Cache::new(settings),
+            keeper: Keeper::new(settings),
             saves: Mutex::new(Vec::new()),
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
@@ -936,6 +955,8 @@ struct Driver {
     refusal: Refusal,
     /// What the run keeps of its system block's state, for the next start (Windows).
     prefix: Cache,
+    /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
+    keeper: Keeper,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -988,10 +1009,13 @@ impl Driver {
             Ok(mut process) => {
                 let warming = self.restore_warm_state(&mut process).await;
                 let restoring = self.ready_frame().and_then(|ready| self.prefix.restore(&ready));
+                self.tell_kept_tokens(&mut process).await;
                 let changed = self.serve(&mut process, &mut jobs, &mut controls, warming, restoring).await;
                 if changed {
                     self.save_warm_state(&mut process).await;
                 }
+                // (the server stops on purpose: the conversation the worker holds is kept, once, with no request running)
+                self.keep_conversation(&mut process).await;
                 process.note_holders();
                 let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
                                           ("command", pyjson::Value::Str("shutdown".into()))]);
@@ -1115,6 +1139,89 @@ impl Driver {
                                 ("read_seconds", pyjson::Value::Float(restored.seconds))]);
         if let Err(message) = process.send_with_body(&header, restored.state()).await {
             tracing::warn!("Straydog could not hand its worker the system block's state: {message}");
+        }
+    }
+
+    /// Tell the worker which conversation the last run kept, if one is there: its tokens only, which are a part of the file's of their own. The state
+    /// stays on the drive until a request that begins with them asks for it ([`Driver::hand_conversation`]).
+    async fn tell_kept_tokens(&self, process: &mut Process) {
+        let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
+        let Ok(Some(tokens)) = opening.await else { return };
+        let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
+        if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
+            tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
+        }
+    }
+
+    /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
+    /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
+    async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
+        let state = match self.ready_frame() {
+            Some(ready) => {
+                let keeper = self.keeper.clone();
+                tokio::task::spawn_blocking(move || keeper.state(&ready)).await.map_err(|error| error.to_string()).and_then(|state| state)
+            }
+            None => Err("the engine is not ready".to_string()),
+        };
+        let header = |seconds: f64, reason: &str| frame(vec![("id", pyjson::Value::Str("kept-state".into())), ("command", pyjson::Value::Str("conversation".into())),
+                                                         ("read_seconds", pyjson::Value::Float(seconds)), ("reason", pyjson::Value::Str(reason.into()))]);
+        match state {
+            Ok((state, seconds)) if (state.len() as u64) <= crate::frames::BODY_LIMIT => {
+                tracing::debug!("Straydog conversation: handing its worker {} MB, opened in {seconds:.2} s", state.len() >> 20);
+                process.send_with_body(&header(seconds, ""), &state).await
+            }
+            Ok(_) => process.send_with_body(&header(0.0, "the state is larger than a frame"), &[]).await,
+            Err(reason) => process.send_with_body(&header(0.0, &reason), &[]).await,
+        }
+    }
+
+    /// The server is stopping: ask the worker for the state of the conversation it holds, and seal it into the file. One line in the log says what was
+    /// kept, or why nothing was. Nothing is written while requests run: the loop that served them is over.
+    async fn keep_conversation(&self, process: &mut Process) {
+        if !self.keeper.is_on() || !matches!(&*self.shared.phase.lock().unwrap(), Phase::Ready(_)) {
+            return;
+        }
+        let Some(ready) = self.ready_frame() else { return };
+        let started = Instant::now();
+        let limit = self.keeper.room();
+        let request = frame(vec![("id", pyjson::Value::Str("kept-state".into())), ("command", pyjson::Value::Str("conversation_state".into())),
+                                 ("limit", pyjson::Value::Int(i128::from(limit)))]);
+        let given = async {
+            process.send(&request).await?;
+            let header = tokio::time::timeout(Duration::from_secs(60), process.read()).await
+                .map_err(|_| "Straydog's worker gave no conversation state within 60 s".to_string())??;
+            if header["id"] != "kept-state" || header["event"] != "conversation_state" {
+                return Err(format!("the worker said {}", header["message"].as_str().unwrap_or("something else")));
+            }
+            let bytes = header["bytes"].as_u64().unwrap_or(0);
+            if bytes == 0 {
+                return Ok(Err(header["reason"].as_str().unwrap_or("it holds none").to_string()));
+            }
+            let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
+                .map_err(|_| "Straydog's worker did not finish the conversation state within 120 s".to_string())??;
+            Ok(Ok(state))
+        }.await;
+        let state = match given {
+            Ok(Ok(state)) => state,
+            Ok(Err(reason)) => {
+                // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
+                if reason.contains("room for") {
+                    tracing::info!("Straydog conversation: not kept ({reason})");
+                } else {
+                    tracing::debug!("Straydog conversation: nothing to keep ({reason})");
+                }
+                return;
+            }
+            Err(message) => {
+                tracing::warn!("Straydog conversation: not kept ({message})");
+                return;
+            }
+        };
+        let keeper = self.keeper.clone();
+        match tokio::task::spawn_blocking(move || keeper.save(&ready, state)).await {
+            Ok(Ok(saved)) => tracing::info!("{}", crate::conversation::saved_line(&saved, started.elapsed().as_secs_f64())),
+            Ok(Err(message)) => tracing::warn!("Straydog conversation: not kept ({message})"),
+            Err(error) => tracing::warn!("Straydog conversation: not kept ({error})"),
         }
     }
 
@@ -1304,13 +1411,7 @@ impl Driver {
                 let excess = tail.len().saturating_sub(STDERR_TAIL);
                 tail.drain(..excess);
                 let text = String::from_utf8_lossy(&line);
-                // (the warm-up's own account stays in the log without --verbose: how long it took, and what it placed; so does the
-                // account of the host banks a partially resident model page-locked, and when it pages or no longer; and of the GPU
-                // memory freed after the start that the expert slots took, or could not)
-                let warm = ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first", "Straydog prefix", "Straydog CPU experts",
-                            "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks"]
-                    .iter().any(|start| text.starts_with(start));
-                if verbose || warm {
+                if verbose || stays_in_the_log(&text) {
                     tracing::info!("worker: {text}");
                 } else {
                     tracing::debug!("worker: {text}");
@@ -1454,6 +1555,11 @@ impl Driver {
                         }
                     }
                     let kind = event["event"].as_str().unwrap_or("").to_string();
+                    if kind == "conversation_wanted" {
+                        // (the request waits for it: the kept conversation is read from the drive and sent, and the events go on)
+                        self.hand_conversation(process).await?;
+                        continue;
+                    }
                     if kind == "done" {
                         tracing::info!("{}", request_summary(&event, client_request_id(&job.body)));
                         self.prefix.note_done(&event);
@@ -1747,6 +1853,37 @@ mod tests {
         // (no page-locked layer: no level to say)
         let without = request_summary(&event(Value::Null), None);
         assert!(without.contains("assisted 70, swaps 3.0"), "{without}");
+    }
+
+    /// The engine's account of the drafts a pass offers is in the log without --verbose, as its other accounts of how it chose; its other lines
+    /// are not.
+    #[test]
+    fn the_drafts_a_pass_offers_are_said_in_the_log() {
+        assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
+        assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
+        assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
+        assert!(!stays_in_the_log("some other line"));
+    }
+
+    /// A partially resident request's line gives its passes by rows up to four, the wider ones where there were some, and the drafts the engine
+    /// had in force at its end where a drafter is placed (none, as with no drafter, says nothing).
+    #[test]
+    fn a_partial_request_line_has_the_drafts_in_force_and_the_wider_passes() {
+        let detail = |passes: Value, pass_ms: Value, drafts: Value| json!({"wait_ms": 8.0, "cpu_ms": 20.0, "gpu_routes": 200.0, "cpu_routes": 180.0,
+                                                                          "assisted_routes": 70.0, "swaps": 3.0, "slots": 900, "passes": passes,
+                                                                          "pass_ms": pass_ms, "drafts": drafts});
+        let event = |detail: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 14.0, "partial_detail": detail}});
+        let wide = request_summary(&event(detail(json!([12, 40, 400, 0]), json!([30.1, 41.5, 60.2, 0.0]), json!(2))), None);
+        assert!(wide.contains("; passes: 12 of 1 row (30.1 ms), 40 of 2 (41.5 ms), 400 of 3 (60.2 ms); drafts in force: 2; prompt streamed"), "{wide}");
+        let all = request_summary(&event(detail(json!([1, 2, 3, 4]), json!([30.0, 40.0, 50.0, 60.0]), json!(3))), None);
+        assert!(all.contains("1 of 1 row (30.0 ms), 2 of 2 (40.0 ms), 3 of 3 (50.0 ms), 4 of 4 (60.0 ms); drafts in force: 3;"), "{all}");
+        // (no drafter: the passes of one row, as before, and no drafts to say)
+        let plain = request_summary(&event(detail(json!([463, 0, 0, 0]), json!([30.9, 0.0, 0.0, 0.0]), Value::Null)), None);
+        assert!(plain.contains("; passes: 463 of 1 row (30.9 ms), 0 of 2 (0.0 ms); prompt streamed"), "{plain}");
+        // (a worker that reports two counts alone: as before)
+        let old = request_summary(&event(detail(json!([10, 3]), json!([20.0, 25.0]), Value::Null)), None);
+        assert!(old.contains("; passes: 10 of 1 row (20.0 ms), 3 of 2 (25.0 ms); prompt streamed"), "{old}");
     }
 
     /// The GPU wait is followed by what the GPU's clock says of it: the layer work, and the resident experts beside the CPU; a build or

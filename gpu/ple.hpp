@@ -41,7 +41,8 @@ __global__ void ple_convolve(float* hidden,const float* gated,const float* norma
 // exact (at most gemv_wide_vectors rows) projects every row with the one-row GEMV arithmetic,
 // so speculative rows match token-by-token decode bitwise.
 void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t steps,
-          const float* embeddings,const float* hidden,float* output,float* resident=nullptr,bool exact=false,bool wait=true) {
+          const float* embeddings,const float* hidden,float* output,float* resident=nullptr,bool exact=false,bool wait=true,
+          bool device_embeddings=false) {
     if (!pointers || !kinds || (!resident && (!hidden || !output)) || !embeddings || !steps || steps>256 ||
         steps*33280>d.output_capacity || steps*10240>d.input_capacity)
         throw std::runtime_error("invalid PLE geometry");
@@ -56,7 +57,8 @@ void ple(Device& d,void* const* pointers,const int* kinds,void* history,size_t s
     }
     auto state=d.allocations.find(history);
     if (state==d.allocations.end() || state->second!=10*10240*4) throw std::runtime_error("invalid PLE state");
-    upload(d,d.input,embeddings,steps*2560*4);
+    if (device_embeddings) check(hipMemcpyAsync(d.input,embeddings,steps*2560*4,hipMemcpyDeviceToDevice,d.stream));
+    else upload(d,d.input,embeddings,steps*2560*4);
     float* key=d.output; float* value=key+steps*10240; float* residual=resident ? resident : value+steps*2560;
     float* gated=value+steps*2560+steps*10240;
     Matrix descriptors[2][max_batch]{};

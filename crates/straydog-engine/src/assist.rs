@@ -121,7 +121,7 @@ pub struct Tuner {
 /// The mean of `samples` without the slowest eighth, and its standard error: a stall of the machine in a pass (a page fault's wait,
 /// another process's thread on a core) says nothing of its level, and one pass in 16 at ten times the rest moves the plain mean by more
 /// than [`GAIN`]. The error is that of the passes kept.
-fn trimmed_mean(samples: &[f64]) -> (f64, f64) {
+pub(crate) fn trimmed_mean(samples: &[f64]) -> (f64, f64) {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
     let kept = &sorted[..sorted.len() - sorted.len() / 8];

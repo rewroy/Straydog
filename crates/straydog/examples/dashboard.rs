@@ -77,6 +77,8 @@ fn main() {
         data_dir: PathBuf::from("/nonexistent/.straydog"),
         expert_ram: None,
         prefix_cache: false,
+        keep_conversation: false,
+        stop_on_stdin: false,
     };
     let mut worker_args = vec!["simulate-worker".into()];
     if deepseek() {
