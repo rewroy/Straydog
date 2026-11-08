@@ -155,10 +155,18 @@ void download_pieces(Device& d, const Piece* pieces, size_t count) {
     StagingCopier::instance().copy_items(items.data(), count);
     d.io_used = 0;   // the stream is idle, so every staged upload has landed
 }
+// The error of an allocation the budget cannot hold: what was asked and what was left.
+std::string budget_exceeded(const Device& value, uint64_t bytes) {
+    const double mib = 1 << 20;
+    char text[160];
+    std::snprintf(text, sizeof text, "Straydog VRAM budget exceeded (%.1f MiB asked, %.1f MiB of %.1f MiB left)", bytes / mib,
+                  value.used < value.budget ? (value.budget - value.used) / mib : 0.0, value.budget / mib);
+    return text;
+}
 // A tracked allocation within the budget; only its tail padding is zeroed.
 void* allocate(Device& value, uint64_t bytes) {
     if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
-        throw std::runtime_error("Straydog VRAM budget exceeded");
+        throw std::runtime_error(budget_exceeded(value, bytes));
     void* pointer = nullptr;
     check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
     // Track ownership before copying so the destructor also cleans up copy failures.
