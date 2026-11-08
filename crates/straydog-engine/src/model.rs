@@ -816,6 +816,12 @@ impl Model {
         crate::host::commit_note("experts placed");
         model.prepare_decoder(context64, false)?;
         crate::host::commit_note("decoder placed");
+        if model.partial {
+            // Size the expert pool beside the PLE and head mixers otherwise uploaded by the
+            // first request. These operands join the verified load before slots are sized.
+            model.with_operands(Model::ple_operands, Group::pin)?;
+            model.with_operands(Model::head_operands, Group::pin)?;
+        }
         // SAFETY of the borrow: the operand points into the weights, which outlive the group.
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;
