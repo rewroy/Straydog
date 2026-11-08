@@ -394,6 +394,9 @@ fn read_fully(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()
 
 /// Allocates and page-locks the host tier's arenas one after another, handing each over as it is
 /// ready; a dropped receiver stops it, and it unpins what it could not hand over.
+/// The most recently used host slots [`DeviceExperts::done_layer_host`] looks through.
+const DONE_LAYER_LOOK: usize = 4096;
+
 struct Pinner {
     arenas: Receiver<std::result::Result<storage::Buffer, String>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -819,6 +822,8 @@ pub struct DeviceExperts {
     deferring: bool,
     /// A prefill streams its experts through (see [`set_streaming`](Self::set_streaming)).
     streaming: bool,
+    /// The layer a streaming prefill takes its experts for (its pass has done the layers below it).
+    stream_layer: u32,
     heads_first: bool,
     tails: Vec<Tail>,
     /// The experts a begun request still fills, and the read chunk it fills them with
@@ -969,6 +974,7 @@ impl DeviceExperts {
         Ok(DeviceExperts {
             deferring: false,
             streaming: false,
+            stream_layer: 0,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
             tails: Vec::new(),
             unfilled: VecDeque::new(),
@@ -1164,6 +1170,9 @@ impl DeviceExperts {
 
     fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
         self.settled = false;
+        if self.streaming {
+            self.stream_layer = layer as u32;
+        }
         let started = std::time::Instant::now();
         let held = self.in_use.len();
         let result = self.acquire_slots(gpu, layer, experts, first);
@@ -1207,6 +1216,9 @@ impl DeviceExperts {
 
     fn begin_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], chunk: u64) -> Result<()> {
         self.settled = false;
+        if self.streaming {
+            self.stream_layer = layer as u32;
+        }
         let started = std::time::Instant::now();
         self.unfilled.clear();
         self.unfilled_chunk = chunk;
@@ -2149,8 +2161,11 @@ impl DeviceExperts {
         // While a prefill streams its experts, a write-back takes no host slot whose expert a streamed VRAM slot holds: that expert's
         // release would then write it back in turn, waiting for its upload into the slot just taken, and so on to the pass's end (a fresh
         // 7.8K-token prompt on Unsloth UD-IQ2_XXS, VRAM and the host tier holding the model with little to spare: 17,696 such write-backs,
-        // 3.3 s of waits). With no other host slot to be had, the expert leaving VRAM is let go of, to be read from the drive when wanted.
-        if self.streaming && !self.unstreamed_host_room(gpu, class)? {
+        // 3.3 s of waits). With no other host slot to be had, a resident of a layer this pass has done is let go of (the pass does not want it
+        // again), and one of a layer to come takes the slot of an expert of a done layer (see done_layer_host); with none, it is let go of
+        // too, to be read from the drive when wanted.
+        if self.streaming && !self.unstreamed_host_room(gpu, class)?
+            && (key.0 < self.stream_layer || self.done_layer_host(gpu, class)?.is_none()) {
             if let Some((_, ready)) = self.slots[slot].ready.take() {
                 self.slots[slot].guards[1].get_or_insert(ready);
             }
@@ -2203,8 +2218,10 @@ impl DeviceExperts {
             }
             // The least recently used expert's slot (its copies long done), before an emptied slot
             // whose upload is still running.
-            // (while streaming, not the copy of an expert a streamed slot holds: see evict)
-            let candidate = self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host))
+            // (while streaming, not the copy of an expert a streamed slot holds, and next an expert of a layer the pass has done: see evict)
+            let copy = self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host));
+            let done = if copy.is_none() && self.streaming { self.done_layer_host(gpu, class)? } else { None };
+            let candidate = copy.or(done)
                 .or_else(|| self.classes[class].host_lru.iter().map(|&(_, host)| host).next())
                 .or_else(|| self.classes[class].host_free.front().copied());
             let Some(host) = candidate else {
@@ -2461,6 +2478,27 @@ impl DeviceExperts {
             return Ok(true);
         }
         Ok(!self.classes[class].copies.is_empty())
+    }
+
+    /// While streaming, the host slot of an expert of a layer the pass has done that no VRAM slot holds or awaits and no copy still uses,
+    /// the least recently used first: one this pass did not route to before one it did (that the next request wants again), and never one
+    /// of a layer still to come in this pass, as the least recently used of all may be. Among the least recently used.
+    fn done_layer_host(&mut self, gpu: &mut Backend, class: usize) -> Result<Option<usize>> {
+        let layer = self.stream_layer;
+        let picks: Vec<usize> = self.classes[class].host_lru.iter().take(DONE_LAYER_LOOK).map(|&(_, host)| host)
+            .filter(|&host| self.host[host].key.is_some_and(|key| key.0 < layer && !self.map.contains_key(&key)))
+            .take(16).collect();
+        for host in picks {
+            let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
+            let mut done = true;
+            for mark in copies.into_iter().flatten() {
+                done &= gpu.mark_done(mark, false)?;
+            }
+            if done {
+                return Ok(Some(host));
+            }
+        }
+        Ok(None)
     }
 
     /// Whether host slot `host` holds the copy of an expert a streamed VRAM slot holds (a prefill's, emptied at its release).
