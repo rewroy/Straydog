@@ -824,6 +824,8 @@ pub struct DeviceExperts {
     streaming: bool,
     /// The layer a streaming prefill takes its experts for (its pass has done the layers below it).
     stream_layer: u32,
+    /// The clock when that pass took its first layer (a prompt of several passes takes layer 0 again).
+    pass_clock: u64,
     heads_first: bool,
     tails: Vec<Tail>,
     /// The experts a begun request still fills, and the read chunk it fills them with
@@ -975,6 +977,7 @@ impl DeviceExperts {
             deferring: false,
             streaming: false,
             stream_layer: 0,
+            pass_clock: 0,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
             tails: Vec::new(),
             unfilled: VecDeque::new(),
@@ -1171,7 +1174,7 @@ impl DeviceExperts {
     fn acquire_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], first: bool) -> Result<Vec<Buffer>> {
         self.settled = false;
         if self.streaming {
-            self.stream_layer = layer as u32;
+            self.stream_at(layer);
         }
         let started = std::time::Instant::now();
         let held = self.in_use.len();
@@ -1217,7 +1220,7 @@ impl DeviceExperts {
     fn begin_with(&mut self, gpu: &mut Backend, layer: usize, experts: &[usize], chunk: u64) -> Result<()> {
         self.settled = false;
         if self.streaming {
-            self.stream_layer = layer as u32;
+            self.stream_at(layer);
         }
         let started = std::time::Instant::now();
         self.unfilled.clear();
@@ -2480,14 +2483,27 @@ impl DeviceExperts {
         Ok(!self.classes[class].copies.is_empty())
     }
 
+    /// A streaming prefill takes experts for `layer`: a layer below the last one taken begins another pass of the prompt.
+    fn stream_at(&mut self, layer: usize) {
+        if (layer as u32) < self.stream_layer || self.pass_clock == 0 {
+            self.pass_clock = self.clock.max(1);
+        }
+        self.stream_layer = layer as u32;
+    }
+
     /// While streaming, the host slot of an expert of a layer the pass has done that no VRAM slot holds or awaits and no copy still uses,
-    /// the least recently used first: one this pass did not route to before one it did (that the next request wants again), and never one
-    /// of a layer still to come in this pass, as the least recently used of all may be. Among the least recently used.
+    /// never one of a layer still to come in this pass (as the least recently used of all may be). First the least recently used of those
+    /// this pass did not route to; then the most recently used of those it did, the furthest ahead for its next pass (its layers come in
+    /// order; the least recently used of them, the first layer's, comes first). The next request wants either again alike.
     fn done_layer_host(&mut self, gpu: &mut Backend, class: usize) -> Result<Option<usize>> {
-        let layer = self.stream_layer;
-        let picks: Vec<usize> = self.classes[class].host_lru.iter().take(DONE_LAYER_LOOK).map(|&(_, host)| host)
-            .filter(|&host| self.host[host].key.is_some_and(|key| key.0 < layer && !self.map.contains_key(&key)))
-            .take(16).collect();
+        let (layer, pass) = (self.stream_layer, self.pass_clock);
+        let done = |store: &Self, host: usize| store.host[host].key.is_some_and(|key| key.0 < layer && !store.map.contains_key(&key));
+        let mut picks: Vec<usize> = self.classes[class].host_lru.iter().take(DONE_LAYER_LOOK).take_while(|&&(used, _)| used < pass)
+            .map(|&(_, host)| host).filter(|&host| done(self, host)).take(16).collect();
+        if picks.is_empty() {
+            picks = self.classes[class].host_lru.iter().rev().take(DONE_LAYER_LOOK).take_while(|&&(used, _)| used >= pass)
+                .map(|&(_, host)| host).filter(|&host| done(self, host)).take(16).collect();
+        }
         for host in picks {
             let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
             let mut done = true;
