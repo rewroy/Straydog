@@ -13,8 +13,10 @@ On Linux with an NVIDIA GPU, install the Linux CUDA Toolkit, set `CUDA_PATH` to 
 `bin` on `PATH` before `cargo build --release --features cuda`. Under WSL2 the NVIDIA driver is
 installed on Windows only and the toolkit inside WSL; `/dev/dxg` and
 `/usr/lib/wsl/lib/nvidia-smi` show that the GPU is reachable. The isolated worker is given
-`/dev/dxg` when it exists, and reads `/usr` as the host has it, so keep the toolkit where the
-executable was linked against it: its runtime is then found inside the isolation too.
+`/dev/dxg` when it exists, and reads `/usr` as the host has it, so a CUDA runtime in `/usr/local`
+is found inside the isolation too. The executable looks for it in `/usr/local/cuda/lib64` and
+`/usr/local/cuda-13/lib64` (the places NVIDIA's packages and runfile install to) and where
+`ldconfig` lists it; the toolkit it was built with is not named in it, whatever `CUDA_PATH` was.
 
 The library implements compressed matrix-vector products and grouped GEMM for the
 floating-point formats, Q2_0, Q4_0/Q5_0/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,

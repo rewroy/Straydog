@@ -51,10 +51,11 @@ rem other GPUs (the default is 75-real;86-real;89-real;120): set STRAYDOG_GPU_AR
 ```
 
 The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm's
-`libamdhip64` and `libhipblas` on Linux with AMD GPUs, the NVIDIA driver and the toolkit's
-`libcublas.so.13` (where the build linked it) on Linux with NVIDIA GPUs, the NVIDIA driver and
-`cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
-bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
+`libamdhip64` and `libhipblas` on Linux with AMD GPUs, the NVIDIA driver and the CUDA 13 runtime
+(`libcublas.so.13` and `libcublasLt.so.13`, in `/usr/local/cuda/lib64` or `/usr/local/cuda-13/lib64`
+or wherever `ldconfig` lists them, as NVIDIA's packages install them) on Linux with NVIDIA GPUs, the
+NVIDIA driver and `cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows.
+Linux also needs bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
 
 ## Run
 
