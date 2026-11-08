@@ -2956,6 +2956,10 @@ impl Model {
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
         let long = self.partial && tokens.len() - position >= threshold;
         let preparing = Instant::now();
+        let empty_before_prepare = long && {
+            let (slots, held) = self.group.slots()?;
+            slots > 0 && held == 0
+        };
         if long {
             self.ensure_kv(tokens.len())?;
             if let Some(rows) = self.group.begin_long_prefill(batch as u64)? {
@@ -2964,7 +2968,7 @@ impl Model {
         }
         self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
         self.last_metrics.insert("prefill_batch_rows".into(), json!(batch));
-        let output = self.prefill_batches(tokens, position, plan, batch, cancelled, progress);
+        let output = self.prefill_batches(tokens, position, plan, batch, empty_before_prepare, cancelled, progress);
         let restoring = Instant::now();
         if long {
             self.group.end_long_prefill()?;
@@ -2973,13 +2977,14 @@ impl Model {
         output
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prefill_batches(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
-                       cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
+                       empty_before_prepare: bool, cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         let mut output = None;
         let beginning = position;
         let mut fill_empty_slots = if self.partial && !self.deferred && tokens.len() - position > batch {
             let (slots, held) = self.group.slots()?;
-            slots > 0 && held == 0
+            slots > 0 && held < slots && (held == 0 || empty_before_prepare)
         } else { false };
         let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
         for stop in stops {
@@ -3007,9 +3012,10 @@ impl Model {
                 position = end;
                 progress(end, tokens.len());
                 if fill_empty_slots && position < tokens.len() && position - beginning >= batch && !cancelled() {
-                    // An interrupted warm start may leave the cache empty. Learn from one batch
-                    // before filling it, so later batches reuse those experts instead of streaming
-                    // them again. A cache already filled at the start keeps its existing routing.
+                    // Borrowing may refill only some slots from an interrupted warm-up
+                    // although the request began with an empty cache. Learn from a batch before
+                    // filling the rest. A cache already populated before preparation, or filled
+                    // completely by it, keeps its existing policy.
                     let filling = Instant::now();
                     self.group.rebalance(0)?;
                     self.metric_add("prefill_cache_fill_seconds", filling.elapsed().as_secs_f64());
