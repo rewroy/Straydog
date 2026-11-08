@@ -101,6 +101,36 @@ and `--config FILE` reads them from a TOML file (with no `--config` and no model
 `setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
 settings in effect and where each came from.
 
+### Keeping a conversation across starts (Windows)
+
+An engine that starts again, as an app's update makes it, holds none of the conversation it held:
+the next request of a long conversation reads all of it again (36,169 tokens took 84 s on an
+RTX 4060 at 5.5 GiB). With `--keep-conversation` (`keep_conversation = true` in the config file) it
+does not.
+- **What is kept.** When the server stops on purpose, once, the state of the conversation the engine
+  held last, at the place its last reply began: the tokens, and the recurrent state, K/V and indexer
+  blocks of its positions. A conversation with an image in it is not kept, nor one under 1024 tokens.
+- **When it is written.** At the stop and at no other time: Ctrl+C, the console closing, Windows
+  ending the session, or a line `stop` on standard input (`--stop-on-stdin`, for a program that
+  starts the server and has no console to send Ctrl+C to). Nothing is written while requests run or
+  per request: the drive sees one write a stop. A state larger than the memory or the drive has room
+  for is not written, and the log says so in one line.
+- **Where, and sealed how.** `<data dir>/conversation`, one file a bundle, a new one replacing the
+  old. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
+  account, as the engine's other saved state is (the system block's, `prefix`): another user cannot
+  open it, and a changed byte refuses it. Its tokens are a sealed part of their own.
+- **At the next start** the file is opened lazily: its tokens are read, and the state stays on the
+  drive until the first request whose prompt begins with them. That request reads it from the file
+  and goes on from there; the request line says `reused 38968 from kept, loaded in 1.8 s`. A
+  request that does not begin with them leaves the file as it is, for a later one. A file of
+  another build, bundle or placement of the engine is deleted, as is one that does not open, and
+  with the option off at the start the file is deleted.
+- **What it costs and saves.** The file is about 28 KB a token (1.0 GB for 36,000 tokens), written
+  in 2 to 2.5 s at the stop (the stop takes 3.5 to 4.7 s). On an RTX 5070 Ti held to 5.5 GiB a
+  conversation of 38,975 tokens was read in 48.9 s from nothing, and in 1.8 s of loading and 2.2 s to
+  the first token from the kept state.
+- **Off by default.** Without the option nothing of a conversation is written to the drive.
+
 A bundle is named by three labels: its model (`--model-name`), its provider, who quantized it
 (`--provider`), and its quantization (`--quant`). Where fewer name one bundle, fewer will do;
 the server takes all three from the files in `-m`.
