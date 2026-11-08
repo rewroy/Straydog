@@ -1,8 +1,8 @@
 # Straydog — design
 
 Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as one
-executable per GPU backend (HIP on Linux, CUDA on Windows). It serves pinned GGUF bundles of two
-models:
+executable per GPU backend (HIP on Linux, CUDA on Windows and on Linux). It serves pinned GGUF
+bundles of two models:
 
 - **DeepSeek-V4.1-Flash** (748B total, 16B active), the main one;
 - **Qwen3.8-Flash-Next**, with its MTP drafter, also the model for a small GPU (5-6 GB of VRAM)
@@ -11,8 +11,9 @@ models:
 This document describes what the code does now. It does not keep the project's history; git
 does. The roundings are listed in the README's Numerics, which this document does not repeat.
 
-Updated: 2026-11-03. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
-Windows with CUDA; DeepSeek-V4.1 has not.
+Updated: 2026-11-08. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
+Windows with CUDA; DeepSeek-V4.1 has not. Both models have run on Linux with CUDA under WSL2, isolated
+by bubblewrap, and not yet on native Linux.
 
 ## 1. Goals
 
@@ -1491,7 +1492,8 @@ with a model of its own reads no file it was not given.
 - Release artifacts: `straydog-linux-x86_64-hip` (needs the ROCm 10 runtime) and
   `straydog-windows-x86_64-cuda.exe` (needs the NVIDIA driver and `cublas64_13.dll`). The
   executable's SHA-256 is published with each release. The model pins are compiled in, so a
-  binary authenticates exactly the bundles it was tested with.
+  binary authenticates exactly the bundles it was tested with. Linux with CUDA is built the same
+  way and is not a release artifact yet.
 
 ## 12. Decisions
 
