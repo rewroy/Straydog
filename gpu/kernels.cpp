@@ -111,6 +111,7 @@
 #define hipGetDevice cudaGetDevice
 #define hipDeviceEnablePeerAccess cudaDeviceEnablePeerAccess
 #define hipErrorPeerAccessAlreadyEnabled cudaErrorPeerAccessAlreadyEnabled
+#define hipErrorNotSupported cudaErrorNotSupported
 #define hipHostMallocPortable cudaHostAllocPortable
 #define hipEventDisableTiming cudaEventDisableTiming
 #define hipEventBlockingSync cudaEventBlockingSync
@@ -2149,7 +2150,15 @@ int sd_hybrid_decay(double decay) {
 int sd_host_register(void* pointer,uint64_t bytes) {
     try {
         if (!pointer || !bytes) throw std::runtime_error("invalid host registration");
-        check(hipHostRegister(pointer,size_t(bytes),hipHostRegisterPortable|hipHostRegisterReadOnly|hipHostRegisterMapped));
+        hipError_t state=hipHostRegister(pointer,size_t(bytes),hipHostRegisterPortable|hipHostRegisterReadOnly|hipHostRegisterMapped);
+        // A device that cannot register memory read-only (CUDA's cudaDevAttrHostRegisterReadOnlySupported 0: two RTX 3090s on Windows
+        // 10 refused a loader's slot so, and the start failed) takes it without the flag: a writable range such as that slot registers
+        // so, and a read-only mapping then fails as it would have, which its caller goes on without (the layer is not page-locked).
+        if (state==hipErrorNotSupported) {
+            (void)hipGetLastError();
+            state=hipHostRegister(pointer,size_t(bytes),hipHostRegisterPortable|hipHostRegisterMapped);
+        }
+        check(state);
         std::lock_guard<std::mutex> lock(registered_mutex);
         registered[reinterpret_cast<uintptr_t>(pointer)]={size_t(bytes),false};
         return 0;
