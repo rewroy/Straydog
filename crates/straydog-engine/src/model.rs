@@ -2976,6 +2976,11 @@ impl Model {
     fn prefill_batches(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
                        cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         let mut output = None;
+        let beginning = position;
+        let mut fill_empty_slots = if self.partial && !self.deferred && tokens.len() - position > batch {
+            let (slots, held) = self.group.slots()?;
+            slots > 0 && held == 0
+        } else { false };
         let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
         for stop in stops {
             while position < stop {
@@ -3001,6 +3006,15 @@ impl Model {
                 }
                 position = end;
                 progress(end, tokens.len());
+                if fill_empty_slots && position < tokens.len() && position - beginning >= batch && !cancelled() {
+                    // An interrupted warm start may leave the cache empty. Learn from one batch
+                    // before filling it, so later batches reuse those experts instead of streaming
+                    // them again. A cache already filled at the start keeps its existing routing.
+                    let filling = Instant::now();
+                    self.group.rebalance(0)?;
+                    self.metric_add("prefill_cache_fill_seconds", filling.elapsed().as_secs_f64());
+                    fill_empty_slots = false;
+                }
             }
             if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
                 for kind in kinds.clone() {
