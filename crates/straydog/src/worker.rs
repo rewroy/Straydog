@@ -488,7 +488,8 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
 /// request that waits for one are different threads, and the engine is behind the lock the request holds.
 struct KeptConversation {
     tokens: Option<Vec<u32>>,
-    waiting: Option<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
+    /// Where the state arrives, with the seconds the server took to read and open it.
+    waiting: Option<std::sync::mpsc::Sender<Result<(Vec<u8>, f64), String>>>,
 }
 
 static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: None, waiting: None });
@@ -558,8 +559,9 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     };
-    let state = match arrived {
-        Ok(state) => state,
+    let arrived_at = started.elapsed().as_secs_f64();
+    let (state, read_seconds) = match arrived {
+        Ok(arrived) => arrived,
         Err(why) => {
             // (the file is gone or cannot be read: asking again would only ask the same)
             kept().tokens = None;
@@ -567,11 +569,13 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
             return None;
         }
     };
+    let importing = Instant::now();
     match engine.model.import_conversation(&state, prompt.len() + 1) {
         Ok(tokens) => {
             kept().tokens = None;
             let seconds = started.elapsed().as_secs_f64();
-            eprintln!("Straydog conversation: loaded {tokens} tokens ({} MB) in {seconds:.1} s", state.len() >> 20);
+            eprintln!("Straydog conversation: loaded {tokens} tokens ({} MB) in {seconds:.1} s (the server read it in {read_seconds:.1} s, it came in {:.1} s, the import took {:.1} s)",
+                      state.len() >> 20, (arrived_at - read_seconds).max(0.0), importing.elapsed().as_secs_f64());
             Some(seconds)
         }
         Err(why) => {
@@ -1149,8 +1153,12 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                     Err(message) => break Err(message),
                 };
                 let reason = request.get("reason").and_then(pyjson::Value::as_str).unwrap_or("the server sent no state").to_string();
+                let read_seconds = match request.get("read_seconds") {
+                    Some(pyjson::Value::Float(seconds)) => *seconds,
+                    _ => 0.0,
+                };
                 if let Some(waiting) = kept().waiting.take() {
-                    let _ = waiting.send(if count > 0 { Ok(body) } else { Err(reason) });
+                    let _ = waiting.send(if count > 0 { Ok((body, read_seconds)) } else { Err(reason) });
                 }
             }
             Some("prefix") => {
