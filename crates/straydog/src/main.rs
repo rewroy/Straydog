@@ -12,10 +12,6 @@ use straydog::{config, progress, setup, worker};
 #[cfg(not(any(feature = "hip", feature = "cuda")))]
 compile_error!("the straydog executable links one GPU backend: build it with --features hip or --features cuda");
 
-// Prompt rows and logits are large host buffers: back them with huge pages.
-#[global_allocator]
-static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::HugePages;
-
 /// With no subcommand, `straydog` serves the API with the given settings, as llama-server does.
 #[derive(Parser)]
 #[command(name = "straydog", version, about = "A local inference engine with an OpenAI-compatible server",
