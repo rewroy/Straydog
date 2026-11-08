@@ -760,8 +760,8 @@ pub struct Counts {
     /// Bytes queued for drive reads (whole blocks), a pass's and a prefetch's alike.
     pub drive_bytes: u64,
     pub writebacks: u64,
-    /// Experts the host tier gave up for room (read from the drive again on their next use), and
-    /// of those, the ones given up while the tier was still below its budget (its arenas not yet
+    /// Experts the host tier gave up for room, or VRAM did with no host slot to write them back to while a prefill streamed (read from
+    /// the drive again on their next use), and of those, the ones given up while the tier was still below its budget (its arenas not yet
     /// pinned).
     pub host_drops: u64,
     pub host_drops_short: u64,
@@ -2146,6 +2146,17 @@ impl DeviceExperts {
             }
             return Ok(());
         }
+        // While a prefill streams its experts, a write-back takes no host slot whose expert a streamed VRAM slot holds: that expert's
+        // release would then write it back in turn, waiting for its upload into the slot just taken, and so on to the pass's end (a fresh
+        // 7.8K-token prompt on Unsloth UD-IQ2_XXS, VRAM and the host tier holding the model with little to spare: 17,696 such write-backs,
+        // 3.3 s of waits). With no other host slot to be had, the expert leaving VRAM is let go of, to be read from the drive when wanted.
+        if self.streaming && !self.unstreamed_host_room(gpu, class)? {
+            if let Some((_, ready)) = self.slots[slot].ready.take() {
+                self.slots[slot].guards[1].get_or_insert(ready);
+            }
+            self.counts.host_drops += 1;
+            return Ok(());
+        }
         let host = self.free_host(gpu, class)?;
         let bytes: u64 = self.layout.roles(key.0 as usize)?.iter().map(|role| role.bytes).sum();
         if let Some((_, ready)) = self.slots[slot].ready.take() {
@@ -2192,7 +2203,8 @@ impl DeviceExperts {
             }
             // The least recently used expert's slot (its copies long done), before an emptied slot
             // whose upload is still running.
-            let candidate = self.classes[class].copies.iter().map(|&(_, host)| host).next()
+            // (while streaming, not the copy of an expert a streamed slot holds: see evict)
+            let candidate = self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host))
                 .or_else(|| self.classes[class].host_lru.iter().map(|&(_, host)| host).next())
                 .or_else(|| self.classes[class].host_free.front().copied());
             let Some(host) = candidate else {
@@ -2449,6 +2461,31 @@ impl DeviceExperts {
             return Ok(true);
         }
         Ok(!self.classes[class].copies.is_empty())
+    }
+
+    /// Whether host slot `host` holds the copy of an expert a streamed VRAM slot holds (a prefill's, emptied at its release).
+    fn streamed_copy(&self, host: usize) -> bool {
+        self.host[host].key.and_then(|key| self.map.get(&key)).is_some_and(|&slot| self.slots[slot].streamed)
+    }
+
+    /// [`free_host`](Self::free_host)'s slot for a write-back while streaming, without waiting: an emptied one whose copies are done,
+    /// pinned room (or a pinned arena ready), or the copy of an expert a VRAM slot holds that no prefill streams.
+    fn unstreamed_host_room(&mut self, gpu: &mut Backend, class: usize) -> Result<bool> {
+        if let Some(&host) = self.classes[class].host_free.front() {
+            let copies = [self.host[host].busy, match self.host[host].content { Content::Packed(mark) => Some(mark), _ => None }];
+            let mut reusable = true;
+            for mark in copies.into_iter().flatten() {
+                reusable &= gpu.mark_done(mark, false)?;
+            }
+            if reusable {
+                return Ok(true);
+            }
+        }
+        let entry = &self.classes[class];
+        if entry.hosts < entry.arenas.len() * entry.per_arena || self.take_arena(class, false)? {
+            return Ok(true);
+        }
+        Ok(self.classes[class].copies.iter().any(|&(_, host)| !self.streamed_copy(host)))
     }
 
     /// Of a warm-up's lists (least recently used first), what this store's slots hold (see
