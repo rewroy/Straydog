@@ -167,6 +167,8 @@ fn sample(host: &Value, decode: f64, prefill: f64) -> Value {
         "cpu_temperature": host["cpu_temperature"],
         "memory": 100.0 * used / total,
         "server_memory": 100.0 * host["server"]["memory"].as_f64().unwrap_or(0.0) / total,
+        "disk_read": host["disk_read_bytes_per_second"].as_f64().map(|rate| rate / 1_048_576.0),
+        "server_read_io": host["server_read_io_bytes_per_second"].as_f64().map(|rate| rate / 1_048_576.0),
         "gpus": gpus,
         "decode": decode,
         "prefill": prefill,
