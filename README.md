@@ -3,8 +3,8 @@
 A local inference engine with an OpenAI-compatible server, in one executable per GPU
 backend. It serves pinned GGUF bundles of Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash.
 
-It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). AMD GPUs on Windows
-are not supported.
+It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). Linux with NVIDIA GPUs
+(CUDA) has been run under WSL2 and not yet on native Linux. AMD GPUs on Windows are not supported.
 
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
@@ -30,6 +30,18 @@ ROCM_PATH=/opt/rocm/core-10.0 cargo build --release --features hip
 # other AMD GPUs: STRAYDOG_GPU_ARCHITECTURES="gfx1100;gfx1201"
 ```
 
+Linux with NVIDIA GPUs (the CUDA 13 Toolkit and its host compiler, CMake, make or Ninja, the NVIDIA
+driver and bubblewrap; RTX 20/30/40/50 by default). Name the toolkit in `CUDA_PATH` and put its `bin`
+on `PATH`:
+
+```bash
+CUDA_PATH=/usr/local/cuda-13.3 PATH=/usr/local/cuda-13.3/bin:$PATH cargo build --release --features cuda
+# other GPUs (the default is 75-real;86-real;89-real;120): STRAYDOG_GPU_ARCHITECTURES=89-real
+```
+
+It has been run under WSL2 (the driver is the Windows one and the toolkit the Linux one inside WSL,
+[gpu/README.md](gpu/README.md)), and not yet on native Linux.
+
 Windows, NVIDIA GPUs only (CUDA 13, from an "x64 Native Tools Command Prompt" with Ninja and the
 CUDA Toolkit; RTX 20/30/40/50 by default):
 
@@ -39,9 +51,10 @@ rem other GPUs (the default is 75-real;86-real;89-real;120): set STRAYDOG_GPU_AR
 ```
 
 The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm's
-`libamdhip64` and `libhipblas` on Linux, the NVIDIA driver and `cublas64_13.dll`
-(next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
-bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm only.
+`libamdhip64` and `libhipblas` on Linux with AMD GPUs, the NVIDIA driver and the toolkit's
+`libcublas.so.13` (where the build linked it) on Linux with NVIDIA GPUs, the NVIDIA driver and
+`cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows. Linux also needs
+bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
 
 ## Run
 
