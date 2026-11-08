@@ -171,10 +171,14 @@ pub struct PageLock(*mut c_void);
 unsafe impl Send for PageLock {}
 
 impl PageLock {
+    /// Page-lock `range`, memory the process owns (a loader's slot), as writable memory: for copies only, so neither read-only
+    /// registration nor a device mapping is asked for. A device that cannot register memory read-only (CUDA's
+    /// cudaDevAttrHostRegisterReadOnlySupported 0: an RTX 3090) refused the slot when they were, and the start failed; and which device's
+    /// support decided depended on which was current.
     pub fn new(range: &[u8]) -> Result<PageLock> {
         let start = range.as_ptr().cast_mut().cast();
         // SAFETY: a live range, unregistered (when this drops) before its owner frees it.
-        check(unsafe { ffi::sd_host_register(start, range.len() as u64) })?;
+        check(unsafe { ffi::sd_host_pin(start, range.len() as u64) })?;
         Ok(PageLock(start))
     }
 }
