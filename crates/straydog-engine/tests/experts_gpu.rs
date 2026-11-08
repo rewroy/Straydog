@@ -770,6 +770,53 @@ fn bulk_reads_and_decode_reads_preserve_expert_bytes() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A prefill streaming through VRAM and a host tier that hold far fewer experts than the file: no streamed expert is written back. A
+/// write-back while streaming takes no host slot whose expert a streamed slot holds (else that expert's release wrote it back too, waiting
+/// for its upload, and so on for every wave after); what VRAM lets go of instead comes back from the drive whole.
+#[test]
+fn a_prefill_through_a_full_store_writes_no_streamed_expert_back() {
+    let layers = roles();
+    let (path, mut gpu, mut store, _reads) = open(&layers, 16, 8);
+    let mut random = Random(0x0bad_cafe);
+    // Decoding over both layers' 80 experts fills VRAM and the host tier with what it last used.
+    for step in 0..60 {
+        let layer = if step % 2 == 0 { 0 } else { 2 };
+        let expert = random.below(EXPERTS);
+        let slots = store.acquire(&mut gpu, layer, &[expert]).unwrap();
+        check_slots(&mut gpu, layers[layer].as_ref().unwrap(), &[expert], &slots, "decode");
+        store.release(&mut gpu).unwrap();
+    }
+    let before = store.counts();
+    // A prefill's two layers, every expert of each in waves of 6, the next wave prefetched beside each.
+    for layer in [0, 2] {
+        store.set_streaming(&mut gpu, true).unwrap();
+        let experts: Vec<usize> = (0..EXPERTS).collect();
+        let waves: Vec<&[usize]> = experts.chunks(6).collect();
+        for (index, wave) in waves.iter().enumerate() {
+            let slots = store.acquire(&mut gpu, layer, wave).unwrap();
+            check_slots(&mut gpu, layers[layer].as_ref().unwrap(), wave, &slots, &format!("layer {layer} wave {index}"));
+            if let Some(next) = waves.get(index + 1) {
+                store.prefetch_bulk(&mut gpu, layer, next, true).unwrap();
+            }
+            store.release(&mut gpu).unwrap();
+        }
+        store.set_streaming(&mut gpu, false).unwrap();
+    }
+    let after = store.counts();
+    // (each of the 16 residents is written back once at most as the waves take its slot; a streamed expert never is)
+    let written = after.writebacks - before.writebacks;
+    assert!(written <= 16, "{written} write-backs while 80 experts streamed through 16 slots");
+    // What left both tiers is read again whole.
+    for (layer, expert) in [(0, 3), (2, 17), (0, 39), (2, 0)] {
+        let slots = store.acquire(&mut gpu, layer, &[expert]).unwrap();
+        check_slots(&mut gpu, layers[layer].as_ref().unwrap(), &[expert], &slots, "after the prefill");
+        store.release(&mut gpu).unwrap();
+    }
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn a_prefill_streams_through_and_room_is_made_between_requests() {
     let layers = roles();
