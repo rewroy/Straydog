@@ -81,6 +81,8 @@ fn probe(args: &[OsString]) {
     let network = TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok();
     println!("network={}", if network { "open" } else { "closed" });
     println!("cwd={}", std::env::current_dir().map(|path| path.display().to_string()).unwrap_or_default());
+    #[cfg(target_os = "linux")]
+    println!("dxg={}", Path::new("/dev/dxg").exists());
     for (name, directory) in [("write-cwd", PathBuf::from(".")), ("write-home", PathBuf::from(&args[1]))] {
         // Left in place: the test looks for it outside.
         let written = std::fs::write(directory.join(PROBE_FILE), "x").is_ok();
@@ -316,6 +318,7 @@ fn the_contained_worker_reads_only_what_is_exposed() {
     assert_eq!(value(&report, "echo"), "over the private pipe");
     assert_eq!(value(&report, "network"), "closed");
     assert_eq!(value(&report, "cwd"), model.display().to_string());
+    assert_eq!(value(&report, "dxg"), Path::new("/dev/dxg").exists().to_string());
     assert_eq!(value(&report, "env HOME"), "/tmp");
     assert_eq!(value(&report, "env HIP_VISIBLE_DEVICES"), "1");
     for (secret, _) in SECRET_VARIABLES {

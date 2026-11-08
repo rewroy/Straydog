@@ -35,8 +35,9 @@ const VARIABLES: [&str; 7] = [
     "HSA_OVERRIDE_GFX_VERSION",
 ];
 
-/// GPU device nodes: AMD's, then NVIDIA's (further NVIDIA GPUs are found by name).
-const DEVICES: [&str; 7] = [
+/// GPU device nodes: AMD's, NVIDIA's (further NVIDIA GPUs are found by name), and
+/// WSL2's GPU bridge. Only nodes present on the host are exposed.
+const DEVICES: [&str; 8] = [
     "/dev/kfd",
     "/dev/dri",
     "/dev/nvidia0",
@@ -44,6 +45,7 @@ const DEVICES: [&str; 7] = [
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-caps",
+    "/dev/dxg",
 ];
 
 /// The bubblewrap executable on PATH (only absolute entries: never one relative to wherever
@@ -224,6 +226,19 @@ mod tests {
             working,
         ];
         assert_eq!(&args[args.len() - tail.len()..], &tail);
+    }
+
+    #[test]
+    fn the_wsl_gpu_bridge_is_bound_only_when_present() {
+        let scratch = Scratch::new("straydog-bwrap-dxg");
+        let args = arguments_for(&exposure(&scratch)).unwrap();
+        let bridge = Path::new("/dev/dxg");
+        assert_eq!(sources(&args, "--dev-bind").contains(&bridge.to_path_buf()), bridge.exists());
+        let mut exposure = exposure(&scratch);
+        exposure.secrets.push(bridge.to_path_buf());
+        if bridge.exists() {
+            assert!(arguments_for(&exposure).unwrap_err().contains("secret"));
+        }
     }
 
     #[test]

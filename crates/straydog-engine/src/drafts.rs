@@ -129,6 +129,11 @@ impl Policy {
         wanted.min(self.rows - 1)
     }
 
+    /// The most tokens a verification takes is now `rows` (the drafts a partially resident model offers have changed).
+    pub fn set_rows(&mut self, rows: usize) {
+        self.rows = rows;
+    }
+
     /// A pass verified `proposed` drafts and accepted `accepted`.
     pub fn record(&mut self, proposed: usize, accepted: usize) {
         if proposed == 0 {
@@ -205,7 +210,17 @@ mod tests {
         assert_eq!(policy.width(32), 3);
     }
 
-#[test]
+    #[test]
+    fn the_rows_follow_the_drafts_a_model_offers() {
+        let mut policy = Policy::new(2);
+        assert_eq!(policy.width(12), 1);
+        policy.set_rows(4);
+        assert_eq!(policy.width(12), 3);
+        policy.set_rows(1);
+        assert_eq!(policy.width(12), 0);
+    }
+
+    #[test]
     fn the_policy_widens_with_the_match_and_rests_after_rejections() {
         let mut policy = Policy::new(4);
         assert_eq!((policy.width(2), policy.width(3), policy.width(5), policy.width(12)), (0, 1, 2, 3));

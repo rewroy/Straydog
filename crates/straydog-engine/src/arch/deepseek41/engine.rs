@@ -3669,12 +3669,15 @@ pub const ATTENTION_ROWS: usize = 256;
 /// The least spare VRAM worth a region of its own, and the unit it is lent in.
 const SPARE_LEAST: u64 = 64 << 20;
 const SPARE_UNIT: u64 = 16 << 20;
+/// The budget lending leaves for what a request allocates after the first passes (a 4 MiB buffer of a 528-token request, with
+/// DSpark's experts 48/28/16 a stage on UD-IQ1_M at --vram 30, found 1.9 MiB of its budget left: lending had taken the rest).
+const SPARE_BUDGET_KEEP: u64 = 128 << 20;
 
 /// The VRAM a device can lend its expert store ([`Engine::lend_spare`]): what its card has `free`
-/// beyond `keep`, and what its budget has left of `allocated`, in whole units; none under
-/// [`SPARE_LEAST`].
+/// beyond `keep`, and what its budget has left of `allocated` beyond [`SPARE_BUDGET_KEEP`], in whole
+/// units; none under [`SPARE_LEAST`].
 fn spare_bytes(free: u64, keep: u64, allocated: u64, budget: u64) -> u64 {
-    let bytes = free.saturating_sub(keep).min(budget.saturating_sub(allocated)) / SPARE_UNIT * SPARE_UNIT;
+    let bytes = free.saturating_sub(keep).min(budget.saturating_sub(allocated).saturating_sub(SPARE_BUDGET_KEEP)) / SPARE_UNIT * SPARE_UNIT;
     if bytes < SPARE_LEAST { 0 } else { bytes }
 }
 
@@ -3820,15 +3823,16 @@ mod tests {
         assert_eq!(queries.need(256, 99), 32 << 20);
     }
 
-    /// A device lends what its card has free beyond what is kept, unless its budget has less left,
-    /// in whole units, and nothing under the least worth a region.
+    /// A device lends what its card has free beyond what is kept, unless its budget has less left
+    /// beyond what a request allocates later, in whole units, and nothing under the least worth a region.
     #[test]
     fn the_spare_vram_is_what_the_card_and_the_budget_both_leave() {
         const MIB: u64 = 1 << 20;
-        // the card holds 1400 MiB past 768 kept: 632, to 624 in units of 16; the budget has 1000 left
+        // the card holds 1400 MiB past 768 kept: 632, to 624 in units of 16; the budget has 1000 left, 872 past its 128 kept
         assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30000 * MIB, 31000 * MIB), 624 * MIB);
-        // a budget with 100 MiB left lends 96
-        assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30900 * MIB, 31000 * MIB), 96 * MIB);
+        // a budget with 300 MiB left lends 172, to 160; with 100 MiB left, none (the 128 MiB kept for a request)
+        assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30700 * MIB, 31000 * MIB), 160 * MIB);
+        assert_eq!(super::spare_bytes(1400 * MIB, 768 * MIB, 30900 * MIB, 31000 * MIB), 0);
         // 63 MiB is under the least; 64 is not; a card below what is kept, or a full budget, lends none
         assert_eq!(super::spare_bytes(831 * MIB, 768 * MIB, 0, 31000 * MIB), 0);
         assert_eq!(super::spare_bytes(832 * MIB, 768 * MIB, 0, 31000 * MIB), 64 * MIB);
