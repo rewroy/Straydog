@@ -3242,7 +3242,7 @@ void* sd_buffer(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);
         if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
-            throw std::runtime_error("Straydog VRAM budget exceeded");
+            throw std::runtime_error(budget_exceeded(value, bytes));
         void* pointer = nullptr;
         check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
         try { value.allocations.emplace(pointer, size_t(bytes)); }
