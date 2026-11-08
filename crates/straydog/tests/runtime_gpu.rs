@@ -17,8 +17,6 @@ use straydog::runtime::{self, Runtime};
 use straydog_api::{Engine, EngineState};
 use straydog_engine::pyjson;
 
-#[global_allocator]
-static ALLOCATOR: straydog_engine::alloc::HugePages = straydog_engine::alloc::HugePages;
 
 #[derive(Parser)]
 struct Worker {
