@@ -287,6 +287,9 @@ struct Parked {
     covered: Option<(usize, usize)>,
     /// The state of a system block held at its root, imported ([`Model::import_prefix`]): once restored, the sequence is the root's too.
     root: bool,
+    /// The state of a conversation held at one of its checkpoints, imported ([`Model::import_conversation`]): once restored, the sequence is
+    /// the checkpoint's too.
+    kept: bool,
 }
 
 impl Parked {
@@ -1727,7 +1730,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: None,
-                    saved: vec![positions], covered: Some((from, self.history.len())), root: false })
+                    saved: vec![positions], covered: Some((from, self.history.len())), root: false, kept: false })
     }
 
     /// `group.save_positions` of `from..to`, with the room for the copy asked first: host memory (pageable, charged to the commit) for hundreds of MB to
@@ -1762,7 +1765,7 @@ impl Model {
             return Err(error);
         }
         Ok(Parked { tokens: self.history.clone(), final_hidden: self.final_hidden.clone(), slot, history: Some(history),
-                    saved: Vec::new(), covered: None, root: false })
+                    saved: Vec::new(), covered: None, root: false, kept: false })
     }
 
     /// Free what a parked sequence holds (once nothing restores it).
@@ -1868,7 +1871,7 @@ impl Model {
             let common = shared(&self.history, &parked.tokens);
             if back > live && resumable && common >= parked.from() {
                 let mut parked = self.parked.take().unwrap();
-                let root = parked.root;
+                let (root, kept) = (parked.root, parked.kept);
                 let slot = if parked.slot == PARK_SLOTS[0] { PARK_SLOTS[1] } else { PARK_SLOTS[0] };
                 // The live sequence whole over what the restore overwrites: from the lowest copy too
                 // (the same tokens below `common`, but perhaps not the same bits once rewritten), or
@@ -1909,13 +1912,16 @@ impl Model {
                 if root {
                     // (the sequence is a system block at its root again: its checkpoint, which the prompt that made the state would have left)
                     self.save_checkpoint("root")?;
+                } else if kept {
+                    // (and a conversation at the place its reply began: the checkpoint the request that made the state would have left)
+                    self.save_checkpoint("turn")?;
                 }
-                return Ok(Some(if root { "prefix" } else { "restored" }));
+                return Ok(Some(if root { "prefix" } else if kept { "kept" } else { "restored" }));
             }
         }
         // A system block's imported state that this prompt does not begin with is of no use to it, and holds its host memory until something
         // takes its place.
-        if self.parked.as_ref().is_some_and(|parked| parked.root && shared(&parked.tokens, &tokens[..limit]) < parked.tokens.len()) {
+        if self.parked.as_ref().is_some_and(|parked| (parked.root || parked.kept) && shared(&parked.tokens, &tokens[..limit]) < parked.tokens.len()) {
             let parked = self.parked.take().unwrap();
             self.discard(parked)?;
         }
@@ -2484,7 +2490,12 @@ impl Model {
     /// sequence still has as the root left them), and the MTP layer's indexer history. None unless the root exists and the held sequence still
     /// begins with its tokens.
     pub fn export_prefix(&mut self) -> Result<Option<Prefix>> {
-        let Some(root) = self.checkpoints.get("root") else { return Ok(None) };
+        self.export_checkpoint("root")
+    }
+
+    /// The state a checkpoint of the held sequence is, as bytes: [`export_prefix`](Self::export_prefix)'s, of the checkpoint `kind`.
+    fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
+        let Some(root) = self.checkpoints.get(kind) else { return Ok(None) };
         let tokens = root.tokens.len();
         if tokens == 0 || tokens % 4 != 0 || shared(&self.history, &root.tokens) < tokens || (self.speculative > 0) != root.history.is_some() {
             return Ok(None);
@@ -2503,6 +2514,43 @@ impl Model {
             return Err(format!("Straydog prefix state is {} bytes where its layout has {size}", bytes.len()));
         }
         Ok(Some(Prefix { tokens, digest: crate::prefix::tokens_digest(&root.tokens), bytes }))
+    }
+
+    /// The checkpoint of the held conversation that is worth keeping for the next start: the deepest of the places a reply began (the last user
+    /// message's, the one before's, the last tool result's) that the held sequence still begins with, at least [`PARK_MINIMUM`] tokens in. The
+    /// next prompt of the same conversation begins with it, whatever the reply was.
+    fn conversation_checkpoint(&self) -> Option<&'static str> {
+        ["turn", "step", "prior"].into_iter()
+            .filter_map(|kind| self.checkpoints.get(kind).map(|checkpoint| (kind, checkpoint)))
+            .filter(|(_, checkpoint)| checkpoint.tokens.len() >= PARK_MINIMUM && shared(&self.history, &checkpoint.tokens) == checkpoint.tokens.len())
+            // (a conversation with an image in it is not kept: the rows of the image are not among the tokens, and a state read back could not tell them)
+            .filter(|(_, checkpoint)| checkpoint.tokens.iter().all(|token| (*token as usize) < VOCABULARY))
+            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len())
+            .map(|(kind, _)| kind)
+    }
+
+    /// The tokens, and the bytes, of the state [`export_conversation`](Self::export_conversation) would give: None when the held conversation has
+    /// no checkpoint worth keeping. For a caller that decides, before the copy is made, whether the room for it is there.
+    pub fn conversation_size(&self) -> Option<(usize, u64)> {
+        let checkpoint = self.checkpoints.get(self.conversation_checkpoint()?)?;
+        Some((checkpoint.tokens.len(), self.state_size(checkpoint.tokens.len(), checkpoint.final_hidden.as_ref().map_or(0, Vec::len))))
+    }
+
+    /// The bytes of a state of `tokens` tokens and a `hidden`-float hidden state: its header and sections.
+    pub fn state_size(&self, tokens: usize, hidden: usize) -> u64 {
+        let plan = self.prefix_sections(tokens, hidden);
+        crate::prefix::header(tokens, hidden, &plan).len() as u64 + plan.iter().map(|(_, bytes)| *bytes).sum::<u64>()
+    }
+
+    /// The state of the conversation the model holds, at its last checkpoint ([`crate::prefix`], the same bytes as a system block's): the tokens
+    /// up to the place the last reply began, and the sequence's recurrent state, K/V and indexer's blocks there. A later start that is handed it
+    /// ([`import_conversation`](Self::import_conversation)) takes the next request of the conversation from there, whatever the reply was. None
+    /// when the model holds no conversation with such a checkpoint.
+    pub fn export_conversation(&mut self) -> Result<Option<Prefix>> {
+        match self.conversation_checkpoint() {
+            Some(kind) => self.export_checkpoint(kind),
+            None => Ok(None),
+        }
     }
 
     /// What an import of a state of `tokens` tokens and a `hidden`-float hidden state needs of this model, to be taken at once, under the lock that
@@ -2526,6 +2574,10 @@ impl Model {
     /// request's `resumed_from` is `prefix`), and one that does not drops it. Refused, with nothing changed, if the K/V grew since the plan was made
     /// (the places of its parts changed with it). The tokens held.
     pub fn install_prefix(&mut self, image: PrefixImage, bytes: &[u8]) -> Result<usize> {
+        self.install_state(image, bytes, false)
+    }
+
+    fn install_state(&mut self, image: PrefixImage, bytes: &[u8], kept: bool) -> Result<usize> {
         if image.capacity != self.kv_capacity {
             return Err("Straydog prefix state refused: the K/V grew while it was read".into());
         }
@@ -2536,7 +2588,7 @@ impl Model {
         }
         self.group.write_recurrent(PARK_SLOTS[0], bytes, &image.recurrent)?;
         self.parked = Some(Parked { tokens: image.ids, final_hidden: image.final_hidden, slot: PARK_SLOTS[0], history: image.kept, saved: vec![image.saved],
-                                    covered: Some((0, tokens)), root: true });
+                                    covered: Some((0, tokens)), root: !kept, kept });
         Ok(tokens)
     }
 
@@ -2547,6 +2599,39 @@ impl Model {
         let parsed = crate::prefix::parse(bytes)?;
         let image = self.prefix_plan(parsed.tokens, parsed.hidden)?.decode(&parsed)?;
         self.install_prefix(image, bytes)
+    }
+
+    /// Take a state [`export_conversation`](Self::export_conversation) made, as the sequence the next request that begins with its tokens
+    /// continues (its `resumed_from` is `kept`): checked against this model's own layout to the byte, and refused with nothing changed if it
+    /// differs by one. The K/V first has room for the state and for `positions` (the prompt that is to go on from it), so that the request does not
+    /// grow it again and drop the state with its old places. The tokens held. Whatever the model held is parked, as for any request.
+    pub fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize> {
+        let parsed = crate::prefix::parse(bytes)?;
+        if parsed.tokens == 0 || parsed.tokens % 4 != 0 || parsed.tokens + 1 >= self.context || positions >= self.context {
+            return Err(format!("Straydog prefix state refused: {} tokens do not fit this model's context", parsed.tokens));
+        }
+        let plan = self.prefix_plan_for(parsed.tokens, parsed.hidden, positions)?;
+        let image = plan.decode(&parsed)?;
+        self.install_state(image, bytes, true)
+    }
+
+    /// [`prefix_plan`](Self::prefix_plan) with the K/V grown to `positions` first, where it is short of them.
+    fn prefix_plan_for(&mut self, tokens: usize, hidden: usize, positions: usize) -> Result<PrefixPlan> {
+        if tokens <= self.kv_capacity && positions <= self.kv_capacity {
+            return self.prefix_plan(tokens, hidden);
+        }
+        // (a check of what the K/V's size does not decide, before it is grown for the state)
+        if hidden != 0 && hidden != WIDTH {
+            return Err(format!("Straydog prefix state refused: a hidden state of {hidden} floats"));
+        }
+        self.ensure_kv(tokens.max(positions))?;
+        self.prefix_plan(tokens, hidden)
+    }
+
+    /// Of `tokens`, how many the model holds already, in the live sequence or the parked one.
+    pub fn held_prefix(&self, tokens: &[u32]) -> usize {
+        let parked = self.parked.as_ref().map_or(&[][..], |parked| &parked.tokens[..]);
+        shared(&self.history, tokens).max(shared(parked, tokens))
     }
 
     /// Keep prompt rows on each GPU between spans; control returns after at most four layers
@@ -3471,7 +3556,10 @@ impl Model {
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
         // (the sequence a start was handed, and this prompt began with)
-        let resumed = if parked == Some("prefix") { "prefix" } else { resumed };
+        let resumed = match parked {
+            Some(origin @ ("prefix" | "kept")) => origin,
+            _ => resumed,
+        };
         self.last_metrics = json!({
             "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
             "parked": parked, "park_seconds": park_seconds, "park_copied_positions": 0,
