@@ -840,6 +840,9 @@ impl Group {
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
+        if self.backends.len() == 2 {
+            return self.on_both(Backend::end_long_prefill, Backend::end_long_prefill);
+        }
         let mut failure = None;
         for backend in &mut self.backends {
             if let Err(error) = backend.end_long_prefill() {
