@@ -17,6 +17,7 @@
 //!
 //! The state is sealed for the Windows account, so this is Windows's alone; elsewhere the option is accepted and keeps nothing.
 
+#[cfg(windows)]
 use std::sync::Arc;
 
 use serde_json::Value;
