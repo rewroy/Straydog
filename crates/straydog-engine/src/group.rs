@@ -807,12 +807,32 @@ impl Group {
     }
 
     /// Each device's host K/V grown to `capacity` positions, `valid` kept (see [`Backend::grow_kv`]).
-    /// One device's long prompt: the rows its batches may take (see [`Backend::begin_long_prefill`]), None with more devices than one.
-    pub fn begin_long_prefill(&mut self) -> Result<Option<u64>> {
-        match self.backends.as_mut_slice() {
-            [backend] => backend.begin_long_prefill().map(Some),
-            _ => Ok(None),
+    /// A long prompt's batch size is limited by the device with the least room after lending
+    /// its expert slots. If one device cannot lend them, put back every device's slots.
+    pub fn begin_long_prefill(&mut self, batch: u64) -> Result<Option<u64>> {
+        let mut rows: Option<u64> = None;
+        let keep_cache = self.backends.len() > 1;
+        // Borrowing can grow a batch only as far as 4096 rows. Leave devices alone if the
+        // request already uses that many (or more), regardless of their current workspace sizes.
+        if keep_cache && batch >= 4096 {
+            return Ok(None);
         }
+        for index in 0..self.backends.len() {
+            match self.backends[index].begin_long_prefill(keep_cache) {
+                Ok(capacity) => rows = Some(rows.map_or(capacity, |rows| rows.min(capacity))),
+                Err(error) => {
+                    if let Err(restore) = self.end_long_prefill() {
+                        return Err(format!("{error}; restoring expert slots failed: {restore}"));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if keep_cache && rows.is_some_and(|rows| rows <= batch) {
+            self.end_long_prefill()?;
+            return Ok(None);
+        }
+        Ok(rows)
     }
 
     pub fn ensure_slots(&mut self) -> Result<()> {
@@ -820,7 +840,13 @@ impl Group {
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
-        self.backends.iter_mut().try_for_each(Backend::end_long_prefill)
+        let mut failure = None;
+        for backend in &mut self.backends {
+            if let Err(error) = backend.end_long_prefill() {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {

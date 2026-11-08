@@ -174,6 +174,9 @@ pub fn checkpoint_bytes() -> u64 {
 /// New tokens from which a partially resident model's batches take the slots' VRAM: past one batch, the second batch's streaming costs more
 /// than putting the slots back, a fraction of a second.
 const LONG_PREFILL: usize = 1536;
+/// Refilling multiple GPUs' expert caches costs several seconds; shorter prompts keep their
+/// original workspaces instead of paying that cost to borrow slots.
+const MULTI_GPU_LONG_PREFILL: usize = 65_536;
 /// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
@@ -2944,17 +2947,23 @@ impl Model {
             batch = batch.max(2);
         }
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
-        let long = self.partial && tokens.len() - position >= LONG_PREFILL.min(self.prefill_batch_size * 2);
+        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
+        let long = self.partial && tokens.len() - position >= threshold;
+        let preparing = Instant::now();
         if long {
             self.ensure_kv(tokens.len())?;
-            if let Some(rows) = self.group.begin_long_prefill()? {
+            if let Some(rows) = self.group.begin_long_prefill(batch as u64)? {
                 batch = batch.max(rows as usize);
             }
         }
+        self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
+        self.last_metrics.insert("prefill_batch_rows".into(), json!(batch));
         let output = self.prefill_batches(tokens, position, plan, batch, cancelled, progress);
+        let restoring = Instant::now();
         if long {
             self.group.end_long_prefill()?;
         }
+        self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
         output
     }
 
@@ -3492,6 +3501,7 @@ impl Model {
                     }
                 }
             }
+            let slot_counts = self.group.slots().ok();
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated, "cpu_phases_ms": cpu_phases,
@@ -3499,7 +3509,9 @@ impl Model {
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
-                "slots": info["cached_experts"], "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
+                "slots": info["cached_experts"], "slot_capacity": slot_counts.map(|(capacity, _)| capacity),
+                "slots_held": slot_counts.map(|(_, held)| held),
+                "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
                 "passes": self.pass_counts, "pass_ms": self.pass_seconds.map(|seconds| 1e3 * seconds),
                 "drafts": (self.speculative > 0).then_some(self.drafts),
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),

@@ -944,17 +944,17 @@ impl Backend {
         Ok(())
     }
 
-    /// A long prompt's batches take the slots' VRAM: a batch streams nearly every expert of every layer over the bus whatever its
-    /// rows, so the wider the batch the fewer bytes a token (IQ2_XS, --vram 8, a 20K prompt: 1024 rows a batch 30.6 s, 2048 21.0, 4096 16.0).
-    /// Wider for good would cost decode its slots. The rows a batch can take in what the slots give up; [`Backend::end_long_prefill`] returns it.
-    pub fn begin_long_prefill(&mut self) -> Result<u64> {
-        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() {
+    /// A long prompt borrows the expert cache's VRAM to widen its batches. On multiple devices it
+    /// fills the cache again with what fits beside the wider workspaces; one device uses only
+    /// the staging pool until [`Backend::end_long_prefill`] restores its original cache.
+    pub fn begin_long_prefill(&mut self, keep_cache: bool) -> Result<u64> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || (keep_cache && self.prefill_capacity >= 4096) {
             return Ok(self.prefill_capacity);
         }
         // SAFETY: a live handle, between batches.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
-        self.restore_slots(0)?;
         self.long_prefill = Some(self.prefill_capacity);
+        self.restore_slots(0)?;
         let (used, budget) = self.memory()?;
         let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
         let free = budget.saturating_sub(used + self.slot_margin) + bytes(self.prefill_capacity);
@@ -964,17 +964,31 @@ impl Backend {
                 break;
             }
         }
+        if keep_cache {
+            // The stage-only pool made room for the workspaces. Put the remaining expert cache
+            // back for this device's layers, instead of streaming every route from host memory.
+            check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+            self.slots_back()?;
+            if self.long_prefill == Some(self.prefill_capacity) {
+                self.long_prefill = None;
+            }
+        }
         Ok(self.prefill_capacity)
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
-        let Some(capacity) = self.long_prefill.take() else { return Ok(()) };
+        let Some(capacity) = self.long_prefill else { return Ok(()) };
         if capacity != self.prefill_capacity {
             self.prefill_buffers(capacity)?;
+            if capacity != self.prefill_capacity {
+                return Err("Straydog could not restore the prefill workspaces".into());
+            }
         }
         // SAFETY: a live handle, between requests.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
-        self.slots_back()
+        self.slots_back()?;
+        self.long_prefill = None;
+        Ok(())
     }
 
     /// The pool at `cache` slots, or none: [`Backend::slots_back`] asks again at the next request's start.
