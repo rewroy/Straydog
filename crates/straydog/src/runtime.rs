@@ -19,6 +19,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{Gemm, Settings, SplitMode};
+use crate::conversation::Keeper;
 use crate::prefix::{Cache, Due, Restored};
 use crate::worker::FRAME_BYTES;
 
@@ -480,7 +481,7 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// passes cost, at the first choice and at each change.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first",
-     "Straydog prefix", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -552,11 +553,13 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
     let number = |value: &Value, digits: usize| value.as_f64().map_or("-".into(), |value| format!("{value:.digits$}"));
     let count = |value: &Value| value.as_u64().map_or("-".into(), |value| value.to_string());
     format!(
-        "Straydog request: {}prompt {} tokens (reused {} from {}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
+        "Straydog request: {}prompt {} tokens (reused {} from {}{}{}){}, {}, first token {} s{}, {} tokens at {} tok/s{}{}{}{}{}{}{}",
         id.map_or(String::new(), |id| format!("id {id}, ")),
         count(&usage["prompt_tokens"]),
         count(&usage["cached_tokens"]),
         timings["resumed_from"].as_str().unwrap_or("-"),
+        // (the conversation an earlier run kept, loaded for this request: the time it took)
+        timings["kept_seconds"].as_f64().map_or(String::new(), |seconds| format!(", loaded in {seconds:.1} s")),
         // (a prompt that agreed further than it could reuse: the client changed what came before)
         match timings["agreed_tokens"].as_u64() {
             Some(agreed) if agreed > usage["cached_tokens"].as_u64().unwrap_or(0) => format!(", the same as before for {agreed}"),
@@ -886,6 +889,7 @@ impl Runtime {
             cancel_patience,
             refusal,
             prefix: Cache::new(settings),
+            keeper: Keeper::new(settings),
             saves: Mutex::new(Vec::new()),
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
@@ -951,6 +955,8 @@ struct Driver {
     refusal: Refusal,
     /// What the run keeps of its system block's state, for the next start (Windows).
     prefix: Cache,
+    /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
+    keeper: Keeper,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -1003,10 +1009,13 @@ impl Driver {
             Ok(mut process) => {
                 let warming = self.restore_warm_state(&mut process).await;
                 let restoring = self.ready_frame().and_then(|ready| self.prefix.restore(&ready));
+                self.tell_kept_tokens(&mut process).await;
                 let changed = self.serve(&mut process, &mut jobs, &mut controls, warming, restoring).await;
                 if changed {
                     self.save_warm_state(&mut process).await;
                 }
+                // (the server stops on purpose: the conversation the worker holds is kept, once, with no request running)
+                self.keep_conversation(&mut process).await;
                 process.note_holders();
                 let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
                                           ("command", pyjson::Value::Str("shutdown".into()))]);
@@ -1130,6 +1139,89 @@ impl Driver {
                                 ("read_seconds", pyjson::Value::Float(restored.seconds))]);
         if let Err(message) = process.send_with_body(&header, restored.state()).await {
             tracing::warn!("Straydog could not hand its worker the system block's state: {message}");
+        }
+    }
+
+    /// Tell the worker which conversation the last run kept, if one is there: its tokens only, which are a part of the file's of their own. The state
+    /// stays on the drive until a request that begins with them asks for it ([`Driver::hand_conversation`]).
+    async fn tell_kept_tokens(&self, process: &mut Process) {
+        let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
+        let Ok(Some(tokens)) = opening.await else { return };
+        let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
+        if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
+            tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
+        }
+    }
+
+    /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
+    /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
+    async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
+        let state = match self.ready_frame() {
+            Some(ready) => {
+                let keeper = self.keeper.clone();
+                tokio::task::spawn_blocking(move || keeper.state(&ready)).await.map_err(|error| error.to_string()).and_then(|state| state)
+            }
+            None => Err("the engine is not ready".to_string()),
+        };
+        let header = |seconds: f64, reason: &str| frame(vec![("id", pyjson::Value::Str("kept-state".into())), ("command", pyjson::Value::Str("conversation".into())),
+                                                         ("read_seconds", pyjson::Value::Float(seconds)), ("reason", pyjson::Value::Str(reason.into()))]);
+        match state {
+            Ok((state, seconds)) if (state.len() as u64) <= crate::frames::BODY_LIMIT => {
+                tracing::debug!("Straydog conversation: handing its worker {} MB, opened in {seconds:.2} s", state.len() >> 20);
+                process.send_with_body(&header(seconds, ""), &state).await
+            }
+            Ok(_) => process.send_with_body(&header(0.0, "the state is larger than a frame"), &[]).await,
+            Err(reason) => process.send_with_body(&header(0.0, &reason), &[]).await,
+        }
+    }
+
+    /// The server is stopping: ask the worker for the state of the conversation it holds, and seal it into the file. One line in the log says what was
+    /// kept, or why nothing was. Nothing is written while requests run: the loop that served them is over.
+    async fn keep_conversation(&self, process: &mut Process) {
+        if !self.keeper.is_on() || !matches!(&*self.shared.phase.lock().unwrap(), Phase::Ready(_)) {
+            return;
+        }
+        let Some(ready) = self.ready_frame() else { return };
+        let started = Instant::now();
+        let limit = self.keeper.room();
+        let request = frame(vec![("id", pyjson::Value::Str("kept-state".into())), ("command", pyjson::Value::Str("conversation_state".into())),
+                                 ("limit", pyjson::Value::Int(i128::from(limit)))]);
+        let given = async {
+            process.send(&request).await?;
+            let header = tokio::time::timeout(Duration::from_secs(60), process.read()).await
+                .map_err(|_| "Straydog's worker gave no conversation state within 60 s".to_string())??;
+            if header["id"] != "kept-state" || header["event"] != "conversation_state" {
+                return Err(format!("the worker said {}", header["message"].as_str().unwrap_or("something else")));
+            }
+            let bytes = header["bytes"].as_u64().unwrap_or(0);
+            if bytes == 0 {
+                return Ok(Err(header["reason"].as_str().unwrap_or("it holds none").to_string()));
+            }
+            let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
+                .map_err(|_| "Straydog's worker did not finish the conversation state within 120 s".to_string())??;
+            Ok(Ok(state))
+        }.await;
+        let state = match given {
+            Ok(Ok(state)) => state,
+            Ok(Err(reason)) => {
+                // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
+                if reason.contains("room for") {
+                    tracing::info!("Straydog conversation: not kept ({reason})");
+                } else {
+                    tracing::debug!("Straydog conversation: nothing to keep ({reason})");
+                }
+                return;
+            }
+            Err(message) => {
+                tracing::warn!("Straydog conversation: not kept ({message})");
+                return;
+            }
+        };
+        let keeper = self.keeper.clone();
+        match tokio::task::spawn_blocking(move || keeper.save(&ready, state)).await {
+            Ok(Ok(saved)) => tracing::info!("{}", crate::conversation::saved_line(&saved, started.elapsed().as_secs_f64())),
+            Ok(Err(message)) => tracing::warn!("Straydog conversation: not kept ({message})"),
+            Err(error) => tracing::warn!("Straydog conversation: not kept ({error})"),
         }
     }
 
@@ -1463,6 +1555,11 @@ impl Driver {
                         }
                     }
                     let kind = event["event"].as_str().unwrap_or("").to_string();
+                    if kind == "conversation_wanted" {
+                        // (the request waits for it: the kept conversation is read from the drive and sent, and the events go on)
+                        self.hand_conversation(process).await?;
+                        continue;
+                    }
                     if kind == "done" {
                         tracing::info!("{}", request_summary(&event, client_request_id(&job.body)));
                         self.prefix.note_done(&event);
