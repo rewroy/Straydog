@@ -107,6 +107,57 @@ fn a_parked_conversation_comes_back() {
     bounded_parking(&model_root, &drafter, quantization, &golden);
 }
 
+/// A prompt stopped between the batches of a pipelined prefill (two GPUs, the whole model, the MTP drafter: each batch's last row
+/// stays on the MTP layer's device for the next batch's first pair) keeps the batches it read, and the same prompt sent again goes
+/// on from them as if it had never stopped: the same tokens, logits, final hidden state and sequence state, the MTP layer's pair
+/// across the stop included, as one request that read it whole. STRAYDOG_QUANT picks another bundle than the golden's (one whose
+/// dense weights fit the two GPUs: Unsloth's UD-IQ1_M does).
+#[test]
+fn a_pipelined_prompt_stopped_between_batches_goes_on_as_if_never_stopped() {
+    let (Some(model_root), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the model bundle directory"),
+                                             common::model_env("STRAYDOG_DRAFTER", "the drafter directory"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
+    let golden: Json = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let quantization = std::env::var("STRAYDOG_QUANT").unwrap_or_else(|_| golden["quantization"].as_str().unwrap().to_string());
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let expected = &golden["placements"]["two-gpu-experts-mtp"];
+    let request = expected["requests"].as_array().unwrap().iter().find(|request| request["name"] == "root").unwrap();
+    let root: Vec<u32> = serde_json::from_value(request["prompt"].clone()).unwrap();
+    // (past two batches of 4096, so that batches are deferred behind others)
+    let prompt: Vec<u32> = root.iter().chain(&root[..4000]).copied().collect();
+    let outcome = |model: &mut Model, tokens: Vec<u32>| Outcome {
+        tokens, logits: model.logits_digests.take().unwrap(), hidden: model.final_hidden().map(digest).unwrap_or_default(),
+        state: model.state_digest().unwrap(), metrics: model.last_metrics.clone(),
+    };
+    let whole = {
+        let mut model = open(&model_root, &drafter, &quantization, &expected["placement"]);
+        assert!(model.resident && model.speculative > 0, "the pipelined prefill needs the whole model on the two GPUs and the drafter");
+        let whole = go(&mut model, &prompt, 16, None);
+        drop(model);
+        whole
+    };
+    let mut model = open(&model_root, &drafter, &quantization, &expected["placement"]);
+    let (read, batch) = (std::cell::Cell::new(0usize), model.prefill_batch_size);
+    model.logits_digests = Some(Vec::new());
+    model.generate(&prompt, 16, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| read.get() >= batch,
+                   &mut |done, _| read.set(done), true, true, &mut |_| panic!("a token from a stopped prompt")).unwrap();
+    let held = model.history.len();
+    assert!(held >= batch && held < prompt.len(), "stopped between batches: {held} of {}", prompt.len());
+    model.logits_digests = Some(Vec::new());
+    let mut tokens = Vec::new();
+    model.generate(&prompt, 16, &straydog_engine::sampling::Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true,
+                   &mut |token| tokens.push(token)).unwrap();
+    let again = outcome(&mut model, tokens);
+    assert_eq!((again.metrics["cached_tokens"].as_u64(), again.metrics["resumed_from"].as_str()), (Some(held as u64), Some("live")));
+    assert_eq!(again.tokens, whole.tokens, "tokens");
+    assert_eq!(again.logits, whole.logits, "logits");
+    assert_eq!(again.hidden, whole.hidden, "final hidden");
+    assert_eq!(again.state, whole.state, "sequence state, the MTP layer's too");
+}
+
 /// Speculative decoding leaves the target as one-token decoding does (T173). Past 512 pooled
 /// blocks (2048 positions) a token attends to the 512 blocks its indexer picks by their pooled
 /// keys, so a block pooled from a rejected draft's input changes what later tokens see: a 20K
