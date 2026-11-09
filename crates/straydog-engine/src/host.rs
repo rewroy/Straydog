@@ -159,7 +159,8 @@ pub fn memory_limit_files() -> Vec<std::path::PathBuf> {
         cgroup_limit_files(std::path::Path::new("/proc/self/cgroup"), std::path::Path::new("/sys/fs/cgroup"))
             .into_iter().flat_map(|limit| {
                 let usage = cgroup_usage_file(&limit);
-                [Some(limit), usage].into_iter().flatten()
+                let stat = limit.with_file_name("memory.stat");
+                [Some(limit), usage, Some(stat)].into_iter().flatten()
             }).filter(|file| file.is_file()).collect()
     }
     #[cfg(not(target_os = "linux"))]
@@ -496,6 +497,23 @@ fn cgroup_usage_file(limit: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(limit.with_file_name(name))
 }
 
+/// File-backed cache can make room for the bank pages the hint asks for; counting it as committed usage would charge those pages twice.
+/// Keep swap-backed shared memory charged where it is reported: it cannot be dropped like the model's clean file pages.
+#[cfg(target_os = "linux")]
+fn cgroup_file_cache(limit: &std::path::Path) -> u64 {
+    let (file, shmem) = match limit.file_name().and_then(|name| name.to_str()) {
+        Some("memory.max") => ("file", "shmem"),
+        Some("memory.limit_in_bytes") => ("total_cache", "total_shmem"),
+        _ => return 0,
+    };
+    let Ok(stat) = std::fs::read_to_string(limit.with_file_name("memory.stat")) else { return 0 };
+    let value = |key: &str| stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse::<u64>().ok()).flatten()
+    });
+    value(file).unwrap_or(0).saturating_sub(value(shmem).unwrap_or(0))
+}
+
 #[cfg(target_os = "linux")]
 fn linux_available(physical: u64, files: &[std::path::PathBuf]) -> u64 {
     files.iter().fold(physical, |available, limit| {
@@ -505,7 +523,7 @@ fn linux_available(physical: u64, files: &[std::path::PathBuf]) -> u64 {
         };
         // A finite bound whose usage is unavailable cannot safely fund speculative reads.
         let current = std::fs::read_to_string(usage).ok().and_then(|value| value.trim().parse::<u64>().ok());
-        available.min(current.map_or(0, |used| maximum.saturating_sub(used)))
+        available.min(current.map_or(0, |used| maximum.saturating_sub(used.saturating_sub(cgroup_file_cache(limit)))))
     })
 }
 
@@ -773,6 +791,57 @@ mod tests {
         std::fs::write(root.join("fs/a/memory.current"), (12 * GIB).to_string()).unwrap();
         assert_eq!(super::linux_available(100 * GIB, &files), 3 * GIB);
         assert_eq!(super::linux_available(2 * GIB, &files), 2 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_cache_does_not_reduce_bank_room_but_other_usage_does() {
+        let root = tree("prefetch_cache", "0::/\n", &[
+            ("memory.max", "34359738368"), ("memory.current", "25769803776"),
+            ("memory.stat", "anon 4294967296\nfile 21474836480\nshmem 0\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 28 * GIB);
+        // More of the same file cached, with no new anonymous allocations: the same room.
+        std::fs::write(root.join("fs/memory.current"), (30 * GIB).to_string()).unwrap();
+        std::fs::write(root.join("fs/memory.stat"), format!("file {}\n", 26 * GIB)).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 28 * GIB);
+        // Eight more GiB of other usage still takes eight GiB from the hint's budget.
+        std::fs::write(root.join("fs/memory.current"), (38 * GIB).to_string()).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 20 * GIB);
+        assert_eq!(super::linux_available(3 * GIB, &files), 3 * GIB);
+        // Shared memory is not clean file cache, even though the file counter includes it.
+        std::fs::write(root.join("fs/memory.stat"), format!("file {}\nshmem {}\n", 26 * GIB, 4 * GIB)).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 16 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_cache_is_counted_at_each_ancestor_and_bad_stats_keep_usage_charged() {
+        let root = tree("prefetch_cache_parent", "0::/a\n", &[
+            ("memory.max", "17179869184"), ("memory.current", "15032385536"), ("memory.stat", "file 4294967296\n"),
+            ("a/memory.max", "8589934592"), ("a/memory.current", "7516192768"), ("a/memory.stat", "file 6442450944\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 6 * GIB);
+        std::fs::write(root.join("fs/memory.stat"), "file invalid\nfile_mapped 99999999999\n").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 2 * GIB);
+        std::fs::remove_file(root.join("fs/memory.stat")).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 2 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_uses_hierarchical_cache_not_the_local_cache() {
+        let root = tree("prefetch_cache_v1", "5:memory:/\n", &[
+            ("memory/memory.limit_in_bytes", "8589934592"), ("memory/memory.usage_in_bytes", "7516192768"),
+            ("memory/memory.stat", "cache 1073741824\ntotal_cache 5368709120\ntotal_shmem 1073741824\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 5 * GIB);
+        // A missing hierarchical counter cannot be replaced by this cgroup's local cache.
+        std::fs::write(root.join("fs/memory/memory.stat"), "cache 5368709120\n").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
         std::fs::remove_dir_all(root).unwrap();
     }
 
