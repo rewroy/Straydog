@@ -2,8 +2,8 @@
 //! resident model's expert banks.
 //!
 //! The app starts the engine when it opens, and the person then types for a while: neither step has to be done before the engine says
-//! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary when
-//! a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request never waits for a layer's turn,
+//! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary, or the next layer of
+//! a prompt's pass, when a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request never waits for a layer's turn,
 //! and the turns give way to a request that is generating). A third thread reads the layers to be locked ahead of the locking, at a low
 //! priority ([`read_ahead_behind`]), so that the pages a request finds in the layers not locked yet are in memory.
 
@@ -17,6 +17,51 @@ use straydog_engine::banks::Piece;
 /// pass, or does not begin. A static because the engine is behind the lock the warm-up holds, and the request loop is generic over its
 /// engine.
 pub(crate) static ARRIVED: AtomicBool = AtomicBool::new(false);
+
+/// When the first request that takes the engine came, in milliseconds on the process's clock (the log says how long the warm-up kept it waiting).
+static ARRIVAL: Arrival = Arrival::new();
+
+/// The process's clock for [`ARRIVAL`]: it starts at the first reading.
+static CLOCK: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn clock_ms() -> u64 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// A request that takes the engine has been read: [`ARRIVED`] is set (the warm-up behind "ready" lets go of the engine), and the time of the
+/// first one is kept. Every place that sets [`ARRIVED`] does it through this.
+pub(crate) fn arrive() {
+    // (the time first, so that whoever sees the flag finds it)
+    ARRIVAL.mark(clock_ms());
+    ARRIVED.store(true, Ordering::SeqCst);
+}
+
+/// Milliseconds since the first request came (None: none has).
+pub(crate) fn waited_ms() -> Option<u64> {
+    ARRIVAL.waited(clock_ms())
+}
+
+/// The moment of the first request, on a clock of milliseconds (kept as the reading plus one: zero is none yet).
+struct Arrival(std::sync::atomic::AtomicU64);
+
+impl Arrival {
+    const fn new() -> Arrival {
+        Arrival(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// A request came at `now`; one that came before it stays the first.
+    fn mark(&self, now: u64) {
+        let _ = self.0.compare_exchange(0, now.saturating_add(1), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Milliseconds from the first request to `now` (None: none came).
+    fn waited(&self, now: u64) -> Option<u64> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            marked => Some(now.saturating_sub(marked - 1)),
+        }
+    }
+}
 
 /// Whether the warm-up has yet to end (it is set before "ready" is sent): what takes the engine in the background waits for it, not
 /// taking it for a request's.
@@ -48,7 +93,7 @@ pub(crate) fn warm_up_over() -> Option<serde_json::Value> {
 pub(crate) enum WarmedUp {
     /// Both passes ran to their ends.
     Done,
-    /// A request came, and the model was reset at the pass boundary it was seen at.
+    /// A request came, and the model was reset where it was seen (at a pass boundary, or between the layers of a prompt's pass).
     CutShort,
     /// A request had the engine first.
     Skipped,
@@ -940,6 +985,25 @@ mod tests {
         assert!(!WARMING.load(Ordering::SeqCst));
         assert_eq!(warm_up_over(), None);
         assert!(!hold_warm_start(&state), "the warm-up is over: the warm start begins at once");
+    }
+
+    /// Decides: the time the first request came is kept, the wait is counted from it, and a later request does not move it.
+    #[test]
+    fn the_first_requests_arrival_is_kept_and_the_wait_counts_from_it() {
+        let arrival = Arrival::new();
+        assert_eq!(arrival.waited(5_000), None, "no request has come");
+        // (a request at the very start of the clock is not taken for none)
+        arrival.mark(0);
+        assert_eq!(arrival.waited(0), Some(0));
+        assert_eq!(arrival.waited(6_900), Some(6_900));
+        arrival.mark(2_000);
+        assert_eq!(arrival.waited(6_900), Some(6_900), "the first request stays the first");
+        let later = Arrival::new();
+        later.mark(11_900);
+        later.mark(12_500);
+        assert_eq!(later.waited(18_800), Some(6_900));
+        // (a clock read before the arrival does not wrap)
+        assert_eq!(later.waited(11_000), Some(0));
     }
 
     /// Decides: a request that comes while the warm-up holds the engine waits for a pass at most: the warm-up sees it and lets go.

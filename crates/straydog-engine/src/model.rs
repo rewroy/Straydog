@@ -109,6 +109,25 @@ pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this seque
 /// The devices are sound: the request fails, and the engine resets.
 pub const IMAGE_REFUSED: &str = "(a request with an image, refused)";
 
+/// The error of a pass that the warm-up behind "ready" stopped in the middle, for a request that came ([`Model::set_warm_stop`]): no device is
+/// left in a state the warm-up's reset does not take back.
+pub const WARM_STOPPED: &str = "Straydog warm-up stopped for a request";
+
+/// Whether `error` is [`WARM_STOPPED`] (it may be joined to the error of restoring the expert slots after it).
+pub fn is_warm_stop(error: &str) -> bool {
+    error.contains(WARM_STOPPED)
+}
+
+/// The spans a resident prefill runs: the first layer alone, then each device's decoder layers (`boundaries`, from layer 1) in spans of at most
+/// `width` layers.
+fn prefill_spans(boundaries: &[(usize, usize)], width: usize) -> Vec<(usize, usize)> {
+    let mut spans = vec![(0, 1)];
+    for (begin, end) in boundaries {
+        spans.extend((*begin..*end).step_by(width).map(|first| (first, (first + width).min(*end))));
+    }
+    spans
+}
+
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 pub const SCARCE_ROW_CACHE: u64 = 1 << 30;
 /// The commit a K/V growth leaves the machine.
@@ -642,6 +661,8 @@ pub struct Model {
     /// whether a table of rope positions is up (`sd_rope_rows`). A sequence without any costs a test of these two.
     rope_delta: u32,
     rope_table: bool,
+    /// Set only while the warm-up behind "ready" runs its passes ([`Model::set_warm_stop`]): the flag a request's arrival sets.
+    warm_stop: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 /// A measurement of what a verification pass costs by its rows (examples/prefill --force-rows): the rows are the sequence's next
@@ -794,6 +815,7 @@ impl Model {
             images: Vec::new(),
             rope_delta: 0,
             rope_table: false,
+            warm_stop: None,
         };
         // Placement allocates every weight before any is read; reading then fills them.
         model.group.defer_uploads();
@@ -1686,6 +1708,16 @@ impl Model {
         self.history.clear();
         self.final_hidden = None;
         self.group.reset_state()
+    }
+
+    /// Let the warm-up behind "ready" be stopped in the middle of a pass: while `stop` is set and true, a prompt batch ends between two layers
+    /// with [`WARM_STOPPED`] (and runs in spans of one layer for it to be seen, not four), instead of at its end. A request's own prefill
+    /// never does (it is read between batches, [`Model::prefill_batches`]: a stopped batch would take the held sequence's state with it), so
+    /// the warm-up sets this for its passes alone and clears it (`None`) before its [`Model::reset`], which takes back what a pass stopped
+    /// half way leaves: the recurrent state (zeroed), `history` (not yet extended by the batch) and the K/V rows past it (read only at positions
+    /// a sequence has written, as after any reset). Experts that reached the slots stay.
+    pub fn set_warm_stop(&mut self, stop: Option<&'static std::sync::atomic::AtomicBool>) {
+        self.warm_stop = stop;
     }
 
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
@@ -2637,17 +2669,29 @@ impl Model {
         shared(&self.history, tokens).max(shared(parked, tokens))
     }
 
-    /// Keep prompt rows on each GPU between spans of at most four layers; rows cross the host only
-    /// at device boundaries.
+    /// The error of a warm-up pass stopped between two spans ([`WARM_STOPPED`]). A span is waited for at its end, except where it is only
+    /// queued (the layers in parts on two devices, a deferred prompt): with more than one device what they queued is waited for here, so that
+    /// the reset after it finds every stream idle.
+    fn warm_stopped(&mut self) -> String {
+        if self.group.backends.len() > 1 {
+            let _ = self.group.prefill_settle();
+        }
+        WARM_STOPPED.to_string()
+    }
+
+    /// Keep prompt rows on each GPU between spans of at most four layers (one while the warm-up can be stopped, [`Model::set_warm_stop`]);
+    /// rows cross the host only at device boundaries.
     /// `stash`: the MTP layer reads every final row from the first layer's workspace, so only
     /// the last comes back; otherwise speculation takes them all.
     /// `keep_rows`: whether the last span returns rows (a deferred batch before the last does not).
     fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], stash: bool, keep_rows: bool) -> Result<Vec<f32>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
-        let boundaries = self.group.decoder_spans(1);
-        let mut spans = vec![(0, 1)];
-        for (begin, end) in &boundaries {
-            spans.extend((*begin..*end).step_by(4).map(|first| (first, (first + 4).min(*end))));
+        // (the warm-up's pass is thrown away, and a request that comes meanwhile is seen at every layer; any other pass runs in spans of four)
+        let stop = self.warm_stop;
+        let stopped = || stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst));
+        let spans = prefill_spans(&self.group.decoder_spans(1), if stop.is_some() { 1 } else { 4 });
+        if stopped() {
+            return Err(self.warm_stopped());
         }
         // The prompt's embeddings start the first span; later spans continue on the device, and
         // rows move GPU to GPU where the next span is on the other device.
@@ -2655,6 +2699,10 @@ impl Model {
         let mut rows_out = Vec::new();
         let mut previous: Option<usize> = None;
         for (index, (first, last)) in spans.into_iter().enumerate() {
+            // (before the rows are handed to the next device and the PLE layer is queued, so that no half of a step is left on a stream)
+            if index > 0 && stopped() {
+                return Err(self.warm_stopped());
+            }
             if let Some(previous) = previous {
                 self.group.prefill_handoff(previous, first, steps)?;
             }
@@ -3791,6 +3839,41 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
         return Err("Straydog model PLE placement mismatch".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod warm_stop_tests {
+    use super::{is_warm_stop, prefill_spans, WARM_STOPPED};
+
+    /// Spans of four are the spans a prompt has always run in, on one device and on two.
+    #[test]
+    fn a_prompt_runs_in_spans_of_four_layers() {
+        assert_eq!(prefill_spans(&[(1, 48)], 4).len(), 1 + 12);
+        let spans = prefill_spans(&[(1, 30), (30, 48)], 4);
+        assert_eq!(spans[..4], [(0, 1), (1, 5), (5, 9), (9, 13)]);
+        assert_eq!(spans[7..], [(25, 29), (29, 30), (30, 34), (34, 38), (38, 42), (42, 46), (46, 48)]);
+        // (every layer once, in order)
+        let layers: Vec<usize> = spans.iter().flat_map(|(first, last)| *first..*last).collect();
+        assert_eq!(layers, (0..48).collect::<Vec<_>>());
+    }
+
+    /// While the warm-up can be stopped, each layer is a span of its own, so that a request is seen at every layer.
+    #[test]
+    fn a_warm_up_pass_runs_in_spans_of_one_layer() {
+        let spans = prefill_spans(&[(1, 30), (30, 48)], 1);
+        assert_eq!(spans.len(), 48);
+        assert!(spans.iter().enumerate().all(|(layer, span)| *span == (layer, layer + 1)));
+        assert_eq!(prefill_spans(&[(1, 48)], 1).last(), Some(&(47, 48)));
+    }
+
+    /// The stop is known by its words, joined to another error or not, and no other error is taken for it.
+    #[test]
+    fn a_stopped_warm_up_pass_is_known_by_its_error() {
+        assert!(is_warm_stop(WARM_STOPPED));
+        assert!(is_warm_stop(&format!("{WARM_STOPPED}; restoring expert slots failed: no memory")));
+        assert!(!is_warm_stop("Straydog token or context is out of range"));
+        assert!(!is_warm_stop(""));
+    }
 }
 
 #[cfg(test)]
