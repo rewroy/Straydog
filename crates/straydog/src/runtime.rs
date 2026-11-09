@@ -476,12 +476,14 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 }
 
 /// Whether a line the worker wrote on stderr is in the log without --verbose. The warm-up's own account stays: how long it took, and what it
-/// placed; so does the account of the host banks a partially resident model page-locked, and when it pages or no longer; of the GPU memory
-/// freed after the start that the expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its
-/// passes cost, at the first choice and at each change.
+/// placed; so does the account of the host banks a partially resident model page-locked; of the GPU memory freed after the start that the
+/// expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its passes cost, at the first choice
+/// and at each change. When the read-ahead hint opens and shuts (Windows) is only with --verbose: it follows the drive's reads, a line every
+/// few seconds through a day of serving, and each request's line already says how many hints were taken and left.
 fn stays_in_the_log(line: &str) -> bool {
-    ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog host paging", "Straydog speed first",
-     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+    ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
+     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog GPU read-only host registration:",
+     "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -1862,6 +1864,7 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(!stays_in_the_log("Straydog host paging: 4.5 GiB available; the CPU's experts are read ahead from now"));
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
         assert!(!stays_in_the_log("some other line"));
     }

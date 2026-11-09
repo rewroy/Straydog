@@ -27,15 +27,19 @@ const STRINGS = {
     gpus: "GPUs", host: "Host", settings: "Settings", logs: "Service log", filter: "Filter",
     warningsOnly: "Warnings only", follow: "Follow", busy: "busy", power: "power", vram: "VRAM", usage: "usage",
     load: "load", memory: "Memory", used: "used", straydog: "Straydog", swap: "Swap", available: "available",
+    disk: "Disk", diskRead: "disk read", serverReadIo: "Straydog read I/O", allVolumes: "all volumes",
+    diskScope: "physical reads · all apps", ioScope: "I/O may include cached reads", ioScopeLinux: "storage reads by process",
+    ioScopeUnknown: "process I/O", serverResident: "Straydog RSS total",
+    rssScope: "Sum of process RSS, not a limit; shared pages may count more than once.",
     cpu: "CPU", gpu: "GPU", state: "State", placement: "Placement", fullyResident: "fully resident",
     partiallyResident: "GPU + CPU experts", kv: "K/V cache", vramKv: "VRAM", hostMemory: "host memory",
-    layers: "Layers", layersValue: "{0}–{1} on GPU {2}", expertSlots: "Experts in VRAM", expertSlotsValue: "{0} slots", expertHost: "Experts in host memory",
+    layers: "Layers", layersValue: "{0}–{1} on GPU {2}", expertSlots: "Experts in VRAM", expertSlotsValue: "{0} slots", expertHost: "Host expert tier budget", expertTotal: "Expert weights (model total)",
     context: "Context", tokens: "{0} tokens", prefillBatch: "Prefill batch", drafts: "{0} drafts",
     sequenceState: "Sequence state", loadedIn: "Loaded in", queue: "Queue", requestsDone: "Requests",
     failedCount: "{0} failed", promptTokens: "Prompt tokens", reused: "Reused", generated: "Generated",
     hostName: "Host name", os: "OS", kernel: "Kernel", architecture: "Architecture", cores: "Cores",
     coresValue: "{0} cores / {1} threads", loadAverage: "Load average", hostUptime: "Host uptime",
-    cpuTemperature: "CPU temperature", serverProcesses: "Straydog processes", serverMemory: "Straydog memory",
+    cpuTemperature: "CPU temperature", serverProcesses: "Straydog processes", serverMemory: "Straydog process RSS total",
     serverCpu: "Straydog CPU", model: "Model", quantization: "Quantization", drafter: "MTP drafter", none: "none",
     draftMax: "MTP drafts", devices: "GPUs", vramBudget: "VRAM per GPU", splitMode: "Split",
     stateRam: "Host memory for state", gemm: "GEMM precision", gemmMin: "GEMM from batch", address: "Address",
@@ -67,15 +71,19 @@ const STRINGS = {
     gpus: "GPU", host: "ホスト", settings: "設定", logs: "サービスログ", filter: "絞り込み",
     warningsOnly: "警告のみ", follow: "追従", busy: "使用率", power: "電力", vram: "VRAM", usage: "使用率",
     load: "負荷", memory: "メモリ", used: "使用", straydog: "Straydog", swap: "スワップ", available: "空き",
+    disk: "ディスク", diskRead: "ディスク読み取り", serverReadIo: "Straydog 読取 I/O", allVolumes: "全ボリューム",
+    diskScope: "実ディスク読取・全アプリ", ioScope: "I/O はキャッシュ読取も含む", ioScopeLinux: "プロセスによる実ストレージ読取",
+    ioScopeUnknown: "プロセス I/O", serverResident: "Straydog RSS 合計",
+    rssScope: "各プロセス RSS の合計です。確保上限ではなく、共有ページは重複計上される場合があります。",
     cpu: "CPU", gpu: "GPU", state: "状態", placement: "配置", fullyResident: "全常駐",
     partiallyResident: "GPU + CPU エキスパート", kv: "K/V キャッシュ", vramKv: "VRAM", hostMemory: "ホストメモリ",
-    layers: "層", layersValue: "{0}–{1}（GPU {2}）", expertSlots: "VRAM のエキスパート", expertSlotsValue: "{0} スロット", expertHost: "ホストメモリのエキスパート",
+    layers: "層", layersValue: "{0}–{1}（GPU {2}）", expertSlots: "VRAM のエキスパート", expertSlotsValue: "{0} スロット", expertHost: "ホスト expert 領域の予算", expertTotal: "エキスパート重み総量（モデル）",
     context: "コンテキスト", tokens: "{0} トークン", prefillBatch: "プレフィルバッチ", drafts: "{0} ドラフト",
     sequenceState: "系列状態", loadedIn: "読み込み", queue: "待ち行列", requestsDone: "リクエスト",
     failedCount: "失敗 {0}", promptTokens: "プロンプト", reused: "再利用", generated: "生成",
     hostName: "ホスト名", os: "OS", kernel: "カーネル", architecture: "アーキテクチャ", cores: "コア",
     coresValue: "{0} コア / {1} スレッド", loadAverage: "ロードアベレージ", hostUptime: "ホスト稼働時間",
-    cpuTemperature: "CPU 温度", serverProcesses: "Straydog のプロセス", serverMemory: "Straydog のメモリ",
+    cpuTemperature: "CPU 温度", serverProcesses: "Straydog のプロセス", serverMemory: "Straydog のプロセス RSS 合計",
     serverCpu: "Straydog の CPU", model: "モデル", quantization: "量子化", drafter: "MTP drafter", none: "なし",
     draftMax: "MTP ドラフト", devices: "GPU", vramBudget: "GPU ごとの VRAM", splitMode: "分割",
     stateRam: "系列状態のホストメモリ", gemm: "GEMM 精度", gemmMin: "GEMM 開始バッチ", address: "アドレス",
@@ -132,6 +140,8 @@ function number(value, digits = 0) {
   return numberFormats.get(digits).format(value);
 }
 const gib = (bytes) => number(bytes / 2 ** 30, 1);
+const sizeGiB = (bytes) => Number.isFinite(bytes) ? `${gib(bytes)} GiB` : "—";
+const mibRate = (bytes) => (Number.isFinite(bytes) ? bytes / 2 ** 20 : null);
 const percent = (part, whole) => (whole > 0 && Number.isFinite(part) ? (100 * part) / whole : null);
 const clock = (seconds) => new Date(seconds * 1000).toLocaleTimeString(LANG, { hour12: false });
 const celsius = (value) => (Number.isFinite(value) ? `${number(value)}°C` : "");
@@ -457,7 +467,7 @@ function gpuList(engine, host) {
 }
 
 let hardwareKey = "";
-const hardware = { gpus: [], cpu: null, memory: null };
+const hardware = { gpus: [], cpu: null, memory: null, disk: null };
 
 function metric(className, label, unit) {
   const node = element("div", `metric ${className}`);
@@ -536,16 +546,17 @@ function buildHardware(gpus) {
   container.append(cpu.card);
   hardware.cpu = cpu;
 
-  const memory = deviceCard(t("memory"), [["prefill", t("used")], ["decode", t("straydog")]]);
+  const memory = deviceCard(t("memory"), [["prefill", t("used")], ["decode", t("serverResident")]]);
+  memory.card.classList.add("memory-card");
   memory.used = metric("memory", t("used"), "%");
   memory.amount = metric("", t("used"), "GiB");
-  memory.server = metric("primary", t("straydog"), "GiB");
+  memory.server = metric("primary", t("serverResident"), "GiB");
   memory.metrics.append(memory.used.node, memory.amount.node, memory.server.node);
   memory.bar = element("div", "bar");
-  memory.serverBar = element("span", "used");
-  memory.otherBar = element("span", "other");
-  memory.bar.append(memory.serverBar, memory.otherBar);
-  memory.card.append(memory.bar, memory.foot);
+  memory.usedBar = element("span", "used");
+  memory.bar.append(memory.usedBar);
+  memory.scope = element("div", "memory-scope", t("rssScope"));
+  memory.card.append(memory.bar, memory.scope, memory.foot);
   memory.timechart = new TimeChart(memory.chart, [
     { key: "used", color: "prefill", axis: "left", fill: true, glow: true },
     { key: "server", color: "decode", axis: "left", width: 1.6 },
@@ -553,7 +564,23 @@ function buildHardware(gpus) {
   container.append(memory.card);
   hardware.memory = memory;
 
-  container.style.setProperty("--cards", String(gpus.length + 2));
+  const disk = deviceCard(t("disk"), [["decode", t("diskRead")], ["prefill", t("serverReadIo")]]);
+  disk.card.classList.add("disk");
+  disk.name.textContent = t("allVolumes");
+  disk.read = metric("primary", t("diskRead"), "MiB/s");
+  disk.server = metric("memory", t("serverReadIo"), "MiB/s");
+  disk.metrics.append(disk.read.node, disk.server.node);
+  disk.timechart = new TimeChart(disk.chart, [
+    { key: "read", color: "decode", axis: "left", fill: true, glow: true },
+    { key: "server", color: "prefill", axis: "left", width: 1.6 },
+  ], { left: { max: "auto", floor: 1 } });
+  disk.footLeft.textContent = t("diskScope");
+  disk.footRight.textContent = t("ioScope");
+  disk.card.append(disk.foot);
+  container.append(disk.card);
+  hardware.disk = disk;
+
+  container.style.setProperty("--cards", String(gpus.length + 3));
   charts.add(speedChart);
 }
 
@@ -569,6 +596,8 @@ function feed(sample) {
   hardware.cpu?.timechart.push("temp", sample.time, sample.cpu_temperature);
   hardware.memory?.timechart.push("used", sample.time, sample.memory);
   hardware.memory?.timechart.push("server", sample.time, sample.server_memory);
+  hardware.disk?.timechart.push("read", sample.time, sample.disk_read);
+  hardware.disk?.timechart.push("server", sample.time, sample.server_read_io);
   speedChart.push("decode", sample.time, sample.decode);
   speedChart.push("prefill", sample.time, sample.prefill);
 }
@@ -629,12 +658,15 @@ function renderHardware(engine, host) {
   memory.name.textContent = `${gib(host.memory_total)} GiB`;
   memory.used.value.textContent = number(percent(used, host.memory_total));
   memory.amount.value.textContent = gib(used);
-  memory.server.value.textContent = gib(host.server.memory);
-  memory.serverBar.style.setProperty("width", `${percent(host.server.memory, host.memory_total) ?? 0}%`);
-  memory.otherBar.style.setProperty("left", `${percent(host.server.memory, host.memory_total) ?? 0}%`);
-  memory.otherBar.style.setProperty("width", `${percent(Math.max(0, used - host.server.memory), host.memory_total) ?? 0}%`);
+  memory.server.value.textContent = Number.isFinite(host.server.memory) ? gib(host.server.memory) : "—";
+  memory.server.unit.textContent = Number.isFinite(host.server.memory) ? "GiB" : "";
+  memory.usedBar.style.setProperty("width", `${Math.min(100, Math.max(0, percent(used, host.memory_total) ?? 0))}%`);
   memory.footLeft.textContent = `${t("available")} ${gib(host.memory_available)} GiB`;
   memory.footRight.textContent = `${t("swap")} ${gib(host.swap_used)} / ${gib(host.swap_total)} GiB`;
+  hardware.disk.read.value.textContent = number(mibRate(host.disk_read_bytes_per_second), 1);
+  hardware.disk.server.value.textContent = number(mibRate(host.server_read_io_bytes_per_second), 1);
+  hardware.disk.footRight.textContent = t(host.server_read_io_source === "proc_read_bytes" ? "ioScopeLinux"
+    : host.server_read_io_source === "io_counters" ? "ioScope" : "ioScopeUnknown");
   return rebuilt;
 }
 
@@ -844,7 +876,8 @@ function renderEngine(engine, ready, activity) {
     isReady && tiered && [t("layers"), (placement.layers || [])
       .map(([first, end], index) => t("layersValue", first, end - 1, ((placement.devices || [])[index] || []).join("+") || "-")).join(" · ")],
     isReady && tiered && [t("expertSlots"), t("expertSlotsValue", placement.expert_slots.map((slots) => number(slots)).join(" + "))],
-    isReady && tiered && [t("expertHost"), `${gib(placement.host_expert_bytes)} GiB`],
+    isReady && tiered && [t("expertHost"), sizeGiB(placement.host_expert_bytes)],
+    isReady && Number.isFinite(placement.expert_bytes) && [t("expertTotal"), sizeGiB(placement.expert_bytes)],
     isReady && [t("context"), number(ready.context)],
     isReady && Array.isArray(placement.vram_budgets) && [t("vramBudget"), `${placement.vram_budgets.map((bytes) => gib(bytes)).join(" + ")} GiB`],
     isReady && [t("prefillBatch"), number(placement.prefill_batch_size)],
@@ -882,7 +915,13 @@ function renderEnvironment(engine, host, server) {
       [t("swap"), `${gib(host.swap_used)} / ${gib(host.swap_total)} GiB`],
       [t("hostUptime"), duration(host.uptime_seconds)],
       [t("serverProcesses"), `${number(host.server.processes)} (PID ${host.server.pid})`],
-      [t("serverMemory"), `${gib(host.server.memory)} GiB`],
+      [t("serverMemory"), sizeGiB(host.server.memory)],
+      engine.state === "ready" && Array.isArray(engine.ready?.placement?.expert_slots)
+        && [t("expertHost"), sizeGiB(engine.ready.placement.host_expert_bytes)],
+      engine.state === "ready" && Number.isFinite(engine.ready?.placement?.expert_bytes)
+        && [t("expertTotal"), sizeGiB(engine.ready.placement.expert_bytes)],
+      [t("diskRead"), `${number(mibRate(host.disk_read_bytes_per_second), 1)} MiB/s`],
+      [t("serverReadIo"), `${number(mibRate(host.server_read_io_bytes_per_second), 1)} MiB/s`],
       [t("serverCpu"), `${number(host.server.cpu_usage)}%`],
     ]);
     const gpus = gpuList(engine, host);
@@ -1213,6 +1252,7 @@ document.getElementById("lang-button").addEventListener("click", () => {
   try { localStorage.setItem(LANG_STORAGE, LANG); } catch { /* storage unavailable */ }
   numberFormats.clear();
   translatePage();
+  hardwareKey = "";
   poll();
 });
 

@@ -2450,6 +2450,19 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_host_register_read_only_supported(int ordinal) {
+    try {
+#if defined(__HIPCC__)
+        (void)ordinal;
+        throw std::runtime_error("read-only host registration support query requires CUDA");
+#else
+        int supported=0;
+        check(cudaDeviceGetAttribute(&supported,cudaDevAttrHostRegisterReadOnlySupported,ordinal));
+        return supported!=0;
+#endif
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+
 int sd_device_pci(int ordinal, int* domain, int* bus, int* device) {
     try {
         if (!domain || !bus || !device) throw std::runtime_error("invalid PCI buffers");

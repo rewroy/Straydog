@@ -180,6 +180,10 @@ main { min-height: 0; }
 .bar .mark { width: 2px; background: var(--text); opacity: .7; border-radius: 0; }
 .device-foot { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; }
 .device-foot span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.device.disk .device-foot { display: block; white-space: normal; line-height: 1.25; }
+.device.disk .device-foot span { display: block; overflow: visible; }
+.memory-card .bar .used { background: var(--prefill); }
+.memory-scope { color: var(--muted); font-size: 11px; line-height: 1.25; }
 
 .cores { display: flex; gap: 2px; align-items: flex-end; height: 26px; flex: none; }
 .cores i { flex: 1; min-width: 2px; height: 100%; border-radius: 2px 2px 0 0; background: var(--faint); position: relative; overflow: hidden; }
@@ -322,7 +326,7 @@ body.chat-open .chat-panel { opacity: 1; transform: none; pointer-events: auto; 
 
 /* ---- smaller screens scroll instead ---- */
 
-@media (max-width: 1100px), (max-height: 680px) {
+@media (max-width: 1400px), (max-height: 680px) {
   .app { height: auto; min-height: 100vh; }
   .overview { grid-template-rows: none; }
   .hardware { grid-template-columns: repeat(2, minmax(0, 1fr)); }

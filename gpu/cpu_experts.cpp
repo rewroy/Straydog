@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #if defined(__linux__)
 #include <fstream>
@@ -648,7 +649,50 @@ struct Engine {
     // The mapped files a gather reads (sd_cpu_gather_file), each with a handle for concurrent reads.
     struct MappedFile { const uint8_t* base; uint64_t bytes; HANDLE file; };
     std::vector<MappedFile> files;
-    ~Engine() { for (const MappedFile& mapped : files) CloseHandle(mapped.file); }
+    // The read-ahead hints' own thread (sd_cpu_read_ahead): PrefetchVirtualMemory costs its caller about 230 us even when every page is
+    // in memory, and asked by the thread that runs the layer it held up decode by up to 5 ms a token (Qwen3.8 UD-IQ1_M on an RTX 5070 Ti
+    // at 9.5 GiB, the pages in memory: 45.8 tok/s with the hints, 60.3 without, the same page faults a token either way). Here it holds up
+    // no layer: a cold page is still asked for in one request, and what is in memory costs a spare core's time. Hints for layers long
+    // done are worth nothing, so a queue that falls behind drops its oldest.
+    struct ReadAhead {
+        static constexpr size_t MOST_QUEUED = 8;
+        std::mutex lock;
+        std::condition_variable wake;
+        std::deque<std::vector<WIN32_MEMORY_RANGE_ENTRY>> queued;
+        bool stopping = false;
+        std::thread thread{[this] { run(); }};
+        void push(std::vector<WIN32_MEMORY_RANGE_ENTRY>&& entries) {
+            {
+                std::lock_guard<std::mutex> held(lock);
+                if (queued.size() >= MOST_QUEUED) queued.pop_front();
+                queued.push_back(std::move(entries));
+            }
+            wake.notify_one();
+        }
+        void run() {
+            for (;;) {
+                std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+                {
+                    std::unique_lock<std::mutex> held(lock);
+                    wake.wait(held, [this] { return stopping || !queued.empty(); });
+                    if (stopping) return;
+                    entries = std::move(queued.front());
+                    queued.pop_front();
+                }
+                PrefetchVirtualMemory(GetCurrentProcess(), ULONG_PTR(entries.size()), entries.data(), 0);
+            }
+        }
+        ~ReadAhead() {
+            { std::lock_guard<std::mutex> held(lock); stopping = true; }
+            wake.notify_one();
+            thread.join();
+        }
+    };
+    std::unique_ptr<ReadAhead> read_ahead;   // with the paging flag (sd_cpu_paging)
+    ~Engine() {
+        read_ahead.reset();   // (no hint is asked for once the engine goes)
+        for (const MappedFile& mapped : files) CloseHandle(mapped.file);
+    }
 #endif
 };
 #if defined(_WIN32)
@@ -1122,10 +1166,16 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
 // taken only then, and never without a flag. Linux does not read it.
 int sd_cpu_paging(void* handle, const uint8_t* flag) {
     static_assert(std::atomic<uint8_t>::is_always_lock_free && sizeof(std::atomic<uint8_t>) == 1, "the flag is a plain byte");
-    auto* engine = static_cast<Engine*>(handle);
-    if (!engine) { cpu_error = "invalid Straydog CPU paging flag"; return -1; }
-    engine->paging = reinterpret_cast<const std::atomic<uint8_t>*>(flag);
-    return 0;
+    try {
+        auto* engine = static_cast<Engine*>(handle);
+        if (!engine) { cpu_error = "invalid Straydog CPU paging flag"; return -1; }
+        engine->paging = reinterpret_cast<const std::atomic<uint8_t>*>(flag);
+#if defined(_WIN32)
+        // (the hints' thread: an allocation or a thread the system refuses is this call's error, not an exception across the boundary)
+        if (!engine->read_ahead) engine->read_ahead = std::make_unique<Engine::ReadAhead>();
+#endif
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
 // Ask for the pages of `count` byte ranges (on Linux on every worker), before a layer's experts read them: with less host memory than
@@ -1148,11 +1198,11 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
             }
         });
 #elif defined(_WIN32)
-        // Only while the machine pages (host.rs PAGING, one load): with the pages in memory a request for them costs 113 us a layer (5.4 ms a
-        // token), 30.4 to 24.9 tok/s.
-        if (!engine->paging || !engine->paging->load(std::memory_order_relaxed)) { ++engine->read_aheads_skipped; return 0; }
+        // Only while the machine pages (host.rs PAGING, one load): with the pages in memory a request for them costs its thread 113 to
+        // 230 us a layer, which the hints' own thread pays (Engine::ReadAhead).
+        if (!engine->paging || !engine->paging->load(std::memory_order_relaxed) || !engine->read_ahead) { ++engine->read_aheads_skipped; return 0; }
         ++engine->read_aheads;
-        // One request for the whole range of each expert's bank slice, queued by this thread: left to the rows' faults, a cold page is
+        // One request for the whole range of each expert's bank slice, queued by the hints' thread: left to the rows' faults, a cold page is
         // read a cluster at a time (46 KB on average), each read holding up the worker that took it. Pages in memory stay what they
         // were (soft faults). Qwen3.8 UD-IQ1_M partially resident on an RTX 5070 Ti with 61.6 GiB, 30 of them free: a 1024-token
         // request read from the drive in 100K reads of 46 KB before, in 20K of 200 KB after.
@@ -1162,7 +1212,7 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
             const uintptr_t begin = uintptr_t(ranges[i]) & ~uintptr_t(4095), end = (uintptr_t(ranges[i]) + bytes[i] + 4095) & ~uintptr_t(4095);
             entries.push_back({reinterpret_cast<void*>(begin), SIZE_T(end - begin)});
         }
-        if (!entries.empty()) PrefetchVirtualMemory(GetCurrentProcess(), ULONG_PTR(entries.size()), entries.data(), 0);
+        if (!entries.empty()) engine->read_ahead->push(std::move(entries));
 #endif
         return 0;
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }

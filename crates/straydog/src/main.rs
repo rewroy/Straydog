@@ -90,6 +90,8 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // (Windows: a process that dies of an exception says where first, on stderr, for whoever runs it)
+    straydog::crash::report_unhandled();
     let args = config::expand_short_options(std::env::args_os());
     let matches = <Cli as clap::CommandFactory>::command().get_matches_from(args);
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());

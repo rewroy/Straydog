@@ -98,9 +98,14 @@ async fn the_page_is_public_and_the_data_needs_the_key() {
     assert_eq!(status["engine"]["state"], "failed");
     assert_eq!(status["engine"]["activity"]["requests"], 0);
     assert!(status["host"]["memory_total"].as_u64().unwrap() > 0);
+    assert!(status["host"].get("disk_read_bytes_per_second").is_some());
+    assert!(status["host"].get("server_read_io_bytes_per_second").is_some());
+    assert!(status["host"]["server_read_io_source"].is_string());
     let samples = status["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0]["decode"], 0.0);
+    assert!(samples[0].get("disk_read").is_some());
+    assert!(samples[0].get("server_read_io").is_some());
     let since = samples[0]["time"].as_f64().unwrap();
     let (_, _, body) = get(&router, &format!("/dashboard/status?since={since}"), Some("sk-dashboard")).await;
     let newer = serde_json::from_slice::<Value>(&body).unwrap()["samples"].as_array().unwrap().clone();

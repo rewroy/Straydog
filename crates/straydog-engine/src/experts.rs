@@ -407,25 +407,74 @@ struct Pinner {
     failure: Option<String>,
 }
 
+/// The host tier's arenas past each class's first are page-locked only once every class has allocated and touched all of its own. A first
+/// touch where free memory is in pieces (after another model's run filled the page cache) makes Linux compact memory, and compaction
+/// migrates pages of arenas already locked for the GPUs, huge ones as well: each migration of a locked range stopped every GPU queue of the
+/// process (a KFD eviction). DeepSeek UD-IQ2_XXS on two R9700s from scattered memory: 15 s of evictions in the 150 s after ready, 3.5
+/// million pages migrated, against 0.8 s from whole memory. Allocated first, the compaction moves nothing locked yet. Each class's
+/// first arena is still locked at once: the staging READY waits for (`prepare_staging`).
+struct Allocated {
+    left: Mutex<usize>,
+    all: std::sync::Condvar,
+}
+
+impl Allocated {
+    fn new(classes: usize) -> Arc<Allocated> {
+        Arc::new(Allocated { left: Mutex::new(classes), all: std::sync::Condvar::new() })
+    }
+
+    /// One class has allocated all it will.
+    fn done(&self) {
+        let mut left = self.left.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *left = left.saturating_sub(1);
+        if *left == 0 {
+            self.all.notify_all();
+        }
+    }
+
+    /// Until every class has, or `stop`.
+    fn wait(&self, stop: &AtomicBool) {
+        let mut left = self.left.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *left > 0 && !stop.load(Ordering::Relaxed) {
+            left = self.all.wait_timeout(left, std::time::Duration::from_millis(100)).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+        }
+    }
+}
+
+/// Says a class's allocating is over however its thread leaves.
+struct AllocatedOnce(Option<Arc<Allocated>>);
+
+impl AllocatedOnce {
+    fn done(&mut self) {
+        if let Some(allocated) = self.0.take() {
+            allocated.done();
+        }
+    }
+}
+
+impl Drop for AllocatedOnce {
+    fn drop(&mut self) {
+        self.done();
+    }
+}
+
 impl Pinner {
-    fn new(count: usize, bytes: usize) -> Pinner {
+    fn new(count: usize, bytes: usize, allocated: Arc<Allocated>) -> Pinner {
         let (tx, arenas) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let pinned_bytes = Arc::new(AtomicU64::new(0));
         let pinned = pinned_bytes.clone();
         let thread = std::thread::spawn(move || {
-            for _ in 0..count {
-                if stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut arena = storage::Buffer::new(bytes);
+            let mut once = AllocatedOnce(Some(allocated.clone()));
+            // Page-locks an arena and hands it over; false when the pin failed or no one takes it any more.
+            let hand_over = |mut arena: storage::Buffer| -> bool {
                 // SAFETY: the arena is handed over pinned; whoever holds it unpins it before freeing.
                 if let Err(error) = unsafe { transfer::pin_host(arena.as_mut_slice().as_mut_ptr(), arena.capacity()) } {
                     let kept = pinned.load(Ordering::Relaxed);
                     eprintln!("WARN Straydog expert host pin stopped: {error}; keeping {kept} of {} planned bytes", count as u64 * bytes as u64);
                     let _ = tx.send(Err(error));
-                    return;
+                    return false;
                 }
                 pinned.fetch_add(arena.capacity() as u64, Ordering::Relaxed);
                 if let Err(unsent) = tx.send(Ok(arena)) {
@@ -434,6 +483,25 @@ impl Pinner {
                         let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
                         pinned.fetch_sub(arena.capacity() as u64, Ordering::Relaxed);
                     }
+                    return false;
+                }
+                true
+            };
+            if count == 0 || stopped.load(Ordering::Relaxed) || !hand_over(storage::Buffer::new(bytes)) {
+                return;
+            }
+            let mut rest = Vec::with_capacity(count - 1);
+            for _ in 1..count {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                rest.push(storage::Buffer::new(bytes));
+            }
+            once.done();
+            allocated.wait(&stopped);
+            for arena in rest {
+                // (one not locked yet is only freed)
+                if stopped.load(Ordering::Relaxed) || !hand_over(arena) {
                     return;
                 }
             }
@@ -954,12 +1022,13 @@ impl DeviceExperts {
         let budgets = host_shares(&distinct, &shares, &counts, layout.experts as u64, host_budget, staging);
         let mut classes = Vec::new();
         let mut all_slots = Vec::new();
+        let allocated = Allocated::new(distinct.len());
         for (index, &(vram_bytes, host_bytes)) in distinct.iter().enumerate() {
             let count = counts[index];
             let reserve = (count / 64).clamp(4, MAX_RESERVE);
             let class_budget = budgets[index];
             let (host_capacity, per_arena, arenas) = host_plan(class_budget, host_bytes, reserve);
-            let pinner = Pinner::new(arenas, per_arena * host_bytes as usize);
+            let pinner = Pinner::new(arenas, per_arena * host_bytes as usize, allocated.clone());
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
                 key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, streamed: false, class: index,

@@ -1,13 +1,14 @@
 //! What the dashboard reads besides the engine: the server's recent log and its host.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{DiskRefreshKind, Disks, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Log lines the dashboard can still read.
 const LOG_LINES: usize = 2000;
@@ -74,6 +75,7 @@ impl Write for LogSink {
 /// How often the whole process table is read to find the server's processes (the server, its
 /// sandbox and the worker); between, only those are refreshed.
 const PROCESS_SCAN: Duration = Duration::from_secs(15);
+const IO_SAMPLE_MAX: Duration = Duration::from_secs(5);
 /// How often the sensors are looked for again: a GPU reset renumbers hwmon.
 const SENSOR_SCAN: Duration = Duration::from_secs(60);
 
@@ -90,6 +92,10 @@ struct HostState {
     system: System,
     tree: Vec<Pid>,
     scanned: Option<Instant>,
+    disks: Disks,
+    disk_reads: HashMap<PathBuf, u64>,
+    process_reads: HashMap<Pid, u64>,
+    io_sampled: Option<Instant>,
     sensors: Sensors,
     found: Option<Instant>,
 }
@@ -127,7 +133,8 @@ impl Default for Host {
             "physical_cores": System::physical_core_count(),
         });
         Host {
-            state: Mutex::new(HostState { system, tree: Vec::new(), scanned: None, sensors: Sensors::default(), found: None }),
+            state: Mutex::new(HostState { system, tree: Vec::new(), scanned: None, disks: Disks::new(), disk_reads: HashMap::new(),
+                                          process_reads: HashMap::new(), io_sampled: None, sensors: Sensors::default(), found: None }),
             pid: Pid::from_u32(std::process::id()),
             facts,
             // Absent without an NVIDIA driver: the dashboard then shows no NVIDIA sensors.
@@ -144,7 +151,7 @@ impl Host {
         let state = &mut *guard;
         state.system.refresh_memory();
         state.system.refresh_cpu_usage();
-        let kind = ProcessRefreshKind::nothing().with_memory().with_cpu();
+        let kind = ProcessRefreshKind::nothing().with_memory().with_cpu().with_disk_usage();
         if state.scanned.is_none_or(|at| at.elapsed() >= PROCESS_SCAN) {
             state.system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
             state.tree = tree_of(state.system.processes(), self.pid);
@@ -157,6 +164,17 @@ impl Host {
             }
         }
         let tree: Vec<_> = state.tree.iter().filter_map(|pid| state.system.process(*pid)).collect();
+        let now = Instant::now();
+        let elapsed = state.io_sampled.replace(now).map(|before| now.duration_since(before)).filter(|span| *span <= IO_SAMPLE_MAX);
+        let process_totals = tree.iter().map(|process| (process.pid(), process.disk_usage().total_read_bytes));
+        let server_read_rate = read_rate(&mut state.process_reads, process_totals, elapsed);
+        state.disks.refresh_specifics(true, DiskRefreshKind::nothing().with_io_usage());
+        let disk_read_rate = if state.disks.list().is_empty() {
+            None
+        } else {
+            let totals = state.disks.list().iter().map(|disk| (disk_key(disk), disk.usage().total_read_bytes));
+            read_rate(&mut state.disk_reads, totals, elapsed)
+        };
         if state.found.is_none_or(|at| at.elapsed() >= SENSOR_SCAN) {
             state.sensors = Sensors::find();
             state.found = Some(Instant::now());
@@ -180,6 +198,12 @@ impl Host {
             "memory_available": system.available_memory(),
             "swap_total": system.total_swap(),
             "swap_used": system.used_swap(),
+            "disk_read_bytes_per_second": disk_read_rate,
+            // Windows process I/O includes cached reads; the disk rate above measures volume I/O.
+            "server_read_io_bytes_per_second": server_read_rate,
+            "server_read_io_source": if cfg!(target_os = "linux") { "proc_read_bytes" }
+                                      else if cfg!(target_os = "windows") { "io_counters" }
+                                      else { "unknown" },
             "uptime_seconds": System::uptime(),
             "server": {
                 "pid": self.pid.as_u32(),
@@ -193,6 +217,22 @@ impl Host {
         }
         snapshot
     }
+}
+
+/// Rates from cumulative counters. A newly observed process or volume starts at zero here,
+/// rather than making all of its earlier reads look like one second of activity.
+fn read_rate<K: Eq + Hash>(previous: &mut HashMap<K, u64>, totals: impl IntoIterator<Item = (K, u64)>,
+                           elapsed: Option<Duration>) -> Option<f64> {
+    let current: HashMap<K, u64> = totals.into_iter().collect();
+    let bytes: u64 = current.iter().map(|(key, &total)| total.saturating_sub(*previous.get(key).unwrap_or(&total))).sum();
+    *previous = current;
+    elapsed.filter(|span| !span.is_zero()).map(|span| bytes as f64 / span.as_secs_f64())
+}
+
+/// Linux can expose the same block device at several mount points. Key its counter by
+/// device instead of counting each mount as another physical read.
+fn disk_key(disk: &sysinfo::Disk) -> PathBuf {
+    if cfg!(target_os = "linux") { PathBuf::from(disk.name()) } else { disk.mount_point().to_path_buf() }
 }
 
 /// This server and the processes under it; Linux lists each thread as well, and those are
@@ -356,12 +396,29 @@ mod tests {
 
     #[test]
     fn the_host_counts_this_process() {
-        let snapshot = Host::default().snapshot();
+        let host = Host::default();
+        let snapshot = host.snapshot();
         assert!(snapshot["memory_total"].as_u64().unwrap() > 0);
         assert!(snapshot["server"]["processes"].as_u64().unwrap() >= 1);
         assert!(snapshot["server"]["memory"].as_u64().unwrap() > 0);
         assert_eq!(snapshot["cpu_cores"].as_array().unwrap().len(), snapshot["logical_cores"].as_u64().unwrap() as usize);
         assert!(snapshot["gpus"].is_array());
+        assert!(snapshot["disk_read_bytes_per_second"].is_null(), "the first disk reading has no interval");
+        assert!(host.snapshot()["server_read_io_bytes_per_second"].is_number());
+    }
+
+    #[test]
+    fn io_rates_skip_old_reads_and_counter_resets() {
+        let mut previous = HashMap::new();
+        let second = Some(Duration::from_secs(1));
+        assert_eq!(read_rate(&mut previous, [(1, 8_000)], None), None);
+        assert_eq!(read_rate(&mut previous, [(1, 9_000), (2, 50_000)], second), Some(1_000.0));
+        assert_eq!(read_rate(&mut previous, [(1, 500), (2, 51_000)], second), Some(1_000.0));
+        assert_eq!(read_rate(&mut previous, [(1, 1_500), (2, 52_000)], None), None);
+        assert_eq!(read_rate(&mut previous, [(1, 2_000), (2, 53_000)], second), Some(1_500.0));
+        let mut volume_reads = HashMap::new();
+        assert_eq!(read_rate(&mut volume_reads, [("same-device", 10_000), ("same-device", 10_000)], None), None);
+        assert_eq!(read_rate(&mut volume_reads, [("same-device", 11_000), ("same-device", 11_000)], second), Some(1_000.0));
     }
 }
 

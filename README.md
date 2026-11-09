@@ -211,6 +211,9 @@ samples at `temperature=1.0` without truncation. `temperature: 0` is greedy. Sam
 controls the engine does not implement are refused (400), never ignored. A client that
 returns the reasoning in its assistant messages keeps the conversation cache warm.
 
+The [timing and cache fields](docs/DESIGN.md#101-timing-and-cache-fields) distinguish prefill
+setup and restoration, expert-cache capacity and occupancy, and reused prompt positions.
+
 Like llama-server, `GET /props` (`default_generation_settings.n_ctx`) and `GET /slots`
 report the context, and `GET /health` the loading progress.
 

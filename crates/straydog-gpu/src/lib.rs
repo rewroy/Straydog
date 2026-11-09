@@ -58,6 +58,13 @@ pub fn device_info(ordinal: usize) -> Result<(String, u64, u64)> {
     Ok((name, free, total))
 }
 
+/// Whether this CUDA GPU advertises support for registering host memory as read-only.
+#[cfg(feature = "cuda")]
+pub fn host_register_read_only_supported(ordinal: usize) -> Result<bool> {
+    // SAFETY: the query reads a device attribute and returns 0, 1, or a negative error.
+    check(unsafe { ffi::sd_host_register_read_only_supported(ordinal as c_int) }).map(|value| value != 0)
+}
+
 /// A device's PCI address as `domain:bus:device.0` in lower-case hex, the form Linux's sysfs
 /// and NVML use.
 pub fn pci_address(ordinal: usize) -> Result<String> {
