@@ -316,11 +316,11 @@ fn working_set_limit(wanted: u64, least: u64, held: u64, available: u64, memory:
     limit.min(wanted).max(least.min(wanted))
 }
 
-/// Nonzero while the machine pages, 0 otherwise: [`keep_resident`] keeps it with every limit it sets, and the CPU engine's read-ahead hint on
+/// Nonzero while the machine pages, 0 otherwise: [`watch_working_set`] observes it from partial residency's start, and the CPU engine's read-ahead hint on
 /// Windows reads it with one load instead of asking the system (`CpuExperts::watch_paging`). The pages the CPU's experts touch are out of
 /// memory only while it does: with RAM to spare the banks stay in the standby list, and a read-ahead of pages already there only costs time
 /// (113 us a layer, 5.4 ms a token, 30.4 to 24.9 tok/s on a machine with RAM to spare). It is set while the system reads the drive for page
-/// faults ([`drive_busy`]), which covers a cold start with memory to spare as well as a working set held at its limit; where the system does
+/// faults ([`PagingObserver`]), which covers a cold start with memory to spare as well as a working set held at its limit; where the system does
 /// not say, while its free memory is short ([`memory_short`]).
 pub static PAGING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -334,18 +334,48 @@ fn memory_short(available: u64, memory: u64, was_short: bool) -> bool {
     available < high || (was_short && available <= high + (high - low))
 }
 
-/// Keeps the working set's limit to what is free, four times a second, whatever the engine is doing: a wide batch reads a gigabyte a second, and
-/// read at each batch the limit came too late (0.47 GiB available). `pinned` follows the K/V.
-pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64) {
+/// Paging is observed while banks are still being locked. Only the quota waits: setting it sooner could trim the pages the locking reads next.
+#[derive(Default)]
+pub struct WorkingSetWatch {
+    quota: std::sync::atomic::AtomicBool,
+}
+
+impl WorkingSetWatch {
+    /// The banks have finished locking; subsequent observations may also adjust the working set.
+    pub fn allow_quota(&self) {
+        self.quota.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(any(windows, test))]
+    fn tick(&self, observe: impl FnOnce(), limit: impl FnOnce()) {
+        observe();
+        if self.quota.load(std::sync::atomic::Ordering::Acquire) {
+            limit();
+        }
+    }
+}
+
+/// Observe paging before ready, then four times a second independently of requests and bank locks. The working-set quota waits for
+/// [`WorkingSetWatch::allow_quota`]. `pinned` follows the K/V. Dropping the model ends its watcher.
+pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64,
+                         watch: &std::sync::Arc<WorkingSetWatch>) {
     #[cfg(windows)]
     {
-        let _ = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
+        let mut paging = PagingObserver::default();
+        let profile = std::env::var_os("DS41_PROFILE").is_some();
+        // Take the baseline here, not after the thread is scheduled or the bank locking ends.
+        paging.observe(memory, profile, false);
+        let watch = std::sync::Arc::downgrade(watch);
+        if let Err(error) = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks);
-        });
+            let Some(watch) = watch.upgrade() else { break };
+            watch.tick(|| paging.observe(memory, profile, watch.quota.load(std::sync::atomic::Ordering::Acquire)), || keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks));
+        }) {
+            eprintln!("WARN Straydog host paging: cannot start the observer: {error}");
+        }
     }
     #[cfg(not(windows))]
-    let _ = (memory, pinned, banks);
+    let _ = (memory, pinned, banks, watch);
 }
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
@@ -393,17 +423,6 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
         let available = windows_available().0;
-        let was_paging = PAGING.load(std::sync::atomic::Ordering::Relaxed) != 0;
-        let paging = drive_busy().unwrap_or_else(|| memory_short(available, memory, was_paging));
-        if paging != was_paging {
-            PAGING.store(u8::from(paging), std::sync::atomic::Ordering::Relaxed);
-            let gib = available as f64 / (1u64 << 30) as f64;
-            if paging {
-                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are read ahead from now");
-            } else {
-                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are no longer read ahead");
-            }
-        }
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
         let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
         let mut wanted = share;
@@ -824,10 +843,30 @@ pub fn commit_note(step: &str) {
     let _ = step;
 }
 
-/// Pages the system has read from the drive to satisfy page faults since it started (all processes): the 32-bit PageReadCount of
-/// SystemPerformanceInformation, which `Memory\Pages Input/sec` counts. None where the system does not say.
+/// Why the system's page-read counter cannot be used. An unknown sample falls back to free memory, not an assumption that the banks are hot.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageReadError {
+    Query(i32),
+    Short(u32),
+    Layout,
+}
+
+#[cfg(any(windows, test))]
+fn page_reads_of(status: i32, returned: u32, buffer: &[u64; 64], available: u64) -> Result<u32, PageReadError> {
+    if status < 0 { return Err(PageReadError::Query(status)); }
+    if returned < 84 { return Err(PageReadError::Short(returned)); }
+    let available_pages = available / 4096;
+    let reported = buffer[5] >> 32;
+    if available_pages == 0 || reported.abs_diff(available_pages) > available_pages / 10 {
+        return Err(PageReadError::Layout);
+    }
+    Ok((buffer[10] & 0xffff_ffff) as u32)
+}
+
+/// PageReadCount of SystemPerformanceInformation (all processes). AvailablePages at byte 44 guards the layout before the count at byte 80 is used.
 #[cfg(windows)]
-fn windows_page_reads() -> Option<u32> {
+fn windows_page_reads(available: u64) -> Result<u32, PageReadError> {
     #[link(name = "ntdll", kind = "raw-dylib")]
     unsafe extern "system" {
         fn NtQuerySystemInformation(class: u32, information: *mut u64, length: u32, returned: *mut u32) -> i32;
@@ -836,20 +875,14 @@ fn windows_page_reads() -> Option<u32> {
     let mut returned = 0u32;
     // SAFETY: a buffer of the length given, and a place for the length returned.
     let status = unsafe { NtQuerySystemInformation(2, buffer.as_mut_ptr(), std::mem::size_of_val(&buffer) as u32, &mut returned) };
-    // (the counter lies at byte 80, after four 64-bit counters and twelve 32-bit ones, of which AvailablePages at byte 44 tells the layout is
-    // the one known: it must be what the memory status says, to a tenth)
-    let layout_known = |available_pages: u64| {
-        let status = windows_available().0 / 4096;
-        status > 0 && available_pages.abs_diff(status) <= status / 10
-    };
-    (status >= 0 && returned >= 84 && layout_known(buffer[5] >> 32)).then_some((buffer[10] & 0xffff_ffff) as u32)
+    page_reads_of(status, returned, &buffer, available)
 }
 
 /// Pages a second of the system's reads for page faults from which the drive counts as being read: 25,000 are 100 MB/s, where an idle system
 /// reads tens (serving UD-IQ1_M partially resident reads 40,000 on average, in bursts).
 #[cfg(any(windows, test))]
 const READS_BUSY: f64 = 25_000.0;
-/// Calls of [`drive_busy`] (250 ms apart) that stay under [`READS_BUSY`] before the drive counts as quiet: two seconds.
+/// Observations (250 ms apart) that stay under [`READS_BUSY`] before the drive counts as quiet: two seconds.
 #[cfg(any(windows, test))]
 const QUIET_CALLS: u32 = 8;
 
@@ -859,26 +892,69 @@ fn quiet_calls(quiet: u32, pages: u32, seconds: f64) -> u32 {
     if f64::from(pages) / seconds >= READS_BUSY { 0 } else { quiet.saturating_add(1) }
 }
 
-/// Whether the drive is being read for page faults: at READS_BUSY pages a second or more over the time since the last call or in the two
-/// seconds before. None where the system does not say. The first call only takes the count.
-#[cfg(windows)]
-fn drive_busy() -> Option<bool> {
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
-    let count = windows_page_reads()?;
-    let now = std::time::Instant::now();
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some((at, before, quiet)) = *last else {
-        *last = Some((now, count, QUIET_CALLS));
-        return Some(false);
-    };
-    let seconds = now.duration_since(at).as_secs_f64();
-    // (calls close together, as when a K/V growth sets the limit, add nothing)
-    if seconds < 0.1 {
-        return Some(quiet < QUIET_CALLS);
+/// Each observer owns its baseline: a query failure invalidates it, so recovery cannot turn a gap into an idle sample.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct PagingObserver {
+    last: Option<(std::time::Instant, u32, u32)>,
+    #[cfg(windows)]
+    error: Option<PageReadError>,
+}
+
+#[cfg(any(windows, test))]
+impl PagingObserver {
+    /// None means the rate is unknown, including the first successful count. It is not a measurement of zero reads.
+    fn sample(&mut self, now: std::time::Instant, count: Result<u32, PageReadError>) -> Option<bool> {
+        let Ok(count) = count else {
+            self.last = None;
+            return None;
+        };
+        let Some((at, before, quiet)) = self.last else {
+            self.last = Some((now, count, QUIET_CALLS));
+            return None;
+        };
+        let seconds = now.duration_since(at).as_secs_f64();
+        if seconds < 0.1 { return Some(quiet < QUIET_CALLS); }
+        let quiet = quiet_calls(quiet, count.wrapping_sub(before), seconds);
+        self.last = Some((now, count, quiet));
+        Some(quiet < QUIET_CALLS)
     }
-    let quiet = quiet_calls(quiet, count.wrapping_sub(before), seconds);
-    *last = Some((now, count, quiet));
-    Some(quiet < QUIET_CALLS)
+
+    #[cfg(windows)]
+    fn observe(&mut self, memory: u64, profile: bool, quota_enabled: bool) {
+        let available = windows_available().0;
+        let count = windows_page_reads(available);
+        let before = self.last;
+        let error = count.err();
+        if error != self.error {
+            if let Some(error) = error {
+                eprintln!("Straydog host paging: page-read query unavailable ({error:?}); using free memory until it recovers");
+            }
+            self.error = error;
+        }
+        if before.is_none() {
+            if let Ok(count) = count {
+                eprintln!("Straydog host paging: first page-read sample {count}; rate unknown until the next sample, using free memory");
+            }
+        }
+        let now = std::time::Instant::now();
+        let busy = self.sample(now, count);
+        let was_paging = PAGING.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        let paging = busy.unwrap_or_else(|| memory_short(available, memory, was_paging));
+        PAGING.store(u8::from(paging), std::sync::atomic::Ordering::Relaxed);
+        if paging != was_paging {
+            let gib = available as f64 / (1u64 << 30) as f64;
+            if paging {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are read ahead from now");
+            } else {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are no longer read ahead");
+            }
+        }
+        if profile {
+            let rate = before.zip(count.ok()).map(|((at, old, _), new)| (new.wrapping_sub(old), now.duration_since(at).as_secs_f64()));
+            eprintln!("Straydog host paging sample: count {count:?}, delta {rate:?}, busy {busy:?}, available {available}, quota_enabled {quota_enabled}, paging {}", u8::from(paging));
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -898,4 +974,57 @@ fn windows_memory() -> u64 {
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: an initialized structure with its length set.
     if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullTotalPhys } else { 0 }
+}
+
+#[cfg(test)]
+mod paging_watch_tests {
+    use super::*;
+    use std::{cell::RefCell, sync::Arc, time::{Duration, Instant}};
+
+    #[test]
+    fn paging_is_observed_before_locks_end_but_the_quota_is_not_set() {
+        let watch = Arc::new(WorkingSetWatch::default());
+        let seen = RefCell::new(Vec::new());
+        let tick = || watch.tick(|| seen.borrow_mut().push("observe"), || seen.borrow_mut().push("quota"));
+        tick();
+        tick();
+        assert_eq!(*seen.borrow(), ["observe", "observe"]);
+        watch.allow_quota();
+        tick();
+        assert_eq!(*seen.borrow(), ["observe", "observe", "observe", "quota"]);
+    }
+
+    #[test]
+    fn a_first_count_and_a_recovered_query_are_unknown_until_a_second_sample() {
+        let mut observer = PagingObserver::default();
+        let at = Instant::now();
+        assert_eq!(observer.sample(at, Ok(100)), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(250), Ok(10_100)), Some(true));
+        assert_eq!(observer.sample(at + Duration::from_millis(500), Err(PageReadError::Query(-1))), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(750), Ok(10_200)), None);
+        assert_eq!(observer.sample(at + Duration::from_secs(1), Ok(10_200)), Some(false));
+    }
+
+    #[test]
+    fn page_read_samples_reject_failed_short_and_unrecognized_layouts() {
+        let mut bytes = [0; 64];
+        bytes[5] = 10_000 << 32;
+        bytes[10] = 123;
+        assert_eq!(page_reads_of(-1, 512, &bytes, 40_960_000), Err(PageReadError::Query(-1)));
+        assert_eq!(page_reads_of(0, 80, &bytes, 40_960_000), Err(PageReadError::Short(80)));
+        assert_eq!(page_reads_of(0, 512, &bytes, 81_920_000), Err(PageReadError::Layout));
+        assert_eq!(page_reads_of(0, 512, &bytes, 40_960_000), Ok(123));
+    }
+
+    #[test]
+    fn a_busy_observer_stays_on_for_two_seconds_and_handles_counter_wrap() {
+        let mut observer = PagingObserver::default();
+        let at = Instant::now();
+        assert_eq!(observer.sample(at, Ok(u32::MAX - 100)), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(250), Ok(10_000)), Some(true));
+        for tick in 2..9 {
+            assert_eq!(observer.sample(at + Duration::from_millis(tick * 250), Ok(10_000)), Some(true));
+        }
+        assert_eq!(observer.sample(at + Duration::from_millis(2250), Ok(10_000)), Some(false));
+    }
 }
