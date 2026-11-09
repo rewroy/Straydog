@@ -923,7 +923,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
                            budget: CHECKPOINT_BYTES, step: CHECKPOINT_STEP, files, drafting },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
-        load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
+        load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
 }
 
