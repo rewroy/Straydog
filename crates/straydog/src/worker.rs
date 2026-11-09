@@ -76,6 +76,9 @@ pub struct WorkerArgs {
     /// Host memory available to the worker (its cgroup limits are invisible inside isolation).
     #[arg(long, default_value_t = 0)]
     pub host_memory_bytes: u64,
+    /// Parent cgroup counters, exposed read-only for a live prefetch budget inside isolation.
+    #[arg(long = "host-memory-limit-file", hide = true)]
+    pub host_memory_limit_files: Vec<PathBuf>,
     /// Straydog's data directory: the shards' verity trees (read only).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
@@ -398,18 +401,8 @@ fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, beg
     let mut fill = None;
     let (asked, refused, asking, filled) = std::thread::scope(|scope| {
         let asking = scope.spawn(|| {
-            let (mut asked, mut refused) = (0u64, None);
-            for request in &start.hints.requests {
-                let Some(alive) = engine.upgrade() else { break };
-                match straydog_engine::host::prefetch(&request.ranges) {
-                    Ok(()) => asked += request.bytes,
-                    Err(message) => {
-                        refused = Some(message);
-                        break;
-                    }
-                }
-                drop(alive);
-            }
+            let ranges = start.hints.requests.iter().flat_map(|request| request.ranges.iter().copied());
+            let (asked, refused) = behind::prefetch_banks_behind(engine, ranges, straydog_engine::host::prefetch);
             (asked, refused, began.elapsed())
         });
         let filled = fill_slots(engine, requests, |engine: &Engine| engine.requests, |engine: &mut Engine| {
@@ -745,6 +738,7 @@ pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
+    straydog_engine::host::set_prefetch_memory_limits(args.host_memory_limit_files.clone());
     // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
     if !straydog_engine::host::full_speed() {
         eprintln!("WARN Straydog could not turn off the system's power throttling of its worker");

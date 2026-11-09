@@ -151,6 +151,46 @@ pub fn available_bytes() -> u64 {
     0
 }
 
+/// The parent's cgroup counters needed by an isolated worker's prefetch budget. Only these
+/// individual files are exposed read-only; its cgroup namespace need not reveal the hierarchy.
+pub fn memory_limit_files() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        cgroup_limit_files(std::path::Path::new("/proc/self/cgroup"), std::path::Path::new("/sys/fs/cgroup"))
+            .into_iter().flat_map(|limit| {
+                let usage = cgroup_usage_file(&limit);
+                [Some(limit), usage].into_iter().flatten()
+            }).filter(|file| file.is_file()).collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+static PREFETCH_LIMITS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Called once by the worker with the parent's read-only cgroup files. Read their current
+/// values when planning, rather than keeping a headroom snapshot from before GPU warm-up.
+pub fn set_prefetch_memory_limits(files: Vec<std::path::PathBuf>) {
+    #[cfg(target_os = "linux")]
+    let _ = PREFETCH_LIMITS.set(files);
+    #[cfg(not(target_os = "linux"))]
+    let _ = files;
+}
+
+/// Memory a speculative bank prefetch may use now. A full cgroup has zero room, not an
+/// unknown/unbounded amount. Windows keeps its existing system-wide available-memory policy.
+pub fn prefetch_available_bytes() -> u64 {
+    let physical = available_bytes();
+    #[cfg(target_os = "linux")]
+    {
+        let files = PREFETCH_LIMITS.get_or_init(memory_limit_files);
+        linux_available(physical, files)
+    }
+    #[cfg(not(target_os = "linux"))]
+    physical
+}
+
 /// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
 /// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
 /// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
@@ -391,37 +431,63 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
 /// mounted root alone then bounds it.
 #[cfg(target_os = "linux")]
 pub fn linux_memory(physical: u64, proc_cgroup: &std::path::Path, cgroup_root: &std::path::Path) -> u64 {
+    cgroup_limit_files(proc_cgroup, cgroup_root).iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok())
+        .fold(physical, u64::min)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_limit_files(proc_cgroup: &std::path::Path, cgroup_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     use std::path::{Component, Path};
-    let Ok(text) = std::fs::read_to_string(proc_cgroup) else { return physical };
-    // From `directory` up to `root`, both included: the smallest limit in `file`.
-    let bounded = |root: &Path, relative: &str, file: &str| -> u64 {
+    let Ok(text) = std::fs::read_to_string(proc_cgroup) else { return Vec::new() };
+    let mut files = Vec::new();
+    let mut collect = |root: &Path, relative: &str, file: &str| {
         let relative = Path::new(relative.trim().trim_start_matches('/'));
         let inside = relative.components().all(|component| matches!(component, Component::Normal(_)));
         let mut directory = if inside { root.join(relative) } else { root.to_path_buf() };
-        let mut total = physical;
         loop {
-            if let Ok(limit) = std::fs::read_to_string(directory.join(file)) {
-                // "max" (v2) is no limit; v1 writes a huge number instead, which min() ignores.
-                if let Ok(limit) = limit.trim().parse::<u64>() {
-                    total = total.min(limit);
-                }
-            }
+            let path = directory.join(file);
+            if path.is_file() { files.push(path); }
             if directory == root || !directory.pop() {
-                return total;
+                break;
             }
         }
     };
-    let mut total = physical;
     for line in text.lines() {
         let mut fields = line.splitn(3, ':');
         let (Some(id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next()) else { continue };
         if id == "0" && controllers.is_empty() {
-            total = total.min(bounded(cgroup_root, path, "memory.max"));
+            collect(cgroup_root, path, "memory.max");
         } else if controllers.split(',').any(|controller| controller == "memory") {
-            total = total.min(bounded(&cgroup_root.join("memory"), path, "memory.limit_in_bytes"));
+            collect(&cgroup_root.join("memory"), path, "memory.limit_in_bytes");
         }
     }
-    total
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_usage_file(limit: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = match limit.file_name()?.to_str()? {
+        "memory.max" => "memory.current",
+        "memory.limit_in_bytes" => "memory.usage_in_bytes",
+        _ => return None,
+    };
+    Some(limit.with_file_name(name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_available(physical: u64, files: &[std::path::PathBuf]) -> u64 {
+    files.iter().fold(physical, |available, limit| {
+        let Some(usage) = cgroup_usage_file(limit) else { return available };
+        let Some(maximum) = std::fs::read_to_string(limit).ok().and_then(|value| value.trim().parse::<u64>().ok()) else {
+            return available; // "max" is unlimited.
+        };
+        // A finite bound whose usage is unavailable cannot safely fund speculative reads.
+        let current = std::fs::read_to_string(usage).ok().and_then(|value| value.trim().parse::<u64>().ok());
+        available.min(current.map_or(0, |used| maximum.saturating_sub(used)))
+    })
 }
 
 #[cfg(test)]
@@ -671,6 +737,47 @@ mod tests {
     fn no_limits_leave_physical_memory() {
         let root = tree("none", "0::/user.slice/session\n", &[]);
         assert_eq!(linux_memory(125 * GIB, &root.join("cgroup"), &root.join("fs")), 125 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The remaining room, including an ancestor's other processes, bounds speculative reads;
+    /// a later plan reads the counters again rather than reusing the first value.
+    #[test]
+    fn prefetch_uses_current_headroom_at_every_cgroup_level() {
+        let root = tree("prefetch_headroom", "0::/a/b\n", &[
+            ("a/memory.max", "17179869184"), ("a/memory.current", "16106127360"),
+            ("a/b/memory.max", "4294967296"), ("a/b/memory.current", "1073741824"),
+            ("memory.max", "max"), ("memory.current", "107374182400"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
+        std::fs::write(root.join("fs/a/memory.current"), (12 * GIB).to_string()).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 3 * GIB);
+        assert_eq!(super::linux_available(2 * GIB, &files), 2 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_full_or_unreadable_finite_cgroup_funds_no_prefetch() {
+        let root = tree("prefetch_full", "0::/\n", &[("memory.max", "1073741824"), ("memory.current", "2147483648")]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::remove_file(root.join("fs/memory.current")).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::write(root.join("fs/memory.current"), "unreadable value").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::write(root.join("fs/memory.max"), "max\n").unwrap();
+        assert_eq!(super::linux_available(7 * GIB, &files), 7 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_prefetch_room_uses_usage_and_the_namespace_root() {
+        let root = tree("prefetch_v1", "5:memory:/../../outside\n", &[
+            ("memory/memory.limit_in_bytes", "3221225472"), ("memory/memory.usage_in_bytes", "2147483648"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

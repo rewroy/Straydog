@@ -1301,7 +1301,7 @@ impl Model {
             Some(Banks { start: banks.map(|bank| bank.as_ptr() as usize), bytes: banks.map(|bank| bank.len() / ROUTED_EXPERTS) })
         };
         let memory = self.weights.host_memory_bytes;
-        let budget = crate::host::within_free(u64::MAX, 0, crate::host::available_bytes(), memory);
+        let budget = crate::host::within_free(u64::MAX, 0, crate::host::prefetch_available_bytes(), memory);
         let hints = routes::plan_hints(&prior.ranked(), 0, budget, &banks);
         Ok(WarmStart { slots, held, swapped: self.group.swapped_experts()?, hints })
     }
