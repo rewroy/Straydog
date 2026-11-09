@@ -2382,6 +2382,48 @@ int sd_device_count() {
     catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+int sd_prime_qwen_prefill_gemm(int ordinal, uint64_t prompt_tokens) {
+    try {
+        if (prompt_tokens < 2 || prompt_tokens > 4096) throw std::runtime_error("invalid prefill GEMM batch");
+        check(hipSetDevice(ordinal));
+        struct Resources {
+            hipStream_t stream = nullptr;
+            hipblasHandle_t blas = nullptr;
+            void* weights = nullptr;
+            void* inputs = nullptr;
+            void* outputs = nullptr;
+            void* workspace = nullptr;
+            ~Resources() {
+                if (stream) (void)hipStreamSynchronize(stream);
+                if (blas) (void)hipblasDestroy(blas);
+                if (stream) (void)hipStreamDestroy(stream);
+                for (void* allocation : {weights, inputs, outputs, workspace}) {
+                    if (allocation) (void)hipFree(allocation);
+                }
+            }
+        } prime;
+        constexpr int rows = 320, width = 10240;
+        const int tokens = int(prompt_tokens);
+        check(hipStreamCreate(&prime.stream));
+        check(hipMalloc(&prime.weights, size_t(rows) * width * 2));
+        check(hipMalloc(&prime.inputs, size_t(tokens) * width * 2));
+        check(hipMalloc(&prime.outputs, size_t(rows) * tokens * 4));
+        check(hipMalloc(&prime.workspace, blas_workspace_bytes));
+        check(hipMemset(prime.weights, 0, size_t(rows) * width * 2));
+        check(hipMemset(prime.inputs, 0, size_t(tokens) * width * 2));
+        blas_check(hipblasCreate(&prime.blas));
+        blas_check(hipblasSetStream(prime.blas, prime.stream));
+        blas_check(hipblasSetWorkspace(prime.blas, prime.workspace, blas_workspace_bytes));
+        blas_check(hipblasSetMathMode(prime.blas, HIPBLAS_DEFAULT_MATH));
+        const float alpha = 1, beta = 0;
+        blas_check(hipblasGemmEx(prime.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, rows, tokens, width, &alpha,
+            prime.weights, HIP_R_16F, width, prime.inputs, HIP_R_16F, width, &beta,
+            prime.outputs, HIP_R_32F, rows, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+        check(hipStreamSynchronize(prime.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 #if defined(_WIN32) && !defined(__HIPCC__)
 // The memory free on the whole GPU, as NVML has it; false where NVML cannot say. CUDA's own figure on Windows leaves out most of what
 // the desktop and other programs hold: RTX 5070 Ti, 14.68 GiB against NVML's 13.07, so `auto`'s margin came to 0.6 GiB, and at that

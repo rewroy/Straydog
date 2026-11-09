@@ -10,6 +10,12 @@ unsafe extern "C" {
     pub fn sd_device_count() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prime_qwen_prefill_gemm(
+        ordinal: ::std::os::raw::c_int,
+        tokens: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_device_info(
         ordinal: ::std::os::raw::c_int,
         name: *mut ::std::os::raw::c_char,
