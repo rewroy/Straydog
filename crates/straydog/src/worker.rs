@@ -781,6 +781,25 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     if id.is_on_demand() {
         return crate::worker_on_demand::main(&args, &plan, output, &|stage, done, total| loading.report(stage, done, total));
     }
+    // The first Qwen prefill GEMM otherwise loads the BLAS code while the ready-time warm-up holds
+    // the engine. Prime each device beside the model's reading and placement, when FP16 GEMM is used.
+    #[cfg(any(feature = "cuda", feature = "hip"))]
+    let gemm_primes = if args.gemm == "fp16" && plan.batch as u64 >= args.gemm_min_batch {
+        args.devices.iter().copied().filter_map(|ordinal| {
+            let tokens = plan.batch;
+            match std::thread::Builder::new().name(format!("straydog-gemm-prime-{ordinal}")).spawn(move || {
+                let started = Instant::now();
+                let result = straydog_gpu::prime_qwen_prefill_gemm(ordinal, tokens);
+                (started.elapsed(), result)
+            }) {
+                Ok(handle) => Some((ordinal, handle)),
+                Err(error) => {
+                    eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming could not start: {error}");
+                    None
+                }
+            }
+        }).collect::<Vec<_>>()
+    } else { Vec::new() };
     let split = plan.split;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
@@ -826,6 +845,14 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         let model = Model::new(weights, group, &settings, &report);
         (text.join().unwrap(), model)
     });
+    #[cfg(any(feature = "cuda", feature = "hip"))]
+    for (ordinal, gemm_prime) in gemm_primes {
+        match gemm_prime.join() {
+            Ok((elapsed, Ok(()))) => eprintln!("Straydog warm code: GPU {ordinal} prefill GEMM primed in {:.1} s", elapsed.as_secs_f64()),
+            Ok((_, Err(error))) => eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming failed: {error}"),
+            Err(_) => eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming panicked"),
+        }
+    }
     let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
     let (text, model) = (Arc::new(text?), model?);
     // The GPU code's warm-up and the page-locking of the banks come behind "ready" ([`behind`]): "plans" and "warm" are what they cost before it.
