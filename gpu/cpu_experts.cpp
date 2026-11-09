@@ -1166,13 +1166,16 @@ int sd_cpu_experts_run(void* handle, const int* kinds, const uint8_t* const* gat
 // taken only then, and never without a flag. Linux does not read it.
 int sd_cpu_paging(void* handle, const uint8_t* flag) {
     static_assert(std::atomic<uint8_t>::is_always_lock_free && sizeof(std::atomic<uint8_t>) == 1, "the flag is a plain byte");
-    auto* engine = static_cast<Engine*>(handle);
-    if (!engine) { cpu_error = "invalid Straydog CPU paging flag"; return -1; }
-    engine->paging = reinterpret_cast<const std::atomic<uint8_t>*>(flag);
+    try {
+        auto* engine = static_cast<Engine*>(handle);
+        if (!engine) { cpu_error = "invalid Straydog CPU paging flag"; return -1; }
+        engine->paging = reinterpret_cast<const std::atomic<uint8_t>*>(flag);
 #if defined(_WIN32)
-    if (!engine->read_ahead) engine->read_ahead = std::make_unique<Engine::ReadAhead>();
+        // (the hints' thread: an allocation or a thread the system refuses is this call's error, not an exception across the boundary)
+        if (!engine->read_ahead) engine->read_ahead = std::make_unique<Engine::ReadAhead>();
 #endif
-    return 0;
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
 
 // Ask for the pages of `count` byte ranges (on Linux on every worker), before a layer's experts read them: with less host memory than
