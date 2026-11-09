@@ -639,20 +639,27 @@ mod pool_tests {
 mod piece_tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Condvar;
     use std::thread::ThreadId;
     use std::time::Duration;
 
-    /// The threads `run_pieces` ran 24 pieces of 10 ms on, with the pieces it ran, for `threads` allowed.
+    /// The threads `run_pieces` ran 24 pieces on, with the pieces it ran, for `threads` allowed.
     fn ran_on(threads: usize, priority: Priority) -> (HashSet<ThreadId>, Vec<(u64, u64)>) {
         let pieces: Vec<(u64, u64)> = (0..24).map(|index| (index * 100, index * 100 + 100)).collect();
-        let seen = Mutex::new((HashSet::new(), Vec::new()));
+        let workers = if threads > 1 { threads.min(pieces.len()) } else { 1 };
+        let seen = (Mutex::new((HashSet::new(), Vec::new())), Condvar::new());
         run_pieces(&pieces, threads, priority, |piece| {
-            std::thread::sleep(Duration::from_millis(10));
-            let mut seen = seen.lock().unwrap();
-            seen.0.insert(std::thread::current().id());
-            seen.1.push(piece);
+            let (state, wake) = &seen;
+            let mut state = state.lock().unwrap();
+            state.0.insert(std::thread::current().id());
+            state.1.push(piece);
+            wake.notify_all();
+            // Hold each worker on its first piece until all workers have taken one. A sleep here
+            // lets a late-scheduled worker lose its piece to one that already finished sleeping.
+            let (state, _) = wake.wait_timeout_while(state, Duration::from_secs(30), |(ids, _)| ids.len() < workers).unwrap();
+            assert_eq!(state.0.len(), workers, "all requested workers must take a piece");
         });
-        let (ids, mut done) = seen.into_inner().unwrap();
+        let (ids, mut done) = seen.0.into_inner().unwrap();
         done.sort_unstable();
         assert_eq!(done, pieces, "every piece ran once");
         (ids, done)
