@@ -3612,11 +3612,17 @@ impl Model {
         }
         let prefilled = self.prefill(tokens, reused, &plan, cancelled, progress);
         if pipelined {
+            // A prompt stopped between batches: its last batch's last row, which only the MTP layer's device kept, is the held
+            // sequence's final hidden state, and the next request's first MTP pair starts from it (taken before the batch flags go).
+            let kept = if matches!(prefilled, Ok(None)) { self.kept_hidden() } else { Ok(None) };
             self.deferred = false;
             self.mtp_kept = 0;
             let settled = self.group.prefill_settle();
             if prefilled.is_ok() {
                 settled?;
+            }
+            if let Some(row) = kept? {
+                self.final_hidden = Some(row);
             }
         }
         let Some(output) = prefilled? else { return Ok(()) };
