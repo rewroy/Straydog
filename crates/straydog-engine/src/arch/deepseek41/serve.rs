@@ -724,6 +724,17 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         pins.sidecars.push(bundle::Sidecar { asset: vision.asset, verity: vision.verity, architecture: bundle::VISION_ARCHITECTURE.into() });
     }
     let mut files = Pinned::open(root, data_dir, &pins)?;
+    // A row read may otherwise fetch a cold 4 KiB proof for its 4 KiB data. Keep the leaves
+    // before expert arenas are pinned, bounded by both the host plan and current headroom.
+    // An explicitly sized expert tier is left as given; a mapping-only row table stays as given.
+    let proof_budget = if settings.host_expert_bytes.is_none() && settings.row_cache_bytes > 0 {
+        (settings.host_memory_bytes / 64).min(1 << 30).min(crate::host::prefetch_available_bytes() / 8)
+    } else { 0 };
+    let saving = Instant::now();
+    let row_proofs = files.preload_row_proofs(proof_budget)?;
+    if row_proofs > 0 {
+        eprintln!("Straydog row proofs: {} MiB checked and kept in host memory in {:.2} s", row_proofs >> 20, saving.elapsed().as_secs_f64());
+    }
     files.cache_tables(settings.row_cache_bytes)?;
     let open_seconds = started.elapsed().as_secs_f64();
     let hp = Hparams::from_model(&files.header, &files)?;
@@ -824,7 +835,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     // experts an agent's turn, to read them from the drive the next)
     let host = match settings.host_expert_bytes {
         Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
-        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts),
+        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES + row_proofs).min(total_experts),
     };
     // (the vision encoder's tensors are read with the first image, not at the start)
     let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix))
