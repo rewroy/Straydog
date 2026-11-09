@@ -641,7 +641,7 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         // (the experts' other costs in the prefill)
         match &timings["prefill_store"] {
-            store if store.is_object() => format!("; prefill store: {} write-backs, {} host-tier drops ({} below its budget), {} of {} prefetched unused, waits {:.3} s for reads, {:.3} s for slots, {:.3} s pinning",
+            store if store.is_object() => format!("; prefill store: {} write-backs, {} host-tier drops ({} while it was still filling), {} of {} prefetched unused, waits {:.3} s for reads, {:.3} s for slots, {:.3} s pinning",
                                                   count(&store["writebacks"]), count(&store["host_drops"]), count(&store["host_drops_short"]),
                                                   count(&store["prefetch_unused"]), count(&store["prefetched"]),
                                                   store["wait_seconds"].as_f64().unwrap_or(0.0), store["slot_wait_seconds"].as_f64().unwrap_or(0.0),
