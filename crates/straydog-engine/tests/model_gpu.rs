@@ -392,7 +392,7 @@ struct Prompts {
 /// (1); its continuation past what was copied (2); a prompt that resumes from a checkpoint below
 /// where it departs (R < live) and prompt lengths at different residues of four (3); drafts at
 /// max_new 1, 2 and 3 and prompts on the stashed and the kept MTP paths, one a token past a
-/// prefill batch (4); a prompt cancelled during its prefill (5); two long conversations trading
+/// prefill batch (4); a prompt cancelled during its prefill, which keeps its whole batches (5); two long conversations trading
 /// places, both slots, and a budget too low for a swap or a copy (6); with the K/V in VRAM and
 /// in host memory behind its stage (7). Run by a_parked_conversation_comes_back, which holds the
 /// GPUs.
@@ -520,6 +520,8 @@ fn interleaved(model: &mut Model, name: &str, p: &Prompts, whole: bool) -> Vec<(
     // (5) a long prompt cancelled during its prefill (the root conversation parked again)
     let cancelled = record(&mut outcomes, "cancelled", go(model, &p.tools, 40, Some(3)));
     assert_eq!(cancelled.metrics["parked"], "saved", "{name}: parked before the cancelled prompt");
+    // (what its whole batches read stays held: the next request that shares it goes on from there)
+    assert!(model.held_prefix(&p.tools) >= p.tools.len().min(model.prefill_batch_size), "{name}: the cancelled prompt's batches kept");
     record(&mut outcomes, "other", go(model, &p.other, 24, None));
     // (3) resuming from the other conversation's root checkpoint (2052) below where it departs
     // (2500), max_new 3: the copy starts under the checkpoint (and the MTP layer's pair before
