@@ -388,6 +388,8 @@ pub struct Verifier {
     /// The hash of each level-0 block, from the checked level 1 (empty when level 0 is one
     /// block, which the digest checks).
     level0: Vec<Hash>,
+    /// A checked, owned copy of every level-0 block, when the row-file budget holds it.
+    resident: Option<Box<[u8]>>,
     /// Checked level-0 blocks, bounded, CLOCK-evicted.
     cache: Mutex<Level0>,
     pub tree_reads: AtomicU64,
@@ -445,10 +447,52 @@ impl Verifier {
         // (verifications on many threads read its blocks at once)
         let tree = crate::storage::concurrent(&tree).unwrap_or(tree);
         Ok(Verifier {
-            geometry, tree, digest: *digest, level0,
+            geometry, tree, digest: *digest, level0, resident: None,
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),
             tree_reads: AtomicU64::new(0),
         })
+    }
+
+    /// Keep the whole leaf level as an immutable, checked copy, only when it fits `budget`.
+    /// Called before readers share the verifier. The old bounded cache remains the fallback;
+    /// no partially checked copy is published on a read, allocation or authentication failure.
+    pub fn preload_level0(&mut self, budget: u64) -> Result<u64, String> {
+        let bytes = self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64;
+        if bytes == 0 || bytes > budget {
+            return Ok(0);
+        }
+        if self.resident.is_some() {
+            return Ok(bytes);
+        }
+        let Ok(length) = usize::try_from(bytes) else { return Ok(0) };
+        let mut blocks = Vec::new();
+        if blocks.try_reserve_exact(length).is_err() {
+            return Ok(0);
+        }
+        blocks.resize(length, 0);
+        read_exact_at(&self.tree, &mut blocks, self.geometry.starts[0]).map_err(|error| format!("tree read: {error}"))?;
+        self.tree_reads.fetch_add(bytes / BLOCK as u64, Ordering::Relaxed);
+        for (index, block) in blocks.chunks_exact(BLOCK).enumerate() {
+            if !self.level0_matches(index as u64, block) {
+                return Err(format!("tree block (0, {index}) does not verify"));
+            }
+        }
+        self.resident = Some(blocks.into_boxed_slice());
+        let cache = self.cache.get_mut().unwrap();
+        cache.blocks.clear();
+        cache.blocks.shrink_to_fit();
+        cache.order.clear();
+        cache.order.shrink_to_fit();
+        cache.hand = 0;
+        Ok(bytes)
+    }
+
+    fn level0_matches(&self, number: u64, block: &[u8]) -> bool {
+        let hash = hash_block(block);
+        match self.level0.get(number as usize) {
+            Some(expected) => hash == *expected,
+            None => self.level0.is_empty() && descriptor_digest(self.geometry.size, &hash) == self.digest,
+        }
     }
 
     /// Check `data`, whole blocks of the file from `offset` (a block boundary); bytes past the
@@ -476,12 +520,16 @@ impl Verifier {
                 }
                 continue;
             }
-            let tree_block = number / FAN;
-            if current.as_ref().is_none_or(|(held, _)| *held != tree_block) {
-                current = Some((tree_block, self.level0_block(tree_block)?));
-            }
-            let entries = &current.as_ref().unwrap().1;
-            let entry = ((number % FAN) * 32) as usize;
+            let (entries, entry) = match self.resident.as_deref() {
+                Some(entries) => (entries, (number * 32) as usize),
+                None => {
+                    let tree_block = number / FAN;
+                    if current.as_ref().is_none_or(|(held, _)| *held != tree_block) {
+                        current = Some((tree_block, self.level0_block(tree_block)?));
+                    }
+                    (&current.as_ref().unwrap().1[..], ((number % FAN) * 32) as usize)
+                }
+            };
             if entries[entry..entry + 32] != hash {
                 return Err(format!("block {number} does not verify"));
             }
@@ -502,11 +550,7 @@ impl Verifier {
         read_exact_at(&self.tree, &mut block[..], self.geometry.starts[0] + tree_block * BLOCK as u64)
             .map_err(|exc| format!("tree read: {exc}"))?;
         self.tree_reads.fetch_add(1, Ordering::Relaxed);
-        let good = match self.level0.get(tree_block as usize) {
-            Some(expected) => hash_block(&block[..]) == *expected,
-            None => self.level0.is_empty() && descriptor_digest(self.geometry.size, &hash_block(&block[..])) == self.digest,
-        };
-        if !good {
+        if !self.level0_matches(tree_block, &block[..]) {
             return Err(format!("tree block (0, {tree_block}) does not verify"));
         }
         let mut cache = self.cache.lock().unwrap();
@@ -656,5 +700,112 @@ mod piece_tests {
         drop(verifier);
         std::fs::remove_file(file).unwrap();
         std::fs::remove_file(tree).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    struct Fixture {
+        file: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        size: usize,
+        data: Vec<u8>,
+        digest: Hash,
+    }
+
+    impl Fixture {
+        fn new(label: &str, size: usize) -> Self {
+            let file = std::env::temp_dir().join(format!("straydog-proof-{label}-{}", std::process::id()));
+            let tree = file.with_extension("tree");
+            let mut data: Vec<u8> = (0..size).map(|at| (at * 31 % 251) as u8).collect();
+            std::fs::write(&file, &data).unwrap();
+            let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+            data.resize(size.next_multiple_of(BLOCK), 0);
+            Self { file, tree, size, data, digest }
+        }
+
+        fn verifier(&self) -> Verifier {
+            Verifier::open(&self.tree, self.size as u64, &self.digest, BLOCK).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.file);
+            let _ = std::fs::remove_file(&self.tree);
+        }
+    }
+
+    #[test]
+    fn resident_proofs_match_bounded_checks_without_later_tree_reads() {
+        let fixture = Fixture::new("resident", (2 * FAN as usize + 1) * BLOCK + 137);
+        let bounded = fixture.verifier();
+        let mut resident = fixture.verifier();
+        let required = resident.geometry.levels[0] * BLOCK as u64;
+        assert_eq!(resident.preload_level0(required - 1).unwrap(), 0);
+        bounded.verify(0, &fixture.data).unwrap();
+        assert_eq!(resident.preload_level0(required).unwrap(), required);
+        let reads = resident.tree_reads.load(Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let resident = &resident;
+                let data = &fixture.data;
+                scope.spawn(move || resident.verify(0, data).unwrap());
+            }
+        });
+        assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
+        let mut changed = fixture.data.clone();
+        for at in [0, FAN as usize * BLOCK + 9, fixture.size - 1, changed.len() - 1] {
+            changed[at] ^= 1;
+            assert!(resident.verify(0, &changed).is_err(), "changed byte {at}");
+            assert!(bounded.verify(0, &changed).is_err(), "changed byte {at}");
+            changed[at] ^= 1;
+        }
+        // A later change to the source tree cannot alter the authenticated copy being used.
+        let tree = std::fs::OpenOptions::new().write(true).open(&fixture.tree).unwrap();
+        let at = resident.geometry.starts[0] + BLOCK as u64 + 7;
+        let mut byte = [0];
+        read_exact_at(&File::open(&fixture.tree).unwrap(), &mut byte, at).unwrap();
+        byte[0] ^= 1;
+        write_at(&tree, &byte, at).unwrap();
+        resident.verify(0, &fixture.data).unwrap();
+        assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
+    }
+
+    #[test]
+    fn a_bad_late_leaf_never_publishes_a_partly_checked_copy() {
+        let fixture = Fixture::new("late-leaf", (2 * FAN as usize + 1) * BLOCK);
+        let mut verifier = fixture.verifier();
+        let tree = std::fs::OpenOptions::new().write(true).open(&fixture.tree).unwrap();
+        let bad = verifier.geometry.starts[0] + 2 * BLOCK as u64;
+        let mut byte = [0];
+        read_exact_at(&File::open(&fixture.tree).unwrap(), &mut byte, bad).unwrap();
+        byte[0] ^= 1;
+        write_at(&tree, &byte, bad).unwrap();
+        assert!(verifier.preload_level0(u64::MAX).unwrap_err().contains("(0, 2)"));
+        assert!(verifier.resident.is_none());
+        verifier.verify(0, &fixture.data[..BLOCK]).unwrap();
+        let at = 2 * FAN as usize * BLOCK;
+        assert!(verifier.verify(at as u64, &fixture.data[at..at + BLOCK]).is_err());
+    }
+
+    #[test]
+    fn empty_single_block_and_single_leaf_roots_still_authenticate() {
+        for size in [0, BLOCK, BLOCK + 1, 2 * BLOCK] {
+            let fixture = Fixture::new(&format!("small-{size}"), size);
+            let mut verifier = fixture.verifier();
+            assert_eq!(verifier.preload_level0(0).unwrap(), 0);
+            let expected = if size > BLOCK { BLOCK as u64 } else { 0 };
+            assert_eq!(verifier.preload_level0(BLOCK as u64).unwrap(), expected);
+            verifier.verify(0, &fixture.data).unwrap();
+            if size > 0 {
+                let mut changed = fixture.data.clone();
+                changed[0] ^= 1;
+                assert!(verifier.verify(0, &changed).is_err());
+            }
+        }
     }
 }
