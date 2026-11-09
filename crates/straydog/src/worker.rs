@@ -582,8 +582,28 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
 /// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty. It runs behind "ready" ([`behind`]), so a request can
 /// come in the middle of it: `cancelled` says so, and it stops at the next pass, resets the model as it does at its end, and a request's first
-/// pass then loads what it needs, as after any reset. Whether it ran to its end.
-fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, String> {
+/// pass then loads what it needs, as after any reset. A prompt's pass reads the experts a cold page cache has not got from the drive, which took
+/// 10 s of a 256-token prompt, so the model looks at `arrived` between the layers of the pass ([`Model::set_warm_stop`]) and ends it there. Whether it
+/// ran to its end.
+fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool, arrived: &'static AtomicBool) -> Result<bool, String> {
+    // (set for these passes alone, and gone before the reset and on every way out: a request's own prefill is read between its batches)
+    model.set_warm_stop(Some(arrived));
+    let passes = warm_up_passes(model, cancelled);
+    model.set_warm_stop(None);
+    let complete = match passes {
+        Ok(complete) => complete,
+        // (a pass stopped half way: what it left is what the reset below takes back)
+        Err(error) if straydog_engine::model::is_warm_stop(&error) => false,
+        Err(error) => return Err(error),
+    };
+    model.reset()?;
+    // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
+    model.clear_route_counts()?;
+    Ok(complete)
+}
+
+/// The passes of [`warm_up`]: whether they ran to their ends.
+fn warm_up_passes(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, String> {
     let longest = model.prefill_batch_size.min(model.context.saturating_sub(4));
     let mut complete = true;
     for length in [longest, longest.min(300)] {
@@ -601,9 +621,6 @@ fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, Stri
             }
         }
     }
-    model.reset()?;
-    // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
-    model.clear_route_counts()?;
     Ok(complete)
 }
 
@@ -868,10 +885,12 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         };
         let mut planned = (None, None);
         let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| {
-            let result = warm_up(&mut engine.model, cancelled);
+            let result = warm_up(&mut engine.model, cancelled, &behind::ARRIVED);
             planned = plan(engine, behind::warm_up_over());
             result
         });
+        // (the engine is let go: how long the request that cut the warm-up short waited for it, from the moment it came)
+        let waited = behind::waited_ms().unwrap_or(0);
         if outcome == behind::WarmedUp::Skipped {
             // (a request had the engine first, and is waited for: the plan is made when it lets go)
             let state = behind::warm_up_over();
@@ -884,7 +903,7 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         let (seconds, after) = (began.elapsed().as_secs_f64(), ready_at.elapsed().as_secs_f64());
         match &outcome {
             behind::WarmedUp::Done => eprintln!("Straydog warm-up: done in {seconds:.1} s, {after:.1} s after ready"),
-            behind::WarmedUp::CutShort => eprintln!("Straydog warm-up: cut short by a request after {seconds:.1} s, {after:.1} s after ready"),
+            behind::WarmedUp::CutShort => eprintln!("Straydog warm-up: cut short by a request after {seconds:.1} s, {after:.1} s after ready, {waited} ms after the request came"),
             behind::WarmedUp::Skipped => eprintln!("Straydog warm-up: not run, a request had the engine first ({after:.1} s after ready)"),
             behind::WarmedUp::Failed(message) => eprintln!("WARN Straydog warm-up failed after {seconds:.1} s: {message}"),
             behind::WarmedUp::Gone => return,
@@ -1079,7 +1098,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("warm_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1097,7 +1116,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("prefix_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1117,7 +1136,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("conversation_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1188,7 +1207,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
             }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
                 // (the warm-up behind "ready" stops at its next pass and lets the request have the engine)
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 let mut current = active.lock().unwrap();
                 if current.is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy"}));
