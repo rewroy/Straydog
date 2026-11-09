@@ -26,6 +26,10 @@ struct Cli {
     /// Show the settings in effect and where each came from, then exit
     #[arg(long)]
     print_config: bool,
+    /// Say whether the model the settings name loads as it is (its pinned files and verity trees), then exit:
+    /// 0 when it does, 1 with the reason. Nothing is hashed, written or downloaded
+    #[arg(long, conflicts_with = "print_config")]
+    check_model: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -98,7 +102,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         None => {
             let file = cli.config.clone().or_else(|| config::implicit_config(&cli.options, config::default_config_path()));
-            serve::main(&matches, file.as_deref(), cli.print_config)
+            serve::main(&matches, file.as_deref(), cli.print_config, cli.check_model)
         }
         Some(Command::Setup(args)) => setup::main(&args),
         Some(Command::Fetch { model, model_name, provider, quant, offline, data_dir }) => {

@@ -50,7 +50,7 @@ fn drafter_clause(settings: &config::Settings) -> String {
     drafter_phrase(mtp, dspark)
 }
 
-pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool) -> Result<(), String> {
+pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool, check_model: bool) -> Result<(), String> {
     let (options, sources) = config::load(matches, config_file)?;
     let settings = config::resolve(options)?;
     // (the engram table named, from an option or the settings file as well as the variable: what the server's checks and
@@ -69,6 +69,9 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             println!("{line}");
         }
         return Ok(());
+    }
+    if check_model {
+        return runtime::check_model(&settings).map(|line| println!("{line}"));
     }
     let logs = Arc::new(LogBuffer::default());
     logging(&settings, logs.clone())?;
