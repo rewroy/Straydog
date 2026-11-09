@@ -128,6 +128,47 @@ fn held<S>(engine: &Weak<Mutex<S>>) -> Held {
     state
 }
 
+/// Issue a warm start's bank hints only between requests. Keep each system call bounded, and
+/// hold the engine for that call so a request cannot start between an idle check and the hint.
+/// The next batch stays pending while a request has the engine, and resumes at the same byte.
+/// The strong reference keeps every range mapped until the call returns; already-issued OS
+/// reads can outlive it and are not claimed to be cancelled.
+pub(crate) fn prefetch_banks_behind<S>(engine: &Weak<Mutex<S>>, ranges: impl IntoIterator<Item = (usize, usize)>,
+                                     ask: impl Fn(&[(usize, usize)]) -> Result<(), String>) -> (u64, Option<String>) {
+    const BATCH: usize = 4 << 20;
+    let mut ranges = ranges.into_iter().filter(|range| range.1 > 0);
+    let mut pending = ranges.next();
+    let mut asked = 0;
+    while pending.is_some() {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        while bytes < BATCH {
+            let Some((start, length)) = pending else { break };
+            let take = length.min(BATCH - bytes);
+            batch.push((start, take));
+            bytes += take;
+            pending = if take < length { Some((start + take, length - take)) } else { ranges.next() };
+        }
+        loop {
+            let Some(alive) = engine.upgrade() else { return (asked, None) };
+            let attempt = match alive.try_lock() {
+                Ok(_guard) => Some(ask(&batch)),
+                Err(TryLockError::WouldBlock) => None,
+                Err(TryLockError::Poisoned(_)) => return (asked, Some("the engine ended during bank prefetch".into())),
+            };
+            drop(alive);
+            match attempt {
+                Some(Ok(())) => { asked += bytes as u64; break; }
+                Some(Err(message)) => return (asked, Some(message)),
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        // Give a request waiting for the engine a turn before another background batch.
+        std::thread::yield_now();
+    }
+    (asked, None)
+}
+
 /// Why a layer could not be locked.
 pub(crate) struct Stopped {
     pub message: String,
@@ -427,6 +468,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Arc;
+
+    /// A request holding the production engine mutex permits zero new bank hints. Releasing
+    /// it lets the very same iterator finish, with no skipped or duplicated range bytes.
+    #[test]
+    fn bank_prefetch_stays_paused_during_a_request_and_resumes() {
+        let engine = Arc::new(Mutex::new(()));
+        let request = engine.lock().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let weak = Arc::downgrade(&engine);
+        let (began, started) = std::sync::mpsc::channel();
+        let (called, counted) = (calls.clone(), bytes.clone());
+        let job = std::thread::spawn(move || {
+            began.send(()).unwrap();
+            prefetch_banks_behind(&weak, [(4096, 10 << 20), (32 << 20, 1 << 20)], |ranges| {
+                assert!(ranges.iter().map(|range| range.1).sum::<usize>() <= 4 << 20);
+                called.fetch_add(1, Ordering::SeqCst);
+                counted.fetch_add(ranges.iter().map(|range| range.1 as u64).sum::<u64>(), Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(bytes.load(Ordering::SeqCst), 0);
+        drop(request);
+        assert_eq!(job.join().unwrap(), (11 << 20, None));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(bytes.load(Ordering::SeqCst), 11 << 20);
+    }
+
+    #[test]
+    fn bank_prefetch_keeps_range_boundaries_and_stops_after_a_refusal() {
+        let engine = Arc::new(Mutex::new(()));
+        let asked = Mutex::new(Vec::new());
+        let done = prefetch_banks_behind(&Arc::downgrade(&engine), [(4096, (4 << 20) + 4096), (64 << 20, 4096)], |ranges| {
+            asked.lock().unwrap().push(ranges.to_vec());
+            Ok(())
+        });
+        assert_eq!(done, ((4 << 20) + 8192, None));
+        assert_eq!(*asked.lock().unwrap(), vec![vec![(4096, 4 << 20)], vec![((4 << 20) + 4096, 4096), (64 << 20, 4096)]]);
+        let calls = AtomicUsize::new(0);
+        let failed = prefetch_banks_behind(&Arc::downgrade(&engine), [(0, 12 << 20)], |_| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 { Err("refused".into()) } else { Ok(()) }
+        });
+        assert_eq!(failed, (4 << 20, Some("refused".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_ended_engine_does_not_keep_bank_mappings_alive() {
+        let engine = Arc::new(Mutex::new(()));
+        let weak = Arc::downgrade(&engine);
+        drop(engine);
+        assert_eq!(prefetch_banks_behind(&weak, [(4096, 4096)], |_| panic!("no live mapping")), (0, None));
+    }
 
     /// A short poll and a guard that the tests which are not about it do not reach.
     const QUICK: Yielding = Yielding { poll: Duration::from_millis(2), at_most: Duration::from_secs(30) };

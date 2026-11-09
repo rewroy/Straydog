@@ -213,6 +213,9 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
     // expert banks) must see the memory this process tree may actually use.
     push("host-memory-bytes", straydog_engine::host::host_memory_bytes().to_string());
+    for file in straydog_engine::host::memory_limit_files() {
+        push("host-memory-limit-file", file.display().to_string());
+    }
     push("data-dir", settings.data_dir.display().to_string());
     if let Some(gib) = settings.expert_ram {
         push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
@@ -277,10 +280,11 @@ pub fn worker_command(settings: &Settings) -> Result<Command, String> {
 /// key file, and the shards' verity trees in the data directory.
 pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, String> {
     use straydog_engine::bundle;
-    let trees = trees(settings)?;
+    let mut trees = trees(settings)?;
     if let Some(tree) = trees.iter().find(|tree| !tree.is_file()) {
         return Err(format!("no verity tree {}: it is built at the server's start, or by `straydog verify`", tree.display()));
     }
+    trees.extend(straydog_engine::host::memory_limit_files());
     let tree_directory = Some(settings.data_dir.join("verity")).filter(|directory| directory.is_dir());
     if settings.bundle.is_on_demand() {
         let pins = bundle::on_demand(settings.bundle)?;
