@@ -4,6 +4,7 @@ pub mod config;
 pub mod conversation;
 #[cfg(windows)]
 pub mod conversation_store;
+pub mod crash;
 pub mod dashboard;
 pub mod frames;
 pub mod monitor;
