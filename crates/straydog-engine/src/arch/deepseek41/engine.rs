@@ -2048,6 +2048,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         // (DS41_PROFILE: a long pass's seconds and phases are logged when it ends)
         let pass_began = (n >= 256).then(|| (std::time::Instant::now(), self.profile.as_ref().map(|(_, phases)| phases.clone())));
+        // A short prompt is a single pass, so there was no earlier next-pass prefetch.
+        // Start its rows before allocating and uploading the stream, keeping the embedding
+        // hints ahead of the deep Engram read queue as prefetch_ahead does for longer prompts.
+        if n > 1 && self.hp.layers[self.settings.layers.clone()].iter().any(|plan| plan.engram.is_some()) {
+            self.prefetch_ahead(tokens, tokens.len())?;
+        }
         self.reserve_state(self.position + n)?;
         self.reserve_rows(n)?;
         self.select_work(n)?;
@@ -2167,7 +2173,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.lap(&[("embedding: decode", decoding), ("embedding: upload", total - decoding)]);
         }
         self.stream_rows = stream;
-        if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
+        if n == 1 && hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens, tokens.len())?;
         }
         self.mark("embedding: Engram reads")?;
