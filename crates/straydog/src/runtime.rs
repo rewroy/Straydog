@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -229,6 +229,43 @@ fn trees(settings: &Settings) -> Result<Vec<PathBuf>, String> {
 /// Whether verity trees are still to be built before the worker can start.
 pub fn missing_trees(settings: &Settings) -> Result<bool, String> {
     Ok(trees(settings)?.iter().any(|tree| !tree.is_file()))
+}
+
+/// `--check-model`: whether the model the settings name loads as it is, said in one line. Every
+/// pinned file is there at its size, and each verity tree is there with the pinned digest at its
+/// top. Nothing is hashed, built, written or downloaded: a program updating Straydog asks the new
+/// executable this before it serves, since pins that changed would only fail once loading began.
+pub fn check_model(settings: &Settings) -> Result<String, String> {
+    use straydog_engine::{bundle, verity};
+    let sized = |path: &Path, asset: &bundle::Asset| match std::fs::metadata(path) {
+        Ok(found) if found.len() == asset.bytes => Ok(()),
+        Ok(found) => Err(format!("{}: {} bytes where the pinned file has {}", path.display(), found.len(), asset.bytes)),
+        Err(exc) => Err(format!("{}: {exc}", path.display())),
+    };
+    let files = bundle::verity_files_in(&settings.model, settings.bundle)?;
+    for (path, asset, digest) in &files {
+        sized(path, asset)?;
+        let tree = bundle::tree_path(&settings.data_dir, asset);
+        if !tree.is_file() {
+            return Err(format!("no verity tree {}: the server would build it first, hashing {}", tree.display(), path.display()));
+        }
+        verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(digest)?, verity::BLOCK)
+            .map_err(|exc| format!("{exc} (not the pinned {})", asset.name))?;
+    }
+    let (resources, drafter) = if settings.bundle.is_on_demand() {
+        (bundle::on_demand(settings.bundle)?.resources, None)
+    } else {
+        let pins = bundle::bundle(settings.bundle)?;
+        (pins.resources, settings.model_draft.as_ref().map(|directory| (directory.join(&pins.drafter.name), pins.drafter)))
+    };
+    for asset in &resources {
+        sized(&settings.model.join(&asset.name), asset)?;
+    }
+    if let Some((path, asset)) = &drafter {
+        sized(path, asset)?;
+    }
+    let count = files.len() + resources.len() + usize::from(drafter.is_some());
+    Ok(format!("Straydog model ready: {} in {} ({count} files)", settings.bundle, settings.model.display()))
 }
 
 /// The worker's isolated command (its trees must exist).
