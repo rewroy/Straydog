@@ -628,7 +628,7 @@ pub struct Model {
     kv_capacity: usize,
     /// What is page-locked, for the thread that keeps the working set's limit.
     pinned_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    watching_memory: bool,
+    memory_watch: std::sync::Arc<crate::host::WorkingSetWatch>,
     /// Page-locked host bytes besides the K/V.
     pinned_other: u64,
     /// The expert banks a partially resident model reads from host memory.
@@ -798,7 +798,7 @@ impl Model {
             cpu_phases_before: [0; 3],
             kv_capacity: context,
             pinned_now: Default::default(),
-            watching_memory: false,
+            memory_watch: Default::default(),
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
             locked_layers: Vec::new(),
@@ -1506,10 +1506,7 @@ impl Model {
     fn hold_banks(&mut self) {
         let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
-        if !self.watching_memory {
-            self.watching_memory = true;
-            crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes);
-        }
+        self.memory_watch.allow_quota();
     }
 
     /// Page-lock every layer the start planned, here and now, as the worker does behind "ready" (for what is not served: examples and tools).
@@ -1633,6 +1630,8 @@ impl Model {
         self.banks_bytes = banks_total;
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
+        // Paging must be observed even while a request holds up bank locking. The quota alone waits for the locks.
+        crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes, &self.memory_watch);
         // (with nothing to lock the limit comes now; else when the locking is over: `Model::banks_lock_ended`)
         if self.lock_pending.is_empty() {
             self.hold_banks();
