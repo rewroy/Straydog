@@ -401,8 +401,18 @@ fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, beg
     let mut fill = None;
     let (asked, refused, asking, filled) = std::thread::scope(|scope| {
         let asking = scope.spawn(|| {
-            let ranges = start.hints.requests.iter().flat_map(|request| request.ranges.iter().copied());
-            let (asked, refused) = behind::prefetch_banks_behind(engine, ranges, straydog_engine::host::prefetch);
+            let (mut asked, mut refused) = (0u64, None);
+            for request in &start.hints.requests {
+                let Some(alive) = engine.upgrade() else { break };
+                match straydog_engine::host::prefetch(&request.ranges) {
+                    Ok(()) => asked += request.bytes,
+                    Err(message) => {
+                        refused = Some(message);
+                        break;
+                    }
+                }
+                drop(alive);
+            }
             (asked, refused, began.elapsed())
         });
         let filled = fill_slots(engine, requests, |engine: &Engine| engine.requests, |engine: &mut Engine| {
