@@ -752,6 +752,20 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
     let plan = plan(&args, &|stage, done, total| loading.report(stage, done, total))?;
+    #[cfg(feature = "cuda")]
+    {
+        let devices = args.devices.iter().map(|&ordinal| {
+            let name = straydog_gpu::device_info(ordinal).map(|(name, _, _)| name)
+                .unwrap_or_else(|_| "unknown GPU".into());
+            let supported = match straydog_gpu::host_register_read_only_supported(ordinal) {
+                Ok(true) => "supported".into(),
+                Ok(false) => "not supported".into(),
+                Err(error) => format!("unknown ({error})"),
+            };
+            format!("GPU {ordinal} ({name}): {supported}")
+        }).collect::<Vec<String>>();
+        eprintln!("Straydog GPU read-only host registration: {}", devices.join(", "));
+    }
     let id = args.bundle()?;
     if id.is_on_demand() {
         return crate::worker_on_demand::main(&args, &plan, output, &|stage, done, total| loading.report(stage, done, total));

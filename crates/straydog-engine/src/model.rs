@@ -174,6 +174,9 @@ pub fn checkpoint_bytes() -> u64 {
 /// New tokens from which a partially resident model's batches take the slots' VRAM: past one batch, the second batch's streaming costs more
 /// than putting the slots back, a fraction of a second.
 const LONG_PREFILL: usize = 1536;
+/// Refilling multiple GPUs' expert caches costs several seconds; shorter prompts keep their
+/// original workspaces instead of paying that cost to borrow slots.
+const MULTI_GPU_LONG_PREFILL: usize = 65_536;
 /// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
@@ -813,6 +816,12 @@ impl Model {
         crate::host::commit_note("experts placed");
         model.prepare_decoder(context64, false)?;
         crate::host::commit_note("decoder placed");
+        if model.partial {
+            // Size the expert pool beside the PLE and head mixers otherwise uploaded by the
+            // first request. These operands join the verified load before slots are sized.
+            model.with_operands(Model::ple_operands, Group::pin)?;
+            model.with_operands(Model::head_operands, Group::pin)?;
+        }
         // SAFETY of the borrow: the operand points into the weights, which outlive the group.
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;
@@ -2309,8 +2318,12 @@ impl Model {
         Ok(())
     }
 
-    /// Advance the model over `tokens`; the logits after the last one when asked (None on cancellation).
-    fn forward(&mut self, tokens: &[u32], logits: bool, cancelled: &dyn Fn() -> bool) -> Result<Option<Option<Vec<f32>>>> {
+    /// Advance the model over `tokens`; the logits after the last one when asked. It runs whole: a request's cancellation is read
+    /// between its batches ([`Model::prefill_batches`]), so the held sequence ends where a whole batch ended, and the next request that
+    /// shares it goes on from there. (Stopped between a batch's spans, the recurrent state the batch had begun could only be reset, with
+    /// everything the batches before it read: a 90K prompt read for 17 minutes on an 8 GB GPU went whole, and its next request read it all
+    /// again.)
+    fn forward(&mut self, tokens: &[u32], logits: bool) -> Result<Option<Vec<f32>>> {
         if self.history.len() + tokens.len() > self.context
             || tokens.iter().any(|token| *token as usize >= VOCABULARY && (*token < IMAGE_TOKEN || self.images.is_empty()))
         {
@@ -2352,9 +2365,7 @@ impl Model {
         } else if tokens.len() > 1 {
             // With another device to keep them on, the prompt's rows never leave the GPUs.
             let stash = self.speculative > 0 && !self.deferred && self.group.mtp_stash();
-            let Some(rows) = self.resident_prefill(&embeddings, tokens, cancelled, stash, logits || !self.deferred)? else {
-                return Ok(None);
-            };
+            let rows = self.resident_prefill(&embeddings, tokens, stash, logits || !self.deferred)?;
             if self.speculative > 0 {
                 if self.deferred || self.group.mtp_parts() {
                     // (the MTP layer in parts reads the rows both devices kept, deferred or not)
@@ -2373,10 +2384,6 @@ impl Model {
             let mut clock = Instant::now();
             let mut hidden = self.group.decode_span(0, 1, &tile(&embeddings), position)?;
             self.phase("step: first layer", &mut clock);
-            if cancelled() {
-                self.reset()?;
-                return Ok(None);
-            }
             let embeddings = self.ple_embeddings(tokens)?;
             self.phase("step: PLE rows wait", &mut clock);
             hidden = self.with_operands(Model::ple_operands, |group, operands| {
@@ -2385,10 +2392,6 @@ impl Model {
             self.phase("step: PLE layer", &mut clock);
             let layers = Instant::now();
             for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
-                if cancelled() {
-                    self.reset()?;
-                    return Ok(None);
-                }
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
                 self.phase(["step: layers (first device)", "step: layers (second device)"][index.min(1)], &mut clock);
             }
@@ -2404,7 +2407,7 @@ impl Model {
         self.draft_note(tokens);
         self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
         if !logits {
-            return Ok(Some(None));
+            return Ok(None);
         }
         let mut clock = Instant::now();
         let row = last_row(&hidden);
@@ -2436,7 +2439,7 @@ impl Model {
         if let Some(capture) = self.logits_capture.as_mut() {
             capture.push(logits.clone());
         }
-        Ok(Some(Some(logits)))
+        Ok(Some(logits))
     }
 
     /// The last processed token's four-stream hidden state.
@@ -2634,13 +2637,12 @@ impl Model {
         shared(&self.history, tokens).max(shared(parked, tokens))
     }
 
-    /// Keep prompt rows on each GPU between spans; control returns after at most four layers
-    /// for cancellation, and rows cross the host only at device boundaries.
+    /// Keep prompt rows on each GPU between spans of at most four layers; rows cross the host only
+    /// at device boundaries.
     /// `stash`: the MTP layer reads every final row from the first layer's workspace, so only
     /// the last comes back; otherwise speculation takes them all.
     /// `keep_rows`: whether the last span returns rows (a deferred batch before the last does not).
-    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], cancelled: &dyn Fn() -> bool, stash: bool,
-                        keep_rows: bool) -> Result<Option<Vec<f32>>> {
+    fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], stash: bool, keep_rows: bool) -> Result<Vec<f32>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
         let boundaries = self.group.decoder_spans(1);
         let mut spans = vec![(0, 1)];
@@ -2657,10 +2659,6 @@ impl Model {
                 self.group.prefill_handoff(previous, first, steps)?;
             }
             previous = Some(last - 1);
-            if cancelled() {
-                self.reset()?;
-                return Ok(None);
-            }
             if index == 1 {
                 let embeddings = self.ple_embeddings(tokens)?;
                 self.with_operands(Model::ple_operands, |group, operands| {
@@ -2681,7 +2679,7 @@ impl Model {
         if stash && !self.group.prefill_handoff(47, 0, steps)? {
             return Err("Straydog could not keep the prompt rows for the MTP layer".into());
         }
-        Ok(Some(rows_out))
+        Ok(rows_out)
     }
 
     /// Advance the MTP layer's K/V over prologue rows starting at `position`.
@@ -2944,23 +2942,42 @@ impl Model {
             batch = batch.max(2);
         }
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
-        let long = self.partial && tokens.len() - position >= LONG_PREFILL.min(self.prefill_batch_size * 2);
+        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
+        let long = self.partial && tokens.len() - position >= threshold;
+        let preparing = Instant::now();
+        let empty_before_prepare = long && {
+            let (slots, held) = self.group.slots()?;
+            slots > 0 && held == 0
+        };
         if long {
             self.ensure_kv(tokens.len())?;
-            if let Some(rows) = self.group.begin_long_prefill()? {
+            if let Some(rows) = self.group.begin_long_prefill(batch as u64)? {
                 batch = batch.max(rows as usize);
             }
         }
-        let output = self.prefill_batches(tokens, position, plan, batch, cancelled, progress);
-        if long {
-            self.group.end_long_prefill()?;
+        self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
+        self.last_metrics.insert("prefill_batch_rows".into(), json!(batch));
+        let output = self.prefill_batches(tokens, position, plan, batch, empty_before_prepare, cancelled, progress);
+        let restoring = Instant::now();
+        let restored = if long { self.group.end_long_prefill() } else { Ok(()) };
+        self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
+        match (output, restored) {
+            (Err(error), Err(restore)) => Err(format!("{error}; restoring expert slots failed: {restore}")),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
         }
-        output
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prefill_batches(&mut self, tokens: &[u32], mut position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
-                       cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
+                       empty_before_prepare: bool, cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         let mut output = None;
+        let beginning = position;
+        let mut fill_empty_slots = if self.partial && !self.deferred && tokens.len() - position > batch {
+            let (slots, held) = self.group.slots()?;
+            slots > 0 && held < slots && (held == 0 || empty_before_prepare)
+        } else { false };
         let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
         for stop in stops {
             while position < stop {
@@ -2975,17 +2992,22 @@ impl Model {
                 // The next batch's PLE rows arrive while this one runs.
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
-                // A one-token batch runs whole, as decode does; a longer one checks between spans.
-                let check: &dyn Fn() -> bool = if self.prefill_batch_size == 1 { &|| false } else { cancelled };
-                let Some(logits) = self.forward(&tokens[position..end], end == tokens.len(), check)? else {
-                    return Ok(None);
-                };
-                output = logits;
+                output = self.forward(&tokens[position..end], end == tokens.len())?;
                 if cancelled() {
                     return Ok(None);
                 }
                 position = end;
                 progress(end, tokens.len());
+                if fill_empty_slots && position < tokens.len() && position - beginning >= batch && !cancelled() {
+                    // Borrowing may refill only some slots from an interrupted warm-up
+                    // although the request began with an empty cache. Learn from a batch before
+                    // filling the rest. A cache already populated before preparation, or filled
+                    // completely by it, keeps its existing policy.
+                    let filling = Instant::now();
+                    self.group.rebalance(0)?;
+                    self.metric_add("prefill_cache_fill_seconds", filling.elapsed().as_secs_f64());
+                    fill_empty_slots = false;
+                }
             }
             if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
                 for kind in kinds.clone() {
@@ -3492,6 +3514,7 @@ impl Model {
                     }
                 }
             }
+            let slot_counts = self.group.slots().ok();
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
                 "wait_ms": spent("wait_ns") / 1e6 / generated, "cpu_ms": spent("cpu_ns") / 1e6 / generated, "cpu_phases_ms": cpu_phases,
@@ -3499,7 +3522,9 @@ impl Model {
                 "gpu_routes": spent("gpu_experts") / generated, "cpu_routes": spent("cpu_experts") / generated,
                 "assisted_routes": spent("assisted_experts") / generated, "swaps": spent("swapped_experts") / generated,
                 "assist": self.assist.as_ref().map(assist::Tuner::level), "locked_layers": self.locked_layers.len(),
-                "slots": info["cached_experts"], "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
+                "slots": info["cached_experts"], "slot_capacity": slot_counts.map(|(capacity, _)| capacity),
+                "slots_held": slot_counts.map(|(_, held)| held),
+                "streamed": spent("streamed_experts"), "prompt_cpu_routes": spent("prompt_cpu_routes"),
                 "passes": self.pass_counts, "pass_ms": self.pass_seconds.map(|seconds| 1e3 * seconds),
                 "drafts": (self.speculative > 0).then_some(self.drafts),
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
@@ -3587,11 +3612,17 @@ impl Model {
         }
         let prefilled = self.prefill(tokens, reused, &plan, cancelled, progress);
         if pipelined {
+            // A prompt stopped between batches: its last batch's last row, which only the MTP layer's device kept, is the held
+            // sequence's final hidden state, and the next request's first MTP pair starts from it (taken before the batch flags go).
+            let kept = if matches!(prefilled, Ok(None)) { self.kept_hidden() } else { Ok(None) };
             self.deferred = false;
             self.mtp_kept = 0;
             let settled = self.group.prefill_settle();
             if prefilled.is_ok() {
                 settled?;
+            }
+            if let Some(row) = kept? {
+                self.final_hidden = Some(row);
             }
         }
         let Some(output) = prefilled? else { return Ok(()) };
@@ -3634,8 +3665,8 @@ impl Model {
             emit(token);
             if index + 1 < max_new {
                 let decode_started = Instant::now();
-                let Some(next) = self.forward(&[token], true, &|| false)? else { return Ok(()) };
-                self.logits_spare = std::mem::replace(&mut logits, next.unwrap());
+                let next = self.forward(&[token], true)?.ok_or("Straydog decode step returned no logits")?;
+                self.logits_spare = std::mem::replace(&mut logits, next);
                 let seconds = decode_started.elapsed().as_secs_f64();
                 self.metric_add("decode_seconds", seconds);
                 if let Some(profile) = self.profile.as_mut() {
