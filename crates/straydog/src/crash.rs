@@ -1,0 +1,116 @@
+//! What a process that dies of an exception nothing handled says first, on Windows: one line on stderr with the exception, what it
+//! touched, and the module and offset it happened at (an access violation in a GPU driver or a library, an illegal instruction). A
+//! program that runs Straydog shows its last line: Dogmind's setup said only "setup ended (exit code: 0xc0000005)", which no one could
+//! act on, and the system's own record of it is in an event log a user does not know to open.
+
+/// The line, from the exception's code, what an access violation touched (its kind, 0 read, 1 write or 8 execute, and the address),
+/// and the module it happened in with the offset into it.
+pub fn crash_line(code: u32, access: Option<(usize, u64)>, module: &str, offset: u64) -> String {
+    let what = match code {
+        0xC000_0005 => "access violation",
+        0xC000_0006 => "in-page error (a mapped file could not be read)",
+        0xC000_001D => "illegal instruction",
+        0xC000_0094 => "integer division by zero",
+        0xC000_00FD => "stack overflow",
+        0xC000_0409 => "fail-fast abort",
+        _ => "exception",
+    };
+    let touched = match access {
+        Some((0, address)) => format!(" reading 0x{address:X}"),
+        Some((1, address)) => format!(" writing 0x{address:X}"),
+        Some((8, address)) => format!(" executing 0x{address:X}"),
+        _ => String::new(),
+    };
+    format!("Straydog crashed: {what} (0x{code:08X}){touched} at {module}+0x{offset:X}")
+}
+
+/// The file name of a module's path (its folder says nothing of where it failed, and may be a user's name).
+pub fn module_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+#[cfg(windows)]
+static PREVIOUS: std::sync::OnceLock<windows_sys::Win32::System::Diagnostics::Debug::LPTOP_LEVEL_EXCEPTION_FILTER> =
+    std::sync::OnceLock::new();
+
+/// Say the line when the process dies of an exception, then let the system end it as before (the same exit code, the same report).
+pub fn report_unhandled() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+        // SAFETY: the process's filter, set once at its start; the one it replaces is called after ours.
+        let previous = unsafe { SetUnhandledExceptionFilter(Some(filter)) };
+        let _ = PREVIOUS.set(previous);
+    }
+}
+
+/// The filter: the line, written straight to the stderr handle (std's stderr takes a lock that the failing thread may hold), then the
+/// filter before, else on to the system.
+#[cfg(windows)]
+unsafe extern "system" fn filter(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    // SAFETY: the system passes the exception's pointers, live while the filter runs.
+    if let Some(record) = unsafe { info.as_ref() }.and_then(|info| unsafe { info.ExceptionRecord.as_ref() }) {
+        let code = record.ExceptionCode as u32;
+        let address = record.ExceptionAddress as usize;
+        let access = ((code == 0xC000_0005 || code == 0xC000_0006) && record.NumberParameters >= 2)
+            .then(|| (record.ExceptionInformation[0], record.ExceptionInformation[1] as u64));
+        let (module, offset) = module_of(address);
+        let line = format!("\n{}\n", crash_line(code, access, &module, offset));
+        let mut written = 0u32;
+        // SAFETY: the process's stderr handle and a buffer of the length given.
+        unsafe { WriteFile(GetStdHandle(STD_ERROR_HANDLE), line.as_ptr(), line.len() as u32, &mut written, std::ptr::null_mut()) };
+    }
+    match PREVIOUS.get().copied().flatten() {
+        // SAFETY: the filter the process had before ours, with the same pointers.
+        Some(previous) => unsafe { previous(info) },
+        // (EXCEPTION_CONTINUE_SEARCH: the system ends the process as it would have)
+        None => 0,
+    }
+}
+
+/// The module `address` lies in, by its file name, and the offset into it; "?" and the address where none is known.
+#[cfg(windows)]
+fn module_of(address: usize) -> (String, u64) {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: FROM_ADDRESS reads the name argument as an address in the module; UNCHANGED_REFCOUNT takes no reference to release.
+    let found = unsafe {
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, address as *const u16, &mut module)
+    };
+    if found == 0 || module.is_null() {
+        return ("?".to_string(), address as u64);
+    }
+    let mut path = [0u16; 520];
+    // SAFETY: a module handle and a buffer of the length given.
+    let length = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&path[..length.min(path.len())]);
+    (module_name(&path).to_string(), (address - module as usize) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line says the exception by its name and code, what an access violation touched, and where: a module and an offset.
+    #[test]
+    fn a_crash_is_said_in_one_line() {
+        assert_eq!(crash_line(0xC000_0005, Some((0, 0x10)), "nvcuda64.dll", 0x1A2B3C),
+                   "Straydog crashed: access violation (0xC0000005) reading 0x10 at nvcuda64.dll+0x1A2B3C");
+        assert_eq!(crash_line(0xC000_0005, Some((1, 0xDEAD0000)), "straydog.exe", 0x40),
+                   "Straydog crashed: access violation (0xC0000005) writing 0xDEAD0000 at straydog.exe+0x40");
+        assert_eq!(crash_line(0xC000_001D, None, "straydog.exe", 0x1234), "Straydog crashed: illegal instruction (0xC000001D) at straydog.exe+0x1234");
+        assert_eq!(crash_line(0xE06D_7363, None, "?", 0x7FF0), "Straydog crashed: exception (0xE06D7363) at ?+0x7FF0");
+    }
+
+    /// Only the file name of a module's path is said: its folder may hold the user's name.
+    #[test]
+    fn a_module_is_named_by_its_file() {
+        assert_eq!(module_name(r"C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64\nvcuda64.dll"), "nvcuda64.dll");
+        assert_eq!(module_name(r"C:\Users\someone\AppData\Local\Programs\Dogmind\straydog.exe"), "straydog.exe");
+        assert_eq!(module_name("straydog"), "straydog");
+    }
+}

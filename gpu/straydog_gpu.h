@@ -17,6 +17,8 @@ extern "C" {
 const char* sd_error(void);
 int sd_device_count(void);
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes);
+/* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
+int sd_host_register_read_only_supported(int ordinal);
 /* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
 int sd_device_pci(int ordinal, int* domain, int* bus, int* device);
 void* sd_create(int ordinal, uint64_t budget);
