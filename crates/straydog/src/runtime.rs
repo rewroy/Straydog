@@ -482,7 +482,8 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// few seconds through a day of serving, and each request's line already says how many hints were taken and left.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
-     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog GPU read-only host registration:",
+     "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
         .iter().any(|start| line.starts_with(start))
 }
 
