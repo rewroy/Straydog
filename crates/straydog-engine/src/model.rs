@@ -826,7 +826,7 @@ impl Model {
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;
         let keep = model.first_use_tensors()?;
-        load_seconds.push(("place", lap(&mut clock)));
+        load_seconds.push(("read and place", lap(&mut clock)));
         crate::host::commit_note("placed");
         let pending = model.group.take_pending();
         crate::load::load(&mut model.weights, &mut model.group, pending, &keep, progress)?;
