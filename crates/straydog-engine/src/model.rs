@@ -2970,11 +2970,14 @@ impl Model {
         self.last_metrics.insert("prefill_batch_rows".into(), json!(batch));
         let output = self.prefill_batches(tokens, position, plan, batch, empty_before_prepare, cancelled, progress);
         let restoring = Instant::now();
-        if long {
-            self.group.end_long_prefill()?;
-        }
+        let restored = if long { self.group.end_long_prefill() } else { Ok(()) };
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
-        output
+        match (output, restored) {
+            (Err(error), Err(restore)) => Err(format!("{error}; restoring expert slots failed: {restore}")),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
