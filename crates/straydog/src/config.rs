@@ -795,6 +795,34 @@ mod tests {
     }
 
     #[test]
+    fn check_model_says_ready_only_with_every_pinned_size_and_tree_and_writes_nothing() {
+        let id = qwen("IQ3_XXS");
+        let model = bundle_directory(id);
+        // (sparse files of the pinned sizes: nothing is read from them)
+        for (asset, _) in bundle::verity_pins(id).unwrap() {
+            std::fs::File::options().write(true).open(model.join(&asset.name)).unwrap().set_len(asset.bytes).unwrap();
+        }
+        let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        let error = crate::runtime::check_model(&settings).unwrap_err();
+        assert!(error.contains("no verity tree"), "{error}");
+        assert!(!settings.data_dir.exists(), "the check builds no trees");
+        // A tree that is not the pinned one's.
+        for (asset, _) in bundle::verity_pins(id).unwrap() {
+            let tree = bundle::tree_path(&settings.data_dir, &asset);
+            std::fs::create_dir_all(tree.parent().unwrap()).unwrap();
+            std::fs::write(tree, b"").unwrap();
+        }
+        let error = crate::runtime::check_model(&settings).unwrap_err();
+        assert!(error.contains("not the pinned"), "{error}");
+        // A file of another size.
+        let first = &bundle::verity_pins(id).unwrap()[0].0;
+        std::fs::File::options().write(true).open(model.join(&first.name)).unwrap().set_len(first.bytes - 1).unwrap();
+        let error = crate::runtime::check_model(&settings).unwrap_err();
+        assert!(error.contains("bytes where the pinned file has"), "{error}");
+        std::fs::remove_dir_all(model).unwrap();
+    }
+
+    #[test]
     fn options_beat_variables_beat_the_file_and_derived_values_follow() {
         let model = bundle_directory(qwen("IQ3_S"));
         let file = model.join("config.toml");
