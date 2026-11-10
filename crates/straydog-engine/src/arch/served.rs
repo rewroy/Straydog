@@ -313,6 +313,18 @@ struct Checkpoint {
 /// one prefills in about a second).
 const ROOT_MINIMUM: usize = 1024;
 
+/// Which checkpoint gives its slot up when all are taken and the state `history` is to be saved: an
+/// earlier turn of the same conversation first (one whose tokens `history` extends: the newer turn
+/// replaces it), the oldest of them; else the oldest turn of any conversation; the root last. A
+/// helper conversation sent to the same server (an agent's sub-agent, some tens of requests with its
+/// own system prompt) so reuses its own slot, and the conversation it interrupted keeps its latest
+/// turn to come back to, where taking the oldest turn of any conversation gave all of them up.
+fn evicted(checkpoints: &[Checkpoint], history: &[u32]) -> usize {
+    checkpoints.iter().position(|checkpoint| !checkpoint.root && history.starts_with(&checkpoint.tokens))
+        .or_else(|| checkpoints.iter().position(|checkpoint| !checkpoint.root))
+        .unwrap_or(0)
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
 
@@ -852,8 +864,8 @@ impl<E: Engines> Session<E> {
     }
 
     /// Save the held state as a checkpoint, the root (the last root becoming a turn's) or the last
-    /// turn's: one of the same tokens just becomes the last; else a free slot takes it, the oldest
-    /// turn's giving its up when all are taken. The engines' budget gives the root's up last.
+    /// turn's: one of the same tokens just becomes the last; else a free slot takes it, one chosen by
+    /// [`evicted`] giving its up when all are taken. The engines' budget gives the root's up last.
     fn save_checkpoint(&mut self, root: bool) -> Result<(), String> {
         // (checkpoints the engines gave up are gone: one of the same tokens is taken again)
         let engines = &self.engines;
@@ -868,8 +880,8 @@ impl<E: Engines> Session<E> {
         } else {
             let slots = self.engines.checkpoints();
             if self.checkpoints.len() >= slots {
-                let oldest = self.checkpoints.iter().position(|checkpoint| !checkpoint.root).unwrap_or(0);
-                self.checkpoints.remove(oldest);
+                let given_up = evicted(&self.checkpoints, &self.history);
+                self.checkpoints.remove(given_up);
             }
             let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot))
                 .ok_or("no free Straydog checkpoint")?;
@@ -1014,6 +1026,37 @@ mod tests {
             self.held.truncate(from + keep);
             Ok(())
         }
+    }
+
+    /// Decides: a helper conversation between two requests of another (a sub-agent's, with its own system prompt) gives up
+    /// its own earlier turns, not the other conversation's latest, so that conversation resumes from its last turn. Within one
+    /// conversation the oldest turn goes first, as before, and a root goes last.
+    #[test]
+    fn a_helper_conversation_reuses_its_own_slot_and_leaves_the_other_its_latest_turn() {
+        let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };
+        // the main conversation: its root, then turns 1..3 (each extends the one before)
+        let main = [1, 1, 1, 1];
+        let mut held = vec![checkpoint(0, &main[..1], true), checkpoint(1, &[1, 1, 2], false), checkpoint(2, &[1, 1, 2, 3, 4], false),
+                            checkpoint(3, &[1, 1, 2, 3, 4, 5, 6], false)];
+        // a helper's first request (another system prompt): nothing of its own yet, so the main conversation's oldest turn goes
+        let helper_first = [9, 9, 7];
+        assert_eq!(evicted(&held, &helper_first), 1);
+        held.remove(1);
+        held.push(checkpoint(1, &helper_first, false));
+        // its next requests give up its own previous turn, each time
+        for (step, helper) in [vec![9, 9, 7, 8, 7], vec![9, 9, 7, 8, 7, 8, 7]].iter().enumerate() {
+            let given_up = evicted(&held, helper);
+            assert!(helper.starts_with(&held[given_up].tokens) && !held[given_up].root, "step {step}");
+            let slot = held.remove(given_up).slot;
+            held.push(checkpoint(slot, helper, false));
+        }
+        // the main conversation's latest turn is still there to come back to
+        assert!(held.iter().any(|kept| kept.tokens == [1, 1, 2, 3, 4, 5, 6]));
+        assert!(held.iter().any(|kept| kept.root));
+        // one conversation alone: its oldest turn first (each later turn extends it), the root last
+        let alone = vec![checkpoint(0, &[1], true), checkpoint(1, &[1, 2], false), checkpoint(2, &[1, 2, 3], false)];
+        assert_eq!(evicted(&alone, &[1, 2, 3, 4]), 1);
+        assert_eq!(evicted(&[checkpoint(0, &[1], true)], &[1, 2]), 0);
     }
 
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
