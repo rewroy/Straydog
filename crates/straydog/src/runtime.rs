@@ -562,12 +562,15 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         .map_or_else(String::new, |counts| format!("; read-ahead: {} taken, {} left", counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
     // (where the GPU may take some of the CPU's routes: the level the engine's measuring left in force, 0 to the most)
     let assist = detail["assist"].as_u64().map_or_else(String::new, |level| format!(" (level {level})"));
-    // (what "other" is made of, where the engine timed the step: the head, the first layer, the PLE rows' wait and layer, and what the layers
-    // spent beyond the wait and the CPU; a part under 0.05 ms is left out)
+    // (what "other" is made of, where the engine timed the step: the draft, the head, the first layer with the PLE,
+    // the acceptance and the commit, and what the layers spent beyond the wait and the CPU; a part under 0.05 ms is left out.
+    // Older metrics named the first layer and the PLE apart; those still add into first/PLE.)
     let steps = &detail["steps_ms"];
-    let parts: Vec<String> = [("head", steps["head"].as_f64()), ("first layer", steps["first layer"].as_f64()), ("PLE wait", steps["PLE wait"].as_f64()),
-                              ("PLE", steps["PLE"].as_f64()), ("in layers", steps["layers"].as_f64().map(|layers| (layers - wait - cpu).max(0.0)))]
-        .into_iter().filter_map(|(name, ms)| ms.filter(|ms| *ms >= 0.05).map(|ms| format!("{name} {ms:.1}"))).collect();
+    let ms = |key: &str| steps[key].as_f64().unwrap_or(0.0);
+    let parts: Vec<String> = [("draft", ms("draft")), ("head", ms("head")),
+                              ("first/PLE", ms("first/PLE") + ms("first layer") + ms("PLE wait") + ms("PLE")),
+                              ("accept", ms("accept")), ("in layers", (ms("layers") - wait - cpu).max(0.0))]
+        .into_iter().filter_map(|(name, ms)| (ms >= 0.05).then(|| format!("{name} {ms:.1}"))).collect();
     let other_parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
     // (the CPU's time by the engine's phases: gate and up, the products, down with the weighted sum; the rest is the call's own)
     let cpu_parts = detail["cpu_phases_ms"].as_array().filter(|ms| ms.len() == 3 && cpu >= 0.05).map_or_else(String::new, |ms| {
@@ -1959,21 +1962,25 @@ mod tests {
         assert!(plain.contains("CPU 8.5, other 2.2;"), "{plain}");
     }
 
-    /// A partially resident request's "other" is followed by its parts when the engine timed them: the head, the first layer, the PLE
-    /// rows' wait and layer, and what the layers spent beyond the GPU wait and the CPU; a part under 0.05 ms is left out, and a request with
-    /// none known reads as it always did.
+    /// A partially resident request's "other" is followed by its parts when the engine timed them: the draft, the head, the first
+    /// layer with the PLE, the acceptance and the commit, and what the layers spent beyond the GPU wait and the CPU. A part under 0.05 ms
+    /// is left out. One parenthesis. A request with none known reads as it always did. Older metrics that named the first layer and the
+    /// PLE apart still add into first/PLE.
     #[test]
     fn a_partial_request_line_breaks_other_into_its_parts() {
         let detail = |steps: Value| json!({"wait_ms": 42.0, "cpu_ms": 21.5, "gpu_routes": 200.0, "cpu_routes": 180.0, "assisted_routes": 0.0,
                                            "swaps": 3.0, "slots": 900, "passes": [10, 0], "pass_ms": [71.6, 0.0], "steps_ms": steps});
         let event = |steps: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 1e3 / 71.6, "partial_detail": detail(steps)}});
-        let steps = json!({"head": 2.1, "first layer": 3.0, "PLE wait": 1.2, "PLE": 0.4, "layers": 64.4});
+        let steps = json!({"head": 2.0, "first layer": 3.0, "PLE wait": 1.0, "PLE": 0.5, "layers": 64.0});
         let line = request_summary(&event(steps.clone()), None);
-        assert!(line.contains("ms a token: GPU wait 42.0, CPU 21.5, other 8.1 (head 2.1, first layer 3.0, PLE wait 1.2, PLE 0.4, in layers 0.9); routes a token:"), "{line}");
+        assert!(line.contains("ms a token: GPU wait 42.0, CPU 21.5, other 8.1 (head 2.0, first/PLE 4.5, in layers 0.5); routes a token:"), "{line}");
         // (a part under 0.05 ms: left out; the layers within the wait and the CPU: no part of their own)
-        let small = request_summary(&event(json!({"head": 2.1, "first layer": 0.049, "PLE wait": 1.2, "PLE": 0.0, "layers": 63.5})), None);
-        assert!(small.contains("other 8.1 (head 2.1, PLE wait 1.2); routes a token:"), "{small}");
-        // (a step not timed, as in a request that verified drafts: the line as before)
+        let small = request_summary(&event(json!({"head": 2.0, "draft": 0.04, "first layer": 0.0, "PLE wait": 1.0, "PLE": 0.0, "layers": 63.5})), None);
+        assert!(small.contains("other 8.1 (head 2.0, first/PLE 1.0); routes a token:"), "{small}");
+        // (a pass of drafts: the same parenthesis, draft and accept included, a part under 0.05 ms left out)
+        let drafted = request_summary(&event(json!({"draft": 4.0, "head": 1.5, "first/PLE": 2.0, "accept": 0.04, "layers": 70.0})), None);
+        assert!(drafted.contains("other 8.1 (draft 4.0, head 1.5, first/PLE 2.0, in layers 6.5); routes a token:"), "{drafted}");
+        // (a step not timed: the line as before)
         for none in [json!({}), Value::Null] {
             let plain = request_summary(&event(none), None);
             assert!(plain.contains("other 8.1; routes a token:"), "{plain}");
@@ -1982,7 +1989,7 @@ mod tests {
         let mut profiled = event(steps);
         profiled["timings"]["decode_profile"] = json!({"step: head": 2.1, "step: layers (first device)": 64.4});
         let line = request_summary(&profiled, None);
-        assert!(line.contains("in layers 0.9); routes a token:") && line.contains("; decode phases (ms a token): step: layers (first device) 64.400, step: head 2.100"), "{line}");
+        assert!(line.contains("in layers 0.5); routes a token:") && line.contains("; decode phases (ms a token): step: layers (first device) 64.400, step: head 2.100"), "{line}");
     }
 
     /// The ready line says whether DSpark is placed, and with how many experts a stage.

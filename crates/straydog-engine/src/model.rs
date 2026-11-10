@@ -225,17 +225,31 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
 }
 
 /// The part of a partially resident request's "other" (the request line's ms a token apart from the GPU wait and the CPU) that a decode
-/// phase is, as the line names it. A lone row's step only: a pass of drafts has more besides (the drafter's, the acceptance, the commit),
-/// which the line does not break down.
+/// phase is, as the line names it. A lone row and a pass of drafts share one short list: the draft, the head, the first layer together
+/// with the PLE, the acceptance and the commit, and the layers.
 fn decode_part(phase: &str) -> Option<&'static str> {
     Some(match phase {
-        "step: head" => "head",
-        "step: first layer" => "first layer",
-        "step: PLE rows wait" => "PLE wait",
-        "step: PLE layer" => "PLE",
-        "step: layers (first device)" | "step: layers (second device)" => "layers",
+        "draft: embeddings" | "draft: catch-up and first draft" | "draft: next draft" => "draft",
+        "step: head" | "verify: head" => "head",
+        "step: first layer" | "step: PLE rows wait" | "step: PLE layer"
+            | "verify: protect, PLE prefetch, embeddings" | "verify: first layer" | "verify: PLE rows wait" | "verify: PLE layer"
+            | "PLE prefetch" => "first/PLE",
+        "accept" | "commit: DeltaNet replay" | "commit: PLE replay" => "accept",
+        "step: layers (first device)" | "step: layers (second device)"
+            | "verify: layers (queued)" | "verify: layers (first device)" | "verify: layers (second device)" => "layers",
         _ => return None,
     })
+}
+
+/// Milliseconds a generated token of each [`decode_part`], from the phases already timed. `generated` is at least 1.
+fn decode_steps(phases: &BTreeMap<&'static str, f64>, generated: f64) -> BTreeMap<&'static str, f64> {
+    let mut steps = BTreeMap::new();
+    for (name, seconds) in phases {
+        if let Some(part) = decode_part(name) {
+            *steps.entry(part).or_default() += 1e3 * seconds / generated;
+        }
+    }
+    steps
 }
 
 /// [`Model::partial_drawn_cut`] of the draft at position `at` (1 the first) from the running means of a pass's seconds by rows (0: none yet).
@@ -3793,15 +3807,8 @@ impl Model {
             let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
             let cpu_phases: Vec<f64> = (0..3).map(|i| phases[i].saturating_sub(self.cpu_phases_before[i]) as f64 / 1e6 / generated).collect();
             // What the host spent outside the layers' routes in a decode step (the line's "other" is made of it and the layers' own time), on
-            // every request, DS41_PROFILE or not. Not in a request that verified drafts: its passes have phases the line does not name.
-            let mut steps: BTreeMap<&str, f64> = BTreeMap::new();
-            if let Some(profile) = self.profile.as_ref().filter(|_| !self.last_metrics.contains_key("speculative_passes")) {
-                for (name, seconds) in &profile.phases {
-                    if let Some(part) = decode_part(name) {
-                        *steps.entry(part).or_default() += 1e3 * seconds / generated;
-                    }
-                }
-            }
+            // every request, DS41_PROFILE or not, including a pass that verified drafts. The clocks were already taken; this only folds them.
+            let steps = self.profile.as_ref().map(|profile| decode_steps(&profile.phases, generated)).unwrap_or_default();
             let slot_counts = self.group.slots().ok();
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
@@ -4151,13 +4158,15 @@ mod warm_stop_tests {
 
 #[cfg(test)]
 mod profile_tests {
-    use super::{decode_part, Profile};
+    use super::{decode_part, decode_steps, Profile};
+    use std::collections::BTreeMap;
 
-    /// Without DS41_PROFILE a partially resident model's profile keeps the decode step's phases the request line names, whatever pass they came in.
+    /// Without DS41_PROFILE a partially resident model's profile keeps the phases the request line names, from a lone row or a pass of drafts.
     #[test]
     fn a_profile_without_every_phase_keeps_the_steps_parts_alone() {
         let timed = [("step: head", 1.5), ("step: first layer", 1.0), ("step: PLE rows wait", 0.5), ("step: PLE layer", 0.25),
-                     ("step: layers (first device)", 30.0), ("verify: head", 2.0), ("draft: next draft", 3.0), ("accept", 0.125)];
+                     ("step: layers (first device)", 30.0), ("verify: head", 2.0), ("draft: next draft", 3.0), ("accept", 0.125),
+                     ("note: not a part", 4.0)];
         let kept = |every: bool| {
             let mut profile = Profile::new(every);
             for (name, seconds) in timed {
@@ -4168,20 +4177,52 @@ mod profile_tests {
         };
         let parts = kept(false);
         assert_eq!(parts.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-                   ["step: PLE layer", "step: PLE rows wait", "step: first layer", "step: head", "step: layers (first device)"]);
+                   ["accept", "draft: next draft", "step: PLE layer", "step: PLE rows wait", "step: first layer", "step: head",
+                    "step: layers (first device)", "verify: head"]);
         assert!(parts.iter().all(|(name, _)| decode_part(name).is_some()));
         assert_eq!(kept(true).len(), timed.len());
     }
 
-    /// The parts of "other": the step's phases, the layers of both devices as one.
+    /// The parts of "other": a lone row and a pass of drafts fold into the same few names. Both devices' layers are one part.
     #[test]
     fn the_steps_phases_are_the_lines_parts() {
-        let parts = ["step: head", "step: first layer", "step: PLE rows wait", "step: PLE layer", "step: layers (first device)", "step: layers (second device)"]
-            .map(decode_part);
-        assert_eq!(parts, [Some("head"), Some("first layer"), Some("PLE wait"), Some("PLE"), Some("layers"), Some("layers")]);
-        for other in ["verify: head", "verify: layers (first device)", "draft: embeddings", "accept", "PLE prefetch", "commit: DeltaNet replay"] {
-            assert_eq!(decode_part(other), None, "{other}");
+        assert_eq!(decode_part("draft: embeddings"), Some("draft"));
+        assert_eq!(decode_part("draft: catch-up and first draft"), Some("draft"));
+        assert_eq!(decode_part("draft: next draft"), Some("draft"));
+        assert_eq!(decode_part("step: head"), Some("head"));
+        assert_eq!(decode_part("verify: head"), Some("head"));
+        for phase in ["step: first layer", "step: PLE rows wait", "step: PLE layer", "verify: protect, PLE prefetch, embeddings",
+                      "verify: first layer", "verify: PLE rows wait", "verify: PLE layer", "PLE prefetch"] {
+            assert_eq!(decode_part(phase), Some("first/PLE"), "{phase}");
         }
+        assert_eq!(decode_part("accept"), Some("accept"));
+        assert_eq!(decode_part("commit: DeltaNet replay"), Some("accept"));
+        assert_eq!(decode_part("commit: PLE replay"), Some("accept"));
+        for phase in ["step: layers (first device)", "step: layers (second device)", "verify: layers (queued)",
+                      "verify: layers (first device)", "verify: layers (second device)"] {
+            assert_eq!(decode_part(phase), Some("layers"), "{phase}");
+        }
+        assert_eq!(decode_part("note: not a part"), None);
+    }
+
+    /// A pass of drafts fills the same `steps_ms` parts. The fold does not look at whether the request verified drafts.
+    #[test]
+    fn a_pass_of_drafts_folds_into_the_same_few_parts() {
+        let mut phases = BTreeMap::new();
+        for (name, seconds) in [("draft: embeddings", 0.001), ("draft: next draft", 0.002), ("verify: head", 0.0015),
+                                ("verify: first layer", 0.0004), ("verify: PLE rows wait", 0.0003), ("PLE prefetch", 0.0002),
+                                ("accept", 0.0008), ("commit: DeltaNet replay", 0.0002), ("verify: layers (first device)", 0.004),
+                                ("note: not a part", 9.0)] {
+            phases.insert(name, seconds);
+        }
+        let steps = decode_steps(&phases, 2.0);
+        let close = |part: &str, ms: f64| assert!((steps[part] - ms).abs() < 1e-9, "{part} {}", steps[part]);
+        close("draft", 1.5);
+        close("head", 0.75);
+        close("first/PLE", 0.45);
+        close("accept", 0.5);
+        close("layers", 2.0);
+        assert_eq!(steps.len(), 5);
     }
 }
 
