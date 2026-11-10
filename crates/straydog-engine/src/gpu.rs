@@ -1047,6 +1047,20 @@ impl Backend {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_prefill_capacity(&mut self, rows: u64) -> Result<()> {
+        self.prefill_buffers(rows)?;
+        if self.prefill_capacity != rows { return Err("validation prefill capacity was refused".into()); }
+        Ok(())
+    }
+
+    /// The test owns context until it detaches the callback, whose borrowed rows are valid only during the native call.
+    #[cfg(test)]
+    pub(crate) unsafe fn test_prefill_observer(&mut self, observer: ffi::sd_prefill_observer, context: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller upholds the callback/context lifetime and no-unwind contract.
+        check(unsafe { ffi::sd_prefill_observe(self.handle, observer, context) }).map(drop)
+    }
+
     /// Load complete four-stream rows before a layer's PLE and span.
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
         let steps = rows.len() / WIDTH;
