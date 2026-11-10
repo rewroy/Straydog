@@ -1861,6 +1861,11 @@ int sd_prefill_handoff(void* from,void* to,uint64_t from_layer,uint64_t to_layer
             check(hipEventRecord(b.handoff,b.stream));
         });
         on_device(a.ordinal,[&]() { check(hipStreamWaitEvent(a.stream,b.handoff,0)); });
+        // Both sides of the handoff now have their work queued.
+#if !defined(__HIPCC__)
+        on_device(a.ordinal,[&]() { flush_launches(a); });
+        on_device(b.ordinal,[&]() { flush_launches(b); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -3492,6 +3497,10 @@ int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, 
             check(hipEventRecord(b.handoff, b.stream));
         });
         on_device(a.ordinal, [&]() { check(hipStreamWaitEvent(a.stream, b.handoff, 0)); });
+#if !defined(__HIPCC__)
+        on_device(a.ordinal, [&]() { flush_launches(a); });
+        on_device(b.ordinal, [&]() { flush_launches(b); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -3627,6 +3636,22 @@ int sd_graph_run(void* handle, uint64_t key) {
         if (found == value.graphs.end()) return 1;
         graph_launch(value, found->second);
         ++value.graph_replays;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_devices_flush(void* const* handles, uint64_t devices) {
+    try {
+#if !defined(__HIPCC__)
+        if (!handles || !devices || devices > 8) throw std::runtime_error("invalid Straydog devices");
+        for (size_t i = 0; i < devices; ++i) {
+            Device& d = device(handles[i]);
+            on_device(d.ordinal, [&]() { flush_launches(d); });
+        }
+#else
+        (void)handles;
+        (void)devices;
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4646,6 +4671,10 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 on_device(list[i]->ordinal, [&]() {
                     if (sd_op_link_sum(handles[i], parts[i], count, outs[i], 0)) throw std::runtime_error(last_error);
                 });
+            // Either link sum may wait for the other device's flag.
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
             return 0;
         }
         link_peers(list);
@@ -4655,6 +4684,10 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+        // A consumer's stream waits for each peer's parts_ready event below.
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4665,6 +4698,9 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4681,6 +4717,9 @@ int sd_devices_settle(void* const* handles, uint64_t devices) {
                 for (Device* other : list)
                     if (other != d && other->parts_read) check(hipStreamWaitEvent(d->stream, other->parts_read, 0));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4736,6 +4775,9 @@ int sd_op_gather_columns(void* const* handles, void* const* outs, const void* co
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4746,6 +4788,9 @@ int sd_op_gather_columns(void* const* handles, void* const* outs, const void* co
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4803,6 +4848,9 @@ int sd_op_gather_owned(void* const* handles, float* const* outs, const float* co
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4813,6 +4861,9 @@ int sd_op_gather_owned(void* const* handles, float* const* outs, const float* co
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

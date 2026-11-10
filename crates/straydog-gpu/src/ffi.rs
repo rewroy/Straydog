@@ -437,6 +437,12 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn sd_graph_run(handle: *mut ::std::os::raw::c_void, key: u64) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn sd_devices_flush(
+        handles: *const *mut ::std::os::raw::c_void,
+        devices: u64,
+    ) -> ::std::os::raw::c_int;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct sd_linear {

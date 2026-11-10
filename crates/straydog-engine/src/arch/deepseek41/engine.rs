@@ -1875,6 +1875,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         ops::sum_devices(&devices, &outs, &parts, (rows * w) as u64)
     }
 
+    fn flush_peers(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.shards.len() > 1 {
+            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+            ops::flush_devices(&devices)?;
+        }
+        Ok(())
+    }
+
     /// Where a device's share of a sublayer's output for a view's rows goes: `out` itself on one
     /// device, else its part.
     fn target(&self, work: &Work, part: usize) -> M {
@@ -2203,6 +2212,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                     hc as u64, w as u64, work.stream.base())?;
             }
             if self.link_pass {
+                self.flush_peers()?;
                 for shard in &mut self.shards {
                     if shard.gpu.part_failed()? {
                         return Err(VOID_PASS.into());
@@ -2234,6 +2244,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     shard.gpu.link_status(work.head.at(outputs * part_rows))?;
                 }
             }
+            if link { self.flush_peers()?; }
             self.stamp_pass(n, 1)?;
             let mut failed = false;
             // One read outstanding per device (at most 1 MiB). Queue every device's copy
@@ -2510,6 +2521,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let gate = shard.dense(&name(layer, "engram_gate"))?;
                     shard.gpu.engram_gate(work.stream.base(), work.engram_kv.base(), gate.buffer.base(), rows, hc, w, hp.norm_eps)?;
                 }
+                if link && expanding { self.flush_peers()?; }
                 self.mark("engram")?;
             }
             let attention = self.attention_plan(layer, first, end, kv_from, full_from, saves);
@@ -2563,6 +2575,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     tap_features(&mut self.shards[index], &work, &hp, layer, first, rows as usize, n)?;
                 }
             }
+            if link || merged { self.flush_peers()?; }
             self.views.replay(avoided);
             if !(record && fixed) {
                 self.mark("hyper-connections")?;
@@ -2614,6 +2627,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     hc_ffn(shard, &work, &hp, layer, attended, link)?;
                 }
             }
+            if link { self.flush_peers()?; }
             self.views.replay(avoided);
             if !record {
                 self.mark("hyper-connections")?;
@@ -2926,6 +2940,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let work = shard.work.view(first);
                     shard.gpu.part_receive(ACTIVATIONS, work.products[buffer].base() as P, summed as u64 * ff, work.product.base())?;
                 }
+                self.flush_peers()?;
             } else {
                 let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
                 let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
@@ -2952,6 +2967,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             for shard in &mut self.shards {
                 shard.experts.release(&mut shard.gpu)?;
             }
+            if self.link_pass { self.flush_peers()?; }
         }
         self.mark("routed experts")
     }
@@ -3055,6 +3071,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 let work = shard.work.view(first);
                 shard.gpu.part_receive(ACTIVATIONS, work.products[0].base() as P, (routed_rows + rows) as u64 * ff, work.product.base())?;
             }
+            self.flush_peers()?;
         } else {
             let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
             let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
@@ -3079,6 +3096,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         for shard in &mut self.shards {
             shard.experts.release(&mut shard.gpu)?;
         }
+        if self.link_pass { self.flush_peers()?; }
         self.mark("routed experts")
     }
 
