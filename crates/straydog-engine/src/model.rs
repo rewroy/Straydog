@@ -606,7 +606,7 @@ pub struct Model {
     pub copy_drafts: usize,
     pub resident: bool,
     pub partial: bool,
-    /// Opt-in until layer-ordered prefill passes its output and performance gates.
+    /// Layer-ordered long prefill; STRAYDOG_LAYER_PREFILL=0 selects the ordinary batch order.
     layer_prefill: bool,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
@@ -802,7 +802,7 @@ impl Model {
             copy_drafts: 0,
             resident: false,
             partial: false,
-            layer_prefill: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "1"),
+            layer_prefill: !std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "0"),
             layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
@@ -4181,6 +4181,6 @@ mod layer_prefill_tests {
     }
 }
 
-#[cfg(all(test, any(feature = "hip", feature = "cuda")))]
+#[cfg(all(test, feature = "prefill-observer", any(feature = "hip", feature = "cuda")))]
 #[path = "layer_prefill_diagnostics.rs"]
 mod layer_prefill_diagnostics;

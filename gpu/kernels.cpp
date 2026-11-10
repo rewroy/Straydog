@@ -523,8 +523,10 @@ struct Device {
     bool prefill_deferred = false;
     ResidentMoe* layer_prefill_plan = nullptr;
     void* layer_prefill_storage = nullptr;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
     sd_prefill_observer prefill_observer = nullptr;
     void* prefill_observer_context = nullptr;
+#endif
     // A sequence with images (sd_rope_delta, sd_rope_rows). The table is allocated at its first image, beside the budget:
     // a few KiB the runtime's reserve holds, needed when the slots have taken all that is counted.
     uint32_t rope_delta = 0;
@@ -1756,6 +1758,7 @@ int sd_prefill_bank_clear(void* handle) {
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context) {
+#if defined(STRAYDOG_PREFILL_OBSERVER)
     try {
         auto& d = device(handle);
         check(hipStreamSynchronize(d.stream));
@@ -1763,6 +1766,12 @@ int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context
         d.prefill_observer_context = observer ? context : nullptr;
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
+#else
+    (void)handle; (void)context;
+    if (!observer) return 0;
+    last_error = "prefill observer is not included in this build";
+    return -1;
+#endif
 }
 int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps) {
     try {

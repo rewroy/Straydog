@@ -31,6 +31,7 @@ fn main() {
     config
         .define("STRAYDOG_BACKEND", backend)
         .define(format!("CMAKE_{backend}_ARCHITECTURES"), &architectures)
+        .define("STRAYDOG_PREFILL_OBSERVER", if env::var_os("CARGO_FEATURE_PREFILL_OBSERVER").is_some() { "ON" } else { "OFF" })
         .profile("Release")
         .build_target("straydog_gpu");
     let rocm = PathBuf::from(env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string()));
