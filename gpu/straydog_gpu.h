@@ -597,6 +597,8 @@ int sd_hybrid_seed(void* handle, void* plan, const double* rates, uint64_t exper
 /* One bounded refresh of the expert slots by those scores, never waiting for its copies: the swaps still on their way after it (0: none wanted), the pool's size and its occupation. */
 int sd_hybrid_refresh(void* handle, uint64_t max_swaps, uint64_t* pending, uint64_t* slots, uint64_t* held);
 int sd_hybrid_slots(void* handle, uint64_t* slots, uint64_t* held);
+/* The current expert cache arena's device bytes, excluding staging. Size groups make slot count times the largest slot an overestimate. */
+int sd_hybrid_cache_bytes(void* handle, uint64_t* bytes);
 
 /* CPU experts and formats */
 const char* sd_cpu_error(void);

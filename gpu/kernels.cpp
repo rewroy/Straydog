@@ -2086,6 +2086,14 @@ int sd_hybrid_refresh(void* handle,uint64_t max_swaps,uint64_t* pending,uint64_t
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_hybrid_cache_bytes(void* handle,uint64_t* bytes) {
+    try {
+        if (!bytes) throw std::runtime_error("invalid hybrid cache bytes");
+        auto& d=device(handle);
+        *bytes=d.slots.base ? d.slots.arena : 0;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The pool's size and occupation, as sd_hybrid_refresh reports them.
 int sd_hybrid_slots(void* handle,uint64_t* slots,uint64_t* held) {
     try {
