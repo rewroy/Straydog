@@ -151,6 +151,26 @@ pub fn available_bytes() -> u64 {
     0
 }
 
+/// The memory the expert banks may hold now beside `pinned` bytes of page-locked state, `locked` bytes of them page-locked already: on
+/// Windows this process's working set (the locked banks and state in it) and what is available (the standby list, where its trimmed bank
+/// pages wait, counts as available; the pages it holds do not); elsewhere what is available, the page cache included, within the cgroup's
+/// limit ([`prefetch_available_bytes`]), and the locked banks, which it leaves out. No reserve is kept from it: it is what the page cache
+/// can hold of the banks, not what may be locked. None where the system does not say.
+pub fn bank_room_now(pinned: u64, locked: u64) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let _ = locked;
+        let available = windows_available().0;
+        (available > 0).then(|| (windows_working_set() + available).saturating_sub(pinned))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pinned;
+        let available = prefetch_available_bytes();
+        (available > 0).then(|| available + locked)
+    }
+}
+
 /// The parent's cgroup counters needed by an isolated worker's prefetch budget. Only these
 /// individual files are exposed read-only; its cgroup namespace need not reveal the hierarchy.
 pub fn memory_limit_files() -> Vec<std::path::PathBuf> {

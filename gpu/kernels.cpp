@@ -2880,6 +2880,18 @@ int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, c
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// The device bytes sd_release would give back for `pointer` (its size and the allocation tail), without releasing it.
+int sd_allocation_bytes(void* handle, const void* pointer, uint64_t* bytes) {
+    try {
+        auto& value = device(handle);
+        if (!bytes) throw std::runtime_error("invalid allocation bytes");
+        auto found = value.allocations.find(const_cast<void*>(pointer));
+        if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        *bytes = uint64_t(found->second + allocation_tail);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_release(void* handle, void* pointer) {
     try {
         auto& value = device(handle);

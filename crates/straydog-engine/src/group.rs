@@ -859,6 +859,12 @@ impl Group {
         self.backends[0].lend_prefill_head()
     }
 
+    /// The rows [`Group::begin_layer_prefill`] would take for a bank pool of `bytes` once the head is lent (0: it would refuse).
+    pub fn layer_prefill_rows(&self, bytes: u64) -> Result<u64> {
+        if self.backends.len() != 1 || self.parts { return Ok(0); }
+        self.backends[0].layer_prefill_rows(bytes)
+    }
+
     pub fn begin_layer_prefill(&mut self, bytes: u64) -> Result<Option<u64>> {
         if self.backends.len() != 1 || self.parts { return Ok(None); }
         self.backends[0].begin_layer_prefill(bytes)

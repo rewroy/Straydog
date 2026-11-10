@@ -1013,6 +1013,32 @@ impl Backend {
         Ok(())
     }
 
+    /// The widest layer-order batch whose workspaces fit beside a bank pool of `bank_bytes` in `free` bytes.
+    fn layer_prefill_capacity(&self, bank_bytes: u64, free: u64) -> Option<u64> {
+        [2048, 1024, 512, 256, 128, 64, 32, 16, 8].into_iter()
+            .find(|rows| bank_bytes + prefill_workspace_bytes(*rows) + self.slot_margin + 3 * ALLOCATION_TAIL <= free)
+    }
+
+    /// Predict [`Backend::begin_layer_prefill`]'s rows after [`Backend::lend_prefill_head`], without allocating or changing anything: what it
+    /// frees first (the expert cache's arena, the lent head and the current workspaces) and sizes the bank and the rows into. 0 where it
+    /// would refuse.
+    pub(crate) fn layer_prefill_rows(&self, bank_bytes: u64) -> Result<u64> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+            return Ok(0);
+        }
+        let mut arena = 0;
+        // SAFETY: a live device and a valid out-parameter; this only reads its current allocation accounting.
+        check(unsafe { ffi::sd_hybrid_cache_bytes(self.handle, &mut arena) })?;
+        let mut head = 0;
+        if let Some(entry) = self.cache.get("output.weight:None") {
+            // SAFETY: a live device, one of its allocations and a valid out-parameter; read only.
+            check(unsafe { ffi::sd_allocation_bytes(self.handle, entry.pointer, &mut head) })?;
+        }
+        let (used, budget) = self.memory()?;
+        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_sub(head)) + prefill_workspace_bytes(self.prefill_capacity);
+        Ok(self.layer_prefill_capacity(bank_bytes, free).unwrap_or(0))
+    }
+
     /// Borrow cache VRAM and a layer bank pool. The caller restores the head before end_long_prefill restores the cache.
     /// A refused allocation returns None without advancing any model state; the same cleanup is still required.
     pub fn begin_layer_prefill(&mut self, bank_bytes: u64) -> Result<Option<u64>> {
@@ -1024,12 +1050,9 @@ impl Backend {
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
         self.restore_slots(0)?;
         self.prefill_buffers(2)?;
-        let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
         let (used, budget) = self.memory()?;
-        let free = budget.saturating_sub(used) + bytes(self.prefill_capacity);
-        let capacity = [2048, 1024, 512, 256, 128, 64, 32, 16, 8].into_iter()
-            .find(|rows| bank_bytes + bytes(*rows) + self.slot_margin + 3 * ALLOCATION_TAIL <= free);
-        let Some(capacity) = capacity else { return Ok(None) };
+        let free = budget.saturating_sub(used) + prefill_workspace_bytes(self.prefill_capacity);
+        let Some(capacity) = self.layer_prefill_capacity(bank_bytes, free) else { return Ok(None) };
         self.prefill_buffers(capacity)?;
         if self.prefill_capacity < 8 { return Ok(None); }
         let mut pool = std::ptr::null_mut();
