@@ -79,11 +79,19 @@ __device__ __forceinline__ void moe_values16_of(const uint8_t* data, size_t k0, 
         #pragma unroll
         for (int i = 0; i < 8; ++i) { values[i] = first[i]; values[8 + i] = second[i]; }
     } else if constexpr (Format == 20) {
+        // IQ4_NL's sixteen levels (nonlinear's table) as int8 bytes in four words, looked up with byte permutes in
+        // registers: nonlinear builds its table in a local array for every call, which a CUDA thread keeps in local
+        // memory, and the IQ4_NL layers' experts took 77 us a row against 12-17 us for Q2_0's.
+        constexpr uint32_t low0 = 0xBFAD9881u, low1 = 0xF6EADDCFu, high0 = 0x26190D01u, high1 = 0x71594535u;
         const uint8_t* b = data + (k0 / 32) * 18;
         const float d = half_at(b);
         const unsigned shift = unsigned(k0 % 32) / 16 * 4;
         #pragma unroll
-        for (int i = 0; i < 16; ++i) values[i] = d * nonlinear((b[2 + i] >> shift) & 15);
+        for (int i = 0; i < 16; ++i) {
+            const unsigned code = (b[2 + i] >> shift) & 15;
+            const unsigned byte = code < 8 ? __byte_perm(low0, low1, code) : __byte_perm(high0, high1, code - 8);
+            values[i] = d * float(int(int8_t(byte & 0xFFu)));
+        }
     } else {
         #pragma unroll
         for (int i = 0; i < 16; ++i) values[i] = weight<Format>(data, k0 + i);
