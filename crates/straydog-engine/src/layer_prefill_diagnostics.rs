@@ -60,15 +60,7 @@ fn open() -> (Model, Vec<u32>) {
 
 /// Both orders use this schedule, including a two-row tail instead of a one-row decode with different arithmetic.
 fn chunks(count: usize, batch: usize) -> Vec<(usize, usize)> {
-    let mut result = Vec::new();
-    let mut first = 0;
-    while first < count {
-        let mut end = (first + batch).min(count);
-        if count - end == 1 && end - first > 2 { end -= 1; }
-        result.push((first, end));
-        first = end;
-    }
-    result
+    layer_prefill_chunks(0, count, batch)
 }
 
 fn run(model: &mut Model, tokens: &[u32], batch: Option<usize>, name: &str) -> Observation {
@@ -198,4 +190,6 @@ fn fixed_width_and_layer_order() {
     serde_json::to_writer_pretty(File::create(out.join("diagnostic-report.json")).unwrap(),&report).unwrap();
     assert_eq!(comparisons[2]["same_main_trace"],true,"the same schedule reference was not deterministic");
     assert_eq!(comparisons[0]["same_main_trace"],true,"equal-width layer ordering changed a main-layer phase; inspect report before acceptance");
+    assert_eq!(comparisons[0]["first_difference"],Value::Null,"equal-width layer ordering changed an MTP phase");
+    assert!(comparisons[0]["state_mismatches"].as_array().unwrap().is_empty(), "equal-width layer ordering changed causal state, including MTP");
 }

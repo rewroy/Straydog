@@ -38,7 +38,7 @@ fn observed(model: &mut Model, tokens: &[u32], keep: bool) -> Observed {
                    &mut |t| emitted.push(t)).unwrap();
     let logits = model.logits_capture.take().unwrap().remove(0);
     Observed { logits, token: emitted.first().copied(), state: model.state_digest().unwrap(),
-               batch: model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0), order: model.last_metrics["prefill_order"].clone() }
+               batch: model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0), order: model.last_metrics.get("prefill_order").cloned().unwrap_or(serde_json::Value::Null) }
 }
 
 fn compare(name: &str, a: &Observed, b: &Observed) -> bool {
@@ -108,5 +108,10 @@ fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
     for (i, name) in ["odd-sized prompt", "root and turn checkpoint", "checkpoint continuation", "cancelled prefix continuation"].iter().enumerate() {
         exact &= compare(name, &runs[0][i], &runs[1][i]);
     }
-    assert!(exact, "inspect all reported logit and state differences before accepting");
+    assert!(runs[0].iter().zip(&runs[1]).all(|(a,b)|a.token==b.token), "a first token changed");
+    if std::env::var("STRAYDOG_LAYER_REPORT_ONLY").as_deref() == Ok("1") {
+        eprintln!("different-width comparison reported: exact={exact}; matched-width strict validation is required separately");
+    } else {
+        assert!(exact, "inspect all reported logit and state differences before accepting");
+    }
 }
