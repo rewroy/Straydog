@@ -476,6 +476,10 @@ int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position
 /* 1 when memory was refused (no allocation), 0 when allocated. */
 int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
 int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
+/* Three authenticated host copies, kept alive until return (all H2D reads have settled).
+   The decoder's ordinary host pointers are unchanged. source_bytes holds each whole bank's size. */
+int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
+                         const uint8_t* const* sources, const uint64_t* source_bytes);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.

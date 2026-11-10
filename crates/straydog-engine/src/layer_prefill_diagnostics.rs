@@ -46,7 +46,8 @@ fn open() -> (Model, Vec<u32>) {
     let mut group = Group::new(&[0], &[budget], crate::group::SplitMode::Experts).unwrap();
     group.configure_gemm(2, true).unwrap();
     let id = crate::bundle::Id::find(Some(crate::bundle::MODEL), None, "UD-IQ2_XS").unwrap();
-    let weights = Weights::open(&root, id, Some(&draft), crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    let mut weights = Weights::open(&root, id, Some(&draft), crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    weights.open_trees(&root.join(".straydog")).unwrap();
     let text = crate::text::Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
     let settings = Settings { context: 262144, state_budget_bytes: 14 << 30, prefill_batch_size: 256,
                               speculative: 3, cpu_threads: 0, row_cache_bytes: None };
@@ -78,6 +79,8 @@ fn run(model: &mut Model, tokens: &[u32], batch: Option<usize>, name: &str) -> O
             let output = model.try_layer_prefill(tokens, 0, &[], &|| false, &mut |_, _| {}).unwrap();
             let batch = model.last_metrics["prefill_batch_rows"].as_u64().unwrap() as usize;
             let LayerPrefill::Ready(logits) = output else { panic!("candidate did not run") };
+            assert!(model.last_metrics["prefill_bank_copied_layers"].as_f64().is_some_and(|count| count >= 48.0),
+                    "the copied bank path did not cover the main layers");
             (logits, batch)
         }
         Some(batch) => {

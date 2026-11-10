@@ -244,14 +244,15 @@ struct StreamEvents {
 extern "C" int sd_cpu_gather(void*, const uint8_t* const*, uint8_t* const*, const uint64_t*, uint32_t);
 extern "C" const char* sd_cpu_error();
 // Gather experts' gate, up and down slices from the mapped banks into the slot images at `slots`.
-void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, size_t count, uint8_t* const* slots) {
+void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, size_t count, uint8_t* const* slots,
+                   const uint8_t* const* bank_sources = nullptr) {
     std::vector<const uint8_t*> sources;
     std::vector<uint8_t*> targets;
     std::vector<uint64_t> bytes;
     for (size_t i = 0; i < count; ++i) {
         size_t offset = 0;
         for (size_t role = 0; role < 3; ++role) {
-            sources.push_back(plan.host[role] + experts[i] * plan.host_bytes[role]);
+            sources.push_back((bank_sources ? bank_sources[role] : plan.host[role]) + experts[i] * plan.host_bytes[role]);
             targets.push_back(slots[i] + offset);
             bytes.push_back(plan.host_bytes[role]);
             offset += plan.host_bytes[role];
@@ -572,7 +573,8 @@ void clear_prefill_bank(Device& d) {
     d.layer_prefill_plan = nullptr;
     d.layer_prefill_storage = nullptr;
 }
-void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
+void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
+                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr) {
     clear_prefill_bank(d);
     const auto decoder = d.decoder.find(layer);
     const auto allocation = d.allocations.find(storage);
@@ -582,6 +584,11 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
     const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
     if (!plan.hybrid || required > bytes || d.slots.cache || !d.slots.host || d.slots.stage < 2 || !d.cpu)
         throw std::runtime_error("layer prefill bank needs empty expert cache and staging");
+    if (sources) {
+        for (size_t role = 0; role < 3; ++role)
+            if (!source_bytes || !sources[role] || source_bytes[role] != plan.host_bytes[role] * plan.experts)
+                throw std::runtime_error("invalid copied layer bank source");
+    }
     if (d.copier) d.copier->wait();
     std::vector<size_t> experts(plan.experts);
     for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
@@ -589,12 +596,12 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
     LayerBankTrace trace(d, layer, required);
     const uint64_t hint_started = layer_trace_tick();
 #endif
-    prefetch_experts(d, plan, experts.data(), experts.size());
+    if (!sources) prefetch_experts(d, plan, experts.data(), experts.size());
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.hint_ns += layer_trace_tick() - hint_started;
 #endif
     auto* bank = static_cast<uint8_t*>(storage);
-    if (plan.mapped[0]) {
+    if (!sources && plan.mapped[0]) {
         size_t offset = 0;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
         trace.before_copy(0);
@@ -626,7 +633,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             const uint64_t gather_started = layer_trace_tick();
 #endif
-            hybrid_gather(d, plan, experts.data() + first, count, targets.data());
+            hybrid_gather(d, plan, experts.data() + first, count, targets.data(), sources);
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             trace.gather_ns += layer_trace_tick() - gather_started;
             trace.before_copy(buffer);

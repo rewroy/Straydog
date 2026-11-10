@@ -1714,6 +1714,16 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_bank_from(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        storage: *mut ::std::os::raw::c_void,
+        bytes: u64,
+        sources: *const *const u8,
+        source_bytes: *const u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_bank_clear(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 pub type sd_prefill_observer = ::std::option::Option<

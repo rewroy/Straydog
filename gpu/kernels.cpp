@@ -1753,6 +1753,14 @@ int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes)
     try { load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
+                         const uint8_t* const* sources, const uint64_t* source_bytes) {
+    try {
+        if (!sources || !source_bytes) throw std::runtime_error("missing copied layer bank sources");
+        load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes), sources, source_bytes);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_bank_clear(void* handle) {
     try { clear_prefill_bank(device(handle)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }

@@ -3155,6 +3155,8 @@ impl Model {
     fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
                               hidden: &mut [f32], cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
+        let layers = 48 + usize::from(self.speculative > 0);
+        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers);
         for stop in layer_prefill_stops(position, tokens.len(), &checkpoints) {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
@@ -3169,6 +3171,7 @@ impl Model {
             } else {
                 self.set_rope(begin, count)?;
                 let rows = &mut hidden[..count * WIDTH];
+                if let Some(reader) = &mut bank_reader { reader.start(0); }
                 let trace_embedding = crate::layer_trace::Span::new("embedding", None, begin, stop, 0);
                 for first in (begin..stop).step_by(batch) {
                     let end = (first + batch).min(stop);
@@ -3183,7 +3186,7 @@ impl Model {
                 for layer in 0..48 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                     let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
-                    self.group.load_layer_bank(layer)?;
+                    self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
                     drop(trace_bank);
                     let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
                     // Avoid a final prefill call of one row; the existing one-row path is a different API.
@@ -3208,7 +3211,7 @@ impl Model {
                 if self.speculative > 0 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                     let trace_bank = crate::layer_trace::Span::new("bank", Some(48), begin, stop, bank_bytes);
-                    self.group.load_layer_bank(48)?;
+                    self.load_prefill_bank_copy(48, layers, &mut bank_reader)?;
                     drop(trace_bank);
                     let _trace_compute = crate::layer_trace::Span::new("compute", Some(48), begin, stop, 0);
                     // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
@@ -3232,6 +3235,26 @@ impl Model {
             if cancelled() { return Ok(false); }
         }
         Ok(true)
+    }
+
+    fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
+        let waiting = Instant::now();
+        let copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
+        self.metric_add("prefill_bank_wait_seconds", waiting.elapsed().as_secs_f64());
+        match &copy {
+            Some(copy) => {
+                self.group.load_layer_bank_from(layer, copy.sources())?;
+                self.metric_add("prefill_bank_copied_layers", 1.0);
+            }
+            None => self.group.load_layer_bank(layer)?,
+        }
+        if let Some(reader) = reader {
+            // The GPU now owns the entire bank: the same host buffer can receive the
+            // next layer while this layer computes, without keeping two host copies.
+            reader.recycle(copy);
+            if layer + 1 < layers { reader.start(layer + 1); }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

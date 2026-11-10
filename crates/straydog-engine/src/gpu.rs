@@ -1047,6 +1047,15 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_bank(self.handle, layer as u64, pool, bytes) }).map(drop)
     }
 
+    /// A scoped authenticated host copy; native code settles every staging/H2D read before returning.
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
+        let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
+        let pointers = sources.map(|source| source.as_ptr());
+        let sizes = sources.map(|source| source.len() as u64);
+        // SAFETY: all three slices stay alive for this synchronous call, as does the owned pool.
+        check(unsafe { ffi::sd_prefill_bank_from(self.handle, layer as u64, pool, bytes, pointers.as_ptr(), sizes.as_ptr()) }).map(drop)
+    }
+
     pub fn clear_layer_bank(&mut self) -> Result<()> {
         // SAFETY: settles pending transfers and removes table references before returning.
         check(unsafe { ffi::sd_prefill_bank_clear(self.handle) }).map(drop)
