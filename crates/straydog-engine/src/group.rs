@@ -511,6 +511,20 @@ impl Group {
         self.backends[owner].prefill_layers(begin, end, values, position, steps, output_rows)
     }
 
+    /// [`Group::prefill_layers`] with every row written into `output` (`steps` rows of the model's width) rather than a new vector
+    /// ([`Backend::prefill_layers_into`]); a span of parts goes through [`Group::prefill_layers`] and is copied.
+    pub fn prefill_layers_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
+                               output: &mut [f32]) -> Result<()> {
+        if self.in_parts(begin, end) {
+            let rows = self.prefill_layers(begin, end, values, position, steps, steps)?;
+            if rows.len() != output.len() { return Err("invalid Straydog prefill output rows".into()); }
+            output.copy_from_slice(&rows);
+            return Ok(());
+        }
+        let owner = self.owner_of_span(begin, end)?;
+        self.backends[owner].prefill_layers_into(begin, end, values, position, steps, output)
+    }
+
     pub fn prefill_embed(&mut self, layer: usize, embeddings: &[f32]) -> Result<()> {
         if self.in_parts(layer, layer + 1) {
             return self.backends.iter_mut().try_for_each(|backend| backend.prefill_embed(layer, embeddings));
