@@ -1470,12 +1470,20 @@ impl Backend {
         }
         let mut output = vec![0f32; output_rows as usize * WIDTH];
         let target = if output_rows > 0 { output.as_mut_ptr() } else { std::ptr::null_mut() };
+        let mut phase_seconds = [0.0f64; 4];
+        let observed = cfg!(feature = "prefill-observer");
         // SAFETY: input rows (or none) and output rows sized above.
         check(unsafe {
             ffi::sd_prefill_span(self.handle, begin as u64, end as u64, position, steps,
                                  values.map_or(std::ptr::null(), <[f32]>::as_ptr), target, output_rows,
-                                 std::ptr::null_mut())
+                                 if observed { phase_seconds.as_mut_ptr() } else { std::ptr::null_mut() })
         })?;
+        if observed {
+            eprintln!("Straydog layer trace: {}", serde_json::json!({"source":"gpu", "phase":"compute",
+                "layer":begin,"layer_end":end,"position":position,"steps":steps,
+                "hc_seconds":phase_seconds[0],"gdn_seconds":phase_seconds[1],
+                "qsa_seconds":phase_seconds[2],"moe_seconds":phase_seconds[3]}));
+        }
         Ok(output)
     }
 
