@@ -2498,6 +2498,7 @@ impl Model {
         if positions <= self.kv_capacity {
             return Ok(());
         }
+        let growing = Instant::now();
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
         }
@@ -2527,6 +2528,9 @@ impl Model {
         self.kv_capacity = capacity;
         self.hold_memory();
         self.refresh_kv_ahead();
+        // (what a growth costs a request: the case for growing by less than doubling)
+        self.metric_add("kv_growth_seconds", growing.elapsed().as_secs_f64());
+        self.last_metrics.insert("kv_capacity".into(), json!(capacity));
         // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
         for checkpoint in self.checkpoints.values_mut() {
             if let Some(history) = checkpoint.history.as_mut() {
