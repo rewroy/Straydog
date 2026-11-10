@@ -1026,7 +1026,7 @@ impl Backend {
     /// frees first (the expert cache's arena, the lent head and the current workspaces) and sizes the bank and the rows into. 0 where it
     /// would refuse.
     pub(crate) fn layer_prefill_rows(&self, bank_bytes: u64) -> Result<u64> {
-        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+        if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
             return Ok(0);
         }
         let mut arena = 0;
