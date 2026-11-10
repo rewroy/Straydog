@@ -1023,9 +1023,9 @@ impl Backend {
     }
 
     /// Predict [`Backend::begin_layer_prefill`]'s rows after [`Backend::lend_prefill_head`], without allocating or changing anything: what it
-    /// frees first (the expert cache's arena, the lent head and the current workspaces) and sizes the bank and the rows into. 0 where it
-    /// would refuse.
-    pub(crate) fn layer_prefill_rows(&self, bank_bytes: u64) -> Result<u64> {
+    /// frees first (the expert cache's arena, the staging slots unless `staging`, the lent head and the current workspaces) and sizes the
+    /// bank and the rows into. 0 where it would refuse.
+    pub(crate) fn layer_prefill_rows(&self, bank_bytes: u64, staging: bool) -> Result<u64> {
         if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
             return Ok(0);
         }
@@ -1037,21 +1037,30 @@ impl Backend {
             // SAFETY: a live device, one of its allocations and a valid out-parameter; read only.
             check(unsafe { ffi::sd_allocation_bytes(self.handle, entry.pointer, &mut head) })?;
         }
+        let stage = if staging || self.slots_absent { 0 } else { self.slot_stage * self.slot_size };
         let (used, budget) = self.memory()?;
-        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_sub(head)) + prefill_workspace_bytes(self.prefill_capacity);
+        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_sub(stage).saturating_sub(head))
+            + prefill_workspace_bytes(self.prefill_capacity);
         Ok(self.layer_prefill_capacity(bank_bytes, free).unwrap_or(0))
     }
 
     /// Borrow cache VRAM and a layer bank pool. The caller restores the head before end_long_prefill restores the cache.
     /// A refused allocation returns None without advancing any model state; the same cleanup is still required.
-    pub fn begin_layer_prefill(&mut self, bank_bytes: u64) -> Result<Option<u64>> {
+    /// Without `staging` the staging slots' VRAM goes to the rows as well: layer order loads its banks through the host mirror and
+    /// streams no expert, so only an ordinary pass in it (a segment under [`crate::model`]'s minimum) needs them.
+    pub fn begin_layer_prefill(&mut self, bank_bytes: u64, staging: bool) -> Result<Option<u64>> {
         if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
             return Ok(None);
         }
         self.long_prefill = Some(self.prefill_capacity);
         // SAFETY: between passes, no decoder work in flight.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        // (the restore also drops the captured graphs that held the pool's addresses)
         self.restore_slots(0)?;
+        if !staging {
+            // SAFETY: as above; end_long_prefill puts the whole pool back.
+            check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        }
         self.prefill_buffers(2)?;
         let (used, budget) = self.memory()?;
         let free = budget.saturating_sub(used) + prefill_workspace_bytes(self.prefill_capacity);

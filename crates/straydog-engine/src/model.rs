@@ -343,6 +343,14 @@ const LAYER_PREFILL_MIN: usize = 512;
 enum LayerPrefill { Fallback, Cancelled, Ready(Vec<f32>) }
 
 /// Common positions at which a layer-ordered prompt may stop: checkpoints plus bounded segments.
+/// Whether a layer-order prefill of `begin..end` has a segment under [`LAYER_PREFILL_MIN`], which runs the ordinary way and needs the staging
+/// slots kept.
+fn layer_prefill_tails(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)]) -> bool {
+    let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
+    let mut from = begin;
+    layer_prefill_stops(begin, end, &checkpoints).into_iter().any(|stop| std::mem::replace(&mut from, stop) + LAYER_PREFILL_MIN > stop)
+}
+
 fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
     let mut stops: Vec<usize> = checkpoints.iter().copied().chain([end]).filter(|at| *at > begin && *at <= end).collect();
     stops.sort_unstable();
@@ -3170,14 +3178,15 @@ impl Model {
         let layer_order = eligible && {
             self.ensure_kv(tokens.len())?;
             let ordinary = self.group.backends[0].ordinary_prefill_rows(batch as u64)? as usize;
-            let rows = self.group.layer_prefill_rows(self.layer_bank_bytes()?)?;
+            let staging = layer_prefill_tails(position, tokens.len(), plan);
+            let rows = self.group.layer_prefill_rows(self.layer_bank_bytes()?, staging)?;
             let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
             let memory = self.weights.host_memory_bytes;
             let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?));
             let selected = self.layer_prefill_forced
                 || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows, LAYER_PREFILL_FITS);
             self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "layer_batch_rows": rows,
-                                     "bank_bytes": self.banks_bytes, "bank_room": room, "selected": selected}));
+                                     "staging_kept": staging, "bank_bytes": self.banks_bytes, "bank_room": room, "selected": selected}));
             selected
         };
         if layer_order {
@@ -3251,7 +3260,8 @@ impl Model {
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
         self.group.lend_prefill_head()?;
         let output: Result<Option<bool>> = (|| {
-            let Some(rows) = self.group.begin_layer_prefill(bank_bytes)? else { return Ok(None) };
+            let staging = layer_prefill_tails(position, tokens.len(), plan);
+            let Some(rows) = self.group.begin_layer_prefill(bank_bytes, staging)? else { return Ok(None) };
             self.last_metrics.insert("prefill_order".into(), json!("layer"));
             self.last_metrics.insert("prefill_batch_rows".into(), json!(rows));
             self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
@@ -4463,7 +4473,7 @@ mod same_text_tests {
 }
 #[cfg(test)]
 mod layer_prefill_tests {
-    use super::{layer_prefill_chunks, layer_prefill_stops, LAYER_PREFILL_ROWS as N};
+    use super::{layer_prefill_chunks, layer_prefill_stops, layer_prefill_tails, LAYER_PREFILL_ROWS as N};
 
     #[test]
     fn body_and_draft_share_the_same_odd_tail() {
@@ -4479,6 +4489,14 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_stops(0, 2 * N, &[N]), [N, 2 * N]);
         assert_eq!(layer_prefill_stops(0, N + 1, &[N]), [N, N + 1]);
         assert_eq!(layer_prefill_stops(0, N + 2, &[N + 1]), [N, N + 1, N + 2]);
+        // a segment under the minimum runs the ordinary way and keeps the staging slots
+        let at = |stops: &[usize]| stops.iter().map(|at| (*at, Vec::new())).collect::<Vec<(usize, Vec<&'static str>)>>();
+        assert!(!layer_prefill_tails(0, 2 * N, &at(&[N])));
+        assert!(layer_prefill_tails(0, N + 1, &at(&[])));
+        assert!(layer_prefill_tails(100, 5000, &at(&[400])));
+        assert!(!layer_prefill_tails(100, 5000, &at(&[612])));
+        assert!(layer_prefill_tails(0, 5000, &at(&[4600])));
+        assert!(!layer_prefill_tails(0, 5000, &at(&[4488, 9000])));
         assert!(layer_prefill_stops(7, 7, &[7]).is_empty());
         assert_eq!(layer_prefill_stops(100, 2 * N + 100, &[N + 100]), [N + 100, 2 * N + 100]);
         assert_eq!(layer_prefill_stops(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
