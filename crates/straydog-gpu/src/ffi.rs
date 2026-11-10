@@ -2188,6 +2188,7 @@ unsafe extern "C" {
         cache: u64,
         stage: u64,
         slot_bytes: u64,
+        mirror: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

@@ -34,6 +34,9 @@ use crate::storage::{self, Buffer, ALIGN};
 
 /// The default cache budget across a model's row tables.
 pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
+/// A row read the working-set quota refused (`ERROR_WORKING_SET_QUOTA`, 1453).
+/// Not [`crate::gpu::HOST_NO_MEMORY`]: that suffix gives locked layers back for a conversation copy.
+pub const ROW_READ_REFUSED: &str = "a row read was refused";
 /// The cache budget that holds every row of a table of `rows` rows of `width` bytes.
 pub fn full_budget(rows: u64, width: u64) -> u64 {
     rows.saturating_mul(width + OVERHEAD)
@@ -58,6 +61,11 @@ const OVERHEAD: u64 = 24;
 /// A slot's `owner` while it holds no row; a row's entry is the row plus one, so that a cache for
 /// a whole table of hundreds of millions of rows is zeroed memory that costs nothing until used.
 const EMPTY: u32 = 0;
+
+/// `ERROR_WORKING_SET_QUOTA` (1453). Elsewhere this is not a row-read failure.
+fn working_set_quota(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error() == Some(1453)
+}
 
 /// Checks a read of the table's file at `offset` (whole aligned blocks, zero past the file's
 /// end) before its rows are used.
@@ -215,17 +223,9 @@ impl Table {
             *buffer = Buffer::new(span);
         }
         let length = (end.min(self.size) - start) as usize;
-        let read = match &self.direct {
-            Some((_, Some(map))) if storage::resident(&map[start as usize..start as usize + length]) >= 1.0 => {
-                storage::read_into(&self.file, start, buffer, 0, length, false)
-            }
-            direct => {
-                self.counts.blocks.fetch_add(length.div_ceil(ALIGN) as u64, Ordering::Relaxed);
-                let file = direct.as_ref().map_or(&self.file, |(file, _)| file);
-                storage::read_into(file, start, buffer, 0, length, direct.is_some())
-            }
-        };
-        read.map_err(|exc| exc.to_string())?;
+        self.fill(start, buffer, length).map_err(|exc| {
+            if working_set_quota(&exc) { format!("{exc}; {ROW_READ_REFUSED}") } else { exc.to_string() }
+        })?;
         if let Some(verify) = &self.verifier {
             // The last block past the file's end is zero, as its tree hashed it.
             let blocks = &mut buffer.as_mut_slice()[..span];
@@ -233,6 +233,54 @@ impl Table {
             verify(start, blocks)?;
         }
         Ok(())
+    }
+
+    /// The whole span, then the same bytes in smaller direct reads, then once through the page
+    /// cache. A working-set refusal (1453) is the only reason to try the next way. The caller
+    /// still verifies the span.
+    fn fill(&self, start: u64, buffer: &mut Buffer, length: usize) -> std::io::Result<()> {
+        match self.read_span(start, buffer, 0, length) {
+            Ok(()) => return Ok(()),
+            Err(exc) if working_set_quota(&exc) => {}
+            Err(exc) => return Err(exc),
+        }
+        match self.read_smaller(start, buffer, length) {
+            Ok(()) => return Ok(()),
+            Err(exc) if working_set_quota(&exc) => {}
+            Err(exc) => return Err(exc),
+        }
+        storage::read_into(&self.file, start, buffer, 0, length, false)
+    }
+
+    /// The same span as a few shorter direct reads. A piece smaller than the span and at least
+    /// one block; otherwise the caller falls through.
+    fn read_smaller(&self, start: u64, buffer: &mut Buffer, length: usize) -> std::io::Result<()> {
+        let piece = (length / 4).next_multiple_of(ALIGN);
+        if piece == 0 || piece >= length {
+            return Err(std::io::Error::from_raw_os_error(1453));
+        }
+        let mut at = 0;
+        while at < length {
+            let step = piece.min(length - at);
+            self.read_span(start, buffer, at, step)?;
+            at += step;
+        }
+        Ok(())
+    }
+
+    /// One direct read, or a cached read of a span the page cache already holds whole.
+    fn read_span(&self, start: u64, buffer: &mut Buffer, at: usize, length: usize) -> std::io::Result<()> {
+        let offset = start + at as u64;
+        match &self.direct {
+            Some((_, Some(map))) if storage::resident(&map[offset as usize..offset as usize + length]) >= 1.0 => {
+                storage::read_into(&self.file, offset, buffer, at, length, false)
+            }
+            direct => {
+                self.counts.blocks.fetch_add(length.div_ceil(ALIGN) as u64, Ordering::Relaxed);
+                let file = direct.as_ref().map_or(&self.file, |(file, _)| file);
+                storage::read_into(file, offset, buffer, at, length, direct.is_some())
+            }
+        }
     }
 
     /// One read job of `batch`: the extent, then every row it covers into the cache.

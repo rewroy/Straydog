@@ -985,6 +985,11 @@ impl Model {
             model.plan_host_banks(pinned)?;
             crate::host::commit_note("banks planned");
             let slots = model.group.create_expert_slots()?;
+            // No staging mirror: layer order gathers through it, so a prompt keeps the ordinary batches.
+            if !model.group.expert_slot_mirrors() {
+                model.layer_prefill = false;
+                model.layer_prefill_forced = false;
+            }
             let experts = 48 * model.weights.tensor("blk.0.ffn_gate_exps.weight")?.dims.last().copied().unwrap_or(0) as u64;
             two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_START * experts as f64;
             crate::host::commit_note("expert slots");
