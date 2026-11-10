@@ -772,6 +772,9 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
     peer_send(d, mixed, steps, 2560, 2564, 0);
+    // (WDDM holds what is queued until the stream is asked about: the peer's half waits for these rows, and this device's
+    // kernels below wait for the peer's half, so each stream is asked as soon as its part is queued)
+    flush_launches(d);
     float* received = peer_partials(d.link);
     on_device(peer->ordinal, [&]() {
         Device& h = *peer;
@@ -793,6 +796,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         }
         peer_signal_peer(h);
         check(hipGetLastError());
+        flush_launches(h);
     });
     const Matrix own[2] = {{static_cast<const uint8_t*>(pointers[3]) + rows_of.first * row_bytes, row_bytes, high_rows, 2560, 0, 0, 0, kinds[3]},
                            {rows_of.extras, row_bytes, rows_of.extra_count, 2560, 0, high_rows, 0, kinds[3]}};
