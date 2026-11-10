@@ -47,6 +47,8 @@ int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint
 /* sd_fill of `height` rows of `width` bytes, `host_pitch` apart in host memory, to rows `pitch` apart from `offset`. */
 int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, const void* host, uint64_t host_pitch, uint64_t width, uint64_t height);
 int sd_release(void* handle, void* pointer);
+/* The device bytes sd_release would give back for `pointer`, without releasing it. */
+int sd_allocation_bytes(void* handle, const void* pointer, uint64_t* bytes);
 int sd_zero(void* handle, void* pointer);
 int sd_download(void* handle, void* pointer, void* output, uint64_t bytes);
 int sd_copy_allocation(void* handle, void* target, const void* source);

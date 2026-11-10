@@ -118,12 +118,35 @@ pub fn is_warm_stop(error: &str) -> bool {
     error.contains(WARM_STOPPED)
 }
 
-/// Layer ordering pays for loading every routed bank once when the ordinary path would reread banks that do not fit in RAM.
-/// Large shortages amortize it over two ordinary batches; a slight shortage needs three full maximum-sized batches.
-fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, memory: u64, pinned: u64) -> bool {
+/// The rows a layer-order batch needs to beat the ordinary path when the banks fit in RAM, on Windows.
+const LAYER_PREFILL_FIT_ROWS: u64 = 512;
+
+/// Whether the ordinary path's transfer of the routed experts costs enough every batch for layer order to win where the banks fit:
+/// Windows (IQ2_XS on an RTX 5070 Ti at 5.5 GiB, banks in RAM: 8.2K new 17.5 s at 512 rows against 25.4 s; 32.6K at 256 rows 73.7 s
+/// both; 3.8K at 128 rows 16.1 s against 10.0 s). Linux reads them faster (the same banks and budget on a Radeon AI PRO R9700: 14.9K new 22.4 s
+/// at 512 rows against 23.6 s, 3.7K 10.5 s against 6.4 s), and keeps the ordinary path.
+const LAYER_PREFILL_FITS: bool = cfg!(windows);
+
+/// The memory the banks may hold for a prefill: what RAM leaves beside `pinned` and [`crate::host::left_free`], bounded by what the system
+/// has for them now (`now`, from [`crate::host::bank_room_now`]) when other programs have taken it. None where RAM is unknown.
+fn layer_prefill_room(memory: u64, pinned: u64, now: Option<u64>) -> Option<u64> {
+    if memory == 0 { return None; }
     let usable = memory.saturating_sub(pinned).saturating_sub(crate::host::left_free(memory));
-    if memory == 0 || banks <= usable { return false; }
-    if u128::from(banks) * 10 >= u128::from(usable) * 13 {
+    Some(now.map_or(usable, |now| usable.min(now)))
+}
+
+/// Layer ordering pays for loading every routed bank once when the ordinary path would reread banks that do not fit in RAM (`room`, from
+/// [`layer_prefill_room`]): under memory pressure, the ordinary path reads them from the drive again every batch (32.6K new on the
+/// RTX 5070 Ti with 4.1 GiB available: 161.8 s, layer order 73.0 s at 256 rows). Large shortages amortize it over two ordinary batches; a
+/// slight shortage needs three full maximum-sized batches. Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order
+/// from three ordinary batches when it can take [`LAYER_PREFILL_FIT_ROWS`] (`rows`, from [`Group::layer_prefill_rows`]).
+fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fits: bool) -> bool {
+    if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens / ordinary.max(batch).max(1) >= 3 {
+        return true;
+    }
+    let Some(room) = room else { return false };
+    if banks <= room { return false; }
+    if u128::from(banks) * 10 >= u128::from(room) * 13 {
         new_tokens > ordinary.max(batch).max(1)
     } else {
         new_tokens / batch.max(crate::gpu::LONG_PREFILL_ROWS as usize) >= 3
@@ -3135,12 +3158,17 @@ impl Model {
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
         let long = self.partial && tokens.len() - position >= threshold;
         let eligible = long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none();
-        let layer_order = eligible && if self.layer_prefill_forced { true } else {
+        let layer_order = eligible && {
             self.ensure_kv(tokens.len())?;
             let ordinary = self.group.backends[0].ordinary_prefill_rows(batch as u64)? as usize;
+            let rows = self.group.layer_prefill_rows(self.layer_bank_bytes()?)?;
             let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
-            let selected = layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, self.weights.host_memory_bytes, pinned);
-            self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "selected": selected}));
+            let memory = self.weights.host_memory_bytes;
+            let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?));
+            let selected = self.layer_prefill_forced
+                || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows, LAYER_PREFILL_FITS);
+            self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "layer_batch_rows": rows,
+                                     "bank_bytes": self.banks_bytes, "bank_room": room, "selected": selected}));
             selected
         };
         if layer_order {
@@ -3183,6 +3211,25 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The bytes of the banks page-locked so far.
+    fn locked_bank_bytes(&self) -> Result<u64> {
+        let mut bytes = 0;
+        for &layer in &self.locked_layers {
+            bytes += Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
+        }
+        Ok(bytes)
+    }
+
+    /// The layer-order bank pool: the largest layer's three routed banks (the drafter's included).
+    fn layer_bank_bytes(&self) -> Result<u64> {
+        let mut bank_bytes = 0;
+        for layer in 0..48 + usize::from(self.speculative > 0) {
+            let bytes = Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
+            bank_bytes = bank_bytes.max(bytes);
+        }
+        Ok(bank_bytes)
+    }
+
     fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
@@ -3190,11 +3237,7 @@ impl Model {
         let count = (tokens.len() - position).min(LAYER_PREFILL_ROWS);
         let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
         self.ensure_kv(tokens.len())?;
-        let mut bank_bytes = 0;
-        for layer in 0..48 + usize::from(self.speculative > 0) {
-            let bytes = Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
-            bank_bytes = bank_bytes.max(bytes);
-        }
+        let bank_bytes = self.layer_bank_bytes()?;
         let preparing = Instant::now();
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
         self.group.lend_prefill_head()?;
@@ -4159,33 +4202,69 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
 
 #[cfg(test)]
 mod layer_prefill_policy_tests {
-    use super::layer_prefill_needed;
+    use super::{layer_prefill_needed, layer_prefill_room};
     const G:u64=1<<30;
+    // The T284 cases: RAM `memory` with `pinned` state and nothing else taking memory (`now` unknown), Linux (no fit rule).
+    fn needed(new:usize,batch:usize,ordinary:usize,banks:u64,memory:u64,pinned:u64)->bool{
+        layer_prefill_needed(new,batch,ordinary,banks,layer_prefill_room(memory,pinned,None),512,false)
+    }
     #[test]
     fn a_small_shortage_needs_three_full_maximum_batches() {
-        let needed=|n,b|layer_prefill_needed(n,b,4096,31*G,32*G,G);
+        let needed=|n,b|needed(n,b,4096,31*G,32*G,G);
         assert!(!needed(2548,256));
         assert!(!needed(3*4096-1,256));assert!(needed(3*4096,256));
         assert!(!needed(3*8192-1,8192));assert!(needed(3*8192,8192));
     }
     #[test]
     fn a_large_shortage_keeps_long_iq2_and_a_follow_up_that_spans_two_actual_batches() {
-        assert!(layer_prefill_needed(14937,256,4096,39*G,32*G,G));
-        assert!(layer_prefill_needed(3232,256,2048,39*G,32*G,G));
-        assert!(!layer_prefill_needed(2048,256,2048,39*G,32*G,G));
-        assert!(!layer_prefill_needed(3232,256,4096,39*G,32*G,G));
+        assert!(needed(14937,256,4096,39*G,32*G,G));
+        assert!(needed(3232,256,2048,39*G,32*G,G));
+        assert!(!needed(2048,256,2048,39*G,32*G,G));
+        assert!(!needed(3232,256,4096,39*G,32*G,G));
         // A 1.3x shortage is the boundary for the two-batch choice: 16-2-4 = 10 GiB usable.
-        assert!(layer_prefill_needed(2049,256,2048,13*G,16*G,2*G));
-        assert!(!layer_prefill_needed(2049,256,2048,13*G-1,16*G,2*G));
+        assert!(needed(2049,256,2048,13*G,16*G,2*G));
+        assert!(!needed(2049,256,2048,13*G-1,16*G,2*G));
     }
     #[test]
     fn fitting_banks_and_unknown_ram_keep_the_ordinary_path() {
-        assert!(!layer_prefill_needed(30000,256,4096,39*G,64*G,G));
+        assert!(!needed(30000,256,4096,39*G,64*G,G));
         let usable=32*G-G-4*G;
-        assert!(!layer_prefill_needed(30000,256,4096,usable,32*G,G));
-        assert!(layer_prefill_needed(30000,256,4096,usable+1,32*G,G));
-        assert!(!layer_prefill_needed(30000,256,4096,39*G,0,G));
-        assert!(!layer_prefill_needed(30000,0,0,0,32*G,G));
+        assert!(!needed(30000,256,4096,usable,32*G,G));
+        assert!(needed(30000,256,4096,usable+1,32*G,G));
+        assert!(!needed(30000,256,4096,39*G,0,G));
+        assert!(!needed(30000,0,0,0,32*G,G));
+    }
+    #[test]
+    fn memory_another_program_takes_counts_as_a_shortage() {
+        // The RTX 5070 Ti at 62 GiB, IQ2_XS banks of 50 GiB. Under pressure (4.1 GiB available, a 17 GiB working set) the ordinary path read
+        // them again every batch, 161.8 s against layer order's 73.0 s at 256 rows: a large shortage.
+        let room=layer_prefill_room(62*G,2*G,Some(17*G+4*G-2*G));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,false));
+        assert!(layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
+        // Unpressured (31 GiB available beside a 16.4 GiB working set) a slight one: a 3.8K follow-up at 128 rows stays ordinary (10.0 s
+        // against 16.1 s), a 32.6K prompt takes layer order (73.7 s both at 256 rows).
+        let room=layer_prefill_room(62*G,2*G,Some(16*G+31*G-2*G));
+        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
+        // what the system says never raises what the RAM leaves
+        assert_eq!(layer_prefill_room(32*G,G,Some(100*G)),Some(32*G-G-4*G));
+        assert_eq!(layer_prefill_room(0,G,Some(100*G)),None);
+    }
+    #[test]
+    fn fitting_banks_take_layer_order_from_three_ordinary_batches_at_the_fit_rows_on_windows() {
+        // Windows, banks in RAM, ordinary batch 2048: 8.2K new at 512 rows layer order, 3.8K follow-up at 128 rows and 32.6K at 256 rows
+        // ordinary.
+        let room=Some(60*G);
+        assert!(layer_prefill_needed(8210,2048,2048,50*G,room,512,true));
+        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
+        assert!(!layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,1024,true));
+        assert!(!layer_prefill_needed(3*2048-1,2048,2048,50*G,room,512,true));
+        assert!(layer_prefill_needed(3*2048,2048,2048,50*G,room,512,true));
+        // Linux keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
+        assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,false));
+        assert!(!layer_prefill_needed(30000,0,0,0,None,0,true));
     }
 }
 
