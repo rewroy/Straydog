@@ -814,7 +814,7 @@ impl Group {
         let keep_cache = self.backends.len() > 1;
         // Borrowing can grow a batch only as far as 4096 rows. Leave devices alone if the
         // request already uses that many (or more), regardless of their current workspace sizes.
-        if batch >= 4096 {
+        if batch >= crate::gpu::LONG_PREFILL_ROWS {
             return Ok(None);
         }
         for index in 0..self.backends.len() {

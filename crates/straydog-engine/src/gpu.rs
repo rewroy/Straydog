@@ -56,6 +56,8 @@ pub enum Rows<'a> {
 
 /// The native library pads every VRAM allocation (allocation_tail in kernels.cpp).
 pub const ALLOCATION_TAIL: u64 = 64;
+/// The largest batch the ordinary partially resident prefill can borrow cache VRAM for.
+pub(crate) const LONG_PREFILL_ROWS: u64 = 4096;
 const MOE_ROW: u64 = 11 * 4480 + 22;
 /// Rows of the peer's batch one pass of expert-parallel help takes (see `@moe:helper`).
 const HELP_ROWS: u64 = 2048;
@@ -69,6 +71,16 @@ const DECODE_HEAD_FLAGS: u64 = 64;
 /// The workspace of the fully resident decoder's spans for a prefill capacity.
 pub fn decoder_workspace_bytes(capacity: u64) -> u64 {
     (capacity * 15364 + 1024 * 2564 + 8) * 4
+}
+
+fn prefill_workspace_bytes(capacity: u64) -> u64 {
+    (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity)
+}
+
+fn widened_prefill_rows(current: u64, free: u64) -> u64 {
+    [LONG_PREFILL_ROWS, 2048, 1024].into_iter()
+        .find(|&capacity| capacity > current && prefill_workspace_bytes(capacity) + 2 * ALLOCATION_TAIL <= free)
+        .unwrap_or(current)
 }
 
 /// What `sd_create` counts of a device's budget from 2 GiB up: its input and output (64 MiB each), the expanded GEMMs (128), half input (32),
@@ -947,11 +959,26 @@ impl Backend {
         Ok(())
     }
 
+    /// Predict the ordinary single-device batch after lending the cache, without reallocating or changing a decoder plan.
+    pub(crate) fn ordinary_prefill_rows(&self, batch: u64) -> Result<u64> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || batch >= LONG_PREFILL_ROWS {
+            return Ok(batch.max(self.prefill_capacity));
+        }
+        let mut arena = 0;
+        // SAFETY: a live device and a valid out-parameter; this only reads its current allocation accounting.
+        check(unsafe { ffi::sd_hybrid_cache_bytes(self.handle, &mut arena) })?;
+        let (used, budget) = self.memory()?;
+        // release_expert_slots then restore_slots(0) retains staging and removes exactly the cache arena.
+        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_add(self.slot_margin))
+            .saturating_add(prefill_workspace_bytes(self.prefill_capacity));
+        Ok(batch.max(widened_prefill_rows(self.prefill_capacity, free)))
+    }
+
     /// A long prompt borrows the expert cache's VRAM to widen its batches. On multiple devices it
     /// fills the cache again with what fits beside the wider workspaces; one device uses only
     /// the staging pool until [`Backend::end_long_prefill`] restores its original cache.
     pub fn begin_long_prefill(&mut self, keep_cache: bool) -> Result<u64> {
-        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || (keep_cache && self.prefill_capacity >= 4096) {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || (keep_cache && self.prefill_capacity >= LONG_PREFILL_ROWS) {
             return Ok(self.prefill_capacity);
         }
         // SAFETY: a live handle, between batches.
@@ -959,14 +986,9 @@ impl Backend {
         self.long_prefill = Some(self.prefill_capacity);
         self.restore_slots(0)?;
         let (used, budget) = self.memory()?;
-        let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
-        let free = budget.saturating_sub(used + self.slot_margin) + bytes(self.prefill_capacity);
-        for capacity in [4096, 2048, 1024] {
-            if capacity > self.prefill_capacity && bytes(capacity) + 2 * ALLOCATION_TAIL <= free {
-                self.prefill_buffers(capacity)?;
-                break;
-            }
-        }
+        let free = budget.saturating_sub(used + self.slot_margin) + prefill_workspace_bytes(self.prefill_capacity);
+        let capacity = widened_prefill_rows(self.prefill_capacity, free);
+        if capacity > self.prefill_capacity { self.prefill_buffers(capacity)?; }
         if keep_cache {
             // The stage-only pool made room for the workspaces. Put the remaining expert cache
             // back for this device's layers, instead of streaming every route from host memory.
@@ -2756,5 +2778,20 @@ mod tests {
         assert!(super::zeroed_floats(usize::MAX / 2).is_none(), "a layout that overflows");
         // (the result goes through black_box: an allocation that is only checked for null may be assumed to succeed, and never made)
         assert!(std::hint::black_box(super::zeroed_floats(std::hint::black_box(1 << 46))).is_none(), "a valid layout of 256 TiB, more than a process can address");
+    }
+}
+
+#[cfg(test)]
+mod ordinary_prefill_estimate_tests {
+    use super::*;
+    #[test]
+    fn predicted_borrowed_batches_share_the_actual_workspace_boundaries() {
+        let full=prefill_workspace_bytes(LONG_PREFILL_ROWS)+2*ALLOCATION_TAIL;
+        assert_eq!(widened_prefill_rows(256,full),4096);
+        assert_eq!(widened_prefill_rows(256,full-1),2048);
+        let half=prefill_workspace_bytes(2048)+2*ALLOCATION_TAIL;
+        assert_eq!(widened_prefill_rows(256,half-1),1024);
+        assert_eq!(widened_prefill_rows(256,0),256);
+        assert_eq!(widened_prefill_rows(8192,full),8192);
     }
 }

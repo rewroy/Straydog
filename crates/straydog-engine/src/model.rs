@@ -118,6 +118,18 @@ pub fn is_warm_stop(error: &str) -> bool {
     error.contains(WARM_STOPPED)
 }
 
+/// Layer ordering pays for loading every routed bank once when the ordinary path would reread banks that do not fit in RAM.
+/// Large shortages amortize it over two ordinary batches; a slight shortage needs three full maximum-sized batches.
+fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, memory: u64, pinned: u64) -> bool {
+    let usable = memory.saturating_sub(pinned).saturating_sub(crate::host::left_free(memory));
+    if memory == 0 || banks <= usable { return false; }
+    if u128::from(banks) * 10 >= u128::from(usable) * 13 {
+        new_tokens > ordinary.max(batch).max(1)
+    } else {
+        new_tokens / batch.max(crate::gpu::LONG_PREFILL_ROWS as usize) >= 3
+    }
+}
+
 /// The spans a resident prefill runs: the first layer alone, then each device's decoder layers (`boundaries`, from layer 1) in spans of at most
 /// `width` layers.
 fn prefill_spans(boundaries: &[(usize, usize)], width: usize) -> Vec<(usize, usize)> {
@@ -608,6 +620,8 @@ pub struct Model {
     pub partial: bool,
     /// Layer-ordered long prefill; STRAYDOG_LAYER_PREFILL=0 selects the ordinary batch order.
     layer_prefill: bool,
+    // Explicit numerical comparisons retain the developer API's forced path.
+    layer_prefill_forced: bool,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
@@ -803,6 +817,7 @@ impl Model {
             resident: false,
             partial: false,
             layer_prefill: !std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "0"),
+            layer_prefill_forced: false,
             layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
@@ -3037,7 +3052,16 @@ impl Model {
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
         let long = self.partial && tokens.len() - position >= threshold;
-        if long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none() {
+        let eligible = long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none();
+        let layer_order = eligible && if self.layer_prefill_forced { true } else {
+            self.ensure_kv(tokens.len())?;
+            let ordinary = self.group.backends[0].ordinary_prefill_rows(batch as u64)? as usize;
+            let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
+            let selected = layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, self.weights.host_memory_bytes, pinned);
+            self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "selected": selected}));
+            selected
+        };
+        if layer_order {
             match self.try_layer_prefill(tokens, position, plan, cancelled, progress)? {
                 LayerPrefill::Fallback => {},
                 LayerPrefill::Cancelled => return Ok(None),
@@ -3069,9 +3093,12 @@ impl Model {
         }
     }
 
-    /// Development/validation: compare identical prompts against the existing batch order.
+    /// Development/validation: force the traversal order for identical-prompt comparisons, bypassing the automatic cost guard.
     #[doc(hidden)]
-    pub fn layer_prefill(&mut self, enabled: bool) { self.layer_prefill = enabled; }
+    pub fn layer_prefill(&mut self, enabled: bool) {
+        self.layer_prefill = enabled;
+        self.layer_prefill_forced = enabled;
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
@@ -4011,6 +4038,38 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
         return Err("Straydog model PLE placement mismatch".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod layer_prefill_policy_tests {
+    use super::layer_prefill_needed;
+    const G:u64=1<<30;
+    #[test]
+    fn a_small_shortage_needs_three_full_maximum_batches() {
+        let needed=|n,b|layer_prefill_needed(n,b,4096,31*G,32*G,G);
+        assert!(!needed(2548,256));
+        assert!(!needed(3*4096-1,256));assert!(needed(3*4096,256));
+        assert!(!needed(3*8192-1,8192));assert!(needed(3*8192,8192));
+    }
+    #[test]
+    fn a_large_shortage_keeps_long_iq2_and_a_follow_up_that_spans_two_actual_batches() {
+        assert!(layer_prefill_needed(14937,256,4096,39*G,32*G,G));
+        assert!(layer_prefill_needed(3232,256,2048,39*G,32*G,G));
+        assert!(!layer_prefill_needed(2048,256,2048,39*G,32*G,G));
+        assert!(!layer_prefill_needed(3232,256,4096,39*G,32*G,G));
+        // A 1.3x shortage is the boundary for the two-batch choice: 16-2-4 = 10 GiB usable.
+        assert!(layer_prefill_needed(2049,256,2048,13*G,16*G,2*G));
+        assert!(!layer_prefill_needed(2049,256,2048,13*G-1,16*G,2*G));
+    }
+    #[test]
+    fn fitting_banks_and_unknown_ram_keep_the_ordinary_path() {
+        assert!(!layer_prefill_needed(30000,256,4096,39*G,64*G,G));
+        let usable=32*G-G-4*G;
+        assert!(!layer_prefill_needed(30000,256,4096,usable,32*G,G));
+        assert!(layer_prefill_needed(30000,256,4096,usable+1,32*G,G));
+        assert!(!layer_prefill_needed(30000,256,4096,39*G,0,G));
+        assert!(!layer_prefill_needed(30000,0,0,0,32*G,G));
+    }
 }
 
 #[cfg(test)]
