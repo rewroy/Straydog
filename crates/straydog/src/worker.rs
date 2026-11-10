@@ -1302,6 +1302,7 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
         && !message.ends_with(straydog_engine::gpu::HOST_NO_MEMORY)
+        && !message.ends_with(straydog_engine::rows::ROW_READ_REFUSED)
         && !message.ends_with(straydog_engine::model::IMAGE_REFUSED)
         && !message.ends_with("exceeds the allocated context");
     Failure { message: format!("{site}: {message}"), fatal }
@@ -1744,6 +1745,9 @@ mod tests {
         // (a K/V that found no memory to grow into, and a copy of the conversation that found none: the devices are sound)
         assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_MEMORY), "site").fatal);
         assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HOST_NO_MEMORY), "site").fatal);
+        // (a row read the working-set quota refused, after the smaller and cached retries; a bare 1453 stays fatal)
+        assert!(!engine_failed(format!("row table read failed: os error 1453; {}", straydog_engine::rows::ROW_READ_REFUSED), "site").fatal);
+        assert!(engine_failed("row table read failed: os error 1453", "site").fatal);
         // (what an image asked is refused, the engine reset)
         assert!(!engine_failed(format!("no memory for its positions {}", straydog_engine::model::IMAGE_REFUSED), "site").fatal);
         // (a prompt found too long before anything ran leaves the engine as it was)

@@ -970,6 +970,11 @@ impl Group {
         self.backends.iter_mut().map(|backend| backend.create_expert_slots(crate::model::STAGING_SLOTS, crate::model::SLOTS_MARGIN)).sum()
     }
 
+    /// Every device's expert pool has the page-locked staging mirror. Layer order gathers through it.
+    pub fn expert_slot_mirrors(&self) -> bool {
+        self.backends.iter().all(|backend| backend.expert_slot_mirror())
+    }
+
     pub fn hybrid_supported(&self) -> Result<bool> {
         for backend in &self.backends {
             if !backend.hybrid_supported()? {

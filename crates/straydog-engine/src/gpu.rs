@@ -357,6 +357,8 @@ pub struct Backend {
     slot_bytes: u64,
     /// `create_expert_slots`' arguments, for a K/V growth to make the pool again (0: no pool).
     slot_stage: u64,
+    /// The staging slots have a page-locked host mirror. Layer order gathers through it.
+    slot_mirror: bool,
     /// The pool could not come back after giving up its VRAM.
     slots_absent: bool,
     slot_margin: u64,
@@ -454,6 +456,7 @@ impl Backend {
             prefill_capacity: 1024,
             slot_bytes: 0,
             slot_stage: 0,
+            slot_mirror: true,
             slots_absent: false,
             slot_margin: 0,
             long_prefill: None,
@@ -1042,7 +1045,7 @@ impl Backend {
     /// Borrow cache VRAM and a layer bank pool. The caller restores the head before end_long_prefill restores the cache.
     /// A refused allocation returns None without advancing any model state; the same cleanup is still required.
     pub fn begin_layer_prefill(&mut self, bank_bytes: u64) -> Result<Option<u64>> {
-        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+        if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
             return Ok(None);
         }
         self.long_prefill = Some(self.prefill_capacity);
@@ -2417,13 +2420,38 @@ impl Backend {
     }
 
     /// Give the remaining budget to expert cache slots; the cache slot count.
+    ///
+    /// A device allocation that answers code 2 is rolled back in the library, then tried again here: the staging count
+    /// halves from `stage` down to 2, and only then the cache halves down to 0. The cache is never shrunk inside the
+    /// library. When the only refusal left at stage 2 is the page-locked staging mirror, the pool starts without that
+    /// mirror ([`Self::expert_slot_mirror`]).
     pub fn create_expert_slots(&mut self, stage: u64, margin: u64) -> Result<u64> {
         let slot = (if self.slot_bytes > 0 { self.slot_bytes } else { expert_bytes([42, 42, 42]) }).div_ceil(256) * 256;
-        let cache = self.slots_that_fit(stage, margin, slot)?;
-        // SAFETY: a live handle.
-        check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot) })?;
-        (self.slot_stage, self.slot_margin, self.slot_size) = (stage, margin, slot);
-        Ok(cache)
+        let mut stage = stage.max(2);
+        let mut cache = self.slots_that_fit(stage, margin, slot)?;
+        let mut mirror = true;
+        loop {
+            // SAFETY: a live handle. A code 2 refusal rolls the partial pool back before it returns.
+            match check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot, c_int::from(mirror)) }) {
+                Ok(_) => {
+                    (self.slot_stage, self.slot_margin, self.slot_size, self.slot_mirror) = (stage, margin, slot, mirror);
+                    return Ok(cache);
+                }
+                Err(error) => {
+                    let Some(next) = next_slot_attempt(stage, cache, mirror, &error) else { return Err(error) };
+                    let cache_next = if next.refit { self.slots_that_fit(next.stage, margin, slot)? } else { next.cache };
+                    eprintln!("Straydog expert slots: stage {stage} cache {cache} mirror {mirror} was refused; trying stage {} cache {cache_next} mirror {}", next.stage, next.mirror);
+                    stage = next.stage;
+                    cache = cache_next;
+                    mirror = next.mirror;
+                }
+            }
+        }
+    }
+
+    /// The staging slots were given a page-locked host mirror.
+    pub fn expert_slot_mirror(&self) -> bool {
+        self.slot_mirror
     }
 
     fn slots_that_fit(&self, stage: u64, margin: u64, slot: u64) -> Result<u64> {
@@ -2880,6 +2908,37 @@ fn bytemuck_bytes(values: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }
 
+/// One more try after an expert-slot allocation answered `code 2`. `refit` means the cache count has to be measured
+/// again for the new staging count. Nothing here asks the device.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SlotAttempt {
+    pub stage: u64,
+    pub cache: u64,
+    pub mirror: bool,
+    pub refit: bool,
+}
+
+pub(crate) fn next_slot_attempt(stage: u64, cache: u64, mirror: bool, error: &str) -> Option<SlotAttempt> {
+    if !error.contains(", code 2)") {
+        return None;
+    }
+    // Halve the staging count first, and never below 2: a stage of 1 cannot gather a prefill.
+    if stage > 2 {
+        return Some(SlotAttempt { stage: (stage / 2).max(2), cache, mirror: true, refit: true });
+    }
+    if stage != 2 {
+        return None;
+    }
+    // The mirror's bytes do not depend on the cache, so a pin that fails at stage 2 is not helped by a smaller cache.
+    if mirror && error.contains("expert slot staging mirror, code 2") {
+        return Some(SlotAttempt { stage, cache, mirror: false, refit: false });
+    }
+    if cache == 0 {
+        return None;
+    }
+    Some(SlotAttempt { stage, cache: cache / 2, mirror, refit: false })
+}
+
 #[cfg(test)]
 mod tests {
     /// Decides: zeroed floats come zeroed and in the number asked for, and a size no machine has is refused where `vec![0f32; n]` would end the process.
@@ -2892,6 +2951,25 @@ mod tests {
         assert!(super::zeroed_floats(usize::MAX / 2).is_none(), "a layout that overflows");
         // (the result goes through black_box: an allocation that is only checked for null may be assumed to succeed, and never made)
         assert!(std::hint::black_box(super::zeroed_floats(std::hint::black_box(1 << 46))).is_none(), "a valid layout of 256 TiB, more than a process can address");
+    }
+
+    /// Code 2 halves the staging count down to 2, then the cache down to 0. Only the staging mirror's own refusal at
+    /// stage 2 drops the mirror, and the cache stays. Any other refusal is not retried.
+    #[test]
+    fn an_expert_slot_pool_refused_with_code_2_shrinks_then_drops_its_mirror() {
+        let refused = "out of memory (hybrid_slots.hpp:157, code 2)";
+        let pin = "out of memory (expert slot staging mirror, code 2)";
+        let next = super::next_slot_attempt;
+        assert_eq!(next(32, 1000, true, refused), Some(super::SlotAttempt { stage: 16, cache: 1000, mirror: true, refit: true }));
+        assert_eq!(next(4, 50, true, refused), Some(super::SlotAttempt { stage: 2, cache: 50, mirror: true, refit: true }));
+        assert_eq!(next(2, 40, true, refused), Some(super::SlotAttempt { stage: 2, cache: 20, mirror: true, refit: false }));
+        assert_eq!(next(2, 1, true, refused), Some(super::SlotAttempt { stage: 2, cache: 0, mirror: true, refit: false }));
+        assert_eq!(next(2, 0, true, refused), None);
+        assert_eq!(next(2, 40, true, pin), Some(super::SlotAttempt { stage: 2, cache: 40, mirror: false, refit: false }));
+        assert_eq!(next(2, 40, false, refused), Some(super::SlotAttempt { stage: 2, cache: 20, mirror: false, refit: false }));
+        assert_eq!(next(2, 0, false, pin), None);
+        assert_eq!(next(32, 10, true, "invalid Straydog expert slot pool"), None);
+        assert_eq!(next(1, 10, true, refused), None);
     }
 }
 

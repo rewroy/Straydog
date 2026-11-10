@@ -578,7 +578,8 @@ int sd_hybrid_route_floor(void* handle, float floor);
 /* Whether a prompt batch's experts beyond the slots with the fewest rows go to the CPU (on by default; prompt_cpu_share). */
 int sd_hybrid_prompt_share(void* handle, int on);
 void* sd_hybrid_moe_create(void* handle, void* const* pointers, const int* kinds, const int* routed_kinds, uint64_t experts, const uint8_t* const* host, void* workspace, uint64_t capacity);
-int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes);
+/* `mirror` is 0 to start without the page-locked staging mirror. Layer order gathers through that mirror, so it stays off. */
+int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes, int mirror);
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
 int sd_expert_slots_release(void* handle);
 int sd_expert_slots_restore(void* handle, uint64_t cache);

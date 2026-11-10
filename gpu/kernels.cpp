@@ -1967,8 +1967,8 @@ void* sd_hybrid_moe_create(void* handle,void* const* pointers,const int* kinds,c
     try { return create_hybrid_moe(device(handle),pointers,kinds,routed_kinds,size_t(experts),host,workspace,size_t(capacity)); }
     catch (const std::exception& e) { last_error=e.what(); return nullptr; }
 }
-int sd_expert_slots(void* handle,uint64_t cache,uint64_t stage,uint64_t slot_bytes) {
-    try { create_expert_slots(device(handle),size_t(cache),size_t(stage),size_t(slot_bytes)); return 0; }
+int sd_expert_slots(void* handle,uint64_t cache,uint64_t stage,uint64_t slot_bytes,int mirror) {
+    try { create_expert_slots(device(handle),size_t(cache),size_t(stage),size_t(slot_bytes), mirror != 0); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // A K/V growth takes the VRAM of the expert slots for its longer indexers and gives back what is left.
