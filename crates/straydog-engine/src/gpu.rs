@@ -1478,10 +1478,36 @@ impl Backend {
             }
         }
         let mut output = vec![0f32; output_rows as usize * WIDTH];
+        self.prefill_span_into(begin, end, values, position, steps, output_rows, &mut output)?;
+        Ok(output)
+    }
+
+    /// [`Backend::prefill_layers`] with all `steps` rows written into `output` (`steps` rows of [`WIDTH`]) instead of a new vector: the
+    /// layer-ordered prefill writes each layer's rows back where they were read from, and a fresh vector a chunk is every row's pages
+    /// zeroed and faulted in again for each layer (32K rows: 1.2 GiB a layer, 16 million faults a prefill on Windows).
+    pub fn prefill_layers_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
+                               output: &mut [f32]) -> Result<()> {
+        if begin >= end || end > 49 || end - begin > 4 || !(2..=self.prefill_capacity).contains(&steps)
+            || position > 262144 - steps || output.len() as u64 != steps * WIDTH as u64
+        {
+            return Err("invalid Straydog resident prefill span".into());
+        }
+        if let Some(values) = values {
+            if values.len() as u64 != steps * WIDTH as u64 || !values.iter().all(|value| value.is_finite()) {
+                return Err("invalid Straydog resident prefill input".into());
+            }
+        }
+        self.prefill_span_into(begin, end, values, position, steps, steps, output)
+    }
+
+    /// The span's work, its `output_rows` rows written into `output` (sized by the callers).
+    fn prefill_span_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64, output_rows: u64,
+                         output: &mut [f32]) -> Result<()> {
         let target = if output_rows > 0 { output.as_mut_ptr() } else { std::ptr::null_mut() };
         let mut phase_seconds = [0.0f64; 4];
         let observed = cfg!(feature = "prefill-observer");
-        // SAFETY: input rows (or none) and output rows sized above.
+        // SAFETY: input rows (or none) checked by the callers; `output` holds `output_rows` rows (prefill_layers sizes it,
+        // prefill_layers_into checks it).
         check(unsafe {
             ffi::sd_prefill_span(self.handle, begin as u64, end as u64, position, steps,
                                  values.map_or(std::ptr::null(), <[f32]>::as_ptr), target, output_rows,
@@ -1493,7 +1519,7 @@ impl Backend {
                 "hc_seconds":phase_seconds[0],"gdn_seconds":phase_seconds[1],
                 "qsa_seconds":phase_seconds[2],"moe_seconds":phase_seconds[3]}));
         }
-        Ok(output)
+        Ok(())
     }
 
     fn ple_operands(&mut self, prefix: &str, operands: &[Operand]) -> Result<(Vec<*mut c_void>, Vec<c_int>, Entry)> {
