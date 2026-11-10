@@ -594,11 +594,12 @@ int sd_hybrid_assist_level(void* handle, uint32_t assist);
    for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */
 int sd_hybrid_unmap(void* handle, const void* gate, uint64_t* found);
 /* The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: page-locked
-   copies of the banks (`copy` 1, sd_host_alloc_on), or the model's mapping again (`copy` 0, before the copies are freed). The copies of its experts
+   copies of the banks (`copy` 1, sd_host_alloc_on; `base` is then the start of the allocation each bank lies in, which sd_hybrid_assist maps, as the
+   runtime maps an allocation by its start), or the model's mapping again (`copy` 0, before the copies are freed; `base` is not read). The copies of its experts
    that were in flight, the kernels that read the banks in place, and the CPU's workers are waited for, so that nothing reads the old memory when this
    returns (a CPU read still under way is an error and leaves the plan as it was); the plan's view for the assist is dropped, and sd_hybrid_assist
    maps the new memory. `found` is 1 where this device holds the plan. */
-int sd_hybrid_repoint(void* handle, const void* from, const uint8_t* const* host, int copy, uint64_t* found);
+int sd_hybrid_repoint(void* handle, const void* from, const uint8_t* const* host, const uint8_t* const* base, int copy, uint64_t* found);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);
