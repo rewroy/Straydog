@@ -169,6 +169,7 @@ pub fn build(file: &File, tree: &Path, progress: &(dyn Fn(u64) + Sync)) -> std::
 }
 
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    crate::layer_trace::proof_read(buffer.len() as u64);
     let mut done = 0;
     while done < buffer.len() {
         let count = crate::storage::read_partial(file, &mut buffer[done..], offset + done as u64)?;
@@ -498,6 +499,7 @@ impl Verifier {
     /// Check `data`, whole blocks of the file from `offset` (a block boundary); bytes past the
     /// file's end must be zero.
     pub fn verify(&self, offset: u64, data: &[u8]) -> Result<(), String> {
+        let _trace = crate::layer_trace::Verify::new(data.len() as u64);
         if !offset.is_multiple_of(BLOCK as u64) || !data.len().is_multiple_of(BLOCK) {
             return Err("a verified read must be whole blocks".into());
         }

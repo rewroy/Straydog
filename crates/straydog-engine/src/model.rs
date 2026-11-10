@@ -3104,6 +3104,7 @@ impl Model {
     fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
+        let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
         let count = (tokens.len() - position).min(LAYER_PREFILL_ROWS);
         let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
         self.ensure_kv(tokens.len())?;
@@ -3113,6 +3114,7 @@ impl Model {
             bank_bytes = bank_bytes.max(bytes);
         }
         let preparing = Instant::now();
+        let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
         self.group.lend_prefill_head()?;
         let output: Result<Option<bool>> = (|| {
             let Some(rows) = self.group.begin_layer_prefill(bank_bytes)? else { return Ok(None) };
@@ -3120,14 +3122,17 @@ impl Model {
             self.last_metrics.insert("prefill_batch_rows".into(), json!(rows));
             self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
             self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
+            drop(trace_prepare);
             self.layer_prefill_segments(tokens, position, plan, rows as usize, &mut hidden, cancelled, progress).map(Some)
         })();
         let restoring = Instant::now();
+        let trace_restore = crate::layer_trace::Span::new("restore", None, position, tokens.len(), 0);
         // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
         let bank = self.group.finish_layer_prefill();
         let head = self.with_operands(Model::head_operands, Group::pin);
         let cache = self.group.end_long_prefill();
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
+        drop(trace_restore);
         let errors: Vec<String> = [bank, head, cache].into_iter().filter_map(Result::err).collect();
         if !errors.is_empty() {
             let restore = errors.join("; ");
@@ -3154,14 +3159,17 @@ impl Model {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
             let count = stop - begin;
+            let _trace_segment = crate::layer_trace::Span::new("segment", None, begin, stop, 0);
             self.group.clear_layer_bank()?;
             if count < LAYER_PREFILL_MIN {
+                let _trace_tail = crate::layer_trace::Span::new("ordinary_tail", None, begin, stop, 0);
                 for first in (begin..stop).step_by(batch) {
                     self.forward(&tokens[first..(first + batch).min(stop)], false)?;
                 }
             } else {
                 self.set_rope(begin, count)?;
                 let rows = &mut hidden[..count * WIDTH];
+                let trace_embedding = crate::layer_trace::Span::new("embedding", None, begin, stop, 0);
                 for first in (begin..stop).step_by(batch) {
                     let end = (first + batch).min(stop);
                     let embedded = self.rows_at(first, &tokens[first..end])?;
@@ -3170,15 +3178,21 @@ impl Model {
                         for stream in row.chunks_exact_mut(HIDDEN) { stream.copy_from_slice(embedded); }
                     }
                 }
+                drop(trace_embedding);
                 let previous = self.final_hidden.clone();
                 for layer in 0..48 {
+                    let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
+                    let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
                     self.group.load_layer_bank(layer)?;
+                    drop(trace_bank);
+                    let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
                     // Avoid a final prefill call of one row; the existing one-row path is a different API.
                     for (first, end) in layer_prefill_chunks(begin, stop, batch) {
                         let low = (first - begin) * WIDTH;
                         let high = (end - begin) * WIDTH;
                         self.group.prefill_rows(layer, &rows[low..high])?;
                         if layer == 1 {
+                            let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
                             let next = (end + batch).min(stop);
                             self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
                             self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
@@ -3192,7 +3206,11 @@ impl Model {
                     }
                 }
                 if self.speculative > 0 {
+                    let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
+                    let trace_bank = crate::layer_trace::Span::new("bank", Some(48), begin, stop, bank_bytes);
                     self.group.load_layer_bank(48)?;
+                    drop(trace_bank);
+                    let _trace_compute = crate::layer_trace::Span::new("compute", Some(48), begin, stop, 0);
                     // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
                     let mut previous = previous;
                     for (first, end) in layer_prefill_chunks(begin, stop, batch) {
@@ -3207,6 +3225,7 @@ impl Model {
             }
             self.group.clear_layer_bank()?;
             if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
+                let _trace_checkpoint = crate::layer_trace::Span::new("checkpoint", None, begin, stop, 0);
                 for kind in kinds.clone() { self.save_checkpoint(kind)?; }
             }
             progress(stop, tokens.len());
