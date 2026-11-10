@@ -15,6 +15,7 @@ pub mod formats;
 pub mod gpu;
 pub mod group;
 pub mod host;
+mod layer_trace;
 pub mod load;
 pub mod model;
 pub mod moe;

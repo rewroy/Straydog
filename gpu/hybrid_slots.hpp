@@ -1,3 +1,4 @@
+#include "layer_trace.hpp"
 // Partially resident experts. Dense layer operands, the router and the shared
 // expert stay pinned on the GPU; routed experts occupy a bounded pool of device
 // slots chosen from routing statistics. Decode evaluates resident experts on the
@@ -584,31 +585,68 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
     if (d.copier) d.copier->wait();
     std::vector<size_t> experts(plan.experts);
     for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    LayerBankTrace trace(d, layer, required);
+    const uint64_t hint_started = layer_trace_tick();
+#endif
     prefetch_experts(d, plan, experts.data(), experts.size());
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    trace.hint_ns += layer_trace_tick() - hint_started;
+#endif
     auto* bank = static_cast<uint8_t*>(storage);
     if (plan.mapped[0]) {
         size_t offset = 0;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.before_copy(0);
+#endif
         for (size_t role = 0; role < 3; ++role) {
             check(hipMemcpy2DAsync(bank + offset, entry, plan.host[role], plan.host_bytes[role], plan.host_bytes[role], plan.experts,
                                    hipMemcpyHostToDevice, d.copy_stream));
             offset += plan.host_bytes[role];
         }
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.after_copy(0);
+#endif
     } else {
         // The same authenticated mapping/file gather as ordinary streaming, overlapped with the previous half's DMA.
         const size_t half = d.slots.stage / 2;
         StreamEvents events;
         for (size_t first = 0, chunk = 0; first < plan.experts; first += half, ++chunk) {
             const size_t count = std::min(half, plan.experts - first), buffer = chunk % 2;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            const uint64_t wait_started = layer_trace_tick();
+#endif
             if (chunk >= 2) check(hipEventSynchronize(events.loaded[buffer]));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.wait_ns += layer_trace_tick() - wait_started;
+#endif
             uint8_t* host = d.slots.host + buffer * half * d.slots.bytes;
             std::vector<uint8_t*> targets;
             for (size_t i = 0; i < count; ++i) targets.push_back(host + i * d.slots.bytes);
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            const uint64_t gather_started = layer_trace_tick();
+#endif
             hybrid_gather(d, plan, experts.data() + first, count, targets.data());
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.gather_ns += layer_trace_tick() - gather_started;
+            trace.before_copy(buffer);
+            const uint64_t submit_started = layer_trace_tick();
+#endif
             for (size_t i = 0; i < count; ++i)
                 check(hipMemcpyAsync(bank + (first + i) * entry, targets[i], entry, hipMemcpyHostToDevice, d.copy_stream));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.submit_ns += layer_trace_tick() - submit_started;
+            trace.after_copy(buffer);
+#endif
             check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         }
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        const uint64_t drain_started = layer_trace_tick();
+#endif
         check(hipStreamSynchronize(d.copy_stream));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.wait_ns += layer_trace_tick() - drain_started;
+#endif
     }
     check(hipStreamSynchronize(d.copy_stream));
     std::vector<std::pair<size_t, const uint8_t*>> loaded;
@@ -619,4 +657,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
     check(hipStreamSynchronize(d.stream));
     plan.layer_prefill = true;
     d.streamed_experts += plan.experts;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    trace.emit();
+#endif
 }
