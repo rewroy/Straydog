@@ -556,3 +556,67 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     }
     return uint64_t(double(ms) * 1e6);
 }
+
+// A whole prompt segment uses one layer at a time. Its table may point into a borrowed bank pool only until it is cleared.
+void clear_prefill_bank(Device& d) {
+    if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+    check(hipStreamSynchronize(d.stream));
+    if (!d.layer_prefill_plan) return;
+    auto& plan = *d.layer_prefill_plan;
+    std::vector<std::pair<size_t, const uint8_t*>> absent;
+    for (size_t expert = 0; expert < plan.experts; ++expert) absent.emplace_back(expert, nullptr);
+    hybrid_point_list(d, plan, absent);
+    check(hipStreamSynchronize(d.stream));
+    plan.layer_prefill = false;
+    d.layer_prefill_plan = nullptr;
+    d.layer_prefill_storage = nullptr;
+}
+void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes) {
+    clear_prefill_bank(d);
+    const auto decoder = d.decoder.find(layer);
+    const auto allocation = d.allocations.find(storage);
+    if (decoder == d.decoder.end() || allocation == d.allocations.end() || bytes > allocation->second || d.qwen_parts != 1)
+        throw std::runtime_error("invalid layer prefill bank storage");
+    auto& plan = *d.resident.at(decoder->second.moe);
+    const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
+    if (!plan.hybrid || required > bytes || d.slots.cache || !d.slots.host || d.slots.stage < 2 || !d.cpu)
+        throw std::runtime_error("layer prefill bank needs empty expert cache and staging");
+    if (d.copier) d.copier->wait();
+    std::vector<size_t> experts(plan.experts);
+    for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
+    prefetch_experts(d, plan, experts.data(), experts.size());
+    auto* bank = static_cast<uint8_t*>(storage);
+    if (plan.mapped[0]) {
+        size_t offset = 0;
+        for (size_t role = 0; role < 3; ++role) {
+            check(hipMemcpy2DAsync(bank + offset, entry, plan.host[role], plan.host_bytes[role], plan.host_bytes[role], plan.experts,
+                                   hipMemcpyHostToDevice, d.copy_stream));
+            offset += plan.host_bytes[role];
+        }
+    } else {
+        // The same authenticated mapping/file gather as ordinary streaming, overlapped with the previous half's DMA.
+        const size_t half = d.slots.stage / 2;
+        StreamEvents events;
+        for (size_t first = 0, chunk = 0; first < plan.experts; first += half, ++chunk) {
+            const size_t count = std::min(half, plan.experts - first), buffer = chunk % 2;
+            if (chunk >= 2) check(hipEventSynchronize(events.loaded[buffer]));
+            uint8_t* host = d.slots.host + buffer * half * d.slots.bytes;
+            std::vector<uint8_t*> targets;
+            for (size_t i = 0; i < count; ++i) targets.push_back(host + i * d.slots.bytes);
+            hybrid_gather(d, plan, experts.data() + first, count, targets.data());
+            for (size_t i = 0; i < count; ++i)
+                check(hipMemcpyAsync(bank + (first + i) * entry, targets[i], entry, hipMemcpyHostToDevice, d.copy_stream));
+            check(hipEventRecord(events.loaded[buffer], d.copy_stream));
+        }
+        check(hipStreamSynchronize(d.copy_stream));
+    }
+    check(hipStreamSynchronize(d.copy_stream));
+    std::vector<std::pair<size_t, const uint8_t*>> loaded;
+    for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
+    d.layer_prefill_plan = &plan;
+    d.layer_prefill_storage = storage;
+    hybrid_point_list(d, plan, loaded);
+    check(hipStreamSynchronize(d.stream));
+    plan.layer_prefill = true;
+    d.streamed_experts += plan.experts;
+}
