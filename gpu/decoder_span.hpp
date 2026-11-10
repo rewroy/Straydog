@@ -5,6 +5,15 @@ __global__ void decoder_residual(float* hidden,const float* mixed,const float* b
     if (index<10240) hidden[index]+=mixed[2560+index/2560]*branch[index%2560];
 }
 
+// A validation observer is absent from normal execution. Downloads deliberately settle the stream: these are not performance runs.
+void observe_prefill(Device& d, size_t layer, size_t phase, size_t position, size_t steps, size_t width, const float* values) {
+    if (!d.prefill_observer) return;
+    std::vector<float> rows(steps * width);
+    download(d, rows.data(), values, rows.size() * sizeof(float));
+    if (d.prefill_observer(d.prefill_observer_context, layer, phase, position, steps, width, rows.data()))
+        throw std::runtime_error("prefill validation observer failed");
+}
+
 // Layer 48 is the MTP draft layer: full (QSA) attention like every fourth layer.
 bool decoder_linear(size_t layer) { return layer % 4 != 3 && layer < 48; }
 
@@ -322,7 +331,9 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         if (steps*std::max({hc_batch_floats,gdn_batch_floats,qsa_batch_floats})>experts.capacity*49302+65536)
             throw std::runtime_error("prefill batch exceeds the resident expert workspace");
         const bool linear=decoder_linear(layer);
+        observe_prefill(d,layer,0,position,steps,10240,hidden);
         record(0,[&]() { hc_prefill(d,pointers,kinds,steps,hidden,mixed,scratch); });
+        observe_prefill(d,layer,1,position,steps,2560,mixed);
         record(linear ? 1 : 2,[&]() {
             if (linear) {
                 const size_t chunk=d.input_capacity>=16*1024*1024 ? 512 : 128;
@@ -333,13 +344,18 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
                 if (steps>1 && !d.layer_prefill_plan) kv_prefetch_from(d,layer+1,position);
             }
         });
+        observe_prefill(d,layer,2,position,steps,2560,branch);
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        observe_prefill(d,layer,3,position,steps,10240,hidden);
         record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch); });
+        observe_prefill(d,layer,4,position,steps,2560,mixed);
         record(3,[&]() {
             if (d.resident.find(plan.moe)->second->part) resident_moe_parts(d,plan.moe,layer,steps,mixed,branch);
             else resident_moe(d,plan.moe,steps,mixed,branch,true);
         });
+        observe_prefill(d,layer,5,position,steps,2560,branch);
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        observe_prefill(d,layer,6,position,steps,10240,hidden);
     }
     const bool parts=span_has_parts(d,begin,end);
     if (d.prefill_deferred && !output_rows && !timings) {
