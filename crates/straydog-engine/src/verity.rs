@@ -221,24 +221,49 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
 /// [`verify_mapped`] with the priority the threads it starts work at (the calling thread keeps its own, which it uses when `threads` is 1 or the
 /// range is one piece): the check of the banks behind "ready" gives way to a request's work, the load's does not.
 pub fn verify_mapped_at(map: &[u8], verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority) -> Result<(), String> {
+    verify_held_at(map, 0, map.len() as u64, verifier, offset, length, threads, priority, true)
+}
+
+/// The whole blocks around bytes `offset .. offset + length` of a file of `size` bytes, as `start .. end`: a block boundary, and a block boundary or the
+/// file's end (its last block is checked zero-padded). A copy of those bytes is what [`verify_copy_at`] checks. None where the range reaches past the file.
+pub fn covering_blocks(size: u64, offset: u64, length: u64) -> Option<(u64, u64)> {
+    let end = offset.checked_add(length).filter(|&end| end <= size)?;
+    Some((offset / BLOCK as u64 * BLOCK as u64, end.next_multiple_of(BLOCK as u64).min(size)))
+}
+
+/// Check bytes `offset .. offset + length` of a file in a copy: `copy` holds the file's bytes from `base` (what [`covering_blocks`] gives, at the least), and what is
+/// checked is the copy's own bytes, as the whole blocks around the range, by the same checker as the mapping's ([`verify_mapped_at`]). For a copy that cannot
+/// change after the check (page-locked host memory): the verified-bytes rule holds for the copy, not for the file's mapping it was made from.
+pub fn verify_copy_at(copy: &[u8], base: u64, verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority) -> Result<(), String> {
+    verify_held_at(copy, base, verifier.size(), verifier, offset, length, threads, priority, false)
+}
+
+/// The check of [`verify_mapped_at`] and [`verify_copy_at`] over `held`, the bytes of a file of `size` from `base` on. `hints` asks the system to read the
+/// pages of a cold piece before it is hashed, which only a mapping has.
+#[allow(clippy::too_many_arguments)]
+fn verify_held_at(held: &[u8], base: u64, size: u64, verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority,
+                  hints: bool) -> Result<(), String> {
     const PIECE: u64 = 16 << 20;
-    let size = map.len() as u64;
     if offset.checked_add(length).is_none_or(|end| end > size) {
         return Err("a verified range past the file's end".into());
     }
     let start = offset / BLOCK as u64 * BLOCK as u64;
     let end = (offset + length).next_multiple_of(BLOCK as u64);
-    // Whole blocks within the file go straight from the mapping; a last partial one is padded.
+    // (the blocks around the range, up to the file's end, must be in what is held)
+    if start < base || end.min(size) > base.saturating_add(held.len() as u64) {
+        return Err("a verified range outside the bytes held".into());
+    }
+    // Whole blocks within the file go straight from the bytes held; a last partial one is padded.
     let whole_end = end.min(size / BLOCK as u64 * BLOCK as u64).max(start);
     let pieces: Vec<(u64, u64)> = (start..whole_end).step_by(PIECE as usize).map(|at| (at, (at + PIECE).min(whole_end))).collect();
     let failure = Mutex::new(None);
     let check = |(from, to): (u64, u64)| {
-        let data = &map[from as usize..to as usize];
+        let data = &held[(from - base) as usize..(to - base) as usize];
         // Issue the cold piece's reads before hashing its 4 KiB blocks. Sequential demand
         // faults otherwise serialize I/O with hashing. Stay inside this worker's 16 MiB
         // piece (at most 128 MiB across the batch), and skip advice on resident pieces.
         // Advice is not authentication: every block below still checks its Merkle proof.
-        if crate::storage::resident(data) < 1.0 {
+        if hints && crate::storage::resident(data) < 1.0 {
             crate::storage::read_ahead(data.chunks(2 << 20));
         }
         if let Err(error) = verifier.verify(from, data) {
@@ -248,7 +273,7 @@ pub fn verify_mapped_at(map: &[u8], verifier: &Verifier, offset: u64, length: u6
     run_pieces(&pieces, threads, priority, check);
     if end > whole_end && whole_end < size {
         let mut last = vec![0u8; BLOCK];
-        last[..(size - whole_end) as usize].copy_from_slice(&map[whole_end as usize..]);
+        last[..(size - whole_end) as usize].copy_from_slice(&held[(whole_end - base) as usize..(size - base) as usize]);
         if let Err(error) = verifier.verify(whole_end, &last) {
             failure.lock().unwrap().get_or_insert(error);
         }
@@ -452,6 +477,11 @@ impl Verifier {
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),
             tree_reads: AtomicU64::new(0),
         })
+    }
+
+    /// The size of the file the tree is of.
+    pub fn size(&self) -> u64 {
+        self.geometry.size
     }
 
     /// Keep the whole leaf level as an immutable, checked copy, only when it fits `budget`.
@@ -816,5 +846,54 @@ mod resident_tests {
                 assert!(verifier.verify(0, &changed).is_err());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// Decides: a copy of the whole blocks around a range is checked by the same checker as the mapping is: it passes where the mapping passes, a byte
+    /// changed anywhere in the blocks around the range fails it as it fails the mapping, and a copy that does not hold those blocks is refused.
+    #[test]
+    fn a_copy_of_the_blocks_around_a_range_is_checked_as_the_mapping_is() {
+        let size = (9 << 20) + 321;
+        let data: Vec<u8> = (0..size).map(|at| (at * 31 % 253) as u8).collect();
+        let file = std::env::temp_dir().join(format!("straydog-auth-copy-{}.data", std::process::id()));
+        let tree = file.with_extension("tree");
+        std::fs::write(&file, &data).unwrap();
+        let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+        let verifier = Verifier::open(&tree, size as u64, &digest, 4 * BLOCK).unwrap();
+        assert_eq!(verifier.size(), size as u64);
+        let block = BLOCK as u64;
+        // a range in a block, one over two blocks, a large one, the file's end, and a range that begins in the file's last whole block
+        let last = size as u64;
+        for (offset, length) in [(0, 5000), (4095, 2), (100_000, 3 << 20), (last - 700, 700), (last - 3 * block - 5, 3 * block + 5), (block, block)] {
+            let (start, end) = covering_blocks(last, offset, length).unwrap();
+            assert!(start % block == 0 && (end % block == 0 || end == last), "{start}..{end}");
+            assert!(start <= offset && offset + length <= end);
+            let copy = data[start as usize..end as usize].to_vec();
+            for threads in [1, 3] {
+                verify_copy_at(&copy, start, &verifier, offset, length, threads, Priority::Normal).unwrap();
+            }
+            for at in [start, offset, offset + length - 1, end - 1] {
+                let mut bad = copy.clone();
+                bad[(at - start) as usize] ^= 1;
+                assert!(verify_copy_at(&bad, start, &verifier, offset, length, 2, Priority::Normal).is_err(), "a byte changed at {at} in {start}..{end}");
+                // (the mapping of the same bytes says the same)
+                let mut whole = data.clone();
+                whole[at as usize] ^= 1;
+                assert!(verify_mapped_at(&whole, &verifier, offset, length, 2, Priority::Normal).is_err());
+            }
+            // not the blocks around the range: shorter at the end, or beginning after the first block
+            assert!(verify_copy_at(&copy[..copy.len() - 1], start, &verifier, offset, length, 1, Priority::Normal).is_err());
+            assert!(verify_copy_at(&copy, start + block, &verifier, offset, length, 1, Priority::Normal).is_err());
+        }
+        assert_eq!(covering_blocks(10, 5, 6), None, "past the file's end");
+        assert_eq!(covering_blocks(10, 5, 5), Some((0, 10)));
+        assert_eq!(covering_blocks(3 * block, block + 7, 5), Some((block, 2 * block)));
+        drop(verifier);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_file(tree).unwrap();
     }
 }
