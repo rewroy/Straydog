@@ -2269,6 +2269,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_cache_bytes(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_cpu_error() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
