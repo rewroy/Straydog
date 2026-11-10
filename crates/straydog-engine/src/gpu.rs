@@ -1130,9 +1130,12 @@ impl Backend {
     /// Load complete four-stream rows before a layer's PLE and span.
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
         let steps = rows.len() / WIDTH;
-        if rows.len() % WIDTH != 0 || !(1..=self.prefill_capacity as usize).contains(&steps) || !rows.iter().all(|v| v.is_finite()) {
+        if rows.len() % WIDTH != 0 || !(1..=self.prefill_capacity as usize).contains(&steps) {
             return Err("invalid layer prefill hidden rows".into());
         }
+        // (the rows are the device's own output of the layer before, or embeddings of checked weights: a scan of every value on one CPU
+        // thread, for every chunk of every layer, took 29 GB of reads at 15K tokens; the ordinary path keeps the same rows in VRAM unchecked)
+        debug_assert!(rows.iter().all(|v| v.is_finite()), "non-finite layer prefill hidden rows");
         // SAFETY: rows have the registered workspace width and capacity, and remain alive through the upload.
         check(unsafe { ffi::sd_prefill_rows(self.handle, layer as u64, rows.as_ptr(), steps as u64) }).map(drop)
     }
