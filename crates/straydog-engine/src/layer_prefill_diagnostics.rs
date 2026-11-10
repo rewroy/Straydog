@@ -1,3 +1,4 @@
+//! Build with --features hip,prefill-observer (or cuda,prefill-observer).
 //! Ignored GPU diagnostic: equal schedules distinguish layer order from a change of arithmetic batch shape.
 use super::*;
 use std::ffi::c_void;
