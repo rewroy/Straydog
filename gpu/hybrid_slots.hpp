@@ -144,7 +144,22 @@ void expert_slots_carve(Device& d, size_t arena) {
     d.slots.cache = d.slots.at.size();
     d.slots.owner.assign(d.slots.cache, {nullptr, -1});
 }
-void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_bytes) {
+// A failed attempt leaves the pool as it was: empty. The caller retries a smaller one. This does not shrink the cache itself.
+void rollback_expert_slots(Device& d, size_t added) {
+    d.copier.reset();
+    if (d.swapped) { cleanup(hipEventDestroy(d.swapped)); d.swapped = nullptr; }
+    if (d.copy_stream) { cleanup(hipStreamDestroy(d.copy_stream)); d.copy_stream = nullptr; }
+    if (d.exchange) { cleanup(hipHostFree(d.exchange)); d.exchange = nullptr; }
+    d.exchange_device = nullptr;
+    if (d.slots.host) { cleanup(hipHostFree(d.slots.host)); d.slots.host = nullptr; }
+    if (d.cpu_partial) { cleanup(hipFree(d.cpu_partial)); d.cpu_partial = nullptr; }
+    if (d.slots.base) { cleanup(hipFree(d.slots.base)); d.slots.base = nullptr; }
+    d.used -= added;
+    d.slots.stage = 0; d.slots.bytes = 0; d.slots.cache = 0; d.slots.arena = 0;
+    d.slots.at.clear(); d.slots.group.clear(); d.slots.owner.clear(); d.slots.pending.clear();
+    d.hybrid_sequence = 0;
+}
+void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_bytes, bool mirror) {
     if (d.slots.base || !slot_bytes || slot_bytes % 256 || stage < 2 || cache + stage > 65536)
         throw std::runtime_error("invalid Straydog expert slot pool");
     for (const auto& entry : d.resident)
@@ -154,23 +169,36 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
     const size_t extra = hybrid_exchange_floats * 4;
     if (bytes > d.budget - d.used || extra > d.budget - d.used - bytes)
         throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
-    check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
-    d.used += bytes;
-    d.slots.stage = stage; d.slots.bytes = slot_bytes;
-    expert_slots_carve(d, cache * slot_bytes);
-    check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
-    d.used += extra;
-    // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
-    check(hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault));
-    check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
-    std::memset(d.exchange, 0, hybrid_exchange_floats * 4);
-    check(hipHostGetDevicePointer(reinterpret_cast<void**>(&d.exchange_device), d.exchange, 0));
-    check(hipMemsetAsync(d.flags, 0, 16, d.stream));
-    check(hipStreamSynchronize(d.stream));
-    d.hybrid_sequence = 0;
-    check(hipStreamCreate(&d.copy_stream));
-    check(hipEventCreateWithFlags(&d.swapped, hipEventDisableTiming));
-    d.copier = std::make_unique<Background>(d.ordinal);
+    size_t added = 0;
+    try {
+        check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
+        d.used += bytes;
+        added += bytes;
+        d.slots.stage = stage; d.slots.bytes = slot_bytes;
+        expert_slots_carve(d, cache * slot_bytes);
+        check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
+        d.used += extra;
+        added += extra;
+        // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
+        // A refusal here is named, so the caller can start without the mirror instead of shrinking the cache.
+        if (mirror) {
+            const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault);
+            if (pinned != hipSuccess)
+                throw std::runtime_error(std::string(hipGetErrorString(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
+        }
+        check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
+        std::memset(d.exchange, 0, hybrid_exchange_floats * 4);
+        check(hipHostGetDevicePointer(reinterpret_cast<void**>(&d.exchange_device), d.exchange, 0));
+        check(hipMemsetAsync(d.flags, 0, 16, d.stream));
+        check(hipStreamSynchronize(d.stream));
+        d.hybrid_sequence = 0;
+        check(hipStreamCreate(&d.copy_stream));
+        check(hipEventCreateWithFlags(&d.swapped, hipEventDisableTiming));
+        d.copier = std::make_unique<Background>(d.ordinal);
+    } catch (...) {
+        rollback_expert_slots(d, added);
+        throw;
+    }
 }
 
 // Spin until the GPU publishes this export (pinned memory written by stream-ordered
