@@ -622,6 +622,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     auto meanwhile=[&]() {
         const size_t n=cpu_routes.size();
         if (!n) return;
+        BankReading reading(d);   // (the CPU's workers read the banks' bytes below: sd_hybrid_repoint waits)
         const auto began=std::chrono::steady_clock::now();
         check(hipEventSynchronize(d.prompt_rows));
         const auto computing=std::chrono::steady_clock::now();

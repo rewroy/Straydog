@@ -53,6 +53,11 @@ int sd_copy_allocation(void* handle, void* target, const void* source);
 int sd_host_register(void* pointer, uint64_t bytes);
 int sd_host_register_on(int ordinal, void* pointer, uint64_t bytes);
 int sd_host_unregister(void* pointer);
+/* `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped), allocated under the context of device
+   `ordinal` from any thread: the engine's copies of the expert banks where the GPU cannot register the model's read-only mapping
+   (sd_hybrid_repoint). sd_host_free gives it back, once nothing reads it. */
+int sd_host_alloc_on(int ordinal, uint64_t bytes, void** pointer);
+int sd_host_free(int ordinal, void* pointer);
 /* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
    refused as a machine short of memory refuses them; 0 ends it. */
 int sd_test_refuse_host(uint64_t count);
@@ -588,6 +593,12 @@ int sd_hybrid_assist_level(void* handle, uint32_t assist);
    before sd_hybrid_assist mapped them): copies of its experts that were in flight, and the layers' graphs that hold the view, are waited
    for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */
 int sd_hybrid_unmap(void* handle, const void* gate, uint64_t* found);
+/* The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: page-locked
+   copies of the banks (`copy` 1, sd_host_alloc_on), or the model's mapping again (`copy` 0, before the copies are freed). The copies of its experts
+   that were in flight, the kernels that read the banks in place, and the CPU's workers are waited for, so that nothing reads the old memory when this
+   returns (a CPU read still under way is an error and leaves the plan as it was); the plan's view for the assist is dropped, and sd_hybrid_assist
+   maps the new memory. `found` is 1 where this device holds the plan. */
+int sd_hybrid_repoint(void* handle, const void* from, const uint8_t* const* host, int copy, uint64_t* found);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);

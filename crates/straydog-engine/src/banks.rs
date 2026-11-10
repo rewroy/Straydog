@@ -17,6 +17,22 @@
 //! Until step 2 the layer is what every layer that is not page-locked is: the CPU's experts read its pages from the mapping and the slots'
 //! copies read them as they are. No path that takes a bank's bytes to the GPU, the assist apart, depends on the lock.
 //!
+//! A GPU that cannot register host memory read-only (CUDA's `cudaDevAttrHostRegisterReadOnlySupported` 0: two RTX 3090s on Windows 10; or
+//! `STRAYDOG_HOST_REGISTER_READ_ONLY=0`, [`lock_mode`]) cannot page-lock the model's read-only mapping in place at all, so a layer's turn is another
+//! one ([`LockMode::Copy`]), with the same two steps and the same rule:
+//!
+//! 1. [`BankLocks::lock_next`] makes ONE page-locked copy of each of the layer's three banks ([`LayerCopy`]: portable, mapped host memory, so every
+//!    device reads the one copy), copies the bank's bytes from the mapping into it, and checks THE COPY against the file's tree
+//!    ([`verity::verify_copy_at`], at the bank's file offset, over the whole blocks around the bank, which the copy holds). A page-locked copy cannot
+//!    change after the check, which is what keeps the rule: the bytes the GPU and the CPU's experts read are the bytes that were checked, not the
+//!    mapping's, whose pages the system may read again from the drive. A copy that does not match is freed and ends the locking as `Unverified`.
+//! 2. [`Model::banks_locked`](crate::model::Model::banks_locked), under the model's lock, points the plans' host pointers at the copies
+//!    ([`Copies::take_over`], [`HostPointers`]): every reader of a bank's bytes goes through them (the slots' copies, the prompt's streaming, the CPU
+//!    experts' gather and routes, the assist's mapping). The model keeps the copies ([`Copies`]) until it gives the layer back or ends.
+//!
+//! A give-back or the model's end points the layer's plans back at the mapping first, which waits for everything that reads the copy, and only then lets
+//! the copy go ([`Copies::give_back`]); a copy a reader still holds ([`LayerCopy::lease`]) is freed when the last reader lets go.
+//!
 //! The locks are an optimisation and the K/V of a conversation is not, so the locks give way to it, in two ways. The locking leaves room: before a
 //! layer's turn it looks at the memory available then, and stops when the layer would leave less than the plan's margin and the K/V the context's
 //! first 64K tokens still have to grow ([`locking_room`]). And when a K/V growth finds no memory anyway,
@@ -28,9 +44,9 @@
 //! the locking). [`BankLocks::read_ahead`] hands out the plan's banks as [`Piece`]s in the order the layers are locked, for a thread of the worker to ask the
 //! system for at a low priority ([`Piece::ask`], [`Piece::resident`]), a few hundred MB at a time, so that the locking and a request find them in memory.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::host::{Lowered, Priority};
 use crate::verity::{self, Verifier};
@@ -75,6 +91,274 @@ impl Bank {
     }
 }
 
+/// How a layer's banks are page-locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// The model's read-only mapping is registered with the runtime in place, and checked locked.
+    Register,
+    /// The runtime cannot register a read-only mapping: the banks are copied into page-locked memory, and the copies are checked.
+    Copy,
+}
+
+/// The environment variable that says the GPUs cannot register host memory read-only (`0`), on any machine whatever the runtime answers: the copy mode
+/// where it is not needed, for tests.
+pub const READ_ONLY_REGISTRATION_ENV: &str = "STRAYDOG_HOST_REGISTER_READ_ONLY";
+
+/// How the banks are page-locked, given the environment variable's value and each GPU's answer (ordinal, whether it registers host memory read-only; None:
+/// the runtime cannot say, taken as it can), and if they are copied, why, for the one line that says so.
+pub fn lock_mode(env: Option<&str>, devices: &[(usize, Option<bool>)]) -> (LockMode, Option<String>) {
+    if env.is_some_and(|value| value.trim() == "0") {
+        return (LockMode::Copy, Some(format!("{READ_ONLY_REGISTRATION_ENV}=0 says to treat the GPUs as unable to register host memory read-only")));
+    }
+    let refusing: Vec<String> = devices.iter().filter(|(_, answer)| *answer == Some(false)).map(|(ordinal, _)| format!("GPU {ordinal}")).collect();
+    match refusing.len() {
+        0 => (LockMode::Register, None),
+        1 => (LockMode::Copy, Some(format!("{} does not support registering host memory read-only (cudaDevAttrHostRegisterReadOnlySupported 0)", refusing[0]))),
+        _ => (LockMode::Copy, Some(format!("{} do not support registering host memory read-only (cudaDevAttrHostRegisterReadOnlySupported 0)", refusing.join(" and ")))),
+    }
+}
+
+/// Where a bank's copy lives: page-locked host memory every device reads in place.
+pub trait HostMemory: Send + Sync {
+    /// `bytes` of page-locked memory, or the runtime's reason it would not.
+    fn allocate(&self, bytes: u64) -> Result<*mut u8, String>;
+
+    /// Give back what [`HostMemory::allocate`] returned.
+    ///
+    /// # Safety
+    /// `pointer` came from `allocate` of this memory, once, and nothing reads it any more.
+    unsafe fn free(&self, pointer: *mut u8);
+}
+
+/// The GPU runtime's page-locked memory, portable and mapped (`hipHostMalloc`), allocated under the context of the device `ordinal`.
+pub struct PinnedMemory {
+    pub ordinal: usize,
+}
+
+impl HostMemory for PinnedMemory {
+    fn allocate(&self, bytes: u64) -> Result<*mut u8, String> {
+        crate::gpu::host_alloc(self.ordinal, bytes)
+    }
+
+    unsafe fn free(&self, pointer: *mut u8) {
+        // SAFETY: the caller's.
+        unsafe { crate::gpu::host_free(self.ordinal, pointer) }
+    }
+}
+
+/// One bank's copy: an allocation of the whole blocks of the file around the bank, so that the copy can be checked against the file's tree as it is.
+struct Part {
+    /// The allocation (null until made) and its bytes.
+    base: *mut u8,
+    bytes: usize,
+    /// The file offset of the allocation's first byte (a block boundary), the bank's first byte's place in it, and the bank's bytes.
+    start: u64,
+    at: usize,
+    len: usize,
+}
+
+impl Part {
+    const NONE: Part = Part { base: std::ptr::null_mut(), bytes: 0, start: 0, at: 0, len: 0 };
+}
+
+/// The memory of one layer's three copies, freed with the last [`LayerCopy`] that holds it.
+struct CopyBlock {
+    memory: Arc<dyn HostMemory>,
+    layer: usize,
+    parts: [Part; 3],
+}
+
+// SAFETY: the parts are page-locked memory that only this block frees, and nothing writes after the copy was made and checked.
+unsafe impl Send for CopyBlock {}
+unsafe impl Sync for CopyBlock {}
+
+impl Drop for CopyBlock {
+    fn drop(&mut self) {
+        for part in &self.parts {
+            if !part.base.is_null() {
+                // SAFETY: allocated by `memory`, once, and freed only here; whoever read it held a `LayerCopy`, which this block outlives.
+                unsafe { self.memory.free(part.base) };
+            }
+        }
+    }
+}
+
+/// One page-locked copy of a layer's three banks, shared by every device that reads the layer. Cloning ([`LayerCopy::lease`]) is how a reader keeps
+/// the memory: it is freed when the last holder lets go.
+#[derive(Clone)]
+pub struct LayerCopy(Arc<CopyBlock>);
+
+impl LayerCopy {
+    /// Allocate the copies of `banks` and copy the bytes of the mapping into them, with the whole blocks around each bank. Nothing is checked yet
+    /// ([`LayerCopy::verify`]). An allocation that is refused frees those made.
+    ///
+    /// # Safety
+    /// The mappings of `banks` must be alive.
+    unsafe fn make(memory: &Arc<dyn HostMemory>, layer: usize, banks: &[Bank; 3]) -> Result<LayerCopy, String> {
+        let mut block = CopyBlock { memory: memory.clone(), layer, parts: [Part::NONE, Part::NONE, Part::NONE] };
+        for (role, bank) in banks.iter().enumerate() {
+            if bank.bytes == 0 {
+                return Err(format!("a bank of no bytes (role {role})"));
+            }
+            let (start, end) = verity::covering_blocks(bank.map_len as u64, bank.offset, bank.bytes).ok_or("a bank past its file's end")?;
+            let base = memory.allocate(end - start)?;
+            block.parts[role] = Part { base, bytes: (end - start) as usize, start, at: (bank.offset - start) as usize, len: bank.bytes as usize };
+            // SAFETY: the mapping is alive and holds `start..end` of its file (`covering_blocks` kept it within the file); `base` is a new allocation of
+            // `end - start` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bank.map.add(start as usize), base, (end - start) as usize) };
+        }
+        Ok(LayerCopy(Arc::new(block)))
+    }
+
+    /// Check the copy's own bytes against the file's tree, bank by bank, as the same blocks the mapping's check takes ([`Bank::verify`]): `Ok(false)` when
+    /// the file has no tree.
+    fn verify(&self, banks: &[Bank; 3], priority: Priority) -> Result<bool, String> {
+        let threads = check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get()));
+        let mut checked = false;
+        for (part, bank) in self.0.parts.iter().zip(banks) {
+            let Some(verifier) = &bank.verifier else { continue };
+            // SAFETY: the allocation of `bytes` bytes is alive as long as `self`, and written only by `make`.
+            let held = unsafe { std::slice::from_raw_parts(part.base, part.bytes) };
+            verity::verify_copy_at(held, part.start, verifier, bank.offset, bank.bytes, threads, priority)?;
+            checked = true;
+        }
+        Ok(checked)
+    }
+
+    /// The layer the copy is of.
+    pub fn layer(&self) -> usize {
+        self.0.layer
+    }
+
+    /// The bytes of the bank `role` (gate, up, down), in the copy.
+    pub fn bank(&self, role: usize) -> &[u8] {
+        let part = &self.0.parts[role];
+        // SAFETY: `part.at + part.len` lies in the allocation (`make`), which lives as long as `self`.
+        unsafe { std::slice::from_raw_parts(part.base.add(part.at), part.len) }
+    }
+
+    /// The copy's three banks as the plans read them.
+    pub fn pointers(&self) -> [*const u8; 3] {
+        [0, 1, 2].map(|role| self.bank(role).as_ptr())
+    }
+
+    /// The bytes of the three banks.
+    pub fn bytes(&self) -> u64 {
+        self.0.parts.iter().map(|part| part.len as u64).sum()
+    }
+
+    /// A hold on the copy for a reader: the memory is freed when the last of them lets go, whatever the model has done with the layer.
+    pub fn lease(&self) -> LayerCopy {
+        self.clone()
+    }
+
+    /// How many hold the copy now (the model's own is one).
+    pub fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+}
+
+/// What the devices do with the host pointers of their plans: the one place a bank's bytes are read from (the slots' copies, the prompt's streaming, the
+/// CPU experts' gather, the assist's mapping).
+pub trait HostPointers {
+    /// Every plan whose gate bank is at `from[0]` reads the same banks from `to` from now on, as page-locked copies (`copy`) or as the model's mapping;
+    /// whether any plan did. It returns when nothing on the devices reads the old memory any more; an error leaves the plans where they were, or says
+    /// they may not be (the caller then keeps what they may read).
+    fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], copy: bool) -> Result<bool, String>;
+}
+
+/// The copies a model holds, a layer's one copy however many devices read the layer.
+#[derive(Default)]
+pub struct Copies {
+    held: BTreeMap<usize, LayerCopy>,
+    /// Copies a plan may still read after a move that failed, which nothing frees before the model ends.
+    stranded: Vec<LayerCopy>,
+}
+
+impl Copies {
+    /// Whether the layer's banks are held as copies.
+    pub fn holds(&self, layer: usize) -> bool {
+        self.held.contains_key(&layer)
+    }
+
+    /// The copy of the layer, if there is one.
+    pub fn get(&self, layer: usize) -> Option<&LayerCopy> {
+        self.held.get(&layer)
+    }
+
+    /// The layers held as copies, and their bytes.
+    pub fn held(&self) -> (usize, u64) {
+        (self.held.len(), self.held.values().map(LayerCopy::bytes).sum())
+    }
+
+    /// Take a layer's checked copy: every plan that reads the layer from `mapping` reads it from the copy from now on. A layer is copied once: one that is
+    /// held already is refused, and so is a layer no device holds (the copy is freed, nothing reads it). If the move fails the copy is kept, since a plan
+    /// may already read it.
+    pub fn take_over(&mut self, plans: &mut dyn HostPointers, mapping: [&[u8]; 3], copy: LayerCopy) -> Result<(), String> {
+        let layer = copy.layer();
+        if self.held.contains_key(&layer) {
+            return Err(format!("layer {layer}'s banks are copied already"));
+        }
+        if (0..3).any(|role| mapping[role].len() != copy.bank(role).len()) {
+            return Err(format!("layer {layer}'s copy is not of the banks of the mapping"));
+        }
+        match plans.repoint(mapping.map(<[u8]>::as_ptr), copy.pointers(), true) {
+            Ok(true) => {
+                self.held.insert(layer, copy);
+                Ok(())
+            }
+            Ok(false) => Err(format!("no device reads layer {layer}'s banks")),
+            Err(error) => {
+                self.stranded.push(copy);
+                Err(error)
+            }
+        }
+    }
+
+    /// Give a layer's copy back: its plans read the mapping again, which waits for everything that read the copy, and only then does the model let the copy go
+    /// (it is freed once no reader holds a lease on it). Whether the layer was held. If the move fails the copy stays held.
+    pub fn give_back(&mut self, plans: &mut dyn HostPointers, layer: usize, mapping: [&[u8]; 3]) -> Result<bool, String> {
+        let Some(copy) = self.held.get(&layer) else { return Ok(false) };
+        plans.repoint(copy.pointers(), mapping.map(<[u8]>::as_ptr), false)?;
+        self.held.remove(&layer);
+        Ok(true)
+    }
+}
+
+/// A refusal of a layer's turn that came with nothing locked, kept by the model for the plans that follow ([`BankLocks::remembering`]): the GPU's runtime
+/// said no to the very first layer, so it will not say yes to the next request's plan of 48.
+#[derive(Clone, Default)]
+pub struct Refusal(Arc<Mutex<Option<String>>>);
+
+impl Refusal {
+    /// A turn was refused with `taken` layers of its plan taken before it.
+    fn note(&self, taken: usize, stop: &Stop) {
+        if taken == 0 {
+            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stop.message());
+        }
+    }
+
+    /// Why no more is to be planned: a refusal came with nothing locked, and `locked` layers are locked still (a refusal after some were is a lack of memory
+    /// that a plan made when memory is free may get past).
+    pub fn blocks_more(&self, locked: usize) -> Option<String> {
+        if locked > 0 {
+            return None;
+        }
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+}
+
+/// How a plan registers the mapping's ranges with the runtime: the system's, but for a test's.
+#[derive(Clone, Copy)]
+struct Registrar {
+    lock: fn(usize, &[u8]) -> Result<(), String>,
+    unlock: fn(&[u8]),
+}
+
+impl Registrar {
+    const SYSTEM: Registrar = Registrar { lock: crate::gpu::lock_host_range, unlock: crate::gpu::unlock_host_range };
+}
+
 /// The threads that check a layer's banks on a machine of `cores`: every core for a locking that nothing waits behind, and at most a quarter of them
 /// (one at least) for the locking behind "ready", which leaves the rest to the request's CPU experts and the memory bandwidth they use.
 pub(crate) fn check_threads(priority: Priority, cores: usize) -> usize {
@@ -99,18 +383,35 @@ pub struct Locked {
     /// The bytes of its banks.
     pub bytes: u64,
     banks: [Bank; 3],
+    /// The copy mode: the layer's page-locked copies, checked, that nothing reads yet.
+    copy: Option<LayerCopy>,
+    /// The register mode: how the banks were registered, to give the registrations up.
+    registrar: Option<Registrar>,
 }
 
 // SAFETY: as [`BankLocks`]'s: the banks address mappings that the holder keeps alive.
 unsafe impl Send for Locked {}
 
 impl Locked {
-    /// Give up the locks of a layer the model will not take (the engine ended meanwhile).
+    /// Give up the locks of a layer the model will not take (the engine ended meanwhile): the registrations of its banks, or its copies, which no plan reads
+    /// yet and which are freed.
     ///
     /// # Safety
     /// The weights the plan was made from must still be mapped.
     pub unsafe fn unlock(self) {
-        BankLocks::release(&self.banks);
+        if let Some(registrar) = self.registrar {
+            BankLocks::release(&registrar, &self.banks);
+        }
+    }
+
+    /// Whether the layer was copied, not registered in place.
+    pub fn is_copy(&self) -> bool {
+        self.copy.is_some()
+    }
+
+    /// The layer's copies, for the model to take ([`Copies::take_over`]); none for a layer that was registered in place.
+    pub fn take_copy(&mut self) -> Option<LayerCopy> {
+        self.copy.take()
     }
 }
 
@@ -120,14 +421,22 @@ pub enum Stop {
     /// The runtime would not page-lock the layer's banks (the commit or the memory is short): the layers that are locked stay so, the rest are
     /// left to the page cache.
     Refused { layer: usize, error: String },
+    /// The runtime would not give page-locked memory for the copies of the layer's banks (the commit or the memory is short).
+    NotCopied { layer: usize, error: String },
     /// The layer's banks, page-locked, do not match the file's tree: the model's bytes are not those that were pinned.
     Unverified { layer: usize, error: String },
 }
 
 impl Stop {
+    /// Whether the runtime refused the layer (it did not fail the check).
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Stop::Refused { .. } | Stop::NotCopied { .. })
+    }
+
     pub fn message(&self) -> String {
         match self {
             Stop::Refused { layer, error } => format!("registering layer {layer}'s banks failed ({error})"),
+            Stop::NotCopied { layer, error } => format!("copying layer {layer}'s banks into page-locked memory failed ({error})"),
             Stop::Unverified { layer, error } => format!("Straydog model bytes do not verify: layer {layer}'s banks ({error})"),
         }
     }
@@ -144,6 +453,13 @@ pub struct BankLocks {
     halt: Arc<AtomicBool>,
     /// The bytes of K/V that the context's first 64K tokens still have to grow, which the model keeps up as its K/V grows ([`locking_room`]).
     kv_ahead: Arc<AtomicU64>,
+    /// The copy mode: where the copies are made. None: the mapping itself is registered ([`LockMode::Register`]).
+    copies: Option<Arc<dyn HostMemory>>,
+    /// How the mapping is registered in the register mode.
+    registrar: Registrar,
+    /// The layers of this plan handed out so far, and where a refusal is kept for the model ([`Refusal`]).
+    taken: usize,
+    refusal: Option<Refusal>,
 }
 
 // SAFETY: the banks hold the address of the weights' mappings, which the thread that uses them keeps alive ([`BankLocks::lock_next`]).
@@ -151,7 +467,34 @@ unsafe impl Send for BankLocks {}
 
 impl BankLocks {
     pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
-        BankLocks { layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default() }
+        BankLocks {
+            layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default(), copies: None, registrar: Registrar::SYSTEM, taken: 0,
+            refusal: None,
+        }
+    }
+
+    /// The plan in the copy mode ([`LockMode::Copy`]): its turns copy the banks into `memory` and check the copies, and register nothing.
+    pub(crate) fn copying(mut self, memory: Arc<dyn HostMemory>) -> BankLocks {
+        self.copies = Some(memory);
+        self
+    }
+
+    /// The plan keeps a refusal that came with nothing locked in `refusal`, for the model's later plans ([`Refusal::blocks_more`]).
+    pub(crate) fn remembering(mut self, refusal: Refusal) -> BankLocks {
+        self.refusal = Some(refusal);
+        self
+    }
+
+    /// Tests only: the plan registers with `registrar` in place of the runtime.
+    #[cfg(test)]
+    fn registering_with(mut self, registrar: Registrar) -> BankLocks {
+        self.registrar = registrar;
+        self
+    }
+
+    /// How the plan page-locks a layer.
+    pub fn mode(&self) -> LockMode {
+        if self.copies.is_some() { LockMode::Copy } else { LockMode::Register }
     }
 
     /// The plan tied to a model: it stops when `halt` is set, and `kv_ahead` says what K/V is still to grow ([`locking_room`]).
@@ -240,12 +583,30 @@ impl BankLocks {
             let ranges: Vec<(usize, usize)> = next.iter().map(|bank| unsafe { bank.range() }).map(|range| (range.as_ptr() as usize, range.len())).collect();
             let _ = crate::host::prefetch(&ranges);
         }
+        let turn = match self.copies.clone() {
+            // SAFETY: the caller's.
+            Some(memory) => unsafe { Self::copy_turn(&memory, layer, banks, priority) },
+            // SAFETY: the caller's.
+            None => unsafe { self.register_turn(layer, banks, priority) },
+        };
+        Some(turn.inspect(|_| self.taken += 1).inspect_err(|stop| {
+            if let (true, Some(refusal)) = (stop.is_refusal(), &self.refusal) {
+                refusal.note(self.taken, stop);
+            }
+        }))
+    }
+
+    /// The register mode's turn: page-lock the layer's banks in the mapping, then check them locked.
+    ///
+    /// # Safety
+    /// As [`BankLocks::lock_next`].
+    unsafe fn register_turn(&self, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
         let mut locked = 0;
         for bank in &banks {
             // SAFETY: the caller's.
-            if let Err(error) = crate::gpu::lock_host_range(self.ordinal, unsafe { bank.range() }) {
-                Self::release(&banks[..locked]);
-                return Some(Err(Stop::Refused { layer, error }));
+            if let Err(error) = (self.registrar.lock)(self.ordinal, unsafe { bank.range() }) {
+                Self::release(&self.registrar, &banks[..locked]);
+                return Err(Stop::Refused { layer, error });
             }
             locked += 1;
         }
@@ -254,19 +615,35 @@ impl BankLocks {
         for bank in &banks {
             // SAFETY: the caller's, and the bank is locked above.
             if let Err(error) = unsafe { bank.verify(priority) } {
-                Self::release(&banks);
-                return Some(Err(Stop::Unverified { layer, error }));
+                Self::release(&self.registrar, &banks);
+                return Err(Stop::Unverified { layer, error });
             }
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
-        Some(Ok(Locked { layer, bytes, banks }))
+        Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar) })
     }
 
-    /// Give up the page locks of `banks`, taken by [`BankLocks::lock_next`].
-    fn release(banks: &[Bank]) {
+    /// The copy mode's turn: copy the layer's banks into page-locked memory, then check the copies against the file's tree. The mapping is registered
+    /// nowhere, and the copies are read by no one until the model takes them. A copy that does not match is freed as it drops.
+    ///
+    /// # Safety
+    /// As [`BankLocks::lock_next`].
+    unsafe fn copy_turn(memory: &Arc<dyn HostMemory>, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
+        // SAFETY: the caller's.
+        let copy = unsafe { LayerCopy::make(memory, layer, &banks) }.map_err(|error| Stop::NotCopied { layer, error })?;
+        // Copied, the bytes are the copy's own and cannot change: with the shards' verity trees, check THEM, not the mapping they came from.
+        if let Err(error) = copy.verify(&banks, priority) {
+            return Err(Stop::Unverified { layer, error });
+        }
+        let bytes = banks.iter().map(|bank| bank.bytes).sum();
+        Ok(Locked { layer, bytes, banks, copy: Some(copy), registrar: None })
+    }
+
+    /// Give up the registrations of `banks`, made by [`BankLocks::lock_next`].
+    fn release(registrar: &Registrar, banks: &[Bank]) {
         for bank in banks {
             // SAFETY: the mapping is alive for the call that took the locks and for the one that gives them up.
-            crate::gpu::unlock_host_range(unsafe { bank.range() });
+            (registrar.unlock)(unsafe { bank.range() });
         }
     }
 }
@@ -694,5 +1071,455 @@ mod tests {
         drop(map);
         drop(file);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- the copy mode ----
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A file of 6 MiB and a few bytes, with its tree built, and its mapping. `tamper` changes a byte of the file after the tree was built.
+    struct Fixture {
+        path: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        map: Option<memmap2::Mmap>,
+        verifier: Option<Arc<Verifier>>,
+    }
+
+    const SIZE: usize = (6 << 20) + 123;
+    /// Three banks of the file: starts inside a block, and the last reaches the file's end (a partial last block).
+    const SPANS: [(u64, u64); 3] = [(1000, 1_100_001), (2_000_003, 1_300_001), (SIZE as u64 - 900_001, 900_001)];
+
+    impl Fixture {
+        fn new(label: &str, tamper: Option<usize>) -> Fixture {
+            let mut data: Vec<u8> = (0..SIZE).map(|at| (at * 37 % 251) as u8).collect();
+            let path = std::env::temp_dir().join(format!("straydog-copy-{label}-{}.bin", std::process::id()));
+            let tree = path.with_extension("tree");
+            std::fs::write(&path, &data).unwrap();
+            let digest = verity::build(&std::fs::File::open(&path).unwrap(), &tree, &|_| {}).unwrap();
+            if let Some(at) = tamper {
+                data[at] ^= 1;
+                std::fs::write(&path, &data).unwrap();
+            }
+            let verifier = Arc::new(Verifier::open(&tree, SIZE as u64, &digest, 4 * verity::BLOCK).unwrap());
+            let file = std::fs::File::open(&path).unwrap();
+            // SAFETY: a file of this test's own, which nothing changes while it is mapped.
+            let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+            Fixture { path, tree, map: Some(map), verifier: Some(verifier) }
+        }
+
+        fn map(&self) -> &memmap2::Mmap {
+            self.map.as_ref().unwrap()
+        }
+
+        /// The three banks of [`SPANS`], with the file's tree or without.
+        fn banks(&self, tree: bool) -> [Bank; 3] {
+            SPANS.map(|(offset, bytes)| Bank::new(self.map().as_ptr(), self.map().len(), offset, bytes, tree.then(|| self.verifier.clone().unwrap())))
+        }
+
+        /// The three banks as the mapping holds them.
+        fn mapping(&self) -> [&[u8]; 3] {
+            SPANS.map(|(offset, bytes)| &self.map()[offset as usize..(offset + bytes) as usize])
+        }
+
+        /// Everything that holds the file is dropped by now: remove it.
+        fn finish(mut self) {
+            self.map.take();
+            self.verifier.take();
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.tree);
+        }
+    }
+
+    /// Host memory from the heap, in place of the runtime's page-locked memory, that counts what it gives and takes back and can refuse.
+    #[derive(Default)]
+    struct HeapMemory {
+        live: Mutex<BTreeMap<usize, std::alloc::Layout>>,
+        attempts: AtomicUsize,
+        allocated: AtomicUsize,
+        freed: AtomicUsize,
+        /// The number of the allocation from which this refuses (1 the first; 0 never).
+        refuse_from: AtomicUsize,
+    }
+
+    impl HostMemory for HeapMemory {
+        fn allocate(&self, bytes: u64) -> Result<*mut u8, String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            let from = self.refuse_from.load(Ordering::SeqCst);
+            if from != 0 && attempt >= from {
+                return Err("out of memory".into());
+            }
+            let layout = std::alloc::Layout::from_size_align(bytes as usize, 4096).unwrap();
+            // SAFETY: a layout of a nonzero size.
+            let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!pointer.is_null());
+            self.live.lock().unwrap().insert(pointer as usize, layout);
+            self.allocated.fetch_add(1, Ordering::SeqCst);
+            Ok(pointer)
+        }
+
+        unsafe fn free(&self, pointer: *mut u8) {
+            let layout = self.live.lock().unwrap().remove(&(pointer as usize)).expect("memory is freed once, and only what was allocated");
+            // (what a reader that outlived its copy would see)
+            // SAFETY: the allocation of this layout, still ours.
+            unsafe {
+                std::ptr::write_bytes(pointer, 0xDD, layout.size());
+                std::alloc::dealloc(pointer, layout);
+            }
+            self.freed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl HeapMemory {
+        fn live(&self) -> usize {
+            self.live.lock().unwrap().len()
+        }
+        fn allocated(&self) -> usize {
+            self.allocated.load(Ordering::SeqCst)
+        }
+        fn freed(&self) -> usize {
+            self.freed.load(Ordering::SeqCst)
+        }
+        fn refusing_from(attempt: usize) -> Arc<HeapMemory> {
+            let memory = HeapMemory::default();
+            memory.refuse_from.store(attempt, Ordering::SeqCst);
+            Arc::new(memory)
+        }
+    }
+
+    /// Devices with plans, as the group has them: each plan reads a layer's banks from three addresses.
+    struct Devices {
+        plans: Vec<Vec<[*const u8; 3]>>,
+        fail: bool,
+    }
+
+    impl HostPointers for Devices {
+        fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], _copy: bool) -> Result<bool, String> {
+            if self.fail {
+                return Err("a device would not move the plan".into());
+            }
+            let mut found = false;
+            for plan in self.plans.iter_mut().flatten() {
+                if plan[0] == from[0] {
+                    *plan = to;
+                    found = true;
+                }
+            }
+            Ok(found)
+        }
+    }
+
+    fn pointers(banks: [&[u8]; 3]) -> [*const u8; 3] {
+        banks.map(<[u8]>::as_ptr)
+    }
+
+    /// A copy of layer 7 made by a plan in the copy mode.
+    fn copied(fixture: &Fixture, memory: &Arc<HeapMemory>) -> LayerCopy {
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).copying(memory.clone());
+        // SAFETY: the fixture keeps the mapping alive.
+        let mut locked = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        locked.take_copy().expect("a copy")
+    }
+
+    /// Decides: the banks are copied where any GPU says it cannot register host memory read-only, or the variable says `0` whatever they say, and are
+    /// registered in place otherwise, also where the runtime cannot say; the reason names the GPUs or the variable.
+    #[test]
+    fn the_banks_are_copied_where_a_gpu_cannot_register_them_read_only_or_the_variable_says_so() {
+        assert_eq!(lock_mode(None, &[(0, Some(true)), (1, Some(true))]), (LockMode::Register, None));
+        assert_eq!(lock_mode(None, &[(0, None)]), (LockMode::Register, None), "a runtime that cannot say is taken as able");
+        assert_eq!(lock_mode(None, &[]), (LockMode::Register, None));
+        let (mode, why) = lock_mode(None, &[(0, Some(false)), (1, Some(false))]);
+        assert_eq!(mode, LockMode::Copy);
+        assert!(why.as_deref().unwrap().starts_with("GPU 0 and GPU 1 do not support registering host memory read-only"), "{why:?}");
+        let (mode, why) = lock_mode(None, &[(0, Some(true)), (1, Some(false))]);
+        assert_eq!(mode, LockMode::Copy, "one that cannot is enough: the registrations are portable");
+        assert!(why.as_deref().unwrap().starts_with("GPU 1 does not support"), "{why:?}");
+        // the variable: on a GPU that supports it, and where the runtime cannot say (HIP)
+        for devices in [vec![(0, Some(true))], vec![(0, None)], vec![]] {
+            let (mode, why) = lock_mode(Some("0"), &devices);
+            assert_eq!(mode, LockMode::Copy, "{devices:?}");
+            assert!(why.as_deref().unwrap().starts_with("STRAYDOG_HOST_REGISTER_READ_ONLY=0"), "{why:?}");
+        }
+        assert_eq!(lock_mode(Some(" 0 "), &[(0, Some(true))]).0, LockMode::Copy);
+        // (anything else leaves it to the GPUs)
+        for value in ["1", "", "copy"] {
+            assert_eq!(lock_mode(Some(value), &[(0, Some(true))]), (LockMode::Register, None), "{value:?}");
+            assert_eq!(lock_mode(Some(value), &[(0, Some(false))]).0, LockMode::Copy, "{value:?}");
+        }
+    }
+
+    /// Decides: a layer's turn in the copy mode makes one copy of each bank, equal to the mapping's bytes and apart from them, checks the copies against
+    /// the file's tree, registers the mapping nowhere, and frees the copies with their last holder.
+    #[test]
+    fn a_copy_turn_copies_the_banks_whole_and_checks_the_copies() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn lock(_: usize, _: &[u8]) -> Result<(), String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unlock(_: &[u8]) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        let fixture = Fixture::new("turn", None);
+        let memory = Arc::new(HeapMemory::default());
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).copying(memory.clone()).registering_with(Registrar { lock, unlock });
+        assert_eq!(locks.mode(), LockMode::Copy);
+        // SAFETY: the fixture keeps the mapping alive.
+        let mut locked = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        assert!(locked.is_copy());
+        assert_eq!((locked.layer, locked.bytes), (7, SPANS.iter().map(|span| span.1).sum::<u64>()));
+        let copy = locked.take_copy().expect("the copy");
+        assert!(!locked.is_copy(), "the copy is the model's now");
+        assert_eq!(copy.layer(), 7);
+        for (role, mapped) in fixture.mapping().iter().enumerate() {
+            assert_eq!(copy.bank(role), *mapped, "bank {role}'s bytes");
+            assert_ne!(copy.bank(role).as_ptr(), mapped.as_ptr(), "a copy, not the mapping");
+        }
+        assert_eq!(copy.bytes(), locked.bytes);
+        assert_eq!((memory.allocated(), memory.live(), memory.freed()), (3, 3, 0), "one allocation a bank");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "the mapping is registered nowhere");
+        // SAFETY: the fixture keeps the mapping alive; a layer whose copy was taken gives nothing up.
+        unsafe { locked.unlock() };
+        assert_eq!((CALLS.load(Ordering::SeqCst), memory.live()), (0, 3));
+        // SAFETY: as above.
+        assert!(unsafe { locks.lock_next() }.is_none(), "the plan had one layer");
+        drop(copy);
+        assert_eq!((memory.live(), memory.freed()), (0, 3), "freed with the last holder");
+        drop(locks);
+        fixture.finish();
+    }
+
+    /// Decides: a mapping whose bytes do not match the file's tree, anywhere in a bank, is `Unverified` once copied, frees every copy the turn made, and is
+    /// not a refusal that the model remembers; the same bytes untampered pass.
+    #[test]
+    fn a_mapping_that_does_not_match_the_tree_is_unverified_and_its_copies_are_freed() {
+        for (label, tamper) in [("a", 1500), ("b", 2_500_000), ("c", SIZE - 10), ("d", SPANS[2].0 as usize)] {
+            let fixture = Fixture::new(&format!("tampered-{label}"), Some(tamper));
+            let memory = Arc::new(HeapMemory::default());
+            let refusal = Refusal::default();
+            let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).copying(memory.clone()).remembering(refusal.clone());
+            // SAFETY: the fixture keeps the mapping alive.
+            let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("a layer that does not verify");
+            assert!(matches!(stop, Stop::Unverified { layer: 7, .. }), "{stop:?} for a byte changed at {tamper}");
+            assert!(stop.message().starts_with("Straydog model bytes do not verify: layer 7's banks"), "{}", stop.message());
+            assert_eq!((memory.allocated(), memory.live(), memory.freed()), (3, 0, 3), "the copies are freed");
+            assert_eq!(refusal.blocks_more(0), None, "a failed check is not a refusal");
+            drop(locks);
+            fixture.finish();
+        }
+    }
+
+    /// Decides: the check is of the copy's own bytes: a byte of a copy changed after it was made fails, and restored passes, though the mapping it came
+    /// from is intact; a bank of a file without a tree is not checked.
+    #[test]
+    fn a_copy_changed_after_it_was_made_does_not_pass_the_check() {
+        let fixture = Fixture::new("changed", None);
+        let memory: Arc<dyn HostMemory> = Arc::new(HeapMemory::default());
+        let banks = fixture.banks(true);
+        // SAFETY: the fixture keeps the mapping alive.
+        let copy = unsafe { LayerCopy::make(&memory, 7, &banks) }.unwrap();
+        assert_eq!(copy.verify(&banks, Priority::Normal), Ok(true));
+        for role in 0..3 {
+            let part = &copy.0.parts[role];
+            // (the bank's first byte, its last, and a byte of the blocks around it that the bank does not use)
+            for at in [part.at, part.at + part.len - 1, 0] {
+                // SAFETY: inside the allocation, which nothing reads meanwhile.
+                unsafe { *part.base.add(at) ^= 1 };
+                assert!(copy.verify(&banks, Priority::Normal).is_err(), "bank {role}, byte {at} of its blocks changed");
+                // SAFETY: as above.
+                unsafe { *part.base.add(at) ^= 1 };
+                assert_eq!(copy.verify(&banks, Priority::Normal), Ok(true), "restored");
+            }
+        }
+        assert_eq!(copy.verify(&fixture.banks(false), Priority::Normal), Ok(false), "no tree: nothing to check against");
+        drop(copy);
+        drop(banks);
+        fixture.finish();
+    }
+
+    /// Decides: a copy that cannot be made frees the banks already copied and ends the turn as a refusal; the model remembers a refusal that came with nothing
+    /// locked (so that no plan is made again after each request), and does not remember one that came after layers were taken.
+    #[test]
+    fn a_refused_copy_frees_what_was_made_and_the_first_refusal_is_remembered() {
+        let fixture = Fixture::new("refused", None);
+        // the second bank's allocation is refused
+        let memory = HeapMemory::refusing_from(2);
+        let refusal = Refusal::default();
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true)), (6, fixture.banks(true))], 0, 1 << 30)
+            .copying(memory.clone()).remembering(refusal.clone());
+        assert_eq!(refusal.blocks_more(0), None);
+        // SAFETY: the fixture keeps the mapping alive.
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
+        assert_eq!(stop, Stop::NotCopied { layer: 7, error: "out of memory".into() });
+        assert!(stop.is_refusal());
+        assert_eq!(stop.message(), "copying layer 7's banks into page-locked memory failed (out of memory)");
+        assert_eq!((memory.allocated(), memory.live(), memory.freed()), (1, 0, 1), "the first bank's copy is freed");
+        assert_eq!(refusal.blocks_more(0), Some(stop.message()), "nothing was locked: remembered");
+        assert_eq!(refusal.blocks_more(3), None, "layers locked meanwhile: the memory may be there next time");
+        drop(locks);
+        // a refusal after a layer was taken is not remembered: the first layer takes allocations 1 to 3, the second's first is the 4th
+        let memory = HeapMemory::refusing_from(4);
+        let refusal = Refusal::default();
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true)), (6, fixture.banks(true))], 0, 1 << 30)
+            .copying(memory.clone()).remembering(refusal.clone());
+        // SAFETY: as above.
+        let first = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
+        assert!(matches!(stop, Stop::NotCopied { layer: 6, .. }));
+        assert_eq!(refusal.blocks_more(0), None, "a layer was taken before it");
+        drop((first, locks));
+        assert_eq!(memory.live(), 0);
+        fixture.finish();
+    }
+
+    /// Decides: where registration is supported the plan is what it was: it registers the three ranges of the mapping, makes no copy, gives the
+    /// registrations up for a layer it is told to let go, and a refusal gives up those it made and is remembered.
+    #[test]
+    fn the_register_mode_registers_the_mapping_and_copies_nothing() {
+        static RECORD: Mutex<Vec<(&str, usize, usize)>> = Mutex::new(Vec::new());
+        static REFUSE_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        fn lock(_: usize, range: &[u8]) -> Result<(), String> {
+            let mut record = RECORD.lock().unwrap();
+            if record.iter().filter(|entry| entry.0 == "lock").count() == REFUSE_AT.load(Ordering::SeqCst) {
+                return Err("not supported".into());
+            }
+            record.push(("lock", range.as_ptr() as usize, range.len()));
+            Ok(())
+        }
+        fn unlock(range: &[u8]) {
+            RECORD.lock().unwrap().push(("unlock", range.as_ptr() as usize, range.len()));
+        }
+        let fixture = Fixture::new("register", None);
+        let base = fixture.map().as_ptr() as usize;
+        let ranges: Vec<(usize, usize)> = SPANS.iter().map(|&(offset, bytes)| (base + offset as usize, bytes as usize)).collect();
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true)), (6, fixture.banks(true))], 0, 1 << 30).registering_with(Registrar { lock, unlock });
+        assert_eq!(locks.mode(), LockMode::Register);
+        // SAFETY: the fixture keeps the mapping alive.
+        let locked = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        assert!(!locked.is_copy());
+        assert_eq!((locked.layer, locked.bytes), (7, SPANS.iter().map(|span| span.1).sum::<u64>()));
+        let locks_made: Vec<(&str, usize, usize)> = ranges.iter().map(|&(address, bytes)| ("lock", address, bytes)).collect();
+        assert_eq!(*RECORD.lock().unwrap(), locks_made, "the mapping's three ranges, in the order of the banks");
+        // SAFETY: the fixture keeps the mapping alive.
+        unsafe { locked.unlock() };
+        let released: Vec<(&str, usize, usize)> = ranges.iter().map(|&(address, bytes)| ("unlock", address, bytes)).collect();
+        assert_eq!(RECORD.lock().unwrap()[3..], released[..], "and given up for a layer the model will not take");
+        // the next layer is refused at its second bank: the first is given up, the stop is a refusal, remembered
+        RECORD.lock().unwrap().clear();
+        REFUSE_AT.store(1, Ordering::SeqCst);
+        drop(locks);
+        let refusal = Refusal::default();
+        let mut locks = BankLocks::new(vec![(6, fixture.banks(true))], 0, 1 << 30).remembering(refusal.clone()).registering_with(Registrar { lock, unlock });
+        // SAFETY: as above.
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
+        assert_eq!(stop, Stop::Refused { layer: 6, error: "not supported".into() });
+        assert_eq!(*RECORD.lock().unwrap(), vec![("lock", ranges[0].0, ranges[0].1), ("unlock", ranges[0].0, ranges[0].1)]);
+        assert_eq!(refusal.blocks_more(0), Some(stop.message()));
+        drop(locks);
+        fixture.finish();
+    }
+
+    /// Decides: two devices that both read a layer read ONE copy of it (the copy is made once and every plan is moved to it), a layer is not copied a
+    /// second time, and a layer no device reads takes no copy.
+    #[test]
+    fn two_devices_that_read_a_layer_read_one_copy_of_it() {
+        let fixture = Fixture::new("shared", None);
+        let memory = Arc::new(HeapMemory::default());
+        let mapping = pointers(fixture.mapping());
+        let mut devices = Devices { plans: vec![vec![mapping], vec![mapping, [1 as *const u8; 3]]], fail: false };
+        let mut copies = Copies::default();
+        let copy = copied(&fixture, &memory);
+        let at = copy.pointers();
+        copies.take_over(&mut devices, fixture.mapping(), copy).unwrap();
+        assert_eq!(devices.plans, vec![vec![at], vec![at, [1 as *const u8; 3]]], "both devices read the same copy; another layer's plan is left alone");
+        assert_eq!((memory.allocated(), memory.live()), (3, 3), "one copy for both");
+        assert_eq!(copies.held(), (1, SPANS.iter().map(|span| span.1).sum::<u64>()));
+        assert!(copies.holds(7) && !copies.holds(6));
+        // a second copy of the layer is refused, and freed
+        let again = copied(&fixture, &memory);
+        assert_eq!(memory.live(), 6);
+        let error = copies.take_over(&mut devices, fixture.mapping(), again).unwrap_err();
+        assert!(error.contains("copied already"), "{error}");
+        assert_eq!((memory.live(), memory.freed()), (3, 3), "the second copy is freed");
+        assert_eq!(devices.plans[0][0], at, "and moved nothing");
+        // a layer that no device reads
+        let mut nobody = Devices { plans: vec![vec![[2 as *const u8; 3]]], fail: false };
+        let mut other = Copies::default();
+        let error = other.take_over(&mut nobody, fixture.mapping(), copied(&fixture, &memory)).unwrap_err();
+        assert!(error.contains("no device reads layer 7"), "{error}");
+        assert_eq!((memory.live(), other.held().0), (3, 0), "freed, not held");
+        drop(copies);
+        assert_eq!(memory.live(), 0, "the copy goes with the model");
+        fixture.finish();
+    }
+
+    /// Decides: a give-back points the layer's plans back at the mapping first and then lets the copy go: freed at once where nothing reads it, and not
+    /// while a reader (the CPU's gather) holds it, which reads it intact to the end; after it, the plans are on the mapping.
+    #[test]
+    fn a_give_back_frees_the_copy_only_after_the_last_reader_and_points_the_plans_back() {
+        let fixture = Fixture::new("giveback", None);
+        let memory = Arc::new(HeapMemory::default());
+        let mapping = pointers(fixture.mapping());
+        let mut devices = Devices { plans: vec![vec![mapping]], fail: false };
+        let mut copies = Copies::default();
+        // no reader: freed at once
+        copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
+        assert_eq!(copies.give_back(&mut devices, 6, fixture.mapping()), Ok(false), "a layer that is not held");
+        assert_eq!(copies.give_back(&mut devices, 7, fixture.mapping()), Ok(true));
+        assert_eq!(devices.plans, vec![vec![mapping]], "back on the mapping");
+        assert_eq!((memory.live(), memory.freed()), (0, 3));
+        assert!(!copies.holds(7));
+        // a reader on another thread reads the copy while the give-back runs
+        copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
+        let lease = copies.get(7).unwrap().lease();
+        assert_eq!(lease.holders(), 2);
+        let expected: Vec<Vec<u8>> = fixture.mapping().iter().map(|bank| bank.to_vec()).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    for (role, bytes) in expected.iter().enumerate() {
+                        assert!(lease.bank(role) == &bytes[..], "the copy changed under a reader (bank {role})");
+                    }
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        assert_eq!(copies.give_back(&mut devices, 7, fixture.mapping()), Ok(true));
+        assert_eq!(devices.plans, vec![vec![mapping]], "the plans are back on the mapping");
+        assert!(!copies.holds(7));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!((memory.live(), memory.freed()), (3, 3), "the reader still holds the copy: not freed (the first layer's three are)");
+        stop.store(true, Ordering::SeqCst);
+        assert!(reader.join().unwrap() > 0);
+        assert_eq!((memory.live(), memory.freed()), (0, 6), "freed when the reader let go");
+        fixture.finish();
+    }
+
+    /// Decides: a move that fails never frees what a plan may still read: a failed give-back keeps the copy held, and a copy whose take-over failed is
+    /// kept until the model ends.
+    #[test]
+    fn a_failed_move_keeps_the_copy() {
+        let fixture = Fixture::new("failed", None);
+        let memory = Arc::new(HeapMemory::default());
+        let mapping = pointers(fixture.mapping());
+        let mut devices = Devices { plans: vec![vec![mapping]], fail: false };
+        let mut copies = Copies::default();
+        copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
+        devices.fail = true;
+        assert!(copies.give_back(&mut devices, 7, fixture.mapping()).is_err());
+        assert!(copies.holds(7));
+        assert_eq!((memory.live(), memory.freed()), (3, 0), "kept");
+        // a take-over that fails
+        let mut other = Copies::default();
+        assert!(other.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).is_err());
+        assert_eq!((other.held().0, memory.live(), memory.freed()), (0, 6, 0), "not held, and not freed");
+        drop(other);
+        assert_eq!((memory.live(), memory.freed()), (3, 3), "freed with the model");
+        drop(copies);
+        assert_eq!(memory.live(), 0);
+        fixture.finish();
     }
 }

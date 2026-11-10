@@ -24,11 +24,14 @@ pub use tree::{prepare, ProcessTree};
 /// STRAYDOG_DIRECT (the GPU queues written directly), STRAYDOG_ENGRAM (the engram table Qwen3.8 reads), STRAYDOG_EXPERT_FLOOR (speed
 /// first's router weight floor), STRAYDOG_CPU_INT8 (=0: the CPU experts' F32 path), STRAYDOG_CPU_AVX512 (=0: their kernels of a
 /// CPU without AVX-512, to measure those on one with it), STRAYDOG_PROMPT_CPU (=0: a prompt batch streams every expert beyond the
-/// slots, none to the CPU) and STRAYDOG_PEER_DIRECT (=0: two GPUs linked through host memory, as on Windows). One list for both: a switch named on one
+/// slots, none to the CPU), STRAYDOG_PEER_DIRECT (=0: two GPUs linked through host memory, as on Windows) and STRAYDOG_HOST_REGISTER_READ_ONLY
+/// (=0: the GPUs are taken as unable to register host memory read-only, so the expert banks are page-locked as copies, to try that on a GPU that
+/// can). One list for both: a switch named on one
 /// system's list alone never reached the other's worker (speed first and the engram table did nothing in a Linux worker).
-pub const ENGINE_VARIABLES: [&str; 12] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 13] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
-                                         "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT"];
+                                         "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
+                                         "STRAYDOG_HOST_REGISTER_READ_ONLY"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;

@@ -194,6 +194,8 @@ struct ResidentMoe {
     bool hybrid=false;
     bool layer_prefill=false;   // this layer's routed banks are held for every prompt chunk
     const uint8_t* host[3]{};
+    // host points at the engine's page-locked copies of the banks, not at the model's mapping (sd_hybrid_repoint): nothing is read ahead of them.
+    bool host_copy=false;
     size_t host_bytes[3]{};
     std::vector<int32_t> slot_of;
     uint8_t slot_group=0;   // the slots its experts take (expert_slots_carve)
@@ -650,6 +652,7 @@ struct Device {
     hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
+    std::atomic<uint32_t> bank_readers{0};   // the CPU's workers reading banks' bytes now (BankReading): sd_hybrid_repoint waits for none
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
     uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
@@ -732,6 +735,15 @@ struct Device {
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
         for (auto event : {kv_released, kv_prefetched, side_fork, side_join}) if (event) cleanup(hipEventDestroy(event));
     }
+};
+// Held while the CPU's workers read the bytes of a layer's banks (the CPU experts' routes, a gather into the staging mirror): the engine moves a layer's
+// banks to other memory and frees the old only after none is held (sd_hybrid_repoint).
+struct BankReading {
+    std::atomic<uint32_t>& count;
+    explicit BankReading(Device& d) : count(d.bank_readers) { count.fetch_add(1); }
+    ~BankReading() { count.fetch_sub(1); }
+    BankReading(const BankReading&) = delete;
+    BankReading& operator=(const BankReading&) = delete;
 };
 
 __device__ float half_at(const uint8_t* p) {
@@ -2211,6 +2223,39 @@ int sd_hybrid_unmap(void* handle,const void* gate,uint64_t* found) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: the engine
+// holds page-locked copies of the banks where the GPU cannot page-lock the model's read-only mapping (`copy` 1), and points the plan back at the mapping
+// before it frees them (`copy` 0). Nothing may read the old memory when this returns: the swap copies in flight (the device's thread and the copy
+// stream) and the kernels that read the banks in place or hold the view in a captured graph (the device) are waited for, and so are the CPU's workers
+// (BankReading; they run inside the engine's calls on this thread, so a count above zero is a fault, and the plan is left as it was). The plan's view
+// for the GPU's assist is dropped: sd_hybrid_assist maps the new memory. `found` is 1 where this device holds the plan.
+int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,int copy,uint64_t* found) {
+    try {
+        if (!from || !host || !host[0] || !host[1] || !host[2] || !found) throw std::runtime_error("invalid hybrid repoint");
+        auto& d=device(handle);
+        *found=0;
+        ResidentMoe* target=nullptr;
+        for (auto& item : d.resident)
+            if (item.second->hybrid && item.second->host[0]==from) { target=item.second.get(); break; }
+        if (!target) return 0;
+        *found=1;
+        if (d.copier) d.copier->wait();
+        if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+        hybrid_drop_graphs(d);   // (it waits for the stream: no kernel is still reading the banks)
+        check(hipDeviceSynchronize());
+        for (unsigned waited=0;d.bank_readers.load()!=0;++waited) {
+            if (waited>5000) throw std::runtime_error("the CPU's experts are still reading the layer's banks");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (size_t role=0;role<3;++role) { target->mapped[role]=nullptr; target->host[role]=host[role]; }
+        target->host_copy=copy!=0;
+        target->prefetched.clear();
+        bool any=false;
+        for (const auto& item : d.resident) any|=item.second->hybrid && item.second->mapped[0];
+        d.hint_experts=!any;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The assist level alone, once sd_hybrid_assist has mapped the banks (mapping them again is the dear part of that call). A level past
 // the cap is refused.
 int sd_hybrid_assist_level(void* handle,uint32_t assist) {
@@ -2248,6 +2293,28 @@ int sd_host_register_on(int ordinal,void* pointer,uint64_t bytes) {
     try {
         check(hipSetDevice(ordinal));
         return sd_host_register(pointer,bytes);
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped): the engine's copies of the expert banks where
+// the GPU cannot register the model's read-only mapping (sd_hybrid_repoint). Allocated under the context of device `ordinal`, from any thread.
+int sd_host_alloc_on(int ordinal,uint64_t bytes,void** pointer) {
+    try {
+        if (!pointer || !bytes) throw std::runtime_error("invalid host allocation");
+        *pointer=nullptr;
+        check(hipSetDevice(ordinal));
+        void* value=nullptr;
+        check(hipHostMalloc(&value,size_t(bytes),hipHostMallocPortable|hipHostMallocMapped));
+        *pointer=value;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Give back memory sd_host_alloc_on returned, once nothing reads it.
+int sd_host_free(int ordinal,void* pointer) {
+    try {
+        if (!pointer) throw std::runtime_error("invalid host free");
+        check(hipSetDevice(ordinal));
+        check(hipHostFree(pointer));
+        return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Page-lock host memory that devices may also write (downloads into it).

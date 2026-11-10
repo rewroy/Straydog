@@ -149,6 +149,19 @@ unsafe extern "C" {
     pub fn sd_host_unregister(pointer: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_host_alloc_on(
+        ordinal: ::std::os::raw::c_int,
+        bytes: u64,
+        pointer: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_host_free(
+        ordinal: ::std::os::raw::c_int,
+        pointer: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_test_refuse_host(count: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2214,6 +2227,15 @@ unsafe extern "C" {
     pub fn sd_hybrid_unmap(
         handle: *mut ::std::os::raw::c_void,
         gate: *const ::std::os::raw::c_void,
+        found: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_repoint(
+        handle: *mut ::std::os::raw::c_void,
+        from: *const ::std::os::raw::c_void,
+        host: *const *const u8,
+        copy: ::std::os::raw::c_int,
         found: *mut u64,
     ) -> ::std::os::raw::c_int;
 }

@@ -27,6 +27,8 @@ size_t expert_slot_bytes(const ResidentMoe& plan) {
 // even for resident pages, so an expert hinted within the last 30 s is skipped. Linux hints on the
 // device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
 void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count) {
+    // A layer held as page-locked copies (sd_hybrid_repoint) no longer reads the mapping: there is nothing to ask the OS for.
+    if (plan.host_copy) return;
 #if defined(_WIN32) || defined(__linux__)
     const auto now = std::chrono::steady_clock::now();
     if (plan.prefetched.size() != plan.experts) plan.prefetched.assign(plan.experts, {});
@@ -246,6 +248,7 @@ extern "C" const char* sd_cpu_error();
 // Gather experts' gate, up and down slices from the mapped banks into the slot images at `slots`.
 void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, size_t count, uint8_t* const* slots,
                    const uint8_t* const* bank_sources = nullptr) {
+    BankReading reading(d);   // (sd_hybrid_repoint waits for the CPU's workers)
     std::vector<const uint8_t*> sources;
     std::vector<uint8_t*> targets;
     std::vector<uint64_t> bytes;

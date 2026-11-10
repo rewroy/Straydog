@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::assist;
-use crate::banks::{BankLocks, GaveBack, Locked};
+use crate::banks::{BankLocks, Copies, GaveBack, LockMode, Locked, PinnedMemory, Refusal};
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, HOST_NO_MEMORY, WIDTH};
@@ -622,6 +622,9 @@ pub struct Model {
     // before the mappings their native plans point into.
     group: Group,
     cpu: Option<CpuExperts>,
+    /// The page-locked copies of the banks of the layers that a GPU which cannot register host memory read-only holds in place of the mapping
+    /// ([`LockMode::Copy`]): the devices' plans and the CPU engine read them, so they are freed after both (here, and not before).
+    copies: Copies,
     pub weights: Weights,
     pub context: usize,
     pub prefill_batch_size: usize,
@@ -705,6 +708,12 @@ pub struct Model {
     lock_pending: Vec<usize>,
     /// A bank that did not match the file's tree when it was locked behind "ready": no request is served from here on.
     bank_failure: Option<String>,
+    /// How the banks are page-locked ([`LockMode`]): decided once, when the plan is made ([`Model::plan_host_banks`]), from what the GPUs say of registering
+    /// host memory read-only, and kept for every later plan, so that a mapping the runtime refused is never offered to it again.
+    lock_mode: LockMode,
+    /// A refusal of the very first layer, with nothing locked, that ends the planning of more ([`Model::more_bank_locks`]); and whether the log said so.
+    lock_refusal: Refusal,
+    refusal_told: bool,
     /// The start's plan was handed out (or found nothing to lock), and a plan is out that has not ended ([`Model::bank_locks`],
     /// [`Model::more_bank_locks`], [`Model::banks_lock_ended`]): one locking at a time, and more only after the start's.
     locks_planned: bool,
@@ -822,6 +831,7 @@ impl Model {
         let mut model = Model {
             group,
             cpu: None,
+            copies: Copies::default(),
             weights,
             context,
             prefill_batch_size: batch,
@@ -872,6 +882,9 @@ impl Model {
             locked_layers: Vec::new(),
             lock_pending: Vec::new(),
             bank_failure: None,
+            lock_mode: LockMode::Register,
+            lock_refusal: Refusal::default(),
+            refusal_told: false,
             locks_planned: false,
             locking: false,
             lock_halt: Default::default(),
@@ -1422,7 +1435,13 @@ impl Model {
             let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)).tied_to(self.lock_halt.clone(), self.kv_ahead.clone()))
+        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
+            .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone());
+        // (a GPU that cannot register the read-only mapping is not asked to: each layer's turn copies its banks, and checks the copies)
+        Ok(match self.lock_mode {
+            LockMode::Register => job,
+            LockMode::Copy => job.copying(std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() })),
+        })
     }
 
     /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then
@@ -1474,6 +1493,13 @@ impl Model {
     /// not one more layer fits; a line in the log says what was planned and why.
     pub fn more_bank_locks(&mut self, prior: impl FnOnce(&Model) -> Option<Routes>) -> Option<BankLocks> {
         if !self.partial || !self.locks_planned || self.locking || self.bank_failure.is_some() || self.locked_layers.len() >= 48 {
+            return None;
+        }
+        // (the runtime refused the first layer of a plan with nothing locked: it would refuse the first of this one, and again after every request)
+        if let Some(why) = self.lock_refusal.blocks_more(self.locked_layers.len()) {
+            if !std::mem::replace(&mut self.refusal_told, true) {
+                eprintln!("Straydog host banks: no more layers are planned to be page-locked: the first layer's turn was refused with none locked ({why})");
+            }
             return None;
         }
         let sizes = (0..48)
@@ -1529,7 +1555,7 @@ impl Model {
     /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
     /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
     /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
-    pub fn banks_locked(&mut self, locked: Locked) -> Result<u64> {
+    pub fn banks_locked(&mut self, mut locked: Locked) -> Result<u64> {
         if self.lock_halt.load(std::sync::atomic::Ordering::SeqCst) {
             // (its locks were given back to a request while this layer's turn ran: the layer is let go, not taken)
             // SAFETY: the model keeps its weights mapped.
@@ -1537,8 +1563,15 @@ impl Model {
             return Err("its page locks were given back to a K/V growth".into());
         }
         let layer = locked.layer;
-        for bank in Self::host_banks(&self.weights, layer)? {
-            self.group.adopt_host(bank);
+        if let Some(copy) = locked.take_copy() {
+            // The layer's banks are page-locked copies, checked: every device's plan of the layer reads them (one copy for all) from here, and the assist
+            // below maps them. The mapping is registered nowhere.
+            let banks = Self::host_banks(&self.weights, layer)?;
+            self.copies.take_over(&mut self.group, banks, copy)?;
+        } else {
+            for bank in Self::host_banks(&self.weights, layer)? {
+                self.group.adopt_host(bank);
+            }
         }
         self.lock_pending.retain(|pending| *pending != layer);
         self.locked_layers.push(layer);
@@ -1692,6 +1725,14 @@ impl Model {
             Some((available, commit)) => (gib(available), format!(", commit left {}", gib(commit))),
             None => (crate::host::memory_note().map_or("unknown".to_string(), |(_, available, _)| gib(available)), String::new()),
         };
+        // A GPU that cannot register host memory read-only cannot page-lock the read-only mapping in place (two RTX 3090s on Windows 10: every layer's lock
+        // failed and none was ever locked): its layers are copied, once, into page-locked memory and the copies are checked. Decided here for every plan.
+        let devices: Vec<(usize, Option<bool>)> = self.group.ordinals().into_iter().map(|ordinal| (ordinal, crate::gpu::host_registers_read_only(ordinal))).collect();
+        let (mode, copy_why) = crate::banks::lock_mode(std::env::var(crate::banks::READ_ONLY_REGISTRATION_ENV).ok().as_deref(), &devices);
+        self.lock_mode = mode;
+        if let Some(copy_why) = copy_why {
+            eprintln!("Straydog host banks: {copy_why}, so each layer's banks are page-locked as one verified copy in portable host memory, not in the model's mapping");
+        }
         eprintln!("Straydog host banks: {} of 48 layers planned to be page-locked behind ready, {} of {}; no more planned because {why}; lock_budget {}, \
                    lockable {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
                   gib(by_memory), gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
@@ -2305,7 +2346,12 @@ impl Model {
         let shortfall = available.map_or(wanted, |available| wanted.saturating_sub(available));
         let count = crate::banks::give_back_count(&sizes, shortfall);
         for &(layer, bytes) in sizes.iter().rev().take(count) {
-            self.group.release_host(Self::host_banks(&self.weights, layer)?)?;
+            let banks = Self::host_banks(&self.weights, layer)?;
+            // (a layer held as copies: its plans read the mapping again first, which waits for everything that reads the copies, and only then are they let
+            // go; a reader that still holds one keeps it until it lets go)
+            if !self.copies.give_back(&mut self.group, layer, banks)? {
+                self.group.release_host(banks)?;
+            }
             self.locked_layers.retain(|locked| *locked != layer);
             gave.layers.push(layer);
             gave.bytes += bytes;

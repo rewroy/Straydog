@@ -1030,6 +1030,11 @@ impl Group {
         self.backends[0].ordinal
     }
 
+    /// The ordinals of the group's devices, in the group's order.
+    pub fn ordinals(&self) -> Vec<usize> {
+        self.backends.iter().map(|backend| backend.ordinal).collect()
+    }
+
     /// Take the page lock of a range made by [`crate::gpu::lock_host_range`], as the backend's that holds them.
     pub fn adopt_host(&mut self, range: &[u8]) {
         self.backends[0].adopt_host(range)
@@ -1289,4 +1294,24 @@ impl Group {
 /// Rows of 10240 in `values`.
 pub fn row_count(values: &[f32]) -> usize {
     values.len() / WIDTH
+}
+
+impl crate::banks::HostPointers for Group {
+    /// Every device that holds the layer reads it from `to` from now on, so two devices that both read a layer read one copy of it. A device that fails
+    /// after others have moved puts them back: an error leaves every plan where it was found, or, if even that fails, says so (the caller then keeps the
+    /// copies, which a plan may still read).
+    fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], copy: bool) -> Result<bool> {
+        let mut moved = Vec::new();
+        for index in 0..self.backends.len() {
+            match self.backends[index].repoint_banks(from[0], to, copy) {
+                Ok(true) => moved.push(index),
+                Ok(false) => {}
+                Err(error) => {
+                    let failed = moved.iter().filter(|&&done| self.backends[done].repoint_banks(to[0], from, !copy).is_err()).count();
+                    return Err(if failed == 0 { error } else { format!("{error}; {failed} device(s) could not be put back") });
+                }
+            }
+        }
+        Ok(!moved.is_empty())
+    }
 }
