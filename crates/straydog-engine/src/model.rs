@@ -705,6 +705,8 @@ pub struct Model {
     banks_bytes: u64,
     /// The layers whose banks are page-locked (resident until the process ends): a warm start asks the OS for no others' pages.
     locked_layers: Vec<usize>,
+    /// The plans the GPU's assist had mapped when it was last started ([`Model::start_assist`]): a layer locked since is mapped when the count grows.
+    assist_mapped: u64,
     /// The layers the start planned to page-lock behind "ready" and that are not locked yet, in the order they are taken ([`Model::bank_locks`]):
     /// a warm start asks the OS for none of their pages either.
     lock_pending: Vec<usize>,
@@ -882,6 +884,7 @@ impl Model {
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
             locked_layers: Vec::new(),
+            assist_mapped: 0,
             lock_pending: Vec::new(),
             bank_failure: None,
             lock_mode: LockMode::Register,
@@ -1426,6 +1429,7 @@ impl Model {
         if mapped > 0 && self.assist.is_none() {
             self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
         }
+        self.assist_mapped = mapped;
         Ok(mapped)
     }
 
@@ -1582,10 +1586,11 @@ impl Model {
         }
         self.lock_pending.retain(|pending| *pending != layer);
         self.locked_layers.push(layer);
+        let before = self.assist_mapped;
         let mapped = self.start_assist()?;
-        // (a copy the runtime would not map for the GPU is a locked layer that assists nothing, and its prompts gather it through the CPU: say so, once per
-        // layer, since nothing else shows it)
-        if copied && mapped < self.locked_layers.len() as u64 {
+        // (a copy the runtime would not map for the GPU is a locked layer that assists nothing, and its prompts gather it through the CPU: say so for that
+        // layer alone, the one whose turn did not add a mapped plan, since nothing else shows it)
+        if copied && mapped <= before {
             eprintln!("WARN Straydog host banks: layer {layer}'s page-locked copy could not be mapped for the GPU's assist ({mapped} of {} locked layers are mapped); \
                        the GPU takes no routes from it and the CPU gathers its experts for a prompt", self.locked_layers.len());
         }
@@ -2369,6 +2374,8 @@ impl Model {
             gave.layers.push(layer);
             gave.bytes += bytes;
         }
+        // (each layer given back took its mapped plan with it, if it had one: a count kept too high would make the next copy's turn look unmapped)
+        self.assist_mapped = if self.locked_layers.is_empty() { 0 } else { self.assist_mapped.saturating_sub(gave.layers.len() as u64) };
         gave.left = self.locked_layers.len();
         gave.left_bytes = sizes.iter().filter(|(layer, _)| self.locked_layers.contains(layer)).map(|(_, bytes)| bytes).sum();
         if self.locked_layers.is_empty() {
