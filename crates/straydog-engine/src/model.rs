@@ -305,6 +305,19 @@ fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<u
     out
 }
 
+/// Layer spans and their MTP pairs use the same token chunks, including a tail of two instead of a one-row decode.
+fn layer_prefill_chunks(begin: usize, end: usize, batch: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    let mut first = begin;
+    while first < end {
+        let mut next = (first + batch).min(end);
+        if end - next == 1 && next - first > 2 { next -= 1; }
+        chunks.push((first, next));
+        first = next;
+    }
+    chunks
+}
+
 struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
@@ -2850,11 +2863,10 @@ impl Model {
     /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t. The token's row at an image's
     /// position is the image's own (llama.cpp's MTP graph takes `inp->embd` there), through the layer's prologue as any.
     fn mtp_prompt(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>) -> Result<()> {
-        self.mtp_prompt_batched(tokens, rows, previous, 512)
+        self.mtp_prompt_batched(tokens, rows, previous, 512, self.history.len())
     }
 
-    fn mtp_prompt_batched(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>, batch: usize) -> Result<()> {
-        let start = self.history.len();
+    fn mtp_prompt_batched(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>, batch: usize, start: usize) -> Result<()> {
         let mut hidden: Vec<&[f32]> = rows.chunks_exact(WIDTH).take(row_count(rows) - 1).collect();
         let mut following: Vec<u32> = tokens[1..].to_vec();
         let mut first = start;
@@ -3135,10 +3147,7 @@ impl Model {
                 for layer in 0..48 {
                     self.group.load_layer_bank(layer)?;
                     // Avoid a final prefill call of one row; the existing one-row path is a different API.
-                    let mut first = begin;
-                    while first < stop {
-                        let mut end = (first + batch).min(stop);
-                        if stop - end == 1 && end - first > 2 { end -= 1; }
+                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
                         let low = (first - begin) * WIDTH;
                         let high = (end - begin) * WIDTH;
                         self.group.prefill_rows(layer, &rows[low..high])?;
@@ -3153,12 +3162,17 @@ impl Model {
                         }
                         let output = self.group.prefill_layers(layer, layer + 1, None, first as u64, (end - first) as u64, (end - first) as u64)?;
                         rows[low..high].copy_from_slice(&output);
-                        first = end;
                     }
                 }
                 if self.speculative > 0 {
                     self.group.load_layer_bank(48)?;
-                    self.mtp_prompt_batched(&tokens[begin..stop], rows, previous, batch.min(512))?;
+                    // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
+                    let mut previous = previous;
+                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
+                        let chunk = &rows[(first - begin) * WIDTH..(end - begin) * WIDTH];
+                        self.mtp_prompt_batched(&tokens[first..end], chunk, previous, batch.min(512), first)?;
+                        previous = Some(last_row(chunk).to_vec());
+                    }
                 }
                 self.final_hidden = Some(last_row(rows).to_vec());
                 self.history.extend_from_slice(&tokens[begin..stop]);
@@ -4145,7 +4159,14 @@ mod same_text_tests {
 }
 #[cfg(test)]
 mod layer_prefill_tests {
-    use super::{layer_prefill_stops, LAYER_PREFILL_ROWS as N};
+    use super::{layer_prefill_chunks, layer_prefill_stops, LAYER_PREFILL_ROWS as N};
+
+    #[test]
+    fn body_and_draft_share_the_same_odd_tail() {
+        assert_eq!(layer_prefill_chunks(0, 1025, 512), [(0,512),(512,1023),(1023,1025)]);
+        assert_eq!(layer_prefill_chunks(7, 16, 8), [(7,14),(14,16)]);
+        assert_eq!(layer_prefill_chunks(0, 1024, 512), [(0,512),(512,1024)]);
+    }
 
     #[test]
     fn layer_segments_bound_work_without_crossing_a_checkpoint() {
