@@ -3284,8 +3284,8 @@ impl Model {
                             self.ple_wait += reading.elapsed().as_secs_f64();
                             self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
                         }
-                        let output = self.group.prefill_layers(layer, layer + 1, None, first as u64, (end - first) as u64, (end - first) as u64)?;
-                        rows[low..high].copy_from_slice(&output);
+                        // (in place: a new vector a chunk faulted every row's pages in again for each layer)
+                        self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?;
                     }
                 }
                 if self.speculative > 0 {
