@@ -845,7 +845,9 @@ impl Model {
             resident: false,
             partial: false,
             layer_prefill: !std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "0"),
-            layer_prefill_forced: false,
+            // (STRAYDOG_LAYER_PREFILL=force: every eligible prompt takes the layer order whatever the memory, to measure it where the
+            // choice would not make it, e.g. a machine whose RAM holds the banks)
+            layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
             layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
