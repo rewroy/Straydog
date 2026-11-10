@@ -91,8 +91,10 @@ fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
         model.generate(&plain, 1, &Sampling::GREEDY, 0, &|| cancelled.get(),
                        &mut |_, _| cancelled.set(true), true, false, &mut |_| {}).unwrap();
         assert!(cancelled.get() && !model.history.is_empty());
-        cases.push(observed(&mut model, &plain, false));
-        assert!(model.last_metrics["cached_tokens"].as_u64().unwrap() > 0);
+        // resume deliberately leaves at least one token to run: continue the cancelled prefix, rather than repeat it whole.
+        let continued = [plain.clone(), plain[..512].to_vec()].concat();
+        cases.push(observed(&mut model, &continued, false));
+        assert_eq!(model.last_metrics["cached_tokens"].as_u64().unwrap(), plain.len() as u64);
         runs.push(cases);
     }
     for (i, name) in ["odd-sized prompt", "root and turn checkpoint", "checkpoint continuation", "cancelled prefix continuation"].iter().enumerate() {
