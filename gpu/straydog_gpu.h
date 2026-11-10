@@ -472,6 +472,13 @@ int sd_prefill_ple(void* handle, void* const* pointers, const int* kinds, void* 
 /* Resident decoder and spans */
 int sd_decoder_layer(void* handle, uint64_t layer, uint64_t context, void* const* pointers, const int* kinds, uint64_t count, void* const* states, void* workspace, void* moe);
 int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, const float* input, float* output);
+/* Temporarily bind one layer's routed banks to an owned allocation. Requires an empty expert cache; clear before releasing storage. */
+/* 1 when memory was refused (no allocation), 0 when allocated. */
+int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
+int sd_prefill_bank_clear(void* handle);
+/* Place four-stream hidden rows in a layer's workspace before its PLE and prefill span. */
+int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
 /* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
    layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a

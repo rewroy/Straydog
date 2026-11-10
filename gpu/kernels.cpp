@@ -192,6 +192,7 @@ struct ResidentMoe {
     // Partial residency: routed experts live in device slots (null data when absent)
     // and are otherwise read from the authenticated host mapping.
     bool hybrid=false;
+    bool layer_prefill=false;   // this layer's routed banks are held for every prompt chunk
     const uint8_t* host[3]{};
     size_t host_bytes[3]{};
     std::vector<int32_t> slot_of;
@@ -520,6 +521,8 @@ struct Device {
     // check accumulates in flags[1] until sd_prefill_settle. `handoff` orders a row handoff
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
+    ResidentMoe* layer_prefill_plan = nullptr;
+    void* layer_prefill_storage = nullptr;
     // A sequence with images (sd_rope_delta, sd_rope_rows). The table is allocated at its first image, beside the budget:
     // a few KiB the runtime's reserve holds, needed when the slots have taken all that is counted.
     uint32_t rope_delta = 0;
@@ -1726,6 +1729,40 @@ int sd_copy_allocation(void* handle,void* target,const void* source) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage) {
+    try {
+        if (!storage || !bytes) throw std::runtime_error("invalid layer bank allocation");
+        *storage = nullptr;
+        auto& d = device(handle);
+        if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes) return 1;
+        const hipError_t status = hipMalloc(storage, size_t(bytes) + allocation_tail);
+        if (status == hipErrorOutOfMemory) { (void)hipGetLastError(); *storage = nullptr; return 1; }
+        check(status);
+        try { d.allocations.emplace(*storage, size_t(bytes)); }
+        catch (...) { cleanup(hipFree(*storage)); *storage = nullptr; throw; }
+        d.used += size_t(bytes) + allocation_tail;
+        check(hipMemsetAsync(static_cast<uint8_t*>(*storage) + bytes, 0, allocation_tail, d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes) {
+    try { load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank_clear(void* handle) {
+    try { clear_prefill_bank(device(handle)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const auto found = d.decoder.find(size_t(layer));
+        if (!rows || found == d.decoder.end() || !steps || steps > found->second.capacity)
+            throw std::runtime_error("invalid prefill hidden rows");
+        upload(d, found->second.workspace, rows, size_t(steps) * 10240 * 4);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,
                      const float* input,float* output,uint64_t output_rows,double* timings) {
     try {
@@ -2730,6 +2767,7 @@ int sd_release(void* handle, void* pointer) {
         auto& value = device(handle);
         auto found = value.allocations.find(pointer);
         if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        if (pointer == value.layer_prefill_storage) throw std::runtime_error("cannot release an active layer prefill bank");
         written(value, pointer);
         if (value.kv_prefetching && (pointer == value.kv_stage || pointer == value.kv_stage_owner)) {
             check(hipStreamSynchronize(value.kv_stream));

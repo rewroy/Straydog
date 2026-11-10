@@ -284,6 +284,27 @@ struct AssistScript {
     trace: Vec<(u32, [u64; 3], f64)>,
 }
 
+const LAYER_PREFILL_ROWS: usize = 16384;
+const LAYER_PREFILL_MIN: usize = 512;
+
+enum LayerPrefill { Fallback, Cancelled, Ready(Vec<f32>) }
+
+/// Common positions at which a layer-ordered prompt may stop: checkpoints plus bounded segments.
+fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
+    let mut stops: Vec<usize> = checkpoints.iter().copied().chain([end]).filter(|at| *at > begin && *at <= end).collect();
+    stops.sort_unstable();
+    stops.dedup();
+    let mut position = begin;
+    let mut out = Vec::new();
+    for stop in stops {
+        while position < stop {
+            position = position.saturating_add(LAYER_PREFILL_ROWS).min(stop);
+            out.push(position);
+        }
+    }
+    out
+}
+
 struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
@@ -572,6 +593,9 @@ pub struct Model {
     pub copy_drafts: usize,
     pub resident: bool,
     pub partial: bool,
+    /// Opt-in until layer-ordered prefill passes its output and performance gates.
+    layer_prefill: bool,
+    layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
     pub placement_note: Option<String>,
@@ -765,6 +789,8 @@ impl Model {
             copy_drafts: 0,
             resident: false,
             partial: false,
+            layer_prefill: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "1"),
+            layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
             history: Vec::new(),
@@ -1704,6 +1730,7 @@ impl Model {
     // ---- state ----
 
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(failure) = &self.layer_prefill_restore_failure { return Err(failure.clone()); }
         self.history.clear();
         self.final_hidden = None;
         self.group.reset_state()
@@ -2440,8 +2467,11 @@ impl Model {
         if !logits {
             return Ok(None);
         }
+        self.head_logits(last_row(&hidden), tokens.len() == 1).map(Some)
+    }
+
+    fn head_logits(&mut self, row: &[f32], step: bool) -> Result<Vec<f32>> {
         let mut clock = Instant::now();
-        let row = last_row(&hidden);
         // (CUDA: the head's mix and projection in one wait, into the last step's allocation; elsewhere a wait and a copy to the host
         // between them)
         let mut logits = std::mem::take(&mut self.logits_spare);
@@ -2457,7 +2487,7 @@ impl Model {
             })?;
             logits = output.into_iter().next().unwrap();
         }
-        if tokens.len() == 1 {
+        if step {
             self.phase("step: head", &mut clock);
             if let Some(profile) = self.profile.as_mut() {
                 profile.end_pass(1, 0.0);
@@ -2470,7 +2500,7 @@ impl Model {
         if let Some(capture) = self.logits_capture.as_mut() {
             capture.push(logits.clone());
         }
-        Ok(Some(logits))
+        Ok(logits)
     }
 
     /// The last processed token's four-stream hidden state.
@@ -2820,6 +2850,10 @@ impl Model {
     /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t. The token's row at an image's
     /// position is the image's own (llama.cpp's MTP graph takes `inp->embd` there), through the layer's prologue as any.
     fn mtp_prompt(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>) -> Result<()> {
+        self.mtp_prompt_batched(tokens, rows, previous, 512)
+    }
+
+    fn mtp_prompt_batched(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>, batch: usize) -> Result<()> {
         let start = self.history.len();
         let mut hidden: Vec<&[f32]> = rows.chunks_exact(WIDTH).take(row_count(rows) - 1).collect();
         let mut following: Vec<u32> = tokens[1..].to_vec();
@@ -2833,7 +2867,7 @@ impl Model {
         }
         let mut offset = 0;
         while offset < hidden.len() {
-            let mut end = (offset + 512).min(hidden.len());
+            let mut end = (offset + batch).min(hidden.len());
             // (a last pass of one row reads the delta alone: in a sequence with images it stays in the table's)
             if !self.images.is_empty() && hidden.len() - end == 1 {
                 end -= 1;
@@ -2991,6 +3025,13 @@ impl Model {
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
         let long = self.partial && tokens.len() - position >= threshold;
+        if long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none() {
+            match self.try_layer_prefill(tokens, position, plan, cancelled, progress)? {
+                LayerPrefill::Fallback => {},
+                LayerPrefill::Cancelled => return Ok(None),
+                LayerPrefill::Ready(logits) => return Ok(Some(Some(logits))),
+            }
+        }
         let preparing = Instant::now();
         let empty_before_prepare = long && {
             let (slots, held) = self.group.slots()?;
@@ -3014,6 +3055,123 @@ impl Model {
             (Ok(_), Err(error)) => Err(error),
             (Ok(output), Ok(())) => Ok(output),
         }
+    }
+
+    /// Development/validation: compare identical prompts against the existing batch order.
+    #[doc(hidden)]
+    pub fn layer_prefill(&mut self, enabled: bool) { self.layer_prefill = enabled; }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
+                         cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
+        if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
+        let count = (tokens.len() - position).min(LAYER_PREFILL_ROWS);
+        let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
+        self.ensure_kv(tokens.len())?;
+        let mut bank_bytes = 0;
+        for layer in 0..48 + usize::from(self.speculative > 0) {
+            let bytes = Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
+            bank_bytes = bank_bytes.max(bytes);
+        }
+        let preparing = Instant::now();
+        self.group.lend_prefill_head()?;
+        let output: Result<Option<bool>> = (|| {
+            let Some(rows) = self.group.begin_layer_prefill(bank_bytes)? else { return Ok(None) };
+            self.last_metrics.insert("prefill_order".into(), json!("layer"));
+            self.last_metrics.insert("prefill_batch_rows".into(), json!(rows));
+            self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
+            self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
+            self.layer_prefill_segments(tokens, position, plan, rows as usize, &mut hidden, cancelled, progress).map(Some)
+        })();
+        let restoring = Instant::now();
+        // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
+        let bank = self.group.finish_layer_prefill();
+        let head = self.with_operands(Model::head_operands, Group::pin);
+        let cache = self.group.end_long_prefill();
+        self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
+        let errors: Vec<String> = [bank, head, cache].into_iter().filter_map(Result::err).collect();
+        if !errors.is_empty() {
+            let restore = errors.join("; ");
+            let failure = match output { Err(error) => format!("{error}; restoring layer prefill failed: {restore}"),
+                                         _ => format!("restoring layer prefill failed: {restore}") };
+            self.layer_prefill_restore_failure = Some(failure.clone());
+            return Err(failure);
+        }
+        match output? {
+            None => Ok(LayerPrefill::Fallback),
+            Some(false) => Ok(LayerPrefill::Cancelled),
+            Some(true) => {
+                let row = self.final_hidden.clone().ok_or("layer prefill returned no final hidden row")?;
+                self.head_logits(&row, false).map(LayerPrefill::Ready)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)], batch: usize,
+                              hidden: &mut [f32], cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
+        let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
+        for stop in layer_prefill_stops(position, tokens.len(), &checkpoints) {
+            if cancelled() { return Ok(false); }
+            let begin = self.history.len();
+            let count = stop - begin;
+            self.group.clear_layer_bank()?;
+            if count < LAYER_PREFILL_MIN {
+                for first in (begin..stop).step_by(batch) {
+                    self.forward(&tokens[first..(first + batch).min(stop)], false)?;
+                }
+            } else {
+                self.set_rope(begin, count)?;
+                let rows = &mut hidden[..count * WIDTH];
+                for first in (begin..stop).step_by(batch) {
+                    let end = (first + batch).min(stop);
+                    let embedded = self.rows_at(first, &tokens[first..end])?;
+                    for (row, embedded) in rows[(first - begin) * WIDTH..(end - begin) * WIDTH].chunks_exact_mut(WIDTH)
+                        .zip(embedded.chunks_exact(HIDDEN)) {
+                        for stream in row.chunks_exact_mut(HIDDEN) { stream.copy_from_slice(embedded); }
+                    }
+                }
+                let previous = self.final_hidden.clone();
+                for layer in 0..48 {
+                    self.group.load_layer_bank(layer)?;
+                    // Avoid a final prefill call of one row; the existing one-row path is a different API.
+                    let mut first = begin;
+                    while first < stop {
+                        let mut end = (first + batch).min(stop);
+                        if stop - end == 1 && end - first > 2 { end -= 1; }
+                        let low = (first - begin) * WIDTH;
+                        let high = (end - begin) * WIDTH;
+                        self.group.prefill_rows(layer, &rows[low..high])?;
+                        if layer == 1 {
+                            let next = (end + batch).min(stop);
+                            self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
+                            self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
+                            let reading = Instant::now();
+                            let embeddings = self.weights.rows(PLE_TABLE, &self.ple_indices(&tokens[..first], &tokens[first..end])?)?;
+                            self.ple_wait += reading.elapsed().as_secs_f64();
+                            self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
+                        }
+                        let output = self.group.prefill_layers(layer, layer + 1, None, first as u64, (end - first) as u64, (end - first) as u64)?;
+                        rows[low..high].copy_from_slice(&output);
+                        first = end;
+                    }
+                }
+                if self.speculative > 0 {
+                    self.group.load_layer_bank(48)?;
+                    self.mtp_prompt_batched(&tokens[begin..stop], rows, previous, batch.min(512))?;
+                }
+                self.final_hidden = Some(last_row(rows).to_vec());
+                self.history.extend_from_slice(&tokens[begin..stop]);
+                self.draft_note(&tokens[begin..stop]);
+            }
+            self.group.clear_layer_bank()?;
+            if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
+                for kind in kinds.clone() { self.save_checkpoint(kind)?; }
+            }
+            progress(stop, tokens.len());
+            if cancelled() { return Ok(false); }
+        }
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3618,6 +3776,7 @@ impl Model {
         }
         sampling.check()?;
         self.weights.check_unchanged()?;
+        if let Some(failure) = &self.layer_prefill_restore_failure { return Err(failure.clone()); }
         // (banks locked behind "ready" that did not match the file's tree: nothing more is served from these bytes)
         if let Some(failure) = &self.bank_failure {
             return Err(failure.clone());
@@ -3982,5 +4141,21 @@ mod same_text_tests {
     fn what_follows_the_held_sequence_stays() {
         assert_eq!(same_text(&[1, 4, 5], &[1], &spelled), [1, 4, 5]);
         assert_eq!(same_text(&[2, 3, 5], &[1], &spelled), [1, 5]);
+    }
+}
+#[cfg(test)]
+mod layer_prefill_tests {
+    use super::{layer_prefill_stops, LAYER_PREFILL_ROWS as N};
+
+    #[test]
+    fn layer_segments_bound_work_without_crossing_a_checkpoint() {
+        assert_eq!(layer_prefill_stops(0, N, &[]), [N]);
+        assert_eq!(layer_prefill_stops(0, N + 1, &[]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops(0, 2 * N, &[N]), [N, 2 * N]);
+        assert_eq!(layer_prefill_stops(0, N + 1, &[N]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops(0, N + 2, &[N + 1]), [N, N + 1, N + 2]);
+        assert!(layer_prefill_stops(7, 7, &[7]).is_empty());
+        assert_eq!(layer_prefill_stops(100, 2 * N + 100, &[N + 100]), [N + 100, 2 * N + 100]);
+        assert_eq!(layer_prefill_stops(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
     }
 }

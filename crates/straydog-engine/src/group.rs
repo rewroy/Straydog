@@ -839,6 +839,22 @@ impl Group {
         self.backends.iter_mut().try_for_each(Backend::ensure_slots)
     }
 
+    /// Stage-one layer ordering is single-device only.
+    pub fn lend_prefill_head(&mut self) -> Result<()> {
+        if self.backends.len() != 1 || self.parts { return Err("layer prefill requires one device".into()); }
+        self.backends[0].lend_prefill_head()
+    }
+
+    pub fn begin_layer_prefill(&mut self, bytes: u64) -> Result<Option<u64>> {
+        if self.backends.len() != 1 || self.parts { return Ok(None); }
+        self.backends[0].begin_layer_prefill(bytes)
+    }
+
+    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].load_layer_bank(layer) }
+    pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
+    pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
+    pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
+
     pub fn end_long_prefill(&mut self) -> Result<()> {
         if self.backends.len() == 2 {
             return self.on_both(Backend::end_long_prefill, Backend::end_long_prefill);

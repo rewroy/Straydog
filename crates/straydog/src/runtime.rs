@@ -550,6 +550,9 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         .map(|((count, ms), rows)| format!(", {count} of {rows} ({ms:.1} ms)")).collect();
     // (where a drafter is: the drafts a pass offered at the end of the request, which the engine chooses by what its passes cost)
     let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
+    let order = if timings["prefill_order"] == "layer" {
+        format!("; prefill layers first, {} rows a batch", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+    } else { String::new() };
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
         _ => String::new(),
@@ -577,7 +580,7 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
