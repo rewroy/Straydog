@@ -38,9 +38,14 @@ unsafe impl Sync for Buffer {}
 impl Buffer {
     pub fn new(len: usize) -> Buffer {
         let layout = Self::layout(len);
+        Self::try_new(len).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    }
+
+    /// A bounded temporary copy can fall back to its original reader if allocation is refused.
+    pub(crate) fn try_new(len: usize) -> Option<Buffer> {
+        let layout = Self::layout(len);
         // SAFETY: a non-zero size and a valid alignment.
-        let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })?;
         // Advised before it is zeroed, so that its first touch takes huge pages where the system has them: the system's allocator zeroes
         // an allocation of this alignment itself, every page then a 4 KiB one (the expert host tier's 1 GiB arenas were 446 MB of huge
         // pages in 108 GB). Compaction passes huge pages by, and khugepaged has nothing to collapse there: each migration or collapse of
@@ -48,7 +53,7 @@ impl Buffer {
         crate::alloc::advise(pointer.as_ptr(), layout.size());
         // SAFETY: the allocation is `layout.size()` bytes this buffer owns.
         unsafe { std::ptr::write_bytes(pointer.as_ptr(), 0, layout.size()) };
-        Buffer { pointer, len }
+        Some(Buffer { pointer, len })
     }
 
     fn layout(len: usize) -> std::alloc::Layout {
