@@ -521,7 +521,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
         for (size_t expert=0;expert<experts;++expert)
-            if (host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
+            if (!plan.layer_prefill && host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
         on_cpu=prompt_cpu_share(d,plan,host_counts.data(),missing);
     }
     // The CPU's routes, expert by expert (before the GPU's work is queued: a download waits for it), and the rows of their tokens

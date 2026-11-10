@@ -26,9 +26,9 @@ pub use tree::{prepare, ProcessTree};
 /// CPU without AVX-512, to measure those on one with it) and STRAYDOG_PROMPT_CPU (=0: a prompt batch streams every expert beyond the
 /// slots, none to the CPU). One list for both: a switch named on one
 /// system's list alone never reached the other's worker (speed first and the engram table did nothing in a Linux worker).
-pub const ENGINE_VARIABLES: [&str; 10] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 11] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
-                                         "STRAYDOG_PROMPT_CPU"];
+                                         "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;

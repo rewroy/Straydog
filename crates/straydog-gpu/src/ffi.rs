@@ -1699,6 +1699,32 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_bank_allocate(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: u64,
+        storage: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        storage: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_clear(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_rows(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        rows: *const f32,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

@@ -351,6 +351,8 @@ pub struct Backend {
     slot_size: u64,
     /// The prefill rows before a long prompt's batches took the slots' VRAM (see [`Backend::begin_long_prefill`]).
     long_prefill: Option<u64>,
+    /// Temporary routed-bank allocation for a layer-ordered prompt.
+    layer_prefill_pool: Option<(*mut c_void, u64)>,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
     pub logical_capacity: usize,
@@ -443,6 +445,7 @@ impl Backend {
             slots_absent: false,
             slot_margin: 0,
             long_prefill: None,
+            layer_prefill_pool: None,
             slot_size: 0,
             registered: Vec::new(),
             batch_capacity,
@@ -974,6 +977,84 @@ impl Backend {
             }
         }
         Ok(self.prefill_capacity)
+    }
+
+    /// Lend the vocabulary projection, whose authenticated host copy the model keeps. No decoder plan owns it.
+    pub fn lend_prefill_head(&mut self) -> Result<()> {
+        let key = "output.weight:None";
+        if let Some(entry) = self.cache.get(key).copied() {
+            // SAFETY: an owned allocation; native code refuses resident/decoder dependencies and drops dependent graphs.
+            check(unsafe { ffi::sd_release(self.handle, entry.pointer) })?;
+            self.cache.remove(key);
+            self.resident.remove(key);
+        }
+        Ok(())
+    }
+
+    /// Borrow cache VRAM and a layer bank pool. The caller restores the head before end_long_prefill restores the cache.
+    /// A refused allocation returns None without advancing any model state; the same cleanup is still required.
+    pub fn begin_layer_prefill(&mut self, bank_bytes: u64) -> Result<Option<u64>> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+            return Ok(None);
+        }
+        self.long_prefill = Some(self.prefill_capacity);
+        // SAFETY: between passes, no decoder work in flight.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.restore_slots(0)?;
+        self.prefill_buffers(2)?;
+        let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
+        let (used, budget) = self.memory()?;
+        let free = budget.saturating_sub(used) + bytes(self.prefill_capacity);
+        let capacity = [2048, 1024, 512, 256, 128, 64, 32, 16, 8].into_iter()
+            .find(|rows| bank_bytes + bytes(*rows) + self.slot_margin + 3 * ALLOCATION_TAIL <= free);
+        let Some(capacity) = capacity else { return Ok(None) };
+        self.prefill_buffers(capacity)?;
+        if self.prefill_capacity < 8 { return Ok(None); }
+        let mut pool = std::ptr::null_mut();
+        // SAFETY: a live device and out-parameter, with no references published until load_layer_bank.
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, bank_bytes, &mut pool) };
+        if !pool.is_null() { self.layer_prefill_pool = Some((pool, bank_bytes)); }
+        if check(status)? == 1 { return Ok(None); }
+        pointer(pool)?;
+        Ok(Some(self.prefill_capacity))
+    }
+
+    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> {
+        let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
+        // SAFETY: owned storage retained until clear_layer_bank/finish_layer_prefill, and a registered decoder layer.
+        check(unsafe { ffi::sd_prefill_bank(self.handle, layer as u64, pool, bytes) }).map(drop)
+    }
+
+    pub fn clear_layer_bank(&mut self) -> Result<()> {
+        // SAFETY: settles pending transfers and removes table references before returning.
+        check(unsafe { ffi::sd_prefill_bank_clear(self.handle) }).map(drop)
+    }
+
+    /// End the temporary bank's lifetime and restore workspace sizes; leave cache restoration until the head is back.
+    pub fn finish_layer_prefill(&mut self) -> Result<()> {
+        self.clear_layer_bank()?;
+        if let Some((pool, _)) = self.layer_prefill_pool {
+            // SAFETY: clear_layer_bank has removed all references and waited for transfers/readers.
+            check(unsafe { ffi::sd_release(self.handle, pool) })?;
+            self.layer_prefill_pool = None;
+        }
+        if let Some(capacity) = self.long_prefill {
+            if capacity != self.prefill_capacity {
+                self.prefill_buffers(capacity)?;
+                if capacity != self.prefill_capacity { return Err("could not restore layer prefill workspace".into()); }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load complete four-stream rows before a layer's PLE and span.
+    pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
+        let steps = rows.len() / WIDTH;
+        if rows.len() % WIDTH != 0 || !(1..=self.prefill_capacity as usize).contains(&steps) || !rows.iter().all(|v| v.is_finite()) {
+            return Err("invalid layer prefill hidden rows".into());
+        }
+        // SAFETY: rows have the registered workspace width and capacity, and remain alive through the upload.
+        check(unsafe { ffi::sd_prefill_rows(self.handle, layer as u64, rows.as_ptr(), steps as u64) }).map(drop)
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
