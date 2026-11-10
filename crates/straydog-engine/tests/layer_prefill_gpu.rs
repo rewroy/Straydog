@@ -11,7 +11,7 @@ use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 use straydog_engine::weights::Weights;
 
-struct Observed { logits: Vec<f32>, token: Option<u32>, state: Vec<String> }
+struct Observed { logits: Vec<f32>, token: Option<u32>, state: Vec<String>, batch: u64, order: serde_json::Value }
 
 fn open(root: &Path, drafter: &Path, layer: bool) -> (Model, Text) {
     let budget = (5.5 * (1u64 << 30) as f64) as u64;
@@ -37,10 +37,11 @@ fn observed(model: &mut Model, tokens: &[u32], keep: bool) -> Observed {
     model.generate(tokens, 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, keep,
                    &mut |t| emitted.push(t)).unwrap();
     let logits = model.logits_capture.take().unwrap().remove(0);
-    Observed { logits, token: emitted.first().copied(), state: model.state_digest().unwrap() }
+    Observed { logits, token: emitted.first().copied(), state: model.state_digest().unwrap(),
+               batch: model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0), order: model.last_metrics["prefill_order"].clone() }
 }
 
-fn compare(name: &str, a: &Observed, b: &Observed) {
+fn compare(name: &str, a: &Observed, b: &Observed) -> bool {
     assert_eq!(a.logits.len(), b.logits.len());
     let max_a = a.logits.iter().copied().map(f64::from).fold(f64::NEG_INFINITY, f64::max);
     let max_b = b.logits.iter().copied().map(f64::from).fold(f64::NEG_INFINITY, f64::max);
@@ -58,10 +59,10 @@ fn compare(name: &str, a: &Observed, b: &Observed) {
     }
     let bitwise = a.logits.iter().zip(&b.logits).all(|(x, y)| x.to_bits() == y.to_bits());
     eprintln!("{}", serde_json::json!({"case":name,"bitwise":bitwise,"max_abs":max_abs,
-        "relative_l2":(diff/norm.max(1e-30)).sqrt(),"kl":kl,"same_token":a.token==b.token,"same_state":a.state==b.state}));
-    assert_eq!(a.token, b.token, "{name}: first token");
-    assert!(bitwise, "{name}: logits differ; inspect the reported max difference and KL before accepting");
-    assert_eq!(a.state, b.state, "{name}: causal state (including MTP)");
+        "relative_l2":(diff/norm.max(1e-30)).sqrt(),"kl":kl,"same_token":a.token==b.token,"same_state":a.state==b.state,
+        "batch_a":a.batch,"batch_b":b.batch,"order_a":a.order,"order_b":b.order,
+        "state_mismatches":a.state.iter().zip(&b.state).filter(|(x,y)| x!=y).take(16).collect::<Vec<_>>()}));
+    a.token == b.token && bitwise && a.state == b.state
 }
 
 #[test]
@@ -97,7 +98,15 @@ fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
         assert_eq!(model.last_metrics["cached_tokens"].as_u64().unwrap(), plain.len() as u64);
         runs.push(cases);
     }
-    for (i, name) in ["odd-sized prompt", "root and turn checkpoint", "checkpoint continuation", "cancelled prefix continuation"].iter().enumerate() {
-        compare(name, &runs[0][i], &runs[1][i]);
+    if let Some(path) = std::env::var_os("STRAYDOG_LAYER_REPORT") {
+        let report: Vec<Vec<_>> = runs.iter().map(|cases| cases.iter().map(|case| serde_json::json!({
+            "logits":case.logits,"token":case.token,"state":case.state,"batch":case.batch,"order":case.order,
+        })).collect()).collect();
+        serde_json::to_writer(std::fs::File::create(path).unwrap(), &report).unwrap();
     }
+    let mut exact = true;
+    for (i, name) in ["odd-sized prompt", "root and turn checkpoint", "checkpoint continuation", "cancelled prefix continuation"].iter().enumerate() {
+        exact &= compare(name, &runs[0][i], &runs[1][i]);
+    }
+    assert!(exact, "inspect all reported logit and state differences before accepting");
 }

@@ -477,6 +477,12 @@ int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position
 int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
 int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
 int sd_prefill_bank_clear(void* handle);
+/* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
+   3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
+   The callback's rows are borrowed for this call; it returns zero on success and must not unwind. */
+typedef int (*sd_prefill_observer)(void* context, uint64_t layer, uint64_t phase, uint64_t position,
+                                  uint64_t rows, uint64_t width, const float* values);
+int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context);
 /* Place four-stream hidden rows in a layer's workspace before its PLE and prefill span. */
 int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);

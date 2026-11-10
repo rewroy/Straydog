@@ -4159,3 +4159,7 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_stops(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
     }
 }
+
+#[cfg(all(test, any(feature = "hip", feature = "cuda")))]
+#[path = "layer_prefill_diagnostics.rs"]
+mod layer_prefill_diagnostics;
