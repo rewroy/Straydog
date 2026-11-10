@@ -120,6 +120,9 @@ pub fn is_warm_stop(error: &str) -> bool {
 
 /// The rows a layer-order batch needs to beat the ordinary path when the banks fit in RAM, on Windows.
 const LAYER_PREFILL_FIT_ROWS: u64 = 512;
+/// The rows it needs where they do not: its MoE takes time inversely with them (a 3.8K follow-up under memory pressure on the RTX 5070 Ti:
+/// 12.7 s at 256 rows against the ordinary path's 16.0 s; about even at 128 rows by the 32.6K fits, losing below).
+const LAYER_PREFILL_SHORT_ROWS: u64 = 128;
 
 /// Whether the ordinary path's transfer of the routed experts costs enough every batch for layer order to win where the banks fit:
 /// Windows (IQ2_XS on an RTX 5070 Ti at 5.5 GiB, banks in RAM: 8.2K new 17.5 s at 512 rows against 25.4 s; 32.6K at 256 rows 73.7 s
@@ -138,14 +141,15 @@ fn layer_prefill_room(memory: u64, pinned: u64, now: Option<u64>) -> Option<u64>
 /// Layer ordering pays for loading every routed bank once when the ordinary path would reread banks that do not fit in RAM (`room`, from
 /// [`layer_prefill_room`]): under memory pressure, the ordinary path reads them from the drive again every batch (32.6K new on the
 /// RTX 5070 Ti with 4.1 GiB available: 161.8 s, layer order 73.0 s at 256 rows). Large shortages amortize it over two ordinary batches; a
-/// slight shortage needs three full maximum-sized batches. Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order
-/// from three ordinary batches when it can take [`LAYER_PREFILL_FIT_ROWS`] (`rows`, from [`Group::layer_prefill_rows`]).
+/// slight shortage needs three full maximum-sized batches, and either [`LAYER_PREFILL_SHORT_ROWS`] (`rows`, from
+/// [`Group::layer_prefill_rows`]). Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order from three ordinary batches
+/// when it can take [`LAYER_PREFILL_FIT_ROWS`].
 fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fits: bool) -> bool {
     if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens / ordinary.max(batch).max(1) >= 3 {
         return true;
     }
     let Some(room) = room else { return false };
-    if banks <= room { return false; }
+    if banks <= room || rows < LAYER_PREFILL_SHORT_ROWS { return false; }
     if u128::from(banks) * 10 >= u128::from(room) * 13 {
         new_tokens > ordinary.max(batch).max(1)
     } else {
@@ -4236,17 +4240,23 @@ mod layer_prefill_policy_tests {
     }
     #[test]
     fn memory_another_program_takes_counts_as_a_shortage() {
-        // The RTX 5070 Ti at 62 GiB, IQ2_XS banks of 50 GiB. Under pressure (4.1 GiB available, a 17 GiB working set) the ordinary path read
-        // them again every batch, 161.8 s against layer order's 73.0 s at 256 rows: a large shortage.
-        let room=layer_prefill_room(62*G,2*G,Some(17*G+4*G-2*G));
-        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
-        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,false));
-        assert!(layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
-        // Unpressured (31 GiB available beside a 16.4 GiB working set) a slight one: a 3.8K follow-up at 128 rows stays ordinary (10.0 s
-        // against 16.1 s), a 32.6K prompt takes layer order (73.7 s both at 256 rows).
-        let room=layer_prefill_room(62*G,2*G,Some(16*G+31*G-2*G));
-        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
-        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
+        // The RTX 5070 Ti at 62 GiB, IQ2_XS banks of 39.4 GiB. Under pressure (4.2 GiB available) the room was 7.9 GiB for a 32.6K prompt,
+        // 20.0 GiB for its 3.8K follow-up: layer order 72.7 and 12.7 s at 256 rows, the ordinary path 161.2 and 16.0 s.
+        let banks=42283827200;
+        for (new,room) in [(32646,8472035328),(3832,21448052736)] {
+            let room=layer_prefill_room(62*G,2*G,Some(room));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,true));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,false));
+            // narrower than 128 rows its MoE loses what the drive costs the ordinary path
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,128,false));
+            assert!(!layer_prefill_needed(new,2048,2048,banks,room,64,false));
+        }
+        // Unpressured the room was 46 GiB: the banks fit, and only Windows' fit rule takes layer order (8.2K at 512 rows: 17.5 s against
+        // 25.4 s); 32.6K at 256 rows and 3.8K at 128 rows stayed ordinary (74.5 and 9.0 s; layer order 73.7 and 16.1 s).
+        let room=layer_prefill_room(62*G,2*G,Some(49839136768));
+        assert!(layer_prefill_needed(8210,2048,2048,banks,room,512,true));
+        assert!(!layer_prefill_needed(32646,2048,2048,banks,room,256,true));
+        assert!(!layer_prefill_needed(3832,2048,2048,banks,room,128,true));
         // what the system says never raises what the RAM leaves
         assert_eq!(layer_prefill_room(32*G,G,Some(100*G)),Some(32*G-G-4*G));
         assert_eq!(layer_prefill_room(0,G,Some(100*G)),None);
