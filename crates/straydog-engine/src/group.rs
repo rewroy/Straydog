@@ -851,6 +851,9 @@ impl Group {
     }
 
     pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].load_layer_bank(layer) }
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
+        self.backends[0].load_layer_bank_from(layer, sources)
+    }
     pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
