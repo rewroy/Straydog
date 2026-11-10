@@ -870,6 +870,12 @@ void run_with_helper(Device& d,size_t begin,size_t end,size_t tokens,Owner&& own
     Device& h=*d.link.peer;
     on_device(h.ordinal,[&]() { helper_span(h,begin,end,tokens); });
     owner();
+    // Both graphs can contain a peer wait. Submit only after both were queued: the first
+    // graph's capture/instantiation may otherwise use much of a display GPU's wait timeout.
+#if !defined(__HIPCC__)
+    flush_launches(d);
+    on_device(h.ordinal,[&]() { flush_launches(h); });
+#endif
 }
 void finish_with_helper(Device& d) {
     Device& h=*d.link.peer;
@@ -1024,4 +1030,13 @@ void resident_moe_parts(Device& d,void* handle,size_t layer,size_t steps,const f
     moe_combine_parts<<<dim3(10,unsigned(steps)),256,0,d.stream>>>(moe.outputs,moe.probabilities,moe.selected,moe.groups,
         steps,true,peer_partials(d.link),d.link.index,nullptr,0,nullptr,output);
     check(hipGetLastError());
+    // The owner's rows and the helper's partials each have a peer wait behind them. Both
+    // streams must be queued before either is flushed, including the helper's separate stream.
+#if !defined(__HIPCC__)
+    flush_launches(d);
+    on_device(h.ordinal,[&]() {
+        StreamScope helping(h,h.helper_stream);
+        flush_launches(h);
+    });
+#endif
 }
