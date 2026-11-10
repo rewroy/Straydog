@@ -2517,6 +2517,17 @@ impl Backend {
         Ok(found != 0)
     }
 
+    /// Point the plan on this device whose gate bank is at `from_gate` at the same banks in `to` (gate, up, down): the engine's page-locked copies
+    /// (`copy`), or the model's mapping again before the copies are freed. Nothing on the device reads the old memory when it returns (the in-flight
+    /// copies, the kernels and graphs that read the banks in place, and the CPU's workers are waited for); the assist's view of the layer is dropped, and
+    /// [`Backend::enable_assist`] maps the new memory. Whether this device holds the layer.
+    pub fn repoint_banks(&mut self, from_gate: *const u8, to: [*const u8; 3], copy: bool) -> Result<bool> {
+        let mut found = 0;
+        // SAFETY: a live handle, an address that is only compared, three addresses the caller keeps alive and an out-parameter.
+        check(unsafe { ffi::sd_hybrid_repoint(self.handle, from_gate.cast(), to.as_ptr(), c_int::from(copy), &mut found) })?;
+        Ok(found != 0)
+    }
+
     /// Give up the page lock of a range this device adopted ([`Backend::adopt_host`]), after [`Backend::unmap_banks`]: the pages are the system's
     /// to page again and the commit they held is given back. A range that was not adopted is left alone.
     pub fn release_host(&mut self, range: &[u8]) -> Result<()> {
@@ -2567,6 +2578,40 @@ impl Backend {
 pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// Whether the GPU `ordinal` registers host memory read-only, as the model's file mapping must be to page-lock it in place: None where the runtime cannot
+/// say (HIP has no such attribute, and a query that failed), which is taken as it being able to.
+pub fn host_registers_read_only(ordinal: usize) -> Option<bool> {
+    #[cfg(feature = "cuda")]
+    {
+        straydog_gpu::host_register_read_only_supported(ordinal).ok()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        None
+    }
+}
+
+/// `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped), allocated under the context of device `ordinal`
+/// from any thread; the runtime's reason if it refused. For the copies of the expert banks ([`crate::banks::PinnedMemory`]).
+pub fn host_alloc(ordinal: usize, bytes: u64) -> Result<*mut u8> {
+    let mut pointer: *mut c_void = std::ptr::null_mut();
+    // SAFETY: an out-parameter.
+    check(unsafe { ffi::sd_host_alloc_on(ordinal as c_int, bytes, &mut pointer) })?;
+    Ok(pointer.cast())
+}
+
+/// Give back memory [`host_alloc`] returned.
+///
+/// # Safety
+/// `pointer` came from [`host_alloc`] of this `ordinal`, once, and nothing reads it any more.
+pub unsafe fn host_free(ordinal: usize, pointer: *mut u8) {
+    // SAFETY: the caller's.
+    if let Err(error) = check(unsafe { ffi::sd_host_free(ordinal as c_int, pointer.cast()) }) {
+        eprintln!("WARN Straydog host banks: a page-locked copy could not be freed ({error})");
+    }
 }
 
 /// The end of the error of a copy of a conversation's state into host memory that the system had none for (see [`Backend::save_positions`]): the devices

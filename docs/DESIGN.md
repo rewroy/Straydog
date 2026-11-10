@@ -86,7 +86,7 @@ sees only what isolation exposes:
 - the pinned model and drafter files;
 - the GPU device nodes;
 - a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
-  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_HOST_REGISTER_READ_ONLY`, `STRAYDOG_DIRECT`), one list for bubblewrap and
   the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
 
 ```
@@ -190,6 +190,21 @@ The engine is built in layers:
     anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
     after ready, whether a request ran meanwhile, how long the turns waited for requests in all and whether the 20 s guard fired, and why it
     stopped if it did.
+  - **Copies where the GPU cannot lock the mapping.** A GPU that cannot register host memory read-only (CUDA's
+    `cudaDevAttrHostRegisterReadOnlySupported` 0: two RTX 3090s on Windows 10, whose every layer's lock failed, so that none of 48 was ever locked and
+    the slots and the prompt read pageable memory) cannot page-lock the model's read-only mapping in place. The start asks each GPU, or takes
+    `STRAYDOG_HOST_REGISTER_READ_ONLY=0` as the answer (a test of this on any machine), says in one line which and why, and from then on every plan is
+    in the copy mode (`LockMode::Copy`), the mapping never offered to the runtime again. A layer's turn then allocates ONE page-locked copy of each of
+    its banks (`hipHostMalloc`, portable and mapped, so every device reads the one copy), copies the bank's bytes from the mapping into it, and
+    checks THE COPY against the file's tree, over the whole blocks around the bank at its file offset (`verity::verify_copy_at`): a page-locked copy
+    cannot change after the check, so the bytes the GPU and the CPU's experts read are the bytes that were checked, which keeps the rule of section 2.
+    A copy that does not match is freed and ends the locking, and the model's service, as a bank that does not match does. Under the engine's lock the
+    plans' host pointers are moved to the copies (`sd_hybrid_repoint`; the one place a bank's bytes are read from: the slots' copies, the prompt's
+    streaming, the CPU experts' gather and routes, the assist's mapping, which then maps the copy), and the layer counts as locked, in the budget,
+    the assist and the give-back. No read-ahead hint is made for a layer held as copies. A give-back, and the model's end, move the plans back to the
+    mapping first, which waits for the device's copy thread and streams and for the CPU's workers, and only then let the copy go; a reader that
+    still holds it (`LayerCopy::lease`) keeps it until it lets go. A failed move keeps the copy. A turn refused with nothing locked is kept by the model
+    (`Refusal`), so that no plan of the remaining layers is made after each request to fail at its first layer again.
   - **The read-ahead of the banks to lock.** A layer's turn reads its banks itself, so a request that comes before the locking is done finds the
     layers not locked yet out of memory when the page cache is cold, and reads them by faulting, one fault after another (Linux, 125 GB, UD-IQ1_S: the
     first request at 28 to 31 tok/s with 218,547 page faults, against 49.4 after the locking; Windows, 62 GiB with the cache emptied by a 46 GiB read: 33.2
