@@ -2521,10 +2521,13 @@ impl Backend {
     /// (`copy`), or the model's mapping again before the copies are freed. Nothing on the device reads the old memory when it returns (the in-flight
     /// copies, the kernels and graphs that read the banks in place, and the CPU's workers are waited for); the assist's view of the layer is dropped, and
     /// [`Backend::enable_assist`] maps the new memory. Whether this device holds the layer.
-    pub fn repoint_banks(&mut self, from_gate: *const u8, to: [*const u8; 3], copy: bool) -> Result<bool> {
+    pub fn repoint_banks(&mut self, from_gate: *const u8, to: crate::banks::Banks, copy: bool) -> Result<bool> {
         let mut found = 0;
-        // SAFETY: a live handle, an address that is only compared, three addresses the caller keeps alive and an out-parameter.
-        check(unsafe { ffi::sd_hybrid_repoint(self.handle, from_gate.cast(), to.as_ptr(), c_int::from(copy), &mut found) })?;
+        // SAFETY: a live handle, an address that is only compared, six addresses the caller keeps alive (the allocations' starts are read only for copies)
+        // and an out-parameter.
+        check(unsafe {
+            ffi::sd_hybrid_repoint(self.handle, from_gate.cast(), to.start.as_ptr(), to.base.as_ptr(), c_int::from(copy), &mut found)
+        })?;
         Ok(found != 0)
     }
 

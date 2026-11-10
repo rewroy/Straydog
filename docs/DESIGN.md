@@ -201,10 +201,17 @@ The engine is built in layers:
     A copy that does not match is freed and ends the locking, and the model's service, as a bank that does not match does. Under the engine's lock the
     plans' host pointers are moved to the copies (`sd_hybrid_repoint`; the one place a bank's bytes are read from: the slots' copies, the prompt's
     streaming, the CPU experts' gather and routes, the assist's mapping, which then maps the copy), and the layer counts as locked, in the budget,
-    the assist and the give-back. No read-ahead hint is made for a layer held as copies. A give-back, and the model's end, move the plans back to the
-    mapping first, which waits for the device's copy thread and streams and for the CPU's workers, and only then let the copy go; a reader that
-    still holds it (`LayerCopy::lease`) keeps it until it lets go. A failed move keeps the copy. A turn refused with nothing locked is kept by the model
-    (`Refusal`), so that no plan of the remaining layers is made after each request to fail at its first layer again.
+    the assist and the give-back. No read-ahead hint is made for a layer held as copies. A give-back moves the plans back to the mapping first, which waits for the
+    device's copy thread and streams and for the CPU's workers, and only then lets the copy go. What makes that safe is the engine's lock (every CPU
+    read of a bank is a synchronous call made under it, so none runs during a give-back) and the device's waits, `bank_readers` among them, which is an
+    error if it does not drain. The model's end does not point the plans back: `Model` has no `Drop`, and its fields drop in their order, the devices
+    (which drain their copy thread and destroy their plans) and the CPU engine before the copies, which is why the copies are declared after them. A
+    failed give-back keeps the copy; a take-over that failed frees it at once if every device is back on the mapping, and keeps it until the model
+    ends if some device could not be put back. The assist maps a copy by the start of its allocation (`host_base`), since a bank begins inside the
+    whole blocks that the copy holds and the runtime maps an allocation by its start; a copy it cannot map is a locked layer that assists nothing, and
+    the log says so (`WARN Straydog host banks: layer N's page-locked copy could not be mapped`). A turn refused with nothing locked is kept by the
+    model (`Refusal`) until the memory available has grown by a layer's banks since, so that no plan of the remaining layers is made after each
+    request to fail at its first layer again.
   - **The read-ahead of the banks to lock.** A layer's turn reads its banks itself, so a request that comes before the locking is done finds the
     layers not locked yet out of memory when the page cache is cold, and reads them by faulting, one fault after another (Linux, 125 GB, UD-IQ1_S: the
     first request at 28 to 31 tok/s with 218,547 page faults, against 49.4 after the locking; Windows, 62 GiB with the cache emptied by a 46 GiB read: 33.2
