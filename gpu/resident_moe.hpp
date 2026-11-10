@@ -598,14 +598,21 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             if (finish<=start) return;
             const dim3 gate_grid(10,unsigned(finish-start),moe_block_m/moe_cuda_m);
             const dim3 down_grid(20,unsigned(finish-start),moe_block_m/moe_cuda_m);
-            if (plan.weights[group*3].kind==42 && plan.weights[group*3+1].kind==42)
-                moe_gate_up_mma<true><<<gate_grid,256,0,d.stream>>>(groups,tiles+start,positions,steps,half_input,product);
-            else
-                moe_gate_up_mma<false><<<dim3(10,unsigned(finish-start)),256,0,d.stream>>>(groups,tiles+start,positions,steps,half_input,product);
-            if (plan.weights[group*3+2].kind==42)
-                moe_down_mma<true><<<down_grid,256,0,d.stream>>>(groups,tiles+start,positions,product,outputs);
-            else
-                moe_down_mma<false><<<dim3(20,unsigned(finish-start)),256,0,d.stream>>>(groups,tiles+start,positions,product,outputs);
+            // Each format with a compiled decode has its own kernel (moe_cuda_mode): a switch on the kind for every
+            // sixteen weights made the generic kernel's prefill about ten times the RDNA4 kernels' a routed row.
+            const int gate_kind=plan.weights[group*3].kind, up_kind=plan.weights[group*3+1].kind;
+            const int gate_mode=gate_kind==up_kind ? moe_cuda_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
+            const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
+            #define SD_CUDA_GATE(mode) case mode: moe_gate_up_mma<mode><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,tiles+start,positions,steps,half_input,product); break;
+            #define SD_CUDA_DOWN(mode) case mode: moe_down_mma<mode><<<mode==42 ? down_grid : down_generic,256,0,d.stream>>>( \
+                groups,tiles+start,positions,product,outputs); break;
+            #define SD_CUDA_MODES(X) X(0) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(29) X(42)
+            switch (gate_mode) { SD_CUDA_MODES(SD_CUDA_GATE) }
+            switch (down_mode) { SD_CUDA_MODES(SD_CUDA_DOWN) }
+            #undef SD_CUDA_MODES
+            #undef SD_CUDA_DOWN
+            #undef SD_CUDA_GATE
         };
         if (begin==0 && end==resident_tiles) {
             const size_t shared_begin=end-(host_counts[experts]+moe_block_m-1)/moe_block_m;
