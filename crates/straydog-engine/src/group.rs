@@ -1298,17 +1298,23 @@ pub fn row_count(values: &[f32]) -> usize {
 
 impl crate::banks::HostPointers for Group {
     /// Every device that holds the layer reads it from `to` from now on, so two devices that both read a layer read one copy of it. A device that fails
-    /// after others have moved puts them back: an error leaves every plan where it was found, or, if even that fails, says so (the caller then keeps the
-    /// copies, which a plan may still read).
-    fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], copy: bool) -> Result<bool> {
+    /// after others have moved puts them back, and the error says whether every one of them is back on `from` (`restored`: nothing reads `to`) or some
+    /// device could not be put back (it may still read `to`, which the caller then keeps). The failing device itself has not moved: the native call
+    /// changes a plan only after its waits succeeded.
+    fn repoint(&mut self, from: crate::banks::Banks, to: crate::banks::Banks, copy: bool) -> std::result::Result<bool, crate::banks::MoveFailed> {
         let mut moved = Vec::new();
         for index in 0..self.backends.len() {
-            match self.backends[index].repoint_banks(from[0], to, copy) {
+            match self.backends[index].repoint_banks(from.start[0], to, copy) {
                 Ok(true) => moved.push(index),
                 Ok(false) => {}
                 Err(error) => {
-                    let failed = moved.iter().filter(|&&done| self.backends[done].repoint_banks(to[0], from, !copy).is_err()).count();
-                    return Err(if failed == 0 { error } else { format!("{error}; {failed} device(s) could not be put back") });
+                    // (a device that does not find its plan where it moved it is not known to be back either)
+                    let stuck = moved.iter().filter(|&&done| !matches!(self.backends[done].repoint_banks(to.start[0], from, !copy), Ok(true))).count();
+                    return Err(if stuck == 0 {
+                        crate::banks::MoveFailed { error, restored: true }
+                    } else {
+                        crate::banks::MoveFailed { error: format!("{error}; {stuck} device(s) could not be put back"), restored: false }
+                    });
                 }
             }
         }

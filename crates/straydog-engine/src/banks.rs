@@ -30,8 +30,16 @@
 //!    ([`Copies::take_over`], [`HostPointers`]): every reader of a bank's bytes goes through them (the slots' copies, the prompt's streaming, the CPU
 //!    experts' gather and routes, the assist's mapping). The model keeps the copies ([`Copies`]) until it gives the layer back or ends.
 //!
-//! A give-back or the model's end points the layer's plans back at the mapping first, which waits for everything that reads the copy, and only then lets
-//! the copy go ([`Copies::give_back`]); a copy a reader still holds ([`LayerCopy::lease`]) is freed when the last reader lets go.
+//! A give-back points the layer's plans back at the mapping first, which waits for everything that reads the copy, and only then lets the copy go
+//! ([`Copies::give_back`]). What makes it safe to free the copy is the engine's lock (every CPU read of a bank is a synchronous call made under it, so
+//! none runs during a give-back) and the waits in the device's repoint (`sd_hybrid_repoint`: its copy thread, its streams, and the `bank_readers` count
+//! that the CPU's reads hold, an error if it does not drain). Nothing else holds a [`LayerCopy`] in production; the tests hold a second reference to the
+//! memory to stand for a reader outside the engine's lock.
+//!
+//! The model's end does not point the plans back: `Model` has no `Drop`, and its fields drop in their order, the devices (which drain their copy thread
+//! and destroy their plans) and the CPU engine (whose workers stop) before the [`Copies`], so that nothing can read a copy when it is freed. The order
+//! matters: copies freed before the devices that read them would be read after they were freed. The memory is then freed by the runtime
+//! (`sd_host_free` sets the device and calls `hipHostFree`), which outlives the device objects.
 //!
 //! The locks are an optimisation and the K/V of a conversation is not, so the locks give way to it, in two ways. The locking leaves room: before a
 //! layer's turn it looks at the memory available then, and stops when the layer would leave less than the plan's margin and the K/V the context's
@@ -183,9 +191,8 @@ impl Drop for CopyBlock {
     }
 }
 
-/// One page-locked copy of a layer's three banks, shared by every device that reads the layer. Cloning ([`LayerCopy::lease`]) is how a reader keeps
-/// the memory: it is freed when the last holder lets go.
-#[derive(Clone)]
+/// One page-locked copy of a layer's three banks, shared by every device that reads the layer: the model's, which holds it until it gives the layer back
+/// or ends (its readers are made safe by the engine's lock and the device's waits, see the module's docs). The memory is freed with its last holder.
 pub struct LayerCopy(Arc<CopyBlock>);
 
 impl LayerCopy {
@@ -247,24 +254,44 @@ impl LayerCopy {
         self.0.parts.iter().map(|part| part.len as u64).sum()
     }
 
-    /// A hold on the copy for a reader: the memory is freed when the last of them lets go, whatever the model has done with the layer.
-    pub fn lease(&self) -> LayerCopy {
-        self.clone()
+    /// Where the plans read the copy's banks from: each bank's first byte, and the start of the allocation it lies in (the bank begins inside the
+    /// whole blocks the allocation holds, and the runtime maps an allocation by its start).
+    pub fn banks(&self) -> Banks {
+        Banks { start: self.pointers(), base: self.0.parts.each_ref().map(|part| part.base.cast_const()) }
     }
+}
 
-    /// How many hold the copy now (the model's own is one).
-    pub fn holders(&self) -> usize {
-        Arc::strong_count(&self.0)
+/// Where a layer's three banks are read from: each bank's first byte, and the start of the allocation it lies in (the same for the mapping).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Banks {
+    pub start: [*const u8; 3],
+    pub base: [*const u8; 3],
+}
+
+impl Banks {
+    /// The three banks as the mapping holds them.
+    pub fn of_mapping(mapping: [&[u8]; 3]) -> Banks {
+        let start = mapping.map(<[u8]>::as_ptr);
+        Banks { start, base: start }
     }
+}
+
+/// A move of plans that failed ([`HostPointers::repoint`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveFailed {
+    pub error: String,
+    /// Every plan that was moved is back on the pointers it had, so nothing reads `to`. False: some plan may still read it (a device could not be put
+    /// back), and `to` must be kept.
+    pub restored: bool,
 }
 
 /// What the devices do with the host pointers of their plans: the one place a bank's bytes are read from (the slots' copies, the prompt's streaming, the
 /// CPU experts' gather, the assist's mapping).
 pub trait HostPointers {
-    /// Every plan whose gate bank is at `from[0]` reads the same banks from `to` from now on, as page-locked copies (`copy`) or as the model's mapping;
-    /// whether any plan did. It returns when nothing on the devices reads the old memory any more; an error leaves the plans where they were, or says
-    /// they may not be (the caller then keeps what they may read).
-    fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], copy: bool) -> Result<bool, String>;
+    /// Every plan whose gate bank is at `from.start[0]` reads the same banks from `to` from now on, as page-locked copies (`copy`) or as the model's
+    /// mapping; whether any plan did. It returns when nothing on the devices reads the old memory any more. On an error it has put the plans it moved
+    /// back and says so (`restored`), or says that it could not.
+    fn repoint(&mut self, from: Banks, to: Banks, copy: bool) -> Result<bool, MoveFailed>;
 }
 
 /// The copies a model holds, a layer's one copy however many devices read the layer.
@@ -292,8 +319,8 @@ impl Copies {
     }
 
     /// Take a layer's checked copy: every plan that reads the layer from `mapping` reads it from the copy from now on. A layer is copied once: one that is
-    /// held already is refused, and so is a layer no device holds (the copy is freed, nothing reads it). If the move fails the copy is kept, since a plan
-    /// may already read it.
+    /// held already is refused, and so is a layer no device holds (the copy is freed, nothing reads it). If the move fails and every plan is back on the
+    /// mapping the copy is freed at once, since nothing reads it; if some plan may still read it, it is kept until the model ends.
     pub fn take_over(&mut self, plans: &mut dyn HostPointers, mapping: [&[u8]; 3], copy: LayerCopy) -> Result<(), String> {
         let layer = copy.layer();
         if self.held.contains_key(&layer) {
@@ -302,49 +329,71 @@ impl Copies {
         if (0..3).any(|role| mapping[role].len() != copy.bank(role).len()) {
             return Err(format!("layer {layer}'s copy is not of the banks of the mapping"));
         }
-        match plans.repoint(mapping.map(<[u8]>::as_ptr), copy.pointers(), true) {
+        match plans.repoint(Banks::of_mapping(mapping), copy.banks(), true) {
             Ok(true) => {
                 self.held.insert(layer, copy);
                 Ok(())
             }
             Ok(false) => Err(format!("no device reads layer {layer}'s banks")),
-            Err(error) => {
-                self.stranded.push(copy);
-                Err(error)
+            Err(failed) => {
+                if !failed.restored {
+                    self.stranded.push(copy);
+                }
+                Err(failed.error)
             }
         }
     }
 
     /// Give a layer's copy back: its plans read the mapping again, which waits for everything that read the copy, and only then does the model let the copy go
-    /// (it is freed once no reader holds a lease on it). Whether the layer was held. If the move fails the copy stays held.
+    /// (it is freed with its last holder, the model's). Whether the layer was held. If the move fails the copy stays held, whether the plans are back on
+    /// it or some may still read it.
     pub fn give_back(&mut self, plans: &mut dyn HostPointers, layer: usize, mapping: [&[u8]; 3]) -> Result<bool, String> {
         let Some(copy) = self.held.get(&layer) else { return Ok(false) };
-        plans.repoint(copy.pointers(), mapping.map(<[u8]>::as_ptr), false)?;
+        plans.repoint(copy.banks(), Banks::of_mapping(mapping), false).map_err(|failed| failed.error)?;
         self.held.remove(&layer);
         Ok(true)
     }
 }
 
-/// A refusal of a layer's turn that came with nothing locked, kept by the model for the plans that follow ([`BankLocks::remembering`]): the GPU's runtime
-/// said no to the very first layer, so it will not say yes to the next request's plan of 48.
+/// A refusal of a layer's turn that came with nothing locked, kept by the model for the plans that follow ([`BankLocks::remembering`]): the runtime said no
+/// to the very first layer, so a plan of the layers that are left made after every request would be refused at its first again. It is kept until the
+/// memory available has grown by a layer's banks since it came, which is when a plan has something new to try; the refusal is most often a shortage.
 #[derive(Clone, Default)]
-pub struct Refusal(Arc<Mutex<Option<String>>>);
+pub struct Refusal(Arc<Mutex<Option<Refused>>>);
+
+/// What a refusal was: the reason, the memory available when it came, and the bytes of the layer that was refused.
+struct Refused {
+    why: String,
+    available: u64,
+    layer_bytes: u64,
+}
 
 impl Refusal {
-    /// A turn was refused with `taken` layers of its plan taken before it.
-    fn note(&self, taken: usize, stop: &Stop) {
+    /// A turn was refused with `taken` layers of its plan taken before it, `available` bytes of memory available then, and the refused layer's banks of
+    /// `layer_bytes`.
+    fn note(&self, taken: usize, stop: &Stop, available: u64, layer_bytes: u64) {
         if taken == 0 {
-            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stop.message());
+            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Refused { why: stop.message(), available, layer_bytes });
         }
     }
 
-    /// Why no more is to be planned: a refusal came with nothing locked, and `locked` layers are locked still (a refusal after some were is a lack of memory
-    /// that a plan made when memory is free may get past).
-    pub fn blocks_more(&self, locked: usize) -> Option<String> {
+    /// Why no more is to be planned with `available` bytes of memory available now: a refusal came with nothing locked, and the memory has not grown by a
+    /// layer's banks since. `locked` layers locked meanwhile end it (a refusal after some were is a lack of memory that a plan made when memory is free may
+    /// get past), and so does that growth, which forgets the refusal: a plan that is refused again keeps its own.
+    pub fn blocks_more(&self, locked: usize, available: u64) -> Option<String> {
         if locked > 0 {
             return None;
         }
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        let mut held = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let refused = held.as_ref()?;
+        let again = refused.available.saturating_add(refused.layer_bytes);
+        if available >= again {
+            *held = None;
+            return None;
+        }
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        Some(format!("{}; planned again once {:.1} GiB of memory is available, a layer's {:.1} GiB more than the {:.1} GiB then",
+                     refused.why, gib(again), gib(refused.layer_bytes), gib(refused.available)))
     }
 }
 
@@ -577,6 +626,7 @@ impl BankLocks {
             return None;
         }
         let (layer, banks) = self.layers.pop_front()?;
+        let layer_bytes: u64 = banks.iter().map(|bank| bank.bytes).sum();
         let _lowered = turn_lowered(priority);
         if let Some((_, next)) = self.layers.front() {
             // SAFETY: the caller's.
@@ -591,7 +641,7 @@ impl BankLocks {
         };
         Some(turn.inspect(|_| self.taken += 1).inspect_err(|stop| {
             if let (true, Some(refusal)) = (stop.is_refusal(), &self.refusal) {
-                refusal.note(self.taken, stop);
+                refusal.note(self.taken, stop, crate::host::available_bytes(), layer_bytes);
             }
         }))
     }
@@ -1186,21 +1236,40 @@ mod tests {
         }
     }
 
-    /// Devices with plans, as the group has them: each plan reads a layer's banks from three addresses.
+    /// How a fake device group's move fails.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Failing {
+        No,
+        /// The move fails, and the plans it moved are back where they were.
+        Restored,
+        /// The move fails with the first plan moved, and a device that could not be put back: that plan may read the new memory.
+        Stuck,
+    }
+
+    /// Devices with plans, as the group has them: each plan reads a layer's banks from three addresses. `last` is where the last move pointed them.
     struct Devices {
         plans: Vec<Vec<[*const u8; 3]>>,
-        fail: bool,
+        fail: Failing,
+        last: Option<Banks>,
     }
 
     impl HostPointers for Devices {
-        fn repoint(&mut self, from: [*const u8; 3], to: [*const u8; 3], _copy: bool) -> Result<bool, String> {
-            if self.fail {
-                return Err("a device would not move the plan".into());
+        fn repoint(&mut self, from: Banks, to: Banks, _copy: bool) -> Result<bool, MoveFailed> {
+            self.last = Some(to);
+            match self.fail {
+                Failing::No => {}
+                Failing::Restored => return Err(MoveFailed { error: "a device would not move the plan".into(), restored: true }),
+                Failing::Stuck => {
+                    if let Some(plan) = self.plans.iter_mut().flatten().find(|plan| plan[0] == from.start[0]) {
+                        *plan = to.start;
+                    }
+                    return Err(MoveFailed { error: "a device would not move the plan, nor be put back".into(), restored: false });
+                }
             }
             let mut found = false;
             for plan in self.plans.iter_mut().flatten() {
-                if plan[0] == from[0] {
-                    *plan = to;
+                if plan[0] == from.start[0] {
+                    *plan = to.start;
                     found = true;
                 }
             }
@@ -1302,7 +1371,7 @@ mod tests {
             assert!(matches!(stop, Stop::Unverified { layer: 7, .. }), "{stop:?} for a byte changed at {tamper}");
             assert!(stop.message().starts_with("Straydog model bytes do not verify: layer 7's banks"), "{}", stop.message());
             assert_eq!((memory.allocated(), memory.live(), memory.freed()), (3, 0, 3), "the copies are freed");
-            assert_eq!(refusal.blocks_more(0), None, "a failed check is not a refusal");
+            assert_eq!(refusal.blocks_more(0, 0), None, "a failed check is not a refusal");
             drop(locks);
             fixture.finish();
         }
@@ -1346,15 +1415,16 @@ mod tests {
         let refusal = Refusal::default();
         let mut locks = BankLocks::new(vec![(7, fixture.banks(true)), (6, fixture.banks(true))], 0, 1 << 30)
             .copying(memory.clone()).remembering(refusal.clone());
-        assert_eq!(refusal.blocks_more(0), None);
+        assert_eq!(refusal.blocks_more(0, 0), None);
         // SAFETY: the fixture keeps the mapping alive.
         let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
         assert_eq!(stop, Stop::NotCopied { layer: 7, error: "out of memory".into() });
         assert!(stop.is_refusal());
         assert_eq!(stop.message(), "copying layer 7's banks into page-locked memory failed (out of memory)");
         assert_eq!((memory.allocated(), memory.live(), memory.freed()), (1, 0, 1), "the first bank's copy is freed");
-        assert_eq!(refusal.blocks_more(0), Some(stop.message()), "nothing was locked: remembered");
-        assert_eq!(refusal.blocks_more(3), None, "layers locked meanwhile: the memory may be there next time");
+        let blocked = refusal.blocks_more(0, 0).expect("nothing was locked: remembered");
+        assert!(blocked.starts_with(&stop.message()) && blocked.contains("planned again once"), "{blocked}");
+        assert_eq!(refusal.blocks_more(3, 0), None, "layers locked meanwhile: the memory may be there next time");
         drop(locks);
         // a refusal after a layer was taken is not remembered: the first layer takes allocations 1 to 3, the second's first is the 4th
         let memory = HeapMemory::refusing_from(4);
@@ -1365,7 +1435,7 @@ mod tests {
         let first = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
         let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
         assert!(matches!(stop, Stop::NotCopied { layer: 6, .. }));
-        assert_eq!(refusal.blocks_more(0), None, "a layer was taken before it");
+        assert_eq!(refusal.blocks_more(0, 0), None, "a layer was taken before it");
         drop((first, locks));
         assert_eq!(memory.live(), 0);
         fixture.finish();
@@ -1413,7 +1483,7 @@ mod tests {
         let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
         assert_eq!(stop, Stop::Refused { layer: 6, error: "not supported".into() });
         assert_eq!(*RECORD.lock().unwrap(), vec![("lock", ranges[0].0, ranges[0].1), ("unlock", ranges[0].0, ranges[0].1)]);
-        assert_eq!(refusal.blocks_more(0), Some(stop.message()));
+        assert!(refusal.blocks_more(0, 0).is_some_and(|blocked| blocked.starts_with(&stop.message())));
         drop(locks);
         fixture.finish();
     }
@@ -1425,13 +1495,21 @@ mod tests {
         let fixture = Fixture::new("shared", None);
         let memory = Arc::new(HeapMemory::default());
         let mapping = pointers(fixture.mapping());
-        let mut devices = Devices { plans: vec![vec![mapping], vec![mapping, [1 as *const u8; 3]]], fail: false };
+        let mut devices = Devices { plans: vec![vec![mapping], vec![mapping, [1 as *const u8; 3]]], fail: Failing::No, last: None };
         let mut copies = Copies::default();
         let copy = copied(&fixture, &memory);
         let at = copy.pointers();
         copies.take_over(&mut devices, fixture.mapping(), copy).unwrap();
         assert_eq!(devices.plans, vec![vec![at], vec![at, [1 as *const u8; 3]]], "both devices read the same copy; another layer's plan is left alone");
         assert_eq!((memory.allocated(), memory.live()), (3, 3), "one copy for both");
+        // the plans get each bank's start and the start of the allocation it lies in: the banks begin inside the blocks of the file the copy holds, and
+        // the runtime maps an allocation by its start, not an address inside it
+        let to = devices.last.expect("the move");
+        assert_eq!(to.start, at);
+        for (role, &(offset, _)) in SPANS.iter().enumerate() {
+            assert_eq!(to.start[role] as usize - to.base[role] as usize, offset as usize % verity::BLOCK, "bank {role}'s place in its allocation");
+        }
+        assert_ne!(to.start[0], to.base[0], "a bank that does not begin on a block");
         assert_eq!(copies.held(), (1, SPANS.iter().map(|span| span.1).sum::<u64>()));
         assert!(copies.holds(7) && !copies.holds(6));
         // a second copy of the layer is refused, and freed
@@ -1442,7 +1520,7 @@ mod tests {
         assert_eq!((memory.live(), memory.freed()), (3, 3), "the second copy is freed");
         assert_eq!(devices.plans[0][0], at, "and moved nothing");
         // a layer that no device reads
-        let mut nobody = Devices { plans: vec![vec![[2 as *const u8; 3]]], fail: false };
+        let mut nobody = Devices { plans: vec![vec![[2 as *const u8; 3]]], fail: Failing::No, last: None };
         let mut other = Copies::default();
         let error = other.take_over(&mut nobody, fixture.mapping(), copied(&fixture, &memory)).unwrap_err();
         assert!(error.contains("no device reads layer 7"), "{error}");
@@ -1453,13 +1531,14 @@ mod tests {
     }
 
     /// Decides: a give-back points the layer's plans back at the mapping first and then lets the copy go: freed at once where nothing reads it, and not
-    /// while a reader (the CPU's gather) holds it, which reads it intact to the end; after it, the plans are on the mapping.
+    /// while a reader that holds a second reference to it (the tests' stand-in for a reader outside the engine's lock; in production the readers are
+    /// waited for) reads it intact to the end; after it, the plans are on the mapping, and the give-back's last move was to the mapping itself.
     #[test]
     fn a_give_back_frees_the_copy_only_after_the_last_reader_and_points_the_plans_back() {
         let fixture = Fixture::new("giveback", None);
         let memory = Arc::new(HeapMemory::default());
         let mapping = pointers(fixture.mapping());
-        let mut devices = Devices { plans: vec![vec![mapping]], fail: false };
+        let mut devices = Devices { plans: vec![vec![mapping]], fail: Failing::No, last: None };
         let mut copies = Copies::default();
         // no reader: freed at once
         copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
@@ -1470,8 +1549,9 @@ mod tests {
         assert!(!copies.holds(7));
         // a reader on another thread reads the copy while the give-back runs
         copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
-        let lease = copies.get(7).unwrap().lease();
-        assert_eq!(lease.holders(), 2);
+        // (a second reference to the memory: what stands for a reader outside the engine's lock, which production has none of)
+        let lease = LayerCopy(copies.get(7).unwrap().0.clone());
+        assert_eq!(Arc::strong_count(&lease.0), 2);
         let expected: Vec<Vec<u8>> = fixture.mapping().iter().map(|bank| bank.to_vec()).collect();
         let stop = Arc::new(AtomicBool::new(false));
         let reader = {
@@ -1489,6 +1569,7 @@ mod tests {
         };
         assert_eq!(copies.give_back(&mut devices, 7, fixture.mapping()), Ok(true));
         assert_eq!(devices.plans, vec![vec![mapping]], "the plans are back on the mapping");
+        assert_eq!(devices.last, Some(Banks::of_mapping(fixture.mapping())), "and read it from the mapping's own start");
         assert!(!copies.holds(7));
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!((memory.live(), memory.freed()), (3, 3), "the reader still holds the copy: not freed (the first layer's three are)");
@@ -1498,28 +1579,74 @@ mod tests {
         fixture.finish();
     }
 
-    /// Decides: a move that fails never frees what a plan may still read: a failed give-back keeps the copy held, and a copy whose take-over failed is
-    /// kept until the model ends.
+    /// Decides: a move that fails frees only what no plan can read. A failed give-back keeps the copy held, whether the plans are back on it or one may
+    /// still read it; a take-over that failed with every plan back on the mapping frees the copy at once (its memory is not held until the model ends), and
+    /// one that failed with a plan that may read the copy keeps it until the model ends.
     #[test]
-    fn a_failed_move_keeps_the_copy() {
+    fn a_failed_move_frees_the_copy_only_where_no_plan_can_read_it() {
         let fixture = Fixture::new("failed", None);
         let memory = Arc::new(HeapMemory::default());
         let mapping = pointers(fixture.mapping());
-        let mut devices = Devices { plans: vec![vec![mapping]], fail: false };
+        let mut devices = Devices { plans: vec![vec![mapping]], fail: Failing::No, last: None };
         let mut copies = Copies::default();
         copies.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap();
-        devices.fail = true;
-        assert!(copies.give_back(&mut devices, 7, fixture.mapping()).is_err());
-        assert!(copies.holds(7));
-        assert_eq!((memory.live(), memory.freed()), (3, 0), "kept");
-        // a take-over that fails
+        let at = copies.get(7).unwrap().pointers();
+        // a give-back that fails keeps the copy, both ways
+        for fail in [Failing::Restored, Failing::Stuck] {
+            devices.fail = fail;
+            assert!(copies.give_back(&mut devices, 7, fixture.mapping()).is_err());
+            assert!(copies.holds(7));
+            assert_eq!((memory.live(), memory.freed()), (3, 0), "kept");
+            devices.plans = vec![vec![at]];
+        }
+        devices.fail = Failing::No;
+        devices.plans = vec![vec![mapping]];
+        // a take-over that fails with every plan put back: nothing reads the copy, and it is freed now
+        devices.fail = Failing::Restored;
         let mut other = Copies::default();
+        let error = other.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).unwrap_err();
+        assert!(error.contains("would not move"), "{error}");
+        assert_eq!(devices.plans, vec![vec![mapping]], "the plans are where they were");
+        assert_eq!((other.held().0, memory.live(), memory.freed()), (0, 3, 3), "not held, and freed at once");
+        assert!(other.stranded.is_empty());
+        // a take-over that fails with a plan that may read the copy: kept until the model ends
+        devices.fail = Failing::Stuck;
         assert!(other.take_over(&mut devices, fixture.mapping(), copied(&fixture, &memory)).is_err());
-        assert_eq!((other.held().0, memory.live(), memory.freed()), (0, 6, 0), "not held, and not freed");
+        assert_ne!(devices.plans, vec![vec![mapping]], "a plan was left on the new pointers");
+        assert_eq!((other.held().0, other.stranded.len(), memory.live(), memory.freed()), (0, 1, 6, 3), "not held, and not freed");
         drop(other);
-        assert_eq!((memory.live(), memory.freed()), (3, 3), "freed with the model");
+        assert_eq!((memory.live(), memory.freed()), (3, 6), "freed with the model");
         drop(copies);
         assert_eq!(memory.live(), 0);
         fixture.finish();
+    }
+
+    /// Decides: a refusal that came with nothing locked blocks the next plans until the memory available has grown by the refused layer's banks since it
+    /// came, and then it is forgotten; layers locked meanwhile end it; one that came after a layer was taken is not kept.
+    #[test]
+    fn a_remembered_refusal_ends_when_the_memory_available_has_grown_by_a_layer() {
+        const GIB: u64 = 1 << 30;
+        let refusal = Refusal::default();
+        let stop = Stop::NotCopied { layer: 7, error: "out of memory".into() };
+        assert_eq!(refusal.blocks_more(0, 0), None, "nothing refused yet");
+        // a layer after one was taken: not kept
+        refusal.note(2, &stop, 10 * GIB, GIB);
+        assert_eq!(refusal.blocks_more(0, 10 * GIB), None);
+        // the first layer, 1 GiB, with 10 GiB available
+        refusal.note(0, &stop, 10 * GIB, GIB);
+        for available in [0, 10 * GIB, 10 * GIB + GIB - 1] {
+            let why = refusal.blocks_more(0, available).unwrap_or_else(|| panic!("{available} available is not a layer's banks more"));
+            assert!(why.starts_with("copying layer 7's banks into page-locked memory failed (out of memory); planned again once 11.0 GiB"), "{why}");
+        }
+        // layers locked meanwhile: nothing blocks, and the refusal stays until memory has grown
+        assert_eq!(refusal.blocks_more(1, 0), None);
+        assert!(refusal.blocks_more(0, 10 * GIB).is_some(), "still kept");
+        // exactly a layer more: planned again, and the refusal is forgotten
+        assert_eq!(refusal.blocks_more(0, 11 * GIB), None);
+        assert_eq!(refusal.blocks_more(0, 0), None, "forgotten: the next refusal is its own");
+        // a refusal again: kept anew, from the memory then
+        refusal.note(0, &stop, 3 * GIB, GIB / 2);
+        assert!(refusal.blocks_more(0, 3 * GIB + GIB / 2 - 1).is_some());
+        assert_eq!(refusal.blocks_more(0, 3 * GIB + GIB / 2), None);
     }
 }

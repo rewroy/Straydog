@@ -623,7 +623,9 @@ pub struct Model {
     group: Group,
     cpu: Option<CpuExperts>,
     /// The page-locked copies of the banks of the layers that a GPU which cannot register host memory read-only holds in place of the mapping
-    /// ([`LockMode::Copy`]): the devices' plans and the CPU engine read them, so they are freed after both (here, and not before).
+    /// ([`LockMode::Copy`]). The devices' plans and the CPU engine read them, and the model has no `Drop`: this field is declared after `group` and `cpu`
+    /// so that they are dropped first (the devices drain their copy thread and destroy their plans, the CPU's workers stop) and nothing reads a copy when
+    /// it is freed. Keep it after them.
     copies: Copies,
     pub weights: Weights,
     pub context: usize,
@@ -1496,11 +1498,15 @@ impl Model {
             return None;
         }
         // (the runtime refused the first layer of a plan with nothing locked: it would refuse the first of this one, and again after every request)
-        if let Some(why) = self.lock_refusal.blocks_more(self.locked_layers.len()) {
-            if !std::mem::replace(&mut self.refusal_told, true) {
-                eprintln!("Straydog host banks: no more layers are planned to be page-locked: the first layer's turn was refused with none locked ({why})");
+        match self.lock_refusal.blocks_more(self.locked_layers.len(), crate::host::available_bytes()) {
+            Some(why) => {
+                if !std::mem::replace(&mut self.refusal_told, true) {
+                    eprintln!("Straydog host banks: no more layers are planned to be page-locked: the first layer's turn was refused with none locked ({why})");
+                }
+                return None;
             }
-            return None;
+            // (the memory has grown by a layer's banks since, or nothing was refused: a refusal that comes later is told as its own)
+            None => self.refusal_told = false,
         }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
@@ -1563,6 +1569,7 @@ impl Model {
             return Err("its page locks were given back to a K/V growth".into());
         }
         let layer = locked.layer;
+        let copied = locked.is_copy();
         if let Some(copy) = locked.take_copy() {
             // The layer's banks are page-locked copies, checked: every device's plan of the layer reads them (one copy for all) from here, and the assist
             // below maps them. The mapping is registered nowhere.
@@ -1576,6 +1583,12 @@ impl Model {
         self.lock_pending.retain(|pending| *pending != layer);
         self.locked_layers.push(layer);
         let mapped = self.start_assist()?;
+        // (a copy the runtime would not map for the GPU is a locked layer that assists nothing, and its prompts gather it through the CPU: say so, once per
+        // layer, since nothing else shows it)
+        if copied && mapped < self.locked_layers.len() as u64 {
+            eprintln!("WARN Straydog host banks: layer {layer}'s page-locked copy could not be mapped for the GPU's assist ({mapped} of {} locked layers are mapped); \
+                       the GPU takes no routes from it and the CPU gathers its experts for a prompt", self.locked_layers.len());
+        }
         // (what a round measured was of the layers locked then)
         if self.assist_tuning() {
             if let Some(tuner) = self.assist.as_mut() {
@@ -2348,7 +2361,7 @@ impl Model {
         for &(layer, bytes) in sizes.iter().rev().take(count) {
             let banks = Self::host_banks(&self.weights, layer)?;
             // (a layer held as copies: its plans read the mapping again first, which waits for everything that reads the copies, and only then are they let
-            // go; a reader that still holds one keeps it until it lets go)
+            // go: nothing reads them, by the engine's lock that this runs under and the device's waits)
             if !self.copies.give_back(&mut self.group, layer, banks)? {
                 self.group.release_host(banks)?;
             }

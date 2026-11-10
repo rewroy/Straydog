@@ -196,6 +196,8 @@ struct ResidentMoe {
     const uint8_t* host[3]{};
     // host points at the engine's page-locked copies of the banks, not at the model's mapping (sd_hybrid_repoint): nothing is read ahead of them.
     bool host_copy=false;
+    // With host_copy: the start of the allocation each bank of the copy lies in (a bank begins inside it; sd_hybrid_assist maps an allocation by its start).
+    const uint8_t* host_base[3]{};
     size_t host_bytes[3]{};
     std::vector<int32_t> slot_of;
     uint8_t slot_group=0;   // the slots its experts take (expert_slots_carve)
@@ -2176,8 +2178,13 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
             if (plan.mapped[0]) { ++*mapped; continue; }
             void* views[3]{};
             bool ok=true;
-            for (size_t role=0;role<3 && ok;++role)
-                ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host[role]),0)==hipSuccess;
+            for (size_t role=0;role<3 && ok;++role) {
+                if (plan.host_copy && plan.host_base[role]) {
+                    // A copy's bank lies inside its allocation: the runtime maps the allocation, not an address in it, and the bank's view is at the same offset.
+                    ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host_base[role]),0)==hipSuccess;
+                    if (ok) views[role]=static_cast<uint8_t*>(views[role])+(plan.host[role]-plan.host_base[role]);
+                } else ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host[role]),0)==hipSuccess;
+            }
             (void)hipGetLastError();   // clear the failed lookup
             for (size_t role=0;role<3;++role) plan.mapped[role]=ok ? static_cast<const uint8_t*>(views[role]) : nullptr;
             *mapped+=ok;
@@ -2224,14 +2231,15 @@ int sd_hybrid_unmap(void* handle,const void* gate,uint64_t* found) {
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: the engine
-// holds page-locked copies of the banks where the GPU cannot page-lock the model's read-only mapping (`copy` 1), and points the plan back at the mapping
-// before it frees them (`copy` 0). Nothing may read the old memory when this returns: the swap copies in flight (the device's thread and the copy
+// holds page-locked copies of the banks where the GPU cannot page-lock the model's read-only mapping (`copy` 1, with `base`: the start of the allocation
+// each bank lies in, which the assist maps), and points the plan back at the mapping before it frees them (`copy` 0, `base` not read). Nothing may read the old memory when this returns: the swap copies in flight (the device's thread and the copy
 // stream) and the kernels that read the banks in place or hold the view in a captured graph (the device) are waited for, and so are the CPU's workers
 // (BankReading; they run inside the engine's calls on this thread, so a count above zero is a fault, and the plan is left as it was). The plan's view
 // for the GPU's assist is dropped: sd_hybrid_assist maps the new memory. `found` is 1 where this device holds the plan.
-int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,int copy,uint64_t* found) {
+int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,const uint8_t* const* base,int copy,uint64_t* found) {
     try {
         if (!from || !host || !host[0] || !host[1] || !host[2] || !found) throw std::runtime_error("invalid hybrid repoint");
+        if (copy && (!base || !base[0] || !base[1] || !base[2])) throw std::runtime_error("invalid hybrid repoint: a copy's allocations");
         auto& d=device(handle);
         *found=0;
         ResidentMoe* target=nullptr;
@@ -2247,7 +2255,9 @@ int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,i
             if (waited>5000) throw std::runtime_error("the CPU's experts are still reading the layer's banks");
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        for (size_t role=0;role<3;++role) { target->mapped[role]=nullptr; target->host[role]=host[role]; }
+        for (size_t role=0;role<3;++role) {
+            target->mapped[role]=nullptr; target->host[role]=host[role]; target->host_base[role]=copy ? base[role] : nullptr;
+        }
         target->host_copy=copy!=0;
         target->prefetched.clear();
         bool any=false;

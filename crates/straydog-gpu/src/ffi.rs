@@ -2235,6 +2235,7 @@ unsafe extern "C" {
         handle: *mut ::std::os::raw::c_void,
         from: *const ::std::os::raw::c_void,
         host: *const *const u8,
+        base: *const *const u8,
         copy: ::std::os::raw::c_int,
         found: *mut u64,
     ) -> ::std::os::raw::c_int;
