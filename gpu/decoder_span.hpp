@@ -96,18 +96,6 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     d.decoder.emplace(layer,std::move(plan));
 }
 
-// WDDM (Windows) holds submitted work until the driver is next asked about the
-// stream, and the export wait asks only every few thousand spins: query right after
-// a launch so the GPU starts it now.
-inline void flush_launches(Device& d) {
-#if !defined(__HIPCC__)
-    const hipError_t state = hipStreamQuery(d.stream);
-    if (state != hipSuccess && state != hipErrorNotReady) check(state);
-#else
-    (void)d;
-#endif
-}
-
 // With prelaunch, layer L+1's graph is launched before the host computes layer L's
 // CPU experts and starts by awaiting that result on the GPU, so no launch latency
 // sits between the host's result and the GPU's next layer.

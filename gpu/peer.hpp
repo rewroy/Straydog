@@ -81,6 +81,29 @@ struct StreamScope {
     StreamScope& operator=(const StreamScope&) = delete;
 };
 
+// WDDM can hold a CUDA stream's queued kernels until the driver is asked about that stream.
+// A peer may already be spinning on a flag those kernels will publish, so submit the producer
+// promptly. HIP launches do not need this query.
+inline void flush_launches(Device& d) {
+#if !defined(__HIPCC__)
+    const hipError_t state = hipStreamQuery(d.stream);
+    if (state != hipSuccess && state != hipErrorNotReady) check(state);
+#else
+    (void)d;
+#endif
+}
+
+// Graph capture records a peer wait for later replay; querying that stream during capture is invalid.
+inline void flush_if_not_capturing(Device& d) {
+#if !defined(__HIPCC__)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    check(cudaStreamIsCapturing(d.stream, &capture));
+    if (capture == cudaStreamCaptureStatusNone) flush_launches(d);
+#else
+    (void)d;
+#endif
+}
+
 inline float* peer_inputs(PeerLink& link) { return link.inbox; }
 inline float* peer_partials(PeerLink& link) { return link.inbox + link.rows * 2560; }
 inline float* peer_remote_partials(PeerLink& link) { return link.peer_inbox + link.rows * 2560; }
