@@ -109,6 +109,20 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     for (size_t first = 0; first < steps; first += chunk) {
         const size_t count = std::min(chunk, steps - first);
         float* rows = qkv + first * H::channels;
+#if defined(__HIPCC__)
+        // A long read's chunk goes through the chunked scan (gated_delta_chunk.hpp): its first kernel convolves, normalizes and packs, its
+        // second scans and moves the convolution's history on.
+        if (d.gdn_chunked && count > 1 && GdnChunkLayout<P>(count).total <= d.input_capacity) {
+            gdn_chunk_prep<P><<<dim3(unsigned((count + gdn_chunk_tokens - 1) / gdn_chunk_tokens), unsigned(H::key)), 640, 0, d.stream>>>(rows,
+                static_cast<const float*>(conv), static_cast<const float*>(pointers[5]), beta + first * H::value, alpha + first * H::value,
+                static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
+            gdn_chunk_scan<P><<<unsigned(H::key * 8), 192, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows,
+                static_cast<float*>(conv));
+            gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
+                post + first * H::gate);
+            continue;
+        }
+#endif
         // (the runs' edges in the packed values' scratch, d.input, before the chunk's values are packed there)
         const unsigned columns = unsigned((H::channels + 255) / 256), runs = unsigned((count + gdn_conv_run - 1) / gdn_conv_run);
         gdn_conv_edges<P><<<columns, 256, 0, d.stream>>>(rows, static_cast<float*>(conv), count, d.input);
