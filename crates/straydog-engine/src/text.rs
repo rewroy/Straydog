@@ -24,8 +24,10 @@ pub const DEFUSED: char = '\u{e001}';
 
 /// Segments (the text between two added tokens) of at least this many bytes are kept by their digest once encoded ([`Text::encode`]).
 const MEMO_FROM: usize = 4096;
-/// The most tokens the kept segments hold, the oldest let go first: a conversation at 262,144 tokens with room to spare.
-const MEMO_TOKENS: usize = 1 << 19;
+/// The most tokens the kept segments hold, the oldest let go first (16 MiB): a conversation at the longest context a model is
+/// served with, DeepSeek-V4.1's 1,048,576 tokens, with room for others. A segment longer than this is not kept: at 1 << 19 a
+/// 932,410-token conversation was encoded again each turn, 0.9 s of a 1.55 s wait for its first token.
+const MEMO_TOKENS: usize = 1 << 22;
 
 /// Encoded segments by the SHA-256 of their text, and the order they came in. A conversation's next request renders its earlier messages
 /// again, and their segments come back the same: only the new ones need encoding (a 250K-token conversation took 0.30 to 0.34 s to encode
