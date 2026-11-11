@@ -14,7 +14,7 @@ use serde_json::json;
 
 use super::drafter::{self, Drafter, Policy, Rings, MAX_SLOTS};
 use super::dspark::Dspark;
-use super::engine::{divided, forward_split, full_snapshot_bytes, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot,
+use super::engine::{divided, forward_split, full_snapshot_bytes, pass_row_bytes, score_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot,
                     ATTENTION_ROWS, EXPANSIONS, OWN_ROWS, TAP_LAYERS, TAP_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Draw, Placed, Proposal, Session, Settings};
@@ -850,7 +850,10 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         let rows = (batch + OWN_ROWS.min(batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
         // Reserved on each device, so it comes out of that device's expert slots.
         let expansions = if settings.half_gemm { EXPANSIONS } else { 0 };
-        let fixed = resident + state(range) + rows + SCRATCH + expansions + RESERVE + dspark_bytes(index);
+        // (and the index scores of a pass's rows over the whole context: lent to the store past what a pass
+        // reaches, as the pass buffers are, but taken from the card like them)
+        let scores = score_bytes(batch.min(ATTENTION_ROWS), settings.context);
+        let fixed = resident + state(range) + rows + scores + SCRATCH + expansions + RESERVE + dspark_bytes(index);
         let free = vram.checked_sub(fixed)
             .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM on GPU {devices:?}", vram as f64 / (1u64 << 30) as f64))?;
         // Each device's share of an expert is 1/parts of a slot: free / share experts.
@@ -1049,6 +1052,15 @@ mod tests {
         assert_eq!(evictions(&[(0, 300 << 20), (1, full), (2, 300 << 20)], full, budget), Some(vec![0, 1]));
         assert_eq!(evictions(&held, budget, budget), Some(vec![0, 1]));
         assert_eq!(evictions(&held, budget + 1, budget), None);
+    }
+
+    /// The index scores of a pass's rows span the whole context, so placement counts them with the rest a device holds:
+    /// 256 MiB a device at 262144 tokens, 1 GiB at 1048576 (a gigabyte the expert slots had counted as theirs).
+    #[test]
+    fn the_index_scores_grow_with_the_context() {
+        assert_eq!(score_bytes(ATTENTION_ROWS, 262_144), (256 << 20) + 1024);
+        assert_eq!(score_bytes(ATTENTION_ROWS, 1_048_576), (1 << 30) + 1024);
+        assert_eq!(score_bytes(ATTENTION_ROWS.min(64), 4096), 64 * 4097 * 4);
     }
 
     /// A context up to the model's 1048576 is served when the bundle declares as much (or does not say); one above the
