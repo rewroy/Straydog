@@ -1785,6 +1785,16 @@ unsafe extern "C" {
     pub fn sd_prefill_row_transfers(handle: *mut ::std::os::raw::c_void, out: *mut u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_layer_rows_put(handle: *mut ::std::os::raw::c_void, storage: *mut ::std::os::raw::c_void, first: u64, rows: *const f32,
+                             steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_layer_rows_get(handle: *mut ::std::os::raw::c_void, storage: *mut ::std::os::raw::c_void, first: u64, rows: *mut f32,
+                             steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_prefill_rows_held(handle: *mut ::std::os::raw::c_void, layer: u64, storage: *mut ::std::os::raw::c_void, first: u64,
+                                steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_prefill_span_held(handle: *mut ::std::os::raw::c_void, begin: u64, end: u64, position: u64, steps: u64,
+                                storage: *mut ::std::os::raw::c_void, first: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

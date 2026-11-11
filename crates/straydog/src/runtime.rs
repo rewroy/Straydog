@@ -570,7 +570,13 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
                 format!(", hidden rows up {:.1} GB in {up_seconds:.1} s and down {:.1} GB in {down_seconds:.1} s", up / 1e9, down / 1e9),
             _ => String::new(),
         };
-        format!("; prefill layers first,{passes} {} rows a batch{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+        // (where the pass's rows were: held in VRAM, or on the host and why)
+        let held = match (timings["prefill_rows_vram"] == true, timings["prefill_rows_host_reason"].as_str()) {
+            (true, _) => ", rows held in VRAM".to_string(),
+            (false, Some(reason)) => format!(", rows on the host ({reason})"),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
     } else {
         // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
         let policy = &timings["layer_prefill_policy"];
@@ -2013,6 +2019,12 @@ mod tests {
         assert!(moved.contains("; prefill layers first, in 16 passes of up to 16384 rows, 2048 rows a batch, hidden rows up 491.2 GB in 31.0 s \
                                 and down 491.2 GB in 28.4 s"), "{moved}");
         assert_eq!(moved.lines().count(), 1);
+        // (the rows held in VRAM, or on the host with why)
+        let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
+        assert!(held.contains("2048 rows a batch, rows held in VRAM"), "{held}");
+        let host = request_summary(&event(json!({"prefill_layer_passes": 2, "prefill_layer_rows": 131072,
+                                                 "prefill_rows_host_reason": "5.00 GiB of rows, 3.50 GiB of VRAM free"})), None);
+        assert!(host.contains("2048 rows a batch, rows on the host (5.00 GiB of rows, 3.50 GiB of VRAM free)"), "{host}");
         let without = request_summary(&event(json!({})), None);
         assert!(without.contains("; prefill layers first, 2048 rows a batch"), "{without}");
     }
