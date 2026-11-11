@@ -1377,6 +1377,7 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "hc_decode.hpp"
 #include "hyperconnection.hpp"
 #include "gated_delta.hpp"
+#include "gated_delta_chunk.hpp"
 #include "ple.hpp"
 #include "grouped_gemm.hpp"
 #include "mixture_of_experts.hpp"

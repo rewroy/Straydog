@@ -1114,6 +1114,28 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   and a block 32 columns, four blocks a head (the columns are independent), and stages 16 tokens'
   q, k, v, decay and beta in LDS a barrier at a time; its sums are explicit FMAs in the order the
   one-block-a-head scan compiled to, the same bits at 1.9x its speed.
+- A read of 16384 new tokens or more (`CHUNKED_SCAN_READ`; `STRAYDOG_DELTA_SCAN=token` keeps the scan above)
+  runs those layers' recurrence in chunks of 16 tokens (`gpu/gated_delta_chunk.hpp`, RDNA4). With g the chunk's
+  decay products, its corrections solve a 16 x 16 unit lower-triangular system, (I + L) C = beta v - diag(beta g) M0^T k,
+  its outputs are g M0^T q + B C and its state g M0 + K^T diag(e) C, so only the products against the state wait
+  for the chunk before. The rest (`gdn_chunk_prep`: the convolution, the q and k norms, the Gram products and the
+  solves) is free of the state and runs for all chunks of a 512-token launch at once, in place of gdn_conv_edges,
+  gdn_conv_runs, gdn_normalize_qk and gdn_pack_values. `gdn_chunk_scan` keeps the state in WMMA accumulators and does
+  every product against it in bf16 pieces: a value is three bf16 (each the leading 8 bits of what the ones before
+  leave), a product is six of the nine pieces' products with F32 sums, which carries about F32's bits (FP16 operands
+  would round every product to 11). The F32 FMA form of the same algebra measured 1.3x slower than delta_split_sequence
+  on an R9700: its operands stream through LDS a float an FMA, and a chunk's products are too small to tile (24 heads x
+  128 columns of state).
+  One R9700, 512 tokens, QwenHeads<2> shapes, random q/k/v: convolution, normalization, packing and scan 340-385 us,
+  the two kernels 187-228 us; against an F64 scan the outputs' largest error is 2.3e-7 to 4.8e-7 of the largest output
+  (the token scan's: 1.0e-7 to 2.0e-7). On the activations of a 95K read (4 heads of 12 layers against an F64 scan) the
+  chunked outputs are 2e-6 to 7e-4 of the largest output off, the token scan's 5e-7 to 1.6e-4, both growing with the
+  tokens read (a state that forgets little keeps its rounding): C = U - W P and g S + B C subtract large partial
+  results where the token form's dot products do not, and the F32 form of the chunk on the CPU is as far off as the
+  bf16 one, so it is the form, not the pieces (keys that nearly agree and strengths near 1 cost it 3 to 4 times the
+  token scan's error there; the decay products are formed in F64, which took a head that forgets little from 2.5 times
+  to the token scan's error, and changed nothing on the 95K read's activations). The first logits move as they do for a
+  change of batch width.
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
