@@ -65,6 +65,26 @@ fn compare(name: &str, a: &Observed, b: &Observed) -> bool {
     a.token == b.token && bitwise && a.state == b.state
 }
 
+/// A pass's hidden rows held in VRAM move by device copies where they went to the host and back: the logits, the token and the state are
+/// the host round trip's, bit for bit.
+#[test]
+fn layer_order_rows_held_in_vram_match_the_host_round_trip() {
+    let (Some(root), Some(drafter)) = (common::model_env("STRAYDOG_LAYER_MODEL", "the Qwen model bundle directory"),
+                                     common::model_env("STRAYDOG_DRAFTER", "the MTP bundle directory")) else { return };
+    let mut runs = Vec::new();
+    for held in [false, true] {
+        let (mut model, text) = open(Path::new(&root), Path::new(&drafter), true);
+        model.layer_rows_in_vram(held);
+        let line = "A printed source lets readers compare the same words, check the evidence, and correct errors in the next edition. ";
+        let mut plain = text.encode(&line.repeat(140)).unwrap();
+        plain.truncate(1025);
+        runs.push(observed(&mut model, &plain, false));
+        assert_eq!(model.last_metrics["prefill_order"], "layer", "the candidate fell back");
+        assert_eq!(model.last_metrics.get("prefill_rows_vram").is_some(), held, "{:?}", model.last_metrics.get("prefill_rows_host_reason"));
+    }
+    assert!(compare("rows held in VRAM against the host round trip", &runs[0], &runs[1]));
+}
+
 #[test]
 fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
     let (Some(root), Some(drafter)) = (common::model_env("STRAYDOG_LAYER_MODEL", "the Qwen model bundle directory"),

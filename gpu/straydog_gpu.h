@@ -500,6 +500,10 @@ int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context
 /* Place four-stream hidden rows in a layer's workspace before its PLE and prefill span. */
 int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps);
 int sd_prefill_row_transfers(void* handle, uint64_t* out);
+int sd_layer_rows_put(void* handle, void* storage, uint64_t first, const float* rows, uint64_t steps);
+int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, uint64_t steps);
+int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps);
+int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
 /* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
    layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a

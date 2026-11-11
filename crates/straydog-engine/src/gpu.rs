@@ -83,6 +83,18 @@ fn widened_prefill_rows(current: u64, free: u64) -> u64 {
         .unwrap_or(current)
 }
 
+/// The rows of a layer-order pass's hidden state (40 KB each) that `free` bytes of VRAM hold beside the slots' `margin`.
+pub(crate) fn layer_rows_room(free: u64, margin: u64) -> u64 {
+    free.saturating_sub(margin + 2 * ALLOCATION_TAIL) / (WIDTH as u64 * 4)
+}
+
+/// Why `rows` rows do not fit in `free` bytes beside `margin` ([`layer_rows_room`]); None where they do.
+pub(crate) fn layer_rows_refusal(rows: u64, free: u64, margin: u64) -> Option<String> {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    (rows > layer_rows_room(free, margin))
+        .then(|| format!("{:.2} GiB of rows, {:.2} GiB of VRAM free", gib(rows * WIDTH as u64 * 4), gib(free)))
+}
+
 /// What `sd_create` counts of a device's budget from 2 GiB up: its input and output (64 MiB each), the expanded GEMMs (128), half input (32),
 /// BLAS (16) and attention scores (48).
 const DEVICE_WORKSPACES: u64 = (64 + 64 + 128 + 32 + 16 << 20) + 256 * 24 * 2052 * 4;
@@ -439,6 +451,8 @@ pub struct Backend {
     long_prefill: Option<u64>,
     /// Temporary routed-bank allocation for a layer-ordered prompt.
     layer_prefill_pool: Option<(*mut c_void, u64)>,
+    /// A layer-order pass's hidden rows held in VRAM ([`Backend::hold_layer_rows`]), and their count: until finish_layer_prefill.
+    layer_rows: Option<(*mut c_void, u64)>,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
     pub logical_capacity: usize,
@@ -533,6 +547,7 @@ impl Backend {
             slot_margin: 0,
             long_prefill: None,
             layer_prefill_pool: None,
+            layer_rows: None,
             slot_size: 0,
             registered: Vec::new(),
             batch_capacity,
@@ -1151,6 +1166,63 @@ impl Backend {
         Ok(Some(self.prefill_capacity))
     }
 
+    /// Hold `rows` rows of a layer-order pass's hidden state in VRAM, beside what layer order holds (after begin_layer_prefill): None where they
+    /// are held, else why not (the pass then moves them to the host and back, as before).
+    pub fn hold_layer_rows(&mut self, rows: u64) -> Result<Option<String>> {
+        if self.layer_rows.is_some() {
+            return Ok(Some("rows already held".into()));
+        }
+        let (used, budget) = self.memory()?;
+        if let Some(reason) = layer_rows_refusal(rows, budget.saturating_sub(used), self.slot_margin) {
+            return Ok(Some(reason));
+        }
+        let mut storage = std::ptr::null_mut();
+        // SAFETY: a live device and out-parameter; nothing reads the rows before they are put.
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, rows * WIDTH as u64 * 4, &mut storage) };
+        if !storage.is_null() { self.layer_rows = Some((storage, rows)); }
+        if check(status)? == 1 { return Ok(Some("the device refused the allocation".into())); }
+        pointer(storage)?;
+        Ok(None)
+    }
+
+    fn held_rows(&self) -> Result<*mut c_void> {
+        self.layer_rows.map(|(storage, _)| storage).ok_or_else(|| "no layer rows held in VRAM".into())
+    }
+
+    /// Rows from `first` of the held rows, from the host.
+    pub fn put_layer_rows(&mut self, first: u64, rows: &[f32]) -> Result<()> {
+        let storage = self.held_rows()?;
+        if rows.len() % WIDTH != 0 { return Err("invalid layer rows".into()); }
+        // SAFETY: the held allocation (checked natively against the rows' range) and host rows alive through the call.
+        check(unsafe { ffi::sd_layer_rows_put(self.handle, storage, first, rows.as_ptr(), (rows.len() / WIDTH) as u64) }).map(drop)
+    }
+
+    /// Rows from `first` of the held rows, to the host (after the work queued before).
+    pub fn get_layer_rows(&mut self, first: u64, rows: &mut [f32]) -> Result<()> {
+        let storage = self.held_rows()?;
+        if rows.len() % WIDTH != 0 { return Err("invalid layer rows".into()); }
+        // SAFETY: as put_layer_rows, with a host place of the rows' size.
+        check(unsafe { ffi::sd_layer_rows_get(self.handle, storage, first, rows.as_mut_ptr(), (rows.len() / WIDTH) as u64) }).map(drop)
+    }
+
+    /// [`Backend::prefill_rows`] from the held rows `first..first + steps`: a device copy into `layer`'s workspace.
+    pub fn prefill_rows_held(&mut self, layer: usize, first: u64, steps: u64) -> Result<()> {
+        let storage = self.held_rows()?;
+        if !(1..=self.prefill_capacity).contains(&steps) { return Err("invalid layer prefill hidden rows".into()); }
+        // SAFETY: the held allocation, its range checked natively, and a registered decoder layer.
+        check(unsafe { ffi::sd_prefill_rows_held(self.handle, layer as u64, storage, first, steps) }).map(drop)
+    }
+
+    /// [`Backend::prefill_layers_into`] of one layer, its output copied back into the held rows `first..first + steps`.
+    pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
+        let storage = self.held_rows()?;
+        if layer >= 49 || !(2..=self.prefill_capacity).contains(&steps) || position > 262144 - steps {
+            return Err("invalid Straydog resident prefill span".into());
+        }
+        // SAFETY: the held allocation, its range checked natively; the span's own checks as sd_prefill_span's.
+        check(unsafe { ffi::sd_prefill_span_held(self.handle, layer as u64, layer as u64 + 1, position, steps, storage, first) }).map(drop)
+    }
+
     pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> {
         let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
         // SAFETY: owned storage retained until clear_layer_bank/finish_layer_prefill, and a registered decoder layer.
@@ -1174,6 +1246,10 @@ impl Backend {
     /// End the temporary bank's lifetime and restore workspace sizes; leave cache restoration until the head is back.
     pub fn finish_layer_prefill(&mut self) -> Result<()> {
         self.clear_layer_bank()?;
+        if let Some((storage, _)) = self.layer_rows.take() {
+            // SAFETY: the held rows' allocation; clear_layer_bank waited for the device's work, the last that read them.
+            check(unsafe { ffi::sd_release(self.handle, storage) })?;
+        }
         if let Some((pool, _)) = self.layer_prefill_pool {
             // SAFETY: clear_layer_bank has removed all references and waited for transfers/readers.
             check(unsafe { ffi::sd_release(self.handle, pool) })?;
@@ -3116,6 +3192,26 @@ mod kv_format_tests {
         assert_eq!(before[32..256], after[32..256], "the other blocks' values");
         assert_eq!(before[258..272], after[258..272], "the other blocks' scales");
         assert_eq!(after[3] as i8, 127);
+    }
+}
+
+#[cfg(test)]
+mod layer_rows_tests {
+    use super::{layer_rows_refusal, layer_rows_room, ALLOCATION_TAIL};
+
+    /// Decides: how many of a pass's hidden rows (40 KB each) the VRAM layer order leaves holds beside the slots' margin, and that a pass of
+    /// more is refused with why: 65,536 rows (2.5 GiB) in 3.5 GiB, not 131,072 (5 GiB); nothing in less than the margin.
+    #[test]
+    fn a_pass_holds_its_rows_in_vram_where_they_fit() {
+        const GIB: u64 = 1 << 30;
+        let margin = 64 << 20;
+        assert_eq!(layer_rows_room(GIB + margin + 2 * ALLOCATION_TAIL, margin), GIB / 40_960);
+        assert_eq!(layer_rows_room(margin, margin), 0);
+        assert!(layer_rows_refusal(65_536, 7 * GIB / 2, margin).is_none());
+        let refused = layer_rows_refusal(131_072, 7 * GIB / 2, margin).unwrap();
+        assert_eq!(refused, "5.00 GiB of rows, 3.50 GiB of VRAM free");
+        assert!(layer_rows_refusal(16_384, 640 << 20, margin).is_some());
+        assert!(layer_rows_refusal(16_384, (640 << 20) + margin + 2 * ALLOCATION_TAIL, margin).is_none());
     }
 }
 
