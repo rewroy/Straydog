@@ -630,6 +630,8 @@ pub struct Prefix {
 pub struct Settings {
     pub context: usize,
     pub state_budget_bytes: u64,
+    /// The rows of a prefill batch asked for, kept as asked where the placement allows; [`DERIVED_BATCH`] (0): the batch derived from the GPU
+    /// budgets ([`resident_batch`]), which the placement may narrow where it does not pay.
     pub prefill_batch_size: usize,
     pub speculative: usize,
     /// CPU expert threads for partial residency (0: one per physical core).
@@ -921,7 +923,7 @@ impl Model {
         if !(1..=CONTEXT_LIMIT).contains(&context) {
             return Err("Straydog context must be within the native model limit".into());
         }
-        if !(1..=4096).contains(&settings.prefill_batch_size) {
+        if settings.prefill_batch_size != DERIVED_BATCH && !(1..=4096).contains(&settings.prefill_batch_size) {
             return Err("Straydog prefill batch must be between 1 and 4096".into());
         }
         if settings.speculative > MAX_DRAFTS {
@@ -932,7 +934,9 @@ impl Model {
         group.balance_layers(&layer_bytes, tail)?;
         let drafting = settings.speculative > 0 && weights.drafter;
         validate_geometry(&weights)?;
-        if settings.prefill_batch_size > group.logical_capacity() {
+        let derived = settings.prefill_batch_size == DERIVED_BATCH;
+        let asked = if derived { resident_batch(group.memory()?.1) } else { settings.prefill_batch_size };
+        if asked > group.logical_capacity() {
             return Err("Straydog prefill exceeds this GPU workspace capacity".into());
         }
         let context64 = context as u64;
@@ -944,21 +948,21 @@ impl Model {
         let recurrent_bytes = 36 * 48 * 128 * 128 * 4;
         // K/V beyond a quarter of the VRAM budget stays in mapped host memory, which the
         // GPU kernels read over the bus.
-        let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
+        let (mut host, mut batch) = (attention_capable && !fits && host_capable, asked);
         let mut placement_note = None;
         let mut resident = false;
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
             // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
             let mut placed = (None, None);
             if group.enable_parts()? {
-                placed = resident_placement(&weights, &group, context64, settings.prefill_batch_size, drafting, fits)?;
+                placed = resident_placement(&weights, &group, context64, asked, derived, drafting, fits)?;
                 if placed.0.is_none() {
                     group.disable_parts()?;
                 }
             }
             if placed.0.is_none() {
                 // (none fitting either way, the note stays the parts' when they were tried: the placement a little more VRAM gives)
-                let split = working_split(&weights, &mut group, context64, settings.prefill_batch_size, drafting, fits)?;
+                let split = working_split(&weights, &mut group, context64, asked, derived, drafting, fits)?;
                 placed = (split.0, if split.0.is_some() { split.1 } else { placed.1.or(split.1) });
             }
             placement_note = placed.1;
@@ -967,9 +971,9 @@ impl Model {
                 resident = true;
             }
         }
-        // (on 48 GiB of budgets and more, where the server's default is the widest batch, a partial placement keeps what it had at 2048: its
-        // room goes to its expert slots. A smaller budget's batch, and one asked for on a card of that size, are taken as they are.)
-        if !resident && group.memory()?.1 >= WIDE_BATCH_BUDGET {
+        // (on 48 GiB of budgets and more, where the derived batch is the widest, a partial placement keeps what it had at 2048: its room goes to
+        // its expert slots. A batch given is taken as it is, and a smaller budget's derived one is not wider than that.)
+        if derived && !resident && group.memory()?.1 >= WIDE_BATCH_BUDGET {
             batch = batch.min(NARROW_BATCH);
         }
         let gpu_attention = fits || host;
@@ -4386,9 +4390,9 @@ const EVEN_SPLIT: usize = 25;
 
 /// The layer split and its full-residency placement (see [`resident_placement`]): the split
 /// balancing bytes moves toward [`EVEN_SPLIT`] while the placement stays as good.
-fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
+fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: usize, derived: bool, drafting: bool, vram_kv: bool)
                  -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
-    let placed = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
+    let placed = resident_placement(weights, group, context, prefill, derived, drafting, vram_kv)?;
     let (Some(baseline), Some(balanced)) = (placed.0, group.split()) else { return Ok(placed) };
     if !group.expert_parallel()? || balanced <= EVEN_SPLIT {
         return Ok(placed);
@@ -4396,7 +4400,7 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
     let as_good = |(keep, host, batch): (bool, bool, usize)| keep >= baseline.0 && (!host || baseline.1) && batch >= baseline.2;
     for split in EVEN_SPLIT..balanced {
         group.set_split(split)?;
-        let placement = resident_placement(weights, group, context, prefill, drafting, vram_kv)?;
+        let placement = resident_placement(weights, group, context, prefill, derived, drafting, vram_kv)?;
         if placement.0.is_some_and(as_good) {
             return Ok(placement);
         }
@@ -4405,16 +4409,31 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
     Ok(placed)
 }
 
-/// The batch a model that is not fully resident keeps of the wider one asked (the 4096 a resident Qwen3.8 on two R9700s is asked for), and the
-/// batch a fully resident one's K/V stays in VRAM at before it moves to host memory at the wider one: what was asked for before 4096.
+/// The batch a model that is not fully resident keeps of the wider one derived (the 4096 a resident Qwen3.8 on two R9700s is derived), and the
+/// batch a fully resident one's K/V stays in VRAM at before it moves to host memory at the wider one: what was derived before 4096.
 const NARROW_BATCH: usize = 2048;
-/// The GPU budgets in all from which the server's default prefill batch is the widest (`resident_batch` in the server's configuration).
+/// The GPU budgets in all from which the derived prefill batch is the widest.
 const WIDE_BATCH_BUDGET: u64 = 48 << 30;
+/// [`Settings::prefill_batch_size`] when the batch is not given: derived from the GPU budgets.
+pub const DERIVED_BATCH: usize = 0;
+
+/// The rows of a prefill batch derived for a resident model on this much GPU budget in all. Under 8 GiB the batches' workspaces rest at 256 rows, with
+/// some 200 MiB more for decode's slots, and widen for a long prompt ([`Group::begin_long_prefill`]). From 48 GiB (two R9700s) it is the widest, 4096,
+/// which the placement narrows (only a batch not given is narrowed): the model that is not fully resident keeps 2048, and one that fits resident only
+/// at 2048 takes it ([`resident_placement`]).
+pub fn resident_batch(total: u64) -> usize {
+    match total {
+        total if total >= WIDE_BATCH_BUDGET => 4096,
+        total if total >= 8 << 30 => 1024,
+        _ => 256,
+    }
+}
 
 /// The placements `resident_placement` tries in order, as (K/V in host memory, prefill batch): K/V in VRAM (when it fits the budget's quarter)
-/// at the asked batch, and at `NARROW_BATCH` if that was wider (a model that fit with its K/V in VRAM at 2048 does not give it up for a wider
-/// batch with the K/V in host memory), then K/V in host memory at batches halved to 1024.
-fn placement_candidates(prefill: usize, vram_kv: bool) -> Vec<(bool, usize)> {
+/// at the asked batch, and for a derived batch at `NARROW_BATCH` if that was wider (a model that fit with its K/V in VRAM at 2048 does not give
+/// it up for a wider batch with the K/V in host memory; a batch given is not narrowed to keep the K/V in VRAM), then K/V in host memory at
+/// batches halved to 1024.
+fn placement_candidates(prefill: usize, derived: bool, vram_kv: bool) -> Vec<(bool, usize)> {
     let mut batches = vec![prefill];
     while *batches.last().unwrap() > 1024 {
         batches.push((batches.last().unwrap() / 2).max(1024));
@@ -4422,7 +4441,7 @@ fn placement_candidates(prefill: usize, vram_kv: bool) -> Vec<(bool, usize)> {
     let mut candidates: Vec<(bool, usize)> = Vec::new();
     if vram_kv {
         candidates.push((false, prefill));
-        if prefill > NARROW_BATCH {
+        if derived && prefill > NARROW_BATCH {
             candidates.push((false, NARROW_BATCH));
         }
     }
@@ -4436,9 +4455,9 @@ fn placement_candidates(prefill: usize, vram_kv: bool) -> Vec<(bool, usize)> {
 /// The first placement that fits, of `placement_candidates`; with the MTP drafter, then without. With it, what the first choice lacked, when it was not taken:
 /// a placement depends on the VRAM left, and the start's line says what a little more would have bought. None fitting, the note says
 /// what the least of them (the last) lacked: what full residency needs.
-fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
+fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, derived: bool, drafting: bool, vram_kv: bool)
                       -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
-    let candidates = placement_candidates(prefill, vram_kv);
+    let candidates = placement_candidates(prefill, derived, vram_kv);
     let keeps: &[bool] = if drafting { &[true, false] } else { &[false] };
     let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
     for keep in keeps {
@@ -4507,19 +4526,38 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
 
 #[cfg(test)]
 mod placement_candidate_tests {
-    use super::placement_candidates;
+    use super::{placement_candidates, resident_batch};
 
     #[test]
-    fn the_wide_batch_keeps_vram_kv_at_the_narrow_one_before_host_kv_at_any() {
-        // (the batch a resident Qwen3.8 is asked for on two R9700s, 4096: K/V in VRAM at 2048 comes before K/V in host memory at 4096)
-        assert_eq!(placement_candidates(4096, true), [(false, 4096), (false, 2048), (true, 4096), (true, 2048), (true, 1024)]);
-        assert_eq!(placement_candidates(4096, false), [(true, 4096), (true, 2048), (true, 1024)]);
-        // (the batch asked for until 4096: what fit then still gets what it got)
-        assert_eq!(placement_candidates(2048, true), [(false, 2048), (true, 2048), (true, 1024)]);
-        assert_eq!(placement_candidates(2048, false), [(true, 2048), (true, 1024)]);
-        assert_eq!(placement_candidates(1024, true), [(false, 1024), (true, 1024)]);
-        assert_eq!(placement_candidates(256, true), [(false, 256), (true, 256)]);
-        assert_eq!(placement_candidates(3000, true), [(false, 3000), (false, 2048), (true, 3000), (true, 1500), (true, 1024)]);
+    fn the_derived_wide_batch_keeps_vram_kv_at_the_narrow_one_before_host_kv_at_any() {
+        // (the batch derived for a resident Qwen3.8 on two R9700s, 4096: K/V in VRAM at 2048 comes before K/V in host memory at 4096)
+        assert_eq!(placement_candidates(4096, true, true), [(false, 4096), (false, 2048), (true, 4096), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(4096, true, false), [(true, 4096), (true, 2048), (true, 1024)]);
+        // (the batch derived until 4096: what fit then still gets what it got)
+        assert_eq!(placement_candidates(2048, true, true), [(false, 2048), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(2048, true, false), [(true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(1024, true, true), [(false, 1024), (true, 1024)]);
+        assert_eq!(placement_candidates(256, true, true), [(false, 256), (true, 256)]);
+        assert_eq!(placement_candidates(3000, true, true), [(false, 3000), (false, 2048), (true, 3000), (true, 1500), (true, 1024)]);
+    }
+
+    #[test]
+    fn a_batch_given_is_not_narrowed_to_keep_vram_kv() {
+        // (--batch-size 4096 is 4096 with the K/V in VRAM, else in host memory, as before the derived batch was 4096)
+        assert_eq!(placement_candidates(4096, false, true), [(false, 4096), (true, 4096), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(4096, false, false), [(true, 4096), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(3000, false, true), [(false, 3000), (true, 3000), (true, 1500), (true, 1024)]);
+        // (a batch of 2048 or less has nothing to narrow)
+        for batch in [256, 1024, 2048] {
+            assert_eq!(placement_candidates(batch, false, true), placement_candidates(batch, true, true));
+        }
+    }
+
+    #[test]
+    fn the_derived_batch_is_the_widest_from_48_gib_of_budgets() {
+        assert_eq!((resident_batch(5 << 30), resident_batch(8 << 30)), (256, 1024), "a small card's batches rest narrow");
+        assert_eq!((resident_batch(40 << 30), resident_batch((48 << 30) - 1), resident_batch(48 << 30), resident_batch(64 << 30)),
+                   (1024, 1024, 4096, 4096));
     }
 }
 

@@ -106,8 +106,8 @@ desktop shares the GPU, an eighth of a small card and 256 MiB, and 2 GiB from 16
 one (`--vram 28`) or one per GPU (`--vram 30,10` for a 32 GB and a 12 GB card).
 
 The budget decides the placement, and with it the speed: Qwen3.8 takes the first of full residency
-with its K/V in VRAM (at a prefill batch of 4096, then 2048), then with the K/V in host memory at prefill batches of 4096 down to 1024, with
-its MTP drafter and then without, and below that partial residency. On two R9700s at 262144 tokens,
+with its K/V in VRAM (at a prefill batch of 4096, then 2048; a batch given with `--batch-size` is not narrowed to keep the K/V in VRAM), then with the K/V
+in host memory at prefill batches of 4096 down to 1024, with its MTP drafter and then without, and below that partial residency. On two R9700s at 262144 tokens,
 UD-IQ3_XXS reads a 95K-token prompt in 19.6 s fully resident; at `--vram 26` it is partially resident
 and an 8K prompt takes 6.0 s instead of 2.5. The ready line says which placement a start took and,
 when the first choice did not fit, what it would have needed: `prefill batch 4096 (K/V in VRAM,

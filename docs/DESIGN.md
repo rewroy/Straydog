@@ -348,8 +348,8 @@ conversation has met.
 
 There is no `-ngl`. Placement measures what fits, in this order:
 
-1. **Full residency.** Every weight in VRAM, the K/V too (Qwen3.8: at the prefill batch asked for, 4096 from 48 GiB of
-   budgets, then at 2048).
+1. **Full residency.** Every weight in VRAM, the K/V too (Qwen3.8: at the prefill batch derived, 4096 from 48 GiB of
+   budgets, then at 2048; a batch given is not narrowed to keep the K/V in VRAM).
 2. **Host K/V,** then a smaller prefill batch (Qwen3.8), with the MTP drafter, then without.
    The first choice that fits is taken; when it is not the first, the placement notes what the first
    would have needed, and with partial residency what full residency would (`resident_placement`),
@@ -1416,11 +1416,14 @@ layer (§6.2).
   7-12% longer than 2048 (5.7 to 6.5 s, 15.8 to 17.2 s), and the derived batch was 2048 until
   2026-11-12, when served runs (one each, two R9700s, UD-IQ3_XXS, 262144 context) read 8K in 1.75 s
   instead of 1.95, 32K 6.81 instead of 7.10, 95K 21.63 instead of 22.83 and 242K 62.6 instead of 66.1,
-  decode the same. The batch is the placement's to narrow: K/V in VRAM at 4096, then at 2048, then K/V
+  decode the same. The derived batch is the placement's to narrow: K/V in VRAM at 4096, then at 2048, then K/V
   in host memory at 4096, 2048 and 1024 (`placement_candidates`), so a model that fit with its K/V in
   VRAM at 2048 still has it there; a model that is not fully resident, on 48 GiB of budgets or more,
-  keeps 2048 for its expert slots' room. A batch given with `--batch-size` is taken as given below
-  48 GiB, and above it too for a resident model.
+  keeps 2048 for its expert slots' room. A batch given with `--batch-size` is never narrowed that way:
+  the server sends the worker `auto` for the derived batch (`Settings::batch_derived`), and the engine
+  takes `DERIVED_BATCH` (0) as the batch to derive and narrow, any other as asked, which is tried at
+  its rows with the K/V in VRAM, then in host memory at the rows halved to 1024 (as before 4096 was the
+  default; the `one-gpu-partial` golden's 4096 on a 24 GiB card stays 4096).
 - **Fewer, fuller launches in a pass** (from a kernel trace at 20K). Every Q8 unit of Q4_K, Q6_K and IQ4_XS is
   staged with Q5_K's pad: a row's lanes read its units 128 or 64 bytes apart, on the same LDS banks, so four
   vectors took twice one's time (a 2560 x 6144 Q6_K out projection 50 to 29 us at four rows). The shared

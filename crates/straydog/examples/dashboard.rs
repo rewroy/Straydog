@@ -52,6 +52,7 @@ fn main() {
         draft_max,
         ctx_size: 262_144,
         batch_size: Some(4096),
+        batch_derived: true,
         gpu: vec![0, 1],
         split_mode: SplitMode::Experts,
         vram: Vram::Gib(vec![30.0]),
