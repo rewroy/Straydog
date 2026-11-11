@@ -469,6 +469,8 @@ fn listing(entries: &[Entry], machine: &Machine) -> serde_json::Value {
                 "download_bytes": sidecar.download,
             })).collect::<Vec<_>>(),
             "context": context,
+            // (the most --ctx-size takes for the model; "context" is what this machine is recommended)
+            "context_max": straydog_engine::bundle::context_limit(entry.id).ok(),
             "fit": fit.class(),
             "runs": fit.runs(),
             "note": fit.note(entry),
@@ -799,6 +801,12 @@ mod tests {
                    (Some("Unsloth"), Some("Qwen"), Some("Qwen Community License 1.0")));
         assert!(unsloth["license_url"].as_str().is_some_and(|url| url.starts_with("https://huggingface.co/Qwen/")));
         assert_eq!((q38["provider"].as_str(), q38["creator"].as_str()), (Some("ISTA-DASLab"), Some("Qwen")));
+        // each bundle's most context: its model's, whatever this machine is recommended
+        for bundle in bundles {
+            let most = if bundle["model"] == "Qwen3.8-Flash-Next" { 262_144 } else { 1_048_576 };
+            assert_eq!(bundle["context_max"].as_u64(), Some(most), "{bundle}");
+            assert!(bundle["context"].as_u64().unwrap() <= most);
+        }
         let none = listing(&entries, &machine_of(0, 0, 32 << 30));
         for bundle in none["bundles"].as_array().unwrap() {
             assert_eq!((bundle["fit"].as_str(), bundle["runs"].as_bool(), bundle["recommended"].as_bool()), (Some("no_gpu"), Some(false), Some(false)));
