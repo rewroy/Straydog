@@ -168,7 +168,9 @@ constexpr size_t qsa_batch_floats = 12288 + 1536 + 128 + 6144 + 3072;
 // `part` (a part's prefill, QwenHeads<2>): which of the two devices this is, when the pair share the indexer (qsa_mark_send): each
 // span of more than one chunk has its chunks scored and selected by one device in turn, and the selected blocks go to the other
 // through the sum link's inbox, so each makes the whole span's marks. The other's selections are waited for by the device's stream,
-// after its own chunks (a part's host must not wait inside a layer).
+// after its own chunks (a part's host must not wait inside a layer). From qsa_prompt_from (per_token) there are no marks: a device attends
+// its own chunks in the loop, from the selection it made (and sends its blocks), keeps the other chunks' normalized queries in the place of
+// their attended values, and after the wait attends those from the blocks it received (qsa_prompt_received).
 template<int P = 1>
 void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_state, void* index_state, void* scores,
                  size_t context, size_t base, size_t steps, const float* mixed, float* branch, float* scratch, int part = -1) {
@@ -213,11 +215,13 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         // (the union of a gathered batch: its blocks' places and the blocks in place order, after the marks. The host waits for the
         // union's size, which a part must not: its exchanges wait for the other part's layer, queued after this one returns.)
         const bool gathered = P == 1 && kv_gathers(d, kv, kv_state, span_rows);
+        // (past qsa_prompt_from each token attends its own selection (qsa_prompt_attention): no marks, no unions)
+        const bool per_token = batched && !gathered && (kv.staged || !d.host_states.count(kv_state)) && base + span >= qsa_prompt_from;
         uint32_t* places = batched ? union_counts + groups : marks;
         uint32_t* placed = places + stride + 1;
         if ((batched ? groups * (stride + 2 * qsa_group_capacity) + groups : 0) + (gathered ? 2 * (stride + 1) : 0) > attention_score_bytes / 4)
             throw std::runtime_error("QSA prefill marks exceed the attention scratch");
-        if (batched) check(hipMemsetAsync(marks, 0, groups * stride * 4, d.stream));
+        if (batched && !per_token) check(hipMemsetAsync(marks, 0, groups * stride * 4, d.stream));
         for (size_t first = span; first < span + span_rows; first += 256) {
             const size_t count = std::min<size_t>(256, span + span_rows - first), position = base + first;
             const size_t selected = std::min(position + count, size_t(2052));
@@ -228,10 +232,13 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             float* chunk_ik = ik + first * 128;
             // (a batch of a sequence with images has its rope positions from the table: sd_rope_rows)
             const uint32_t* axes = d.rope_count ? d.rope_rows + (position - d.rope_first) * 3 : nullptr;
+            // (a chunk the other device selects, past qsa_prompt_from, keeps its normalized queries in its attended values' place until the
+            // other's blocks have come: write_attention_kv reads the keys and values only)
+            float* queries = per_token && !own ? attended + first * Q : d.input;
             if (axes) qsa_normalize_axes<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
-                512, axes, d.input);
+                512, axes, queries);
             else qsa_normalize<<<unsigned(count * H::query), 256, 0, d.stream>>>(chunk_q, static_cast<const float*>(pointers[6]), H::query, 256,
-                512, position, d.input);
+                512, position, queries);
             if (axes) qsa_normalize_axes<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
                 256, 256, axes, d.input + count * Q);
             else qsa_normalize<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
@@ -249,7 +256,14 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             if (own) qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
             write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity, position, count, d.input,
                 nullptr, nullptr, kv.mirror, kv.mirror_rows);
-            if (batched) {
+            if (per_token) {
+                if (own) {
+                    if (shared)
+                        qsa_send_blocks<P><<<unsigned(count), 128, 0, d.stream>>>(d.input, count, selected, first - span,
+                            reinterpret_cast<uint16_t*>(d.sums.peer_inbox), d.sums.state, d.sums.capacity * 2);
+                    qsa_prompt_chunk<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q);
+                }
+            } else if (batched) {
                 cast_half<<<unsigned((count * Q + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * Q, count * Q);
                 if (!shared)
                     qsa_mark_blocks<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
@@ -264,11 +278,15 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             // The other's chunks' selections: its stores are done before its flag, which this device's stream waits for.
             qsa_share_signal(d);
             const size_t theirs = size_t(1 - part), turns = chunks > theirs ? (chunks - theirs + 1) / 2 : 0;
-            qsa_mark_received<<<dim3(256, unsigned(turns)), 128, 0, d.stream>>>(base + span, theirs, span_rows, stride, marks,
-                reinterpret_cast<const uint16_t*>(d.sums.inbox), d.sums.state, d.sums.capacity * 2);
+            if (per_token)
+                qsa_prompt_received<P>(d, kv.kv, kv.capacity, base + span, span_rows, theirs, turns, attended + span * Q,
+                    reinterpret_cast<const uint16_t*>(d.sums.inbox), d.sums.state, d.sums.capacity * 2);
+            else
+                qsa_mark_received<<<dim3(256, unsigned(turns)), 128, 0, d.stream>>>(base + span, theirs, span_rows, stride, marks,
+                    reinterpret_cast<const uint16_t*>(d.sums.inbox), d.sums.state, d.sums.capacity * 2);
         }
 #if defined(__HIPCC__)
-        if (batched) {
+        if (batched && !per_token) {
             qsa_union_blocks<<<unsigned(groups), 256, 0, d.stream>>>(marks, stride, base + span, span_rows, union_blocks, union_masks, union_counts);
             if (gathered) {
                 // As many groups at a time as the stage holds the union of (qsa_attention_gathered).
