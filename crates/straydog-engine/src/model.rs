@@ -92,6 +92,14 @@ pub fn context_state_bytes(context: u64, drafting: bool) -> u64 {
     state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4
 }
 
+/// The bytes one more token of context adds to [`context_state_bytes`]: every attention layer's K/V position and its share of
+/// the pooled indexer keys (28,288 with the MTP layer: thirteen layers of 2,048 and 128). What a bundle's footprint counts of the
+/// context ([`crate::bundle::footprint`]): the formula's own, so that it follows the K/V as it is held.
+pub fn state_per_token(drafting: bool) -> u64 {
+    const CONTEXT: u64 = 262_144;
+    (context_state_bytes(2 * CONTEXT, drafting) - context_state_bytes(CONTEXT, drafting)) / CONTEXT
+}
+
 /// A whole attention layer's K/V bytes a position: four planes of KV_ROW_FLOATS.
 const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS * 4;
 
