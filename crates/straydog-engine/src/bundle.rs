@@ -764,6 +764,15 @@ pub fn architecture_of(id: Id) -> Result<String, String> {
     }
 }
 
+/// The most tokens of context a pinned bundle's model is served with: the context its GGUFs
+/// declare, which the model's loader holds it to (Qwen3.8's 262144, DeepSeek-V4.1's 1048576).
+pub fn context_limit(id: Id) -> Result<usize, String> {
+    Ok(match architecture_of(id)?.as_str() {
+        "deepseek41" => crate::arch::deepseek41::CONTEXT_LIMIT,
+        _ => crate::weights::CONTEXT_LIMIT,
+    })
+}
+
 /// Where every pinned file of a bundle comes from (either kind): provisioning only.
 pub fn sources_of(id: Id) -> Result<Vec<Source>, String> {
     if id.is_on_demand() { on_demand_sources(id) } else { sources(id) }
@@ -846,6 +855,16 @@ mod tests {
         assert!(on_demand(qw("IQ3_S")).is_err() && on_demand(qw("UD-IQ1_M")).is_err() && bundle(ds("UD-IQ1_M")).is_err());
         // a provider's manifest pins only its own bundles
         assert!(on_demand(Id { model: DEEPSEEK, provider: ISTA, quant: "UD-IQ1_M" }).is_err());
+    }
+
+    /// A model's context limit is its architecture's: every DeepSeek-V4.1 bundle's 1048576, every Qwen3.8 bundle's 262144.
+    #[test]
+    fn a_bundles_context_limit_is_its_models() {
+        for id in bundles() {
+            let expected = if id.model == DEEPSEEK { 1_048_576 } else { 262_144 };
+            assert_eq!(context_limit(id).unwrap(), expected, "{id}");
+        }
+        assert_eq!((context_limit(ds("IQ2_XS")).unwrap(), context_limit(qw("IQ3_S")).unwrap()), (1 << 20, 1 << 18));
     }
 
     /// Unsloth's Qwen3.8 UD-IQ1_M is a resident bundle fetched from its own repository and revision, with the official

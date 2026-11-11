@@ -122,9 +122,8 @@ pub struct Options {
     /// MTP drafts per pass, 0 turns MTP speculation off [default: 3 with a drafter]
     #[arg(long, env = "STRAYDOG_DRAFT_MAX", value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub draft_max: Option<u8>,
-    /// Context in tokens [default: 262144]
-    #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N",
-          value_parser = clap::value_parser!(u32).range(1..=262144))]
+    /// Context in tokens, at most the model's own: Qwen3.8-Flash-Next's 262144, DeepSeek-V4.1-Flash-1017's 1048576 [default: 262144]
+    #[arg(short = 'c', long, env = "STRAYDOG_CTX_SIZE", value_name = "N")]
     pub ctx_size: Option<u32>,
     /// Prefill batch [default: 1024, 4096 with 48 GiB or more of GPU budget; DeepSeek-V4.1: the largest whose pass buffers take at most an eighth of a GPU's budget, 8192 down to 256, or on a card of 24 GiB or more a third of it, 32768 or 16384]
     #[arg(short = 'b', long, env = "STRAYDOG_BATCH_SIZE", value_name = "N",
@@ -539,7 +538,13 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     if options.batch_size.is_some_and(|batch| batch > 4096) && !deepseek {
         return Err("--batch-size above 4096 is for DeepSeek-V4.1 alone".into());
     }
+    // The model's own limit holds whether the value came from an option, a variable or the file; a
+    // range on the option could not check the file's, nor know the model.
     let ctx_size = options.ctx_size.unwrap_or(262144);
+    let ctx_limit = bundle::context_limit(id)?;
+    if !(1..=ctx_limit).contains(&(ctx_size as usize)) {
+        return Err(format!("--ctx-size must be between 1 and {ctx_limit} tokens for {}, not {ctx_size}", id.model));
+    }
     // The bundles read on demand read each routed expert a pass needs once per pass: the longer
     // the pass, the fewer reads.
     // With the budgets left to the worker, it chooses the same way from those it finds.
@@ -881,6 +886,39 @@ mod tests {
             assert_eq!(resolved(&["--gpu", "0,1"], Some(text)).unwrap().vram, expected, "{text}");
         }
         std::fs::remove_dir_all(model).unwrap();
+    }
+
+    /// The context is held to the model's own limit (DeepSeek-V4.1's 1048576, Qwen3.8's 262144), whether it came from an
+    /// option or the settings file; the default is 262144 for both.
+    #[test]
+    fn the_context_is_held_to_the_models_own_limit() {
+        let models = [(bundle_directory(id(bundle::DEEPSEEK, "UD-IQ2_XXS")), 1_048_576u32), (bundle_directory(qwen("IQ3_S")), 262_144)];
+        for (model, limit) in &models {
+            let resolved = |args: &[&str], file: Option<&str>| {
+                let path = model.join("ctx.toml");
+                if let Some(text) = file {
+                    std::fs::write(&path, format!("model = {:?}\n{text}\n", model.display())).unwrap();
+                }
+                let mut argv = vec!["--model".to_string(), model.display().to_string()];
+                argv.extend(args.iter().map(|arg| arg.to_string()));
+                let matches = command().try_get_matches_from(&argv).unwrap();
+                load(&matches, file.map(|_| path.as_path())).and_then(|(options, _)| resolve(options))
+            };
+            let (at, over) = (limit.to_string(), (limit + 1).to_string());
+            assert_eq!(resolved(&[], None).unwrap().ctx_size, 262_144);
+            assert_eq!(resolved(&["-c", &at], None).unwrap().ctx_size, *limit);
+            assert_eq!(resolved(&[], Some(&format!("ctx_size = {limit}"))).unwrap().ctx_size, *limit);
+            for error in [resolved(&["--ctx-size", &over], None), resolved(&[], Some(&format!("ctx_size = {over}")))] {
+                let error = error.unwrap_err();
+                assert!(error.contains(&format!("between 1 and {limit} tokens")) && error.contains(&format!("not {over}")), "{error}");
+            }
+            // (the other model's maximum is no limit of this one's)
+            assert_eq!(resolved(&["-c", "1048576"], None).is_ok(), *limit == 1_048_576);
+            assert!(resolved(&["-c", "0"], None).is_err() && resolved(&[], Some("ctx_size = 0")).is_err());
+            // (the option replaces the file's value, which is then not checked)
+            assert_eq!(resolved(&["-c", "32768"], Some(&format!("ctx_size = {over}"))).unwrap().ctx_size, 32768);
+        }
+        assert!(models.iter().all(|(model, _)| std::fs::remove_dir_all(model).is_ok()));
     }
 
     #[test]
