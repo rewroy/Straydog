@@ -1782,6 +1782,9 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_row_transfers(handle: *mut ::std::os::raw::c_void, out: *mut u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,

@@ -1203,6 +1203,14 @@ impl Backend {
     }
 
     /// Load complete four-stream rows before a layer's PLE and span.
+    /// The hidden rows layer order moved to and from the host so far: (nanoseconds up, bytes up, nanoseconds down, bytes down).
+    pub fn prefill_row_transfers(&self) -> Result<[u64; 4]> {
+        let mut out = [0u64; 4];
+        // SAFETY: a live handle and a place for four values.
+        check(unsafe { ffi::sd_prefill_row_transfers(self.handle, out.as_mut_ptr()) })?;
+        Ok(out)
+    }
+
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
         let steps = rows.len() / WIDTH;
         if rows.len() % WIDTH != 0 || !(1..=self.prefill_capacity as usize).contains(&steps) {

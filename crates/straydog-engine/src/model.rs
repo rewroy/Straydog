@@ -3402,7 +3402,16 @@ impl Model {
             self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
             drop(trace_prepare);
             let _active = LayerPrefillActive::begin();
-            self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, cancelled, progress).map(Some)
+            let moved = self.group.prefill_row_transfers().ok();
+            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, cancelled, progress);
+            // (the hidden rows to the GPU and back, every layer of every pass: what holding them in VRAM would save)
+            if let (Some(before), Ok(after)) = (moved, self.group.prefill_row_transfers()) {
+                self.metric_add("prefill_rows_up_seconds", after[0].saturating_sub(before[0]) as f64 / 1e9);
+                self.metric_add("prefill_rows_up_bytes", after[1].saturating_sub(before[1]) as f64);
+                self.metric_add("prefill_rows_down_seconds", after[2].saturating_sub(before[2]) as f64 / 1e9);
+                self.metric_add("prefill_rows_down_bytes", after[3].saturating_sub(before[3]) as f64);
+            }
+            done.map(Some)
         })();
         let restoring = Instant::now();
         let trace_restore = crate::layer_trace::Span::new("restore", None, position, tokens.len(), 0);

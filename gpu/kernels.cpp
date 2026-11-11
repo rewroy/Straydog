@@ -608,6 +608,9 @@ struct Device {
     // (QwenHeads<2>::kv); set as its layer registers.
     std::unordered_map<const void*,size_t> kv_planes;
     unsigned kv_row = kv_row_f16;   // bytes of a K/V row: its format (sd_kv_format), set before any layer registers
+    // Layer order's hidden rows to the device (sd_prefill_rows) and back (prefill_span's output), wall nanoseconds and bytes so far
+    // (sd_prefill_row_transfers): each timed between waits the transfers make anyway, none added.
+    uint64_t rows_up_ns = 0, rows_up_bytes = 0, rows_down_ns = 0, rows_down_bytes = 0;
     size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
     // A draft's vocabulary on the device holding the head (sd_draft_vocabulary): the head's first `draft_rows` rows, and
     // `draft_extra_count` rows of tokens past them, copied into `draft_extras` (their tokens in `draft_extra_tokens`).
@@ -1840,7 +1843,20 @@ int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t st
         const auto found = d.decoder.find(size_t(layer));
         if (!rows || found == d.decoder.end() || !steps || steps > found->second.capacity)
             throw std::runtime_error("invalid prefill hidden rows");
+        // (the stream is idle: the span before this one waited for its output. The last piece's copy lands under the next span)
+        const auto started = std::chrono::steady_clock::now();
         upload(d, found->second.workspace, rows, size_t(steps) * 10240 * 4);
+        d.rows_up_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_up_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Layer order's hidden rows moved so far: up nanoseconds, up bytes, down nanoseconds, down bytes.
+int sd_prefill_row_transfers(void* handle, uint64_t* out) {
+    try {
+        auto& d = device(handle);
+        if (!out) throw std::runtime_error("no place for the row transfers");
+        out[0] = d.rows_up_ns; out[1] = d.rows_up_bytes; out[2] = d.rows_down_ns; out[3] = d.rows_down_bytes;
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
