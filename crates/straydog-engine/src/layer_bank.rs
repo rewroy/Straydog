@@ -104,7 +104,19 @@ impl Prefetch {
 
     pub(crate) fn start(&mut self, layer: usize) {
         // (a layer whose banks are registered in place is read from the mapping, whose pages its locks keep: not from the file again)
-        if self.pending.is_some() || self.registered.is_registered(layer) { return; }
+        if self.registered.is_registered(layer) { return; }
+        self.begin(layer);
+    }
+
+    /// Read `layer`'s banks now, registered or not: a layer whose registration was given up after [`Prefetch::start`] passed it by. Its checked
+    /// copy, or None where the layer has no plan (it is loaded as before).
+    pub(crate) fn read_now(&mut self, layer: usize) -> Result<Option<Copy>, String> {
+        self.begin(layer);
+        self.take(layer)
+    }
+
+    fn begin(&mut self, layer: usize) {
+        if self.pending.is_some() { return; }
         let Some(plan) = self.plans.get(layer).cloned().flatten() else { return };
         let Some(buffer) = self.free.take() else { return };
         let reader = self.reader.clone();

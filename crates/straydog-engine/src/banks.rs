@@ -538,7 +538,7 @@ impl Registered {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn mark(&self, layer: usize) {
+    pub(crate) fn mark(&self, layer: usize) {
         if layer < 64 {
             self.state().layers |= 1 << layer;
         }
