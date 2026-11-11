@@ -15,6 +15,15 @@ __device__ inline float link_load(const float* value) {
 #endif
 }
 
+// Eight bytes of this device's inbox as the other device wrote them (never a stale cached line).
+__device__ inline uint64_t link_load64(const void* at) {
+#if defined(__HIPCC__)
+    return __hip_atomic_load(static_cast<const uint64_t*>(at), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *static_cast<const volatile uint64_t*>(at);
+#endif
+}
+
 // A value of a part into the other device's inbox.
 __device__ __forceinline__ void link_send(float* at, float value) {
 #if defined(__HIPCC__)
