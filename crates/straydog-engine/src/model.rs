@@ -817,6 +817,8 @@ pub struct Model {
     /// How the banks are page-locked ([`LockMode`]): decided once, when the plan is made ([`Model::plan_host_banks`]), from what the GPUs say of registering
     /// host memory read-only, and kept for every later plan, so that a mapping the runtime refused is never offered to it again.
     lock_mode: LockMode,
+    /// The layers registered in place and the reads of them under way ([`crate::banks::Registered`]): this model's alone.
+    registered: std::sync::Arc<crate::banks::Registered>,
     /// A refusal of the very first layer, with nothing locked, that ends the planning of more ([`Model::more_bank_locks`]); and whether the log said so.
     lock_refusal: Refusal,
     refusal_told: bool,
@@ -993,6 +995,7 @@ impl Model {
             lock_pending: Vec::new(),
             bank_failure: None,
             lock_mode: LockMode::Register,
+            registered: Default::default(),
             lock_refusal: Refusal::default(),
             refusal_told: false,
             locks_planned: false,
@@ -1560,7 +1563,7 @@ impl Model {
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
         let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
-            .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone());
+            .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone()).marking(self.registered.clone());
         // (a GPU that cannot register the read-only mapping is not asked to: each layer's turn copies its banks, and checks the copies)
         Ok(match self.lock_mode {
             LockMode::Register => job,
@@ -2485,9 +2488,10 @@ impl Model {
             let banks = Self::host_banks(&self.weights, layer)?;
             // (a layer held as copies: its plans read the mapping again first, which waits for everything that reads the copies, and only then are they let
             // go: nothing reads them, by the engine's lock that this runs under and the device's waits)
+            // (the mark first, and a read under way waited for: then the locks; a layer held as copies has none)
+            self.registered.release(layer);
             if !self.copies.give_back(&mut self.group, layer, banks)? {
                 self.group.release_host(banks)?;
-                crate::banks::unregistered(layer);
             }
             self.locked_layers.retain(|locked| *locked != layer);
             gave.layers.push(layer);
@@ -3411,7 +3415,7 @@ impl Model {
                               batch: usize, hidden: &mut [f32], cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
-        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers);
+        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
         for stop in layer_prefill_stops(position, end, &checkpoints, layer_prefill_rows()) {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
@@ -3507,11 +3511,14 @@ impl Model {
                 self.metric_add("prefill_bank_copied_layers", 1.0);
             }
             None => {
-                // (a layer registered in place: the mapping's pages, which its locks keep, not the file's again)
-                if crate::banks::registered(layer) {
+                // (a layer registered in place: the mapping's pages, which its locks keep checked, not the file's again; the read holds the
+                // registration until the load's copies are done, which it waits for)
+                let held = self.registered.read(layer);
+                if held.is_some() {
                     self.metric_add("prefill_bank_registered_layers", 1.0);
                 }
-                self.group.load_layer_bank(layer)?
+                self.group.load_layer_bank(layer)?;
+                drop(held);
             }
         }
         if let Some(reader) = reader {
