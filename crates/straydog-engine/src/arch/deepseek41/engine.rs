@@ -590,6 +590,17 @@ pub fn snapshot_bytes(position: usize, window: usize, layers: usize, dim: usize,
     ((floats + history) * 4) as u64
 }
 
+/// Host bytes a [`Snapshot`] of a sequence at the full `context` holds, the most one ever does: every kv
+/// source's groups at the end of the context (`context / ratio`), the window rings of every layer and
+/// `context` tokens of history, as [`snapshot_bytes`] counts them. (Engines that split the layers each hold their
+/// own copy of the history, 4 bytes a token.)
+pub fn full_snapshot_bytes(hp: &Hparams, context: usize) -> u64 {
+    let groups: Vec<usize> = hp.layers.iter().enumerate()
+        .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer))
+        .map(|c| context / c.ratio).collect();
+    snapshot_bytes(context, hp.window, hp.layers.len(), hp.head_dim, hp.index_dim, &groups, context)
+}
+
 /// Positions `first..end` in a ring of `ring` rows: (ring row, rows, rows before it), at most two.
 fn ring_runs(first: usize, end: usize, ring: usize) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
