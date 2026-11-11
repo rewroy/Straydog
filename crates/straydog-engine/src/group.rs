@@ -878,6 +878,13 @@ impl Group {
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
     pub fn prefill_row_transfers(&self) -> Result<[u64; 4]> { self.backends[0].prefill_row_transfers() }
+    pub fn hold_layer_rows(&mut self, rows: u64) -> Result<Option<String>> { self.backends[0].hold_layer_rows(rows) }
+    pub fn put_layer_rows(&mut self, first: u64, rows: &[f32]) -> Result<()> { self.backends[0].put_layer_rows(first, rows) }
+    pub fn get_layer_rows(&mut self, first: u64, rows: &mut [f32]) -> Result<()> { self.backends[0].get_layer_rows(first, rows) }
+    pub fn prefill_rows_held(&mut self, layer: usize, first: u64, steps: u64) -> Result<()> { self.backends[0].prefill_rows_held(layer, first, steps) }
+    pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
+        self.backends[0].prefill_span_held(layer, first, position, steps)
+    }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
         if self.backends.len() == 2 {

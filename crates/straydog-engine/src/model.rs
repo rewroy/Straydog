@@ -408,6 +408,11 @@ impl Drop for LayerPrefillActive {
     }
 }
 
+/// STRAYDOG_LAYER_ROWS_VRAM: anything but 0 (or unset) holds a layer-order pass's rows in VRAM where they fit.
+fn layer_rows_vram_named(value: Option<&str>) -> bool {
+    value.map_or(true, |value| value.trim() != "0")
+}
+
 fn layer_prefill_rows_named(value: Option<&str>) -> usize {
     match value.map(|value| value.trim().replace('_', "").parse::<usize>()) {
         None => LAYER_PREFILL_ROWS,
@@ -765,6 +770,9 @@ pub struct Model {
     layer_prefill: bool,
     // Explicit numerical comparisons retain the developer API's forced path.
     layer_prefill_forced: bool,
+    /// A layer-order pass holds its hidden rows in VRAM where they fit (STRAYDOG_LAYER_ROWS_VRAM=0: on the host, moved to the GPU and back
+    /// for every layer, as before; [`Model::layer_rows_in_vram`] for a test).
+    layer_rows_vram: bool,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
@@ -976,6 +984,7 @@ impl Model {
             // (STRAYDOG_LAYER_PREFILL=force: every eligible prompt takes the layer order whatever the memory, to measure it where the
             // choice would not make it, e.g. a machine whose RAM holds the banks)
             layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
+            layer_rows_vram: layer_rows_vram_named(std::env::var("STRAYDOG_LAYER_ROWS_VRAM").ok().as_deref()),
             layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
@@ -3359,6 +3368,11 @@ impl Model {
         self.layer_prefill_forced = enabled;
     }
 
+    /// Whether a layer-order pass holds its hidden rows in VRAM where they fit (a test compares the two ways).
+    pub fn layer_rows_in_vram(&mut self, held: bool) {
+        self.layer_rows_vram = held;
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// The bytes of the banks page-locked so far.
     fn locked_bank_bytes(&self) -> Result<u64> {
@@ -3402,8 +3416,15 @@ impl Model {
             self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
             drop(trace_prepare);
             let _active = LayerPrefillActive::begin();
+            // (the pass's hidden rows in VRAM where they fit beside what layer order holds; else on the host, and the line says why)
+            let host = if self.layer_rows_vram { self.group.hold_layer_rows(count as u64)? } else { Some("STRAYDOG_LAYER_ROWS_VRAM=0".to_string()) };
+            match &host {
+                Some(reason) => { self.last_metrics.insert("prefill_rows_host_reason".into(), json!(reason)); }
+                None => { self.last_metrics.insert("prefill_rows_vram".into(), json!(true)); }
+            }
             let moved = self.group.prefill_row_transfers().ok();
-            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, cancelled, progress);
+            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, host.is_none(),
+                                                   cancelled, progress);
             // (the hidden rows to the GPU and back, every layer of every pass: what holding them in VRAM would save)
             if let (Some(before), Ok(after)) = (moved, self.group.prefill_row_transfers()) {
                 self.metric_add("prefill_rows_up_seconds", after[0].saturating_sub(before[0]) as f64 / 1e9);
@@ -3444,8 +3465,10 @@ impl Model {
     /// The segments of `position..end` ([`layer_prefill_split`]'s end); without `staging` the pool has none, and a segment that would run
     /// the ordinary way is refused.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, end: usize, staging: bool, plan: &[(usize, Vec<&'static str>)],
-                              batch: usize, hidden: &mut [f32], cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
+                              batch: usize, hidden: &mut [f32], held: bool, cancelled: &dyn Fn() -> bool,
+                              progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
         let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
@@ -3479,6 +3502,10 @@ impl Model {
                     }
                 }
                 drop(trace_embedding);
+                // (held in VRAM: the pass's rows go up once, and come back once after its last layer)
+                if held {
+                    self.group.put_layer_rows(0, rows)?;
+                }
                 let previous = self.final_hidden.clone();
                 for layer in 0..48 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
@@ -3490,7 +3517,11 @@ impl Model {
                     for (first, end) in layer_prefill_chunks(begin, stop, batch) {
                         let low = (first - begin) * WIDTH;
                         let high = (end - begin) * WIDTH;
-                        self.group.prefill_rows(layer, &rows[low..high])?;
+                        if held {
+                            self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?;
+                        } else {
+                            self.group.prefill_rows(layer, &rows[low..high])?;
+                        }
                         if layer == 1 {
                             let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
                             let next = (end + batch).min(stop);
@@ -3501,9 +3532,16 @@ impl Model {
                             self.ple_wait += reading.elapsed().as_secs_f64();
                             self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
                         }
-                        // (in place: a new vector a chunk faulted every row's pages in again for each layer)
-                        self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?;
+                        if held {
+                            self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?;
+                        } else {
+                            // (in place: a new vector a chunk faulted every row's pages in again for each layer)
+                            self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?;
+                        }
                     }
+                }
+                if held {
+                    self.group.get_layer_rows(0, rows)?;
                 }
                 if self.speculative > 0 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
@@ -4701,6 +4739,14 @@ mod layer_prefill_tests {
         let held = registered.read(9);
         assert!(passed_by && held.is_none());
         assert_eq!(bank_source(false, held.is_some(), true), BankSource::ReadNow);
+    }
+
+    /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.
+    #[test]
+    fn the_rows_are_held_in_vram_unless_the_variable_says_0() {
+        use super::layer_rows_vram_named;
+        assert!(layer_rows_vram_named(None) && layer_rows_vram_named(Some("1")) && layer_rows_vram_named(Some("yes")));
+        assert!(!layer_rows_vram_named(Some("0")) && !layer_rows_vram_named(Some(" 0 ")));
     }
 
     /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the

@@ -1851,6 +1851,70 @@ int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t st
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// Layer order's hidden rows held in VRAM for a pass (an allocation of sd_prefill_bank_allocate): rows [first, first + steps) of `storage`,
+// 10240 floats a row.
+static float* held_layer_rows(Device& d, void* storage, uint64_t first, uint64_t steps) {
+    auto found = d.allocations.find(storage);
+    if (!storage || found == d.allocations.end() || !steps || first + steps > found->second / (10240 * 4))
+        throw std::runtime_error("invalid layer rows held in VRAM");
+    return static_cast<float*>(storage) + size_t(first) * 10240;
+}
+// A pass's rows from the host into the rows held in VRAM (the embeddings, once a pass).
+int sd_layer_rows_put(void* handle, void* storage, uint64_t first, const float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        float* held = held_layer_rows(d, storage, first, steps);
+        if (!rows) throw std::runtime_error("no layer rows to put");
+        const auto started = std::chrono::steady_clock::now();
+        upload(d, held, rows, size_t(steps) * 10240 * 4);
+        d.rows_up_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_up_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The rows held in VRAM back to the host (the last layer's output, once a pass), after the work queued before them.
+int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const float* held = held_layer_rows(d, storage, first, steps);
+        if (!rows) throw std::runtime_error("no place for the layer rows");
+        // (the wait the download makes anyway, first: what is timed is the copy alone)
+        check(hipStreamSynchronize(d.stream));
+        const auto started = std::chrono::steady_clock::now();
+        download(d, rows, held, size_t(steps) * 10240 * 4);
+        d.rows_down_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_down_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_rows from rows held in VRAM: a device copy into the layer's workspace.
+int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const auto found = d.decoder.find(size_t(layer));
+        if (found == d.decoder.end() || !steps || steps > found->second.capacity)
+            throw std::runtime_error("invalid prefill hidden rows");
+        const float* held = held_layer_rows(d, storage, first, steps);
+        check(hipMemcpyAsync(found->second.workspace, held, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_span of the rows a workspace holds, its output copied back into the rows held in VRAM: the same span, with its check of
+// the values each span (as with an output to the host), and a device copy where the host's was.
+int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
+    auto& d = device(handle);
+    const bool deferred = d.prefill_deferred;
+    try {
+        float* held = held_layer_rows(d, storage, first, steps);
+        const auto found = d.decoder.find(size_t(begin));
+        if (found == d.decoder.end()) throw std::runtime_error("prefill span has no compatible resident layer");
+        d.prefill_deferred = false;
+        prefill_span(d, size_t(begin), size_t(end), size_t(position), size_t(steps), nullptr, nullptr, 0, nullptr);
+        d.prefill_deferred = deferred;
+        check(hipMemcpyAsync(held, found->second.workspace, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+        return 0;
+    } catch (const std::exception& e) { d.prefill_deferred = deferred; last_error=e.what(); return -1; }
+}
 // Layer order's hidden rows moved so far: up nanoseconds, up bytes, down nanoseconds, down bytes.
 int sd_prefill_row_transfers(void* handle, uint64_t* out) {
     try {
