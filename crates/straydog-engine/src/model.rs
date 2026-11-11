@@ -249,6 +249,11 @@ const LONG_PREFILL: usize = 1536;
 /// Refilling multiple GPUs' expert caches costs several seconds; shorter prompts keep their
 /// original workspaces instead of paying that cost to borrow slots.
 const MULTI_GPU_LONG_PREFILL: usize = 65_536;
+/// New tokens from which a read's DeltaNet layers scan in chunks of tokens (gpu/gated_delta_chunk.hpp) where the token-by-token scan
+/// ran: a read this long spends a tenth of its time in the recurrence, and the chunked scan takes about 2.5 s off a 242K one. Its sums are in
+/// another order (README, Numerics says how far that moves the outputs). Shorter reads (a conversation's turns, the pinned tests'
+/// prompts) keep the scan, so their bits stay as they were.
+pub const CHUNKED_SCAN_READ: usize = 16_384;
 /// A partially resident model's passes in a row with a draft: one alone then keeps [`Model::partial_drawn_cut`]'s measure current.
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
@@ -411,6 +416,11 @@ impl Drop for LayerPrefillActive {
 /// STRAYDOG_LAYER_ROWS_VRAM: anything but 0 (or unset) holds a layer-order pass's rows in VRAM where they fit.
 fn layer_rows_vram_named(value: Option<&str>) -> bool {
     value.map_or(true, |value| value.trim() != "0")
+}
+
+/// STRAYDOG_DELTA_SCAN=token: every read scans its DeltaNet layers token by token (anything else: in chunks from [`CHUNKED_SCAN_READ`] new tokens).
+fn chunked_scan_from_named(value: Option<&str>) -> usize {
+    if value.is_some_and(|value| value.trim() == "token") { usize::MAX } else { CHUNKED_SCAN_READ }
 }
 
 fn layer_prefill_rows_named(value: Option<&str>) -> usize {
@@ -773,6 +783,8 @@ pub struct Model {
     /// A layer-order pass holds its hidden rows in VRAM where they fit (STRAYDOG_LAYER_ROWS_VRAM=0: on the host, moved to the GPU and back
     /// for every layer, as before; [`Model::layer_rows_in_vram`] for a test).
     layer_rows_vram: bool,
+    /// New tokens from which a read scans its DeltaNet layers in chunks ([`CHUNKED_SCAN_READ`]; [`Model::chunked_scan_from`] for a test).
+    chunked_scan_from: usize,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
@@ -992,6 +1004,7 @@ impl Model {
             // choice would not make it, e.g. a machine whose RAM holds the banks)
             layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
             layer_rows_vram: layer_rows_vram_named(std::env::var("STRAYDOG_LAYER_ROWS_VRAM").ok().as_deref()),
+            chunked_scan_from: chunked_scan_from_named(std::env::var("STRAYDOG_DELTA_SCAN").ok().as_deref()),
             layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
@@ -3287,9 +3300,21 @@ impl Model {
     /// The next token and its drafts through every layer with the one-token arithmetic.
     #[allow(clippy::type_complexity)]
     /// The prompt's batches from `position`, with the checkpoints of `plan`: the last batch's
-    /// logits, or None when cancelled.
+    /// logits, or None when cancelled. A read of [`CHUNKED_SCAN_READ`] new tokens or more runs its DeltaNet layers' recurrence in
+    /// chunks of tokens on every device (the same sums in another order), a shorter read token by token.
     fn prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
+        self.group.prompt_scan(tokens.len().saturating_sub(position) >= self.chunked_scan_from)?;
+        let output = self.prefill_read(tokens, position, plan, cancelled, progress);
+        let cleared = self.group.prompt_scan(false);
+        let output = output?;
+        cleared?;
+        Ok(output)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn prefill_read(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
+                    cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
         // A long prompt's batches take the slots' VRAM until its end, however it ends.
         let mut batch = self.prefill_batch_size;
         // (a pass over an image's rows is one of at least two)
@@ -3378,6 +3403,13 @@ impl Model {
     /// Whether a layer-order pass holds its hidden rows in VRAM where they fit (a test compares the two ways).
     pub fn layer_rows_in_vram(&mut self, held: bool) {
         self.layer_rows_vram = held;
+    }
+
+    /// The read length (new tokens) from which the DeltaNet layers scan in chunks: `usize::MAX` for never, 0 for always (a test compares
+    /// the two scans on a prompt shorter than the rule's).
+    #[doc(hidden)]
+    pub fn chunked_scan_from(&mut self, tokens: usize) {
+        self.chunked_scan_from = tokens;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4783,6 +4815,17 @@ mod layer_prefill_tests {
         let held = registered.read(9);
         assert!(passed_by && held.is_none());
         assert_eq!(bank_source(false, held.is_some(), true), BankSource::ReadNow);
+    }
+
+    /// Decides: reads of 16384 new tokens or more scan their DeltaNet layers in chunks, shorter ones (the pinned tests' prompts) token by token as
+    /// they did, and STRAYDOG_DELTA_SCAN=token keeps every read on the token-by-token scan.
+    #[test]
+    fn long_reads_scan_in_chunks_unless_the_variable_says_token() {
+        use super::{chunked_scan_from_named, CHUNKED_SCAN_READ};
+        assert_eq!(chunked_scan_from_named(None), CHUNKED_SCAN_READ);
+        assert_eq!(chunked_scan_from_named(Some("chunks")), CHUNKED_SCAN_READ);
+        assert_eq!(chunked_scan_from_named(Some(" token ")), usize::MAX);
+        assert!(CHUNKED_SCAN_READ > 8192 && CHUNKED_SCAN_READ <= 16_384);
     }
 
     /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.
