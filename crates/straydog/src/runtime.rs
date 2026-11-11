@@ -557,7 +557,12 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // (where a drafter is: the drafts a pass offered at the end of the request, which the engine chooses by what its passes cost)
     let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
     let order = if timings["prefill_order"] == "layer" {
-        format!("; prefill layers first, {} rows a batch", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+        // (the passes through every layer, each reading the banks, and the rows a pass takes at most)
+        let passes = match (timings["prefill_layer_passes"].as_u64(), timings["prefill_layer_rows"].as_u64()) {
+            (Some(passes), Some(rows)) => format!(" in {passes} passes of up to {rows} rows,"),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
     } else {
         // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
         let policy = &timings["layer_prefill_policy"];
@@ -1976,6 +1981,25 @@ mod tests {
         let linux = request_summary(&event(detail(json!({"fault_read_pages": 2_000, "fault_reads_system": false,
                                                            "kv_positions": 32768, "kv_gib": 0.81, "kv_host": false})), 0), None);
         assert!(linux.contains("1741229 page faults, 0.01 GB read back from the drive, K/V 32768 positions 0.81 GiB in VRAM"), "{linux}");
+    }
+
+    /// Decides: a layer-order prompt's line says its passes through every layer and the rows a pass takes at most, beside its batch's
+    /// rows; a line from an engine that does not count them reads as before.
+    #[test]
+    fn a_layer_order_line_says_its_passes() {
+        let detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                            "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 0.0});
+        let event = |extra: Value| {
+            let mut timings = json!({"decode_tokens_per_second": 22.2, "prefill_order": "layer", "prefill_batch_rows": 2048, "partial_detail": detail.clone()});
+            for (key, value) in extra.as_object().unwrap() {
+                timings[key] = value.clone();
+            }
+            json!({"event": "done", "tokens": [], "timings": timings})
+        };
+        let with = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536})), None);
+        assert!(with.contains("; prefill layers first, in 4 passes of up to 65536 rows, 2048 rows a batch"), "{with}");
+        let without = request_summary(&event(json!({})), None);
+        assert!(without.contains("; prefill layers first, 2048 rows a batch"), "{without}");
     }
 
     /// A partially resident request's line says the assist level its decode ended at, where the GPU may take the CPU's routes.
