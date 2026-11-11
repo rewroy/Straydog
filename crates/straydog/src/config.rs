@@ -237,6 +237,9 @@ pub struct Settings {
     pub ctx_size: u32,
     /// None: chosen by the worker from the GPUs' budgets (`--vram auto`).
     pub batch_size: Option<u16>,
+    /// The batch was not given: `batch_size` is what the GPU budgets derive (shown, and sent to the worker as auto), which a placement may narrow;
+    /// a batch given is kept as it is where it fits.
+    pub batch_derived: bool,
     pub gpu: Vec<usize>,
     pub split_mode: SplitMode,
     pub vram: Vram,
@@ -450,17 +453,6 @@ fn drafter_directory(file: &Path) -> Result<PathBuf, String> {
 }
 
 /// Fill every derived setting.
-/// The rows of a prefill batch for a resident model on this much GPU budget. Under 8 GiB the batches' workspaces rest at 256 rows, with some 200 MiB more for decode's
-/// slots, and widen for a long prompt ([`straydog_engine`]'s `begin_long_prefill`). From 48 GiB (two R9700s) it is the widest, 4096, which is the placement's
-/// to narrow: the model that is not fully resident keeps 2048, and one that fits resident only at 2048 takes it (`resident_placement`).
-pub(crate) fn resident_batch(total: u64) -> u16 {
-    match total {
-        total if total >= 48 << 30 => 4096,
-        total if total >= 8 << 30 => 1024,
-        _ => 256,
-    }
-}
-
 pub fn resolve(options: Options) -> Result<Settings, String> {
     let model = options.model.ok_or("no model: give -m DIR or set model in the config file")?;
     let model = model.canonicalize().map_err(|exc| format!("model {}: {exc}", model.display()))?;
@@ -550,13 +542,14 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
     // the pass, the fewer reads.
     // With the budgets left to the worker, it chooses the same way from those it finds.
     let total = vram.bytes(gpu.len()).map(|bytes| bytes.iter().sum::<u64>());
+    let batch_derived = options.batch_size.is_none();
     let batch_size = options.batch_size.or(match total {
         // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 32768)
         _ if deepseek => None,
         _ if on_demand => Some(4096),
         // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048 on 2026-10-29; on 2026-11-12, served,
         // one run each, 4096 against 2048: 8K 1.95 -> 1.75 s, 32K 7.10 -> 6.81 s, 95K 22.83 -> 21.63 s, 242K 66.1 -> 62.6 s, decode the same)
-        Some(total) => Some(resident_batch(total)),
+        Some(total) => Some(straydog_engine::model::resident_batch(total) as u16),
         None => None,
     });
     // Enough for the context's state (K/V stays on the host when it exceeds a quarter of the
@@ -617,6 +610,7 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         draft_max,
         ctx_size,
         batch_size,
+        batch_derived,
         gpu,
         split_mode: options.split_mode.unwrap_or(SplitMode::Experts),
         vram,
@@ -927,9 +921,21 @@ mod tests {
         let settings = resolved(&["--gpu", "0,1", "--vram", "30,10"], None).unwrap();
         assert_eq!(settings.vram.bytes(2), Some(vec![30 << 30, 10 << 30]));
         assert_eq!(settings.batch_size, Some(1024));   // 40 GiB in all
-        assert_eq!((resident_batch(5 << 30), resident_batch(8 << 30)), (256, 1024), "a small card's batches rest narrow");
-        assert_eq!((resident_batch(40 << 30), resident_batch((48 << 30) - 1), resident_batch(48 << 30), resident_batch(64 << 30)),
-                   (1024, 1024, 4096, 4096), "the widest batch is for 48 GiB of budget and more");
+        assert!(settings.batch_derived);
+        // (the batch derived from the budgets and one given are told apart: the placement narrows only the derived, and the worker is told `auto` for it)
+        let batch_arg = |settings: &Settings| {
+            let args = crate::runtime::worker_args(settings);
+            let at = args.iter().position(|arg| arg == "--prefill-batch-size").unwrap();
+            args[at + 1].to_string_lossy().into_owned()
+        };
+        let derived = resolved(&["--gpu", "0,1", "--vram", "30"], None).unwrap();
+        assert_eq!((derived.batch_size, derived.batch_derived, batch_arg(&derived).as_str()), (Some(4096), true, "auto"));
+        let given = resolved(&["--gpu", "0,1", "--vram", "30", "--batch-size", "4096"], None).unwrap();
+        assert_eq!((given.batch_size, given.batch_derived, batch_arg(&given).as_str()), (Some(4096), false, "4096"));
+        let given = resolved(&["--gpu", "0,1", "--vram", "30", "--batch-size", "2048"], None).unwrap();
+        assert_eq!((given.batch_size, given.batch_derived, batch_arg(&given).as_str()), (Some(2048), false, "2048"));
+        let auto = resolved(&["--gpu", "0,1", "--vram", "auto"], None).unwrap();
+        assert_eq!((auto.batch_size, auto.batch_derived, batch_arg(&auto).as_str()), (None, true, "auto"));
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "8"], None).unwrap().vram.bytes(2), Some(vec![8 << 30, 8 << 30]));
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "auto"], None).unwrap().vram, Vram::Auto);
         assert!(resolved(&["--gpu", "0,1", "--vram", "30,10,5"], None).unwrap_err().contains("3 budgets for 2 GPUs"));

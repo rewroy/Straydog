@@ -642,6 +642,8 @@ const VRAM_PATIENCE: Duration = Duration::from_secs(60);
 pub(crate) struct Plan {
     pub budgets: Vec<u64>,
     pub batch: usize,
+    /// The batch was not given (`auto`): the engine's placement may narrow it.
+    pub derived: bool,
     pub split: SplitMode,
 }
 
@@ -756,12 +758,12 @@ pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result
     let batch = match args.prefill_batch_size.as_str() {
         // (as the configuration derives it from given budgets: 4096 for the resident models from 48 GiB, narrowed by the placement, see config::resolve)
         "auto" if on_demand => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
-        "auto" => crate::config::resident_batch(budgets.iter().sum()) as usize,
+        "auto" => straydog_engine::model::resident_batch(budgets.iter().sum()),
         given => given.parse().map_err(|_| format!("invalid Straydog prefill batch {given:?}"))?,
     };
     let (least, most) = (*budgets.iter().min().unwrap(), *budgets.iter().max().unwrap());
     let split = if args.split_mode == "layer" || most - least > most / 10 { SplitMode::Layer } else { SplitMode::Experts };
-    Ok(Plan { budgets, batch, split })
+    Ok(Plan { budgets, batch, derived: args.prefill_batch_size == "auto", split })
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
@@ -844,7 +846,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let settings = Settings {
         context: args.context,
         state_budget_bytes: args.state_ram_bytes,
-        prefill_batch_size: plan.batch,
+        // (a derived batch is the engine's to derive and narrow; `plan.batch` is what it will derive, for warming the GEMM code)
+        prefill_batch_size: if plan.derived { straydog_engine::model::DERIVED_BATCH } else { plan.batch },
         speculative: args.speculative,
         cpu_threads: 0,
         row_cache_bytes: args.row_cache_bytes,

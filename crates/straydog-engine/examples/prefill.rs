@@ -4,6 +4,8 @@
 //!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer] [--row-cache MIB]
 //!     [--pause SECONDS] [--sampled] [--drafts N] [--chat] [--force-rows W,W,... --force-tokens FILE [--force-logits] [--force-reject N]] [--copy-drafts N]
 //!
+//! Without --batch the batch is derived from the budgets as the server derives it (and a placement may narrow it); --batch N asks for N, which is kept.
+//!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, "+N"
 //! appends N tokens to the previous prompt, and "TOKENS:G" generates G tokens for that run instead
@@ -79,7 +81,7 @@ fn main() -> Result<(), String> {
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
-    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(4096),
+    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(straydog_engine::model::DERIVED_BATCH),
                               speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
