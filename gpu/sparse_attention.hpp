@@ -421,7 +421,7 @@ void sparse_attention(Device& d, void* const* pointers, const int* kinds, void* 
         if (found==d.allocations.end() || found->second!=bytes)
             throw std::runtime_error("invalid Straydog QSA state allocation");
     };
-    check_state(kv_state,context*1024*sizeof(kv_t));
+    check_state(kv_state,context*4*d.kv_row);
     // (a K/V that grows: its indexer and scratch may hold more than it does)
     auto check_room=[&](void* pointer,size_t bytes) {
         auto found=d.allocations.find(pointer);
@@ -472,7 +472,7 @@ void sparse_attention(Device& d, void* const* pointers, const int* kinds, void* 
         qsa_block_scores<<<dim3(unsigned((pool+255)/256),unsigned(steps)),256,0,d.stream>>>(iq,blocks,pool,base,steps,static_cast<float*>(scratch));
     qsa_select<<<unsigned(steps),256,0,d.stream>>>(static_cast<float*>(scratch),pool,base,steps,selected,d.input);
     const KvView kv=kv_for_prefill(d,kv_state,context,base,steps);
-    write_attention_kv<<<unsigned((steps*512+255)/256),256,0,d.stream>>>(kv.kv,kv.capacity,base,steps,d.input,nullptr,nullptr,kv.mirror,kv.mirror_rows);
+    write_attention_kv<<<unsigned((steps*512+255)/256),256,0,d.stream>>>(d.kv_row,kv.kv,kv.capacity,base,steps,d.input,nullptr,nullptr,kv.mirror,kv.mirror_rows);
     float* attended=d.output+steps*13952;
     qsa_attention(d,kv.kv,kv.capacity,base,steps,selected,d.input,attended,nullptr,kv.mirror,kv.mirror_rows);
     kv_after_prefill(d,kv,kv_state,context,base,steps);

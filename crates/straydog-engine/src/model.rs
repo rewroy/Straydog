@@ -88,7 +88,7 @@ const VOCABULARY: usize = 248320;
 /// attention layer's (the MTP layer's too, `drafting`) QSA K/V, pooled indexer keys and the
 /// indexer's rolling history (eight inputs), DeltaNet state and convolution, PLE history.
 pub fn context_state_bytes(context: u64, drafting: bool) -> u64 {
-    let state = attention_layers(drafting) * (context * 4 * crate::gpu::KV_ROW_FLOATS + (context / 4 + 1) * 128 + 8 * 128) * 4;
+    let state = attention_layers(drafting) * (context * 4 * crate::gpu::KV_ROW_FLOATS_F16 + (context / 4 + 1) * 128 + 8 * 128) * 4;
     state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4
 }
 
@@ -100,8 +100,14 @@ pub fn state_per_token(drafting: bool) -> u64 {
     (context_state_bytes(2 * CONTEXT, drafting) - context_state_bytes(CONTEXT, drafting)) / CONTEXT
 }
 
-/// A whole attention layer's K/V bytes a position: four planes of KV_ROW_FLOATS.
-const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS * 4;
+/// A whole attention layer's K/V bytes a position in FP16, four planes of KV_ROW_FLOATS_F16: what the placement counts (whether the
+/// K/V stays in VRAM) until the Q8_0 rows are measured.
+const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS_F16 * 4;
+
+/// A whole attention layer's K/V bytes a position as it is held ([`crate::gpu::KvFormat::selected`]): what its memory takes.
+fn kv_position_bytes() -> u64 {
+    4 * crate::gpu::KvFormat::selected().row_bytes()
+}
 
 /// The layers with QSA attention: twelve, and the MTP layer when drafting.
 fn attention_layers(drafting: bool) -> u64 {
@@ -1008,7 +1014,7 @@ impl Model {
         }
         let mut two_drafts = false;
         if model.partial {
-            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * KV_POSITION_BYTES } else { 0 };
+            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * kv_position_bytes() } else { 0 };
             // (the banks are locked behind "ready", by the worker: [`Model::bank_locks`]; the slots below are sized as they were with
             // the locks taken, and the plan has left the commit the locks need out of what the VRAM takes)
             model.plan_host_banks(pinned)?;
@@ -2376,7 +2382,7 @@ impl Model {
     /// The working set's limit, which follows what is free ([`crate::host::watch_working_set`]), after what a K/V growth has just locked.
     fn hold_memory(&self) {
         if self.partial {
-            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * KV_POSITION_BYTES;
+            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
             self.pinned_now.store(pinned, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -2386,7 +2392,7 @@ impl Model {
     fn refresh_kv_ahead(&self) {
         let ahead = if self.host_kv {
             let reach = self.context.min(crate::banks::KV_ROOM_POSITIONS);
-            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * KV_POSITION_BYTES
+            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * kv_position_bytes()
         } else {
             0
         };
@@ -2401,8 +2407,8 @@ impl Model {
     /// The bytes a growth of the K/V to `capacity` positions asks of the memory: the layers' new positions, a layer's old K/V and new one both held while
     /// it is copied, and the margin the commit keeps.
     fn kv_growth_cost(&self, capacity: usize) -> u64 {
-        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
-        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * KV_POSITION_BYTES + KV_COMMIT_MARGIN
+        let position = attention_layers(self.weights.drafter) * kv_position_bytes();
+        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * kv_position_bytes() + KV_COMMIT_MARGIN
     }
 
     /// A request found no memory for `wanted` bytes of what it asks (`asked_by` says what): the page locks of the expert banks give way. The locking
@@ -2482,7 +2488,7 @@ impl Model {
     fn kv_capacity_for(&self, positions: usize) -> Result<usize> {
         let doubled = (positions + 4096).next_power_of_two().min(self.context);
         let Some((free, left)) = crate::host::commit_left() else { return Ok(doubled) };
-        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
+        let position = attention_layers(self.weights.drafter) * kv_position_bytes();
         let cost = |capacity: usize| self.kv_growth_cost(capacity);
         let least = self.kv_least(positions);
         let quarter = least.max((self.kv_capacity + self.kv_capacity / 4).div_ceil(4096) * 4096).min(self.context);
@@ -2526,7 +2532,7 @@ impl Model {
         let mut begun: Option<usize> = None;
         let capacity = loop {
             let attempt = begun.map_or_else(|| self.kv_capacity_for(positions), Ok).and_then(|capacity| {
-                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * KV_POSITION_BYTES;
+                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * kv_position_bytes();
                 // (the limit waits for the locking behind "ready", whose reads it would cut short)
                 if self.lock_pending.is_empty() {
                     crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
@@ -4005,7 +4011,7 @@ impl Model {
             // needs to say why a request waited on the drive)
             let read_back = crate::host::fault_reads().zip(self.fault_reads_before).map(|(now, before)| now.since(before));
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-            let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * KV_POSITION_BYTES;
+            let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
             let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             // (the CPU's time a token by the engine's phases: where a faster kernel shows, or does not)
             let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
