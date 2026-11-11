@@ -462,6 +462,20 @@ __global__ void __launch_bounds__(128) qsa_mark_send(const float* packed, size_t
     *reinterpret_cast<uint2*>(to) = make_uint2(uint32_t(blocks[0]) | uint32_t(blocks[1]) << 16, uint32_t(blocks[2]) | uint32_t(blocks[3]) << 16);
     if (t == 0 && complete * 4 <= position) atomicOr(group + complete, bit);
 }
+// qsa_mark_send without the marks, for a chunk whose rows attend their own selection (qsa_prompt_attention): only the blocks go to the
+// other device, which attends them from its inbox (qsa_prompt_received). Every row selects 512 blocks (a chunk past 2048 positions).
+template<int P = 1>
+__global__ void __launch_bounds__(128) qsa_send_blocks(const float* packed, size_t steps, size_t selected, size_t first,
+                                                       uint16_t* peer_inbox, const uint32_t* state, size_t slot) {
+    const size_t token = blockIdx.x, index_start = steps * QwenHeads<P>::packed;
+    const float* indices = packed + index_start + token * selected;
+    const unsigned t = threadIdx.x;
+    uint16_t blocks[qsa_share_ids];
+    #pragma unroll
+    for (unsigned k = 0; k < qsa_share_ids; ++k) blocks[k] = uint16_t(size_t(indices[(t * qsa_share_ids + k) * 4]) / 4);
+    uint16_t* to = peer_inbox + size_t((state[0] + 1) & 1) * slot + (first + token) * qsa_share_blocks + t * qsa_share_ids;
+    *reinterpret_cast<uint2*>(to) = make_uint2(uint32_t(blocks[0]) | uint32_t(blocks[1]) << 16, uint32_t(blocks[2]) | uint32_t(blocks[3]) << 16);
+}
 // The marks of the rows the other device selected (chunks first_chunk, first_chunk + 2, ... of the span's `rows`), from its inbox,
 // after its flag: blockIdx.y the chunk's turn, blockIdx.x the row in it. `base`: the span's first position.
 __global__ void __launch_bounds__(128) qsa_mark_received(size_t base, size_t first_chunk, size_t rows, size_t stride, uint32_t* marks,

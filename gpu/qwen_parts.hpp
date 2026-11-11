@@ -4,7 +4,7 @@
 // routed experts; and half of the shared expert's width (rows of gate and up, columns of down). Both keep the whole residual
 // streams and compute the HyperConnections and the router alike, so they select the same experts; the attention's indexer alike
 // for a pass's few rows, and for a prompt's chunks shared out in turn (qsa_prefill's), the selected blocks exchanged: both hold the
-// same K/V blocks' marks. A
+// same K/V blocks (as marks, or as each token's own selection list from 8192 tokens). A
 // layer's two outputs, the attention's projection and the experts', are each this device's part of a sum the devices add (the
 // SumLink of device_link.hpp) before it goes into the streams; both add the same two values, so their streams stay equal. A
 // part's states are its own: its DeltaNet heads' recurrence and convolution, its K/V head's planes.
