@@ -309,9 +309,81 @@ pub struct Entry {
     pub cols: u64,
 }
 
-/// Qwen3.8's attention K/V holds FP16 values: a plane's row of a position is 256 halves, this many of its state's floats (each layer
-/// state `@qsa:` has its planes' rows of this width; `kv_row_floats` natively).
-pub const KV_ROW_FLOATS: u64 = 128;
+/// The format of Qwen3.8's attention K/V: a plane's row of a position (one head's 256 values) as FP16, 512 bytes, or as Q8_0, the 256
+/// values as int8 and then the FP16 scales of their eight 32-value blocks, 272 bytes: half the memory and half what decode reads of
+/// a K/V in host memory over the bus. Each layer state `@qsa:` has its planes' rows of [`KvFormat::row_floats`] floats (`kv_row`
+/// natively, `sd_kv_format`). Q8_0 unless STRAYDOG_KV=f16 when the process starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFormat {
+    F16,
+    Q8,
+}
+
+impl KvFormat {
+    /// The process's format: STRAYDOG_KV=f16 keeps FP16.
+    pub fn selected() -> KvFormat {
+        static SELECTED: std::sync::OnceLock<KvFormat> = std::sync::OnceLock::new();
+        *SELECTED.get_or_init(|| KvFormat::named(std::env::var("STRAYDOG_KV").ok().as_deref()))
+    }
+
+    fn named(name: Option<&str>) -> KvFormat {
+        match name {
+            Some("f16" | "fp16") => KvFormat::F16,
+            _ => KvFormat::Q8,
+        }
+    }
+
+    /// Bytes of a row: a position's 256 values of one head.
+    pub const fn row_bytes(self) -> u64 {
+        match self {
+            KvFormat::F16 => 512,
+            KvFormat::Q8 => 272,
+        }
+    }
+
+    /// A row in a state's floats.
+    pub const fn row_floats(self) -> u64 {
+        self.row_bytes() / 4
+    }
+}
+
+/// A K/V row's floats in FP16: what the placement and the plans count until the Q8_0 rows are measured (the rows held are
+/// [`kv_row_floats`]).
+pub const KV_ROW_FLOATS_F16: u64 = 128;
+
+/// A K/V row's floats in the format the K/V is held in.
+pub fn kv_row_floats() -> u64 {
+    KvFormat::selected().row_floats()
+}
+
+/// A row of 256 K/V values as Q8_0, by the device's arithmetic (`kv_encode`): each 32-value block's scale is the F16 of its largest
+/// magnitude over 127, and each value the int8 nearest (ties to even) its quotient by that scale.
+pub fn kv_q8_row(values: &[f32; 256]) -> [u8; 272] {
+    let mut row = [0u8; 272];
+    for block in 0..8 {
+        let part = &values[block * 32..block * 32 + 32];
+        let top = part.iter().fold(0f32, |top, value| top.max(value.abs()));
+        let half = formats::f32_to_f16(top / 127.0);
+        let scale = formats::f16_to_f32(half);
+        for (at, value) in part.iter().enumerate() {
+            let q = if scale > 0.0 { (value / scale).round_ties_even().clamp(-127.0, 127.0) as i8 } else { 0 };
+            row[block * 32 + at] = q as u8;
+        }
+        row[256 + 2 * block..258 + 2 * block].copy_from_slice(&half.to_le_bytes());
+    }
+    row
+}
+
+/// The values a Q8_0 row holds, as the device reads them (`kv_load`).
+pub fn kv_q8_values(row: &[u8; 272]) -> [f32; 256] {
+    let mut values = [0f32; 256];
+    for (column, value) in values.iter_mut().enumerate() {
+        let block = column / 32;
+        let scale = formats::f16_to_f32(u16::from_le_bytes([row[256 + 2 * block], row[257 + 2 * block]]));
+        *value = f32::from(row[column] as i8) * scale;
+    }
+    values
+}
 
 /// Floats of a sequence state copied out: `height` runs of `width` floats, `pitch` floats apart
 /// in the state, from float `offset`; `first` the first position they hold. They lie in `device`
@@ -441,7 +513,7 @@ impl Backend {
         if budget >= 2 << 30 {
             output_capacity *= 2;
         }
-        Ok(Backend {
+        let backend = Backend {
             handle,
             ordinal,
             cache: HashMap::new(),
@@ -473,7 +545,10 @@ impl Backend {
             mtp_parts: false,
             pending_host: Vec::new(),
             deferred: None,
-        })
+        };
+        // SAFETY: a live handle, before any state or layer.
+        check(unsafe { ffi::sd_kv_format(backend.handle, KvFormat::selected().row_bytes() as u32) })?;
+        Ok(backend)
     }
 
     pub fn handle(&self) -> *mut c_void {
@@ -817,7 +892,7 @@ impl Backend {
                     plan.push((format!("@conv:blk.{layer}."), 4, WIDTH as u64 / parts, false));
                 }
             } else {
-                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, KV_ROW_FLOATS, host_attention));
+                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, kv_row_floats(), host_attention));
                 plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + INDEX_HISTORY, 1, false));
             }
         }
@@ -1210,9 +1285,9 @@ impl Backend {
     /// 4 to 8 ms a four-row pass where the sixteenth of the budget mirrors 37K to 43K of them).
     pub fn grow_kv_stage(&mut self, context: u64) -> Result<()> {
         let Some(stage) = self.states.get("@kv:stage").copied() else { return Ok(()) };
-        // (in the stage's rows of 1024 floats: a position takes a row of KV_ROW_FLOATS a plane, four planes for a whole layer, a part's two)
+        // (in the stage's rows of 1024 floats: a position takes a row of kv_row_floats() a plane, four planes for a whole layer, a part's two)
         let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:"))
-            .map(|key| (self.kv_planes(key) * context * KV_ROW_FLOATS).div_ceil(1024)).sum();
+            .map(|key| (self.kv_planes(key) * context * kv_row_floats()).div_ceil(1024)).sum();
         let (used, budget) = self.memory()?;
         let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
         let rows = (stage.rows / 4 + free / 4096).min(needed);
@@ -2068,7 +2143,7 @@ impl Backend {
     /// Bytes [`save_positions`](Self::save_positions) copies per position.
     pub fn position_bytes(&self) -> u64 {
         self.states.keys().map(|key| {
-            if key.starts_with("@qsa:") { self.kv_planes(key) * KV_ROW_FLOATS * 4 } else if key.starts_with("@indexer:") { 128 } else { 0 }
+            if key.starts_with("@qsa:") { self.kv_planes(key) * kv_row_floats() * 4 } else if key.starts_with("@indexer:") { 128 } else { 0 }
         }).sum()
     }
 
@@ -2107,11 +2182,11 @@ impl Backend {
         for (key, entry) in &self.states {
             let floats = entry.rows * entry.cols;
             if key.starts_with("@qsa:") {
-                // Four planes (each head's keys, then each head's values; a part's two), a position's KV_ROW_FLOATS a row.
+                // Four planes (each head's keys, then each head's values; a part's two), a position's kv_row_floats() a row.
                 let planes = self.kv_planes(key);
                 let context = entry.rows / planes;
-                parts.push(StatePart { key: key.clone(), offset: from * KV_ROW_FLOATS, pitch: context * KV_ROW_FLOATS,
-                                       width: (to - from) * KV_ROW_FLOATS,
+                parts.push(StatePart { key: key.clone(), offset: from * kv_row_floats(), pitch: context * kv_row_floats(),
+                                       width: (to - from) * kv_row_floats(),
                                        height: planes, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
@@ -2228,11 +2303,11 @@ impl Backend {
                 for low in (0..to).step_by(RUN as usize) {
                     let high = (low + RUN).min(to);
                     parts.push((format!("{key} rows {low}..{high}"),
-                                part(low * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, (high - low) * KV_ROW_FLOATS, planes)));
+                                part(low * kv_row_floats(), entry.rows / planes * kv_row_floats(), (high - low) * kv_row_floats(), planes)));
                 }
                 // (and the last few one by one: where a sequence's writes end)
                 for row in to.saturating_sub(8)..to {
-                    parts.push((format!("{key} row {row}"), part(row * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, KV_ROW_FLOATS, planes)));
+                    parts.push((format!("{key} row {row}"), part(row * kv_row_floats(), entry.rows / planes * kv_row_floats(), kv_row_floats(), planes)));
                 }
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
@@ -2949,6 +3024,91 @@ pub(crate) fn next_slot_attempt(stage: u64, cache: u64, mirror: bool, error: &st
         return None;
     }
     Some(SlotAttempt { stage, cache: cache / 2, mirror, refit: false })
+}
+
+#[cfg(test)]
+mod kv_format_tests {
+    use super::*;
+
+    /// Decides: the rows' sizes. Q8_0's row is 272 bytes, a multiple of 16 (the 16-byte pieces the kernels read and copy), a
+    /// position of a whole layer 1,088 bytes against FP16's 2,048, and Qwen3.8's 262,144-position K/V of thirteen layers 3.45 GiB
+    /// against 6.5. FP16 keeps the rows the K/V had (128 floats); STRAYDOG_KV=f16 selects it and anything else Q8_0.
+    #[test]
+    fn rows_are_sized_for_their_format() {
+        assert_eq!((KvFormat::F16.row_bytes(), KvFormat::F16.row_floats()), (512, KV_ROW_FLOATS_F16));
+        assert_eq!((KvFormat::Q8.row_bytes(), KvFormat::Q8.row_floats()), (272, 68));
+        assert_eq!(KvFormat::Q8.row_bytes() % 16, 0);
+        assert_eq!(4 * KvFormat::Q8.row_bytes(), 1088);
+        assert_eq!(13 * 262_144 * 4 * KvFormat::F16.row_bytes(), 13 << 29);
+        let q8 = 13 * 262_144 * 4 * KvFormat::Q8.row_bytes();
+        assert_eq!(q8, 3_707_764_736);
+        assert_eq!(format!("{:.2}", q8 as f64 / (1u64 << 30) as f64), "3.45");
+        assert_eq!(KvFormat::named(Some("f16")), KvFormat::F16);
+        assert_eq!(KvFormat::named(Some("fp16")), KvFormat::F16);
+        assert_eq!(KvFormat::named(None), KvFormat::Q8);
+        assert_eq!(KvFormat::named(Some("q8")), KvFormat::Q8);
+    }
+
+    fn row(seed: u32, magnitude: f32) -> [f32; 256] {
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        std::array::from_fn(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * magnitude
+        })
+    }
+
+    /// Decides: the layout. The int8 of column c is byte c; the eight F16 scales follow at 256 + 2 * block, little-endian; a
+    /// block's largest magnitude is held as ±127 times its scale.
+    #[test]
+    fn a_q8_row_holds_its_values_then_its_scales() {
+        let mut values = [0f32; 256];
+        for (column, value) in values.iter_mut().enumerate() {
+            *value = (column as f32 - 128.0) / 16.0;
+        }
+        let packed = kv_q8_row(&values);
+        for block in 0..8 {
+            let part = &values[block * 32..block * 32 + 32];
+            let top = part.iter().fold(0f32, |top, value| top.max(value.abs()));
+            let scale = u16::from_le_bytes([packed[256 + 2 * block], packed[257 + 2 * block]]);
+            assert_eq!(scale, formats::f32_to_f16(top / 127.0), "block {block}'s scale");
+            let largest = (0..32).map(|at| block * 32 + at).max_by(|a, b| values[*a].abs().total_cmp(&values[*b].abs())).unwrap();
+            assert_eq!((packed[largest] as i8).unsigned_abs(), 127, "block {block}'s largest value");
+            assert_eq!((packed[largest] as i8) < 0, values[largest] < 0.0);
+        }
+        assert_eq!(packed[128] as i8, 0, "the zero at column 128");
+    }
+
+    /// Decides: the round trip. Every value comes back within half its block's scale (and the F16 scale's own rounding), a block
+    /// that is all zero comes back zero with a zero scale, and a large value in one block leaves the others' precision alone.
+    #[test]
+    fn q8_rows_come_back_within_half_a_scale() {
+        for seed in 1..200 {
+            let magnitude = [1e-3f32, 0.1, 1.0, 30.0, 600.0][seed as usize % 5];
+            let values = row(seed, magnitude);
+            let packed = kv_q8_row(&values);
+            let back = kv_q8_values(&packed);
+            for block in 0..8 {
+                let scale = formats::f16_to_f32(u16::from_le_bytes([packed[256 + 2 * block], packed[257 + 2 * block]]));
+                for column in block * 32..block * 32 + 32 {
+                    let error = (back[column] - values[column]).abs();
+                    assert!(error <= scale * 0.5 * 1.001 + values[column].abs() * 1e-3, "seed {seed} column {column}: {} -> {}",
+                            values[column], back[column]);
+                }
+            }
+        }
+        let zero = kv_q8_values(&kv_q8_row(&[0f32; 256]));
+        assert!(zero.iter().all(|value| *value == 0.0));
+        assert!(kv_q8_row(&[0f32; 256]).iter().all(|byte| *byte == 0));
+        let mut values = row(7, 1.0);
+        let before = kv_q8_row(&values);
+        values[3] = 500.0;
+        let after = kv_q8_row(&values);
+        assert_eq!(before[32..256], after[32..256], "the other blocks' values");
+        assert_eq!(before[258..272], after[258..272], "the other blocks' scales");
+        assert_eq!(after[3] as i8, 127);
+    }
 }
 
 #[cfg(test)]

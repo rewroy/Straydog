@@ -297,11 +297,12 @@ constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1
 // A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
 // verify_max) leave what it reads in place, with nothing to copy again.
 constexpr size_t kv_mirror_margin = 8;
-// Qwen3.8's attention K/V (its planes of `context` positions, each K/V head's keys, then each one's values) holds FP16 values: a
-// plane's row of a position is 256 halves, 128 of its allocation's floats. The prompt's flash rounded the keys and values to FP16
-// already; decode and verification read them as such. (Copies, stage and mirrors count in these elements.)
-typedef __half kv_t;
-constexpr size_t kv_row_floats = 256 * sizeof(kv_t) / 4;
+// Qwen3.8's attention K/V: its planes of `context` positions (each K/V head's keys, then each one's values), a plane's row of a
+// position one head's 256 values in the device's format (Device::kv_row, sd_kv_format): FP16, a row of 512 bytes; or Q8_0, the 256
+// values as int8 and then the FP16 scales of their eight 32-value blocks, 272 bytes (17 pieces of 16: every row stays 16-byte aligned
+// and is read in one run). kv_t is a byte of it; copies, stage and mirrors count in rows of Device::kv_row bytes.
+typedef uint8_t kv_t;
+constexpr unsigned kv_row_f16 = 512, kv_row_q8 = 272;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
@@ -606,6 +607,7 @@ struct Device {
     // Planes of a host K/V state (each K/V head's keys, then each one's values): 4 for a whole layer, 2 for a part
     // (QwenHeads<2>::kv); set as its layer registers.
     std::unordered_map<const void*,size_t> kv_planes;
+    unsigned kv_row = kv_row_f16;   // bytes of a K/V row: its format (sd_kv_format), set before any layer registers
     size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
     // A draft's vocabulary on the device holding the head (sd_draft_vocabulary): the head's first `draft_rows` rows, and
     // `draft_extra_count` rows of tokens past them, copied into `draft_extras` (their tokens in `draft_extra_tokens`).
@@ -996,14 +998,50 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
     if (index < count) output[index] = __float2half(input[index]);
 }
 
-// A K/V value as it is held (kv_t), and as it is read.
-__device__ __forceinline__ kv_t kv_value(float value) { return __float2half_rn(value); }
-__device__ __forceinline__ float kv_load(const kv_t* at) { return __half2float(*at); }
+// A K/V row's values as they are read: FP16, or Q8_0's int8 times its block's scale. `kv_row`: the row's bytes, its format.
+__device__ __forceinline__ float kv_scale(const kv_t* row, size_t column) {
+    return __half2float(reinterpret_cast<const __half*>(row + 256)[column / 32]);
+}
+__device__ __forceinline__ float kv_load(const kv_t* row, size_t column, unsigned kv_row) {
+    if (kv_row == kv_row_q8) return float(reinterpret_cast<const int8_t*>(row)[column]) * kv_scale(row, column);
+    return __half2float(reinterpret_cast<const __half*>(row)[column]);
+}
+// Four values from `column` (a multiple of four, so in one block) as FP16, eight bytes as the WMMA prefill stages them.
+__device__ __forceinline__ uint2 kv_half4(const kv_t* row, size_t column, unsigned kv_row) {
+    if (kv_row != kv_row_q8) return *reinterpret_cast<const uint2*>(row + column * 2);
+    const uint32_t word = *reinterpret_cast<const uint32_t*>(row + column);
+    const float scale = kv_scale(row, column);
+    uint32_t halves[4];
+    #pragma unroll
+    for (unsigned b = 0; b < 4; ++b) halves[b] = __half_as_ushort(__float2half_rn(float(int8_t(word >> (8 * b))) * scale));
+    return uint2{halves[0] | halves[1] << 16, halves[2] | halves[3] << 16};
+}
+// A value to store. Q8_0 takes its block's scale from the largest magnitude of the block's 32 values, which the 32 lanes of a warp
+// hold (lane = column % 32): every lane of the warp encodes together. The scale is rounded to FP16 first and the value divided by
+// that, so what is read back is what the int8 meant (its error at most half a scale).
+struct KvValue { float value; __half scale; int q; };
+__device__ __forceinline__ KvValue kv_encode(float value, unsigned kv_row) {
+    KvValue out{value, __float2half_rn(0.0f), 0};
+    if (kv_row != kv_row_q8) return out;
+    float top = fabsf(value);
+    for (unsigned offset = 16; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 32));
+    out.scale = __float2half_rn(top / 127.0f);
+    const float scale = __half2float(out.scale);
+    const int q = scale > 0.0f ? __float2int_rn(value / scale) : 0;
+    out.q = q > 127 ? 127 : q < -127 ? -127 : q;
+    return out;
+}
+__device__ __forceinline__ void kv_put(kv_t* row, size_t column, const KvValue& value, unsigned kv_row) {
+    if (kv_row != kv_row_q8) { reinterpret_cast<__half*>(row)[column] = __float2half_rn(value.value); return; }
+    reinterpret_cast<int8_t*>(row)[column] = int8_t(value.q);
+    if (column % 32 == 0) reinterpret_cast<__half*>(row + 256)[column / 32] = value.scale;
+}
 
 // values (optional) holds the rows' values instead of the packed input. A layer's K/V is
 // 2 * QwenHeads<P>::kv planes of `context` rows: each K/V head's keys, then each one's values.
+// (a warp's 32 threads are one block of a row: whole warps return, `steps * width` being a multiple of 256)
 template<int P=1>
-__global__ void write_attention_kv(kv_t* state, size_t context, size_t base, size_t steps, const float* input,
+__global__ void write_attention_kv(unsigned kv_row, kv_t* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
                                    kv_t* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
     constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
@@ -1012,17 +1050,18 @@ __global__ void write_attention_kv(kv_t* state, size_t context, size_t base, siz
     if (index >= steps * width) return;
     const size_t step = index / width, head = (index % width) / 256, column = index % 256;
     const size_t keys_start = steps * QwenHeads<P>::query * 256;
-    const kv_t key = kv_value(input[keys_start + index]), value = kv_value(values ? values[index] : input[keys_start + steps * width + index]);
-    state[(head * context + base + step) * 256 + column] = key;
-    state[context * width + (head * context + base + step) * 256 + column] = value;
+    const KvValue key = kv_encode(input[keys_start + index], kv_row);
+    const KvValue value = kv_encode(values ? values[index] : input[keys_start + steps * width + index], kv_row);
+    kv_put(state + (head * context + base + step) * kv_row, column, key, kv_row);
+    kv_put(state + ((K + head) * context + base + step) * kv_row, column, value, kv_row);
     if (mirror_rows) {
         const size_t slot=unsigned(base+step)%unsigned(mirror_rows);
-        mirror[(head*mirror_rows+slot)*256+column]=key;
-        mirror[((K+head)*mirror_rows+slot)*256+column]=value;
+        kv_put(mirror+(head*mirror_rows+slot)*kv_row,column,key,kv_row);
+        kv_put(mirror+((K+head)*mirror_rows+slot)*kv_row,column,value,kv_row);
     }
 }
 
-__global__ void attention_scores(const kv_t* state, size_t context, size_t base, size_t steps,
+__global__ void attention_scores(unsigned kv_row, const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, float* scores, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24;
@@ -1036,7 +1075,7 @@ __global__ void attention_scores(const kv_t* state, size_t context, size_t base,
                 const size_t token = size_t(raw);
                 result = 0;
                 for (size_t column = 0; column < 256; ++column)
-                    result += kv_load(&state[((head / 12) * context + token) * 256 + column])
+                    result += kv_load(state + ((head / 12) * context + token) * kv_row, column, kv_row)
                             * input[item * 256 + column];
                 result *= 0.0625f;
             }
@@ -1045,7 +1084,7 @@ __global__ void attention_scores(const kv_t* state, size_t context, size_t base,
     }
 }
 
-__global__ void attention_reduce(const kv_t* state, size_t context, size_t base, size_t steps,
+__global__ void attention_reduce(unsigned kv_row, const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, const float* scores, float* output, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24, column = threadIdx.x;
@@ -1083,7 +1122,7 @@ __global__ void attention_reduce(const kv_t* state, size_t context, size_t base,
         if (raw >= 0 && raw <= float(base + step) && raw < float(context)) {
             const size_t token = size_t(raw);
             result += probabilities[slot]
-                    * kv_load(&state[context * 512 + ((head / 12) * context + token) * 256 + column]);
+                    * kv_load(state + (2 * context + (head / 12) * context + token) * kv_row, column, kv_row);
         }
     }
     output[item * 256 + column] = result;
@@ -3085,7 +3124,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown = nullptr;
         // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
         // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (host_allocate(&grown, to * 1024 * sizeof(kv_t) + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+        if (host_allocate(&grown, to * 4 * d.kv_row + allocation_tail, hipHostMallocMapped) != hipSuccess) {
             (void)hipGetLastError();
             throw std::runtime_error(kv_no_memory);
         }
@@ -3093,10 +3132,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown_index = nullptr;
         void* grown_scratch = nullptr;
         try {
-            std::memset(grown, 0, to * 1024 * sizeof(kv_t) + allocation_tail);
+            std::memset(grown, 0, to * 4 * d.kv_row + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
-                std::memcpy(static_cast<kv_t*>(grown) + plane * to * 256, static_cast<const kv_t*>(host->second) + plane * from * 256,
-                            valid * 256 * sizeof(kv_t));
+                std::memcpy(static_cast<kv_t*>(grown) + plane * to * d.kv_row, static_cast<const kv_t*>(host->second) + plane * from * d.kv_row,
+                            valid * d.kv_row);
             check(hipHostGetDevicePointer(&pointer, grown, 0));
             // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
             std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
@@ -3117,7 +3156,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         kv_clear_graphs(d);
         check(hipHostFree(host->second));
         d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
-        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * sizeof(kv_t));
+        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 4 * d.kv_row);
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
         plan.states[0] = pointer; plan.context = to;
         if (grown_index) {
@@ -3203,6 +3242,17 @@ int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint
         }
         *moe = new_moe; *decoder = new_decoder;
         return refused ? 1 : 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// The format of the K/V: the bytes of its rows, 512 (FP16) or 272 (Q8_0). Before any decoder layer registers.
+int sd_kv_format(void* handle, uint32_t row) {
+    try {
+        auto& value = device(handle);
+        if ((row != kv_row_f16 && row != kv_row_q8) || !value.decoder.empty() || !value.host_states.empty())
+            throw std::runtime_error("invalid Straydog K/V format");
+        value.kv_row = row;
+        return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
@@ -3310,7 +3360,7 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
             !steps || steps > max_batch || base > context || steps > context - base || !selected || selected > 2052)
             throw std::runtime_error("invalid Straydog attention dimensions");
         auto found = value.allocations.find(state);
-        if (found == value.allocations.end() || found->second != context * 1024 * sizeof(kv_t))
+        if (found == value.allocations.end() || found->second != context * 4 * value.kv_row)
             throw std::runtime_error("Straydog attention state size mismatch");
         if (input_count != steps * (24 * 256 + 1024 + selected + 1) || output_count != steps * 24 * 256 ||
             input_count > value.input_capacity || output_count > value.output_capacity)
@@ -3324,11 +3374,11 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
         }
         upload(value, value.input, input, size_t(input_count) * 4);
         kv_invalidate_write(value,state,size_t(base));
-        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<kv_t*>(state),
+        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(value.kv_row, static_cast<kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), value.input);
-        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
+        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(value.kv_row, static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores);
-        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
+        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(value.kv_row, static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores, value.output);
         check(hipGetLastError());
         download(value, output, value.output, size_t(output_count) * 4);
