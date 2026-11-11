@@ -1402,7 +1402,7 @@ named as llama-server names it where it has the same setting.
 | `-md, --model-draft DIR` | Qwen3.8's MTP drafter | none |
 | `--mmproj FILE` | Qwen3.8's vision encoder and projector (§8.1) | a `mmproj-*.gguf` in the model's directory or the one above it |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
-| `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
+| `-c, --ctx-size N` | context in tokens, at most the model's own: Qwen3.8 262144, DeepSeek-V4.1 1048576 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 32768 | 1024; 4096 with 48 GiB or more of GPU budget; DeepSeek-V4.1: from its GPUs' budgets (§7.2) |
 | `-gpu, --gpu LIST` | GPU ordinals (`-dev`, `--device` also accepted) | `0` |
 | `-sm, --split-mode MODE` | `experts`: every layer split across the GPUs; `layer`: ranges of layers | `experts` |

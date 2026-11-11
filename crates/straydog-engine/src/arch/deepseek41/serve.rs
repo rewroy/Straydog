@@ -709,6 +709,21 @@ fn auto_batch(budget: u64, per_row: u64) -> usize {
     AUTO_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 8).unwrap_or(AUTO_BATCHES[AUTO_BATCHES.len() - 1])
 }
 
+/// A context the model is served with: within [`super::CONTEXT_LIMIT`], and no more than the first
+/// shard's header declares (`deepseek41.context_length`) when it declares one, the context its
+/// rope scaling was made for.
+fn check_context(context: usize, declared: Option<u64>) -> Result<(), String> {
+    if !(1..=super::CONTEXT_LIMIT).contains(&context) {
+        return Err(format!("Straydog context {context} must be between 1 and {} tokens for DeepSeek-V4.1", super::CONTEXT_LIMIT));
+    }
+    match declared {
+        Some(declared) if context as u64 > declared => {
+            Err(format!("Straydog context {context} is above the {declared} tokens this DeepSeek-V4.1 bundle declares"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn layer_of(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
@@ -724,6 +739,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         pins.sidecars.push(bundle::Sidecar { asset: vision.asset, verity: vision.verity, architecture: bundle::VISION_ARCHITECTURE.into() });
     }
     let mut files = Pinned::open(root, data_dir, &pins)?;
+    check_context(settings.context, files.header.declared_context)?;
     // A row read may otherwise fetch a cold 4 KiB proof for its 4 KiB data. Keep the leaves
     // before expert arenas are pinned, bounded by both the host plan and current headroom.
     // An explicitly sized expert tier is left as given; a mapping-only row table stays as given.
@@ -961,6 +977,22 @@ mod tests {
         assert_eq!(evictions(&held, 1400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
+    }
+
+    /// A context up to the model's 1048576 is served when the bundle declares as much (or does not say); one above the
+    /// bundle's declaration, above the model's, or of nothing is refused.
+    #[test]
+    fn a_context_above_what_the_bundle_declares_is_refused() {
+        const DECLARED: Option<u64> = Some(1_048_576);
+        assert_eq!(check_context(262_144, DECLARED), Ok(()));
+        assert_eq!(check_context(1_048_576, DECLARED), Ok(()));
+        assert_eq!(check_context(1_048_576, None), Ok(()));
+        assert!(check_context(1_048_577, DECLARED).unwrap_err().contains("must be between 1 and 1048576"));
+        assert!(check_context(1_048_577, None).is_err() && check_context(0, DECLARED).is_err());
+        // (a bundle that declares less holds the context to that)
+        assert_eq!(check_context(131_072, Some(131_072)), Ok(()));
+        let error = check_context(131_073, Some(131_072)).unwrap_err();
+        assert!(error.contains("131073") && error.contains("above the 131072 tokens"), "{error}");
     }
 
     /// With 0.32 MB a row, 32768 rows are chosen for a 31 GiB budget, 16384 for 24 GiB, 8192 below that,
