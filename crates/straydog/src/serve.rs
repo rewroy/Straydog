@@ -85,7 +85,10 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
         tracing::info!(
-            "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
+            "Straydog starting: {} {} ({}), {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
+            if cfg!(feature = "cuda") { "CUDA" } else { "HIP" },
+            env!("CARGO_PKG_VERSION"),
+            env!("STRAYDOG_COMMIT"),
             settings.bundle,
             settings.model.display(),
             settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
