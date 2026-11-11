@@ -572,8 +572,24 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // (decode passes the assist's round timed, one row each with no drafts: this request's decode rate is not its usual)
     let round = timings["assist_round_passes"].as_u64().filter(|passes| *passes > 0)
         .map_or_else(String::new, |passes| format!("; assist round: {passes} passes timed"));
+    // (passes of a probe of the drafts' width chooser, at a width not in force)
+    let probe = timings["drafts_probe_passes"].as_u64().filter(|passes| *passes > 0)
+        .map_or_else(String::new, |passes| format!("; drafts probe: {passes} passes at another width"));
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
-        (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
+        (Some(resident), Some(available)) => {
+            // (what the drive gave back for faults while it ran: Windows counts every process's)
+            let read_back = detail["fault_read_pages"].as_u64().map_or_else(String::new, |pages| {
+                let whose = if detail["fault_reads_system"] == true { " (every process)" } else { "" };
+                format!(", {:.2} GB read back from the drive{whose}", pages as f64 * 4096.0 / 1e9)
+            });
+            let limit = detail["working_set_limit_gib"].as_f64().map_or_else(String::new, |gib| format!(", working set limit {gib:.1} GiB"));
+            let kv = match (detail["kv_positions"].as_u64(), detail["kv_gib"].as_f64()) {
+                (Some(positions), Some(gib)) => format!(", K/V {positions} positions {gib:.2} GiB in {}", if detail["kv_host"] == true { "host memory" } else { "VRAM" }),
+                _ => String::new(),
+            };
+            format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults{read_back}{limit}{kv}",
+                    detail["page_faults"].as_u64().unwrap_or(0))
+        }
         _ => String::new(),
     };
     // (Windows: the hints that read a layer's cold experts ahead, taken while the machine paged and left when it did not)
@@ -602,7 +618,7 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}{round}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}{round}{probe}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -1931,6 +1947,35 @@ mod tests {
         assert!(line.contains("first token 6.08 s (besides reading: encode 0.34 s, slots back 0.42 s)"), "{line}");
         assert!(line.contains("; layer order not taken: 128 rows a batch, banks 39.4 GiB, room 46.1 GiB"), "{line}");
         assert!(line.contains("; assist round: 63 passes timed"), "{line}");
+    }
+
+    /// Decides: the memory a request ended with says what the drive gave back for faults while it ran (Windows: every process's), the
+    /// working set's limit in force and the K/V's capacity, and a request whose passes probed another drafts width says so, still one line;
+    /// a line from an engine that reports none of them reads as before (2026-11-11's investigation took them with scripts of its own).
+    #[test]
+    fn a_request_line_says_what_memory_held_and_what_the_drive_gave_back() {
+        let detail = |extra: Value| {
+            let mut detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                                    "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 0.0,
+                                    "resident_gib": 23.4, "available_gib": 4.0, "page_faults": 1741229});
+            for (key, value) in extra.as_object().unwrap() {
+                detail[key] = value.clone();
+            }
+            detail
+        };
+        let event = |detail: Value, probe: u64| json!({"event": "done", "tokens": [],
+            "timings": {"decode_tokens_per_second": 33.7, "drafts_probe_passes": probe, "partial_detail": detail}});
+        let before = request_summary(&event(detail(json!({})), 0), None);
+        assert!(before.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults; ") || before.ends_with("1741229 page faults"), "{before}");
+        assert!(!before.contains("read back") && !before.contains("working set") && !before.contains("K/V") && !before.contains("drafts probe"), "{before}");
+        let windows = request_summary(&event(detail(json!({"fault_read_pages": 1_855_000, "fault_reads_system": true, "working_set_limit_gib": 27.04,
+                                                             "kv_positions": 262144, "kv_gib": 6.5, "kv_host": true})), 12), None);
+        assert!(windows.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults, 7.60 GB read back from the drive (every process), working set limit 27.0 GiB, K/V 262144 positions 6.50 GiB in host memory"), "{windows}");
+        assert!(windows.contains("; drafts probe: 12 passes at another width") && windows.lines().count() == 1, "{windows}");
+        // (Linux: the process's own major faults, no working set limit; a K/V the VRAM holds)
+        let linux = request_summary(&event(detail(json!({"fault_read_pages": 2_000, "fault_reads_system": false,
+                                                           "kv_positions": 32768, "kv_gib": 0.81, "kv_host": false})), 0), None);
+        assert!(linux.contains("1741229 page faults, 0.01 GB read back from the drive, K/V 32768 positions 0.81 GiB in VRAM"), "{linux}");
     }
 
     /// A partially resident request's line says the assist level its decode ended at, where the GPU may take the CPU's routes.
