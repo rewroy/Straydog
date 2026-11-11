@@ -1490,7 +1490,15 @@ impl Model {
         self.refresh_kv_ahead();
         let mut planned = Vec::with_capacity(layers.len());
         for &layer in layers {
-            let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
+            let bank = |role: &str| -> Result<crate::banks::Bank> {
+                let name = format!("blk.{layer}.ffn_{role}_exps.weight");
+                let bank = self.weights.mapped_bank(&name)?;
+                // (the copy mode reads each bank's copy from its file)
+                Ok(match self.lock_mode {
+                    LockMode::Register => bank,
+                    LockMode::Copy => bank.reading(self.weights.bank_file(&name)?),
+                })
+            };
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
         let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
