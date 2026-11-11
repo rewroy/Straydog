@@ -233,6 +233,9 @@ unsafe extern "C" {
     pub fn sd_host_state_supported(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_kv_format(handle: *mut ::std::os::raw::c_void, row: u32) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_kv_stage(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,

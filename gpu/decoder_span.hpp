@@ -74,7 +74,7 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
             if (found==d.allocations.end() || found->second<bytes)
                 throw std::runtime_error("invalid decoder layer allocation");
         };
-        allocation(states[0],context*1024/parts*sizeof(kv_t)); room(states[1],((context/4+1)*128+qsa_history*128)*4);
+        allocation(states[0],context*4/parts*d.kv_row); room(states[1],((context/4+1)*128+qsa_history*128)*4);
         room(states[2],256*(context/4+1)*4);
     }
     DecoderLayer plan{}; plan.index=layer; plan.context=context; plan.capacity=capacity; plan.moe=moe;

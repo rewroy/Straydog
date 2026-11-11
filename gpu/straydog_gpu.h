@@ -76,6 +76,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
 int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint64_t decoder_bytes, void** moe, void** decoder);
 int sd_kv_scratch(void* handle, void** scratch);
 int sd_host_state_supported(void* handle);
+int sd_kv_format(void* handle, uint32_t row);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
