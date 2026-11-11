@@ -743,6 +743,8 @@ pub struct Model {
     /// This request's passes by rows, and this process's memory as it began, for its log line.
     pass_counts: [u64; PARTIAL_ROWS],
     memory_before: Option<(u64, u64, u64)>,
+    /// The pages read from the drive for page faults when the request began ([`crate::host::fault_reads`]).
+    fault_reads_before: Option<crate::host::FaultReads>,
     /// The CPU engine's read-ahead hints (taken, left) when the request began.
     read_aheads_before: (u64, u64),
     /// The CPU engine's phase times when the request began ([`CpuExperts::phase_ns`]).
@@ -931,6 +933,7 @@ impl Model {
             assist_script: None,
             pass_counts: [0; PARTIAL_ROWS],
             memory_before: None,
+            fault_reads_before: None,
             read_aheads_before: (0, 0),
             cpu_phases_before: [0; 3],
             kv_capacity: context,
@@ -3802,6 +3805,10 @@ impl Model {
                 Some(chooser) if !probing && self.forced_rows.is_none() => chooser.plan(),
                 _ => width::Plan { drafts: self.drafts, probe: false },
             };
+            // (a pass of a probe at a width not in force: the request's decode rate is not the width's in force)
+            if plan.probe {
+                self.metric_count("drafts_probe_passes", 1);
+            }
             let limit = if probing { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
@@ -3970,6 +3977,7 @@ impl Model {
             self.hybrid_counts = self.group.info().unwrap_or_default();
             self.pass_counts = [0; PARTIAL_ROWS];
             self.memory_before = crate::host::memory_note();
+            self.fault_reads_before = crate::host::fault_reads();
             self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             self.cpu_phases_before = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
         }
@@ -3993,6 +4001,11 @@ impl Model {
             let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
+            // (the pages the drive gave back for faults while it ran, the working set's limit and the K/V's capacity: what the memory line
+            // needs to say why a request waited on the drive)
+            let read_back = crate::host::fault_reads().zip(self.fault_reads_before).map(|(now, before)| now.since(before));
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * KV_POSITION_BYTES;
             let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             // (the CPU's time a token by the engine's phases: where a faster kernel shows, or does not)
             let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
@@ -4016,6 +4029,9 @@ impl Model {
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
                 "page_faults": faults,
+                "fault_read_pages": read_back.map(|(pages, _)| pages), "fault_reads_system": read_back.map(|(_, system)| system),
+                "working_set_limit_gib": crate::host::working_set_limit_now().map(gib),
+                "kv_positions": self.kv_capacity, "kv_gib": gib(kv_bytes), "kv_host": self.host_kv,
                 "read_aheads": [taken - self.read_aheads_before.0, left - self.read_aheads_before.1],
                 "graphs": info["devices"][0]["cached_graphs"], "replays": info["devices"][0]["graph_replays"].as_u64().unwrap_or(0)
                     .saturating_sub(self.hybrid_counts["devices"][0]["graph_replays"].as_u64().unwrap_or(0)),

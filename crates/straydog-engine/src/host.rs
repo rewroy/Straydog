@@ -255,6 +255,56 @@ pub fn memory_note() -> Option<(u64, u64, u64)> {
     None
 }
 
+/// A count of the pages read from the drive for page faults: Windows counts every process's ([`PagingObserver`]'s count,
+/// SystemPerformanceInformation's PageReadCount, 32 bits that wrap), Linux this process's major faults (`/proc/self/stat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaultReads {
+    count: u64,
+    system: bool,
+}
+
+impl FaultReads {
+    /// The pages read back since `before` (a request's beginning), and whether they are every process's.
+    pub fn since(self, before: FaultReads) -> (u64, bool) {
+        let pages = if self.system { u64::from((self.count as u32).wrapping_sub(before.count as u32)) } else { self.count.saturating_sub(before.count) };
+        (pages, self.system)
+    }
+}
+
+/// The pages read from the drive for page faults so far ([`FaultReads`]); None where the system does not say.
+pub fn fault_reads() -> Option<FaultReads> {
+    #[cfg(windows)]
+    {
+        windows_page_reads(windows_available().0).ok().map(|count| FaultReads { count: u64::from(count), system: true })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // (past the command's closing parenthesis: majflt is field 12)
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        fields.get(12 - 3)?.parse::<u64>().ok().map(|count| FaultReads { count, system: false })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    None
+}
+
+/// The upper limit of this process's working set in force now ([`keep_resident`] sets it on Windows), None where none is.
+pub fn working_set_limit_now() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let (mut least, mut most, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: the pseudo handle of this process and places for the three values.
+        if unsafe { GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mut least, &mut most, &mut flags) } == 0 {
+            return None;
+        }
+        (flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE != 0).then_some(most as u64)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// Ask the system for the pages of these byte ranges (address, length) of a mapped file in as few large requests as the caller makes of them: Windows
 /// reads each range in one request of the I/O manager's (`PrefetchVirtualMemory`), Linux in the device's request size (`madvise(MADV_WILLNEED)` reads at
 /// most that much of its range, so a range goes in steps of 128 KiB). Only a hint on the mapping: nothing is locked, no commit is taken, and the pages
@@ -1126,5 +1176,22 @@ mod paging_watch_tests {
             assert_eq!(observer.sample(at + Duration::from_millis(tick * 250), Ok(10_000)), Some(true));
         }
         assert_eq!(observer.sample(at + Duration::from_millis(2250), Ok(10_000)), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod fault_read_tests {
+    use super::FaultReads;
+
+    /// Decides: a request's pages read back are the counter's difference: Windows's count of every process's is 32 bits and wraps, and
+    /// a wrap between a request's two readings is no huge read; Linux's is the process's own and never wraps.
+    #[test]
+    fn the_pages_read_back_are_the_counters_difference_across_a_wrap() {
+        let system = |count: u64| FaultReads { count, system: true };
+        assert_eq!(system(1_000_250).since(system(1_000_000)), (250, true));
+        assert_eq!(system(5).since(system(u64::from(u32::MAX) - 10)), (16, true));
+        let own = |count: u64| FaultReads { count, system: false };
+        assert_eq!(own(5_000_000_000).since(own(4_999_999_000)), (1000, false));
+        assert_eq!(own(3).since(own(7)), (0, false));
     }
 }
