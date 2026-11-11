@@ -22,10 +22,18 @@
 //! one ([`LockMode::Copy`]), with the same two steps and the same rule:
 //!
 //! 1. [`BankLocks::lock_next`] makes ONE page-locked copy of each of the layer's three banks ([`LayerCopy`]: portable, mapped host memory, so every
-//!    device reads the one copy), copies the bank's bytes from the mapping into it, and checks THE COPY against the file's tree
+//!    device reads the one copy), reads the bank's bytes into it from the model's FILE, and checks THE COPY against the file's tree
 //!    ([`verity::verify_copy_at`], at the bank's file offset, over the whole blocks around the bank, which the copy holds). A page-locked copy cannot
 //!    change after the check, which is what keeps the rule: the bytes the GPU and the CPU's experts read are the bytes that were checked, not the
 //!    mapping's, whose pages the system may read again from the drive. A copy that does not match is freed and ends the locking as `Unverified`.
+//!
+//!    The copy is read from the file and never from the mapping: a copy made from the mapping faults each of the layer's pages into this process's working
+//!    set, and the memory then holds the layer twice, in the working set and in the copy, which the runtime allocated outside it (28.2 GiB of copies on a
+//!    machine of 62 GiB: 37.5 to 42 GiB resident and 2.6 to 4.7 GiB available, against 23 to 27 GiB resident and 11.8 to 13.2 GiB available with the same
+//!    layers registered in place). The file is read as the row tables' rows are ([`crate::rows`]): whole blocks past the page cache straight into the copy
+//!    ([`crate::storage::direct`]), in smaller direct reads if the working-set quota refuses that (Windows' error 1453), and once through the page cache if
+//!    it refuses those too ([`read_in_ways`]). The mapping's pages of a copied layer are not read at all, so the plan has no read-ahead
+//!    ([`BankLocks::read_ahead`]) and a turn asks the system for no pages of the next layer.
 //! 2. [`Model::banks_locked`](crate::model::Model::banks_locked), under the model's lock, points the plans' host pointers at the copies
 //!    ([`Copies::take_over`], [`HostPointers`]): every reader of a bank's bytes goes through them (the slots' copies, the prompt's streaming, the CPU
 //!    experts' gather and routes, the assist's mapping). The model keeps the copies ([`Copies`]) until it gives the layer back or ends.
@@ -51,29 +59,39 @@
 //! reads the rest by faulting, one fault after another (Linux, a cold page cache: 28 to 31 tok/s with 218,547 page faults against 49.4 tok/s after
 //! the locking). [`BankLocks::read_ahead`] hands out the plan's banks as [`Piece`]s in the order the layers are locked, for a thread of the worker to ask the
 //! system for at a low priority ([`Piece::ask`], [`Piece::resident`]), a few hundred MB at a time, so that the locking and a request find them in memory.
+//! (A plan in the copy mode hands out none: its locks do not read the mapping.)
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::host::{Lowered, Priority};
+use crate::storage::{self, ALIGN};
 use crate::verity::{self, Verifier};
 
 /// One bank (a layer's gate, up or down experts) as a thread that does not hold the weights sees it: its file's mapping, its place in
-/// that, and the file's verity tree if it was opened.
+/// that, the file's verity tree if it was opened, and the file's handles if the bank is to be copied ([`Bank::reading`]).
 pub(crate) struct Bank {
     map: *const u8,
     map_len: usize,
     offset: u64,
     bytes: u64,
     verifier: Option<Arc<Verifier>>,
+    file: Option<Arc<BankFile>>,
 }
 
 impl Bank {
     /// A bank at `offset` of `bytes` in the mapping `map` of `map_len` bytes. The mapping must outlive every use of the bank
     /// ([`BankLocks::lock_next`]); the range lies within it ([`Weights::mapped_bank`](crate::weights::Weights::mapped_bank) checks).
     pub(crate) fn new(map: *const u8, map_len: usize, offset: u64, bytes: u64, verifier: Option<Arc<Verifier>>) -> Bank {
-        Bank { map, map_len, offset, bytes, verifier }
+        Bank { map, map_len, offset, bytes, verifier, file: None }
+    }
+
+    /// The bank with the handles of its file, which the copy mode reads its copy through ([`LayerCopy::make`]): the register mode needs none.
+    pub(crate) fn reading(mut self, file: Arc<BankFile>) -> Bank {
+        self.file = Some(file);
+        self
     }
 
     /// The bank's bytes.
@@ -96,6 +114,21 @@ impl Bank {
         // SAFETY: the caller's.
         let map = unsafe { std::slice::from_raw_parts(self.map, self.map_len) };
         verity::verify_mapped_at(map, verifier, self.offset, self.bytes, threads, priority).map(|()| true)
+    }
+}
+
+/// The handles a model file is read through to copy its banks, made once for the file and shared by every bank in it: one that reads past the page cache
+/// ([`storage::direct`], where the system gives one) and one that reads through it, for when the first is refused or the memory is not aligned for it.
+pub(crate) struct BankFile {
+    direct: Option<File>,
+    cached: File,
+}
+
+impl BankFile {
+    /// The handles of `file`: new ones on the same file ([`storage::direct`], [`storage::reader`]); the weights' own handle, which maps the file, stays what it was.
+    pub(crate) fn of(file: &File) -> Result<BankFile, String> {
+        let cached = storage::reader(file).map_err(|error| format!("cannot open the model file again to copy its banks: {error}"))?;
+        Ok(BankFile { direct: storage::direct(file), cached })
     }
 }
 
@@ -156,7 +189,8 @@ impl HostMemory for PinnedMemory {
 
 /// One bank's copy: an allocation of the whole blocks of the file around the bank, so that the copy can be checked against the file's tree as it is.
 struct Part {
-    /// The allocation (null until made) and its bytes.
+    /// The allocation (null until made) and the bytes of the file's blocks it holds, which the check sees: the allocation is these rounded up to whole blocks,
+    /// since a direct read ends on a block boundary.
     base: *mut u8,
     bytes: usize,
     /// The file offset of the allocation's first byte (a block boundary), the bank's first byte's place in it, and the bank's bytes.
@@ -196,23 +230,27 @@ impl Drop for CopyBlock {
 pub struct LayerCopy(Arc<CopyBlock>);
 
 impl LayerCopy {
-    /// Allocate the copies of `banks` and copy the bytes of the mapping into them, with the whole blocks around each bank. Nothing is checked yet
-    /// ([`LayerCopy::verify`]). An allocation that is refused frees those made.
-    ///
-    /// # Safety
-    /// The mappings of `banks` must be alive.
-    unsafe fn make(memory: &Arc<dyn HostMemory>, layer: usize, banks: &[Bank; 3]) -> Result<LayerCopy, String> {
-        let mut block = CopyBlock { memory: memory.clone(), layer, parts: [Part::NONE, Part::NONE, Part::NONE] };
+    /// Allocate the copies of `banks` and read the bytes of their file into them, with the whole blocks around each bank ([`read_copy`]): from the file, not
+    /// from the mapping, whose pages would join the working set (the module's docs). Nothing is checked yet ([`LayerCopy::verify`]). A bank that has no file
+    /// to read ends it before anything is allocated; an allocation that is refused, or a read that fails, frees those made.
+    fn make(memory: &Arc<dyn HostMemory>, layer: usize, banks: &[Bank; 3]) -> Result<LayerCopy, String> {
+        let mut files = Vec::with_capacity(3);
         for (role, bank) in banks.iter().enumerate() {
+            files.push(bank.file.as_deref().ok_or_else(|| format!("a bank with no file to copy from (role {role})"))?);
+        }
+        let mut block = CopyBlock { memory: memory.clone(), layer, parts: [Part::NONE, Part::NONE, Part::NONE] };
+        for (role, (bank, file)) in banks.iter().zip(files).enumerate() {
             if bank.bytes == 0 {
                 return Err(format!("a bank of no bytes (role {role})"));
             }
             let (start, end) = verity::covering_blocks(bank.map_len as u64, bank.offset, bank.bytes).ok_or("a bank past its file's end")?;
-            let base = memory.allocate(end - start)?;
-            block.parts[role] = Part { base, bytes: (end - start) as usize, start, at: (bank.offset - start) as usize, len: bank.bytes as usize };
-            // SAFETY: the mapping is alive and holds `start..end` of its file (`covering_blocks` kept it within the file); `base` is a new allocation of
-            // `end - start` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(bank.map.add(start as usize), base, (end - start) as usize) };
+            let bytes = (end - start) as usize;
+            let capacity = bytes.next_multiple_of(ALIGN);
+            let base = memory.allocate(capacity as u64)?;
+            block.parts[role] = Part { base, bytes, start, at: (bank.offset - start) as usize, len: bank.bytes as usize };
+            // SAFETY: `base` is a new allocation of `capacity` bytes, which nothing else reads or writes before the copy is made.
+            let target = unsafe { std::slice::from_raw_parts_mut(base, capacity) };
+            read_copy(file, start, target, bytes).map_err(|error| format!("reading layer {layer}'s bank {role} from its file: {error}"))?;
         }
         Ok(LayerCopy(Arc::new(block)))
     }
@@ -274,6 +312,53 @@ impl Banks {
         let start = mapping.map(<[u8]>::as_ptr);
         Banks { start, base: start }
     }
+}
+
+/// Read `bytes` bytes from `offset` of the bank's file (a block boundary) into `target`, the copy's allocation: directly where the file has a direct handle and
+/// the allocation is aligned for it, else through the page cache ([`read_in_ways`]).
+fn read_copy(file: &BankFile, offset: u64, target: &mut [u8], bytes: usize) -> std::io::Result<()> {
+    let direct = file.direct.as_ref().filter(|_| offset.is_multiple_of(ALIGN as u64) && (target.as_ptr() as usize).is_multiple_of(ALIGN));
+    read_in_ways(direct.is_some(), offset, target, bytes, storage::working_set_quota, &mut |way, at, span, len| match (way, direct) {
+        (Way::Direct, Some(direct)) => storage::read_direct_into(direct, at, span, len),
+        _ => storage::read_at(&file.cached, at, &mut span[..len]),
+    })
+}
+
+/// How a read of a copy's bytes goes: past the page cache, or through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Way {
+    Direct,
+    Cached,
+}
+
+/// Read `bytes` bytes at `offset` into `target` with `read` (given the way, the file's offset, the part of `target` from there on, and the bytes to read), as
+/// the row tables' reads go ([`crate::rows`]): the whole range direct (`direct`: whether that is possible), then the rest of it in direct pieces of a quarter of
+/// the range if the whole was refused, then what is left once through the page cache if a piece was refused. Only the working-set quota's refusal (`refused`)
+/// is a reason to try the next way: any other error ends the read. Never from the mapping, whose pages the read would bring into the working set.
+fn read_in_ways(direct: bool, offset: u64, target: &mut [u8], bytes: usize, refused: fn(&std::io::Error) -> bool,
+                read: &mut dyn FnMut(Way, u64, &mut [u8], usize) -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut done = 0;
+    if direct {
+        match read(Way::Direct, offset, target, bytes) {
+            Ok(()) => return Ok(()),
+            Err(error) if refused(&error) => {}
+            Err(error) => return Err(error),
+        }
+        // (whole blocks; a piece that is no block, or no smaller than the range, is no smaller way)
+        let piece = (bytes / 4).next_multiple_of(ALIGN);
+        while piece > 0 && piece < bytes && done < bytes {
+            let step = piece.min(bytes - done);
+            match read(Way::Direct, offset + done as u64, &mut target[done..], step) {
+                Ok(()) => done += step,
+                Err(error) if refused(&error) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if done == bytes {
+            return Ok(());
+        }
+    }
+    read(Way::Cached, offset + done as u64, &mut target[done..], bytes - done)
 }
 
 /// A move of plans that failed ([`HostPointers::repoint`]).
@@ -470,7 +555,8 @@ pub enum Stop {
     /// The runtime would not page-lock the layer's banks (the commit or the memory is short): the layers that are locked stay so, the rest are
     /// left to the page cache.
     Refused { layer: usize, error: String },
-    /// The runtime would not give page-locked memory for the copies of the layer's banks (the commit or the memory is short).
+    /// The runtime would not give page-locked memory for the copies of the layer's banks (the commit or the memory is short), or the banks' file could not be
+    /// read into it.
     NotCopied { layer: usize, error: String },
     /// The layer's banks, page-locked, do not match the file's tree: the model's bytes are not those that were pinned.
     Unverified { layer: usize, error: String },
@@ -581,9 +667,10 @@ impl BankLocks {
 
 
     /// The plan's banks as pieces for a read-ahead, in the order the layers are taken ([`pieces_of`], [`AHEAD_PIECE`]); every byte of the banks still to lock
-    /// and no other. Addresses in the weights' mappings, which whoever asks the system for them keeps alive.
+    /// and no other. Addresses in the weights' mappings, which whoever asks the system for them keeps alive. None in the copy mode: its turns read the
+    /// file, not the mapping, so a read-ahead of the mapping's pages would read them for nothing and into the working set.
     pub fn read_ahead(&self) -> Vec<Piece> {
-        if self.halted() {
+        if self.halted() || self.copies.is_some() {
             return Vec::new();
         }
         let layers: Vec<(usize, [(usize, u64); 3])> = self.layers.iter()
@@ -628,14 +715,14 @@ impl BankLocks {
         let (layer, banks) = self.layers.pop_front()?;
         let layer_bytes: u64 = banks.iter().map(|bank| bank.bytes).sum();
         let _lowered = turn_lowered(priority);
-        if let Some((_, next)) = self.layers.front() {
+        // (the copy mode reads the file: the next layer's pages in the mapping would be read for nothing, into the working set)
+        if let Some((_, next)) = self.layers.front().filter(|_| self.copies.is_none()) {
             // SAFETY: the caller's.
             let ranges: Vec<(usize, usize)> = next.iter().map(|bank| unsafe { bank.range() }).map(|range| (range.as_ptr() as usize, range.len())).collect();
             let _ = crate::host::prefetch(&ranges);
         }
         let turn = match self.copies.clone() {
-            // SAFETY: the caller's.
-            Some(memory) => unsafe { Self::copy_turn(&memory, layer, banks, priority) },
+            Some(memory) => Self::copy_turn(&memory, layer, banks, priority),
             // SAFETY: the caller's.
             None => unsafe { self.register_turn(layer, banks, priority) },
         };
@@ -673,15 +760,11 @@ impl BankLocks {
         Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar) })
     }
 
-    /// The copy mode's turn: copy the layer's banks into page-locked memory, then check the copies against the file's tree. The mapping is registered
-    /// nowhere, and the copies are read by no one until the model takes them. A copy that does not match is freed as it drops.
-    ///
-    /// # Safety
-    /// As [`BankLocks::lock_next`].
-    unsafe fn copy_turn(memory: &Arc<dyn HostMemory>, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
-        // SAFETY: the caller's.
-        let copy = unsafe { LayerCopy::make(memory, layer, &banks) }.map_err(|error| Stop::NotCopied { layer, error })?;
-        // Copied, the bytes are the copy's own and cannot change: with the shards' verity trees, check THEM, not the mapping they came from.
+    /// The copy mode's turn: read the layer's banks from their file into page-locked memory, then check the copies against the file's tree. The mapping is
+    /// registered nowhere and not read, and the copies are read by no one until the model takes them. A copy that does not match is freed as it drops.
+    fn copy_turn(memory: &Arc<dyn HostMemory>, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
+        let copy = LayerCopy::make(memory, layer, &banks).map_err(|error| Stop::NotCopied { layer, error })?;
+        // Copied, the bytes are the copy's own and cannot change: with the shards' verity trees, check THEM, not the file they came from.
         if let Err(error) = copy.verify(&banks, priority) {
             return Err(Stop::Unverified { layer, error });
         }
@@ -1133,6 +1216,8 @@ mod tests {
         tree: std::path::PathBuf,
         map: Option<memmap2::Mmap>,
         verifier: Option<Arc<Verifier>>,
+        /// The handles a copy is read through.
+        file: Option<Arc<BankFile>>,
     }
 
     const SIZE: usize = (6 << 20) + 123;
@@ -1154,16 +1239,19 @@ mod tests {
             let file = std::fs::File::open(&path).unwrap();
             // SAFETY: a file of this test's own, which nothing changes while it is mapped.
             let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-            Fixture { path, tree, map: Some(map), verifier: Some(verifier) }
+            let handles = Arc::new(BankFile::of(&file).unwrap());
+            Fixture { path, tree, map: Some(map), verifier: Some(verifier), file: Some(handles) }
         }
 
         fn map(&self) -> &memmap2::Mmap {
             self.map.as_ref().unwrap()
         }
 
-        /// The three banks of [`SPANS`], with the file's tree or without.
+        /// The three banks of [`SPANS`], with the file's tree or without, and the file to copy them from.
         fn banks(&self, tree: bool) -> [Bank; 3] {
-            SPANS.map(|(offset, bytes)| Bank::new(self.map().as_ptr(), self.map().len(), offset, bytes, tree.then(|| self.verifier.clone().unwrap())))
+            SPANS.map(|(offset, bytes)| {
+                Bank::new(self.map().as_ptr(), self.map().len(), offset, bytes, tree.then(|| self.verifier.clone().unwrap())).reading(self.file.clone().unwrap())
+            })
         }
 
         /// The three banks as the mapping holds them.
@@ -1175,6 +1263,7 @@ mod tests {
         fn finish(mut self) {
             self.map.take();
             self.verifier.take();
+            self.file.take();
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_file(&self.tree);
         }
@@ -1193,6 +1282,8 @@ mod tests {
 
     impl HostMemory for HeapMemory {
         fn allocate(&self, bytes: u64) -> Result<*mut u8, String> {
+            // (a direct read ends on a block boundary, so a copy's allocation reaches one)
+            assert!(bytes.is_multiple_of(ALIGN as u64), "a copy's allocation of {bytes} bytes is not whole blocks");
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             let from = self.refuse_from.load(Ordering::SeqCst);
             if from != 0 && attempt >= from {
@@ -1316,8 +1407,8 @@ mod tests {
         }
     }
 
-    /// Decides: a layer's turn in the copy mode makes one copy of each bank, equal to the mapping's bytes and apart from them, checks the copies against
-    /// the file's tree, registers the mapping nowhere, and frees the copies with their last holder.
+    /// Decides: a layer's turn in the copy mode makes one copy of each bank, equal to the file's bytes (the mapping's) and apart from them, checks the copies
+    /// against the file's tree, registers the mapping nowhere, and frees the copies with their last holder.
     #[test]
     fn a_copy_turn_copies_the_banks_whole_and_checks_the_copies() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1357,10 +1448,10 @@ mod tests {
         fixture.finish();
     }
 
-    /// Decides: a mapping whose bytes do not match the file's tree, anywhere in a bank, is `Unverified` once copied, frees every copy the turn made, and is
+    /// Decides: a file whose bytes do not match its tree, anywhere in a bank, is `Unverified` once copied, frees every copy the turn made, and is
     /// not a refusal that the model remembers; the same bytes untampered pass.
     #[test]
-    fn a_mapping_that_does_not_match_the_tree_is_unverified_and_its_copies_are_freed() {
+    fn a_file_that_does_not_match_the_tree_is_unverified_and_its_copies_are_freed() {
         for (label, tamper) in [("a", 1500), ("b", 2_500_000), ("c", SIZE - 10), ("d", SPANS[2].0 as usize)] {
             let fixture = Fixture::new(&format!("tampered-{label}"), Some(tamper));
             let memory = Arc::new(HeapMemory::default());
@@ -1384,8 +1475,7 @@ mod tests {
         let fixture = Fixture::new("changed", None);
         let memory: Arc<dyn HostMemory> = Arc::new(HeapMemory::default());
         let banks = fixture.banks(true);
-        // SAFETY: the fixture keeps the mapping alive.
-        let copy = unsafe { LayerCopy::make(&memory, 7, &banks) }.unwrap();
+        let copy = LayerCopy::make(&memory, 7, &banks).unwrap();
         assert_eq!(copy.verify(&banks, Priority::Normal), Ok(true));
         for role in 0..3 {
             let part = &copy.0.parts[role];
@@ -1619,6 +1709,170 @@ mod tests {
         drop(copies);
         assert_eq!(memory.live(), 0);
         fixture.finish();
+    }
+
+    /// Decides: a copy is read from the file and never from the mapping: banks whose mapping holds other bytes than the file still make copies of the file's
+    /// bytes, which pass the check against the file's tree, and a plan in the copy mode has no read-ahead of the mapping's pages.
+    #[test]
+    fn a_copy_is_read_from_the_file_not_from_the_mapping() {
+        let fixture = Fixture::new("file", None);
+        // a mapping of the same length that is not the file's bytes
+        let other = vec![0xEEu8; fixture.map().len()];
+        let file = fixture.file.clone().unwrap();
+        let banks = SPANS.map(|(offset, bytes)| Bank::new(other.as_ptr(), other.len(), offset, bytes, fixture.verifier.clone()).reading(file.clone()));
+        let memory = Arc::new(HeapMemory::default());
+        let mut locks = BankLocks::new(vec![(7, banks)], 0, 1 << 30).copying(memory.clone());
+        assert!(locks.read_ahead().is_empty(), "the mapping's pages are not read ahead where the copy does not read them");
+        // SAFETY: the fixture keeps the file alive, and the mapping is not read.
+        let mut locked = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        let copy = locked.take_copy().expect("the copy");
+        for (role, mapped) in fixture.mapping().iter().enumerate() {
+            assert_eq!(copy.bank(role), *mapped, "bank {role} is the file's bytes");
+        }
+        drop((copy, locked, locks));
+        assert_eq!(memory.live(), 0);
+        fixture.finish();
+    }
+
+    /// Decides: a plan in the register mode reads ahead the pages of its banks as it did, and one in the copy mode none of them.
+    #[test]
+    fn a_plan_reads_the_mappings_pages_ahead_in_the_register_mode_only() {
+        let fixture = Fixture::new("ahead", None);
+        let layers = || vec![(7, fixture.banks(true)), (6, fixture.banks(true))];
+        let registering = BankLocks::new(layers(), 0, 1 << 30);
+        assert_eq!(registering.read_ahead().len(), 6);
+        let copying = BankLocks::new(layers(), 0, 1 << 30).copying(Arc::new(HeapMemory::default()));
+        assert!(copying.read_ahead().is_empty());
+        assert_eq!(copying.remaining(), 2, "its layers are still to lock");
+        drop((registering, copying));
+        fixture.finish();
+    }
+
+    /// Decides: banks that have no file to read are refused as a copy that cannot be made, before anything is allocated: a copy is never made from the mapping.
+    #[test]
+    fn a_copy_turn_of_banks_without_their_file_is_refused_and_allocates_nothing() {
+        let fixture = Fixture::new("nofile", None);
+        let banks = SPANS.map(|(offset, bytes)| Bank::new(fixture.map().as_ptr(), fixture.map().len(), offset, bytes, fixture.verifier.clone()));
+        let memory = Arc::new(HeapMemory::default());
+        let mut locks = BankLocks::new(vec![(7, banks)], 0, 1 << 30).copying(memory.clone());
+        // SAFETY: the fixture keeps the mapping alive.
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("refused");
+        assert!(matches!(&stop, Stop::NotCopied { layer: 7, error } if error.contains("no file to copy from")), "{stop:?}");
+        assert_eq!((memory.allocated(), memory.live()), (0, 0));
+        drop(locks);
+        fixture.finish();
+    }
+
+    /// Host memory whose allocations begin in the middle of a block, which a direct read cannot fill.
+    struct Misaligned {
+        heap: HeapMemory,
+        /// Each allocation's address, and the heap's it lies in.
+        starts: Mutex<BTreeMap<usize, usize>>,
+    }
+
+    impl HostMemory for Misaligned {
+        fn allocate(&self, bytes: u64) -> Result<*mut u8, String> {
+            let base = self.heap.allocate(bytes + ALIGN as u64)?;
+            // SAFETY: inside the allocation, which is a block longer than asked.
+            let start = unsafe { base.add(512) };
+            self.starts.lock().unwrap().insert(start as usize, base as usize);
+            Ok(start)
+        }
+
+        unsafe fn free(&self, pointer: *mut u8) {
+            let base = self.starts.lock().unwrap().remove(&(pointer as usize)).expect("freed once");
+            // SAFETY: the heap's allocation that `pointer` lies in.
+            unsafe { self.heap.free(base as *mut u8) };
+        }
+    }
+
+    /// Decides: memory that is not aligned for a direct read is filled through the page cache, with the same bytes and the same check.
+    #[test]
+    fn memory_not_aligned_for_a_direct_read_is_filled_through_the_page_cache() {
+        let fixture = Fixture::new("misaligned", None);
+        let memory = Arc::new(Misaligned { heap: HeapMemory::default(), starts: Mutex::default() });
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).copying(memory.clone());
+        // SAFETY: the fixture keeps the mapping alive.
+        let mut locked = unsafe { locks.lock_next() }.expect("a layer").unwrap_or_else(|stop| panic!("{}", stop.message()));
+        let copy = locked.take_copy().expect("the copy");
+        for (role, mapped) in fixture.mapping().iter().enumerate() {
+            assert_eq!(copy.bank(role), *mapped, "bank {role}");
+            assert!((copy.0.parts[role].base as usize) % ALIGN != 0, "the allocation is not aligned");
+        }
+        drop((copy, locked, locks));
+        assert_eq!(memory.heap.live(), 0);
+        fixture.finish();
+    }
+
+    /// Decides: a copy's read goes the way a row's does: the whole range direct, then the range in direct pieces of a quarter if the working-set quota refused
+    /// that, then what is left through the page cache if it refused a piece; a read that is not a quota refusal ends it at once, whichever way it came on.
+    #[test]
+    fn a_copys_read_tries_the_whole_range_then_pieces_then_the_page_cache_on_a_quota_refusal_alone() {
+        const AT: u64 = ALIGN as u64;
+        let refused = |error: &std::io::Error| error.raw_os_error() == Some(1453);
+        let quota = || std::io::Error::from_raw_os_error(1453);
+        let bytes = 8 * ALIGN + 100;
+        let source: Vec<u8> = (0..bytes).map(|at| (at * 7 % 251) as u8).collect();
+        // `fail` is given a call's number, its way, its offset and its bytes, and says what error the call returns, if any
+        let run = |direct: bool, bytes: usize, fail: &dyn Fn(usize, Way, u64, usize) -> Option<std::io::Error>| {
+            let mut target = vec![0u8; bytes.next_multiple_of(ALIGN)];
+            let mut calls: Vec<(Way, u64, usize)> = Vec::new();
+            let result = read_in_ways(direct, AT, &mut target, bytes, refused, &mut |way, at, span, len| {
+                let number = calls.len();
+                calls.push((way, at, len));
+                if let Some(error) = fail(number, way, at, len) {
+                    return Err(error);
+                }
+                let from = (at - AT) as usize;
+                span[..len].copy_from_slice(&source[from..from + len]);
+                Ok(())
+            });
+            target.truncate(bytes);
+            (result, calls, target)
+        };
+        // (a piece is a quarter of the range, up to whole blocks: three blocks, and the last piece what is left)
+        let piece = 3 * ALIGN;
+        let pieces = [(Way::Direct, AT, piece), (Way::Direct, AT + piece as u64, piece), (Way::Direct, AT + 2 * piece as u64, bytes - 2 * piece)];
+        // the whole range, direct
+        let (result, calls, target) = run(true, bytes, &|_, _, _, _| None);
+        assert!(result.is_ok());
+        assert_eq!(calls, vec![(Way::Direct, AT, bytes)]);
+        assert_eq!(target, source);
+        // refused: the pieces
+        let (result, calls, target) = run(true, bytes, &|number, _, _, _| (number == 0).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls, [vec![(Way::Direct, AT, bytes)], pieces.to_vec()].concat());
+        assert_eq!(target, source);
+        // a piece refused: what is left once through the page cache, from where the pieces got to
+        let (result, calls, target) = run(true, bytes, &|number, _, _, _| (number == 0 || number == 2).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls, vec![(Way::Direct, AT, bytes), pieces[0], pieces[1], (Way::Cached, AT + piece as u64, bytes - piece)]);
+        assert_eq!(target, source);
+        // the first piece refused: all of it through the page cache
+        let (result, calls, target) = run(true, bytes, &|number, _, _, _| (number <= 1).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls, vec![(Way::Direct, AT, bytes), pieces[0], (Way::Cached, AT, bytes)]);
+        assert_eq!(target, source);
+        // a range that is not more than a block has no smaller way
+        let (result, calls, target) = run(true, 100, &|number, _, _, _| (number == 0).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls, vec![(Way::Direct, AT, 100), (Way::Cached, AT, 100)]);
+        assert_eq!(target, source[..100]);
+        // no direct handle, or memory not aligned for it: the page cache alone
+        let (result, calls, target) = run(false, bytes, &|_, _, _, _| None);
+        assert!(result.is_ok());
+        assert_eq!(calls, vec![(Way::Cached, AT, bytes)]);
+        assert_eq!(target, source);
+        // any other error ends it where it is, and none is tried again through the page cache
+        let other = || std::io::Error::from_raw_os_error(5);
+        let (result, calls, _) = run(true, bytes, &|_, _, _, _| Some(other()));
+        assert_eq!((result.unwrap_err().raw_os_error(), calls.len()), (Some(5), 1));
+        let (result, calls, _) = run(true, bytes, &|number, _, _, _| Some(if number == 0 { quota() } else { other() }));
+        assert_eq!((result.unwrap_err().raw_os_error(), calls.len()), (Some(5), 2), "an error of a piece");
+        // the page cache's own refusal is the last word
+        let (result, calls, _) = run(true, bytes, &|number, way, _, _| (number <= 1 || way == Way::Cached).then(quota));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(1453));
+        assert_eq!(calls.last().map(|call| call.0), Some(Way::Cached));
     }
 
     /// Decides: a refusal that came with nothing locked blocks the next plans until the memory available has grown by the refused layer's banks since it

@@ -62,11 +62,6 @@ const OVERHEAD: u64 = 24;
 /// a whole table of hundreds of millions of rows is zeroed memory that costs nothing until used.
 const EMPTY: u32 = 0;
 
-/// `ERROR_WORKING_SET_QUOTA` (1453). Elsewhere this is not a row-read failure.
-fn working_set_quota(error: &std::io::Error) -> bool {
-    cfg!(windows) && error.raw_os_error() == Some(1453)
-}
-
 /// Checks a read of the table's file at `offset` (whole aligned blocks, zero past the file's
 /// end) before its rows are used.
 pub type Verifier = Arc<dyn Fn(u64, &[u8]) -> Result<(), String> + Send + Sync>;
@@ -224,7 +219,7 @@ impl Table {
         }
         let length = (end.min(self.size) - start) as usize;
         self.fill(start, buffer, length).map_err(|exc| {
-            if working_set_quota(&exc) { format!("{exc}; {ROW_READ_REFUSED}") } else { exc.to_string() }
+            if storage::working_set_quota(&exc) { format!("{exc}; {ROW_READ_REFUSED}") } else { exc.to_string() }
         })?;
         if let Some(verify) = &self.verifier {
             // The last block past the file's end is zero, as its tree hashed it.
@@ -241,12 +236,12 @@ impl Table {
     fn fill(&self, start: u64, buffer: &mut Buffer, length: usize) -> std::io::Result<()> {
         match self.read_span(start, buffer, 0, length) {
             Ok(()) => return Ok(()),
-            Err(exc) if working_set_quota(&exc) => {}
+            Err(exc) if storage::working_set_quota(&exc) => {}
             Err(exc) => return Err(exc),
         }
         match self.read_smaller(start, buffer, length) {
             Ok(()) => return Ok(()),
-            Err(exc) if working_set_quota(&exc) => {}
+            Err(exc) if storage::working_set_quota(&exc) => {}
             Err(exc) => return Err(exc),
         }
         storage::read_into(&self.file, start, buffer, 0, length, false)

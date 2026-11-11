@@ -225,19 +225,37 @@ pub fn read_into(file: &File, offset: u64, buffer: &mut Buffer, at: usize, len: 
     if !direct {
         return read_at(file, offset, &mut buffer.as_mut_slice()[at..at + len]);
     }
-    if (at + len).next_multiple_of(ALIGN) > buffer.capacity() || !offset.is_multiple_of(ALIGN as u64)
-        || !at.is_multiple_of(ALIGN)
-    {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "misaligned Straydog direct read"));
+    if (at + len).next_multiple_of(ALIGN) > buffer.capacity() || !at.is_multiple_of(ALIGN) {
+        return Err(misaligned());
+    }
+    // SAFETY: [at, capacity) lies within the buffer's allocation, which it owns and which is borrowed mutably here (checked above).
+    let target = unsafe { std::slice::from_raw_parts_mut(buffer.pointer.as_ptr().add(at), buffer.capacity() - at) };
+    read_direct_into(file, offset, target, len)
+}
+
+/// Read `len` bytes from `offset` of `file`, a direct handle ([`direct`]), into the start of `target`, memory that is not a [`Buffer`] (page-locked host
+/// memory, say). `offset` and the address of `target` must be aligned, and `target` must reach the block boundary at or past `len`: the reads end there,
+/// which may run past the file's end (they stop there) and past `len` into `target`'s bytes beyond it.
+pub fn read_direct_into(file: &File, offset: u64, target: &mut [u8], len: usize) -> std::io::Result<()> {
+    if len.next_multiple_of(ALIGN) > target.len() || !offset.is_multiple_of(ALIGN as u64) || !(target.as_ptr() as usize).is_multiple_of(ALIGN) {
+        return Err(misaligned());
     }
     let mut done = 0;
     while done < len {
         let want = (len - done).next_multiple_of(ALIGN);
-        // SAFETY: [at + done, at + done + want) lies within the buffer's capacity (checked above).
-        let target = unsafe { std::slice::from_raw_parts_mut(buffer.pointer.as_ptr().add(at + done), want) };
-        done += read_some(file, target, offset + done as u64)?.min(len - done);
+        done += read_some(file, &mut target[done..done + want], offset + done as u64)?.min(len - done);
     }
     Ok(())
+}
+
+fn misaligned() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "misaligned Straydog direct read")
+}
+
+/// Whether `error` is the refusal of a read by the working-set quota (`ERROR_WORKING_SET_QUOTA`, 1453): a process whose working set has a hard maximum
+/// is refused an unbuffered read that its pages would not fit under. Only Windows says so; elsewhere nothing is a quota refusal.
+pub fn working_set_quota(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error() == Some(1453)
 }
 
 /// One read: at least a byte, or an error at the end of the file.
@@ -530,6 +548,29 @@ mod tests {
             let error = read_into(&direct, offset, &mut block, at, ALIGN, true).unwrap_err();
             assert_eq!(error.to_string(), "misaligned Straydog direct read");
         }
+    }
+
+    /// Decides: a direct read into a slice that is not a `Buffer` (page-locked host memory) is refused unless its address, its offset and its room are
+    /// aligned, whatever the handle, and where the system gives a direct handle it reads from a block boundary through the end of the file, which cuts the
+    /// last block short.
+    #[test]
+    fn a_direct_read_into_a_slice_wants_aligned_room_and_stops_at_the_end_of_the_file() {
+        let temp = Temp::new(3, 100);
+        let mut buffer = Buffer::new(4 * ALIGN);
+        // (address, offset, and room for the blocks the read ends on)
+        for (offset, at, len) in [(0u64, 1usize, ALIGN), (1, 0, ALIGN), (0, 0, 4 * ALIGN + 1)] {
+            let error = read_direct_into(&temp.file, offset, &mut buffer.as_mut_slice()[at..], len).unwrap_err();
+            assert_eq!((error.kind(), error.to_string().as_str()), (std::io::ErrorKind::InvalidInput, "misaligned Straydog direct read"), "{offset} {at} {len}");
+        }
+        let Some(direct) = direct(&temp.file) else { return };
+        let len = 3 * ALIGN + 100;
+        read_direct_into(&direct, 0, buffer.as_mut_slice(), len).unwrap();
+        assert_bytes(&buffer.as_slice()[..len], 0);
+        // from a later block, the room being the blocks the read ends on
+        buffer.as_mut_slice().fill(0);
+        read_direct_into(&direct, ALIGN as u64, buffer.as_mut_slice(), len - ALIGN).unwrap();
+        assert_bytes(&buffer.as_slice()[..len - ALIGN], ALIGN as u64);
+        assert!(read_direct_into(&direct, 4 * ALIGN as u64, buffer.as_mut_slice(), ALIGN).is_err(), "past the end of the file");
     }
 
     /// Offsets past 4 GiB take their high half through `OVERLAPPED.OffsetHigh`: a sparse file with one block there.
