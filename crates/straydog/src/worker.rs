@@ -76,6 +76,9 @@ pub struct WorkerArgs {
     /// Host memory available to the worker (its cgroup limits are invisible inside isolation).
     #[arg(long, default_value_t = 0)]
     pub host_memory_bytes: u64,
+    /// Parent cgroup counters, exposed read-only for a live prefetch budget inside isolation.
+    #[arg(long = "host-memory-limit-file", hide = true)]
+    pub host_memory_limit_files: Vec<PathBuf>,
     /// Straydog's data directory: the shards' verity trees (read only).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
@@ -589,8 +592,28 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
 /// Run two prompts and a few tokens once, so that no request pays for loading the GPU code it
 /// runs (1.5 s more for the first 4,096 tokens on two R9700s); the model then starts empty. It runs behind "ready" ([`behind`]), so a request can
 /// come in the middle of it: `cancelled` says so, and it stops at the next pass, resets the model as it does at its end, and a request's first
-/// pass then loads what it needs, as after any reset. Whether it ran to its end.
-fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, String> {
+/// pass then loads what it needs, as after any reset. A prompt's pass reads the experts a cold page cache has not got from the drive, which took
+/// 10 s of a 256-token prompt, so the model looks at `arrived` between the layers of the pass ([`Model::set_warm_stop`]) and ends it there. Whether it
+/// ran to its end.
+fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool, arrived: &'static AtomicBool) -> Result<bool, String> {
+    // (set for these passes alone, and gone before the reset and on every way out: a request's own prefill is read between its batches)
+    model.set_warm_stop(Some(arrived));
+    let passes = warm_up_passes(model, cancelled);
+    model.set_warm_stop(None);
+    let complete = match passes {
+        Ok(complete) => complete,
+        // (a pass stopped half way: what it left is what the reset below takes back)
+        Err(error) if straydog_engine::model::is_warm_stop(&error) => false,
+        Err(error) => return Err(error),
+    };
+    model.reset()?;
+    // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
+    model.clear_route_counts()?;
+    Ok(complete)
+}
+
+/// The passes of [`warm_up`]: whether they ran to their ends.
+fn warm_up_passes(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, String> {
     let longest = model.prefill_batch_size.min(model.context.saturating_sub(4));
     let mut complete = true;
     for length in [longest, longest.min(300)] {
@@ -608,9 +631,6 @@ fn warm_up(model: &mut Model, cancelled: &dyn Fn() -> bool) -> Result<bool, Stri
             }
         }
     }
-    model.reset()?;
-    // (the routes of these passes say nothing of a later run's: the warm-up state counts from the first request)
-    model.clear_route_counts()?;
     Ok(complete)
 }
 
@@ -745,6 +765,7 @@ pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
+    straydog_engine::host::set_prefetch_memory_limits(args.host_memory_limit_files.clone());
     // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
     if !straydog_engine::host::full_speed() {
         eprintln!("WARN Straydog could not turn off the system's power throttling of its worker");
@@ -770,6 +791,25 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     if id.is_on_demand() {
         return crate::worker_on_demand::main(&args, &plan, output, &|stage, done, total| loading.report(stage, done, total));
     }
+    // The first Qwen prefill GEMM otherwise loads the BLAS code while the ready-time warm-up holds
+    // the engine. Prime each device beside the model's reading and placement, when FP16 GEMM is used.
+    #[cfg(any(feature = "cuda", feature = "hip"))]
+    let gemm_primes = if args.gemm == "fp16" && plan.batch as u64 >= args.gemm_min_batch {
+        args.devices.iter().copied().filter_map(|ordinal| {
+            let tokens = plan.batch;
+            match std::thread::Builder::new().name(format!("straydog-gemm-prime-{ordinal}")).spawn(move || {
+                let started = Instant::now();
+                let result = straydog_gpu::prime_qwen_prefill_gemm(ordinal, tokens);
+                (started.elapsed(), result)
+            }) {
+                Ok(handle) => Some((ordinal, handle)),
+                Err(error) => {
+                    eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming could not start: {error}");
+                    None
+                }
+            }
+        }).collect::<Vec<_>>()
+    } else { Vec::new() };
     let split = plan.split;
     let drafter = args.drafter.as_deref().filter(|_| args.speculative > 0);
     let report = |stage: &str, done, total| loading.report(stage, done, total);
@@ -815,6 +855,14 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         let model = Model::new(weights, group, &settings, &report);
         (text.join().unwrap(), model)
     });
+    #[cfg(any(feature = "cuda", feature = "hip"))]
+    for (ordinal, gemm_prime) in gemm_primes {
+        match gemm_prime.join() {
+            Ok((elapsed, Ok(()))) => eprintln!("Straydog warm code: GPU {ordinal} prefill GEMM primed in {:.1} s", elapsed.as_secs_f64()),
+            Ok((_, Err(error))) => eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming failed: {error}"),
+            Err(_) => eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming panicked"),
+        }
+    }
     let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
     let (text, model) = (Arc::new(text?), model?);
     // The GPU code's warm-up and the page-locking of the banks come behind "ready" ([`behind`]): "plans" and "warm" are what they cost before it.
@@ -874,10 +922,12 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         };
         let mut planned = (None, None);
         let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| {
-            let result = warm_up(&mut engine.model, cancelled);
+            let result = warm_up(&mut engine.model, cancelled, &behind::ARRIVED);
             planned = plan(engine, behind::warm_up_over());
             result
         });
+        // (the engine is let go: how long the request that cut the warm-up short waited for it, from the moment it came)
+        let waited = behind::waited_ms().unwrap_or(0);
         if outcome == behind::WarmedUp::Skipped {
             // (a request had the engine first, and is waited for: the plan is made when it lets go)
             let state = behind::warm_up_over();
@@ -890,7 +940,7 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         let (seconds, after) = (began.elapsed().as_secs_f64(), ready_at.elapsed().as_secs_f64());
         match &outcome {
             behind::WarmedUp::Done => eprintln!("Straydog warm-up: done in {seconds:.1} s, {after:.1} s after ready"),
-            behind::WarmedUp::CutShort => eprintln!("Straydog warm-up: cut short by a request after {seconds:.1} s, {after:.1} s after ready"),
+            behind::WarmedUp::CutShort => eprintln!("Straydog warm-up: cut short by a request after {seconds:.1} s, {after:.1} s after ready, {waited} ms after the request came"),
             behind::WarmedUp::Skipped => eprintln!("Straydog warm-up: not run, a request had the engine first ({after:.1} s after ready)"),
             behind::WarmedUp::Failed(message) => eprintln!("WARN Straydog warm-up failed after {seconds:.1} s: {message}"),
             behind::WarmedUp::Gone => return,
@@ -1085,7 +1135,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("warm_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1103,7 +1153,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("prefix_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1123,7 +1173,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                 }
             }
             Some("conversation_state") => {
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 if active.lock().unwrap().is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy", "fatal": false}));
                     continue;
@@ -1194,7 +1244,7 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
             }
             Some("chat") if matches!(request.get("body"), Some(pyjson::Value::Object(_))) => {
                 // (the warm-up behind "ready" stops at its next pass and lets the request have the engine)
-                behind::ARRIVED.store(true, Ordering::SeqCst);
+                behind::arrive();
                 let mut current = active.lock().unwrap();
                 if current.is_some() {
                     output.send(&json!({"id": id, "event": "error", "message": "Straydog is busy"}));
@@ -1252,6 +1302,7 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
         && !message.ends_with(straydog_engine::gpu::HOST_NO_MEMORY)
+        && !message.ends_with(straydog_engine::rows::ROW_READ_REFUSED)
         && !message.ends_with(straydog_engine::model::IMAGE_REFUSED)
         && !message.ends_with("exceeds the allocated context");
     Failure { message: format!("{site}: {message}"), fatal }
@@ -1694,6 +1745,9 @@ mod tests {
         // (a K/V that found no memory to grow into, and a copy of the conversation that found none: the devices are sound)
         assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_MEMORY), "site").fatal);
         assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HOST_NO_MEMORY), "site").fatal);
+        // (a row read the working-set quota refused, after the smaller and cached retries; a bare 1453 stays fatal)
+        assert!(!engine_failed(format!("row table read failed: os error 1453; {}", straydog_engine::rows::ROW_READ_REFUSED), "site").fatal);
+        assert!(engine_failed("row table read failed: os error 1453", "site").fatal);
         // (what an image asked is refused, the engine reset)
         assert!(!engine_failed(format!("no memory for its positions {}", straydog_engine::model::IMAGE_REFUSED), "site").fatal);
         // (a prompt found too long before anything ran leaves the engine as it was)

@@ -22,6 +22,23 @@ fn gguf_pre_tokenizer(name: &str) -> Option<serde_json::Value> {
 /// ([`Text::defuse`]): [`Text::encode`] takes it as ordinary text, never as that token.
 pub const DEFUSED: char = '\u{e001}';
 
+/// Segments (the text between two added tokens) of at least this many bytes are kept by their digest once encoded ([`Text::encode`]).
+const MEMO_FROM: usize = 4096;
+/// The most tokens the kept segments hold, the oldest let go first (16 MiB): a conversation at the longest context a model is
+/// served with, DeepSeek-V4.1's 1,048,576 tokens, with room for others. A segment longer than this is not kept: at 1 << 19 a
+/// 932,410-token conversation was encoded again each turn, 0.9 s of a 1.55 s wait for its first token.
+const MEMO_TOKENS: usize = 1 << 22;
+
+/// Encoded segments by the SHA-256 of their text, and the order they came in. A conversation's next request renders its earlier messages
+/// again, and their segments come back the same: only the new ones need encoding (a 250K-token conversation took 0.30 to 0.34 s to encode
+/// whole for every request on a Ryzen 7 9700X). Memory only, never written anywhere.
+#[derive(Default)]
+struct Memo {
+    segments: std::collections::HashMap<[u8; 32], std::sync::Arc<[u32]>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    tokens: usize,
+}
+
 pub struct Text {
     tokenizer: Tokenizer,
     /// The same without its added tokens: a defused one's text as any other text.
@@ -30,6 +47,7 @@ pub struct Text {
     added: Option<(regex::Regex, regex::Regex)>,
     /// [`Text::token_bytes`], built on first use.
     bytes: std::sync::OnceLock<std::sync::Arc<crate::constraint::TokenBytes>>,
+    memo: std::sync::Mutex<Memo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +78,7 @@ impl Text {
             let compile = |pattern: String| regex::Regex::new(&pattern).map_err(|exc| TextError(exc.to_string()));
             Some((compile(alternatives.clone())?, compile(format!("^(?:{alternatives})"))?))
         };
-        Ok(Text { tokenizer, plain, added, bytes: std::sync::OnceLock::new() })
+        Ok(Text { tokenizer, plain, added, bytes: std::sync::OnceLock::new(), memo: Default::default() })
     }
 
     /// `text`, a message's own, with each added token's text in it marked [`DEFUSED`]: only the
@@ -131,18 +149,61 @@ impl Text {
     /// [`DEFUSED`] one's, ordinary text (a mark before anything else is dropped).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, TextError> {
         if !text.contains(DEFUSED) {
-            return Self::encode_with(&self.tokenizer, text);
+            return self.encode_kept(text);
         }
         let (mut ids, mut rest) = (Vec::new(), text);
         while let Some(at) = rest.find(DEFUSED) {
-            ids.extend(Self::encode_with(&self.tokenizer, &rest[..at])?);
+            ids.extend(self.encode_kept(&rest[..at])?);
             let after = &rest[at + DEFUSED.len_utf8()..];
             let length = self.added.as_ref().and_then(|(_, at_start)| at_start.find(after)).map_or(0, |found| found.end());
             ids.extend(Self::encode_with(&self.plain, &after[..length])?);
             rest = &after[length..];
         }
-        ids.extend(Self::encode_with(&self.tokenizer, rest)?);
+        ids.extend(self.encode_kept(rest)?);
         Ok(ids)
+    }
+
+    /// [`Text::encode_with`] the full tokenizer, its long segments from the [`Memo`]. The tokenizer splits a text at its added tokens before
+    /// anything else (none of them strips the space around it) and encodes each piece alone, NFC included: the pieces' ids side by side are
+    /// the whole text's.
+    fn encode_kept(&self, text: &str) -> Result<Vec<u32>, TextError> {
+        let Some((anywhere, _)) = &self.added else { return Self::encode_with(&self.tokenizer, text) };
+        if text.len() < MEMO_FROM {
+            return Self::encode_with(&self.tokenizer, text);
+        }
+        let (mut ids, mut last) = (Vec::new(), 0);
+        for found in anywhere.find_iter(text) {
+            self.encode_segment(&text[last..found.start()], &mut ids)?;
+            ids.extend(Self::encode_with(&self.tokenizer, found.as_str())?);
+            last = found.end();
+        }
+        self.encode_segment(&text[last..], &mut ids)?;
+        Ok(ids)
+    }
+
+    fn encode_segment(&self, segment: &str, ids: &mut Vec<u32>) -> Result<(), TextError> {
+        if segment.len() < MEMO_FROM {
+            ids.extend(Self::encode_with(&self.tokenizer, segment)?);
+            return Ok(());
+        }
+        use sha2::Digest;
+        let key: [u8; 32] = sha2::Sha256::digest(segment.as_bytes()).into();
+        if let Some(kept) = self.memo.lock().unwrap().segments.get(&key).cloned() {
+            ids.extend_from_slice(&kept);
+            return Ok(());
+        }
+        let encoded: std::sync::Arc<[u32]> = Self::encode_with(&self.tokenizer, segment)?.into();
+        ids.extend_from_slice(&encoded);
+        let mut memo = self.memo.lock().unwrap();
+        if encoded.len() <= MEMO_TOKENS && memo.segments.insert(key, encoded.clone()).is_none() {
+            memo.order.push_back(key);
+            memo.tokens += encoded.len();
+            while memo.tokens > MEMO_TOKENS {
+                let Some(oldest) = memo.order.pop_front() else { break };
+                if let Some(gone) = memo.segments.remove(&oldest) { memo.tokens -= gone.len(); }
+            }
+        }
+        Ok(())
     }
 
     fn encode_with(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, TextError> {
@@ -231,5 +292,33 @@ impl Detokenizer<'_> {
             .strip_prefix(self.prefix.as_str())
             .map(str::to_string)
             .ok_or_else(|| TextError("the decoder changed text it had already emitted".into()))
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::{Text, MEMO_FROM};
+
+    /// Decides: a rendered conversation's ids are the same with the kept segments as without, the first time and when its earlier
+    /// messages come back with a new one (the real Qwen3.8 tokenizer; skipped where its file is not on the machine).
+    #[test]
+    fn kept_segments_encode_a_conversation_as_the_tokenizer_does_whole() {
+        let path = std::env::var("STRAYDOG_TOKENIZER_JSON")
+            .unwrap_or_else(|_| "/server/gguf-models/Qwen3.8-Flash-Next-GGUF/UD-IQ2_XS/tokenizer.json".into());
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let text = Text::new(&bytes).unwrap();
+        // long segments with accents in both composed and decomposed forms (NFC), code, Japanese and spaces at the seams
+        let body = |n: usize| -> String {
+            let line = format!("fn f{n}() {{ let café = \"cafe\\u{{301}} e\u{301}\"; }} // 日本語の行 {n}  \\n  ");
+            line.repeat(MEMO_FROM / line.len() + 3)
+        };
+        let mut rendered = String::from("<|im_start|>system\nYou are helpful.<|im_end|>\n");
+        for turn in 0..4 {
+            rendered += &format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n {} <|im_end|>\n", body(turn), body(turn + 10));
+            let whole = Text::encode_with(&text.tokenizer, &rendered).unwrap();
+            assert_eq!(text.encode(&rendered).unwrap(), whole, "turn {turn}, first time");
+            assert_eq!(text.encode(&rendered).unwrap(), whole, "turn {turn}, from the kept segments");
+        }
+        assert!(text.memo.lock().unwrap().segments.len() >= 4);
     }
 }

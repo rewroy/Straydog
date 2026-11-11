@@ -193,6 +193,7 @@ int sd_op_link_sum(void* handle, const float* part, uint64_t count, float* out, 
     check(hipGetLastError());
     link_add_grid_kernel<<<blocks, 256, 0, value.stream>>>(part, size_t(count), link.state, link.inbox, link.capacity,
                                                            accumulate ? 1 : 0, out);
+    flush_if_not_capturing(value);
     SD_OP_END
 }
 

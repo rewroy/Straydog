@@ -16,6 +16,8 @@ extern "C" {
 /* Errors and devices */
 const char* sd_error(void);
 int sd_device_count(void);
+/* Load the first Qwen prompt-prefill GEMM's GPU code without reading model weights. */
+int sd_prime_qwen_prefill_gemm(int ordinal, uint64_t tokens);
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes);
 /* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
 int sd_host_register_read_only_supported(int ordinal);
@@ -45,12 +47,19 @@ int sd_fill(void* filler, void* pointer, uint64_t offset, const void* host, uint
 /* sd_fill of `height` rows of `width` bytes, `host_pitch` apart in host memory, to rows `pitch` apart from `offset`. */
 int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, const void* host, uint64_t host_pitch, uint64_t width, uint64_t height);
 int sd_release(void* handle, void* pointer);
+/* The device bytes sd_release would give back for `pointer`, without releasing it. */
+int sd_allocation_bytes(void* handle, const void* pointer, uint64_t* bytes);
 int sd_zero(void* handle, void* pointer);
 int sd_download(void* handle, void* pointer, void* output, uint64_t bytes);
 int sd_copy_allocation(void* handle, void* target, const void* source);
 int sd_host_register(void* pointer, uint64_t bytes);
 int sd_host_register_on(int ordinal, void* pointer, uint64_t bytes);
 int sd_host_unregister(void* pointer);
+/* `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped), allocated under the context of device
+   `ordinal` from any thread: the engine's copies of the expert banks where the GPU cannot register the model's read-only mapping
+   (sd_hybrid_repoint). sd_host_free gives it back, once nothing reads it. */
+int sd_host_alloc_on(int ordinal, uint64_t bytes, void** pointer);
+int sd_host_free(int ordinal, void* pointer);
 /* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
    refused as a machine short of memory refuses them; 0 ends it. */
 int sd_test_refuse_host(uint64_t count);
@@ -67,6 +76,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
 int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint64_t decoder_bytes, void** moe, void** decoder);
 int sd_kv_scratch(void* handle, void** scratch);
 int sd_host_state_supported(void* handle);
+int sd_kv_format(void* handle, uint32_t row);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
@@ -128,6 +138,8 @@ int sd_gemm_check_read(void* handle, uint64_t* counters, uint64_t count);
 int sd_graph_begin(void* handle);
 int sd_graph_end(void* handle, uint64_t key, int keep);
 int sd_graph_run(void* handle, uint64_t key);
+/* Ask the driver to submit queued work on every device after both sides of a peer wait are queued. */
+int sd_devices_flush(void* const* handles, uint64_t devices);
 /* Several linear ops in one launch where the GEMV takes them (up to four inputs, and strides shared
    when there are several): out = W[first_row ..] . in per item; up to 24 items. A half GEMM whose
    items read the same rows (pointer, width and stride) rounds those rows to FP16 once. */
@@ -470,6 +482,28 @@ int sd_prefill_ple(void* handle, void* const* pointers, const int* kinds, void* 
 /* Resident decoder and spans */
 int sd_decoder_layer(void* handle, uint64_t layer, uint64_t context, void* const* pointers, const int* kinds, uint64_t count, void* const* states, void* workspace, void* moe);
 int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, const float* input, float* output);
+/* Temporarily bind one layer's routed banks to an owned allocation. Requires an empty expert cache; clear before releasing storage. */
+/* 1 when memory was refused (no allocation), 0 when allocated. */
+int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
+/* Three authenticated host copies, kept alive until return (all H2D reads have settled).
+   The decoder's ordinary host pointers are unchanged. source_bytes holds each whole bank's size. */
+int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
+                         const uint8_t* const* sources, const uint64_t* source_bytes);
+int sd_prefill_bank_clear(void* handle);
+/* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
+   3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
+   The callback's rows are borrowed for this call; it returns zero on success and must not unwind. */
+typedef int (*sd_prefill_observer)(void* context, uint64_t layer, uint64_t phase, uint64_t position,
+                                  uint64_t rows, uint64_t width, const float* values);
+int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context);
+/* Place four-stream hidden rows in a layer's workspace before its PLE and prefill span. */
+int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps);
+int sd_prefill_row_transfers(void* handle, uint64_t* out);
+int sd_layer_rows_put(void* handle, void* storage, uint64_t first, const float* rows, uint64_t steps);
+int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, uint64_t steps);
+int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps);
+int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
 /* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
    layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a
@@ -550,7 +584,8 @@ int sd_hybrid_route_floor(void* handle, float floor);
 /* Whether a prompt batch's experts beyond the slots with the fewest rows go to the CPU (on by default; prompt_cpu_share). */
 int sd_hybrid_prompt_share(void* handle, int on);
 void* sd_hybrid_moe_create(void* handle, void* const* pointers, const int* kinds, const int* routed_kinds, uint64_t experts, const uint8_t* const* host, void* workspace, uint64_t capacity);
-int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes);
+/* `mirror` is 0 to start without the page-locked staging mirror. Layer order gathers through that mirror, so it stays off. */
+int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_bytes, int mirror);
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
 int sd_expert_slots_release(void* handle);
 int sd_expert_slots_restore(void* handle, uint64_t cache);
@@ -567,6 +602,13 @@ int sd_hybrid_assist_level(void* handle, uint32_t assist);
    before sd_hybrid_assist mapped them): copies of its experts that were in flight, and the layers' graphs that hold the view, are waited
    for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */
 int sd_hybrid_unmap(void* handle, const void* gate, uint64_t* found);
+/* The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: page-locked
+   copies of the banks (`copy` 1, sd_host_alloc_on; `base` is then the start of the allocation each bank lies in, which sd_hybrid_assist maps, as the
+   runtime maps an allocation by its start), or the model's mapping again (`copy` 0, before the copies are freed; `base` is not read). The copies of its experts
+   that were in flight, the kernels that read the banks in place, and the CPU's workers are waited for, so that nothing reads the old memory when this
+   returns (a CPU read still under way is an error and leaves the plan as it was); the plan's view for the assist is dropped, and sd_hybrid_assist
+   maps the new memory. `found` is 1 where this device holds the plan. */
+int sd_hybrid_repoint(void* handle, const void* from, const uint8_t* const* host, const uint8_t* const* base, int copy, uint64_t* found);
 int sd_hybrid_decay(double decay);
 int sd_hybrid_timing(void* handle, uint64_t* wait_ns, uint64_t* cpu_ns, uint64_t* swapped, uint64_t* assisted);
 int sd_hybrid_counts(void* handle, uint64_t* gpu, uint64_t* cpu, uint64_t* streamed, uint64_t* cached);
@@ -582,6 +624,8 @@ int sd_hybrid_seed(void* handle, void* plan, const double* rates, uint64_t exper
 /* One bounded refresh of the expert slots by those scores, never waiting for its copies: the swaps still on their way after it (0: none wanted), the pool's size and its occupation. */
 int sd_hybrid_refresh(void* handle, uint64_t max_swaps, uint64_t* pending, uint64_t* slots, uint64_t* held);
 int sd_hybrid_slots(void* handle, uint64_t* slots, uint64_t* held);
+/* The current expert cache arena's device bytes, excluding staging. Size groups make slot count times the largest slot an overestimate. */
+int sd_hybrid_cache_bytes(void* handle, uint64_t* bytes);
 
 /* CPU experts and formats */
 const char* sd_cpu_error(void);

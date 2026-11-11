@@ -342,7 +342,8 @@ fn working(architecture: &str) -> Working {
         // 15.2 GiB counted, 590 slots), 6.96 GiB on two (59.4 GiB, 5832 slots) and 7.14 GiB on two
         // with GSQ-RCO-IQ2_XS (5147 slots): 2.34 GiB and 2.40 GiB a GPU, of which the state, 3200
         // bytes a token, is 0.78 GiB. It started at --vram 14 and 15 and not at 13 (and 12, 10), 1.4
-        // GiB more than it counted, for the rows of a prefill pass of 4096 tokens.
+        // GiB more than it counted, for the rows of a prefill pass of 4096 tokens. The checkpoints' host memory is
+        // CHECKPOINT_BYTES, what the server takes at every context setup chooses (262144 and below).
         "deepseek41" => Working { vram: gib_hundredths(234), per_gpu: gib_hundredths(162), state: State::EveryGpu, arena: gib_hundredths(140), host: CHECKPOINT_BYTES },
         // Qwen3.8 with every expert resident (a partial placement counts otherwise: `partial_room`) keeps its sequence
         // state in host memory; the rows and buffers of its passes: 6.26 GiB on two GPUs with IQ3_S (57.3 GiB counted)
@@ -803,7 +804,9 @@ pub(crate) mod tests {
                 // and 32 GB holds none of them whole: the K/V's whole context would leave the banks 10 GiB of it. From 8 GB Unsloth's
                 // first, the one reading least; at 6 GB their dense layers (Q5_K to Q8_0: 3.5 to 4.1 GiB pinned, ISTA-DASLab's IQ2_XS
                 // 2.6) leave them short of VRAM, and ISTA-DASLab's IQ2_XS is the one
-                assert_eq!(named, Some(if mib < 8000 { id("IQ2_XS") } else { unsloth("UD-IQ1_S") }), "{name}");
+                // (but Linux's 16 GB card: UD-IQ1_M leaves 1.2 GiB to the drive, within a twentieth of the least, and is the one)
+                let first = if mib < 8000 { id("IQ2_XS") } else if mib > 16000 && !on_windows { unsloth("UD-IQ1_M") } else { unsloth("UD-IQ1_S") };
+                assert_eq!(named, Some(first), "{name}");
                 if mib < 8000 {
                     for quant in ["UD-IQ3_XXS", "UD-IQ2_XS", "UD-IQ1_M", "UD-IQ1_S"] {
                         assert!(matches!(verdicts_of(&fits, unsloth(quant)), Fit::TooLittleVram { .. }), "{name}: {quant}");
@@ -862,8 +865,8 @@ pub(crate) mod tests {
         // 96 GiB, more than twice these banks: half of what the K/V leaves, up to the table's rows
         let wide = row_cache(&ours, 96 << 30, ours.footprint.state_per_token * DEFAULT_CONTEXT);
         assert!(wide > 30 << 30 && wide < 40 << 30, "{wide}");
-        // the K/V's growth is what parts 16 GB's RAM class: the banks of IQ3_S do not keep beside it at 62 GiB, IQ3_XXS's do
-        let (pc, cases) = (windows_pc(16303, DESKTOP, 62 << 30), pinned_entries());
+        // the K/V's growth is what parts 16 GB's RAM class: the banks of IQ3_S do not keep beside it at 56 GiB, IQ3_XXS's do
+        let (pc, cases) = (windows_pc(16303, DESKTOP, 56 << 30), pinned_entries());
         let (fits, named) = verdicts(true, &pc);
         // (Unsloth's first: UD-IQ2_XS, as large as ISTA-DASLab's IQ3_XXS, keeps its banks as that does)
         assert_eq!(named, Some(unsloth("UD-IQ2_XS")));
@@ -871,9 +874,17 @@ pub(crate) mod tests {
         assert!(matches!(fit_on(true, &big, &pc, DEFAULT_CONTEXT), Fit::Drive(0)), "{:?}", fit_on(true, &big, &pc, DEFAULT_CONTEXT));
         assert!(matches!(verdict(&fits, "IQ3_XXS").1, Fit::Ram(_)));
         assert_eq!(cases.len(), fits.len());
+        // at 62 GiB IQ3_S's keep too, beside the 6.91 GiB of state the engine counts at 262144 tokens; the table's copy of it from
+        // when the K/V was F32, 54,912 bytes a token (13.4 GiB), told that machine it would read them from the drive
+        let roomy = windows_pc(16303, DESKTOP, 62 << 30);
+        let mut stale = big.clone();
+        stale.footprint.state_per_token = 54_912;
+        assert!(matches!(fit_on(true, &big, &roomy, DEFAULT_CONTEXT), Fit::Ram(_)), "{:?}", fit_on(true, &big, &roomy, DEFAULT_CONTEXT));
+        assert!(matches!(fit_on(true, &stale, &roomy, DEFAULT_CONTEXT), Fit::Drive(0)));
+        assert_eq!(verdicts(true, &roomy).1, Some(unsloth("UD-IQ3_XXS")));
         // no state of a Qwen3.8 is counted at the whole context for what a shorter one will take: a smaller context keeps more
-        let ram_only = |context| match fit_on(true, &big, &windows_pc(16303, DESKTOP, 64 << 30), context) { Fit::Ram(_) => true, Fit::Drive(_) => false, verdict => panic!("{verdict:?}") };
-        assert!(ram_only(131_072));
+        let ram_only = |context| match fit_on(true, &big, &pc, context) { Fit::Ram(_) => true, Fit::Drive(_) => false, verdict => panic!("{verdict:?}") };
+        assert!(ram_only(131_072) && !ram_only(DEFAULT_CONTEXT));
     }
 
     /// An Unsloth Qwen3.8 bundle set up with another engram table fetches that file instead of its own table shard, and counts it.

@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::assist;
-use crate::banks::{BankLocks, GaveBack, Locked};
+use crate::banks::{BankLocks, Copies, GaveBack, LockMode, Locked, PinnedMemory, Refusal};
 use crate::constraint::{self, Constraint, Suppression};
 use crate::drafts::{Ngrams, Policy, LONG_MATCH};
 use crate::gpu::{expert_bytes, Columns, CpuExperts, Data, Operand, Piece, Result, Scores, HIDDEN, HOST_NO_MEMORY, WIDTH};
@@ -88,12 +88,26 @@ const VOCABULARY: usize = 248320;
 /// attention layer's (the MTP layer's too, `drafting`) QSA K/V, pooled indexer keys and the
 /// indexer's rolling history (eight inputs), DeltaNet state and convolution, PLE history.
 pub fn context_state_bytes(context: u64, drafting: bool) -> u64 {
-    let state = attention_layers(drafting) * (context * 4 * crate::gpu::KV_ROW_FLOATS + (context / 4 + 1) * 128 + 8 * 128) * 4;
+    let state = attention_layers(drafting) * (context * 4 * crate::gpu::KV_ROW_FLOATS_F16 + (context / 4 + 1) * 128 + 8 * 128) * 4;
     state + 36 * (48 * 128 * 128 + 4 * 10240) * 4 + 10 * 10240 * 4
 }
 
-/// A whole attention layer's K/V bytes a position: four planes of KV_ROW_FLOATS.
-const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS * 4;
+/// The bytes one more token of context adds to [`context_state_bytes`]: every attention layer's K/V position and its share of
+/// the pooled indexer keys (28,288 with the MTP layer: thirteen layers of 2,048 and 128). What a bundle's footprint counts of the
+/// context ([`crate::bundle::footprint`]): the formula's own, so that it follows the K/V as it is held.
+pub fn state_per_token(drafting: bool) -> u64 {
+    const CONTEXT: u64 = 262_144;
+    (context_state_bytes(2 * CONTEXT, drafting) - context_state_bytes(CONTEXT, drafting)) / CONTEXT
+}
+
+/// A whole attention layer's K/V bytes a position in FP16, four planes of KV_ROW_FLOATS_F16: what the placement counts (whether the
+/// K/V stays in VRAM) until the Q8_0 rows are measured.
+const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS_F16 * 4;
+
+/// A whole attention layer's K/V bytes a position as it is held ([`crate::gpu::KvFormat::selected`]): what its memory takes.
+fn kv_position_bytes() -> u64 {
+    4 * crate::gpu::KvFormat::selected().row_bytes()
+}
 
 /// The layers with QSA attention: twelve, and the MTP layer when drafting.
 fn attention_layers(drafting: bool) -> u64 {
@@ -108,6 +122,64 @@ pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this seque
 /// pass of one row, which no pass of its kind takes (the chat template cannot render one: its images are followed by text enough).
 /// The devices are sound: the request fails, and the engine resets.
 pub const IMAGE_REFUSED: &str = "(a request with an image, refused)";
+
+/// The error of a pass that the warm-up behind "ready" stopped in the middle, for a request that came ([`Model::set_warm_stop`]): no device is
+/// left in a state the warm-up's reset does not take back.
+pub const WARM_STOPPED: &str = "Straydog warm-up stopped for a request";
+
+/// Whether `error` is [`WARM_STOPPED`] (it may be joined to the error of restoring the expert slots after it).
+pub fn is_warm_stop(error: &str) -> bool {
+    error.contains(WARM_STOPPED)
+}
+
+/// The rows a layer-order batch needs to beat the ordinary path when the banks fit in RAM, on Windows.
+const LAYER_PREFILL_FIT_ROWS: u64 = 512;
+/// The rows it needs where they do not: its MoE takes time inversely with them (a 3.8K follow-up under memory pressure on the RTX 5070 Ti:
+/// 12.7 s at 256 rows against the ordinary path's 16.0 s; about even at 128 rows by the 32.6K fits, losing below).
+const LAYER_PREFILL_SHORT_ROWS: u64 = 128;
+
+/// Whether the ordinary path's transfer of the routed experts costs enough every batch for layer order to win where the banks fit:
+/// Windows (IQ2_XS on an RTX 5070 Ti at 5.5 GiB, banks in RAM: 8.2K new 17.5 s at 512 rows against 25.4 s; 32.6K at 256 rows 73.7 s
+/// both; 3.8K at 128 rows 16.1 s against 10.0 s). Linux reads them faster (the same banks and budget on a Radeon AI PRO R9700: 14.9K new 22.4 s
+/// at 512 rows against 23.6 s, 3.7K 10.5 s against 6.4 s), and keeps the ordinary path.
+const LAYER_PREFILL_FITS: bool = cfg!(windows);
+
+/// The memory the banks may hold for a prefill: what RAM leaves beside `pinned` and [`crate::host::left_free`], bounded by what the system
+/// has for them now (`now`, from [`crate::host::bank_room_now`]) when other programs have taken it. None where RAM is unknown.
+fn layer_prefill_room(memory: u64, pinned: u64, now: Option<u64>) -> Option<u64> {
+    if memory == 0 { return None; }
+    let usable = memory.saturating_sub(pinned).saturating_sub(crate::host::left_free(memory));
+    Some(now.map_or(usable, |now| usable.min(now)))
+}
+
+/// Layer ordering pays for loading every routed bank once when the ordinary path would reread banks that do not fit in RAM (`room`, from
+/// [`layer_prefill_room`]): under memory pressure, the ordinary path reads them from the drive again every batch (32.6K new on the
+/// RTX 5070 Ti with 4.1 GiB available: 161.8 s, layer order 73.0 s at 256 rows). Large shortages amortize it over two ordinary batches; a
+/// slight shortage needs three full maximum-sized batches, and either [`LAYER_PREFILL_SHORT_ROWS`] (`rows`, from
+/// [`Group::layer_prefill_rows`]). Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order from three ordinary batches
+/// when it can take [`LAYER_PREFILL_FIT_ROWS`].
+fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fits: bool) -> bool {
+    if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens / ordinary.max(batch).max(1) >= 3 {
+        return true;
+    }
+    let Some(room) = room else { return false };
+    if banks <= room || rows < LAYER_PREFILL_SHORT_ROWS { return false; }
+    if u128::from(banks) * 10 >= u128::from(room) * 13 {
+        new_tokens > ordinary.max(batch).max(1)
+    } else {
+        new_tokens / batch.max(crate::gpu::LONG_PREFILL_ROWS as usize) >= 3
+    }
+}
+
+/// The spans a resident prefill runs: the first layer alone, then each device's decoder layers (`boundaries`, from layer 1) in spans of at most
+/// `width` layers.
+fn prefill_spans(boundaries: &[(usize, usize)], width: usize) -> Vec<(usize, usize)> {
+    let mut spans = vec![(0, 1)];
+    for (begin, end) in boundaries {
+        spans.extend((*begin..*end).step_by(width).map(|first| (first, (first + width).min(*end))));
+    }
+    spans
+}
 
 /// The PLE table's row cache of a partially resident model with less memory than twice its banks.
 pub const SCARCE_ROW_CACHE: u64 = 1 << 30;
@@ -194,17 +266,31 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
 }
 
 /// The part of a partially resident request's "other" (the request line's ms a token apart from the GPU wait and the CPU) that a decode
-/// phase is, as the line names it. A lone row's step only: a pass of drafts has more besides (the drafter's, the acceptance, the commit),
-/// which the line does not break down.
+/// phase is, as the line names it. A lone row and a pass of drafts share one short list: the draft, the head, the first layer together
+/// with the PLE, the acceptance and the commit, and the layers.
 fn decode_part(phase: &str) -> Option<&'static str> {
     Some(match phase {
-        "step: head" => "head",
-        "step: first layer" => "first layer",
-        "step: PLE rows wait" => "PLE wait",
-        "step: PLE layer" => "PLE",
-        "step: layers (first device)" | "step: layers (second device)" => "layers",
+        "draft: embeddings" | "draft: catch-up and first draft" | "draft: next draft" => "draft",
+        "step: head" | "verify: head" => "head",
+        "step: first layer" | "step: PLE rows wait" | "step: PLE layer"
+            | "verify: protect, PLE prefetch, embeddings" | "verify: first layer" | "verify: PLE rows wait" | "verify: PLE layer"
+            | "PLE prefetch" => "first/PLE",
+        "accept" | "commit: DeltaNet replay" | "commit: PLE replay" => "accept",
+        "step: layers (first device)" | "step: layers (second device)"
+            | "verify: layers (queued)" | "verify: layers (first device)" | "verify: layers (second device)" => "layers",
         _ => return None,
     })
+}
+
+/// Milliseconds a generated token of each [`decode_part`], from the phases already timed. `generated` is at least 1.
+fn decode_steps(phases: &BTreeMap<&'static str, f64>, generated: f64) -> BTreeMap<&'static str, f64> {
+    let mut steps = BTreeMap::new();
+    for (name, seconds) in phases {
+        if let Some(part) = decode_part(name) {
+            *steps.entry(part).or_default() += 1e3 * seconds / generated;
+        }
+    }
+    steps
 }
 
 /// [`Model::partial_drawn_cut`] of the draft at position `at` (1 the first) from the running means of a pass's seconds by rows (0: none yet).
@@ -263,6 +349,128 @@ struct AssistScript {
     level: u32,
     routed: [u64; 3],
     trace: Vec<(u32, [u64; 3], f64)>,
+}
+
+/// The rows a layer-order pass takes through every layer at most: the prompt's hidden rows it holds (40 KB a row, F32), and the passes a
+/// prompt takes, each of which reads every layer's banks (a 250K prompt on Windows with 64 GB: 16 passes read some 36 GB of banks from the
+/// drive each). STRAYDOG_LAYER_PREFILL_ROWS changes it, to measure ([`layer_prefill_rows`]).
+const LAYER_PREFILL_ROWS: usize = 16384;
+const LAYER_PREFILL_MIN: usize = 512;
+
+/// The rows a layer-order pass takes: [`LAYER_PREFILL_ROWS`], or STRAYDOG_LAYER_PREFILL_ROWS when the process starts (from
+/// [`LAYER_PREFILL_MIN`] to the context's limit; a value outside them, or not a number, keeps the default).
+fn layer_prefill_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref()))
+}
+
+/// Where a layer-order pass loads a layer's banks from.
+#[derive(Debug, PartialEq, Eq)]
+enum BankSource {
+    /// The reader's checked copy, read ahead.
+    Copy,
+    /// The mapping, whose pages the layer's registration keeps checked (held for the load).
+    Registered,
+    /// A checked copy read now: the reader passed the layer by while it was registered, and its registration was given up since.
+    ReadNow,
+    /// The mapping, as with no reader at all.
+    Mapping,
+}
+
+/// [`BankSource`] of a layer: whether the reader `copied` it ahead, whether the model's marks hold it `registered` now, and whether there is a
+/// `reader`. A layer the reader skipped for its mark and that is no longer registered is not read from the mapping it no longer keeps.
+fn bank_source(copied: bool, registered: bool, reader: bool) -> BankSource {
+    match (copied, registered, reader) {
+        (true, _, _) => BankSource::Copy,
+        (false, true, _) => BankSource::Registered,
+        (false, false, true) => BankSource::ReadNow,
+        (false, false, false) => BankSource::Mapping,
+    }
+}
+
+/// Whether a prompt is going through the layers in layer order now: the locking behind "ready" may take its turns meanwhile
+/// (STRAYDOG_LOCK_DURING_PREFILL), as the prompt reads every layer's banks and no CPU expert of a generating request is in the way.
+pub static LAYER_PREFILL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets [`LAYER_PREFILL_ACTIVE`] for its life.
+struct LayerPrefillActive;
+
+impl LayerPrefillActive {
+    fn begin() -> LayerPrefillActive {
+        LAYER_PREFILL_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        LayerPrefillActive
+    }
+}
+
+impl Drop for LayerPrefillActive {
+    fn drop(&mut self) {
+        LAYER_PREFILL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// STRAYDOG_LAYER_ROWS_VRAM: anything but 0 (or unset) holds a layer-order pass's rows in VRAM where they fit.
+fn layer_rows_vram_named(value: Option<&str>) -> bool {
+    value.map_or(true, |value| value.trim() != "0")
+}
+
+fn layer_prefill_rows_named(value: Option<&str>) -> usize {
+    match value.map(|value| value.trim().replace('_', "").parse::<usize>()) {
+        None => LAYER_PREFILL_ROWS,
+        Some(Ok(rows)) if (LAYER_PREFILL_MIN..=CONTEXT_LIMIT).contains(&rows) => rows,
+        Some(_) => {
+            eprintln!("WARN STRAYDOG_LAYER_PREFILL_ROWS must be a count from {LAYER_PREFILL_MIN} to {CONTEXT_LIMIT}; {LAYER_PREFILL_ROWS} rows a pass");
+            LAYER_PREFILL_ROWS
+        }
+    }
+}
+
+/// Layer order's outcome: fall back to the ordinary path, cancelled, the logits, or done up to a position from which the ordinary path
+/// finishes the prompt (a short last segment, after the layer order has given its VRAM back).
+enum LayerPrefill { Fallback, Cancelled, Ready(Vec<f32>), Continue(usize) }
+
+/// How a layer-order prefill of `begin..end` splits: the position up to which it runs in layer order, and whether it keeps the staging
+/// slots. A segment under [`LAYER_PREFILL_MIN`] runs the ordinary way, which needs them; a short last segment (the reply's opening tokens
+/// after a conversation's checkpoint, as most chat requests end) is left to the ordinary path after the layer order ends, so the layer
+/// order's rows may have the staging slots' VRAM. A short segment before a long one keeps them.
+fn layer_prefill_split(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)], segment: usize) -> (usize, bool) {
+    let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
+    let stops = layer_prefill_stops(begin, end, &checkpoints, segment);
+    let starts: Vec<usize> = [begin].into_iter().chain(stops.iter().copied()).collect();
+    let short: Vec<bool> = stops.iter().zip(&starts).map(|(stop, start)| stop - start < LAYER_PREFILL_MIN).collect();
+    match short.iter().position(|short| *short) {
+        None => (end, false),
+        Some(at) if at + 1 == stops.len() && at > 0 => (starts[at], false),
+        Some(_) => (end, true),
+    }
+}
+
+/// Common positions at which a layer-ordered prompt may stop: checkpoints plus segments of at most `segment` rows (a pass's).
+fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize], segment: usize) -> Vec<usize> {
+    let mut stops: Vec<usize> = checkpoints.iter().copied().chain([end]).filter(|at| *at > begin && *at <= end).collect();
+    stops.sort_unstable();
+    stops.dedup();
+    let mut position = begin;
+    let mut out = Vec::new();
+    for stop in stops {
+        while position < stop {
+            position = position.saturating_add(segment.max(1)).min(stop);
+            out.push(position);
+        }
+    }
+    out
+}
+
+/// Layer spans and their MTP pairs use the same token chunks, including a tail of two instead of a one-row decode.
+fn layer_prefill_chunks(begin: usize, end: usize, batch: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    let mut first = begin;
+    while first < end {
+        let mut next = (first + batch).min(end);
+        if end - next == 1 && next - first > 2 { next -= 1; }
+        chunks.push((first, next));
+        first = next;
+    }
+    chunks
 }
 
 struct Checkpoint {
@@ -543,6 +751,11 @@ pub struct Model {
     // before the mappings their native plans point into.
     group: Group,
     cpu: Option<CpuExperts>,
+    /// The page-locked copies of the banks of the layers that a GPU which cannot register host memory read-only holds in place of the mapping
+    /// ([`LockMode::Copy`]). The devices' plans and the CPU engine read them, and the model has no `Drop`: this field is declared after `group` and `cpu`
+    /// so that they are dropped first (the devices drain their copy thread and destroy their plans, the CPU's workers stop) and nothing reads a copy when
+    /// it is freed. Keep it after them.
+    copies: Copies,
     pub weights: Weights,
     pub context: usize,
     pub prefill_batch_size: usize,
@@ -553,6 +766,14 @@ pub struct Model {
     pub copy_drafts: usize,
     pub resident: bool,
     pub partial: bool,
+    /// Layer-ordered long prefill; STRAYDOG_LAYER_PREFILL=0 selects the ordinary batch order.
+    layer_prefill: bool,
+    // Explicit numerical comparisons retain the developer API's forced path.
+    layer_prefill_forced: bool,
+    /// A layer-order pass holds its hidden rows in VRAM where they fit (STRAYDOG_LAYER_ROWS_VRAM=0: on the host, moved to the GPU and back
+    /// for every layer, as before; [`Model::layer_rows_in_vram`] for a test).
+    layer_rows_vram: bool,
+    layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
     pub placement_note: Option<String>,
@@ -601,6 +822,8 @@ pub struct Model {
     /// This request's passes by rows, and this process's memory as it began, for its log line.
     pass_counts: [u64; PARTIAL_ROWS],
     memory_before: Option<(u64, u64, u64)>,
+    /// The pages read from the drive for page faults when the request began ([`crate::host::fault_reads`]).
+    fault_reads_before: Option<crate::host::FaultReads>,
     /// The CPU engine's read-ahead hints (taken, left) when the request began.
     read_aheads_before: (u64, u64),
     /// The CPU engine's phase times when the request began ([`CpuExperts::phase_ns`]).
@@ -609,18 +832,28 @@ pub struct Model {
     kv_capacity: usize,
     /// What is page-locked, for the thread that keeps the working set's limit.
     pinned_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    watching_memory: bool,
+    memory_watch: std::sync::Arc<crate::host::WorkingSetWatch>,
     /// Page-locked host bytes besides the K/V.
     pinned_other: u64,
     /// The expert banks a partially resident model reads from host memory.
     banks_bytes: u64,
     /// The layers whose banks are page-locked (resident until the process ends): a warm start asks the OS for no others' pages.
     locked_layers: Vec<usize>,
+    /// The plans the GPU's assist had mapped when it was last started ([`Model::start_assist`]): a layer locked since is mapped when the count grows.
+    assist_mapped: u64,
     /// The layers the start planned to page-lock behind "ready" and that are not locked yet, in the order they are taken ([`Model::bank_locks`]):
     /// a warm start asks the OS for none of their pages either.
     lock_pending: Vec<usize>,
     /// A bank that did not match the file's tree when it was locked behind "ready": no request is served from here on.
     bank_failure: Option<String>,
+    /// How the banks are page-locked ([`LockMode`]): decided once, when the plan is made ([`Model::plan_host_banks`]), from what the GPUs say of registering
+    /// host memory read-only, and kept for every later plan, so that a mapping the runtime refused is never offered to it again.
+    lock_mode: LockMode,
+    /// The layers registered in place and the reads of them under way ([`crate::banks::Registered`]): this model's alone.
+    registered: std::sync::Arc<crate::banks::Registered>,
+    /// A refusal of the very first layer, with nothing locked, that ends the planning of more ([`Model::more_bank_locks`]); and whether the log said so.
+    lock_refusal: Refusal,
+    refusal_told: bool,
     /// The start's plan was handed out (or found nothing to lock), and a plan is out that has not ended ([`Model::bank_locks`],
     /// [`Model::more_bank_locks`], [`Model::banks_lock_ended`]): one locking at a time, and more only after the start's.
     locks_planned: bool,
@@ -642,6 +875,8 @@ pub struct Model {
     /// whether a table of rope positions is up (`sd_rope_rows`). A sequence without any costs a test of these two.
     rope_delta: u32,
     rope_table: bool,
+    /// Set only while the warm-up behind "ready" runs its passes ([`Model::set_warm_stop`]): the flag a request's arrival sets.
+    warm_stop: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 /// A measurement of what a verification pass costs by its rows (examples/prefill --force-rows): the rows are the sequence's next
@@ -736,6 +971,7 @@ impl Model {
         let mut model = Model {
             group,
             cpu: None,
+            copies: Copies::default(),
             weights,
             context,
             prefill_batch_size: batch,
@@ -744,6 +980,12 @@ impl Model {
             copy_drafts: 0,
             resident: false,
             partial: false,
+            layer_prefill: !std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "0"),
+            // (STRAYDOG_LAYER_PREFILL=force: every eligible prompt takes the layer order whatever the memory, to measure it where the
+            // choice would not make it, e.g. a machine whose RAM holds the banks)
+            layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
+            layer_rows_vram: layer_rows_vram_named(std::env::var("STRAYDOG_LAYER_ROWS_VRAM").ok().as_deref()),
+            layer_prefill_restore_failure: None,
             host_kv: host,
             placement_note,
             history: Vec::new(),
@@ -773,16 +1015,22 @@ impl Model {
             assist_script: None,
             pass_counts: [0; PARTIAL_ROWS],
             memory_before: None,
+            fault_reads_before: None,
             read_aheads_before: (0, 0),
             cpu_phases_before: [0; 3],
             kv_capacity: context,
             pinned_now: Default::default(),
-            watching_memory: false,
+            memory_watch: Default::default(),
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
             locked_layers: Vec::new(),
+            assist_mapped: 0,
             lock_pending: Vec::new(),
             bank_failure: None,
+            lock_mode: LockMode::Register,
+            registered: Default::default(),
+            lock_refusal: Refusal::default(),
+            refusal_told: false,
             locks_planned: false,
             locking: false,
             lock_halt: Default::default(),
@@ -794,6 +1042,7 @@ impl Model {
             images: Vec::new(),
             rope_delta: 0,
             rope_table: false,
+            warm_stop: None,
         };
         // Placement allocates every weight before any is read; reading then fills them.
         model.group.defer_uploads();
@@ -826,7 +1075,7 @@ impl Model {
         let head: Operand<'static> = unsafe { std::mem::transmute(model.projection("output.weight")?) };
         model.group.pin_head(&head)?;
         let keep = model.first_use_tensors()?;
-        load_seconds.push(("place", lap(&mut clock)));
+        load_seconds.push(("read and place", lap(&mut clock)));
         crate::host::commit_note("placed");
         let pending = model.group.take_pending();
         crate::load::load(&mut model.weights, &mut model.group, pending, &keep, progress)?;
@@ -842,12 +1091,17 @@ impl Model {
         }
         let mut two_drafts = false;
         if model.partial {
-            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * KV_POSITION_BYTES } else { 0 };
+            let pinned = checkpoint_bytes + if host { attention_layers(model.weights.drafter) * model.kv_capacity as u64 * kv_position_bytes() } else { 0 };
             // (the banks are locked behind "ready", by the worker: [`Model::bank_locks`]; the slots below are sized as they were with
             // the locks taken, and the plan has left the commit the locks need out of what the VRAM takes)
             model.plan_host_banks(pinned)?;
             crate::host::commit_note("banks planned");
             let slots = model.group.create_expert_slots()?;
+            // No staging mirror: layer order gathers through it, so a prompt keeps the ordinary batches.
+            if !model.group.expert_slot_mirrors() {
+                model.layer_prefill = false;
+                model.layer_prefill_forced = false;
+            }
             let experts = 48 * model.weights.tensor("blk.0.ffn_gate_exps.weight")?.dims.last().copied().unwrap_or(0) as u64;
             two_drafts = cfg!(feature = "hip") && slots as f64 >= TWO_DRAFTS_START * experts as f64;
             crate::host::commit_note("expert slots");
@@ -1301,7 +1555,7 @@ impl Model {
             Some(Banks { start: banks.map(|bank| bank.as_ptr() as usize), bytes: banks.map(|bank| bank.len() / ROUTED_EXPERTS) })
         };
         let memory = self.weights.host_memory_bytes;
-        let budget = crate::host::within_free(u64::MAX, 0, crate::host::available_bytes(), memory);
+        let budget = crate::host::within_free(u64::MAX, 0, crate::host::prefetch_available_bytes(), memory);
         let hints = routes::plan_hints(&prior.ranked(), 0, budget, &banks);
         Ok(WarmStart { slots, held, swapped: self.group.swapped_experts()?, hints })
     }
@@ -1321,6 +1575,7 @@ impl Model {
         if mapped > 0 && self.assist.is_none() {
             self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
         }
+        self.assist_mapped = mapped;
         Ok(mapped)
     }
 
@@ -1329,10 +1584,24 @@ impl Model {
         self.refresh_kv_ahead();
         let mut planned = Vec::with_capacity(layers.len());
         for &layer in layers {
-            let bank = |role: &str| self.weights.mapped_bank(&format!("blk.{layer}.ffn_{role}_exps.weight"));
+            let bank = |role: &str| -> Result<crate::banks::Bank> {
+                let name = format!("blk.{layer}.ffn_{role}_exps.weight");
+                let bank = self.weights.mapped_bank(&name)?;
+                // (the copy mode reads each bank's copy from its file)
+                Ok(match self.lock_mode {
+                    LockMode::Register => bank,
+                    LockMode::Copy => bank.reading(self.weights.bank_file(&name)?),
+                })
+            };
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        Ok(BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes)).tied_to(self.lock_halt.clone(), self.kv_ahead.clone()))
+        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
+            .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone()).marking(self.registered.clone());
+        // (a GPU that cannot register the read-only mapping is not asked to: each layer's turn copies its banks, and checks the copies)
+        Ok(match self.lock_mode {
+            LockMode::Register => job,
+            LockMode::Copy => job.copying(std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() })),
+        })
     }
 
     /// The layers a start planned to page-lock, as a plan to take layer by layer behind "ready" ([`BankLocks::lock_next`], then
@@ -1385,6 +1654,17 @@ impl Model {
     pub fn more_bank_locks(&mut self, prior: impl FnOnce(&Model) -> Option<Routes>) -> Option<BankLocks> {
         if !self.partial || !self.locks_planned || self.locking || self.bank_failure.is_some() || self.locked_layers.len() >= 48 {
             return None;
+        }
+        // (the runtime refused the first layer of a plan with nothing locked: it would refuse the first of this one, and again after every request)
+        match self.lock_refusal.blocks_more(self.locked_layers.len(), crate::host::available_bytes()) {
+            Some(why) => {
+                if !std::mem::replace(&mut self.refusal_told, true) {
+                    eprintln!("Straydog host banks: no more layers are planned to be page-locked: the first layer's turn was refused with none locked ({why})");
+                }
+                return None;
+            }
+            // (the memory has grown by a layer's banks since, or nothing was refused: a refusal that comes later is told as its own)
+            None => self.refusal_told = false,
         }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
@@ -1439,7 +1719,7 @@ impl Model {
     /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
     /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
     /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
-    pub fn banks_locked(&mut self, locked: Locked) -> Result<u64> {
+    pub fn banks_locked(&mut self, mut locked: Locked) -> Result<u64> {
         if self.lock_halt.load(std::sync::atomic::Ordering::SeqCst) {
             // (its locks were given back to a request while this layer's turn ran: the layer is let go, not taken)
             // SAFETY: the model keeps its weights mapped.
@@ -1447,12 +1727,27 @@ impl Model {
             return Err("its page locks were given back to a K/V growth".into());
         }
         let layer = locked.layer;
-        for bank in Self::host_banks(&self.weights, layer)? {
-            self.group.adopt_host(bank);
+        let copied = locked.is_copy();
+        if let Some(copy) = locked.take_copy() {
+            // The layer's banks are page-locked copies, checked: every device's plan of the layer reads them (one copy for all) from here, and the assist
+            // below maps them. The mapping is registered nowhere.
+            let banks = Self::host_banks(&self.weights, layer)?;
+            self.copies.take_over(&mut self.group, banks, copy)?;
+        } else {
+            for bank in Self::host_banks(&self.weights, layer)? {
+                self.group.adopt_host(bank);
+            }
         }
         self.lock_pending.retain(|pending| *pending != layer);
         self.locked_layers.push(layer);
+        let before = self.assist_mapped;
         let mapped = self.start_assist()?;
+        // (a copy the runtime would not map for the GPU is a locked layer that assists nothing, and its prompts gather it through the CPU: say so for that
+        // layer alone, the one whose turn did not add a mapped plan, since nothing else shows it)
+        if copied && mapped <= before {
+            eprintln!("WARN Straydog host banks: layer {layer}'s page-locked copy could not be mapped for the GPU's assist ({mapped} of {} locked layers are mapped); \
+                       the GPU takes no routes from it and the CPU gathers its experts for a prompt", self.locked_layers.len());
+        }
         // (what a round measured was of the layers locked then)
         if self.assist_tuning() {
             if let Some(tuner) = self.assist.as_mut() {
@@ -1484,10 +1779,7 @@ impl Model {
     fn hold_banks(&mut self) {
         let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
         crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
-        if !self.watching_memory {
-            self.watching_memory = true;
-            crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes);
-        }
+        self.memory_watch.allow_quota();
     }
 
     /// Page-lock every layer the start planned, here and now, as the worker does behind "ready" (for what is not served: examples and tools).
@@ -1605,12 +1897,22 @@ impl Model {
             Some((available, commit)) => (gib(available), format!(", commit left {}", gib(commit))),
             None => (crate::host::memory_note().map_or("unknown".to_string(), |(_, available, _)| gib(available)), String::new()),
         };
+        // A GPU that cannot register host memory read-only cannot page-lock the read-only mapping in place (two RTX 3090s on Windows 10: every layer's lock
+        // failed and none was ever locked): its layers are copied, once, into page-locked memory and the copies are checked. Decided here for every plan.
+        let devices: Vec<(usize, Option<bool>)> = self.group.ordinals().into_iter().map(|ordinal| (ordinal, crate::gpu::host_registers_read_only(ordinal))).collect();
+        let (mode, copy_why) = crate::banks::lock_mode(std::env::var(crate::banks::READ_ONLY_REGISTRATION_ENV).ok().as_deref(), &devices);
+        self.lock_mode = mode;
+        if let Some(copy_why) = copy_why {
+            eprintln!("Straydog host banks: {copy_why}, so each layer's banks are page-locked as one verified copy in portable host memory, not in the model's mapping");
+        }
         eprintln!("Straydog host banks: {} of 48 layers planned to be page-locked behind ready, {} of {}; no more planned because {why}; lock_budget {}, \
                    lockable {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
                   gib(by_memory), gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
+        // Paging must be observed even while a request holds up bank locking. The quota alone waits for the locks.
+        crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes, &self.memory_watch);
         // (with nothing to lock the limit comes now; else when the locking is over: `Model::banks_lock_ended`)
         if self.lock_pending.is_empty() {
             self.hold_banks();
@@ -1683,9 +1985,20 @@ impl Model {
     // ---- state ----
 
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(failure) = &self.layer_prefill_restore_failure { return Err(failure.clone()); }
         self.history.clear();
         self.final_hidden = None;
         self.group.reset_state()
+    }
+
+    /// Let the warm-up behind "ready" be stopped in the middle of a pass: while `stop` is set and true, a prompt batch ends between two layers
+    /// with [`WARM_STOPPED`] (and runs in spans of one layer for it to be seen, not four), instead of at its end. A request's own prefill
+    /// never does (it is read between batches, [`Model::prefill_batches`]: a stopped batch would take the held sequence's state with it), so
+    /// the warm-up sets this for its passes alone and clears it (`None`) before its [`Model::reset`], which takes back what a pass stopped
+    /// half way leaves: the recurrent state (zeroed), `history` (not yet extended by the batch) and the K/V rows past it (read only at positions
+    /// a sequence has written, as after any reset). Experts that reached the slots stay.
+    pub fn set_warm_stop(&mut self, stop: Option<&'static std::sync::atomic::AtomicBool>) {
+        self.warm_stop = stop;
     }
 
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
@@ -2146,7 +2459,7 @@ impl Model {
     /// The working set's limit, which follows what is free ([`crate::host::watch_working_set`]), after what a K/V growth has just locked.
     fn hold_memory(&self) {
         if self.partial {
-            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * KV_POSITION_BYTES;
+            let pinned = self.pinned_other + attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
             self.pinned_now.store(pinned, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -2156,7 +2469,7 @@ impl Model {
     fn refresh_kv_ahead(&self) {
         let ahead = if self.host_kv {
             let reach = self.context.min(crate::banks::KV_ROOM_POSITIONS);
-            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * KV_POSITION_BYTES
+            attention_layers(self.weights.drafter) * reach.saturating_sub(self.kv_capacity) as u64 * kv_position_bytes()
         } else {
             0
         };
@@ -2171,8 +2484,8 @@ impl Model {
     /// The bytes a growth of the K/V to `capacity` positions asks of the memory: the layers' new positions, a layer's old K/V and new one both held while
     /// it is copied, and the margin the commit keeps.
     fn kv_growth_cost(&self, capacity: usize) -> u64 {
-        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
-        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * KV_POSITION_BYTES + KV_COMMIT_MARGIN
+        let position = attention_layers(self.weights.drafter) * kv_position_bytes();
+        (capacity - self.kv_capacity) as u64 * position + capacity as u64 * kv_position_bytes() + KV_COMMIT_MARGIN
     }
 
     /// A request found no memory for `wanted` bytes of what it asks (`asked_by` says what): the page locks of the expert banks give way. The locking
@@ -2205,11 +2518,20 @@ impl Model {
         let shortfall = available.map_or(wanted, |available| wanted.saturating_sub(available));
         let count = crate::banks::give_back_count(&sizes, shortfall);
         for &(layer, bytes) in sizes.iter().rev().take(count) {
-            self.group.release_host(Self::host_banks(&self.weights, layer)?)?;
+            let banks = Self::host_banks(&self.weights, layer)?;
+            // (a layer held as copies: its plans read the mapping again first, which waits for everything that reads the copies, and only then are they let
+            // go: nothing reads them, by the engine's lock that this runs under and the device's waits)
+            // (the mark first, and a read under way waited for: then the locks; a layer held as copies has none)
+            self.registered.release(layer);
+            if !self.copies.give_back(&mut self.group, layer, banks)? {
+                self.group.release_host(banks)?;
+            }
             self.locked_layers.retain(|locked| *locked != layer);
             gave.layers.push(layer);
             gave.bytes += bytes;
         }
+        // (each layer given back took its mapped plan with it, if it had one: a count kept too high would make the next copy's turn look unmapped)
+        self.assist_mapped = if self.locked_layers.is_empty() { 0 } else { self.assist_mapped.saturating_sub(gave.layers.len() as u64) };
         gave.left = self.locked_layers.len();
         gave.left_bytes = sizes.iter().filter(|(layer, _)| self.locked_layers.contains(layer)).map(|(_, bytes)| bytes).sum();
         if self.locked_layers.is_empty() {
@@ -2245,7 +2567,7 @@ impl Model {
     fn kv_capacity_for(&self, positions: usize) -> Result<usize> {
         let doubled = (positions + 4096).next_power_of_two().min(self.context);
         let Some((free, left)) = crate::host::commit_left() else { return Ok(doubled) };
-        let position = attention_layers(self.weights.drafter) * KV_POSITION_BYTES;
+        let position = attention_layers(self.weights.drafter) * kv_position_bytes();
         let cost = |capacity: usize| self.kv_growth_cost(capacity);
         let least = self.kv_least(positions);
         let quarter = least.max((self.kv_capacity + self.kv_capacity / 4).div_ceil(4096) * 4096).min(self.context);
@@ -2280,6 +2602,7 @@ impl Model {
         if positions <= self.kv_capacity {
             return Ok(());
         }
+        let growing = Instant::now();
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
         }
@@ -2288,7 +2611,7 @@ impl Model {
         let mut begun: Option<usize> = None;
         let capacity = loop {
             let attempt = begun.map_or_else(|| self.kv_capacity_for(positions), Ok).and_then(|capacity| {
-                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * KV_POSITION_BYTES;
+                let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * kv_position_bytes();
                 // (the limit waits for the locking behind "ready", whose reads it would cut short)
                 if self.lock_pending.is_empty() {
                     crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
@@ -2309,6 +2632,9 @@ impl Model {
         self.kv_capacity = capacity;
         self.hold_memory();
         self.refresh_kv_ahead();
+        // (what a growth costs a request: the case for growing by less than doubling)
+        self.metric_add("kv_growth_seconds", growing.elapsed().as_secs_f64());
+        self.last_metrics.insert("kv_capacity".into(), json!(capacity));
         // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
         for checkpoint in self.checkpoints.values_mut() {
             if let Some(history) = checkpoint.history.as_mut() {
@@ -2409,8 +2735,11 @@ impl Model {
         if !logits {
             return Ok(None);
         }
+        self.head_logits(last_row(&hidden), tokens.len() == 1).map(Some)
+    }
+
+    fn head_logits(&mut self, row: &[f32], step: bool) -> Result<Vec<f32>> {
         let mut clock = Instant::now();
-        let row = last_row(&hidden);
         // (CUDA: the head's mix and projection in one wait, into the last step's allocation; elsewhere a wait and a copy to the host
         // between them)
         let mut logits = std::mem::take(&mut self.logits_spare);
@@ -2426,7 +2755,7 @@ impl Model {
             })?;
             logits = output.into_iter().next().unwrap();
         }
-        if tokens.len() == 1 {
+        if step {
             self.phase("step: head", &mut clock);
             if let Some(profile) = self.profile.as_mut() {
                 profile.end_pass(1, 0.0);
@@ -2439,7 +2768,7 @@ impl Model {
         if let Some(capture) = self.logits_capture.as_mut() {
             capture.push(logits.clone());
         }
-        Ok(Some(logits))
+        Ok(logits)
     }
 
     /// The last processed token's four-stream hidden state.
@@ -2637,17 +2966,29 @@ impl Model {
         shared(&self.history, tokens).max(shared(parked, tokens))
     }
 
-    /// Keep prompt rows on each GPU between spans of at most four layers; rows cross the host only
-    /// at device boundaries.
+    /// The error of a warm-up pass stopped between two spans ([`WARM_STOPPED`]). A span is waited for at its end, except where it is only
+    /// queued (the layers in parts on two devices, a deferred prompt): with more than one device what they queued is waited for here, so that
+    /// the reset after it finds every stream idle.
+    fn warm_stopped(&mut self) -> String {
+        if self.group.backends.len() > 1 {
+            let _ = self.group.prefill_settle();
+        }
+        WARM_STOPPED.to_string()
+    }
+
+    /// Keep prompt rows on each GPU between spans of at most four layers (one while the warm-up can be stopped, [`Model::set_warm_stop`]);
+    /// rows cross the host only at device boundaries.
     /// `stash`: the MTP layer reads every final row from the first layer's workspace, so only
     /// the last comes back; otherwise speculation takes them all.
     /// `keep_rows`: whether the last span returns rows (a deferred batch before the last does not).
     fn resident_prefill(&mut self, embeddings: &[f32], tokens: &[u32], stash: bool, keep_rows: bool) -> Result<Vec<f32>> {
         let (steps, position) = (tokens.len() as u64, self.history.len() as u64);
-        let boundaries = self.group.decoder_spans(1);
-        let mut spans = vec![(0, 1)];
-        for (begin, end) in &boundaries {
-            spans.extend((*begin..*end).step_by(4).map(|first| (first, (first + 4).min(*end))));
+        // (the warm-up's pass is thrown away, and a request that comes meanwhile is seen at every layer; any other pass runs in spans of four)
+        let stop = self.warm_stop;
+        let stopped = || stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst));
+        let spans = prefill_spans(&self.group.decoder_spans(1), if stop.is_some() { 1 } else { 4 });
+        if stopped() {
+            return Err(self.warm_stopped());
         }
         // The prompt's embeddings start the first span; later spans continue on the device, and
         // rows move GPU to GPU where the next span is on the other device.
@@ -2655,6 +2996,10 @@ impl Model {
         let mut rows_out = Vec::new();
         let mut previous: Option<usize> = None;
         for (index, (first, last)) in spans.into_iter().enumerate() {
+            // (before the rows are handed to the next device and the PLE layer is queued, so that no half of a step is left on a stream)
+            if index > 0 && stopped() {
+                return Err(self.warm_stopped());
+            }
             if let Some(previous) = previous {
                 self.group.prefill_handoff(previous, first, steps)?;
             }
@@ -2773,7 +3118,10 @@ impl Model {
     /// Fill the MTP layer's K/V for a prompt batch: pair (hidden_t, token_t+1) sits at position t. The token's row at an image's
     /// position is the image's own (llama.cpp's MTP graph takes `inp->embd` there), through the layer's prologue as any.
     fn mtp_prompt(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>) -> Result<()> {
-        let start = self.history.len();
+        self.mtp_prompt_batched(tokens, rows, previous, 512, self.history.len())
+    }
+
+    fn mtp_prompt_batched(&mut self, tokens: &[u32], rows: &[f32], previous: Option<Vec<f32>>, batch: usize, start: usize) -> Result<()> {
         let mut hidden: Vec<&[f32]> = rows.chunks_exact(WIDTH).take(row_count(rows) - 1).collect();
         let mut following: Vec<u32> = tokens[1..].to_vec();
         let mut first = start;
@@ -2786,7 +3134,7 @@ impl Model {
         }
         let mut offset = 0;
         while offset < hidden.len() {
-            let mut end = (offset + 512).min(hidden.len());
+            let mut end = (offset + batch).min(hidden.len());
             // (a last pass of one row reads the delta alone: in a sequence with images it stays in the table's)
             if !self.images.is_empty() && hidden.len() - end == 1 {
                 end -= 1;
@@ -2944,6 +3292,44 @@ impl Model {
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
         let long = self.partial && tokens.len() - position >= threshold;
+        let eligible = long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none();
+        let layer_order = eligible && {
+            self.ensure_kv(tokens.len())?;
+            let ordinary = self.group.backends[0].ordinary_prefill_rows(batch as u64)? as usize;
+            let (_, staging) = layer_prefill_split(position, tokens.len(), plan, layer_prefill_rows());
+            let rows = self.group.layer_prefill_rows(self.layer_bank_bytes()?, staging)?;
+            let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
+            let memory = self.weights.host_memory_bytes;
+            // (the banks share the memory with the hidden rows a pass holds)
+            let hidden = ((tokens.len() - position).min(layer_prefill_rows()) * WIDTH * 4) as u64;
+            let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?))
+                .map(|room| room.saturating_sub(hidden));
+            let selected = self.layer_prefill_forced
+                || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows, LAYER_PREFILL_FITS);
+            self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "layer_batch_rows": rows,
+                                     "staging_kept": staging, "bank_bytes": self.banks_bytes, "bank_room": room, "selected": selected}));
+            selected
+        };
+        let mut position = position;
+        let mut long = long;
+        let mut layer_rows = None;
+        let tail_plan: Vec<(usize, Vec<&'static str>)>;
+        let mut plan = plan;
+        if layer_order {
+            match self.try_layer_prefill(tokens, position, plan, cancelled, progress)? {
+                LayerPrefill::Fallback => {},
+                LayerPrefill::Cancelled => return Ok(None),
+                LayerPrefill::Ready(logits) => return Ok(Some(Some(logits))),
+                // (the short last segment, the ordinary way: only the checkpoints past the layer order's are left to save)
+                LayerPrefill::Continue(at) => {
+                    position = at;
+                    long = self.partial && tokens.len() - position >= threshold;
+                    layer_rows = self.last_metrics.get("prefill_batch_rows").cloned();
+                    tail_plan = plan.iter().filter(|(stop, _)| *stop > at).cloned().collect();
+                    plan = &tail_plan;
+                }
+            }
+        }
         let preparing = Instant::now();
         let empty_before_prepare = long && {
             let (slots, held) = self.group.slots()?;
@@ -2956,7 +3342,13 @@ impl Model {
             }
         }
         self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
-        self.last_metrics.insert("prefill_batch_rows".into(), json!(batch));
+        match layer_rows {
+            Some(rows) => {
+                self.last_metrics.insert("prefill_batch_rows".into(), rows);
+                self.last_metrics.insert("prefill_tail_tokens".into(), json!(tokens.len() - position));
+            }
+            None => { self.last_metrics.insert("prefill_batch_rows".into(), json!(batch)); }
+        }
         let output = self.prefill_batches(tokens, position, plan, batch, empty_before_prepare, cancelled, progress);
         let restoring = Instant::now();
         let restored = if long { self.group.end_long_prefill() } else { Ok(()) };
@@ -2967,6 +3359,256 @@ impl Model {
             (Ok(_), Err(error)) => Err(error),
             (Ok(output), Ok(())) => Ok(output),
         }
+    }
+
+    /// Development/validation: force the traversal order for identical-prompt comparisons, bypassing the automatic cost guard.
+    #[doc(hidden)]
+    pub fn layer_prefill(&mut self, enabled: bool) {
+        self.layer_prefill = enabled;
+        self.layer_prefill_forced = enabled;
+    }
+
+    /// Whether a layer-order pass holds its hidden rows in VRAM where they fit (a test compares the two ways).
+    pub fn layer_rows_in_vram(&mut self, held: bool) {
+        self.layer_rows_vram = held;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The bytes of the banks page-locked so far.
+    fn locked_bank_bytes(&self) -> Result<u64> {
+        let mut bytes = 0;
+        for &layer in &self.locked_layers {
+            bytes += Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
+        }
+        Ok(bytes)
+    }
+
+    /// The layer-order bank pool: the largest layer's three routed banks (the drafter's included).
+    fn layer_bank_bytes(&self) -> Result<u64> {
+        let mut bank_bytes = 0;
+        for layer in 0..48 + usize::from(self.speculative > 0) {
+            let bytes = Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>();
+            bank_bytes = bank_bytes.max(bytes);
+        }
+        Ok(bank_bytes)
+    }
+
+    fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
+                         cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
+        if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
+        let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
+        // (the K/V grown to the prompt first: its growth asks the commit that the hidden rows would take, more of it at more rows a pass)
+        self.ensure_kv(tokens.len())?;
+        let segment = layer_prefill_rows();
+        let count = (tokens.len() - position).min(segment);
+        let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
+        let bank_bytes = self.layer_bank_bytes()?;
+        let (layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
+        let preparing = Instant::now();
+        let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
+        self.group.lend_prefill_head()?;
+        let output: Result<Option<bool>> = (|| {
+            let Some(rows) = self.group.begin_layer_prefill(bank_bytes, staging)? else { return Ok(None) };
+            self.last_metrics.insert("prefill_order".into(), json!("layer"));
+            self.last_metrics.insert("prefill_batch_rows".into(), json!(rows));
+            self.last_metrics.insert("prefill_layer_rows".into(), json!(segment));
+            self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
+            self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
+            drop(trace_prepare);
+            let _active = LayerPrefillActive::begin();
+            // (the pass's hidden rows in VRAM where they fit beside what layer order holds; else on the host, and the line says why)
+            let host = if self.layer_rows_vram { self.group.hold_layer_rows(count as u64)? } else { Some("STRAYDOG_LAYER_ROWS_VRAM=0".to_string()) };
+            match &host {
+                Some(reason) => { self.last_metrics.insert("prefill_rows_host_reason".into(), json!(reason)); }
+                None => { self.last_metrics.insert("prefill_rows_vram".into(), json!(true)); }
+            }
+            let moved = self.group.prefill_row_transfers().ok();
+            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, host.is_none(),
+                                                   cancelled, progress);
+            // (the hidden rows to the GPU and back, every layer of every pass: what holding them in VRAM would save)
+            if let (Some(before), Ok(after)) = (moved, self.group.prefill_row_transfers()) {
+                self.metric_add("prefill_rows_up_seconds", after[0].saturating_sub(before[0]) as f64 / 1e9);
+                self.metric_add("prefill_rows_up_bytes", after[1].saturating_sub(before[1]) as f64);
+                self.metric_add("prefill_rows_down_seconds", after[2].saturating_sub(before[2]) as f64 / 1e9);
+                self.metric_add("prefill_rows_down_bytes", after[3].saturating_sub(before[3]) as f64);
+            }
+            done.map(Some)
+        })();
+        let restoring = Instant::now();
+        let trace_restore = crate::layer_trace::Span::new("restore", None, position, tokens.len(), 0);
+        // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
+        let bank = self.group.finish_layer_prefill();
+        let head = self.with_operands(Model::head_operands, Group::pin);
+        let cache = self.group.end_long_prefill();
+        self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
+        drop(trace_restore);
+        let errors: Vec<String> = [bank, head, cache].into_iter().filter_map(Result::err).collect();
+        if !errors.is_empty() {
+            let restore = errors.join("; ");
+            let failure = match output { Err(error) => format!("{error}; restoring layer prefill failed: {restore}"),
+                                         _ => format!("restoring layer prefill failed: {restore}") };
+            self.layer_prefill_restore_failure = Some(failure.clone());
+            return Err(failure);
+        }
+        match output? {
+            None => Ok(LayerPrefill::Fallback),
+            Some(false) => Ok(LayerPrefill::Cancelled),
+            Some(true) if layer_end < tokens.len() => Ok(LayerPrefill::Continue(layer_end)),
+            Some(true) => {
+                let row = self.final_hidden.clone().ok_or("layer prefill returned no final hidden row")?;
+                self.head_logits(&row, false).map(LayerPrefill::Ready)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The segments of `position..end` ([`layer_prefill_split`]'s end); without `staging` the pool has none, and a segment that would run
+    /// the ordinary way is refused.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, end: usize, staging: bool, plan: &[(usize, Vec<&'static str>)],
+                              batch: usize, hidden: &mut [f32], held: bool, cancelled: &dyn Fn() -> bool,
+                              progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
+        let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
+        let layers = 48 + usize::from(self.speculative > 0);
+        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
+        for stop in layer_prefill_stops(position, end, &checkpoints, layer_prefill_rows()) {
+            if cancelled() { return Ok(false); }
+            let begin = self.history.len();
+            let count = stop - begin;
+            let _trace_segment = crate::layer_trace::Span::new("segment", None, begin, stop, 0);
+            self.group.clear_layer_bank()?;
+            if count < LAYER_PREFILL_MIN && !staging {
+                return Err(format!("a layer-order segment of {count} tokens has no staging slots to run the ordinary way"));
+            }
+            if count < LAYER_PREFILL_MIN {
+                let _trace_tail = crate::layer_trace::Span::new("ordinary_tail", None, begin, stop, 0);
+                for first in (begin..stop).step_by(batch) {
+                    self.forward(&tokens[first..(first + batch).min(stop)], false)?;
+                }
+            } else {
+                // (a pass through every layer, reading each one's banks)
+                self.metric_count("prefill_layer_passes", 1);
+                self.set_rope(begin, count)?;
+                let rows = &mut hidden[..count * WIDTH];
+                if let Some(reader) = &mut bank_reader { reader.start(0); }
+                let trace_embedding = crate::layer_trace::Span::new("embedding", None, begin, stop, 0);
+                for first in (begin..stop).step_by(batch) {
+                    let end = (first + batch).min(stop);
+                    let embedded = self.rows_at(first, &tokens[first..end])?;
+                    for (row, embedded) in rows[(first - begin) * WIDTH..(end - begin) * WIDTH].chunks_exact_mut(WIDTH)
+                        .zip(embedded.chunks_exact(HIDDEN)) {
+                        for stream in row.chunks_exact_mut(HIDDEN) { stream.copy_from_slice(embedded); }
+                    }
+                }
+                drop(trace_embedding);
+                // (held in VRAM: the pass's rows go up once, and come back once after its last layer)
+                if held {
+                    self.group.put_layer_rows(0, rows)?;
+                }
+                let previous = self.final_hidden.clone();
+                for layer in 0..48 {
+                    let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
+                    let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
+                    self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
+                    drop(trace_bank);
+                    let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
+                    // Avoid a final prefill call of one row; the existing one-row path is a different API.
+                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
+                        let low = (first - begin) * WIDTH;
+                        let high = (end - begin) * WIDTH;
+                        if held {
+                            self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?;
+                        } else {
+                            self.group.prefill_rows(layer, &rows[low..high])?;
+                        }
+                        if layer == 1 {
+                            let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
+                            let next = (end + batch).min(stop);
+                            self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
+                            self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
+                            let reading = Instant::now();
+                            let embeddings = self.weights.rows(PLE_TABLE, &self.ple_indices(&tokens[..first], &tokens[first..end])?)?;
+                            self.ple_wait += reading.elapsed().as_secs_f64();
+                            self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
+                        }
+                        if held {
+                            self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?;
+                        } else {
+                            // (in place: a new vector a chunk faulted every row's pages in again for each layer)
+                            self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?;
+                        }
+                    }
+                }
+                if held {
+                    self.group.get_layer_rows(0, rows)?;
+                }
+                if self.speculative > 0 {
+                    let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
+                    let trace_bank = crate::layer_trace::Span::new("bank", Some(48), begin, stop, bank_bytes);
+                    self.load_prefill_bank_copy(48, layers, &mut bank_reader)?;
+                    drop(trace_bank);
+                    let _trace_compute = crate::layer_trace::Span::new("compute", Some(48), begin, stop, 0);
+                    // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
+                    let mut previous = previous;
+                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
+                        let chunk = &rows[(first - begin) * WIDTH..(end - begin) * WIDTH];
+                        self.mtp_prompt_batched(&tokens[first..end], chunk, previous, batch.min(512), first)?;
+                        previous = Some(last_row(chunk).to_vec());
+                    }
+                }
+                self.final_hidden = Some(last_row(rows).to_vec());
+                self.history.extend_from_slice(&tokens[begin..stop]);
+                self.draft_note(&tokens[begin..stop]);
+            }
+            self.group.clear_layer_bank()?;
+            if let Some((_, kinds)) = plan.iter().find(|(at, _)| *at == stop) {
+                let _trace_checkpoint = crate::layer_trace::Span::new("checkpoint", None, begin, stop, 0);
+                for kind in kinds.clone() { self.save_checkpoint(kind)?; }
+            }
+            progress(stop, tokens.len());
+            if cancelled() { return Ok(false); }
+        }
+        Ok(true)
+    }
+
+    fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
+        let waiting = Instant::now();
+        let mut copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
+        self.metric_add("prefill_bank_wait_seconds", waiting.elapsed().as_secs_f64());
+        // (a layer registered in place: the read holds the registration until the load's copies are done, which it waits for)
+        let held = if copy.is_none() { self.registered.read(layer) } else { None };
+        match bank_source(copy.is_some(), held.is_some(), reader.is_some()) {
+            BankSource::Copy => {}
+            // (the mapping's pages, which its locks keep checked, not the file's again)
+            BankSource::Registered => {
+                self.metric_add("prefill_bank_registered_layers", 1.0);
+                self.group.load_layer_bank(layer)?;
+            }
+            // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
+            BankSource::ReadNow => {
+                let reading = Instant::now();
+                copy = reader.as_mut().map(|reader| reader.read_now(layer)).transpose()?.flatten();
+                self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
+                self.metric_add("prefill_bank_read_late_layers", 1.0);
+                if copy.is_none() {
+                    self.group.load_layer_bank(layer)?;
+                }
+            }
+            BankSource::Mapping => self.group.load_layer_bank(layer)?,
+        }
+        drop(held);
+        if let Some(copy) = &copy {
+            self.group.load_layer_bank_from(layer, copy.sources())?;
+            self.metric_add("prefill_bank_copied_layers", 1.0);
+        }
+        if let Some(reader) = reader {
+            // The GPU now owns the entire bank: the same host buffer can receive the
+            // next layer while this layer computes, without keeping two host copies.
+            reader.recycle(copy);
+            if layer + 1 < layers { reader.start(layer + 1); }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2993,6 +3635,7 @@ impl Model {
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
                 output = self.forward(&tokens[position..end], end == tokens.len())?;
+                self.metric_count("prefill_batches", 1);
                 if cancelled() {
                     return Ok(None);
                 }
@@ -3204,6 +3847,10 @@ impl Model {
 
     /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
     fn assist_pass(&mut self, seconds: f64) {
+        // (a request whose passes the assist's round timed: decode rates of such a request are no other's, its drafts left out)
+        if self.assist_probing() {
+            self.metric_count("assist_round_passes", 1);
+        }
         if self.assist_script.is_some() {
             return self.assist_scripted(seconds);
         }
@@ -3309,6 +3956,10 @@ impl Model {
                 Some(chooser) if !probing && self.forced_rows.is_none() => chooser.plan(),
                 _ => width::Plan { drafts: self.drafts, probe: false },
             };
+            // (a pass of a probe at a width not in force: the request's decode rate is not the width's in force)
+            if plan.probe {
+                self.metric_count("drafts_probe_passes", 1);
+            }
             let limit = if probing { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
@@ -3477,6 +4128,7 @@ impl Model {
             self.hybrid_counts = self.group.info().unwrap_or_default();
             self.pass_counts = [0; PARTIAL_ROWS];
             self.memory_before = crate::host::memory_note();
+            self.fault_reads_before = crate::host::fault_reads();
             self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             self.cpu_phases_before = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
         }
@@ -3500,20 +4152,18 @@ impl Model {
             let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
+            // (the pages the drive gave back for faults while it ran, the working set's limit and the K/V's capacity: what the memory line
+            // needs to say why a request waited on the drive)
+            let read_back = crate::host::fault_reads().zip(self.fault_reads_before).map(|(now, before)| now.since(before));
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
             let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
             // (the CPU's time a token by the engine's phases: where a faster kernel shows, or does not)
             let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
             let cpu_phases: Vec<f64> = (0..3).map(|i| phases[i].saturating_sub(self.cpu_phases_before[i]) as f64 / 1e6 / generated).collect();
             // What the host spent outside the layers' routes in a decode step (the line's "other" is made of it and the layers' own time), on
-            // every request, DS41_PROFILE or not. Not in a request that verified drafts: its passes have phases the line does not name.
-            let mut steps: BTreeMap<&str, f64> = BTreeMap::new();
-            if let Some(profile) = self.profile.as_ref().filter(|_| !self.last_metrics.contains_key("speculative_passes")) {
-                for (name, seconds) in &profile.phases {
-                    if let Some(part) = decode_part(name) {
-                        *steps.entry(part).or_default() += 1e3 * seconds / generated;
-                    }
-                }
-            }
+            // every request, DS41_PROFILE or not, including a pass that verified drafts. The clocks were already taken; this only folds them.
+            let steps = self.profile.as_ref().map(|profile| decode_steps(&profile.phases, generated)).unwrap_or_default();
             let slot_counts = self.group.slots().ok();
             self.last_metrics.insert("partial_detail".into(), json!({
                 "steps_ms": steps,
@@ -3530,6 +4180,9 @@ impl Model {
                 "resident_gib": memory.map(|note| note.0 as f64 / (1u64 << 30) as f64),
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
                 "page_faults": faults,
+                "fault_read_pages": read_back.map(|(pages, _)| pages), "fault_reads_system": read_back.map(|(_, system)| system),
+                "working_set_limit_gib": crate::host::working_set_limit_now().map(gib),
+                "kv_positions": self.kv_capacity, "kv_gib": gib(kv_bytes), "kv_host": self.host_kv,
                 "read_aheads": [taken - self.read_aheads_before.0, left - self.read_aheads_before.1],
                 "graphs": info["devices"][0]["cached_graphs"], "replays": info["devices"][0]["graph_replays"].as_u64().unwrap_or(0)
                     .saturating_sub(self.hybrid_counts["devices"][0]["graph_replays"].as_u64().unwrap_or(0)),
@@ -3571,6 +4224,7 @@ impl Model {
         }
         sampling.check()?;
         self.weights.check_unchanged()?;
+        if let Some(failure) = &self.layer_prefill_restore_failure { return Err(failure.clone()); }
         // (banks locked behind "ready" that did not match the file's tree: nothing more is served from these bytes)
         if let Some(failure) = &self.bank_failure {
             return Err(failure.clone());
@@ -3794,14 +4448,125 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
 }
 
 #[cfg(test)]
-mod profile_tests {
-    use super::{decode_part, Profile};
+mod layer_prefill_policy_tests {
+    use super::{layer_prefill_needed, layer_prefill_room};
+    const G:u64=1<<30;
+    // The T284 cases: RAM `memory` with `pinned` state and nothing else taking memory (`now` unknown), Linux (no fit rule).
+    fn needed(new:usize,batch:usize,ordinary:usize,banks:u64,memory:u64,pinned:u64)->bool{
+        layer_prefill_needed(new,batch,ordinary,banks,layer_prefill_room(memory,pinned,None),512,false)
+    }
+    #[test]
+    fn a_small_shortage_needs_three_full_maximum_batches() {
+        let needed=|n,b|needed(n,b,4096,31*G,32*G,G);
+        assert!(!needed(2548,256));
+        assert!(!needed(3*4096-1,256));assert!(needed(3*4096,256));
+        assert!(!needed(3*8192-1,8192));assert!(needed(3*8192,8192));
+    }
+    #[test]
+    fn a_large_shortage_keeps_long_iq2_and_a_follow_up_that_spans_two_actual_batches() {
+        assert!(needed(14937,256,4096,39*G,32*G,G));
+        assert!(needed(3232,256,2048,39*G,32*G,G));
+        assert!(!needed(2048,256,2048,39*G,32*G,G));
+        assert!(!needed(3232,256,4096,39*G,32*G,G));
+        // A 1.3x shortage is the boundary for the two-batch choice: 16-2-4 = 10 GiB usable.
+        assert!(needed(2049,256,2048,13*G,16*G,2*G));
+        assert!(!needed(2049,256,2048,13*G-1,16*G,2*G));
+    }
+    #[test]
+    fn fitting_banks_and_unknown_ram_keep_the_ordinary_path() {
+        assert!(!needed(30000,256,4096,39*G,64*G,G));
+        let usable=32*G-G-4*G;
+        assert!(!needed(30000,256,4096,usable,32*G,G));
+        assert!(needed(30000,256,4096,usable+1,32*G,G));
+        assert!(!needed(30000,256,4096,39*G,0,G));
+        assert!(!needed(30000,0,0,0,32*G,G));
+    }
+    #[test]
+    fn memory_another_program_takes_counts_as_a_shortage() {
+        // The RTX 5070 Ti at 62 GiB, IQ2_XS banks of 39.4 GiB. Under pressure (4.2 GiB available) the room was 7.9 GiB for a 32.6K prompt,
+        // 20.0 GiB for its 3.8K follow-up: layer order 72.7 and 12.7 s at 256 rows, the ordinary path 161.2 and 16.0 s.
+        let banks=42283827200;
+        for (new,room) in [(32646,8472035328),(3832,21448052736)] {
+            let room=layer_prefill_room(62*G,2*G,Some(room));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,true));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,false));
+            // narrower than 128 rows its MoE loses what the drive costs the ordinary path
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,128,false));
+            assert!(!layer_prefill_needed(new,2048,2048,banks,room,64,false));
+        }
+        // Unpressured the room was 46 GiB: the banks fit, and only Windows' fit rule takes layer order (8.2K at 512 rows: 17.5 s against
+        // 25.4 s); 32.6K at 256 rows and 3.8K at 128 rows stayed ordinary (74.5 and 9.0 s; layer order 73.7 and 16.1 s).
+        let room=layer_prefill_room(62*G,2*G,Some(49839136768));
+        assert!(layer_prefill_needed(8210,2048,2048,banks,room,512,true));
+        assert!(!layer_prefill_needed(32646,2048,2048,banks,room,256,true));
+        assert!(!layer_prefill_needed(3832,2048,2048,banks,room,128,true));
+        // what the system says never raises what the RAM leaves
+        assert_eq!(layer_prefill_room(32*G,G,Some(100*G)),Some(32*G-G-4*G));
+        assert_eq!(layer_prefill_room(0,G,Some(100*G)),None);
+    }
+    #[test]
+    fn fitting_banks_take_layer_order_from_three_ordinary_batches_at_the_fit_rows_on_windows() {
+        // Windows, banks in RAM, ordinary batch 2048: 8.2K new at 512 rows layer order, 3.8K follow-up at 128 rows and 32.6K at 256 rows
+        // ordinary.
+        let room=Some(60*G);
+        assert!(layer_prefill_needed(8210,2048,2048,50*G,room,512,true));
+        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
+        assert!(!layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,1024,true));
+        assert!(!layer_prefill_needed(3*2048-1,2048,2048,50*G,room,512,true));
+        assert!(layer_prefill_needed(3*2048,2048,2048,50*G,room,512,true));
+        // Linux keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
+        assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,false));
+        assert!(!layer_prefill_needed(30000,0,0,0,None,0,true));
+    }
+}
 
-    /// Without DS41_PROFILE a partially resident model's profile keeps the decode step's phases the request line names, whatever pass they came in.
+#[cfg(test)]
+mod warm_stop_tests {
+    use super::{is_warm_stop, prefill_spans, WARM_STOPPED};
+
+    /// Spans of four are the spans a prompt has always run in, on one device and on two.
+    #[test]
+    fn a_prompt_runs_in_spans_of_four_layers() {
+        assert_eq!(prefill_spans(&[(1, 48)], 4).len(), 1 + 12);
+        let spans = prefill_spans(&[(1, 30), (30, 48)], 4);
+        assert_eq!(spans[..4], [(0, 1), (1, 5), (5, 9), (9, 13)]);
+        assert_eq!(spans[7..], [(25, 29), (29, 30), (30, 34), (34, 38), (38, 42), (42, 46), (46, 48)]);
+        // (every layer once, in order)
+        let layers: Vec<usize> = spans.iter().flat_map(|(first, last)| *first..*last).collect();
+        assert_eq!(layers, (0..48).collect::<Vec<_>>());
+    }
+
+    /// While the warm-up can be stopped, each layer is a span of its own, so that a request is seen at every layer.
+    #[test]
+    fn a_warm_up_pass_runs_in_spans_of_one_layer() {
+        let spans = prefill_spans(&[(1, 30), (30, 48)], 1);
+        assert_eq!(spans.len(), 48);
+        assert!(spans.iter().enumerate().all(|(layer, span)| *span == (layer, layer + 1)));
+        assert_eq!(prefill_spans(&[(1, 48)], 1).last(), Some(&(47, 48)));
+    }
+
+    /// The stop is known by its words, joined to another error or not, and no other error is taken for it.
+    #[test]
+    fn a_stopped_warm_up_pass_is_known_by_its_error() {
+        assert!(is_warm_stop(WARM_STOPPED));
+        assert!(is_warm_stop(&format!("{WARM_STOPPED}; restoring expert slots failed: no memory")));
+        assert!(!is_warm_stop("Straydog token or context is out of range"));
+        assert!(!is_warm_stop(""));
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{decode_part, decode_steps, Profile};
+    use std::collections::BTreeMap;
+
+    /// Without DS41_PROFILE a partially resident model's profile keeps the phases the request line names, from a lone row or a pass of drafts.
     #[test]
     fn a_profile_without_every_phase_keeps_the_steps_parts_alone() {
         let timed = [("step: head", 1.5), ("step: first layer", 1.0), ("step: PLE rows wait", 0.5), ("step: PLE layer", 0.25),
-                     ("step: layers (first device)", 30.0), ("verify: head", 2.0), ("draft: next draft", 3.0), ("accept", 0.125)];
+                     ("step: layers (first device)", 30.0), ("verify: head", 2.0), ("draft: next draft", 3.0), ("accept", 0.125),
+                     ("note: not a part", 4.0)];
         let kept = |every: bool| {
             let mut profile = Profile::new(every);
             for (name, seconds) in timed {
@@ -3812,20 +4577,52 @@ mod profile_tests {
         };
         let parts = kept(false);
         assert_eq!(parts.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-                   ["step: PLE layer", "step: PLE rows wait", "step: first layer", "step: head", "step: layers (first device)"]);
+                   ["accept", "draft: next draft", "step: PLE layer", "step: PLE rows wait", "step: first layer", "step: head",
+                    "step: layers (first device)", "verify: head"]);
         assert!(parts.iter().all(|(name, _)| decode_part(name).is_some()));
         assert_eq!(kept(true).len(), timed.len());
     }
 
-    /// The parts of "other": the step's phases, the layers of both devices as one.
+    /// The parts of "other": a lone row and a pass of drafts fold into the same few names. Both devices' layers are one part.
     #[test]
     fn the_steps_phases_are_the_lines_parts() {
-        let parts = ["step: head", "step: first layer", "step: PLE rows wait", "step: PLE layer", "step: layers (first device)", "step: layers (second device)"]
-            .map(decode_part);
-        assert_eq!(parts, [Some("head"), Some("first layer"), Some("PLE wait"), Some("PLE"), Some("layers"), Some("layers")]);
-        for other in ["verify: head", "verify: layers (first device)", "draft: embeddings", "accept", "PLE prefetch", "commit: DeltaNet replay"] {
-            assert_eq!(decode_part(other), None, "{other}");
+        assert_eq!(decode_part("draft: embeddings"), Some("draft"));
+        assert_eq!(decode_part("draft: catch-up and first draft"), Some("draft"));
+        assert_eq!(decode_part("draft: next draft"), Some("draft"));
+        assert_eq!(decode_part("step: head"), Some("head"));
+        assert_eq!(decode_part("verify: head"), Some("head"));
+        for phase in ["step: first layer", "step: PLE rows wait", "step: PLE layer", "verify: protect, PLE prefetch, embeddings",
+                      "verify: first layer", "verify: PLE rows wait", "verify: PLE layer", "PLE prefetch"] {
+            assert_eq!(decode_part(phase), Some("first/PLE"), "{phase}");
         }
+        assert_eq!(decode_part("accept"), Some("accept"));
+        assert_eq!(decode_part("commit: DeltaNet replay"), Some("accept"));
+        assert_eq!(decode_part("commit: PLE replay"), Some("accept"));
+        for phase in ["step: layers (first device)", "step: layers (second device)", "verify: layers (queued)",
+                      "verify: layers (first device)", "verify: layers (second device)"] {
+            assert_eq!(decode_part(phase), Some("layers"), "{phase}");
+        }
+        assert_eq!(decode_part("note: not a part"), None);
+    }
+
+    /// A pass of drafts fills the same `steps_ms` parts. The fold does not look at whether the request verified drafts.
+    #[test]
+    fn a_pass_of_drafts_folds_into_the_same_few_parts() {
+        let mut phases = BTreeMap::new();
+        for (name, seconds) in [("draft: embeddings", 0.001), ("draft: next draft", 0.002), ("verify: head", 0.0015),
+                                ("verify: first layer", 0.0004), ("verify: PLE rows wait", 0.0003), ("PLE prefetch", 0.0002),
+                                ("accept", 0.0008), ("commit: DeltaNet replay", 0.0002), ("verify: layers (first device)", 0.004),
+                                ("note: not a part", 9.0)] {
+            phases.insert(name, seconds);
+        }
+        let steps = decode_steps(&phases, 2.0);
+        let close = |part: &str, ms: f64| assert!((steps[part] - ms).abs() < 1e-9, "{part} {}", steps[part]);
+        close("draft", 1.5);
+        close("head", 0.75);
+        close("first/PLE", 0.45);
+        close("accept", 0.5);
+        close("layers", 2.0);
+        assert_eq!(steps.len(), 5);
     }
 }
 
@@ -3902,3 +4699,115 @@ mod same_text_tests {
         assert_eq!(same_text(&[2, 3, 5], &[1], &spelled), [1, 5]);
     }
 }
+#[cfg(test)]
+mod layer_prefill_tests {
+    use super::{layer_prefill_chunks, layer_prefill_rows_named, layer_prefill_split, layer_prefill_stops, LAYER_PREFILL_MIN, LAYER_PREFILL_ROWS as N};
+
+    fn layer_prefill_stops_default(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
+        layer_prefill_stops(begin, end, checkpoints, N)
+    }
+
+    fn layer_prefill_split_default(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)]) -> (usize, bool) {
+        layer_prefill_split(begin, end, plan, N)
+    }
+
+    #[test]
+    fn body_and_draft_share_the_same_odd_tail() {
+        assert_eq!(layer_prefill_chunks(0, 1025, 512), [(0,512),(512,1023),(1023,1025)]);
+        assert_eq!(layer_prefill_chunks(7, 16, 8), [(7,14),(14,16)]);
+        assert_eq!(layer_prefill_chunks(0, 1024, 512), [(0,512),(512,1024)]);
+    }
+
+    /// Decides: where a layer's banks come from. A copy read ahead is used; else a layer the model's marks hold registered is read from the
+    /// mapping its locks keep checked; one whose registration was given up between the reader passing it by and its load is read now as a
+    /// checked copy, never from the mapping it no longer keeps; with no reader, the mapping as before.
+    #[test]
+    fn a_layer_whose_registration_went_after_it_was_passed_by_is_read_as_a_checked_copy() {
+        use super::{bank_source, BankSource};
+        use crate::banks::Registered;
+        assert_eq!(bank_source(true, true, true), BankSource::Copy);
+        assert_eq!(bank_source(true, false, true), BankSource::Copy);
+        assert_eq!(bank_source(false, true, true), BankSource::Registered);
+        assert_eq!(bank_source(false, true, false), BankSource::Registered);
+        assert_eq!(bank_source(false, false, true), BankSource::ReadNow);
+        assert_eq!(bank_source(false, false, false), BankSource::Mapping);
+        // (the race: registered when the reader passes it by, given up before its load)
+        let registered = std::sync::Arc::new(Registered::default());
+        registered.mark(9);
+        let passed_by = registered.is_registered(9);
+        registered.release(9);
+        let held = registered.read(9);
+        assert!(passed_by && held.is_none());
+        assert_eq!(bank_source(false, held.is_some(), true), BankSource::ReadNow);
+    }
+
+    /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.
+    #[test]
+    fn the_rows_are_held_in_vram_unless_the_variable_says_0() {
+        use super::layer_rows_vram_named;
+        assert!(layer_rows_vram_named(None) && layer_rows_vram_named(Some("1")) && layer_rows_vram_named(Some("yes")));
+        assert!(!layer_rows_vram_named(Some("0")) && !layer_rows_vram_named(Some(" 0 ")));
+    }
+
+    /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the
+    /// context's limit; anything else keeps 16,384.
+    #[test]
+    fn the_rows_a_pass_takes_are_the_variables_within_bounds() {
+        assert_eq!(layer_prefill_rows_named(None), N);
+        assert_eq!(layer_prefill_rows_named(Some("65536")), 65_536);
+        assert_eq!(layer_prefill_rows_named(Some("131_072")), 131_072);
+        assert_eq!(layer_prefill_rows_named(Some(" 262144 ")), 262_144);
+        assert_eq!(layer_prefill_rows_named(Some(&LAYER_PREFILL_MIN.to_string())), LAYER_PREFILL_MIN);
+        for refused in ["511", "0", "262145", "many", "", "-1"] {
+            assert_eq!(layer_prefill_rows_named(Some(refused)), N, "{refused}");
+        }
+    }
+
+    /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
+    /// 4 at 65,536 and 1 at 262,144; a checkpoint inside a pass splits it there; the short last segment is left to the ordinary path the same.
+    #[test]
+    fn more_rows_a_pass_take_a_long_prompt_in_fewer_passes() {
+        let passes = |rows: usize| layer_prefill_stops(0, 249_925, &[], rows).len();
+        assert_eq!((passes(N), passes(65_536), passes(131_072), passes(262_144)), (16, 4, 2, 1));
+        assert_eq!(layer_prefill_stops(0, 249_925, &[], 65_536), [65_536, 131_072, 196_608, 249_925]);
+        assert_eq!(layer_prefill_stops(0, 200_000, &[100_000], 65_536), [65_536, 100_000, 165_536, 200_000]);
+        assert_eq!(layer_prefill_stops(1_000, 250_000, &[249_800], 262_144), [249_800, 250_000]);
+        let at = |stops: &[usize]| stops.iter().map(|at| (*at, Vec::new())).collect::<Vec<(usize, Vec<&'static str>)>>();
+        assert_eq!(layer_prefill_split(1_000, 250_000, &at(&[249_800]), 262_144), (249_800, false));
+        assert_eq!(layer_prefill_split(0, 65_537, &at(&[]), 65_536), (65_536, false));
+        assert_eq!(layer_prefill_split(0, 70_000, &at(&[]), 65_536), (70_000, false));
+        // (each pass covers its rows once and the passes cover the prompt)
+        for rows in [LAYER_PREFILL_MIN, N, 65_536, 262_144] {
+            let stops = layer_prefill_stops(5, 249_930, &[], rows);
+            let starts: Vec<usize> = [5].into_iter().chain(stops.iter().copied()).collect();
+            assert!(stops.iter().zip(&starts).all(|(stop, start)| stop > start && stop - start <= rows), "{rows}");
+            assert_eq!(*stops.last().unwrap(), 249_930);
+        }
+    }
+
+    #[test]
+    fn layer_segments_bound_work_without_crossing_a_checkpoint() {
+        assert_eq!(layer_prefill_stops_default(0, N, &[]), [N]);
+        assert_eq!(layer_prefill_stops_default(0, N + 1, &[]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops_default(0, 2 * N, &[N]), [N, 2 * N]);
+        assert_eq!(layer_prefill_stops_default(0, N + 1, &[N]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops_default(0, N + 2, &[N + 1]), [N, N + 1, N + 2]);
+        // a short last segment is left to the ordinary path after the layer order; a short segment before a long one keeps the staging slots
+        let at = |stops: &[usize]| stops.iter().map(|at| (*at, Vec::new())).collect::<Vec<(usize, Vec<&'static str>)>>();
+        assert_eq!(layer_prefill_split_default(0, 2 * N, &at(&[N])), (2 * N, false));
+        assert_eq!(layer_prefill_split_default(0, N + 1, &at(&[])), (N, false));
+        assert_eq!(layer_prefill_split_default(0, 32646, &at(&[32640])), (32640, false));
+        assert_eq!(layer_prefill_split_default(100, 5000, &at(&[400])), (5000, true));
+        assert_eq!(layer_prefill_split_default(100, 5000, &at(&[612])), (5000, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[4600])), (4600, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[4488, 9000])), (5000, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[300, 4990])), (5000, true));
+        assert!(layer_prefill_stops_default(7, 7, &[7]).is_empty());
+        assert_eq!(layer_prefill_stops_default(100, 2 * N + 100, &[N + 100]), [N + 100, 2 * N + 100]);
+        assert_eq!(layer_prefill_stops_default(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
+    }
+}
+
+#[cfg(all(test, feature = "prefill-observer", any(feature = "hip", feature = "cuda")))]
+#[path = "layer_prefill_diagnostics.rs"]
+mod layer_prefill_diagnostics;

@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -213,6 +213,9 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
     // expert banks) must see the memory this process tree may actually use.
     push("host-memory-bytes", straydog_engine::host::host_memory_bytes().to_string());
+    for file in straydog_engine::host::memory_limit_files() {
+        push("host-memory-limit-file", file.display().to_string());
+    }
     push("data-dir", settings.data_dir.display().to_string());
     if let Some(gib) = settings.expert_ram {
         push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
@@ -231,6 +234,43 @@ pub fn missing_trees(settings: &Settings) -> Result<bool, String> {
     Ok(trees(settings)?.iter().any(|tree| !tree.is_file()))
 }
 
+/// `--check-model`: whether the model the settings name loads as it is, said in one line. Every
+/// pinned file is there at its size, and each verity tree is there with the pinned digest at its
+/// top. Nothing is hashed, built, written or downloaded: a program updating Straydog asks the new
+/// executable this before it serves, since pins that changed would only fail once loading began.
+pub fn check_model(settings: &Settings) -> Result<String, String> {
+    use straydog_engine::{bundle, verity};
+    let sized = |path: &Path, asset: &bundle::Asset| match std::fs::metadata(path) {
+        Ok(found) if found.len() == asset.bytes => Ok(()),
+        Ok(found) => Err(format!("{}: {} bytes where the pinned file has {}", path.display(), found.len(), asset.bytes)),
+        Err(exc) => Err(format!("{}: {exc}", path.display())),
+    };
+    let files = bundle::verity_files_in(&settings.model, settings.bundle)?;
+    for (path, asset, digest) in &files {
+        sized(path, asset)?;
+        let tree = bundle::tree_path(&settings.data_dir, asset);
+        if !tree.is_file() {
+            return Err(format!("no verity tree {}: the server would build it first, hashing {}", tree.display(), path.display()));
+        }
+        verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(digest)?, verity::BLOCK)
+            .map_err(|exc| format!("{exc} (not the pinned {})", asset.name))?;
+    }
+    let (resources, drafter) = if settings.bundle.is_on_demand() {
+        (bundle::on_demand(settings.bundle)?.resources, None)
+    } else {
+        let pins = bundle::bundle(settings.bundle)?;
+        (pins.resources, settings.model_draft.as_ref().map(|directory| (directory.join(&pins.drafter.name), pins.drafter)))
+    };
+    for asset in &resources {
+        sized(&settings.model.join(&asset.name), asset)?;
+    }
+    if let Some((path, asset)) = &drafter {
+        sized(path, asset)?;
+    }
+    let count = files.len() + resources.len() + usize::from(drafter.is_some());
+    Ok(format!("Straydog model ready: {} in {} ({count} files)", settings.bundle, settings.model.display()))
+}
+
 /// The worker's isolated command (its trees must exist).
 pub fn worker_command(settings: &Settings) -> Result<Command, String> {
     straydog_isolation::worker_command(&worker_args(settings), &exposure(settings)?)
@@ -240,10 +280,11 @@ pub fn worker_command(settings: &Settings) -> Result<Command, String> {
 /// key file, and the shards' verity trees in the data directory.
 pub fn exposure(settings: &Settings) -> Result<straydog_isolation::Exposure, String> {
     use straydog_engine::bundle;
-    let trees = trees(settings)?;
+    let mut trees = trees(settings)?;
     if let Some(tree) = trees.iter().find(|tree| !tree.is_file()) {
         return Err(format!("no verity tree {}: it is built at the server's start, or by `straydog verify`", tree.display()));
     }
+    trees.extend(straydog_engine::host::memory_limit_files());
     let tree_directory = Some(settings.data_dir.join("verity")).filter(|directory| directory.is_dir());
     if settings.bundle.is_on_demand() {
         let pins = bundle::on_demand(settings.bundle)?;
@@ -446,7 +487,12 @@ fn prefill_summary(usage: &Value, timings: &Value) -> String {
     match (fresh, timings["prefill_seconds"].as_f64()) {
         (Some(fresh), Some(seconds)) => {
             let rate = if fresh >= PREFILL_RATE_TOKENS && seconds > 0.0 { format!(" ({:.0} tok/s)", fresh as f64 / seconds) } else { String::new() };
-            format!("new {fresh} in {:.0} ms{rate}", seconds * 1e3)
+            // (the batches it ran in, and how wide: a partially resident prompt streams nearly every expert outside the slots once a batch)
+            let batches = match (timings["prefill_batches"].as_u64(), timings["prefill_batch_rows"].as_u64()) {
+                (Some(batches), Some(rows)) if batches > 0 => format!(" in {batches} batch{} of up to {rows} rows", if batches == 1 { "" } else { "es" }),
+                _ => String::new(),
+            };
+            format!("new {fresh} in {:.0} ms{rate}{batches}", seconds * 1e3)
         }
         (Some(fresh), None) => format!("new {fresh}"),
         _ => "new -".into(),
@@ -482,8 +528,9 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// few seconds through a day of serving, and each request's line already says how many hints were taken and left.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
-     "Straydog prefix", "Straydog conversation", "Straydog CPU experts", "Straydog GPU read-only host registration:",
-     "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog cannot lock more banks", "Straydog drafts:"]
+     "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
+     "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
+     "Straydog row proofs:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -509,8 +556,59 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         .map(|((count, ms), rows)| format!(", {count} of {rows} ({ms:.1} ms)")).collect();
     // (where a drafter is: the drafts a pass offered at the end of the request, which the engine chooses by what its passes cost)
     let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
+    let order = if timings["prefill_order"] == "layer" {
+        // (the passes through every layer, each reading the banks, and the rows a pass takes at most)
+        let passes = match (timings["prefill_layer_passes"].as_u64(), timings["prefill_layer_rows"].as_u64()) {
+            (Some(passes), Some(rows)) => format!(" in {passes} passes of up to {rows} rows,"),
+            _ => String::new(),
+        };
+        // (the hidden rows to the GPU and back: their bytes and the wall time of the copies)
+        let number = |key: &str| timings[key].as_f64();
+        let moved = match (number("prefill_rows_up_bytes"), number("prefill_rows_up_seconds"), number("prefill_rows_down_bytes"),
+                           number("prefill_rows_down_seconds")) {
+            (Some(up), Some(up_seconds), Some(down), Some(down_seconds)) =>
+                format!(", hidden rows up {:.1} GB in {up_seconds:.1} s and down {:.1} GB in {down_seconds:.1} s", up / 1e9, down / 1e9),
+            _ => String::new(),
+        };
+        // (where the pass's rows were: held in VRAM, or on the host and why)
+        let held = match (timings["prefill_rows_vram"] == true, timings["prefill_rows_host_reason"].as_str()) {
+            (true, _) => ", rows held in VRAM".to_string(),
+            (false, Some(reason)) => format!(", rows on the host ({reason})"),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+    } else {
+        // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
+        let policy = &timings["layer_prefill_policy"];
+        match (policy["selected"].as_bool(), policy["layer_batch_rows"].as_u64()) {
+            (Some(false), Some(rows)) => {
+                let gib = |key: &str| policy[key].as_f64().map_or("-".into(), |bytes| format!("{:.1} GiB", bytes / (1u64 << 30) as f64));
+                format!("; layer order not taken: {rows} rows a batch, banks {}, room {}", gib("bank_bytes"), gib("bank_room"))
+            }
+            _ => String::new(),
+        }
+    };
+    // (decode passes the assist's round timed, one row each with no drafts: this request's decode rate is not its usual)
+    let round = timings["assist_round_passes"].as_u64().filter(|passes| *passes > 0)
+        .map_or_else(String::new, |passes| format!("; assist round: {passes} passes timed"));
+    // (passes of a probe of the drafts' width chooser, at a width not in force)
+    let probe = timings["drafts_probe_passes"].as_u64().filter(|passes| *passes > 0)
+        .map_or_else(String::new, |passes| format!("; drafts probe: {passes} passes at another width"));
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
-        (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
+        (Some(resident), Some(available)) => {
+            // (what the drive gave back for faults while it ran: Windows counts every process's)
+            let read_back = detail["fault_read_pages"].as_u64().map_or_else(String::new, |pages| {
+                let whose = if detail["fault_reads_system"] == true { " (every process)" } else { "" };
+                format!(", {:.2} GB read back from the drive{whose}", pages as f64 * 4096.0 / 1e9)
+            });
+            let limit = detail["working_set_limit_gib"].as_f64().map_or_else(String::new, |gib| format!(", working set limit {gib:.1} GiB"));
+            let kv = match (detail["kv_positions"].as_u64(), detail["kv_gib"].as_f64()) {
+                (Some(positions), Some(gib)) => format!(", K/V {positions} positions {gib:.2} GiB in {}", if detail["kv_host"] == true { "host memory" } else { "VRAM" }),
+                _ => String::new(),
+            };
+            format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults{read_back}{limit}{kv}",
+                    detail["page_faults"].as_u64().unwrap_or(0))
+        }
         _ => String::new(),
     };
     // (Windows: the hints that read a layer's cold experts ahead, taken while the machine paged and left when it did not)
@@ -518,12 +616,15 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         .map_or_else(String::new, |counts| format!("; read-ahead: {} taken, {} left", counts[0].as_u64().unwrap_or(0), counts[1].as_u64().unwrap_or(0)));
     // (where the GPU may take some of the CPU's routes: the level the engine's measuring left in force, 0 to the most)
     let assist = detail["assist"].as_u64().map_or_else(String::new, |level| format!(" (level {level})"));
-    // (what "other" is made of, where the engine timed the step: the head, the first layer, the PLE rows' wait and layer, and what the layers
-    // spent beyond the wait and the CPU; a part under 0.05 ms is left out)
+    // (what "other" is made of, where the engine timed the step: the draft, the head, the first layer with the PLE,
+    // the acceptance and the commit, and what the layers spent beyond the wait and the CPU; a part under 0.05 ms is left out.
+    // Older metrics named the first layer and the PLE apart; those still add into first/PLE.)
     let steps = &detail["steps_ms"];
-    let parts: Vec<String> = [("head", steps["head"].as_f64()), ("first layer", steps["first layer"].as_f64()), ("PLE wait", steps["PLE wait"].as_f64()),
-                              ("PLE", steps["PLE"].as_f64()), ("in layers", steps["layers"].as_f64().map(|layers| (layers - wait - cpu).max(0.0)))]
-        .into_iter().filter_map(|(name, ms)| ms.filter(|ms| *ms >= 0.05).map(|ms| format!("{name} {ms:.1}"))).collect();
+    let ms = |key: &str| steps[key].as_f64().unwrap_or(0.0);
+    let parts: Vec<String> = [("draft", ms("draft")), ("head", ms("head")),
+                              ("first/PLE", ms("first/PLE") + ms("first layer") + ms("PLE wait") + ms("PLE")),
+                              ("accept", ms("accept")), ("in layers", (ms("layers") - wait - cpu).max(0.0))]
+        .into_iter().filter_map(|(name, ms)| (ms >= 0.05).then(|| format!("{name} {ms:.1}"))).collect();
     let other_parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
     // (the CPU's time by the engine's phases: gate and up, the products, down with the weighted sum; the rest is the call's own)
     let cpu_parts = detail["cpu_phases_ms"].as_array().filter(|ms| ms.len() == 3 && cpu >= 0.05).map_or_else(String::new, |ms| {
@@ -536,7 +637,7 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}{round}{probe}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -575,10 +676,16 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         prefill_summary(usage, timings),
         number(&timings["ttft_seconds"], 2),
-        // (of which restoring a checkpoint and saving the request's: copies of the whole state)
+        // (of which restoring a checkpoint and saving the request's: copies of the whole state; and what is neither the prompt's reading
+        // nor that: encoding the rendered conversation, growing the K/V, putting the expert slots back)
         match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
             (restore, save) if restore + save >= 0.05 => format!(" (checkpoints: restore {restore:.2} s, save {save:.2} s)"),
             _ => String::new(),
+        } + &{
+            let parts: Vec<String> = [("encode", "encode_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
+                .into_iter().filter_map(|(name, key)| timings[key].as_f64().filter(|seconds| *seconds >= 0.05).map(|seconds| format!("{name} {seconds:.2} s")))
+                .collect();
+            if parts.is_empty() { String::new() } else { format!(" (besides reading: {})", parts.join(", ")) }
         },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
@@ -604,7 +711,7 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         // (the experts' other costs in the prefill)
         match &timings["prefill_store"] {
-            store if store.is_object() => format!("; prefill store: {} write-backs, {} host-tier drops ({} below its budget), {} of {} prefetched unused, waits {:.3} s for reads, {:.3} s for slots, {:.3} s pinning",
+            store if store.is_object() => format!("; prefill store: {} write-backs, {} host-tier drops ({} while it was still filling), {} of {} prefetched unused, waits {:.3} s for reads, {:.3} s for slots, {:.3} s pinning",
                                                   count(&store["writebacks"]), count(&store["host_drops"]), count(&store["host_drops_short"]),
                                                   count(&store["prefetch_unused"]), count(&store["prefetched"]),
                                                   store["wait_seconds"].as_f64().unwrap_or(0.0), store["slot_wait_seconds"].as_f64().unwrap_or(0.0),
@@ -1842,6 +1949,86 @@ mod tests {
                 "{summary}");
     }
 
+    /// Decides: a log alone tells a prompt's batches, the time beside its reading, a layer order not taken and an assist round (the questions
+    /// 2026-11-11's investigation answered from the API's timings or rebuilt diagnostic binaries).
+    #[test]
+    fn a_request_line_says_what_its_prompt_did_besides_the_tokens() {
+        let detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                            "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 23408.0});
+        let event = json!({"event": "done", "tokens": [], "usage": {"prompt_tokens": 250387, "cached_tokens": 249988, "completion_tokens": 291},
+            "timings": {"prefill_tokens": 399, "prefill_seconds": 5.657, "prefill_batches": 2, "prefill_batch_rows": 256, "ttft_seconds": 6.08,
+                        "encode_seconds": 0.337, "rebalance_seconds": 0.423, "kv_growth_seconds": 0.01, "decode_tokens_per_second": 46.4,
+                        "assist_round_passes": 63,
+                        "layer_prefill_policy": {"selected": false, "layer_batch_rows": 128, "bank_bytes": 42283827200u64, "bank_room": 49477619712u64},
+                        "partial_detail": detail}});
+        let line = request_summary(&event, None);
+        assert!(line.contains("new 399 in 5657 ms (71 tok/s) in 2 batches of up to 256 rows"), "{line}");
+        assert!(line.contains("first token 6.08 s (besides reading: encode 0.34 s, slots back 0.42 s)"), "{line}");
+        assert!(line.contains("; layer order not taken: 128 rows a batch, banks 39.4 GiB, room 46.1 GiB"), "{line}");
+        assert!(line.contains("; assist round: 63 passes timed"), "{line}");
+    }
+
+    /// Decides: the memory a request ended with says what the drive gave back for faults while it ran (Windows: every process's), the
+    /// working set's limit in force and the K/V's capacity, and a request whose passes probed another drafts width says so, still one line;
+    /// a line from an engine that reports none of them reads as before (2026-11-11's investigation took them with scripts of its own).
+    #[test]
+    fn a_request_line_says_what_memory_held_and_what_the_drive_gave_back() {
+        let detail = |extra: Value| {
+            let mut detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                                    "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 0.0,
+                                    "resident_gib": 23.4, "available_gib": 4.0, "page_faults": 1741229});
+            for (key, value) in extra.as_object().unwrap() {
+                detail[key] = value.clone();
+            }
+            detail
+        };
+        let event = |detail: Value, probe: u64| json!({"event": "done", "tokens": [],
+            "timings": {"decode_tokens_per_second": 33.7, "drafts_probe_passes": probe, "partial_detail": detail}});
+        let before = request_summary(&event(detail(json!({})), 0), None);
+        assert!(before.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults; ") || before.ends_with("1741229 page faults"), "{before}");
+        assert!(!before.contains("read back") && !before.contains("working set") && !before.contains("K/V") && !before.contains("drafts probe"), "{before}");
+        let windows = request_summary(&event(detail(json!({"fault_read_pages": 1_855_000, "fault_reads_system": true, "working_set_limit_gib": 27.04,
+                                                             "kv_positions": 262144, "kv_gib": 6.5, "kv_host": true})), 12), None);
+        assert!(windows.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults, 7.60 GB read back from the drive (every process), working set limit 27.0 GiB, K/V 262144 positions 6.50 GiB in host memory"), "{windows}");
+        assert!(windows.contains("; drafts probe: 12 passes at another width") && windows.lines().count() == 1, "{windows}");
+        // (Linux: the process's own major faults, no working set limit; a K/V the VRAM holds)
+        let linux = request_summary(&event(detail(json!({"fault_read_pages": 2_000, "fault_reads_system": false,
+                                                           "kv_positions": 32768, "kv_gib": 0.81, "kv_host": false})), 0), None);
+        assert!(linux.contains("1741229 page faults, 0.01 GB read back from the drive, K/V 32768 positions 0.81 GiB in VRAM"), "{linux}");
+    }
+
+    /// Decides: a layer-order prompt's line says its passes through every layer and the rows a pass takes at most, beside its batch's
+    /// rows; a line from an engine that does not count them reads as before.
+    #[test]
+    fn a_layer_order_line_says_its_passes() {
+        let detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                            "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 0.0});
+        let event = |extra: Value| {
+            let mut timings = json!({"decode_tokens_per_second": 22.2, "prefill_order": "layer", "prefill_batch_rows": 2048, "partial_detail": detail.clone()});
+            for (key, value) in extra.as_object().unwrap() {
+                timings[key] = value.clone();
+            }
+            json!({"event": "done", "tokens": [], "timings": timings})
+        };
+        let with = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536})), None);
+        assert!(with.contains("; prefill layers first, in 4 passes of up to 65536 rows, 2048 rows a batch"), "{with}");
+        // (and the hidden rows it moved to the GPU and back, where the engine timed them)
+        let moved = request_summary(&event(json!({"prefill_layer_passes": 16, "prefill_layer_rows": 16384, "prefill_rows_up_bytes": 491.2e9,
+                                                  "prefill_rows_up_seconds": 31.04, "prefill_rows_down_bytes": 491.2e9,
+                                                  "prefill_rows_down_seconds": 28.4})), None);
+        assert!(moved.contains("; prefill layers first, in 16 passes of up to 16384 rows, 2048 rows a batch, hidden rows up 491.2 GB in 31.0 s \
+                                and down 491.2 GB in 28.4 s"), "{moved}");
+        assert_eq!(moved.lines().count(), 1);
+        // (the rows held in VRAM, or on the host with why)
+        let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
+        assert!(held.contains("2048 rows a batch, rows held in VRAM"), "{held}");
+        let host = request_summary(&event(json!({"prefill_layer_passes": 2, "prefill_layer_rows": 131072,
+                                                 "prefill_rows_host_reason": "5.00 GiB of rows, 3.50 GiB of VRAM free"})), None);
+        assert!(host.contains("2048 rows a batch, rows on the host (5.00 GiB of rows, 3.50 GiB of VRAM free)"), "{host}");
+        let without = request_summary(&event(json!({})), None);
+        assert!(without.contains("; prefill layers first, 2048 rows a batch"), "{without}");
+    }
+
     /// A partially resident request's line says the assist level its decode ended at, where the GPU may take the CPU's routes.
     #[test]
     fn a_partial_request_line_has_the_assist_level() {
@@ -1915,21 +2102,25 @@ mod tests {
         assert!(plain.contains("CPU 8.5, other 2.2;"), "{plain}");
     }
 
-    /// A partially resident request's "other" is followed by its parts when the engine timed them: the head, the first layer, the PLE
-    /// rows' wait and layer, and what the layers spent beyond the GPU wait and the CPU; a part under 0.05 ms is left out, and a request with
-    /// none known reads as it always did.
+    /// A partially resident request's "other" is followed by its parts when the engine timed them: the draft, the head, the first
+    /// layer with the PLE, the acceptance and the commit, and what the layers spent beyond the GPU wait and the CPU. A part under 0.05 ms
+    /// is left out. One parenthesis. A request with none known reads as it always did. Older metrics that named the first layer and the
+    /// PLE apart still add into first/PLE.
     #[test]
     fn a_partial_request_line_breaks_other_into_its_parts() {
         let detail = |steps: Value| json!({"wait_ms": 42.0, "cpu_ms": 21.5, "gpu_routes": 200.0, "cpu_routes": 180.0, "assisted_routes": 0.0,
                                            "swaps": 3.0, "slots": 900, "passes": [10, 0], "pass_ms": [71.6, 0.0], "steps_ms": steps});
         let event = |steps: Value| json!({"event": "done", "tokens": [], "timings": {"decode_tokens_per_second": 1e3 / 71.6, "partial_detail": detail(steps)}});
-        let steps = json!({"head": 2.1, "first layer": 3.0, "PLE wait": 1.2, "PLE": 0.4, "layers": 64.4});
+        let steps = json!({"head": 2.0, "first layer": 3.0, "PLE wait": 1.0, "PLE": 0.5, "layers": 64.0});
         let line = request_summary(&event(steps.clone()), None);
-        assert!(line.contains("ms a token: GPU wait 42.0, CPU 21.5, other 8.1 (head 2.1, first layer 3.0, PLE wait 1.2, PLE 0.4, in layers 0.9); routes a token:"), "{line}");
+        assert!(line.contains("ms a token: GPU wait 42.0, CPU 21.5, other 8.1 (head 2.0, first/PLE 4.5, in layers 0.5); routes a token:"), "{line}");
         // (a part under 0.05 ms: left out; the layers within the wait and the CPU: no part of their own)
-        let small = request_summary(&event(json!({"head": 2.1, "first layer": 0.049, "PLE wait": 1.2, "PLE": 0.0, "layers": 63.5})), None);
-        assert!(small.contains("other 8.1 (head 2.1, PLE wait 1.2); routes a token:"), "{small}");
-        // (a step not timed, as in a request that verified drafts: the line as before)
+        let small = request_summary(&event(json!({"head": 2.0, "draft": 0.04, "first layer": 0.0, "PLE wait": 1.0, "PLE": 0.0, "layers": 63.5})), None);
+        assert!(small.contains("other 8.1 (head 2.0, first/PLE 1.0); routes a token:"), "{small}");
+        // (a pass of drafts: the same parenthesis, draft and accept included, a part under 0.05 ms left out)
+        let drafted = request_summary(&event(json!({"draft": 4.0, "head": 1.5, "first/PLE": 2.0, "accept": 0.04, "layers": 70.0})), None);
+        assert!(drafted.contains("other 8.1 (draft 4.0, head 1.5, first/PLE 2.0, in layers 6.5); routes a token:"), "{drafted}");
+        // (a step not timed: the line as before)
         for none in [json!({}), Value::Null] {
             let plain = request_summary(&event(none), None);
             assert!(plain.contains("other 8.1; routes a token:"), "{plain}");
@@ -1938,7 +2129,7 @@ mod tests {
         let mut profiled = event(steps);
         profiled["timings"]["decode_profile"] = json!({"step: head": 2.1, "step: layers (first device)": 64.4});
         let line = request_summary(&profiled, None);
-        assert!(line.contains("in layers 0.9); routes a token:") && line.contains("; decode phases (ms a token): step: layers (first device) 64.400, step: head 2.100"), "{line}");
+        assert!(line.contains("in layers 0.5); routes a token:") && line.contains("; decode phases (ms a token): step: layers (first device) 64.400, step: head 2.100"), "{line}");
     }
 
     /// The ready line says whether DSpark is placed, and with how many experts a stage.

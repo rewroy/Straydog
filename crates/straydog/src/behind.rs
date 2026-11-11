@@ -2,8 +2,8 @@
 //! resident model's expert banks.
 //!
 //! The app starts the engine when it opens, and the person then types for a while: neither step has to be done before the engine says
-//! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary when
-//! a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request never waits for a layer's turn,
+//! ready. Both run on a thread of the worker, the warm-up first (it holds the engine for its passes, and stops at the next pass boundary, or the next layer of
+//! a prompt's pass, when a request comes), then the locking (it holds the engine only to hand the model what it has locked: a request never waits for a layer's turn,
 //! and the turns give way to a request that is generating). A third thread reads the layers to be locked ahead of the locking, at a low
 //! priority ([`read_ahead_behind`]), so that the pages a request finds in the layers not locked yet are in memory.
 
@@ -17,6 +17,51 @@ use straydog_engine::banks::Piece;
 /// pass, or does not begin. A static because the engine is behind the lock the warm-up holds, and the request loop is generic over its
 /// engine.
 pub(crate) static ARRIVED: AtomicBool = AtomicBool::new(false);
+
+/// When the first request that takes the engine came, in milliseconds on the process's clock (the log says how long the warm-up kept it waiting).
+static ARRIVAL: Arrival = Arrival::new();
+
+/// The process's clock for [`ARRIVAL`]: it starts at the first reading.
+static CLOCK: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn clock_ms() -> u64 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// A request that takes the engine has been read: [`ARRIVED`] is set (the warm-up behind "ready" lets go of the engine), and the time of the
+/// first one is kept. Every place that sets [`ARRIVED`] does it through this.
+pub(crate) fn arrive() {
+    // (the time first, so that whoever sees the flag finds it)
+    ARRIVAL.mark(clock_ms());
+    ARRIVED.store(true, Ordering::SeqCst);
+}
+
+/// Milliseconds since the first request came (None: none has).
+pub(crate) fn waited_ms() -> Option<u64> {
+    ARRIVAL.waited(clock_ms())
+}
+
+/// The moment of the first request, on a clock of milliseconds (kept as the reading plus one: zero is none yet).
+struct Arrival(std::sync::atomic::AtomicU64);
+
+impl Arrival {
+    const fn new() -> Arrival {
+        Arrival(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// A request came at `now`; one that came before it stays the first.
+    fn mark(&self, now: u64) {
+        let _ = self.0.compare_exchange(0, now.saturating_add(1), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Milliseconds from the first request to `now` (None: none came).
+    fn waited(&self, now: u64) -> Option<u64> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            marked => Some(now.saturating_sub(marked - 1)),
+        }
+    }
+}
 
 /// Whether the warm-up has yet to end (it is set before "ready" is sent): what takes the engine in the background waits for it, not
 /// taking it for a request's.
@@ -48,7 +93,7 @@ pub(crate) fn warm_up_over() -> Option<serde_json::Value> {
 pub(crate) enum WarmedUp {
     /// Both passes ran to their ends.
     Done,
-    /// A request came, and the model was reset at the pass boundary it was seen at.
+    /// A request came, and the model was reset where it was seen (at a pass boundary, or between the layers of a prompt's pass).
     CutShort,
     /// A request had the engine first.
     Skipped,
@@ -117,15 +162,35 @@ enum Held {
     Gone,
 }
 
-/// Look at the engine's lock without keeping it (nor a strong reference to the engine, so that it can end while the locking waits).
+/// Look at the engine's lock without keeping it (nor a strong reference to the engine, so that it can end while the locking waits). With
+/// STRAYDOG_LOCK_DURING_PREFILL=1 a request that runs a prompt in layer order does not hold the locking back ([`lock_during_prefill`]).
 fn held<S>(engine: &Weak<Mutex<S>>) -> Held {
+    held_unless(engine, || lock_during_prefill() && straydog_engine::model::LAYER_PREFILL_ACTIVE.load(Ordering::SeqCst))
+}
+
+/// [`held`], with a request that has the engine taken as free while `passing` says so.
+fn held_unless<S>(engine: &Weak<Mutex<S>>, passing: impl Fn() -> bool) -> Held {
     let Some(alive) = engine.upgrade() else { return Held::Gone };
     let state = match alive.try_lock() {
         Ok(_) => Held::Free,
+        Err(TryLockError::WouldBlock) if passing() => Held::Free,
         Err(TryLockError::WouldBlock) => Held::Busy,
         Err(TryLockError::Poisoned(_)) => Held::Gone,
     };
     state
+}
+
+/// Whether the locking takes its turns while a request runs a prompt in layer order (STRAYDOG_LOCK_DURING_PREFILL=1, to measure): such a
+/// prompt reads every layer's banks pass after pass, and a layer locked meanwhile stays in memory for the passes after it, where the locking
+/// otherwise waits the guard's 20 s a layer (a 250K prompt on Windows with 64 GB: some 15 layers locked in its 317 s). A generating request is
+/// waited for as ever.
+fn lock_during_prefill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lock_during_prefill_named(std::env::var("STRAYDOG_LOCK_DURING_PREFILL").ok().as_deref()))
+}
+
+fn lock_during_prefill_named(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on"))
 }
 
 /// Why a layer could not be locked.
@@ -845,6 +910,25 @@ mod tests {
         assert!(!hold_warm_start(&state), "the warm-up is over: the warm start begins at once");
     }
 
+    /// Decides: the time the first request came is kept, the wait is counted from it, and a later request does not move it.
+    #[test]
+    fn the_first_requests_arrival_is_kept_and_the_wait_counts_from_it() {
+        let arrival = Arrival::new();
+        assert_eq!(arrival.waited(5_000), None, "no request has come");
+        // (a request at the very start of the clock is not taken for none)
+        arrival.mark(0);
+        assert_eq!(arrival.waited(0), Some(0));
+        assert_eq!(arrival.waited(6_900), Some(6_900));
+        arrival.mark(2_000);
+        assert_eq!(arrival.waited(6_900), Some(6_900), "the first request stays the first");
+        let later = Arrival::new();
+        later.mark(11_900);
+        later.mark(12_500);
+        assert_eq!(later.waited(18_800), Some(6_900));
+        // (a clock read before the arrival does not wrap)
+        assert_eq!(later.waited(11_000), Some(0));
+    }
+
     /// Decides: a request that comes while the warm-up holds the engine waits for a pass at most: the warm-up sees it and lets go.
     #[test]
     fn a_request_waits_for_a_pass_of_the_warm_up_at_most() {
@@ -1115,5 +1199,37 @@ mod tests {
             true
         }, || u64::MAX, |_| Ok(()));
         assert_eq!((done.asked, done.stopped), (200, Some(AheadStop::Engine)));
+    }
+}
+
+#[cfg(test)]
+mod prefill_locking_tests {
+    use super::{held_unless, lock_during_prefill_named, Held};
+    use std::sync::{Arc, Mutex};
+
+    /// Decides: STRAYDOG_LOCK_DURING_PREFILL=1 (or true, on) lets the locking take its turns while a request runs a prompt in layer order;
+    /// unset or anything else keeps it waiting for every request, as before.
+    #[test]
+    fn the_locking_goes_on_during_a_layer_order_prompt_only_when_asked() {
+        assert!(lock_during_prefill_named(Some("1")) && lock_during_prefill_named(Some(" true ")) && lock_during_prefill_named(Some("on")));
+        for off in [None, Some("0"), Some(""), Some("yes please")] {
+            assert!(!lock_during_prefill_named(off), "{off:?}");
+        }
+    }
+
+    /// Decides: a request that has the engine holds the locking back unless it is running a prompt in layer order (and the locking was asked
+    /// to go on then); a free engine is free and an ended one gone, either way.
+    #[test]
+    fn a_request_in_a_layer_order_prompt_does_not_hold_the_locking_back() {
+        let engine = Arc::new(Mutex::new(0u32));
+        let weak = Arc::downgrade(&engine);
+        assert!(matches!(held_unless(&weak, || false), Held::Free));
+        assert!(matches!(held_unless(&weak, || true), Held::Free));
+        let guard = engine.lock().unwrap();
+        assert!(matches!(held_unless(&weak, || false), Held::Busy));
+        assert!(matches!(held_unless(&weak, || true), Held::Free));
+        drop(guard);
+        drop(engine);
+        assert!(matches!(held_unless(&weak, || true), Held::Gone));
     }
 }

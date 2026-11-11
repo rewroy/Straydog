@@ -590,6 +590,24 @@ pub fn snapshot_bytes(position: usize, window: usize, layers: usize, dim: usize,
     ((floats + history) * 4) as u64
 }
 
+/// Host bytes a [`Snapshot`] of a sequence at the full `context` holds, the most one ever does: every kv
+/// source's groups at the end of the context (`context / ratio`), the window rings of every layer and
+/// `context` tokens of history, as [`snapshot_bytes`] counts them. (Engines that split the layers each hold their
+/// own copy of the history, 4 bytes a token.)
+pub fn full_snapshot_bytes(hp: &Hparams, context: usize) -> u64 {
+    let groups: Vec<usize> = hp.layers.iter().enumerate()
+        .filter_map(|(layer, plan)| plan.compressed.filter(|c| c.kv_source == layer))
+        .map(|c| context / c.ratio).collect();
+    snapshot_bytes(context, hp.window, hp.layers.len(), hp.head_dim, hp.index_dim, &groups, context)
+}
+
+/// VRAM the index scores of a pass of `rows` rows take on each device: a score for every row and every
+/// position's group of a `context`-token sequence (a ratio-1 source has one a position), F32. Sized for the
+/// whole context: 256 MiB for 256 rows at 262144 tokens, 1 GiB at 1048576.
+pub fn score_bytes(rows: usize, context: usize) -> u64 {
+    (rows * (context + 1) * 4) as u64
+}
+
 /// Positions `first..end` in a ring of `ring` rows: (ring row, rows, rows before it), at most two.
 fn ring_runs(first: usize, end: usize, ring: usize) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
@@ -859,7 +877,6 @@ impl Shard {
         }
         // A batch's new compressed rows and index keys in F32 before they are rounded into the state
         let staging = if sources.is_empty() { None } else { Some(floats(&mut gpu, (b + 2) * (hp.head_dim + hp.index_dim))?) };
-        let max_groups = settings.context + 1;
         let identity: Vec<f32> = (0..r).flat_map(|_| (0..hc).map(|j| f32::from(u8::from(j == 0)))).collect();
         let all_rows: Vec<i32> = (0..b as i32).collect();
         let mut chosen = BTreeMap::new();
@@ -913,7 +930,7 @@ impl Shard {
             group_positions: floats(&mut gpu, b + 1)?,
             index_q: floats(&mut gpu, b * hp.index_heads * hp.index_dim)?,
             index_w: floats(&mut gpu, b * hp.index_heads)?,
-            scores: floats(&mut gpu, b * max_groups)?,
+            scores: gpu.buffer(score_bytes(b, settings.context))?,
             router: floats(&mut gpu, (b + 1) * hp.experts)?,
             all_rows: floats(&mut gpu, b)?,
             engram_rows: floats(&mut gpu, b * hp.engram_columns() * hp.engram.as_ref().map_or(1, |e| e.head_dim))?,
@@ -1875,6 +1892,15 @@ impl<'a, T: Tensors> Engine<'a, T> {
         ops::sum_devices(&devices, &outs, &parts, (rows * w) as u64)
     }
 
+    fn flush_peers(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.shards.len() > 1 {
+            let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+            ops::flush_devices(&devices)?;
+        }
+        Ok(())
+    }
+
     /// Where a device's share of a sublayer's output for a view's rows goes: `out` itself on one
     /// device, else its part.
     fn target(&self, work: &Work, part: usize) -> M {
@@ -2048,6 +2074,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
         }
         // (DS41_PROFILE: a long pass's seconds and phases are logged when it ends)
         let pass_began = (n >= 256).then(|| (std::time::Instant::now(), self.profile.as_ref().map(|(_, phases)| phases.clone())));
+        // A short prompt is a single pass, so there was no earlier next-pass prefetch.
+        // Start its rows before allocating and uploading the stream, keeping the embedding
+        // hints ahead of the deep Engram read queue as prefetch_ahead does for longer prompts.
+        if n > 1 && self.hp.layers[self.settings.layers.clone()].iter().any(|plan| plan.engram.is_some()) {
+            self.prefetch_ahead(tokens, tokens.len())?;
+        }
         self.reserve_state(self.position + n)?;
         self.reserve_rows(n)?;
         self.select_work(n)?;
@@ -2167,7 +2199,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             self.lap(&[("embedding: decode", decoding), ("embedding: upload", total - decoding)]);
         }
         self.stream_rows = stream;
-        if hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
+        if n == 1 && hp.layers[range.clone()].iter().any(|plan| plan.engram.is_some()) {
             self.prefetch_engram(tokens, tokens.len())?;
         }
         self.mark("embedding: Engram reads")?;
@@ -2197,6 +2229,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                                     hc as u64, w as u64, work.stream.base())?;
             }
             if self.link_pass {
+                self.flush_peers()?;
                 for shard in &mut self.shards {
                     if shard.gpu.part_failed()? {
                         return Err(VOID_PASS.into());
@@ -2228,6 +2261,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     shard.gpu.link_status(work.head.at(outputs * part_rows))?;
                 }
             }
+            if link { self.flush_peers()?; }
             self.stamp_pass(n, 1)?;
             let mut failed = false;
             // One read outstanding per device (at most 1 MiB). Queue every device's copy
@@ -2504,6 +2538,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let gate = shard.dense(&name(layer, "engram_gate"))?;
                     shard.gpu.engram_gate(work.stream.base(), work.engram_kv.base(), gate.buffer.base(), rows, hc, w, hp.norm_eps)?;
                 }
+                if link && expanding { self.flush_peers()?; }
                 self.mark("engram")?;
             }
             let attention = self.attention_plan(layer, first, end, kv_from, full_from, saves);
@@ -2557,6 +2592,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     tap_features(&mut self.shards[index], &work, &hp, layer, first, rows as usize, n)?;
                 }
             }
+            if link || merged { self.flush_peers()?; }
             self.views.replay(avoided);
             if !(record && fixed) {
                 self.mark("hyper-connections")?;
@@ -2608,6 +2644,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     hc_ffn(shard, &work, &hp, layer, attended, link)?;
                 }
             }
+            if link { self.flush_peers()?; }
             self.views.replay(avoided);
             if !record {
                 self.mark("hyper-connections")?;
@@ -2920,6 +2957,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                     let work = shard.work.view(first);
                     shard.gpu.part_receive(ACTIVATIONS, work.products[buffer].base() as P, summed as u64 * ff, work.product.base())?;
                 }
+                self.flush_peers()?;
             } else {
                 let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
                 let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
@@ -2946,6 +2984,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
             for shard in &mut self.shards {
                 shard.experts.release(&mut shard.gpu)?;
             }
+            if self.link_pass { self.flush_peers()?; }
         }
         self.mark("routed experts")
     }
@@ -3049,6 +3088,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 let work = shard.work.view(first);
                 shard.gpu.part_receive(ACTIVATIONS, work.products[0].base() as P, (routed_rows + rows) as u64 * ff, work.product.base())?;
             }
+            self.flush_peers()?;
         } else {
             let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
             let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.product.base()).collect();
@@ -3073,6 +3113,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         for shard in &mut self.shards {
             shard.experts.release(&mut shard.gpu)?;
         }
+        if self.link_pass { self.flush_peers()?; }
         self.mark("routed experts")
     }
 

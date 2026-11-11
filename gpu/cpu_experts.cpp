@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include "cpu_read_ahead.hpp"
 #elif defined(_WIN32)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -1185,16 +1186,13 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
         auto* engine = static_cast<Engine*>(handle);
         if (!engine || !ranges || !bytes) throw std::runtime_error("invalid Straydog CPU read-ahead request");
 #if defined(__linux__)
-        uint64_t total = 0;
-        for (uint32_t i = 0; i < count; ++i) total += bytes[i];
-        constexpr uint64_t unit = 128 * 1024;   // one MADV_WILLNEED reads at most the device's largest request
-        engine->workers->run_blocks(size_t((total + unit - 1) / unit), 1, [&](size_t first, size_t last) {
+        // Round each range's chunk count up separately: a chunk never drops the start of the next range.
+        const sd_cpu::ReadAheadRanges chunks(bytes, count);
+        engine->workers->run_blocks(chunks.size(), 1, [&](size_t first, size_t last) {
             for (size_t at = first; at < last; ++at) {
-                uint64_t position = at * unit;
-                uint32_t i = 0;
-                while (position >= bytes[i]) position -= bytes[i++];
-                const uintptr_t begin = uintptr_t(ranges[i] + position), page = begin & ~uintptr_t(4095);
-                madvise(reinterpret_cast<void*>(page), size_t(begin - page + std::min(unit, bytes[i] - position)), MADV_WILLNEED);
+                const auto chunk = chunks.at(at);
+                const uintptr_t begin = uintptr_t(ranges[chunk.range] + chunk.offset), page = begin & ~uintptr_t(4095);
+                madvise(reinterpret_cast<void*>(page), size_t(begin - page + chunk.bytes), MADV_WILLNEED);
             }
         });
 #elif defined(_WIN32)

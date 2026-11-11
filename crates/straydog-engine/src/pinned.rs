@@ -158,6 +158,21 @@ impl Pinned {
         })
     }
 
+    /// Preload the gathered files' checked proof leaves within one shared budget. Call before
+    /// `cache_tables` shares the verifiers with its readers. Each file is counted only once.
+    pub fn preload_row_proofs(&mut self, budget: u64) -> Result<u64, String> {
+        let mut files: Vec<usize> = self.tensors.iter().filter(|(name, _)| gathered(name)).map(|(_, (file, _))| *file).collect();
+        files.sort_unstable();
+        files.dedup();
+        let mut kept = 0;
+        for file in files {
+            if let Some(verifier) = Arc::get_mut(&mut self.verifiers[file]) {
+                kept += verifier.preload_level0(budget.saturating_sub(kept))?;
+            }
+        }
+        Ok(kept)
+    }
+
     /// Read the gathered tables' rows through row caches sharing `budget` bytes instead of the
     /// mapping (0 keeps the mapping), each read's blocks verified between the read and the use.
     pub fn cache_tables(&mut self, budget: u64) -> Result<(), String> {
@@ -517,6 +532,23 @@ mod tests {
         cached.cache_tables(1 << 20).unwrap();
         cached.prefetch_rows("per_layer_token_embd.weight", &wanted).unwrap();
         assert_eq!(cached.rows("per_layer_token_embd.weight", &wanted).unwrap(), expected);
+    }
+
+    #[test]
+    fn row_proof_preload_is_budgeted_and_rows_still_verify_before_use() {
+        let bundle = bundle("resident-proofs");
+        let mut files = open(&bundle).unwrap();
+        assert_eq!(files.preload_row_proofs(0).unwrap(), 0);
+        let proof_bytes = files.preload_row_proofs(1 << 20).unwrap();
+        assert!(proof_bytes > 0 && proof_bytes <= 1 << 20);
+        files.cache_tables(1 << 20).unwrap();
+        let wanted = [110_000, 0, 110_001];
+        assert!(!files.rows("per_layer_token_embd.weight", &wanted).unwrap().is_empty());
+        let changed_row = TABLE_ROWS as u32 - 1;
+        let row = files.tensors["per_layer_token_embd.weight"].1.offset + u64::from(changed_row) * ROW;
+        tamper(&bundle, 1, row);
+        assert!(files.rows("per_layer_token_embd.weight", &[changed_row]).unwrap_err().contains("do not verify"));
+        assert!(files.rows("per_layer_token_embd.weight", &[changed_row]).is_err());
     }
 
     #[test]

@@ -511,6 +511,20 @@ impl Group {
         self.backends[owner].prefill_layers(begin, end, values, position, steps, output_rows)
     }
 
+    /// [`Group::prefill_layers`] with every row written into `output` (`steps` rows of the model's width) rather than a new vector
+    /// ([`Backend::prefill_layers_into`]); a span of parts goes through [`Group::prefill_layers`] and is copied.
+    pub fn prefill_layers_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
+                               output: &mut [f32]) -> Result<()> {
+        if self.in_parts(begin, end) {
+            let rows = self.prefill_layers(begin, end, values, position, steps, steps)?;
+            if rows.len() != output.len() { return Err("invalid Straydog prefill output rows".into()); }
+            output.copy_from_slice(&rows);
+            return Ok(());
+        }
+        let owner = self.owner_of_span(begin, end)?;
+        self.backends[owner].prefill_layers_into(begin, end, values, position, steps, output)
+    }
+
     pub fn prefill_embed(&mut self, layer: usize, embeddings: &[f32]) -> Result<()> {
         if self.in_parts(layer, layer + 1) {
             return self.backends.iter_mut().try_for_each(|backend| backend.prefill_embed(layer, embeddings));
@@ -814,7 +828,7 @@ impl Group {
         let keep_cache = self.backends.len() > 1;
         // Borrowing can grow a batch only as far as 4096 rows. Leave devices alone if the
         // request already uses that many (or more), regardless of their current workspace sizes.
-        if batch >= 4096 {
+        if batch >= crate::gpu::LONG_PREFILL_ROWS {
             return Ok(None);
         }
         for index in 0..self.backends.len() {
@@ -837,6 +851,39 @@ impl Group {
 
     pub fn ensure_slots(&mut self) -> Result<()> {
         self.backends.iter_mut().try_for_each(Backend::ensure_slots)
+    }
+
+    /// Stage-one layer ordering is single-device only.
+    pub fn lend_prefill_head(&mut self) -> Result<()> {
+        if self.backends.len() != 1 || self.parts { return Err("layer prefill requires one device".into()); }
+        self.backends[0].lend_prefill_head()
+    }
+
+    /// The rows [`Group::begin_layer_prefill`] would take for a bank pool of `bytes` once the head is lent (0: it would refuse).
+    pub fn layer_prefill_rows(&self, bytes: u64, staging: bool) -> Result<u64> {
+        if self.backends.len() != 1 || self.parts { return Ok(0); }
+        self.backends[0].layer_prefill_rows(bytes, staging)
+    }
+
+    pub fn begin_layer_prefill(&mut self, bytes: u64, staging: bool) -> Result<Option<u64>> {
+        if self.backends.len() != 1 || self.parts { return Ok(None); }
+        self.backends[0].begin_layer_prefill(bytes, staging)
+    }
+
+    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].load_layer_bank(layer) }
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
+        self.backends[0].load_layer_bank_from(layer, sources)
+    }
+    pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
+    pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
+    pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
+    pub fn prefill_row_transfers(&self) -> Result<[u64; 4]> { self.backends[0].prefill_row_transfers() }
+    pub fn hold_layer_rows(&mut self, rows: u64) -> Result<Option<String>> { self.backends[0].hold_layer_rows(rows) }
+    pub fn put_layer_rows(&mut self, first: u64, rows: &[f32]) -> Result<()> { self.backends[0].put_layer_rows(first, rows) }
+    pub fn get_layer_rows(&mut self, first: u64, rows: &mut [f32]) -> Result<()> { self.backends[0].get_layer_rows(first, rows) }
+    pub fn prefill_rows_held(&mut self, layer: usize, first: u64, steps: u64) -> Result<()> { self.backends[0].prefill_rows_held(layer, first, steps) }
+    pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
+        self.backends[0].prefill_span_held(layer, first, position, steps)
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
@@ -931,6 +978,11 @@ impl Group {
         self.backends.iter_mut().map(|backend| backend.create_expert_slots(crate::model::STAGING_SLOTS, crate::model::SLOTS_MARGIN)).sum()
     }
 
+    /// Every device's expert pool has the page-locked staging mirror. Layer order gathers through it.
+    pub fn expert_slot_mirrors(&self) -> bool {
+        self.backends.iter().all(|backend| backend.expert_slot_mirror())
+    }
+
     pub fn hybrid_supported(&self) -> Result<bool> {
         for backend in &self.backends {
             if !backend.hybrid_supported()? {
@@ -1009,6 +1061,11 @@ impl Group {
     /// Page locks are process-wide; one backend holds them: the device whose context a thread that makes them uses ([`crate::gpu::lock_host_range`]).
     pub fn host_ordinal(&self) -> usize {
         self.backends[0].ordinal
+    }
+
+    /// The ordinals of the group's devices, in the group's order.
+    pub fn ordinals(&self) -> Vec<usize> {
+        self.backends.iter().map(|backend| backend.ordinal).collect()
     }
 
     /// Take the page lock of a range made by [`crate::gpu::lock_host_range`], as the backend's that holds them.
@@ -1270,4 +1327,30 @@ impl Group {
 /// Rows of 10240 in `values`.
 pub fn row_count(values: &[f32]) -> usize {
     values.len() / WIDTH
+}
+
+impl crate::banks::HostPointers for Group {
+    /// Every device that holds the layer reads it from `to` from now on, so two devices that both read a layer read one copy of it. A device that fails
+    /// after others have moved puts them back, and the error says whether every one of them is back on `from` (`restored`: nothing reads `to`) or some
+    /// device could not be put back (it may still read `to`, which the caller then keeps). The failing device itself has not moved: the native call
+    /// changes a plan only after its waits succeeded.
+    fn repoint(&mut self, from: crate::banks::Banks, to: crate::banks::Banks, copy: bool) -> std::result::Result<bool, crate::banks::MoveFailed> {
+        let mut moved = Vec::new();
+        for index in 0..self.backends.len() {
+            match self.backends[index].repoint_banks(from.start[0], to, copy) {
+                Ok(true) => moved.push(index),
+                Ok(false) => {}
+                Err(error) => {
+                    // (a device that does not find its plan where it moved it is not known to be back either)
+                    let stuck = moved.iter().filter(|&&done| !matches!(self.backends[done].repoint_banks(to.start[0], from, !copy), Ok(true))).count();
+                    return Err(if stuck == 0 {
+                        crate::banks::MoveFailed { error, restored: true }
+                    } else {
+                        crate::banks::MoveFailed { error: format!("{error}; {stuck} device(s) could not be put back"), restored: false }
+                    });
+                }
+            }
+        }
+        Ok(!moved.is_empty())
+    }
 }

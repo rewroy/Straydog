@@ -10,6 +10,7 @@ links = "straydog_gpu"
 # One GPU backend; without either, only the bindings compile and nothing can link.
 hip = []
 cuda = []
+prefill-observer = []
 
 [build-dependencies]
 cmake = "0.1"

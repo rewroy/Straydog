@@ -136,6 +136,8 @@ pub struct Weights {
     /// or at the first start), so a file not changed since needs no reading through at a start.
     tree_current: Vec<bool>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
+    /// Per file, once made: the handles the copy mode reads its banks' copies through ([`Weights::bank_file`]).
+    bank_files: Mutex<HashMap<usize, Arc<crate::banks::BankFile>>>,
     /// The F32 routers whose every value is a BF16 value, which go up as BF16 ([`Weights::narrowed`]).
     narrow: std::sync::OnceLock<HashSet<String>>,
     embeddings: Mutex<EmbeddingCache>,
@@ -302,6 +304,7 @@ impl Weights {
             verifiers: Vec::new(),
             tree_current: Vec::new(),
             vectors: Mutex::new(HashMap::new()),
+            bank_files: Mutex::new(HashMap::new()),
             narrow: std::sync::OnceLock::new(),
             embeddings: Mutex::new((HashMap::new(), VecDeque::new())),
         };
@@ -588,6 +591,19 @@ impl Weights {
         Ok(crate::banks::Bank::new(map.as_ptr(), map.len(), tensor.offset, tensor.bytes, self.verifier_of(tensor.file).cloned()))
     }
 
+    /// The handles of the file a tensor lives in, to read a copy of it through ([`crate::banks::Bank::reading`]): made once per file, whichever banks of it ask,
+    /// and only by the copy mode.
+    pub(crate) fn bank_file(&self, name: &str) -> Result<Arc<crate::banks::BankFile>, String> {
+        let file = self.tensor(name)?.file;
+        let mut made = self.bank_files.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = made.get(&file) {
+            return Ok(held.clone());
+        }
+        let handles = Arc::new(crate::banks::BankFile::of(&self.files[file])?);
+        made.insert(file, handles.clone());
+        Ok(handles)
+    }
+
     /// The file a tensor lives in (for read-ahead hints).
     pub fn file_of(&self, name: &str) -> Result<&File, String> {
         Ok(&self.files[self.tensor(name)?.file])
@@ -679,6 +695,8 @@ impl Weights {
         let path = self.paths[file].clone();
         self.maps[file] = Mapped(None);
         let stand_in = self.files[0].try_clone().map_err(|exc| exc.to_string())?;
+        // (a table's file holds no expert, so no handles were made for copying banks from it; were there any, they would keep the file open)
+        self.bank_files.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&file);
         drop(std::mem::replace(&mut self.files[file], stand_in));
         drop(std::fs::OpenOptions::new().read(true).custom_flags(NO_BUFFERING).open(&path));
         let reopened = File::open(&path).map_err(|exc| format!("{}: {exc}", path.display()))?;

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde_json::{json, Map};
 use straydog_engine::arch::deepseek41;
 use straydog_engine::bundle;
-use straydog_engine::model::context_state_bytes;
+use straydog_engine::model::state_per_token as qwen_state_per_token;
 use straydog_engine::pinned::gathered;
 use straydog_gguf::ModelHeader;
 
@@ -30,10 +30,8 @@ fn state_per_token(architecture: &str, header: &ModelHeader) -> Result<u64, Stri
                 .map(|compressed| 2 * (hp.head_dim + hp.index_dim) as u64 / compressed.ratio as u64)
                 .sum())
         }
-        _ => {
-            const CONTEXT: u64 = 262_144;
-            Ok((context_state_bytes(2 * CONTEXT, true) - context_state_bytes(CONTEXT, true)) / CONTEXT)
-        }
+        // (the footprint reads Qwen3.8's from the engine, not from the table: bundle::footprint)
+        _ => Ok(qwen_state_per_token(true)),
     }
 }
 

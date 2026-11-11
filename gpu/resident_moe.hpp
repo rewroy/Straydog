@@ -521,7 +521,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
         for (size_t expert=0;expert<experts;++expert)
-            if (host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
+            if (!plan.layer_prefill && host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
         on_cpu=prompt_cpu_share(d,plan,host_counts.data(),missing);
     }
     // The CPU's routes, expert by expert (before the GPU's work is queued: a download waits for it), and the rows of their tokens
@@ -598,14 +598,21 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             if (finish<=start) return;
             const dim3 gate_grid(10,unsigned(finish-start),moe_block_m/moe_cuda_m);
             const dim3 down_grid(20,unsigned(finish-start),moe_block_m/moe_cuda_m);
-            if (plan.weights[group*3].kind==42 && plan.weights[group*3+1].kind==42)
-                moe_gate_up_mma<true><<<gate_grid,256,0,d.stream>>>(groups,tiles+start,positions,steps,half_input,product);
-            else
-                moe_gate_up_mma<false><<<dim3(10,unsigned(finish-start)),256,0,d.stream>>>(groups,tiles+start,positions,steps,half_input,product);
-            if (plan.weights[group*3+2].kind==42)
-                moe_down_mma<true><<<down_grid,256,0,d.stream>>>(groups,tiles+start,positions,product,outputs);
-            else
-                moe_down_mma<false><<<dim3(20,unsigned(finish-start)),256,0,d.stream>>>(groups,tiles+start,positions,product,outputs);
+            // Each format with a compiled decode has its own kernel (moe_cuda_mode): a switch on the kind for every
+            // sixteen weights made the generic kernel's prefill about ten times the RDNA4 kernels' a routed row.
+            const int gate_kind=plan.weights[group*3].kind, up_kind=plan.weights[group*3+1].kind;
+            const int gate_mode=gate_kind==up_kind ? moe_cuda_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
+            const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
+            #define SD_CUDA_GATE(mode) case mode: moe_gate_up_mma<mode><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,tiles+start,positions,steps,half_input,product); break;
+            #define SD_CUDA_DOWN(mode) case mode: moe_down_mma<mode><<<mode==42 ? down_grid : down_generic,256,0,d.stream>>>( \
+                groups,tiles+start,positions,product,outputs); break;
+            #define SD_CUDA_MODES(X) X(0) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(29) X(42)
+            switch (gate_mode) { SD_CUDA_MODES(SD_CUDA_GATE) }
+            switch (down_mode) { SD_CUDA_MODES(SD_CUDA_DOWN) }
+            #undef SD_CUDA_MODES
+            #undef SD_CUDA_DOWN
+            #undef SD_CUDA_GATE
         };
         if (begin==0 && end==resident_tiles) {
             const size_t shared_begin=end-(host_counts[experts]+moe_block_m-1)/moe_block_m;
@@ -622,6 +629,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     auto meanwhile=[&]() {
         const size_t n=cpu_routes.size();
         if (!n) return;
+        BankReading reading(d);   // (the CPU's workers read the banks' bytes below: sd_hybrid_repoint waits)
         const auto began=std::chrono::steady_clock::now();
         check(hipEventSynchronize(d.prompt_rows));
         const auto computing=std::chrono::steady_clock::now();
@@ -870,6 +878,12 @@ void run_with_helper(Device& d,size_t begin,size_t end,size_t tokens,Owner&& own
     Device& h=*d.link.peer;
     on_device(h.ordinal,[&]() { helper_span(h,begin,end,tokens); });
     owner();
+    // Both graphs can contain a peer wait. Submit only after both were queued: the first
+    // graph's capture/instantiation may otherwise use much of a display GPU's wait timeout.
+#if !defined(__HIPCC__)
+    flush_launches(d);
+    on_device(h.ordinal,[&]() { flush_launches(h); });
+#endif
 }
 void finish_with_helper(Device& d) {
     Device& h=*d.link.peer;
@@ -1024,4 +1038,13 @@ void resident_moe_parts(Device& d,void* handle,size_t layer,size_t steps,const f
     moe_combine_parts<<<dim3(10,unsigned(steps)),256,0,d.stream>>>(moe.outputs,moe.probabilities,moe.selected,moe.groups,
         steps,true,peer_partials(d.link),d.link.index,nullptr,0,nullptr,output);
     check(hipGetLastError());
+    // The owner's rows and the helper's partials each have a peer wait behind them. Both
+    // streams must be queued before either is flushed, including the helper's separate stream.
+#if !defined(__HIPCC__)
+    flush_launches(d);
+    on_device(h.ordinal,[&]() {
+        StreamScope helping(h,h.helper_stream);
+        flush_launches(h);
+    });
+#endif
 }

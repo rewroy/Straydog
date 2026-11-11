@@ -116,6 +116,13 @@ pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) ->
     check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
+/// Submit each device's queued work after both sides of a peer wait have been queued.
+pub fn flush_devices(devices: &[&Backend]) -> Result<()> {
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    // SAFETY: every handle is live, and the native function only queries its stream.
+    check(unsafe { ffi::sd_devices_flush(handles.as_ptr(), handles.len() as u64) })
+}
+
 /// Every device's `outs` (`rows` of `full` FP16 values) = each device's `parts` (rows of its `share`
 /// FP16 columns) at its columns `firsts`: the devices' disjoint columns of one product, gathered
 /// (the peers' read over the peer link, ordered as [`sum_devices`] orders its reads).

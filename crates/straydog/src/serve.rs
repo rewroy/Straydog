@@ -50,7 +50,7 @@ fn drafter_clause(settings: &config::Settings) -> String {
     drafter_phrase(mtp, dspark)
 }
 
-pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool) -> Result<(), String> {
+pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool, check_model: bool) -> Result<(), String> {
     let (options, sources) = config::load(matches, config_file)?;
     let settings = config::resolve(options)?;
     // (the engram table named, from an option or the settings file as well as the variable: what the server's checks and
@@ -70,6 +70,9 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
         }
         return Ok(());
     }
+    if check_model {
+        return runtime::check_model(&settings).map(|line| println!("{line}"));
+    }
     let logs = Arc::new(LogBuffer::default());
     logging(&settings, logs.clone())?;
     if let Some(reason) = straydog_isolation::unavailable_reason() {
@@ -82,7 +85,10 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
     let tokio = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|exc| exc.to_string())?;
     tokio.block_on(async move {
         tracing::info!(
-            "Straydog starting: {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
+            "Straydog starting: {} {} ({}), {} from {}, GPU {}, VRAM {}, context {}, prefill batch {}{}",
+            if cfg!(feature = "cuda") { "CUDA" } else { "HIP" },
+            env!("CARGO_PKG_VERSION"),
+            env!("STRAYDOG_COMMIT"),
             settings.bundle,
             settings.model.display(),
             settings.gpu.iter().map(usize::to_string).collect::<Vec<_>>().join(","),

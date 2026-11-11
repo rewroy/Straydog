@@ -148,13 +148,13 @@ void qsa_attention_gathered(Device& d, void* state, size_t context, size_t base,
             count = (count + 1) / 2;
         }
         if (total * 4 <= capacity) {
-            qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(static_cast<const kv_t*>(state), context, planes, blocks,
+            qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(d.kv_row, static_cast<const kv_t*>(state), context, planes, blocks,
                                                                      kv_stage_rows(d), capacity);
             qsa_renumber_selection<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, steps, selected, first, places);
-            qsa_flash<P><<<dim3(unsigned(count), unsigned(H::kv)), 256, 0, d.stream>>>(kv_stage_rows(d), capacity, base, steps, selected,
+            qsa_flash<P><<<dim3(unsigned(count), unsigned(H::kv)), 256, 0, d.stream>>>(d.kv_row, kv_stage_rows(d), capacity, base, steps, selected,
                                                                                      d.input, output, first);
         } else   // (a stage too small for one token's selection)
-            qsa_flash<P><<<dim3(1, unsigned(H::kv)), 256, 0, d.stream>>>(static_cast<const kv_t*>(state), context, base, steps, selected,
+            qsa_flash<P><<<dim3(1, unsigned(H::kv)), 256, 0, d.stream>>>(d.kv_row, static_cast<const kv_t*>(state), context, base, steps, selected,
                                                                        d.input, output, first);
         first += count;
     }
@@ -231,7 +231,7 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
             qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
-            write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(kv.kv, kv.capacity, position, count, d.input,
+            write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity, position, count, d.input,
                 nullptr, nullptr, kv.mirror, kv.mirror_rows);
             if (batched) {
                 cast_half<<<unsigned((count * Q + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * Q, count * Q);
@@ -258,15 +258,15 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
                     }
                     const bool fits = total * 4 <= capacity;
                     if (fits)
-                        qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(static_cast<const kv_t*>(kv_state), context,
+                        qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(d.kv_row, static_cast<const kv_t*>(kv_state), context,
                                                                                  kv_planes_of(d, kv_state), placed, kv_stage_rows(d), capacity);
                     qsa_flash_wmma<P><<<dim3(unsigned(count), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(
-                        fits ? kv_stage_rows(d) : kv.kv, fits ? capacity : kv.capacity, base + span, span_rows, half + span * Q, union_blocks,
+                        d.kv_row, fits ? kv_stage_rows(d) : kv.kv, fits ? capacity : kv.capacity, base + span, span_rows, half + span * Q, union_blocks,
                         union_masks, union_counts, attended + span * Q, fits ? places : nullptr, unsigned(first));
                     first += count;
                 }
             } else
-                qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(kv.kv, kv.capacity,
+                qsa_flash_wmma<P><<<dim3(unsigned(groups), unsigned(H::kv)), unsigned(qsa_group * 48), 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity,
                     base + span, span_rows, half + span * Q, union_blocks, union_masks, union_counts, attended + span * Q);
         }
 #endif

@@ -47,6 +47,13 @@ pub fn device_count() -> Result<usize> {
     check(unsafe { ffi::sd_device_count() }).map(|count| count as usize)
 }
 
+/// Load the first Qwen prefill GEMM's GPU code before a prompt can need it.
+#[cfg(any(feature = "cuda", feature = "hip"))]
+pub fn prime_qwen_prefill_gemm(ordinal: usize, tokens: usize) -> Result<()> {
+    // SAFETY: the GPU library selects the device and owns the temporary buffers and handle.
+    check(unsafe { ffi::sd_prime_qwen_prefill_gemm(ordinal as c_int, tokens as u64) }).map(drop)
+}
+
 /// A device's name, free and total memory in bytes.
 pub fn device_info(ordinal: usize) -> Result<(String, u64, u64)> {
     let mut name = [0 as std::ffi::c_char; 256];

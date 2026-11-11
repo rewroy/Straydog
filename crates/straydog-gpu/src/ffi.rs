@@ -10,6 +10,12 @@ unsafe extern "C" {
     pub fn sd_device_count() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prime_qwen_prefill_gemm(
+        ordinal: ::std::os::raw::c_int,
+        tokens: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_device_info(
         ordinal: ::std::os::raw::c_int,
         name: *mut ::std::os::raw::c_char,
@@ -106,6 +112,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_allocation_bytes(
+        handle: *mut ::std::os::raw::c_void,
+        pointer: *const ::std::os::raw::c_void,
+        bytes: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_zero(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,
@@ -141,6 +154,19 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_host_unregister(pointer: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_host_alloc_on(
+        ordinal: ::std::os::raw::c_int,
+        bytes: u64,
+        pointer: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_host_free(
+        ordinal: ::std::os::raw::c_int,
+        pointer: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_test_refuse_host(count: u64) -> ::std::os::raw::c_int;
@@ -205,6 +231,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_host_state_supported(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_kv_format(handle: *mut ::std::os::raw::c_void, row: u32) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_kv_stage(
@@ -430,6 +459,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_graph_run(handle: *mut ::std::os::raw::c_void, key: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_devices_flush(
+        handles: *const *mut ::std::os::raw::c_void,
+        devices: u64,
+    ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1693,6 +1728,73 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_bank_allocate(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: u64,
+        storage: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        storage: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_from(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        storage: *mut ::std::os::raw::c_void,
+        bytes: u64,
+        sources: *const *const u8,
+        source_bytes: *const u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_clear(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+pub type sd_prefill_observer = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut ::std::os::raw::c_void,
+        layer: u64,
+        phase: u64,
+        position: u64,
+        rows: u64,
+        width: u64,
+        values: *const f32,
+    ) -> ::std::os::raw::c_int,
+>;
+unsafe extern "C" {
+    pub fn sd_prefill_observe(
+        handle: *mut ::std::os::raw::c_void,
+        observer: sd_prefill_observer,
+        context: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_rows(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        rows: *const f32,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_row_transfers(handle: *mut ::std::os::raw::c_void, out: *mut u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_layer_rows_put(handle: *mut ::std::os::raw::c_void, storage: *mut ::std::os::raw::c_void, first: u64, rows: *const f32,
+                             steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_layer_rows_get(handle: *mut ::std::os::raw::c_void, storage: *mut ::std::os::raw::c_void, first: u64, rows: *mut f32,
+                             steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_prefill_rows_held(handle: *mut ::std::os::raw::c_void, layer: u64, storage: *mut ::std::os::raw::c_void, first: u64,
+                                steps: u64) -> ::std::os::raw::c_int;
+    pub fn sd_prefill_span_held(handle: *mut ::std::os::raw::c_void, begin: u64, end: u64, position: u64, steps: u64,
+                                storage: *mut ::std::os::raw::c_void, first: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_span(
         handle: *mut ::std::os::raw::c_void,
         begin: u64,
@@ -2102,6 +2204,7 @@ unsafe extern "C" {
         cache: u64,
         stage: u64,
         slot_bytes: u64,
+        mirror: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2148,6 +2251,16 @@ unsafe extern "C" {
     pub fn sd_hybrid_unmap(
         handle: *mut ::std::os::raw::c_void,
         gate: *const ::std::os::raw::c_void,
+        found: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_repoint(
+        handle: *mut ::std::os::raw::c_void,
+        from: *const ::std::os::raw::c_void,
+        host: *const *const u8,
+        base: *const *const u8,
+        copy: ::std::os::raw::c_int,
         found: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
@@ -2216,6 +2329,12 @@ unsafe extern "C" {
         handle: *mut ::std::os::raw::c_void,
         slots: *mut u64,
         held: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_cache_bytes(
+        handle: *mut ::std::os::raw::c_void,
+        bytes: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

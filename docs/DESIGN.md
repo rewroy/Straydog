@@ -86,7 +86,7 @@ sees only what isolation exposes:
 - the pinned model and drafter files;
 - the GPU device nodes;
 - a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
-  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_HOST_REGISTER_READ_ONLY`, `STRAYDOG_DIRECT`), one list for bubblewrap and
   the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
 
 ```
@@ -190,6 +190,28 @@ The engine is built in layers:
     anew with each. The working set's limit comes when the locking ends, as it did after the locks. One line: layers, GiB, seconds, seconds
     after ready, whether a request ran meanwhile, how long the turns waited for requests in all and whether the 20 s guard fired, and why it
     stopped if it did.
+  - **Copies where the GPU cannot lock the mapping.** A GPU that cannot register host memory read-only (CUDA's
+    `cudaDevAttrHostRegisterReadOnlySupported` 0: two RTX 3090s on Windows 10, whose every layer's lock failed, so that none of 48 was ever locked and
+    the slots and the prompt read pageable memory) cannot page-lock the model's read-only mapping in place. The start asks each GPU, or takes
+    `STRAYDOG_HOST_REGISTER_READ_ONLY=0` as the answer (a test of this on any machine), says in one line which and why, and from then on every plan is
+    in the copy mode (`LockMode::Copy`), the mapping never offered to the runtime again. A layer's turn then allocates ONE page-locked copy of each of
+    its banks (`hipHostMalloc`, portable and mapped, so every device reads the one copy), copies the bank's bytes from the mapping into it, and
+    checks THE COPY against the file's tree, over the whole blocks around the bank at its file offset (`verity::verify_copy_at`): a page-locked copy
+    cannot change after the check, so the bytes the GPU and the CPU's experts read are the bytes that were checked, which keeps the rule of section 2.
+    A copy that does not match is freed and ends the locking, and the model's service, as a bank that does not match does. Under the engine's lock the
+    plans' host pointers are moved to the copies (`sd_hybrid_repoint`; the one place a bank's bytes are read from: the slots' copies, the prompt's
+    streaming, the CPU experts' gather and routes, the assist's mapping, which then maps the copy), and the layer counts as locked, in the budget,
+    the assist and the give-back. No read-ahead hint is made for a layer held as copies. A give-back moves the plans back to the mapping first, which waits for the
+    device's copy thread and streams and for the CPU's workers, and only then lets the copy go. What makes that safe is the engine's lock (every CPU
+    read of a bank is a synchronous call made under it, so none runs during a give-back) and the device's waits, `bank_readers` among them, which is an
+    error if it does not drain. The model's end does not point the plans back: `Model` has no `Drop`, and its fields drop in their order, the devices
+    (which drain their copy thread and destroy their plans) and the CPU engine before the copies, which is why the copies are declared after them. A
+    failed give-back keeps the copy; a take-over that failed frees it at once if every device is back on the mapping, and keeps it until the model
+    ends if some device could not be put back. The assist maps a copy by the start of its allocation (`host_base`), since a bank begins inside the
+    whole blocks that the copy holds and the runtime maps an allocation by its start; a copy it cannot map is a locked layer that assists nothing, and
+    the log says so (`WARN Straydog host banks: layer N's page-locked copy could not be mapped`). A turn refused with nothing locked is kept by the
+    model (`Refusal`) until the memory available has grown by a layer's banks since, so that no plan of the remaining layers is made after each
+    request to fail at its first layer again.
   - **The read-ahead of the banks to lock.** A layer's turn reads its banks itself, so a request that comes before the locking is done finds the
     layers not locked yet out of memory when the page cache is cold, and reads them by faulting, one fault after another (Linux, 125 GB, UD-IQ1_S: the
     first request at 28 to 31 tok/s with 218,547 page faults, against 49.4 after the locking; Windows, 62 GiB with the cache emptied by a 46 GiB read: 33.2
@@ -404,7 +426,9 @@ The engine holds one sequence.
     window's rows and the incomplete groups' tails go back, since a later position never writes a
     complete group's compressed row or index key. Its copy may go on later; the copies of
     checkpoints above it are made first.
-  - Beyond about 160K tokens a checkpoint no longer fits the budget, and none is saved.
+  - The checkpoints take at most 2 GiB of host memory, or room for two at the full context when that is
+    more: a checkpoint is ~0.85 GB at 262144 tokens and ~3.4 GB at 1048576, so a 1048576-token context
+    gets ~6.3 GiB. A checkpoint over the budget is not saved.
 - **A void pass** (DeepSeek-V4.1: a part link's wait gave up after 10 s, as when the host stalled)
   voids that pass, not the reply: once, the sequence starts over from the checkpoints with the
   tokens already sent as part of its prompt, and the reply goes on.
@@ -1380,7 +1404,7 @@ named as llama-server names it where it has the same setting.
 | `-md, --model-draft DIR` | Qwen3.8's MTP drafter | none |
 | `--mmproj FILE` | Qwen3.8's vision encoder and projector (§8.1) | a `mmproj-*.gguf` in the model's directory or the one above it |
 | `--draft-max N` | most MTP drafts per pass (0 turns MTP off) | 3 with a drafter |
-| `-c, --ctx-size N` | context in tokens, at most 262144 | 262144 |
+| `-c, --ctx-size N` | context in tokens, at most the model's own: Qwen3.8 262144, DeepSeek-V4.1 1048576 | 262144 |
 | `-b, --batch-size N` | prefill batch, 1-4096; DeepSeek-V4.1: up to 32768 | 1024; 4096 with 48 GiB or more of GPU budget; DeepSeek-V4.1: from its GPUs' budgets (§7.2) |
 | `-gpu, --gpu LIST` | GPU ordinals (`-dev`, `--device` also accepted) | `0` |
 | `-sm, --split-mode MODE` | `experts`: every layer split across the GPUs; `layer`: ranges of layers | `experts` |

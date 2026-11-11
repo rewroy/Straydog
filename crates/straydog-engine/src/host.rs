@@ -151,6 +151,67 @@ pub fn available_bytes() -> u64 {
     0
 }
 
+/// The memory the expert banks may hold now beside `pinned` bytes of page-locked state, `locked` bytes of them page-locked already: on
+/// Windows this process's working set (the locked banks and state in it) and what is available (the standby list, where its trimmed bank
+/// pages wait, counts as available; the pages it holds do not); elsewhere what is available, the page cache included, within the cgroup's
+/// limit ([`prefetch_available_bytes`]), and the locked banks, which it leaves out. No reserve is kept from it: it is what the page cache
+/// can hold of the banks, not what may be locked. None where the system does not say.
+pub fn bank_room_now(pinned: u64, locked: u64) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let _ = locked;
+        let available = windows_available().0;
+        (available > 0).then(|| (windows_working_set() + available).saturating_sub(pinned))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pinned;
+        let available = prefetch_available_bytes();
+        (available > 0).then(|| available + locked)
+    }
+}
+
+/// The parent's cgroup counters needed by an isolated worker's prefetch budget. Only these
+/// individual files are exposed read-only; its cgroup namespace need not reveal the hierarchy.
+pub fn memory_limit_files() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        cgroup_limit_files(std::path::Path::new("/proc/self/cgroup"), std::path::Path::new("/sys/fs/cgroup"))
+            .into_iter().flat_map(|limit| {
+                let usage = cgroup_usage_file(&limit);
+                let stat = limit.with_file_name("memory.stat");
+                [Some(limit), usage, Some(stat)].into_iter().flatten()
+            }).filter(|file| file.is_file()).collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+static PREFETCH_LIMITS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Called once by the worker with the parent's read-only cgroup files. Read their current
+/// values when planning, rather than keeping a headroom snapshot from before GPU warm-up.
+pub fn set_prefetch_memory_limits(files: Vec<std::path::PathBuf>) {
+    #[cfg(target_os = "linux")]
+    let _ = PREFETCH_LIMITS.set(files);
+    #[cfg(not(target_os = "linux"))]
+    let _ = files;
+}
+
+/// Memory a speculative bank prefetch may use now. A full cgroup has zero room, not an
+/// unknown/unbounded amount. Windows keeps its existing system-wide available-memory policy.
+pub fn prefetch_available_bytes() -> u64 {
+    let physical = available_bytes();
+    #[cfg(target_os = "linux")]
+    {
+        let files = PREFETCH_LIMITS.get_or_init(memory_limit_files);
+        linux_available(physical, files)
+    }
+    #[cfg(not(target_os = "linux"))]
+    physical
+}
+
 /// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
 /// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
 /// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
@@ -191,6 +252,56 @@ pub fn memory_note() -> Option<(u64, u64, u64)> {
         Some((number(24)? * 4096, available, number(10)? + number(12)?))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
+    None
+}
+
+/// A count of the pages read from the drive for page faults: Windows counts every process's ([`PagingObserver`]'s count,
+/// SystemPerformanceInformation's PageReadCount, 32 bits that wrap), Linux this process's major faults (`/proc/self/stat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaultReads {
+    count: u64,
+    system: bool,
+}
+
+impl FaultReads {
+    /// The pages read back since `before` (a request's beginning), and whether they are every process's.
+    pub fn since(self, before: FaultReads) -> (u64, bool) {
+        let pages = if self.system { u64::from((self.count as u32).wrapping_sub(before.count as u32)) } else { self.count.saturating_sub(before.count) };
+        (pages, self.system)
+    }
+}
+
+/// The pages read from the drive for page faults so far ([`FaultReads`]); None where the system does not say.
+pub fn fault_reads() -> Option<FaultReads> {
+    #[cfg(windows)]
+    {
+        windows_page_reads(windows_available().0).ok().map(|count| FaultReads { count: u64::from(count), system: true })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // (past the command's closing parenthesis: majflt is field 12)
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        fields.get(12 - 3)?.parse::<u64>().ok().map(|count| FaultReads { count, system: false })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    None
+}
+
+/// The upper limit of this process's working set in force now ([`keep_resident`] sets it on Windows), None where none is.
+pub fn working_set_limit_now() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let (mut least, mut most, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: the pseudo handle of this process and places for the three values.
+        if unsafe { GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mut least, &mut most, &mut flags) } == 0 {
+            return None;
+        }
+        (flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE != 0).then_some(most as u64)
+    }
+    #[cfg(not(windows))]
     None
 }
 
@@ -276,11 +387,11 @@ fn working_set_limit(wanted: u64, least: u64, held: u64, available: u64, memory:
     limit.min(wanted).max(least.min(wanted))
 }
 
-/// Nonzero while the machine pages, 0 otherwise: [`keep_resident`] keeps it with every limit it sets, and the CPU engine's read-ahead hint on
+/// Nonzero while the machine pages, 0 otherwise: [`watch_working_set`] observes it from partial residency's start, and the CPU engine's read-ahead hint on
 /// Windows reads it with one load instead of asking the system (`CpuExperts::watch_paging`). The pages the CPU's experts touch are out of
 /// memory only while it does: with RAM to spare the banks stay in the standby list, and a read-ahead of pages already there only costs time
 /// (113 us a layer, 5.4 ms a token, 30.4 to 24.9 tok/s on a machine with RAM to spare). It is set while the system reads the drive for page
-/// faults ([`drive_busy`]), which covers a cold start with memory to spare as well as a working set held at its limit; where the system does
+/// faults ([`PagingObserver`]), which covers a cold start with memory to spare as well as a working set held at its limit; where the system does
 /// not say, while its free memory is short ([`memory_short`]).
 pub static PAGING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -294,18 +405,48 @@ fn memory_short(available: u64, memory: u64, was_short: bool) -> bool {
     available < high || (was_short && available <= high + (high - low))
 }
 
-/// Keeps the working set's limit to what is free, four times a second, whatever the engine is doing: a wide batch reads a gigabyte a second, and
-/// read at each batch the limit came too late (0.47 GiB available). `pinned` follows the K/V.
-pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64) {
+/// Paging is observed while banks are still being locked. Only the quota waits: setting it sooner could trim the pages the locking reads next.
+#[derive(Default)]
+pub struct WorkingSetWatch {
+    quota: std::sync::atomic::AtomicBool,
+}
+
+impl WorkingSetWatch {
+    /// The banks have finished locking; subsequent observations may also adjust the working set.
+    pub fn allow_quota(&self) {
+        self.quota.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(any(windows, test))]
+    fn tick(&self, observe: impl FnOnce(), limit: impl FnOnce()) {
+        observe();
+        if self.quota.load(std::sync::atomic::Ordering::Acquire) {
+            limit();
+        }
+    }
+}
+
+/// Observe paging before ready, then four times a second independently of requests and bank locks. The working-set quota waits for
+/// [`WorkingSetWatch::allow_quota`]. `pinned` follows the K/V. Dropping the model ends its watcher.
+pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64,
+                         watch: &std::sync::Arc<WorkingSetWatch>) {
     #[cfg(windows)]
     {
-        let _ = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
+        let mut paging = PagingObserver::default();
+        let profile = std::env::var_os("DS41_PROFILE").is_some();
+        // Take the baseline here, not after the thread is scheduled or the bank locking ends.
+        paging.observe(memory, profile, false);
+        let watch = std::sync::Arc::downgrade(watch);
+        if let Err(error) = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks);
-        });
+            let Some(watch) = watch.upgrade() else { break };
+            watch.tick(|| paging.observe(memory, profile, watch.quota.load(std::sync::atomic::Ordering::Acquire)), || keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks));
+        }) {
+            eprintln!("WARN Straydog host paging: cannot start the observer: {error}");
+        }
     }
     #[cfg(not(windows))]
-    let _ = (memory, pinned, banks);
+    let _ = (memory, pinned, banks, watch);
 }
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
@@ -336,6 +477,15 @@ pub fn lockable(memory: u64, vram_room: u64) -> u64 {
     }
 }
 
+/// Whether a working-set refusal (the GiB asked, the GiB taken) differs from the one logged last: the watcher asks four times a second, and the
+/// same refusal logged each time took 479 to 500 lines of a run on a 62 GiB PC.
+#[cfg(windows)]
+fn refusal_changed(share: u64, taken: u64) -> bool {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = (share >> 30) << 32 | (taken >> 30);
+    LAST.swap(now, std::sync::atomic::Ordering::Relaxed) != now
+}
+
 /// Ask the system to leave this process what its share of `memory` holds beside `pinned` bytes of
 /// page-locked state: pages it trims from the working set come back one fault at a time under the
 /// CPU's expert threads (Windows at 32 GiB: 800K faults/s and 3 tokens/s at the worst, with no
@@ -353,17 +503,6 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
         let available = windows_available().0;
-        let was_paging = PAGING.load(std::sync::atomic::Ordering::Relaxed) != 0;
-        let paging = drive_busy().unwrap_or_else(|| memory_short(available, memory, was_paging));
-        if paging != was_paging {
-            PAGING.store(u8::from(paging), std::sync::atomic::Ordering::Relaxed);
-            let gib = available as f64 / (1u64 << 30) as f64;
-            if paging {
-                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are read ahead from now");
-            } else {
-                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are no longer read ahead");
-            }
-        }
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
         let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
         let mut wanted = share;
@@ -371,14 +510,16 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
             // SAFETY: the pseudo handle of this process and plain values.
             let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), (wanted / 8 * 7) as usize, wanted as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) };
             if done != 0 {
-                if wanted < share {
+                if wanted < share && refusal_changed(share, wanted) {
                     eprintln!("a working set of {} GiB was refused; {} GiB taken", share >> 30, wanted >> 30);
                 }
                 return;
             }
             wanted = wanted / 4 * 3;
         }
-        eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
+        if refusal_changed(share, 0) {
+            eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
+        }
     }
     #[cfg(not(windows))]
     let _ = (memory, pinned, banks);
@@ -391,37 +532,80 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
 /// mounted root alone then bounds it.
 #[cfg(target_os = "linux")]
 pub fn linux_memory(physical: u64, proc_cgroup: &std::path::Path, cgroup_root: &std::path::Path) -> u64 {
+    cgroup_limit_files(proc_cgroup, cgroup_root).iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok())
+        .fold(physical, u64::min)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_limit_files(proc_cgroup: &std::path::Path, cgroup_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     use std::path::{Component, Path};
-    let Ok(text) = std::fs::read_to_string(proc_cgroup) else { return physical };
-    // From `directory` up to `root`, both included: the smallest limit in `file`.
-    let bounded = |root: &Path, relative: &str, file: &str| -> u64 {
+    let Ok(text) = std::fs::read_to_string(proc_cgroup) else { return Vec::new() };
+    let mut files = Vec::new();
+    let mut collect = |root: &Path, relative: &str, file: &str| {
         let relative = Path::new(relative.trim().trim_start_matches('/'));
         let inside = relative.components().all(|component| matches!(component, Component::Normal(_)));
         let mut directory = if inside { root.join(relative) } else { root.to_path_buf() };
-        let mut total = physical;
         loop {
-            if let Ok(limit) = std::fs::read_to_string(directory.join(file)) {
-                // "max" (v2) is no limit; v1 writes a huge number instead, which min() ignores.
-                if let Ok(limit) = limit.trim().parse::<u64>() {
-                    total = total.min(limit);
-                }
-            }
+            let path = directory.join(file);
+            if path.is_file() { files.push(path); }
             if directory == root || !directory.pop() {
-                return total;
+                break;
             }
         }
     };
-    let mut total = physical;
     for line in text.lines() {
         let mut fields = line.splitn(3, ':');
         let (Some(id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next()) else { continue };
         if id == "0" && controllers.is_empty() {
-            total = total.min(bounded(cgroup_root, path, "memory.max"));
+            collect(cgroup_root, path, "memory.max");
         } else if controllers.split(',').any(|controller| controller == "memory") {
-            total = total.min(bounded(&cgroup_root.join("memory"), path, "memory.limit_in_bytes"));
+            collect(&cgroup_root.join("memory"), path, "memory.limit_in_bytes");
         }
     }
-    total
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_usage_file(limit: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = match limit.file_name()?.to_str()? {
+        "memory.max" => "memory.current",
+        "memory.limit_in_bytes" => "memory.usage_in_bytes",
+        _ => return None,
+    };
+    Some(limit.with_file_name(name))
+}
+
+/// File-backed cache can make room for the bank pages the hint asks for; counting it as committed usage would charge those pages twice.
+/// Keep swap-backed shared memory charged where it is reported: it cannot be dropped like the model's clean file pages.
+#[cfg(target_os = "linux")]
+fn cgroup_file_cache(limit: &std::path::Path) -> u64 {
+    let (file, shmem) = match limit.file_name().and_then(|name| name.to_str()) {
+        Some("memory.max") => ("file", "shmem"),
+        Some("memory.limit_in_bytes") => ("total_cache", "total_shmem"),
+        _ => return 0,
+    };
+    let Ok(stat) = std::fs::read_to_string(limit.with_file_name("memory.stat")) else { return 0 };
+    let value = |key: &str| stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse::<u64>().ok()).flatten()
+    });
+    value(file).unwrap_or(0).saturating_sub(value(shmem).unwrap_or(0))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_available(physical: u64, files: &[std::path::PathBuf]) -> u64 {
+    files.iter().fold(physical, |available, limit| {
+        let Some(usage) = cgroup_usage_file(limit) else { return available };
+        let Some(maximum) = std::fs::read_to_string(limit).ok().and_then(|value| value.trim().parse::<u64>().ok()) else {
+            return available; // "max" is unlimited.
+        };
+        // A finite bound whose usage is unavailable cannot safely fund speculative reads.
+        let current = std::fs::read_to_string(usage).ok().and_then(|value| value.trim().parse::<u64>().ok());
+        available.min(current.map_or(0, |used| maximum.saturating_sub(used.saturating_sub(cgroup_file_cache(limit)))))
+    })
 }
 
 #[cfg(test)]
@@ -673,6 +857,98 @@ mod tests {
         assert_eq!(linux_memory(125 * GIB, &root.join("cgroup"), &root.join("fs")), 125 * GIB);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// The remaining room, including an ancestor's other processes, bounds speculative reads;
+    /// a later plan reads the counters again rather than reusing the first value.
+    #[test]
+    fn prefetch_uses_current_headroom_at_every_cgroup_level() {
+        let root = tree("prefetch_headroom", "0::/a/b\n", &[
+            ("a/memory.max", "17179869184"), ("a/memory.current", "16106127360"),
+            ("a/b/memory.max", "4294967296"), ("a/b/memory.current", "1073741824"),
+            ("memory.max", "max"), ("memory.current", "107374182400"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
+        std::fs::write(root.join("fs/a/memory.current"), (12 * GIB).to_string()).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 3 * GIB);
+        assert_eq!(super::linux_available(2 * GIB, &files), 2 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_cache_does_not_reduce_bank_room_but_other_usage_does() {
+        let root = tree("prefetch_cache", "0::/\n", &[
+            ("memory.max", "34359738368"), ("memory.current", "25769803776"),
+            ("memory.stat", "anon 4294967296\nfile 21474836480\nshmem 0\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 28 * GIB);
+        // More of the same file cached, with no new anonymous allocations: the same room.
+        std::fs::write(root.join("fs/memory.current"), (30 * GIB).to_string()).unwrap();
+        std::fs::write(root.join("fs/memory.stat"), format!("file {}\n", 26 * GIB)).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 28 * GIB);
+        // Eight more GiB of other usage still takes eight GiB from the hint's budget.
+        std::fs::write(root.join("fs/memory.current"), (38 * GIB).to_string()).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 20 * GIB);
+        assert_eq!(super::linux_available(3 * GIB, &files), 3 * GIB);
+        // Shared memory is not clean file cache, even though the file counter includes it.
+        std::fs::write(root.join("fs/memory.stat"), format!("file {}\nshmem {}\n", 26 * GIB, 4 * GIB)).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 16 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_cache_is_counted_at_each_ancestor_and_bad_stats_keep_usage_charged() {
+        let root = tree("prefetch_cache_parent", "0::/a\n", &[
+            ("memory.max", "17179869184"), ("memory.current", "15032385536"), ("memory.stat", "file 4294967296\n"),
+            ("a/memory.max", "8589934592"), ("a/memory.current", "7516192768"), ("a/memory.stat", "file 6442450944\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 6 * GIB);
+        std::fs::write(root.join("fs/memory.stat"), "file invalid\nfile_mapped 99999999999\n").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 2 * GIB);
+        std::fs::remove_file(root.join("fs/memory.stat")).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 2 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_uses_hierarchical_cache_not_the_local_cache() {
+        let root = tree("prefetch_cache_v1", "5:memory:/\n", &[
+            ("memory/memory.limit_in_bytes", "8589934592"), ("memory/memory.usage_in_bytes", "7516192768"),
+            ("memory/memory.stat", "cache 1073741824\ntotal_cache 5368709120\ntotal_shmem 1073741824\n"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 5 * GIB);
+        // A missing hierarchical counter cannot be replaced by this cgroup's local cache.
+        std::fs::write(root.join("fs/memory/memory.stat"), "cache 5368709120\n").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_full_or_unreadable_finite_cgroup_funds_no_prefetch() {
+        let root = tree("prefetch_full", "0::/\n", &[("memory.max", "1073741824"), ("memory.current", "2147483648")]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::remove_file(root.join("fs/memory.current")).unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::write(root.join("fs/memory.current"), "unreadable value").unwrap();
+        assert_eq!(super::linux_available(100 * GIB, &files), 0);
+        std::fs::write(root.join("fs/memory.max"), "max\n").unwrap();
+        assert_eq!(super::linux_available(7 * GIB, &files), 7 * GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_prefetch_room_uses_usage_and_the_namespace_root() {
+        let root = tree("prefetch_v1", "5:memory:/../../outside\n", &[
+            ("memory/memory.limit_in_bytes", "3221225472"), ("memory/memory.usage_in_bytes", "2147483648"),
+        ]);
+        let files = super::cgroup_limit_files(&root.join("cgroup"), &root.join("fs"));
+        assert_eq!(super::linux_available(100 * GIB, &files), GIB);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -717,10 +993,30 @@ pub fn commit_note(step: &str) {
     let _ = step;
 }
 
-/// Pages the system has read from the drive to satisfy page faults since it started (all processes): the 32-bit PageReadCount of
-/// SystemPerformanceInformation, which `Memory\Pages Input/sec` counts. None where the system does not say.
+/// Why the system's page-read counter cannot be used. An unknown sample falls back to free memory, not an assumption that the banks are hot.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageReadError {
+    Query(i32),
+    Short(u32),
+    Layout,
+}
+
+#[cfg(any(windows, test))]
+fn page_reads_of(status: i32, returned: u32, buffer: &[u64; 64], available: u64) -> Result<u32, PageReadError> {
+    if status < 0 { return Err(PageReadError::Query(status)); }
+    if returned < 84 { return Err(PageReadError::Short(returned)); }
+    let available_pages = available / 4096;
+    let reported = buffer[5] >> 32;
+    if available_pages == 0 || reported.abs_diff(available_pages) > available_pages / 10 {
+        return Err(PageReadError::Layout);
+    }
+    Ok((buffer[10] & 0xffff_ffff) as u32)
+}
+
+/// PageReadCount of SystemPerformanceInformation (all processes). AvailablePages at byte 44 guards the layout before the count at byte 80 is used.
 #[cfg(windows)]
-fn windows_page_reads() -> Option<u32> {
+fn windows_page_reads(available: u64) -> Result<u32, PageReadError> {
     #[link(name = "ntdll", kind = "raw-dylib")]
     unsafe extern "system" {
         fn NtQuerySystemInformation(class: u32, information: *mut u64, length: u32, returned: *mut u32) -> i32;
@@ -729,20 +1025,14 @@ fn windows_page_reads() -> Option<u32> {
     let mut returned = 0u32;
     // SAFETY: a buffer of the length given, and a place for the length returned.
     let status = unsafe { NtQuerySystemInformation(2, buffer.as_mut_ptr(), std::mem::size_of_val(&buffer) as u32, &mut returned) };
-    // (the counter lies at byte 80, after four 64-bit counters and twelve 32-bit ones, of which AvailablePages at byte 44 tells the layout is
-    // the one known: it must be what the memory status says, to a tenth)
-    let layout_known = |available_pages: u64| {
-        let status = windows_available().0 / 4096;
-        status > 0 && available_pages.abs_diff(status) <= status / 10
-    };
-    (status >= 0 && returned >= 84 && layout_known(buffer[5] >> 32)).then_some((buffer[10] & 0xffff_ffff) as u32)
+    page_reads_of(status, returned, &buffer, available)
 }
 
 /// Pages a second of the system's reads for page faults from which the drive counts as being read: 25,000 are 100 MB/s, where an idle system
 /// reads tens (serving UD-IQ1_M partially resident reads 40,000 on average, in bursts).
 #[cfg(any(windows, test))]
 const READS_BUSY: f64 = 25_000.0;
-/// Calls of [`drive_busy`] (250 ms apart) that stay under [`READS_BUSY`] before the drive counts as quiet: two seconds.
+/// Observations (250 ms apart) that stay under [`READS_BUSY`] before the drive counts as quiet: two seconds.
 #[cfg(any(windows, test))]
 const QUIET_CALLS: u32 = 8;
 
@@ -752,26 +1042,69 @@ fn quiet_calls(quiet: u32, pages: u32, seconds: f64) -> u32 {
     if f64::from(pages) / seconds >= READS_BUSY { 0 } else { quiet.saturating_add(1) }
 }
 
-/// Whether the drive is being read for page faults: at READS_BUSY pages a second or more over the time since the last call or in the two
-/// seconds before. None where the system does not say. The first call only takes the count.
-#[cfg(windows)]
-fn drive_busy() -> Option<bool> {
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
-    let count = windows_page_reads()?;
-    let now = std::time::Instant::now();
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some((at, before, quiet)) = *last else {
-        *last = Some((now, count, QUIET_CALLS));
-        return Some(false);
-    };
-    let seconds = now.duration_since(at).as_secs_f64();
-    // (calls close together, as when a K/V growth sets the limit, add nothing)
-    if seconds < 0.1 {
-        return Some(quiet < QUIET_CALLS);
+/// Each observer owns its baseline: a query failure invalidates it, so recovery cannot turn a gap into an idle sample.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct PagingObserver {
+    last: Option<(std::time::Instant, u32, u32)>,
+    #[cfg(windows)]
+    error: Option<PageReadError>,
+}
+
+#[cfg(any(windows, test))]
+impl PagingObserver {
+    /// None means the rate is unknown, including the first successful count. It is not a measurement of zero reads.
+    fn sample(&mut self, now: std::time::Instant, count: Result<u32, PageReadError>) -> Option<bool> {
+        let Ok(count) = count else {
+            self.last = None;
+            return None;
+        };
+        let Some((at, before, quiet)) = self.last else {
+            self.last = Some((now, count, QUIET_CALLS));
+            return None;
+        };
+        let seconds = now.duration_since(at).as_secs_f64();
+        if seconds < 0.1 { return Some(quiet < QUIET_CALLS); }
+        let quiet = quiet_calls(quiet, count.wrapping_sub(before), seconds);
+        self.last = Some((now, count, quiet));
+        Some(quiet < QUIET_CALLS)
     }
-    let quiet = quiet_calls(quiet, count.wrapping_sub(before), seconds);
-    *last = Some((now, count, quiet));
-    Some(quiet < QUIET_CALLS)
+
+    #[cfg(windows)]
+    fn observe(&mut self, memory: u64, profile: bool, quota_enabled: bool) {
+        let available = windows_available().0;
+        let count = windows_page_reads(available);
+        let before = self.last;
+        let error = count.err();
+        if error != self.error {
+            if let Some(error) = error {
+                eprintln!("Straydog host paging: page-read query unavailable ({error:?}); using free memory until it recovers");
+            }
+            self.error = error;
+        }
+        if before.is_none() {
+            if let Ok(count) = count {
+                eprintln!("Straydog host paging: first page-read sample {count}; rate unknown until the next sample, using free memory");
+            }
+        }
+        let now = std::time::Instant::now();
+        let busy = self.sample(now, count);
+        let was_paging = PAGING.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        let paging = busy.unwrap_or_else(|| memory_short(available, memory, was_paging));
+        PAGING.store(u8::from(paging), std::sync::atomic::Ordering::Relaxed);
+        if paging != was_paging {
+            let gib = available as f64 / (1u64 << 30) as f64;
+            if paging {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are read ahead from now");
+            } else {
+                eprintln!("Straydog host paging: {gib:.1} GiB available; the CPU's experts are no longer read ahead");
+            }
+        }
+        if profile {
+            let rate = before.zip(count.ok()).map(|((at, old, _), new)| (new.wrapping_sub(old), now.duration_since(at).as_secs_f64()));
+            eprintln!("Straydog host paging sample: count {count:?}, delta {rate:?}, busy {busy:?}, available {available}, quota_enabled {quota_enabled}, paging {}", u8::from(paging));
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -791,4 +1124,83 @@ fn windows_memory() -> u64 {
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: an initialized structure with its length set.
     if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullTotalPhys } else { 0 }
+}
+
+#[cfg(test)]
+mod paging_watch_tests {
+    use super::*;
+    use std::{cell::RefCell, sync::Arc, time::{Duration, Instant}};
+
+    #[test]
+    fn paging_is_observed_before_locks_end_but_the_quota_is_not_set() {
+        let watch = Arc::new(WorkingSetWatch::default());
+        let seen = RefCell::new(Vec::new());
+        let tick = || watch.tick(|| seen.borrow_mut().push("observe"), || seen.borrow_mut().push("quota"));
+        tick();
+        tick();
+        assert_eq!(*seen.borrow(), ["observe", "observe"]);
+        watch.allow_quota();
+        tick();
+        assert_eq!(*seen.borrow(), ["observe", "observe", "observe", "quota"]);
+    }
+
+    #[test]
+    fn a_first_count_and_a_recovered_query_are_unknown_until_a_second_sample() {
+        let mut observer = PagingObserver::default();
+        let at = Instant::now();
+        assert_eq!(observer.sample(at, Ok(100)), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(250), Ok(10_100)), Some(true));
+        assert_eq!(observer.sample(at + Duration::from_millis(500), Err(PageReadError::Query(-1))), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(750), Ok(10_200)), None);
+        assert_eq!(observer.sample(at + Duration::from_secs(1), Ok(10_200)), Some(false));
+    }
+
+    #[test]
+    fn page_read_samples_reject_failed_short_and_unrecognized_layouts() {
+        let mut bytes = [0; 64];
+        bytes[5] = 10_000 << 32;
+        bytes[10] = 123;
+        assert_eq!(page_reads_of(-1, 512, &bytes, 40_960_000), Err(PageReadError::Query(-1)));
+        assert_eq!(page_reads_of(0, 80, &bytes, 40_960_000), Err(PageReadError::Short(80)));
+        assert_eq!(page_reads_of(0, 512, &bytes, 81_920_000), Err(PageReadError::Layout));
+        assert_eq!(page_reads_of(0, 512, &bytes, 40_960_000), Ok(123));
+    }
+
+    #[test]
+    fn a_busy_observer_stays_on_for_two_seconds_and_handles_counter_wrap() {
+        let mut observer = PagingObserver::default();
+        let at = Instant::now();
+        assert_eq!(observer.sample(at, Ok(u32::MAX - 100)), None);
+        assert_eq!(observer.sample(at + Duration::from_millis(250), Ok(10_000)), Some(true));
+        for tick in 2..9 {
+            assert_eq!(observer.sample(at + Duration::from_millis(tick * 250), Ok(10_000)), Some(true));
+        }
+        assert_eq!(observer.sample(at + Duration::from_millis(2250), Ok(10_000)), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod fault_read_tests {
+    use super::FaultReads;
+
+    /// Decides: Linux's count is read from this process's stat (majflt, past the command's parenthesis), not left out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reads_its_major_faults() {
+        let before = super::fault_reads().expect("majflt from /proc/self/stat");
+        assert!(!before.system);
+        assert_eq!(super::fault_reads().unwrap().since(before).1, false);
+    }
+
+    /// Decides: a request's pages read back are the counter's difference: Windows's count of every process's is 32 bits and wraps, and
+    /// a wrap between a request's two readings is no huge read; Linux's is the process's own and never wraps.
+    #[test]
+    fn the_pages_read_back_are_the_counters_difference_across_a_wrap() {
+        let system = |count: u64| FaultReads { count, system: true };
+        assert_eq!(system(1_000_250).since(system(1_000_000)), (250, true));
+        assert_eq!(system(5).since(system(u64::from(u32::MAX) - 10)), (16, true));
+        let own = |count: u64| FaultReads { count, system: false };
+        assert_eq!(own(5_000_000_000).since(own(4_999_999_000)), (1000, false));
+        assert_eq!(own(3).since(own(7)), (0, false));
+    }
 }

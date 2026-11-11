@@ -180,6 +180,8 @@ fn describe(settings: &Settings) -> Value {
     let started = unix_now();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // (the build's commit: a development build repeats its release's version)
+        "commit": env!("STRAYDOG_COMMIT"),
         "backend": if cfg!(feature = "cuda") { "CUDA" } else { "HIP" },
         "started": started,
         "alias": settings.alias,
