@@ -87,22 +87,24 @@ pub(crate) struct Prefetch {
     reader: Arc<Reader>,
     free: Option<Buffer>,
     pending: Option<(usize, JoinHandle<Result<Copy, String>>)>,
+    /// The model's layers registered in place, which are read from the mapping instead.
+    registered: Arc<crate::banks::Registered>,
 }
 
 impl Prefetch {
     /// At most one layer's anonymous copy. Under pressure, or without a pinned
     /// tree, retain the existing authenticated mapping path instead.
-    pub(crate) fn new(weights: &Weights, layers: usize) -> Option<Self> {
+    pub(crate) fn new(weights: &Weights, layers: usize, registered: Arc<crate::banks::Registered>) -> Option<Self> {
         let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
         if bytes as u64 + (1 << 30) > crate::host::prefetch_available_bytes() { return None; }
         let buffer = Buffer::try_new(bytes)?;
-        Some(Self { plans, reader: Reader::shared(), free: Some(buffer), pending: None })
+        Some(Self { plans, reader: Reader::shared(), free: Some(buffer), pending: None, registered })
     }
 
     pub(crate) fn start(&mut self, layer: usize) {
         // (a layer whose banks are registered in place is read from the mapping, whose pages its locks keep: not from the file again)
-        if self.pending.is_some() || crate::banks::registered(layer) { return; }
+        if self.pending.is_some() || self.registered.is_registered(layer) { return; }
         let Some(plan) = self.plans.get(layer).cloned().flatten() else { return };
         let Some(buffer) = self.free.take() else { return };
         let reader = self.reader.clone();
