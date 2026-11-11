@@ -207,7 +207,11 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     if let Some(mib) = settings.row_cache {
         push("row-cache-bytes", (u64::from(mib) << 20).to_string());
     }
-    push("prefill-batch-size", settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()));
+    // (a batch the budgets derived goes as auto, so that the worker and the engine can tell it from one given: only the derived is narrowed)
+    push("prefill-batch-size", match settings.batch_size {
+        Some(batch) if !settings.batch_derived => batch.to_string(),
+        _ => "auto".into(),
+    });
     push("gemm", if settings.gemm == Gemm::Fp16 { "fp16" } else { "fp32" }.into());
     push("gemm-min-batch", settings.gemm_min_batch.to_string());
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
