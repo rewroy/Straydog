@@ -934,6 +934,7 @@ impl Model {
         // GPU kernels read over the bus.
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, settings.prefill_batch_size);
         let mut placement_note = None;
+        let mut resident = false;
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
             // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
             let mut placed = (None, None);
@@ -951,7 +952,13 @@ impl Model {
             placement_note = placed.1;
             if let Some((_, resident_host, resident_batch)) = placed.0 {
                 (host, batch) = (resident_host, resident_batch);
+                resident = true;
             }
+        }
+        // (on 48 GiB of budgets and more, where the server's default is the widest batch, a partial placement keeps what it had at 2048: its
+        // room goes to its expert slots. A smaller budget's batch, and one asked for on a card of that size, are taken as they are.)
+        if !resident && group.memory()?.1 >= WIDE_BATCH_BUDGET {
+            batch = batch.min(NARROW_BATCH);
         }
         let gpu_attention = fits || host;
         if !gpu_attention {
@@ -4366,21 +4373,40 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
     Ok(placed)
 }
 
-/// (drafter kept, K/V in host memory, prefill batch) that lets every weight live on the GPUs,
-/// if any. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
-/// keeping the drafter wins over one that drops it; the configured batch and VRAM K/V first.
-/// The first placement that fits, of: K/V in VRAM (when it is at most a quarter of the budget) at the asked batch, then K/V in host
-/// memory at batches halved to 1024; with the MTP drafter, then without. With it, what the first choice lacked, when it was not taken:
-/// a placement depends on the VRAM left, and the start's line says what a little more would have bought. None fitting, the note says
-/// what the least of them (the last) lacked: what full residency needs.
-fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
-                      -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
+/// The batch a model that is not fully resident keeps of the wider one asked (the 4096 a resident Qwen3.8 on two R9700s is asked for), and the
+/// batch a fully resident one's K/V stays in VRAM at before it moves to host memory at the wider one: what was asked for before 4096.
+const NARROW_BATCH: usize = 2048;
+/// The GPU budgets in all from which the server's default prefill batch is the widest (`resident_batch` in the server's configuration).
+const WIDE_BATCH_BUDGET: u64 = 48 << 30;
+
+/// The placements `resident_placement` tries in order, as (K/V in host memory, prefill batch): K/V in VRAM (when it fits the budget's quarter)
+/// at the asked batch, and at `NARROW_BATCH` if that was wider (a model that fit with its K/V in VRAM at 2048 does not give it up for a wider
+/// batch with the K/V in host memory), then K/V in host memory at batches halved to 1024.
+fn placement_candidates(prefill: usize, vram_kv: bool) -> Vec<(bool, usize)> {
     let mut batches = vec![prefill];
     while *batches.last().unwrap() > 1024 {
         batches.push((batches.last().unwrap() / 2).max(1024));
     }
-    let mut candidates: Vec<(bool, usize)> = if vram_kv { vec![(false, prefill)] } else { Vec::new() };
+    let mut candidates: Vec<(bool, usize)> = Vec::new();
+    if vram_kv {
+        candidates.push((false, prefill));
+        if prefill > NARROW_BATCH {
+            candidates.push((false, NARROW_BATCH));
+        }
+    }
     candidates.extend(batches.iter().map(|batch| (true, *batch)));
+    candidates
+}
+
+/// (drafter kept, K/V in host memory, prefill batch) that lets every weight live on the GPUs,
+/// if any. Full residency (and with it MTP) is worth more than K/V in VRAM; a placement
+/// keeping the drafter wins over one that drops it; the configured batch and VRAM K/V first.
+/// The first placement that fits, of `placement_candidates`; with the MTP drafter, then without. With it, what the first choice lacked, when it was not taken:
+/// a placement depends on the VRAM left, and the start's line says what a little more would have bought. None fitting, the note says
+/// what the least of them (the last) lacked: what full residency needs.
+fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: usize, drafting: bool, vram_kv: bool)
+                      -> Result<(Option<(bool, bool, usize)>, Option<String>)> {
+    let candidates = placement_candidates(prefill, vram_kv);
     let keeps: &[bool] = if drafting { &[true, false] } else { &[false] };
     let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
     for keep in keeps {
@@ -4445,6 +4471,24 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
         return Err("Straydog model PLE placement mismatch".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod placement_candidate_tests {
+    use super::placement_candidates;
+
+    #[test]
+    fn the_wide_batch_keeps_vram_kv_at_the_narrow_one_before_host_kv_at_any() {
+        // (the batch a resident Qwen3.8 is asked for on two R9700s, 4096: K/V in VRAM at 2048 comes before K/V in host memory at 4096)
+        assert_eq!(placement_candidates(4096, true), [(false, 4096), (false, 2048), (true, 4096), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(4096, false), [(true, 4096), (true, 2048), (true, 1024)]);
+        // (the batch asked for until 4096: what fit then still gets what it got)
+        assert_eq!(placement_candidates(2048, true), [(false, 2048), (true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(2048, false), [(true, 2048), (true, 1024)]);
+        assert_eq!(placement_candidates(1024, true), [(false, 1024), (true, 1024)]);
+        assert_eq!(placement_candidates(256, true), [(false, 256), (true, 256)]);
+        assert_eq!(placement_candidates(3000, true), [(false, 3000), (false, 2048), (true, 3000), (true, 1500), (true, 1024)]);
+    }
 }
 
 #[cfg(test)]
