@@ -7,22 +7,26 @@
 // Only the state's products M0^T [k q] and the rank-16 update depend on the state, so the rest is done for every chunk of a launch
 // at once (gdn_chunk_prep: the factor (I+L)^-1 applied to beta v and to diag(beta g), as U and W, and the R-weighted Gram as B), and
 // the scan over the chunks (gdn_chunk_scan) is only products: C = U - W P, out = g S + B C. No division: the decay products are formed
-// as products (in F64, rounded once), so a long-forgotten token underflows to zero where g_t/g_s would not. The arithmetic is F32
-// but for the products against the state, the keys, the queries and W, B and C: those run on the matrix cores in bf16 pieces
-// (gdn_split), three to a value and six of the nine products of a pair summed in F32, which carries about F32's bits. The sums
-// are in another order than the token-by-token scan's, and the order is not neutral: the chunk's C = U - W P and g S + B C subtract
-// large partial results that the token form's dot products do not, so on real activations the outputs are further from an F64
-// scan than the token-by-token scan's, by up to 10x in layers whose state forgets little (README, Numerics). Tokens past a launch's
+// as products (in F64, rounded once; g_end as two floats), so a long-forgotten token underflows to zero where g_t/g_s would not. The
+// arithmetic is F32 but for the products against the state, the keys, the queries and W, B and C: those run on the matrix cores in
+// bf16 pieces (gdn_split), three to a value and six of the nine products of a pair summed in F32, which carries about F32's bits. The
+// sums are in another order than the token-by-token scan's, but the scan's error against an F64 scan is within twice the token scan's
+// on real activations, and far below it where the state forgets little (README, Numerics), because no matrix-core accumulate adds a
+// small sum to a large value: its accumulate of a product sum into an accumulator drops the sum's low bits toward zero (measured:
+// half an F32 spacing a wmma, with errors of up to three spacings), and six of them a chunk shrank a state that forgets little by
+// 1e-7 of itself every chunk, a coherent loss that put the outputs of such heads 10x to 100x further from an F64 scan than the token
+// scan's. So the products start from a zero accumulator (their sums are small against the state) and the state's decay joins them in
+// F32 fused multiply-adds, the decay's own rounding (a coherent 3e-8 a chunk) kept in a second float. Tokens past a launch's
 // end are inert (zero keys, queries and values, decay 1, strength 0), so each chunk is whole.
 #pragma once
 
 constexpr unsigned gdn_chunk_tokens = 16;
 
 // A launch's scratch, in floats from `scratch`: U (token, head, 128), per chunk and head the lower-triangular W and B (16 x 16
-// each) and g, e (16 each: e[s] = R[15][s], what the state update weights token s by), per chunk and key head the keys and
-// queries as bf16 pieces (gdn_piece_floats floats: three planes of 16 rows of 128, 136 apart, for the keys, the same for the
-// queries, and three of 128 rows of 16 tokens, 24 apart, for the keys again, transposed), and last the convolution's history after
-// the launch (its last four inputs).
+// each) and g, e (16 each: e[s] = R[15][s], what the state update weights token s by; e[15] is 1, so its slot holds g_end's low
+// part), per chunk and key head the keys and queries as bf16 pieces (gdn_piece_floats floats: three planes of 16 rows of 128, 136
+// apart, for the keys, the same for the queries, and three of 128 rows of 16 tokens, 24 apart, for the keys again, transposed), and
+// last the convolution's history after the launch (its last four inputs).
 constexpr size_t gdn_piece_floats = (2 * 3 * 16 * 136 + 3 * 128 * 24) / 2;
 template<int P>
 struct GdnChunkLayout {
@@ -207,7 +211,14 @@ __global__ void __launch_bounds__(640) gdn_chunk_prep(const float* rows, const f
             bout[((chunk * H::value + head) * CT + t) * CT + s] = t >= s ? float(r * double(sgq[t * (CT + 1) + s])) : 0.0f;
             sl[(j * CT + t) * CT + s] = t > s ? float(double(sb[j * CT + t]) * r * double(sg[t * (CT + 1) + s])) : 0.0f;
         }
-        vec[((chunk * H::value + head) * 2 + 1) * CT + s] = float(r);
+        // e_s = R[end][s] (e_end is 1 whatever the decays: its slot carries the low part of g_end, which the scan adds as a second float)
+        if (s == CT - 1) {
+            double g = 1.0;
+            for (unsigned t = 0; t < CT; ++t) g *= double(sf[j * CT + t]);
+            vec[((chunk * H::value + head) * 2 + 1) * CT + s] = float(g - double(float(g)));
+        } else {
+            vec[((chunk * H::value + head) * 2 + 1) * CT + s] = float(r);
+        }
     }
     __syncthreads();
     // (I + L) X = rhs by forward substitution, a column to a thread: U's columns (beta v) from the value threads' convolved
@@ -385,21 +396,25 @@ __global__ void __launch_bounds__(192) gdn_chunk_scan(float* state, size_t count
             }
         }
         // M = g M + sum_t k_t (x) (e_t C_t)
-        const float gend = sv[j][0][CT - 1];
+        const float gend = sv[j][0][CT - 1], gend_low = sv[j][1][CT - 1];
         gdn_f8 ce;
         #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) ce[i] = sv[j][1][8 * lh + i] * cr[i];
+        for (unsigned i = 0; i < 8; ++i) ce[i] = (lh == 1 && i == 7 ? 1.0f : sv[j][1][8 * lh + i]) * cr[i];
         gdn_bf8 cb[3];
         gdn_pieces(ce, cb);
         #pragma unroll
         for (unsigned kt = 0; kt < 4; ++kt) {
-            gdn_f8 acc = m[kt] * gend;
             gdn_bf8 a[3];
             #pragma unroll
             for (unsigned k = 0; k < 3; ++k) a[k] = *reinterpret_cast<const gdn_bf8*>(skt + (k * 128 + 64 * hk + 16 * kt + lc) * 24 + 8 * lh);
+            gdn_f8 acc = {};
             acc = gdn_wmma(a[2], cb[0], acc); acc = gdn_wmma(a[1], cb[1], acc); acc = gdn_wmma(a[0], cb[2], acc);
             acc = gdn_wmma(a[1], cb[0], acc); acc = gdn_wmma(a[0], cb[1], acc); acc = gdn_wmma(a[0], cb[0], acc);
-            m[kt] = acc;
+            // the state's own decay is F32 fused multiply-adds (g_end as two floats: its rounding is a coherent loss each chunk), the matrix core's
+            // sum is the small change alone: added into the state itself its accumulation drops the sum's low bits towards zero, a shrinking of the
+            // state each chunk (the outputs of a long-memory head ended 10x to 100x further from an F64 scan than the token scan's)
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) m[kt][i] = fmaf(m[kt][i], gend, fmaf(m[kt][i], gend_low, acc[i]));
         }
         __syncthreads();
         if (chunk + 1 < chunks) GDN_STAGE()
