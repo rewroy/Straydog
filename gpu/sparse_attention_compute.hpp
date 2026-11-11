@@ -424,6 +424,63 @@ __global__ void qsa_mark_blocks(const float* packed, size_t steps, size_t select
         if (i == 0 || size_t(indices[i - 1]) / 4 != block) atomicOr(group + block, 1u << (row % qsa_group));
     }
 }
+// A part's share of a span's indexer (qsa_prefill<2>): the chunks of 256 rows go to the two devices in turn, each scores and selects
+// its own, and the other's rows reach it as their selected blocks alone: the 512 block numbers of a row past 512 complete blocks, as
+// 16 bits each (a context of 262144 tokens has 65536), where the whole selection was 2052 floats. A row of 512 blocks or fewer selects
+// every causal block, and the tail block (the incomplete one, past the last complete) is where the row's position puts it: neither
+// is sent. The marks come out as qsa_mark_blocks' (a bit set is the same bit set in any order).
+constexpr size_t qsa_share_blocks = 512, qsa_share_ids = 4;   // selected blocks a row; a thread's run of them, one 8-byte store
+// qsa_mark_blocks for a chunk whose rows' selection this device made, and the blocks of each row it sends: a row's 512 into slot
+// `slot` halves of the other's inbox, at row `first + token` of the span. `base`: the chunk's first position.
+template<int P = 1>
+__global__ void __launch_bounds__(128) qsa_mark_send(const float* packed, size_t steps, size_t selected, size_t base, size_t first,
+                                                     size_t stride, uint32_t* marks, uint16_t* peer_inbox, const uint32_t* state,
+                                                     size_t slot) {
+    const size_t token = blockIdx.x, index_start = steps * QwenHeads<P>::packed;
+    const float* indices = packed + index_start + token * selected;
+    const size_t row = first + token, position = base + token, complete = (position + 1) / 4;
+    uint32_t* group = marks + row / qsa_group * stride;
+    const uint32_t bit = 1u << (row % qsa_group);
+    const unsigned t = threadIdx.x;
+    if (complete <= qsa_share_blocks) {
+        const size_t count = size_t(packed[index_start + steps * selected + token]);
+        for (size_t i = t; i < count; i += 128) {
+            const size_t block = size_t(indices[i]) / 4;
+            if (i == 0 || size_t(indices[i - 1]) / 4 != block) atomicOr(group + block, bit);
+        }
+        return;
+    }
+    // (the selection is four positions to a block, in block order)
+    uint16_t blocks[qsa_share_ids];
+    #pragma unroll
+    for (unsigned k = 0; k < qsa_share_ids; ++k) {
+        const size_t block = size_t(indices[(t * qsa_share_ids + k) * 4]) / 4;
+        atomicOr(group + block, bit);
+        blocks[k] = uint16_t(block);
+    }
+    uint16_t* to = peer_inbox + size_t((state[0] + 1) & 1) * slot + row * qsa_share_blocks + t * qsa_share_ids;
+    *reinterpret_cast<uint2*>(to) = make_uint2(uint32_t(blocks[0]) | uint32_t(blocks[1]) << 16, uint32_t(blocks[2]) | uint32_t(blocks[3]) << 16);
+    if (t == 0 && complete * 4 <= position) atomicOr(group + complete, bit);
+}
+// The marks of the rows the other device selected (chunks first_chunk, first_chunk + 2, ... of the span's `rows`), from its inbox,
+// after its flag: blockIdx.y the chunk's turn, blockIdx.x the row in it. `base`: the span's first position.
+__global__ void __launch_bounds__(128) qsa_mark_received(size_t base, size_t first_chunk, size_t rows, size_t stride, uint32_t* marks,
+                                                         const uint16_t* inbox, const uint32_t* state, size_t slot) {
+    const size_t row = (first_chunk + 2 * blockIdx.y) * 256 + blockIdx.x;
+    if (row >= rows) return;
+    const size_t position = base + row, complete = (position + 1) / 4;
+    uint32_t* group = marks + row / qsa_group * stride;
+    const uint32_t bit = 1u << (row % qsa_group);
+    const unsigned t = threadIdx.x;
+    if (complete <= qsa_share_blocks) {
+        for (size_t block = t; block <= position / 4; block += 128) atomicOr(group + block, bit);
+        return;
+    }
+    const uint64_t pair = link_load64(inbox + size_t(state[0] & 1) * slot + row * qsa_share_blocks + t * qsa_share_ids);
+    #pragma unroll
+    for (unsigned k = 0; k < qsa_share_ids; ++k) atomicOr(group + ((pair >> (16 * k)) & 0xffffu), bit);
+    if (t == 0 && complete * 4 <= position) atomicOr(group + complete, bit);
+}
 // The union's order: a pair of waves skips 16 keys none of its tokens selected, so blocks are
 // sorted by the pairs that need them (block order within), which gathers a pair's blocks into
 // fewer of those steps (a pair computes 0.3 of them at 131072 tokens, against 0.6 in block order).

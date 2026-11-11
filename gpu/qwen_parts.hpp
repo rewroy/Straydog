@@ -2,8 +2,9 @@
 // (QwenHeads<2>): half of a DeltaNet's heads (8 key heads and the 24 value heads that read them) or of an attention layer's
 // (12 query heads and their K/V head), with their rows of the projections and their columns of the output projection; half of the
 // routed experts; and half of the shared expert's width (rows of gate and up, columns of down). Both keep the whole residual
-// streams and compute the
-// HyperConnections, the router and the attention's indexer alike, so they select the same experts and the same K/V blocks. A
+// streams and compute the HyperConnections and the router alike, so they select the same experts; the attention's indexer alike
+// for a pass's few rows, and for a prompt's chunks shared out in turn (qsa_prefill's), the selected blocks exchanged: both hold the
+// same K/V blocks' marks. A
 // layer's two outputs, the attention's projection and the experts', are each this device's part of a sum the devices add (the
 // SumLink of device_link.hpp) before it goes into the streams; both add the same two values, so their streams stay equal. A
 // part's states are its own: its DeltaNet heads' recurrence and convolution, its K/V head's planes.
@@ -92,13 +93,7 @@ inline BatchRows batch_rows(size_t steps, size_t part) {
 // The exchanges move 8 values a thread into the other's inbox (16-byte stores) and 4 out of this device's (8-byte system-scope
 // loads, never a stale cached line): a 95K prompt's exchanges were 1.2% faster than with a value or two a thread.
 __device__ inline uint32_t qwen_half2_bits(__half2 value) { uint32_t bits; memcpy(&bits, &value, 4); return bits; }
-__device__ inline uint64_t qwen_inbox_bits(const void* at) {
-#if defined(__HIPCC__)
-    return __hip_atomic_load(static_cast<const uint64_t*>(at), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#else
-    return *static_cast<const volatile uint64_t*>(at);
-#endif
-}
+__device__ inline uint64_t qwen_inbox_bits(const void* at) { return link_load64(at); }
 // Four halves of this device's inbox, as floats.
 __device__ inline float4 qwen_inbox_half4(const __half* at) {
     const uint64_t bits = qwen_inbox_bits(at);
@@ -286,6 +281,10 @@ void qwen_gather_mixed(Device& d, const float* local, size_t steps, BatchRows ow
         steps, other.first, other.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed);
     check(hipGetLastError());
 }
+void qsa_share_signal(Device& d) {
+    link_signal_kernel<<<1, 1, 0, d.stream>>>(d.sums.state, d.sums.peer_flag, d.await_timeout);
+    check(hipGetLastError());
+}
 // This device's rows of the residual streams into the other's (`peer_hidden`, its workspace), then the other's flag raised and this
 // device's waited for: every row on both, as F32.
 void qwen_gather_hidden(Device& d, const float* hidden, float* peer_hidden, BatchRows own) {
@@ -428,7 +427,7 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
         gdn_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], steps, chunk, mixed, branch, scratch);
     } else {
         qsa_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], plan.states[2], plan.context, position, steps, mixed,
-                       branch, scratch);
+                       branch, scratch, int(plan.part));
         if (steps > 1) kv_prefetch_from(d, layer + 1, position);
     }
     void* const* second = pointers + 4 + (linear ? 9 : 10);

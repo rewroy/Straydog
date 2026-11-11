@@ -1107,8 +1107,11 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
     prompt's grouped experts run without it and the half beside them as FP16 GEMMs;
   - their rows of the projections and columns of the output projection (`Model::part_operands`,
     gathered at load: a piece of the mapped matrix a run of rows, or a run of every row's columns).
-- **Whole on both:** the residual streams, the HyperConnections, the router and the attention's
-  indexer, so both select the same experts and K/V blocks. The PLE layer runs on both as well.
+- **Whole on both:** the residual streams, the HyperConnections and the router, so both select the same
+  experts; and the attention's indexer, so both select the same K/V blocks (a pass's rows alike; a
+  prompt's chunks of 256 rows go to the devices in turn, and the blocks each selected are sent as 16-bit
+  block numbers, 1 KiB a row, into the other's inbox, so both hold every row's selection). The PLE layer
+  runs on both as well.
 - **Sums.** A layer's attention output and its experts' are each a part of a sum (the SumLink of
   `gpu/device_link.hpp`): a pass's rows in one single-block kernel that sends this device's part,
   raises the other's flag, waits for its own and adds the two parts into the four streams (both add

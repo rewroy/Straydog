@@ -160,11 +160,18 @@ void qsa_attention_gathered(Device& d, void* state, size_t context, size_t base,
     }
 }
 
+// This device's flag in the other's raised and the other's waited for (qwen_parts.hpp: device_link.hpp comes after this file).
+void qsa_share_signal(Device& d);
+
 // Scratch: q/gate 12288 + k/v/index-q 1536 + index-k 128 + attended 6144 + half 3072 floats per row (a part's fewer).
 constexpr size_t qsa_batch_floats = 12288 + 1536 + 128 + 6144 + 3072;
+// `part` (a part's prefill, QwenHeads<2>): which of the two devices this is, when the pair share the indexer (qsa_mark_send): each
+// span of more than one chunk has its chunks scored and selected by one device in turn, and the selected blocks go to the other
+// through the sum link's inbox, so each makes the whole span's marks. The other's selections are waited for by the device's stream,
+// after its own chunks (a part's host must not wait inside a layer).
 template<int P = 1>
 void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_state, void* index_state, void* scores,
-                 size_t context, size_t base, size_t steps, const float* mixed, float* branch, float* scratch) {
+                 size_t context, size_t base, size_t steps, const float* mixed, float* branch, float* scratch, int part = -1) {
     using H = QwenHeads<P>;
     constexpr size_t Q = H::query * 256, K = H::kv * 256;   // a row's attended values (and query rows), its keys
     const size_t rows[6] = {2 * Q, K, K, 512, 128, 2560}, cols[6] = {2560, 2560, 2560, 2560, 2560, Q};
@@ -188,8 +195,15 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
     // span's queries in FP16 where the projections' FP16 inputs were and the block marks and
     // unions in the decode attention scratch.
     const bool batched = d.rdna4 && d.half_gemm && d.attention_scores && steps > 1;
+    // (both devices must take the same exchanges: the decision is the pair's, from what both hold)
+    const Device* peer = d.sums.peer;
+    const bool sharing = P == 2 && part >= 0 && batched && peer && peer->rdna4 && peer->half_gemm && peer->attention_scores &&
+                         context <= 262144 && d.sums.capacity % 8 == 0 && d.sums.capacity == peer->sums.capacity;
     for (size_t span = 0; span < steps; span += 2048) {
         const size_t span_rows = std::min<size_t>(2048, steps - span), groups = (span_rows + qsa_group - 1) / qsa_group;
+        // (a row's blocks as 16 bits in a slot of the inbox: a thousand bytes against the 2560 of a row of the sums)
+        const size_t chunks = (span_rows + 255) / 256;
+        const bool shared = sharing && chunks > 1 && span_rows * qsa_share_blocks * 2 <= d.sums.capacity * 4;
         const size_t stride = (base + span + span_rows) / 4 + 1;
         auto* marks = reinterpret_cast<uint32_t*>(d.attention_scores);
         uint32_t* union_blocks = marks + groups * stride;
@@ -207,6 +221,8 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
         for (size_t first = span; first < span + span_rows; first += 256) {
             const size_t count = std::min<size_t>(256, span + span_rows - first), position = base + first;
             const size_t selected = std::min(position + count, size_t(2052));
+            // (a chunk the other device selects: its normalized index queries and the selection are not this device's to make)
+            const bool own = !shared || (first - span) / 256 % 2 == size_t(part);
             float* chunk_q = qgate + first * 2 * Q;
             float* chunk_iq = iq + first * 512;
             float* chunk_ik = ik + first * 128;
@@ -221,8 +237,8 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             else qsa_normalize<<<unsigned(count * H::kv), 256, 0, d.stream>>>(key + first * K, static_cast<const float*>(pointers[7]), H::kv,
                 256, 256, position, d.input + count * Q);
             check(hipMemcpyAsync(d.input + count * (Q + K), value + first * K, count * K * 4, hipMemcpyDeviceToDevice, d.stream));
-            if (axes) qsa_normalize_axes<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, axes, chunk_iq);
-            else qsa_normalize<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, position, chunk_iq);
+            if (own && axes) qsa_normalize_axes<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, axes, chunk_iq);
+            else if (own) qsa_normalize<<<unsigned(count * 4), 128, 0, d.stream>>>(chunk_iq, static_cast<const float*>(pointers[8]), 4, 128, 128, position, chunk_iq);
             const size_t completed = (position + count) / 4 - position / 4;
             if (completed && axes)
                 qsa_pool_axes<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position,
@@ -230,15 +246,26 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             else if (completed)
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
-            qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
+            if (own) qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
             write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity, position, count, d.input,
                 nullptr, nullptr, kv.mirror, kv.mirror_rows);
             if (batched) {
                 cast_half<<<unsigned((count * Q + 255) / 256), 256, 0, d.stream>>>(d.input, half + first * Q, count * Q);
-                qsa_mark_blocks<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
+                if (!shared)
+                    qsa_mark_blocks<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, count, selected, first - span, stride, marks);
+                else if (own)
+                    qsa_mark_send<P><<<unsigned(count), 128, 0, d.stream>>>(d.input, count, selected, position, first - span, stride, marks,
+                        reinterpret_cast<uint16_t*>(d.sums.peer_inbox), d.sums.state, d.sums.capacity * 2);
             } else if (gathered) qsa_attention_gathered<P>(d, kv_state, context, position, count, selected, attended + first * Q, places, placed);
             else qsa_attention<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q, nullptr, kv.mirror,
                                   kv.mirror_rows);
+        }
+        if (shared) {
+            // The other's chunks' selections: its stores are done before its flag, which this device's stream waits for.
+            qsa_share_signal(d);
+            const size_t theirs = size_t(1 - part), turns = chunks > theirs ? (chunks - theirs + 1) / 2 : 0;
+            qsa_mark_received<<<dim3(256, unsigned(turns)), 128, 0, d.stream>>>(base + span, theirs, span_rows, stride, marks,
+                reinterpret_cast<const uint16_t*>(d.sums.inbox), d.sums.state, d.sums.capacity * 2);
         }
 #if defined(__HIPCC__)
         if (batched) {
