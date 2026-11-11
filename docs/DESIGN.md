@@ -1172,13 +1172,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   One R9700, 512 tokens, QwenHeads<2> shapes, random q/k/v: convolution, normalization, packing and scan 340-385 us,
   the two kernels 187-228 us; against an F64 scan the outputs' largest error is 2.3e-7 to 4.8e-7 of the largest output
   (the token scan's: 1.0e-7 to 2.0e-7). On the activations of a 95K read (4 heads of 12 layers against an F64 scan) the
-  chunked outputs are 2e-6 to 7e-4 of the largest output off, the token scan's 5e-7 to 1.6e-4, both growing with the
-  tokens read (a state that forgets little keeps its rounding): C = U - W P and g S + B C subtract large partial
-  results where the token form's dot products do not, and the F32 form of the chunk on the CPU is as far off as the
-  bf16 one, so it is the form, not the pieces (keys that nearly agree and strengths near 1 cost it 3 to 4 times the
-  token scan's error there; the decay products are formed in F64, which took a head that forgets little from 2.5 times
-  to the token scan's error, and changed nothing on the 95K read's activations). The first logits move as they do for a
-  change of batch width.
+  chunked outputs are 4e-7 to 3.6e-6 of the largest output off, the token scan's 5e-7 to 1.6e-4: within twice the token scan's
+  in every layer, and 10x to 100x below it where the state forgets little. A first version was 2e-6 to 7e-4 off, growing
+  linearly with the tokens read, from two coherent losses a chunk: a matrix core's accumulate of a product sum into a large
+  accumulator (the state, which the update's six chained products were added into) drops the sum's low bits toward zero
+  (measured on an R9700: half an F32 spacing a WMMA, with errors of up to three spacings, so six a chunk shrank the state by
+  1e-7 of itself), and g_end rounded to F32 lost 3e-8 a chunk. The products now start from a zero accumulator, the decay is
+  F32 fused multiply-adds with g_end as two floats, and the real kernel's error matches a staged F64 emulation of the same
+  algorithm (every stage rounded as the GPU rounds it, run on the same activations). The first logits after a 95K read differ
+  from the token scan's by KL 6.7e-4 (242K: 1.6e-5), where the token scan at another batch width differs by 4.4e-2 (1.6e-5).
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
