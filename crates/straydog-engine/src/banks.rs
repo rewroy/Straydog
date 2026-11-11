@@ -510,6 +510,31 @@ fn turn_lowered(priority: Priority) -> Lowered {
     Lowered::begin_reading(priority)
 }
 
+/// The layers whose banks are registered in place (the register mode's locks), one bit a layer: set when a layer's turn has locked and checked them,
+/// cleared when they are given up, whether the model has taken the layer yet or not. A layer-order prompt reads such a layer's banks from the
+/// mapping, whose pages the locks keep in memory, instead of reading them from the file again ([`crate::layer_bank::Prefetch`]).
+static REGISTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn mark_registered(layer: usize, registered: bool) {
+    if layer < 64 {
+        if registered {
+            REGISTERED.fetch_or(1 << layer, Ordering::SeqCst);
+        } else {
+            REGISTERED.fetch_and(!(1u64 << layer), Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether `layer`'s banks are registered in place now ([`REGISTERED`]).
+pub fn registered(layer: usize) -> bool {
+    layer < 64 && REGISTERED.load(Ordering::SeqCst) & (1 << layer) != 0
+}
+
+/// The model gave `layer`'s registrations up (it took them back for memory): its banks are the page cache's again.
+pub fn unregistered(layer: usize) {
+    mark_registered(layer, false);
+}
+
 /// A layer whose banks were page-locked and checked, and whose locks are the caller's until [`Model::banks_locked`](crate::model::Model::banks_locked)
 /// takes them.
 pub struct Locked {
@@ -535,6 +560,7 @@ impl Locked {
     pub unsafe fn unlock(self) {
         if let Some(registrar) = self.registrar {
             BankLocks::release(&registrar, &self.banks);
+            mark_registered(self.layer, false);
         }
     }
 
@@ -757,6 +783,7 @@ impl BankLocks {
             }
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
+        mark_registered(layer, true);
         Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar) })
     }
 
@@ -1902,5 +1929,26 @@ mod tests {
         refusal.note(0, &stop, 3 * GIB, GIB / 2);
         assert!(refusal.blocks_more(0, 3 * GIB + GIB / 2 - 1).is_some());
         assert_eq!(refusal.blocks_more(0, 3 * GIB + GIB / 2), None);
+    }
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::{mark_registered, registered, unregistered};
+
+    /// Decides: a layer is registered in place from its turn until it is given up, by the model or by the locking; the others are not
+    /// touched, and a layer past the mask is never taken as registered. (Layers 60 to 62: the other tests' turns register low ones.)
+    #[test]
+    fn a_layer_is_registered_from_its_turn_until_it_is_given_up() {
+        assert!(!registered(60) && !registered(61));
+        mark_registered(60, true);
+        mark_registered(61, true);
+        assert!(registered(60) && registered(61) && !registered(62));
+        unregistered(60);
+        assert!(!registered(60) && registered(61));
+        mark_registered(61, false);
+        assert!(!registered(61));
+        mark_registered(70, true);
+        assert!(!registered(70));
     }
 }
