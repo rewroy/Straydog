@@ -601,6 +601,13 @@ pub fn full_snapshot_bytes(hp: &Hparams, context: usize) -> u64 {
     snapshot_bytes(context, hp.window, hp.layers.len(), hp.head_dim, hp.index_dim, &groups, context)
 }
 
+/// VRAM the index scores of a pass of `rows` rows take on each device: a score for every row and every
+/// position's group of a `context`-token sequence (a ratio-1 source has one a position), F32. Sized for the
+/// whole context: 256 MiB for 256 rows at 262144 tokens, 1 GiB at 1048576.
+pub fn score_bytes(rows: usize, context: usize) -> u64 {
+    (rows * (context + 1) * 4) as u64
+}
+
 /// Positions `first..end` in a ring of `ring` rows: (ring row, rows, rows before it), at most two.
 fn ring_runs(first: usize, end: usize, ring: usize) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
@@ -870,7 +877,6 @@ impl Shard {
         }
         // A batch's new compressed rows and index keys in F32 before they are rounded into the state
         let staging = if sources.is_empty() { None } else { Some(floats(&mut gpu, (b + 2) * (hp.head_dim + hp.index_dim))?) };
-        let max_groups = settings.context + 1;
         let identity: Vec<f32> = (0..r).flat_map(|_| (0..hc).map(|j| f32::from(u8::from(j == 0)))).collect();
         let all_rows: Vec<i32> = (0..b as i32).collect();
         let mut chosen = BTreeMap::new();
@@ -924,7 +930,7 @@ impl Shard {
             group_positions: floats(&mut gpu, b + 1)?,
             index_q: floats(&mut gpu, b * hp.index_heads * hp.index_dim)?,
             index_w: floats(&mut gpu, b * hp.index_heads)?,
-            scores: floats(&mut gpu, b * max_groups)?,
+            scores: gpu.buffer(score_bytes(b, settings.context))?,
             router: floats(&mut gpu, (b + 1) * hp.experts)?,
             all_rows: floats(&mut gpu, b)?,
             engram_rows: floats(&mut gpu, b * hp.engram_columns() * hp.engram.as_ref().map_or(1, |e| e.head_dim))?,
