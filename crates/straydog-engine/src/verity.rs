@@ -168,15 +168,36 @@ pub fn build(file: &File, tree: &Path, progress: &(dyn Fn(u64) + Sync)) -> std::
     Ok(descriptor_digest(size, &below[0]))
 }
 
+/// How many refusals of a read by the working-set quota in a row are put up with, a short pause after each ([`read_exact_with`]).
+const REFUSED_TRIES: u32 = 5;
+const REFUSED_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     crate::layer_trace::proof_read(buffer.len() as u64);
-    let mut done = 0;
+    read_exact_with(buffer, offset, crate::storage::working_set_quota, &mut |piece, at| crate::storage::read_partial(file, piece, at))
+}
+
+/// Fill `buffer` from `offset` with `read` (which reads into the start of the piece it is given, at the offset it is given, and returns the bytes it got, 0 at the
+/// end of the file). A process whose working set has a hard maximum (Windows, [`crate::host::keep_resident`]) can have a read refused (`refused`: the quota's
+/// error, 1453), the tree's among them, which a check that must pass would take for a failure of the file: after a refusal what is left is read a block at a time,
+/// and a read refused again is tried again after a short pause, [`REFUSED_TRIES`] refusals in a row being put up with and the next one's error returned.
+fn read_exact_with(buffer: &mut [u8], offset: u64, refused: fn(&std::io::Error) -> bool,
+                   read: &mut dyn FnMut(&mut [u8], u64) -> std::io::Result<usize>) -> std::io::Result<()> {
+    let (mut done, mut piece, mut tries) = (0, buffer.len(), 0);
     while done < buffer.len() {
-        let count = crate::storage::read_partial(file, &mut buffer[done..], offset + done as u64)?;
-        if count == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its tree"));
+        let end = (done + piece).min(buffer.len());
+        match read(&mut buffer[done..end], offset + done as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its tree")),
+            Ok(count) => {
+                done += count;
+                tries = 0;
+            }
+            Err(error) if refused(&error) && tries < REFUSED_TRIES => {
+                (piece, tries) = (BLOCK, tries + 1);
+                std::thread::sleep(REFUSED_PAUSE);
+            }
+            Err(error) => return Err(error),
         }
-        done += count;
     }
     Ok(())
 }
@@ -846,6 +867,90 @@ mod resident_tests {
                 assert!(verifier.verify(0, &changed).is_err());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod refused_read_tests {
+    use super::*;
+
+    fn quota(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(1453)
+    }
+
+    /// A read of `source` that `fail` can refuse: it is given the number of the call and the bytes asked, and the calls are kept.
+    fn read_of<'a>(source: &'a [u8], calls: &'a mut Vec<(u64, usize)>, fail: &'a dyn Fn(usize, usize) -> Option<std::io::Error>)
+                   -> impl FnMut(&mut [u8], u64) -> std::io::Result<usize> + 'a {
+        move |piece: &mut [u8], at: u64| {
+            let number = calls.len();
+            calls.push((at, piece.len()));
+            if let Some(error) = fail(number, piece.len()) {
+                return Err(error);
+            }
+            piece.copy_from_slice(&source[at as usize..at as usize + piece.len()]);
+            Ok(piece.len())
+        }
+    }
+
+    /// Decides: a read the working-set quota refused goes on a block at a time from where it was, a block refused again is tried a few times more and then fails
+    /// with the quota's error, and anything else that goes wrong (another error, a file that ends early) is what it was: no retry, no pieces.
+    #[test]
+    fn a_tree_read_the_working_set_refused_goes_on_a_block_at_a_time_and_gives_up_after_a_few_tries() {
+        let size = 3 * BLOCK + 500;
+        let source: Vec<u8> = (0..size + 64).map(|at| (at * 13 % 251) as u8).collect();
+        let refusal = || std::io::Error::from_raw_os_error(1453);
+        let mut buffer = vec![0u8; size];
+        // not refused: one read
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 8, quota, &mut read_of(&source, &mut calls, &|_, _| None)).unwrap();
+        assert_eq!(calls, vec![(8, size)]);
+        assert_eq!(buffer[..], source[8..8 + size]);
+        // the whole refused: the rest in blocks, the last what is left of it
+        buffer.fill(0);
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 8, quota, &mut read_of(&source, &mut calls, &|number, _| (number == 0).then(refusal))).unwrap();
+        let step = BLOCK as u64;
+        assert_eq!(calls, vec![(8, size), (8, BLOCK), (8 + step, BLOCK), (8 + 2 * step, BLOCK), (8 + 3 * step, 500)]);
+        assert_eq!(buffer[..], source[8..8 + size]);
+        // a block refused twice, then read: the same block is asked again, from where it was
+        buffer.fill(0);
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|number, _| matches!(number, 0 | 2 | 3).then(refusal))).unwrap();
+        assert_eq!(calls, vec![(0, size), (0, BLOCK), (step, BLOCK), (step, BLOCK), (step, BLOCK), (2 * step, BLOCK), (3 * step, 500)]);
+        assert_eq!(buffer[..], source[..size]);
+        // refused every time: `REFUSED_TRIES` refusals are put up with, then the quota's own error comes back with the next
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|_, _| Some(refusal()))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(1453));
+        assert_eq!(calls.len(), 1 + REFUSED_TRIES as usize);
+        assert_eq!(calls[1..], vec![(0, BLOCK); REFUSED_TRIES as usize][..], "after the first, a block each, from the start");
+        // another error is returned at once; so is the quota's where nothing is a quota refusal (not Windows)
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|_, _| Some(std::io::Error::from_raw_os_error(5)))).unwrap_err();
+        assert_eq!((error.raw_os_error(), calls.len()), (Some(5), 1));
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, |_| false, &mut read_of(&source, &mut calls, &|_, _| Some(refusal()))).unwrap_err();
+        assert_eq!((error.raw_os_error(), calls.len()), (Some(1453), 1));
+        // a read that gets less than it was asked goes on from there; none at all is the end of the file
+        let mut calls = Vec::new();
+        let mut short = |piece: &mut [u8], at: u64| -> std::io::Result<usize> {
+            calls.push((at, piece.len()));
+            let count = piece.len().min(1000);
+            piece[..count].copy_from_slice(&source[at as usize..at as usize + count]);
+            Ok(count)
+        };
+        read_exact_with(&mut buffer, 0, quota, &mut short).unwrap();
+        assert_eq!(buffer[..], source[..size]);
+        assert_eq!(calls.iter().map(|call| call.0).collect::<Vec<_>>(), vec![0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000]);
+        let error = read_exact_with(&mut buffer, 0, quota, &mut |_, _| Ok(0)).unwrap_err();
+        assert_eq!((error.kind(), error.to_string().as_str()), (std::io::ErrorKind::UnexpectedEof, "file shorter than its tree"));
+        // (and the production read, on a file, is what it was)
+        let path = std::env::temp_dir().join(format!("straydog-refused-{}", std::process::id()));
+        std::fs::write(&path, &source).unwrap();
+        let mut again = vec![0u8; size];
+        read_exact_at(&File::open(&path).unwrap(), &mut again, 8).unwrap();
+        assert_eq!(again[..], source[8..8 + size]);
+        std::fs::remove_file(path).unwrap();
     }
 }
 
