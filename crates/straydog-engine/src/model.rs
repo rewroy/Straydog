@@ -351,8 +351,29 @@ struct AssistScript {
     trace: Vec<(u32, [u64; 3], f64)>,
 }
 
+/// The rows a layer-order pass takes through every layer at most: the prompt's hidden rows it holds (40 KB a row, F32), and the passes a
+/// prompt takes, each of which reads every layer's banks (a 250K prompt on Windows with 64 GB: 16 passes read some 36 GB of banks from the
+/// drive each). STRAYDOG_LAYER_PREFILL_ROWS changes it, to measure ([`layer_prefill_rows`]).
 const LAYER_PREFILL_ROWS: usize = 16384;
 const LAYER_PREFILL_MIN: usize = 512;
+
+/// The rows a layer-order pass takes: [`LAYER_PREFILL_ROWS`], or STRAYDOG_LAYER_PREFILL_ROWS when the process starts (from
+/// [`LAYER_PREFILL_MIN`] to the context's limit; a value outside them, or not a number, keeps the default).
+fn layer_prefill_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref()))
+}
+
+fn layer_prefill_rows_named(value: Option<&str>) -> usize {
+    match value.map(|value| value.trim().replace('_', "").parse::<usize>()) {
+        None => LAYER_PREFILL_ROWS,
+        Some(Ok(rows)) if (LAYER_PREFILL_MIN..=CONTEXT_LIMIT).contains(&rows) => rows,
+        Some(_) => {
+            eprintln!("WARN STRAYDOG_LAYER_PREFILL_ROWS must be a count from {LAYER_PREFILL_MIN} to {CONTEXT_LIMIT}; {LAYER_PREFILL_ROWS} rows a pass");
+            LAYER_PREFILL_ROWS
+        }
+    }
+}
 
 /// Layer order's outcome: fall back to the ordinary path, cancelled, the logits, or done up to a position from which the ordinary path
 /// finishes the prompt (a short last segment, after the layer order has given its VRAM back).
@@ -362,9 +383,9 @@ enum LayerPrefill { Fallback, Cancelled, Ready(Vec<f32>), Continue(usize) }
 /// slots. A segment under [`LAYER_PREFILL_MIN`] runs the ordinary way, which needs them; a short last segment (the reply's opening tokens
 /// after a conversation's checkpoint, as most chat requests end) is left to the ordinary path after the layer order ends, so the layer
 /// order's rows may have the staging slots' VRAM. A short segment before a long one keeps them.
-fn layer_prefill_split(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)]) -> (usize, bool) {
+fn layer_prefill_split(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)], segment: usize) -> (usize, bool) {
     let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
-    let stops = layer_prefill_stops(begin, end, &checkpoints);
+    let stops = layer_prefill_stops(begin, end, &checkpoints, segment);
     let starts: Vec<usize> = [begin].into_iter().chain(stops.iter().copied()).collect();
     let short: Vec<bool> = stops.iter().zip(&starts).map(|(stop, start)| stop - start < LAYER_PREFILL_MIN).collect();
     match short.iter().position(|short| *short) {
@@ -374,8 +395,8 @@ fn layer_prefill_split(begin: usize, end: usize, plan: &[(usize, Vec<&'static st
     }
 }
 
-/// Common positions at which a layer-ordered prompt may stop: checkpoints plus bounded segments.
-fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
+/// Common positions at which a layer-ordered prompt may stop: checkpoints plus segments of at most `segment` rows (a pass's).
+fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize], segment: usize) -> Vec<usize> {
     let mut stops: Vec<usize> = checkpoints.iter().copied().chain([end]).filter(|at| *at > begin && *at <= end).collect();
     stops.sort_unstable();
     stops.dedup();
@@ -383,7 +404,7 @@ fn layer_prefill_stops(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<u
     let mut out = Vec::new();
     for stop in stops {
         while position < stop {
-            position = position.saturating_add(LAYER_PREFILL_ROWS).min(stop);
+            position = position.saturating_add(segment.max(1)).min(stop);
             out.push(position);
         }
     }
@@ -3217,11 +3238,14 @@ impl Model {
         let layer_order = eligible && {
             self.ensure_kv(tokens.len())?;
             let ordinary = self.group.backends[0].ordinary_prefill_rows(batch as u64)? as usize;
-            let (_, staging) = layer_prefill_split(position, tokens.len(), plan);
+            let (_, staging) = layer_prefill_split(position, tokens.len(), plan, layer_prefill_rows());
             let rows = self.group.layer_prefill_rows(self.layer_bank_bytes()?, staging)?;
             let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
             let memory = self.weights.host_memory_bytes;
-            let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?));
+            // (the banks share the memory with the hidden rows a pass holds)
+            let hidden = ((tokens.len() - position).min(layer_prefill_rows()) * WIDTH * 4) as u64;
+            let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?))
+                .map(|room| room.saturating_sub(hidden));
             let selected = self.layer_prefill_forced
                 || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows, LAYER_PREFILL_FITS);
             self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "layer_batch_rows": rows,
@@ -3310,11 +3334,13 @@ impl Model {
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
         let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
-        let count = (tokens.len() - position).min(LAYER_PREFILL_ROWS);
-        let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
+        // (the K/V grown to the prompt first: its growth asks the commit that the hidden rows would take, more of it at more rows a pass)
         self.ensure_kv(tokens.len())?;
+        let segment = layer_prefill_rows();
+        let count = (tokens.len() - position).min(segment);
+        let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
         let bank_bytes = self.layer_bank_bytes()?;
-        let (layer_end, staging) = layer_prefill_split(position, tokens.len(), plan);
+        let (layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
         let preparing = Instant::now();
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
         self.group.lend_prefill_head()?;
@@ -3322,6 +3348,7 @@ impl Model {
             let Some(rows) = self.group.begin_layer_prefill(bank_bytes, staging)? else { return Ok(None) };
             self.last_metrics.insert("prefill_order".into(), json!("layer"));
             self.last_metrics.insert("prefill_batch_rows".into(), json!(rows));
+            self.last_metrics.insert("prefill_layer_rows".into(), json!(segment));
             self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
             self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
             drop(trace_prepare);
@@ -3363,7 +3390,7 @@ impl Model {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
         let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers);
-        for stop in layer_prefill_stops(position, end, &checkpoints) {
+        for stop in layer_prefill_stops(position, end, &checkpoints, layer_prefill_rows()) {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
             let count = stop - begin;
@@ -3378,6 +3405,8 @@ impl Model {
                     self.forward(&tokens[first..(first + batch).min(stop)], false)?;
                 }
             } else {
+                // (a pass through every layer, reading each one's banks)
+                self.metric_count("prefill_layer_passes", 1);
                 self.set_rope(begin, count)?;
                 let rows = &mut hidden[..count * WIDTH];
                 if let Some(reader) = &mut bank_reader { reader.start(0); }
@@ -4556,7 +4585,15 @@ mod same_text_tests {
 }
 #[cfg(test)]
 mod layer_prefill_tests {
-    use super::{layer_prefill_chunks, layer_prefill_split, layer_prefill_stops, LAYER_PREFILL_ROWS as N};
+    use super::{layer_prefill_chunks, layer_prefill_rows_named, layer_prefill_split, layer_prefill_stops, LAYER_PREFILL_MIN, LAYER_PREFILL_ROWS as N};
+
+    fn layer_prefill_stops_default(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
+        layer_prefill_stops(begin, end, checkpoints, N)
+    }
+
+    fn layer_prefill_split_default(begin: usize, end: usize, plan: &[(usize, Vec<&'static str>)]) -> (usize, bool) {
+        layer_prefill_split(begin, end, plan, N)
+    }
 
     #[test]
     fn body_and_draft_share_the_same_odd_tail() {
@@ -4565,26 +4602,62 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_chunks(0, 1024, 512), [(0,512),(512,1024)]);
     }
 
+    /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the
+    /// context's limit; anything else keeps 16,384.
+    #[test]
+    fn the_rows_a_pass_takes_are_the_variables_within_bounds() {
+        assert_eq!(layer_prefill_rows_named(None), N);
+        assert_eq!(layer_prefill_rows_named(Some("65536")), 65_536);
+        assert_eq!(layer_prefill_rows_named(Some("131_072")), 131_072);
+        assert_eq!(layer_prefill_rows_named(Some(" 262144 ")), 262_144);
+        assert_eq!(layer_prefill_rows_named(Some(&LAYER_PREFILL_MIN.to_string())), LAYER_PREFILL_MIN);
+        for refused in ["511", "0", "262145", "many", "", "-1"] {
+            assert_eq!(layer_prefill_rows_named(Some(refused)), N, "{refused}");
+        }
+    }
+
+    /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
+    /// 4 at 65,536 and 1 at 262,144; a checkpoint inside a pass splits it there; the short last segment is left to the ordinary path the same.
+    #[test]
+    fn more_rows_a_pass_take_a_long_prompt_in_fewer_passes() {
+        let passes = |rows: usize| layer_prefill_stops(0, 249_925, &[], rows).len();
+        assert_eq!((passes(N), passes(65_536), passes(131_072), passes(262_144)), (16, 4, 2, 1));
+        assert_eq!(layer_prefill_stops(0, 249_925, &[], 65_536), [65_536, 131_072, 196_608, 249_925]);
+        assert_eq!(layer_prefill_stops(0, 200_000, &[100_000], 65_536), [65_536, 100_000, 165_536, 200_000]);
+        assert_eq!(layer_prefill_stops(1_000, 250_000, &[249_800], 262_144), [249_800, 250_000]);
+        let at = |stops: &[usize]| stops.iter().map(|at| (*at, Vec::new())).collect::<Vec<(usize, Vec<&'static str>)>>();
+        assert_eq!(layer_prefill_split(1_000, 250_000, &at(&[249_800]), 262_144), (249_800, false));
+        assert_eq!(layer_prefill_split(0, 65_537, &at(&[]), 65_536), (65_536, false));
+        assert_eq!(layer_prefill_split(0, 70_000, &at(&[]), 65_536), (70_000, false));
+        // (each pass covers its rows once and the passes cover the prompt)
+        for rows in [LAYER_PREFILL_MIN, N, 65_536, 262_144] {
+            let stops = layer_prefill_stops(5, 249_930, &[], rows);
+            let starts: Vec<usize> = [5].into_iter().chain(stops.iter().copied()).collect();
+            assert!(stops.iter().zip(&starts).all(|(stop, start)| stop > start && stop - start <= rows), "{rows}");
+            assert_eq!(*stops.last().unwrap(), 249_930);
+        }
+    }
+
     #[test]
     fn layer_segments_bound_work_without_crossing_a_checkpoint() {
-        assert_eq!(layer_prefill_stops(0, N, &[]), [N]);
-        assert_eq!(layer_prefill_stops(0, N + 1, &[]), [N, N + 1]);
-        assert_eq!(layer_prefill_stops(0, 2 * N, &[N]), [N, 2 * N]);
-        assert_eq!(layer_prefill_stops(0, N + 1, &[N]), [N, N + 1]);
-        assert_eq!(layer_prefill_stops(0, N + 2, &[N + 1]), [N, N + 1, N + 2]);
+        assert_eq!(layer_prefill_stops_default(0, N, &[]), [N]);
+        assert_eq!(layer_prefill_stops_default(0, N + 1, &[]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops_default(0, 2 * N, &[N]), [N, 2 * N]);
+        assert_eq!(layer_prefill_stops_default(0, N + 1, &[N]), [N, N + 1]);
+        assert_eq!(layer_prefill_stops_default(0, N + 2, &[N + 1]), [N, N + 1, N + 2]);
         // a short last segment is left to the ordinary path after the layer order; a short segment before a long one keeps the staging slots
         let at = |stops: &[usize]| stops.iter().map(|at| (*at, Vec::new())).collect::<Vec<(usize, Vec<&'static str>)>>();
-        assert_eq!(layer_prefill_split(0, 2 * N, &at(&[N])), (2 * N, false));
-        assert_eq!(layer_prefill_split(0, N + 1, &at(&[])), (N, false));
-        assert_eq!(layer_prefill_split(0, 32646, &at(&[32640])), (32640, false));
-        assert_eq!(layer_prefill_split(100, 5000, &at(&[400])), (5000, true));
-        assert_eq!(layer_prefill_split(100, 5000, &at(&[612])), (5000, false));
-        assert_eq!(layer_prefill_split(0, 5000, &at(&[4600])), (4600, false));
-        assert_eq!(layer_prefill_split(0, 5000, &at(&[4488, 9000])), (5000, false));
-        assert_eq!(layer_prefill_split(0, 5000, &at(&[300, 4990])), (5000, true));
-        assert!(layer_prefill_stops(7, 7, &[7]).is_empty());
-        assert_eq!(layer_prefill_stops(100, 2 * N + 100, &[N + 100]), [N + 100, 2 * N + 100]);
-        assert_eq!(layer_prefill_stops(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
+        assert_eq!(layer_prefill_split_default(0, 2 * N, &at(&[N])), (2 * N, false));
+        assert_eq!(layer_prefill_split_default(0, N + 1, &at(&[])), (N, false));
+        assert_eq!(layer_prefill_split_default(0, 32646, &at(&[32640])), (32640, false));
+        assert_eq!(layer_prefill_split_default(100, 5000, &at(&[400])), (5000, true));
+        assert_eq!(layer_prefill_split_default(100, 5000, &at(&[612])), (5000, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[4600])), (4600, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[4488, 9000])), (5000, false));
+        assert_eq!(layer_prefill_split_default(0, 5000, &at(&[300, 4990])), (5000, true));
+        assert!(layer_prefill_stops_default(7, 7, &[7]).is_empty());
+        assert_eq!(layer_prefill_stops_default(100, 2 * N + 100, &[N + 100]), [N + 100, 2 * N + 100]);
+        assert_eq!(layer_prefill_stops_default(0, 20000, &[1000, 1000]), [1000, 17384, 20000]);
     }
 }
 
