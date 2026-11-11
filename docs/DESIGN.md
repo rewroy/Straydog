@@ -426,7 +426,9 @@ The engine holds one sequence.
     window's rows and the incomplete groups' tails go back, since a later position never writes a
     complete group's compressed row or index key. Its copy may go on later; the copies of
     checkpoints above it are made first.
-  - Beyond about 160K tokens a checkpoint no longer fits the budget, and none is saved.
+  - The checkpoints take at most 2 GiB of host memory, or room for two at the full context when that is
+    more: a checkpoint is ~0.85 GB at 262144 tokens and ~3.4 GB at 1048576, so a 1048576-token context
+    gets ~6.3 GiB. A checkpoint over the budget is not saved.
 - **A void pass** (DeepSeek-V4.1: a part link's wait gave up after 10 s, as when the host stalled)
   voids that pass, not the reply: once, the sequence starts over from the checkpoints with the
   tokens already sent as part of its prompt, and the reply goes on.

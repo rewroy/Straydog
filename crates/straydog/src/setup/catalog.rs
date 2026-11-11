@@ -342,7 +342,8 @@ fn working(architecture: &str) -> Working {
         // 15.2 GiB counted, 590 slots), 6.96 GiB on two (59.4 GiB, 5832 slots) and 7.14 GiB on two
         // with GSQ-RCO-IQ2_XS (5147 slots): 2.34 GiB and 2.40 GiB a GPU, of which the state, 3200
         // bytes a token, is 0.78 GiB. It started at --vram 14 and 15 and not at 13 (and 12, 10), 1.4
-        // GiB more than it counted, for the rows of a prefill pass of 4096 tokens.
+        // GiB more than it counted, for the rows of a prefill pass of 4096 tokens. The checkpoints' host memory is
+        // CHECKPOINT_BYTES, what the server takes at every context setup chooses (262144 and below).
         "deepseek41" => Working { vram: gib_hundredths(234), per_gpu: gib_hundredths(162), state: State::EveryGpu, arena: gib_hundredths(140), host: CHECKPOINT_BYTES },
         // Qwen3.8 with every expert resident (a partial placement counts otherwise: `partial_room`) keeps its sequence
         // state in host memory; the rows and buffers of its passes: 6.26 GiB on two GPUs with IQ3_S (57.3 GiB counted)

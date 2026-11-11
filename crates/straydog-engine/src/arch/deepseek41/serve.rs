@@ -14,8 +14,8 @@ use serde_json::json;
 
 use super::drafter::{self, Drafter, Policy, Rings, MAX_SLOTS};
 use super::dspark::Dspark;
-use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS, EXPANSIONS,
-                    OWN_ROWS, TAP_LAYERS, TAP_ROWS};
+use super::engine::{divided, forward_split, full_snapshot_bytes, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot,
+                    ATTENTION_ROWS, EXPANSIONS, OWN_ROWS, TAP_LAYERS, TAP_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Draw, Placed, Proposal, Session, Settings};
 use crate::bundle;
@@ -34,13 +34,25 @@ pub type Model = Session<Engines>;
 /// conversation switched away from comes back from there), one where the last long system prompt
 /// ended (a new conversation with it starts from there).
 pub const CHECKPOINTS: usize = 4;
-/// Host memory the checkpoints take at most, together and at any moment (a 20K-token
-/// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
-/// over it is not taken. Enough for one at the full 262144-token context (~1.7 GiB): at 1 GiB a
-/// conversation past ~160K tokens kept none, and each new turn there (the template drops the last
-/// reply's reasoning) read the conversation again from an older checkpoint, 43K tokens in 48 s.
-/// The expert host tier gives up what this takes.
+/// Host memory the checkpoints take at most, together and at any moment, up to a context of 262144
+/// tokens (a 20K-token conversation's ~140 MB): the oldest give theirs up before a new one is taken,
+/// and one alone over it is not taken. Enough for one at the full 262144-token context (~0.85 GB: the
+/// compressed rows and index keys are BF16): at 1 GiB a conversation past ~160K tokens kept none, and
+/// each new turn there (the template drops the last reply's reasoning) read the conversation again from
+/// an older checkpoint, 43K tokens in 48 s. A longer context takes more: [`checkpoint_budget`].
 pub const CHECKPOINT_BYTES: u64 = 2 << 30;
+
+/// Host memory the checkpoints of a server with `context` tokens take at most: [`CHECKPOINT_BYTES`], or
+/// when more, room for two at the full context, so that the checkpoint a conversation comes back to is
+/// still held while its next turn's is taken (the oldest give theirs up before a new one is taken). A
+/// checkpoint grows with the context: ~0.85 GB at 262144 tokens, ~3.4 GB at 1048576, where 2 GiB
+/// held none past ~660K tokens and each new turn there read the conversation again from an older
+/// checkpoint. At 262144 tokens and below this is [`CHECKPOINT_BYTES`]. The expert host tier gives up
+/// what this takes.
+pub fn checkpoint_budget(hp: &Hparams, context: usize) -> u64 {
+    CHECKPOINT_BYTES.max(2 * full_snapshot_bytes(hp, context))
+}
+
 /// VRAM left free on each card, as the runtime reports it, when the spare is lent to the expert
 /// stores ([`Engines::lend_spare`], after the first passes). The least margin an automatic budget
 /// leaves is 512 MiB; the driver counts 204 MiB of a card's memory used that the runtime's free
@@ -69,7 +81,7 @@ pub struct Engines {
     order: Vec<usize>,
     /// The slot given up last ([`served::Engines::keep_checkpoint`]).
     kept: Option<usize>,
-    /// Host bytes they may take ([`CHECKPOINT_BYTES`]).
+    /// Host bytes they may take ([`checkpoint_budget`]).
     budget: u64,
     /// Floats a step between requests copies of their pending rows ([`CHECKPOINT_STEP`]).
     step: usize,
@@ -754,6 +766,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     files.cache_tables(settings.row_cache_bytes)?;
     let open_seconds = started.elapsed().as_secs_f64();
     let hp = Hparams::from_model(&files.header, &files)?;
+    let checkpoints = checkpoint_budget(&hp, settings.context);
     let layers = hp.layers.len();
     // Per layer: the routed experts' bytes, and the resident bytes kept whole on every device
     // and divided among an engine's devices; the same for the head.
@@ -851,7 +864,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     // experts an agent's turn, to read them from the drive the next)
     let host = match settings.host_expert_bytes {
         Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
-        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES + row_proofs).min(total_experts),
+        None => served::host_tier(settings, u64::MAX).saturating_sub(checkpoints + row_proofs).min(total_experts),
     };
     // (the vision encoder's tensors are read with the first image, not at the start)
     let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix))
@@ -947,7 +960,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: CHECKPOINT_BYTES, step: CHECKPOINT_STEP, files, drafting },
+                           budget: checkpoints, step: CHECKPOINT_STEP, files, drafting },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
@@ -957,7 +970,25 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
 #[cfg(test)]
 mod tests {
     use super::super::engine::snapshot_bytes;
+    use super::super::{Compressed, Gating, Layer, Rope};
     use super::*;
+
+    /// DeepSeek-V4.1's 40 layers as the checkpoints see them: a window of 128, rows of 512 and index keys of 128, the first two layers
+    /// of the window alone, and the kv sources 2, 8 and 14 at ratio 2 and 20 at ratio 1 (the layers after each reading its rows).
+    fn hparams() -> Hparams {
+        let layers = (0..40).map(|layer| {
+            let source = [2, 8, 14, 20].into_iter().rev().find(|&source| layer >= source);
+            let compressed = source.map(|kv_source| Compressed { ratio: if kv_source == 20 { 1 } else { 2 }, kv_source, index_source: kv_source });
+            Layer { compressed, engram: None, clamp_routed: 0.0, clamp_shared: 0.0 }
+        }).collect();
+        let rope = Rope { base: 10000.0, yarn: None };
+        Hparams {
+            vocabulary: 1, width: 1, heads: 1, head_dim: 512, rope_dims: 64, q_rank: 1, out_groups: 1, out_rank: 1, window: 128, norm_eps: 1e-6,
+            experts: 1, experts_used: 1, expert_ff: 1, shared_experts: 0, gating: Gating::Softmax, route_scale: 1.0, route_normalize: false,
+            index_heads: 64, index_dim: 128, index_top_k: 512, candidates: None, hc: 1, sinkhorn_iterations: 1, hc_eps: 1e-6,
+            compressed_rope: rope.clone(), rope, engram: None, layers,
+        }
+    }
 
     /// A checkpoint at the full 262144-token context (DeepSeek-V4.1's 40 layers, sources 2, 8, 14
     /// at ratio 2 and 20 at ratio 1) fits the budget: the oldest give theirs up for it, no more.
@@ -977,6 +1008,47 @@ mod tests {
         assert_eq!(evictions(&held, 1400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
+    }
+
+    /// The checkpoints' budget is 2 GiB up to a context of 262144 tokens, so that today's servers are as they were, and grows with the
+    /// context beyond: room for two full-context checkpoints, ~3.4 GB each at 1048576 tokens, which 2 GiB would not hold past ~660K.
+    #[test]
+    fn the_checkpoint_budget_follows_the_context() {
+        let hp = hparams();
+        // (the same count as the full-context checkpoint above, from the layers)
+        let position = 262_144;
+        let groups = [position / 2, position / 2, position / 2, position];
+        assert_eq!(full_snapshot_bytes(&hp, position), snapshot_bytes(position, 128, 40, 512, 128, &groups, position));
+        for context in [1, 4096, 32_768, 131_072, 262_144] {
+            assert_eq!(checkpoint_budget(&hp, context), 2 << 30, "{context}");
+        }
+        let full = full_snapshot_bytes(&hp, 1_048_576);
+        assert!(full > 3_300_000_000 && full < 3_450_000_000, "{full}");
+        let budget = checkpoint_budget(&hp, 1_048_576);
+        assert_eq!(budget, 2 * full);
+        assert!(budget > 6 << 30 && budget < 7 << 30, "{budget}");
+        // (more context, never less budget; 2 GiB held one checkpoint alone up to ~660K)
+        let contexts = [262_144, 300_000, 400_000, 524_288, 786_432, 1_048_576];
+        assert!(contexts.windows(2).all(|pair| checkpoint_budget(&hp, pair[0]) <= checkpoint_budget(&hp, pair[1])));
+        assert!(full_snapshot_bytes(&hp, 660_000) < CHECKPOINT_BYTES && full_snapshot_bytes(&hp, 680_000) > CHECKPOINT_BYTES);
+        assert!(contexts.iter().all(|&context| full_snapshot_bytes(&hp, context) < checkpoint_budget(&hp, context)));
+    }
+
+    /// At 1048576 tokens a full checkpoint is taken: with the oldest given up when room is needed, as at 262144, and where 2 GiB took none.
+    #[test]
+    fn a_full_checkpoint_at_a_million_tokens_fits_its_budget() {
+        let hp = hparams();
+        let full = full_snapshot_bytes(&hp, 1_048_576);
+        let budget = checkpoint_budget(&hp, 1_048_576);
+        assert_eq!(evictions(&[], full, CHECKPOINT_BYTES), None, "2 GiB held none");
+        assert_eq!(evictions(&[], full, budget), Some(vec![]));
+        // the previous turn's, as large, stays while this turn's is taken; a small one beside them makes the oldest give up
+        let held = [(0, full), (1, 300 << 20)];
+        assert_eq!(evictions(&held[..1], full, budget), Some(vec![]));
+        assert_eq!(evictions(&held, full, budget), Some(vec![0]));
+        assert_eq!(evictions(&[(0, 300 << 20), (1, full), (2, 300 << 20)], full, budget), Some(vec![0, 1]));
+        assert_eq!(evictions(&held, budget, budget), Some(vec![0, 1]));
+        assert_eq!(evictions(&held, budget + 1, budget), None);
     }
 
     /// A context up to the model's 1048576 is served when the bundle declares as much (or does not say); one above the
