@@ -722,25 +722,79 @@ mod tests {
         id(bundle::MODEL, quant)
     }
 
+    /// A folder of the test's own in the temporary directory, removed when it goes out of scope, so also when an assert
+    /// fails: a failed run once left a bundle-sized file there (47 GB), and the next ones found the disk full.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            // (one per call: the tests run in parallel, each removing its own)
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("straydog-config-{name}-{}-{}", std::process::id(),
+                                                         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(&path).unwrap();
+            Scratch(path)
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A model directory holding (empty) files named like one bundle's shards.
-    fn bundle_directory(id: bundle::Id) -> PathBuf {
-        let quant = id.quant;
-        // (one per call: the tests run in parallel, each removing its own)
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let directory = std::env::temp_dir().join(format!("straydog-config-{quant}-{}-{}", std::process::id(),
-                                                          NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-        std::fs::create_dir_all(&directory).unwrap();
+    fn bundle_directory(id: bundle::Id) -> Scratch {
+        let directory = Scratch::new(id.quant);
         for shard in bundle::shards(id).unwrap() {
             std::fs::write(directory.join(shard.name), b"").unwrap();
         }
         directory
     }
 
+    /// Makes the file at `path` `bytes` long without writing them. The file is sparse where the file system allows it:
+    /// Linux's set_len leaves a hole, and on Windows the file is marked sparse first, or NTFS would allocate every byte.
+    /// Where it cannot be sparse, the disk has to hold the bytes, and the reason comes back when it has not the room.
+    fn sized(path: &Path, bytes: u64) -> Result<(), String> {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        if !sparse(&file) {
+            // (a gibibyte to spare: the disk is shared with the build and the other tests)
+            let free = crate::setup::machine::free_space(path).unwrap_or(0);
+            if free < bytes.saturating_add(1 << 30) {
+                return Err(format!("{} would take {bytes} bytes of a disk with {free} free, and it cannot be sparse there", path.display()));
+            }
+        }
+        file.set_len(bytes).unwrap();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn sparse(file: &std::fs::File) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        let mut returned = 0u32;
+        // SAFETY: a live handle; FSCTL_SET_SPARSE (0x000900C4) takes no buffers (without one it marks the whole file).
+        unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(file.as_raw_handle() as _, 0x0009_00C4, std::ptr::null(), 0, std::ptr::null_mut(), 0,
+                                                            &mut returned, std::ptr::null_mut()) != 0
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn sparse(_: &std::fs::File) -> bool {
+        true
+    }
+
     #[test]
     fn a_bundle_read_on_demand_keeps_its_trees_beside_it_or_in_the_data_directory() {
         let model = bundle_directory(id(bundle::DEEPSEEK, "UD-IQ2_XXS"));
-        let data = std::env::temp_dir().join(format!("straydog-config-data-{}", std::process::id()));
-        std::fs::create_dir_all(&data).unwrap();
+        let data = Scratch::new("data");
         let parse = |args: &[&str]| {
             let mut all = vec!["-m", model.to_str().unwrap()];
             all.extend_from_slice(args);
@@ -749,7 +803,7 @@ mod tests {
         };
         // By default beside the model (options alone: STRAYDOG_DATA_DIR may be set around the
         // tests); --data-dir moves the trees and the warm-up state.
-        let beside = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        let beside = resolve(Options { model: Some(model.to_path_buf()), ..Options::default() }).unwrap();
         assert_eq!(beside.data_dir, model.canonicalize().unwrap().join(".straydog"));
         let settings = parse(&["--data-dir", data.to_str().unwrap(), "--expert-ram", "48"]).unwrap();
         assert_eq!((settings.bundle.quant, settings.alias.as_str()), ("UD-IQ2_XXS", "DeepSeek-V4.1-Flash-1017-Unsloth-UD-IQ2_XXS"));
@@ -763,15 +817,12 @@ mod tests {
         // The trees are what the worker reads beside the shards: they are built before it starts.
         assert!(crate::runtime::missing_trees(&settings).unwrap());
         assert!(crate::runtime::exposure(&settings).unwrap_err().contains("no verity tree"));
-        std::fs::remove_dir_all(model).unwrap();
-        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
     fn verity_trees_in_the_data_directory_are_built_before_the_worker_reads_them() {
         let model = bundle_directory(qwen("IQ3_XXS"));
-        let data = std::env::temp_dir().join(format!("straydog-config-trees-{}", std::process::id()));
-        std::fs::create_dir_all(&data).unwrap();
+        let data = Scratch::new("trees");
         let parse = |args: &[&str]| {
             let mut all = vec!["-m", model.to_str().unwrap()];
             all.extend_from_slice(args);
@@ -780,7 +831,7 @@ mod tests {
         let pins = bundle::verity_pins(qwen("IQ3_XXS")).unwrap();
         assert_eq!(pins.len(), 2, "both IQ3_XXS shards have pinned verity digests");
         // Beside the model (options alone: STRAYDOG_DATA_DIR may be set around the tests), or given.
-        let beside = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        let beside = resolve(Options { model: Some(model.to_path_buf()), ..Options::default() }).unwrap();
         for settings in [beside, parse(&["--data-dir", data.to_str().unwrap()])] {
             assert!(crate::runtime::missing_trees(&settings).unwrap());
             assert!(crate::runtime::exposure(&settings).unwrap_err().contains("no verity tree"));
@@ -795,8 +846,6 @@ mod tests {
             assert!(exposure.directories.contains(&verity));
             assert!(pins.iter().all(|(asset, _)| exposure.files.contains(&verity.join(format!("{}.verity", asset.name)))));
         }
-        std::fs::remove_dir_all(model).unwrap();
-        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
@@ -805,9 +854,12 @@ mod tests {
         let model = bundle_directory(id);
         // (sparse files of the pinned sizes: nothing is read from them)
         for (asset, _) in bundle::verity_pins(id).unwrap() {
-            std::fs::File::options().write(true).open(model.join(&asset.name)).unwrap().set_len(asset.bytes).unwrap();
+            if let Err(reason) = sized(&model.join(&asset.name), asset.bytes) {
+                eprintln!("skipped: {reason}");
+                return;
+            }
         }
-        let settings = resolve(Options { model: Some(model.clone()), ..Options::default() }).unwrap();
+        let settings = resolve(Options { model: Some(model.to_path_buf()), ..Options::default() }).unwrap();
         let error = crate::runtime::check_model(&settings).unwrap_err();
         assert!(error.contains("no verity tree"), "{error}");
         assert!(!settings.data_dir.exists(), "the check builds no trees");
@@ -824,7 +876,6 @@ mod tests {
         std::fs::File::options().write(true).open(model.join(&first.name)).unwrap().set_len(first.bytes - 1).unwrap();
         let error = crate::runtime::check_model(&settings).unwrap_err();
         assert!(error.contains("bytes where the pinned file has"), "{error}");
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     #[test]
@@ -854,7 +905,6 @@ mod tests {
         assert!(line("host").ends_with("[default]"));
         std::fs::write(&file, "unknown = 1\n").unwrap();
         assert!(load(&command().try_get_matches_from(Vec::<&str>::new()).unwrap(), Some(&file)).is_err());
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     #[test]
@@ -885,7 +935,6 @@ mod tests {
                                  ("vram = \"24,11\"", Vram::Gib(vec![24.0, 11.0])), ("vram = \"auto\"", Vram::Auto)] {
             assert_eq!(resolved(&["--gpu", "0,1"], Some(text)).unwrap().vram, expected, "{text}");
         }
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     /// The context is held to the model's own limit (DeepSeek-V4.1's 1048576, Qwen3.8's 262144), whether it came from an
@@ -918,7 +967,6 @@ mod tests {
             // (the option replaces the file's value, which is then not checked)
             assert_eq!(resolved(&["-c", "32768"], Some(&format!("ctx_size = {over}"))).unwrap().ctx_size, 32768);
         }
-        assert!(models.iter().all(|(model, _)| std::fs::remove_dir_all(model).is_ok()));
     }
 
     #[test]
@@ -937,7 +985,6 @@ mod tests {
         assert!(parse(&["--temp", "3"]).is_err());
         assert!(parse(&["-c", "300000"]).is_err());
         assert!(parse(&["--draft-max", "4"]).is_err());
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     /// The bundle served is the one the labels name, the directory's shards deciding between the bundles they
@@ -971,12 +1018,9 @@ mod tests {
         assert!(parse(&unsloth, &["--expert-floor", "1.5"]).unwrap_err().contains("expert floor 1.5"));
         let ista_qwen = bundle_directory(qwen("IQ2_XS"));
         assert!(parse(&ista_qwen, &["--engram", "Q8_0"]).unwrap_err().contains("has no engram table"));
-        std::fs::remove_dir_all(ista_qwen).unwrap();
         // 0.1.3's settings: DeepSeek-V4.1's ISTA-DASLab bundle by its GSQ-RCO name
         let ista = bundle_directory(id(bundle::DEEPSEEK, "IQ2_XXS"));
         assert_eq!(parse(&ista, &["--quant", "GSQ-RCO-IQ2_XXS"]).unwrap().bundle, id(bundle::DEEPSEEK, "IQ2_XXS"));
-        std::fs::remove_dir_all(unsloth).unwrap();
-        std::fs::remove_dir_all(ista).unwrap();
     }
 
     #[test]
@@ -990,7 +1034,6 @@ mod tests {
         std::fs::write(&stray, b"").unwrap();
         let matches = command().try_get_matches_from(["-m", stray.to_str().unwrap()]).unwrap();
         assert!(resolve(Options::from_arg_matches(&matches).unwrap()).is_err());
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     #[test]
@@ -1028,7 +1071,7 @@ mod tests {
         let file = model.join("default.toml");
         std::fs::write(&file, format!("model = {:?}\nport = 9000\n", model.display())).unwrap();
         let none = Options::default();
-        let named = Options { model: Some(model.clone()), ..Options::default() };
+        let named = Options { model: Some(model.to_path_buf()), ..Options::default() };
         assert_eq!(implicit_config(&none, Some(file.clone())), Some(file.clone()));
         // a model by option or variable: the file's quantization and drafter would not fit another model
         assert_eq!(implicit_config(&named, Some(file.clone())), None);
@@ -1042,7 +1085,6 @@ mod tests {
         let lines = describe(&settings, &sources);
         assert!(lines.iter().any(|line| line.starts_with("model ") && line.ends_with(&format!("[config {}]", file.display()))));
         assert!(lines.iter().any(|line| line.starts_with("port ") && line.ends_with("[option --port]")));
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     /// The state of the first request's system block is kept by default; `prefix_cache = false` in the config file turns it off, and so does
@@ -1080,7 +1122,6 @@ no_prefix_cache = true
 ", model.display())).unwrap();
         let matches = command().try_get_matches_from(["-m", model.to_str().unwrap()]).unwrap();
         assert!(load(&matches, Some(&path)).is_err());
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     /// The conversation's state is not kept unless it is asked for: off by default, on with `keep_conversation = true` in the file or with
@@ -1123,7 +1164,6 @@ no_prefix_cache = true
 stop_on_stdin = true
 ", model.display())).unwrap();
         assert!(load(&command().try_get_matches_from(["-m", model.to_str().unwrap()]).unwrap(), Some(&path)).is_err());
-        std::fs::remove_dir_all(model).unwrap();
     }
 
     #[test]
