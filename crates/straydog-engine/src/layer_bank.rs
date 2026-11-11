@@ -101,7 +101,8 @@ impl Prefetch {
     }
 
     pub(crate) fn start(&mut self, layer: usize) {
-        if self.pending.is_some() { return; }
+        // (a layer whose banks are registered in place is read from the mapping, whose pages its locks keep: not from the file again)
+        if self.pending.is_some() || crate::banks::registered(layer) { return; }
         let Some(plan) = self.plans.get(layer).cloned().flatten() else { return };
         let Some(buffer) = self.free.take() else { return };
         let reader = self.reader.clone();

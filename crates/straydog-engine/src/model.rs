@@ -364,6 +364,26 @@ fn layer_prefill_rows() -> usize {
     *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref()))
 }
 
+/// Whether a prompt is going through the layers in layer order now: the locking behind "ready" may take its turns meanwhile
+/// (STRAYDOG_LOCK_DURING_PREFILL), as the prompt reads every layer's banks and no CPU expert of a generating request is in the way.
+pub static LAYER_PREFILL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets [`LAYER_PREFILL_ACTIVE`] for its life.
+struct LayerPrefillActive;
+
+impl LayerPrefillActive {
+    fn begin() -> LayerPrefillActive {
+        LAYER_PREFILL_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        LayerPrefillActive
+    }
+}
+
+impl Drop for LayerPrefillActive {
+    fn drop(&mut self) {
+        LAYER_PREFILL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn layer_prefill_rows_named(value: Option<&str>) -> usize {
     match value.map(|value| value.trim().replace('_', "").parse::<usize>()) {
         None => LAYER_PREFILL_ROWS,
@@ -2467,6 +2487,7 @@ impl Model {
             // go: nothing reads them, by the engine's lock that this runs under and the device's waits)
             if !self.copies.give_back(&mut self.group, layer, banks)? {
                 self.group.release_host(banks)?;
+                crate::banks::unregistered(layer);
             }
             self.locked_layers.retain(|locked| *locked != layer);
             gave.layers.push(layer);
@@ -3352,6 +3373,7 @@ impl Model {
             self.last_metrics.insert("prefill_layer_bank_bytes".into(), json!(bank_bytes));
             self.metric_add("prefill_prepare_seconds", preparing.elapsed().as_secs_f64());
             drop(trace_prepare);
+            let _active = LayerPrefillActive::begin();
             self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, cancelled, progress).map(Some)
         })();
         let restoring = Instant::now();
@@ -3484,7 +3506,13 @@ impl Model {
                 self.group.load_layer_bank_from(layer, copy.sources())?;
                 self.metric_add("prefill_bank_copied_layers", 1.0);
             }
-            None => self.group.load_layer_bank(layer)?,
+            None => {
+                // (a layer registered in place: the mapping's pages, which its locks keep, not the file's again)
+                if crate::banks::registered(layer) {
+                    self.metric_add("prefill_bank_registered_layers", 1.0);
+                }
+                self.group.load_layer_bank(layer)?
+            }
         }
         if let Some(reader) = reader {
             // The GPU now owns the entire bank: the same host buffer can receive the
