@@ -1070,8 +1070,31 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - Every fourth layer attends sparsely: an indexer scores the prompt's 4-token blocks, and each
   token attends the keys of its 512 best complete blocks and of its own incomplete block.
 - A prompt is prefilled in batches, split into 256-row chunks for the indexer.
-- With FP16 GEMM on RDNA4, a batch's attention runs at once. Groups of 16 tokens walk the union of
-  their selected blocks, so each key and value is read once per group.
+- With FP16 GEMM on RDNA4, a batch's attention runs at once. In a span that starts below 8192
+  tokens, groups of 16 tokens walk the union of their selected blocks, so each key and value is
+  read once per group (`qsa_flash_wmma`). From there each token attends its own selection
+  (`qsa_prompt_attention`, K/V in the device's memory): a workgroup is a token and a K/V head, its
+  four waves take every fourth tile of 16 keys with an online softmax each (merged at the end),
+  the K rows go from memory into the WMMA operands and the V rows through the wave's own LDS, so
+  no wave waits for another. The union saved less than its walk cost: 16 tokens' 8.2K selected
+  blocks are a union of 1.6K (32K tokens), 2.1K (95K) or 2.3K (242K) blocks, 40% of them selected
+  by one token at 242K, and a group's tiles of loads, staging and barriers took 71 us a token (both
+  GPUs, 13 layers) at 242K, a quarter of it the global loads. The same FP16 keys, values, queries
+  and probabilities, F32 sums in another order. Two R9700s, UD-IQ3_XXS, MTP, 262144 context, batch
+  2048: the attention 75 us a token (flash 71, union 3, marks 1) to 19.6; a fresh 242K read 64.7 s
+  to 58.8 s, 95K 22.3 s to 20.6 s, 32K 8.07 s to 7.82 s. The pinned generations' prompts end
+  before 5.3K, so they keep their bits.
+- In parts the two devices share the indexer (a span's chunks of 256 rows in turn), and from 8192
+  tokens a device attends its own chunks' tokens in the chunk loop, from the selection it made, and
+  sends the selected blocks (`qsa_send_blocks`) into the other's inbox. The other's chunks it
+  normalizes the queries of into the place of their attended values (`write_attention_kv` reads only
+  the keys and values) and attends after the span's one signal and wait, from the block numbers it
+  received, in one launch of the span's chunks of the other (`qsa_prompt_attention<..., Received>`):
+  the selection list is rebuilt in the order the indexer wrote it (the selected blocks in block order,
+  four positions each, then the incomplete block's), so every sum is the one the device's own kernel
+  makes and the two paths give the same bits as one device selecting every chunk. The attended
+  values replace the queries in place: a workgroup reads its token's queries before it writes its
+  values, and no two share a token and K/V head.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
 - Past the stage's positions (a 64th of the budget, grown into what the slots leave: some 45K at 6 GiB),

@@ -1384,6 +1384,7 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "moe_gemm_cuda.hpp"
 #endif
 #include "sparse_attention_compute.hpp"
+#include "qsa_prompt_attention.hpp"
 #include "kv_stage.hpp"
 #include "sparse_attention.hpp"
 #include "hybrid_slots.hpp"
