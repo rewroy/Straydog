@@ -451,10 +451,11 @@ fn drafter_directory(file: &Path) -> Result<PathBuf, String> {
 
 /// Fill every derived setting.
 /// The rows of a prefill batch for a resident model on this much GPU budget. Under 8 GiB the batches' workspaces rest at 256 rows, with some 200 MiB more for decode's
-/// slots, and widen for a long prompt ([`straydog_engine`]'s `begin_long_prefill`).
+/// slots, and widen for a long prompt ([`straydog_engine`]'s `begin_long_prefill`). From 48 GiB (two R9700s) it is the widest, 4096, which is the placement's
+/// to narrow: the model that is not fully resident keeps 2048, and one that fits resident only at 2048 takes it (`resident_placement`).
 pub(crate) fn resident_batch(total: u64) -> u16 {
     match total {
-        total if total >= 48 << 30 => 2048,
+        total if total >= 48 << 30 => 4096,
         total if total >= 8 << 30 => 1024,
         _ => 256,
     }
@@ -553,7 +554,8 @@ pub fn resolve(options: Options) -> Result<Settings, String> {
         // (DeepSeek-V4.1 chooses its own from what the GPUs' memory holds: up to 32768)
         _ if deepseek => None,
         _ if on_demand => Some(4096),
-        // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048, 2026-10-29)
+        // (Qwen3.8 on two R9700s: 4096 rows a batch read a 20K or 60K prompt 7-12% slower than 2048 on 2026-10-29; on 2026-11-12, served,
+        // one run each, 4096 against 2048: 8K 1.95 -> 1.75 s, 32K 7.10 -> 6.81 s, 95K 22.83 -> 21.63 s, 242K 66.1 -> 62.6 s, decode the same)
         Some(total) => Some(resident_batch(total)),
         None => None,
     });
@@ -891,7 +893,7 @@ mod tests {
         let settings = resolve(options).unwrap();
         assert_eq!((settings.vram.clone(), settings.port, settings.gpu.clone()), (Vram::Gib(vec![30.0]), 9100, vec![0, 1]));
         assert_eq!(settings.bundle, qwen("IQ3_S"));
-        assert_eq!(settings.batch_size, Some(2048));   // 2 x 30 GiB of GPU budget
+        assert_eq!(settings.batch_size, Some(4096));   // 2 x 30 GiB of GPU budget
         assert_eq!(settings.ctx_size, 32768);
         assert_eq!(settings.state_ram, 1.0);     // what 32768 tokens of state need (FP16 K/V), rounded up
         assert_eq!(settings.alias, "Qwen3.8-Flash-Next-ISTA-DASLab-IQ3_S");
@@ -926,6 +928,8 @@ mod tests {
         assert_eq!(settings.vram.bytes(2), Some(vec![30 << 30, 10 << 30]));
         assert_eq!(settings.batch_size, Some(1024));   // 40 GiB in all
         assert_eq!((resident_batch(5 << 30), resident_batch(8 << 30)), (256, 1024), "a small card's batches rest narrow");
+        assert_eq!((resident_batch(40 << 30), resident_batch((48 << 30) - 1), resident_batch(48 << 30), resident_batch(64 << 30)),
+                   (1024, 1024, 4096, 4096), "the widest batch is for 48 GiB of budget and more");
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "8"], None).unwrap().vram.bytes(2), Some(vec![8 << 30, 8 << 30]));
         assert_eq!(resolved(&["--gpu", "0,1", "--vram", "auto"], None).unwrap().vram, Vram::Auto);
         assert!(resolved(&["--gpu", "0,1", "--vram", "30,10,5"], None).unwrap_err().contains("3 budgets for 2 GPUs"));
