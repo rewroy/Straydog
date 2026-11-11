@@ -254,6 +254,11 @@ impl Group {
         self.backends.iter().map(|backend| backend.logical_capacity).min().unwrap()
     }
 
+    /// [`Backend::prompt_scan`] on every device: the same on all, so a pair of parts sum alike.
+    pub fn prompt_scan(&self, chunked: bool) -> Result<()> {
+        self.backends.iter().try_for_each(|backend| backend.prompt_scan(chunked))
+    }
+
     pub fn configure_gemm(&mut self, minimum_batch: u64, half: bool) -> Result<()> {
         self.backends.iter().try_for_each(|backend| backend.configure_gemm(minimum_batch, half))?;
         // (FP16 gives back half of the expanded buffer: nothing has been placed yet, and this is what that looks like now)

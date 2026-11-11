@@ -102,6 +102,10 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision);
 // Decode options (RDNA4 only), flags: 1 a decode row's Q5_K/Q8_0 GEMVs and IQ2 experts' gate/up on the Q8
 // kernels; 2 a decode or verify pass's index scores and attention scores through WMMA (FP16 operands, F32 sums).
 int sd_decode_options(void* handle, int flags);
+// Prompt-read options (RDNA4 only), flags: 1 a prompt pass's DeltaNet layers scan in chunks of 16 tokens (the same recurrence, its sums
+// in another order, the products against the state on the matrix cores in bf16 pieces that carry F32's bits), for a read long enough
+// to be worth it. Set before the read's batches, cleared after.
+int sd_prompt_options(void* handle, int flags);
 int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);
 int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds, const uint64_t* rows, const uint64_t* cols, uint64_t count, const float* input, uint64_t input_count, float* output, uint64_t output_count);
