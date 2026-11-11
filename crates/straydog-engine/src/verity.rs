@@ -168,14 +168,36 @@ pub fn build(file: &File, tree: &Path, progress: &(dyn Fn(u64) + Sync)) -> std::
     Ok(descriptor_digest(size, &below[0]))
 }
 
+/// How many refusals of a read by the working-set quota in a row are put up with, a short pause after each ([`read_exact_with`]).
+const REFUSED_TRIES: u32 = 5;
+const REFUSED_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
-    let mut done = 0;
+    crate::layer_trace::proof_read(buffer.len() as u64);
+    read_exact_with(buffer, offset, crate::storage::working_set_quota, &mut |piece, at| crate::storage::read_partial(file, piece, at))
+}
+
+/// Fill `buffer` from `offset` with `read` (which reads into the start of the piece it is given, at the offset it is given, and returns the bytes it got, 0 at the
+/// end of the file). A process whose working set has a hard maximum (Windows, [`crate::host::keep_resident`]) can have a read refused (`refused`: the quota's
+/// error, 1453), the tree's among them, which a check that must pass would take for a failure of the file: after a refusal what is left is read a block at a time,
+/// and a read refused again is tried again after a short pause, [`REFUSED_TRIES`] refusals in a row being put up with and the next one's error returned.
+fn read_exact_with(buffer: &mut [u8], offset: u64, refused: fn(&std::io::Error) -> bool,
+                   read: &mut dyn FnMut(&mut [u8], u64) -> std::io::Result<usize>) -> std::io::Result<()> {
+    let (mut done, mut piece, mut tries) = (0, buffer.len(), 0);
     while done < buffer.len() {
-        let count = crate::storage::read_partial(file, &mut buffer[done..], offset + done as u64)?;
-        if count == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its tree"));
+        let end = (done + piece).min(buffer.len());
+        match read(&mut buffer[done..end], offset + done as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shorter than its tree")),
+            Ok(count) => {
+                done += count;
+                tries = 0;
+            }
+            Err(error) if refused(&error) && tries < REFUSED_TRIES => {
+                (piece, tries) = (BLOCK, tries + 1);
+                std::thread::sleep(REFUSED_PAUSE);
+            }
+            Err(error) => return Err(error),
         }
-        done += count;
     }
     Ok(())
 }
@@ -220,24 +242,49 @@ pub fn verify_mapped(map: &[u8], verifier: &Verifier, offset: u64, length: u64, 
 /// [`verify_mapped`] with the priority the threads it starts work at (the calling thread keeps its own, which it uses when `threads` is 1 or the
 /// range is one piece): the check of the banks behind "ready" gives way to a request's work, the load's does not.
 pub fn verify_mapped_at(map: &[u8], verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority) -> Result<(), String> {
+    verify_held_at(map, 0, map.len() as u64, verifier, offset, length, threads, priority, true)
+}
+
+/// The whole blocks around bytes `offset .. offset + length` of a file of `size` bytes, as `start .. end`: a block boundary, and a block boundary or the
+/// file's end (its last block is checked zero-padded). A copy of those bytes is what [`verify_copy_at`] checks. None where the range reaches past the file.
+pub fn covering_blocks(size: u64, offset: u64, length: u64) -> Option<(u64, u64)> {
+    let end = offset.checked_add(length).filter(|&end| end <= size)?;
+    Some((offset / BLOCK as u64 * BLOCK as u64, end.next_multiple_of(BLOCK as u64).min(size)))
+}
+
+/// Check bytes `offset .. offset + length` of a file in a copy: `copy` holds the file's bytes from `base` (what [`covering_blocks`] gives, at the least), and what is
+/// checked is the copy's own bytes, as the whole blocks around the range, by the same checker as the mapping's ([`verify_mapped_at`]). For a copy that cannot
+/// change after the check (page-locked host memory): the verified-bytes rule holds for the copy, not for the file's mapping it was made from.
+pub fn verify_copy_at(copy: &[u8], base: u64, verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority) -> Result<(), String> {
+    verify_held_at(copy, base, verifier.size(), verifier, offset, length, threads, priority, false)
+}
+
+/// The check of [`verify_mapped_at`] and [`verify_copy_at`] over `held`, the bytes of a file of `size` from `base` on. `hints` asks the system to read the
+/// pages of a cold piece before it is hashed, which only a mapping has.
+#[allow(clippy::too_many_arguments)]
+fn verify_held_at(held: &[u8], base: u64, size: u64, verifier: &Verifier, offset: u64, length: u64, threads: usize, priority: Priority,
+                  hints: bool) -> Result<(), String> {
     const PIECE: u64 = 16 << 20;
-    let size = map.len() as u64;
     if offset.checked_add(length).is_none_or(|end| end > size) {
         return Err("a verified range past the file's end".into());
     }
     let start = offset / BLOCK as u64 * BLOCK as u64;
     let end = (offset + length).next_multiple_of(BLOCK as u64);
-    // Whole blocks within the file go straight from the mapping; a last partial one is padded.
+    // (the blocks around the range, up to the file's end, must be in what is held)
+    if start < base || end.min(size) > base.saturating_add(held.len() as u64) {
+        return Err("a verified range outside the bytes held".into());
+    }
+    // Whole blocks within the file go straight from the bytes held; a last partial one is padded.
     let whole_end = end.min(size / BLOCK as u64 * BLOCK as u64).max(start);
     let pieces: Vec<(u64, u64)> = (start..whole_end).step_by(PIECE as usize).map(|at| (at, (at + PIECE).min(whole_end))).collect();
     let failure = Mutex::new(None);
     let check = |(from, to): (u64, u64)| {
-        let data = &map[from as usize..to as usize];
+        let data = &held[(from - base) as usize..(to - base) as usize];
         // Issue the cold piece's reads before hashing its 4 KiB blocks. Sequential demand
         // faults otherwise serialize I/O with hashing. Stay inside this worker's 16 MiB
         // piece (at most 128 MiB across the batch), and skip advice on resident pieces.
         // Advice is not authentication: every block below still checks its Merkle proof.
-        if crate::storage::resident(data) < 1.0 {
+        if hints && crate::storage::resident(data) < 1.0 {
             crate::storage::read_ahead(data.chunks(2 << 20));
         }
         if let Err(error) = verifier.verify(from, data) {
@@ -247,7 +294,7 @@ pub fn verify_mapped_at(map: &[u8], verifier: &Verifier, offset: u64, length: u6
     run_pieces(&pieces, threads, priority, check);
     if end > whole_end && whole_end < size {
         let mut last = vec![0u8; BLOCK];
-        last[..(size - whole_end) as usize].copy_from_slice(&map[whole_end as usize..]);
+        last[..(size - whole_end) as usize].copy_from_slice(&held[(whole_end - base) as usize..(size - base) as usize]);
         if let Err(error) = verifier.verify(whole_end, &last) {
             failure.lock().unwrap().get_or_insert(error);
         }
@@ -388,6 +435,8 @@ pub struct Verifier {
     /// The hash of each level-0 block, from the checked level 1 (empty when level 0 is one
     /// block, which the digest checks).
     level0: Vec<Hash>,
+    /// A checked, owned copy of every level-0 block, when the row-file budget holds it.
+    resident: Option<Box<[u8]>>,
     /// Checked level-0 blocks, bounded, CLOCK-evicted.
     cache: Mutex<Level0>,
     pub tree_reads: AtomicU64,
@@ -445,15 +494,63 @@ impl Verifier {
         // (verifications on many threads read its blocks at once)
         let tree = crate::storage::concurrent(&tree).unwrap_or(tree);
         Ok(Verifier {
-            geometry, tree, digest: *digest, level0,
+            geometry, tree, digest: *digest, level0, resident: None,
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),
             tree_reads: AtomicU64::new(0),
         })
     }
 
+    /// The size of the file the tree is of.
+    pub fn size(&self) -> u64 {
+        self.geometry.size
+    }
+
+    /// Keep the whole leaf level as an immutable, checked copy, only when it fits `budget`.
+    /// Called before readers share the verifier. The old bounded cache remains the fallback;
+    /// no partially checked copy is published on a read, allocation or authentication failure.
+    pub fn preload_level0(&mut self, budget: u64) -> Result<u64, String> {
+        let bytes = self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64;
+        if bytes == 0 || bytes > budget {
+            return Ok(0);
+        }
+        if self.resident.is_some() {
+            return Ok(bytes);
+        }
+        let Ok(length) = usize::try_from(bytes) else { return Ok(0) };
+        let mut blocks = Vec::new();
+        if blocks.try_reserve_exact(length).is_err() {
+            return Ok(0);
+        }
+        blocks.resize(length, 0);
+        read_exact_at(&self.tree, &mut blocks, self.geometry.starts[0]).map_err(|error| format!("tree read: {error}"))?;
+        self.tree_reads.fetch_add(bytes / BLOCK as u64, Ordering::Relaxed);
+        for (index, block) in blocks.chunks_exact(BLOCK).enumerate() {
+            if !self.level0_matches(index as u64, block) {
+                return Err(format!("tree block (0, {index}) does not verify"));
+            }
+        }
+        self.resident = Some(blocks.into_boxed_slice());
+        let cache = self.cache.get_mut().unwrap();
+        cache.blocks.clear();
+        cache.blocks.shrink_to_fit();
+        cache.order.clear();
+        cache.order.shrink_to_fit();
+        cache.hand = 0;
+        Ok(bytes)
+    }
+
+    fn level0_matches(&self, number: u64, block: &[u8]) -> bool {
+        let hash = hash_block(block);
+        match self.level0.get(number as usize) {
+            Some(expected) => hash == *expected,
+            None => self.level0.is_empty() && descriptor_digest(self.geometry.size, &hash) == self.digest,
+        }
+    }
+
     /// Check `data`, whole blocks of the file from `offset` (a block boundary); bytes past the
     /// file's end must be zero.
     pub fn verify(&self, offset: u64, data: &[u8]) -> Result<(), String> {
+        let _trace = crate::layer_trace::Verify::new(data.len() as u64);
         if !offset.is_multiple_of(BLOCK as u64) || !data.len().is_multiple_of(BLOCK) {
             return Err("a verified read must be whole blocks".into());
         }
@@ -476,12 +573,16 @@ impl Verifier {
                 }
                 continue;
             }
-            let tree_block = number / FAN;
-            if current.as_ref().is_none_or(|(held, _)| *held != tree_block) {
-                current = Some((tree_block, self.level0_block(tree_block)?));
-            }
-            let entries = &current.as_ref().unwrap().1;
-            let entry = ((number % FAN) * 32) as usize;
+            let (entries, entry) = match self.resident.as_deref() {
+                Some(entries) => (entries, (number * 32) as usize),
+                None => {
+                    let tree_block = number / FAN;
+                    if current.as_ref().is_none_or(|(held, _)| *held != tree_block) {
+                        current = Some((tree_block, self.level0_block(tree_block)?));
+                    }
+                    (&current.as_ref().unwrap().1[..], ((number % FAN) * 32) as usize)
+                }
+            };
             if entries[entry..entry + 32] != hash {
                 return Err(format!("block {number} does not verify"));
             }
@@ -502,11 +603,7 @@ impl Verifier {
         read_exact_at(&self.tree, &mut block[..], self.geometry.starts[0] + tree_block * BLOCK as u64)
             .map_err(|exc| format!("tree read: {exc}"))?;
         self.tree_reads.fetch_add(1, Ordering::Relaxed);
-        let good = match self.level0.get(tree_block as usize) {
-            Some(expected) => hash_block(&block[..]) == *expected,
-            None => self.level0.is_empty() && descriptor_digest(self.geometry.size, &hash_block(&block[..])) == self.digest,
-        };
-        if !good {
+        if !self.level0_matches(tree_block, &block[..]) {
             return Err(format!("tree block (0, {tree_block}) does not verify"));
         }
         let mut cache = self.cache.lock().unwrap();
@@ -595,20 +692,27 @@ mod pool_tests {
 mod piece_tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Condvar;
     use std::thread::ThreadId;
     use std::time::Duration;
 
-    /// The threads `run_pieces` ran 24 pieces of 10 ms on, with the pieces it ran, for `threads` allowed.
+    /// The threads `run_pieces` ran 24 pieces on, with the pieces it ran, for `threads` allowed.
     fn ran_on(threads: usize, priority: Priority) -> (HashSet<ThreadId>, Vec<(u64, u64)>) {
         let pieces: Vec<(u64, u64)> = (0..24).map(|index| (index * 100, index * 100 + 100)).collect();
-        let seen = Mutex::new((HashSet::new(), Vec::new()));
+        let workers = if threads > 1 { threads.min(pieces.len()) } else { 1 };
+        let seen = (Mutex::new((HashSet::new(), Vec::new())), Condvar::new());
         run_pieces(&pieces, threads, priority, |piece| {
-            std::thread::sleep(Duration::from_millis(10));
-            let mut seen = seen.lock().unwrap();
-            seen.0.insert(std::thread::current().id());
-            seen.1.push(piece);
+            let (state, wake) = &seen;
+            let mut state = state.lock().unwrap();
+            state.0.insert(std::thread::current().id());
+            state.1.push(piece);
+            wake.notify_all();
+            // Hold each worker on its first piece until all workers have taken one. A sleep here
+            // lets a late-scheduled worker lose its piece to one that already finished sleeping.
+            let (state, _) = wake.wait_timeout_while(state, Duration::from_secs(30), |(ids, _)| ids.len() < workers).unwrap();
+            assert_eq!(state.0.len(), workers, "all requested workers must take a piece");
         });
-        let (ids, mut done) = seen.into_inner().unwrap();
+        let (ids, mut done) = seen.0.into_inner().unwrap();
         done.sort_unstable();
         assert_eq!(done, pieces, "every piece ran once");
         (ids, done)
@@ -653,6 +757,246 @@ mod piece_tests {
                 data[at] ^= 1;
             }
         }
+        drop(verifier);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_file(tree).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    struct Fixture {
+        file: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        size: usize,
+        data: Vec<u8>,
+        digest: Hash,
+    }
+
+    impl Fixture {
+        fn new(label: &str, size: usize) -> Self {
+            let file = std::env::temp_dir().join(format!("straydog-proof-{label}-{}", std::process::id()));
+            let tree = file.with_extension("tree");
+            let mut data: Vec<u8> = (0..size).map(|at| (at * 31 % 251) as u8).collect();
+            std::fs::write(&file, &data).unwrap();
+            let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+            data.resize(size.next_multiple_of(BLOCK), 0);
+            Self { file, tree, size, data, digest }
+        }
+
+        fn verifier(&self) -> Verifier {
+            Verifier::open(&self.tree, self.size as u64, &self.digest, BLOCK).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.file);
+            let _ = std::fs::remove_file(&self.tree);
+        }
+    }
+
+    #[test]
+    fn resident_proofs_match_bounded_checks_without_later_tree_reads() {
+        let fixture = Fixture::new("resident", (2 * FAN as usize + 1) * BLOCK + 137);
+        let bounded = fixture.verifier();
+        let mut resident = fixture.verifier();
+        let required = resident.geometry.levels[0] * BLOCK as u64;
+        assert_eq!(resident.preload_level0(required - 1).unwrap(), 0);
+        bounded.verify(0, &fixture.data).unwrap();
+        assert_eq!(resident.preload_level0(required).unwrap(), required);
+        let reads = resident.tree_reads.load(Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let resident = &resident;
+                let data = &fixture.data;
+                scope.spawn(move || resident.verify(0, data).unwrap());
+            }
+        });
+        assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
+        let mut changed = fixture.data.clone();
+        for at in [0, FAN as usize * BLOCK + 9, fixture.size - 1, changed.len() - 1] {
+            changed[at] ^= 1;
+            assert!(resident.verify(0, &changed).is_err(), "changed byte {at}");
+            assert!(bounded.verify(0, &changed).is_err(), "changed byte {at}");
+            changed[at] ^= 1;
+        }
+        // A later change to the source tree cannot alter the authenticated copy being used.
+        let tree = std::fs::OpenOptions::new().write(true).open(&fixture.tree).unwrap();
+        let at = resident.geometry.starts[0] + BLOCK as u64 + 7;
+        let mut byte = [0];
+        read_exact_at(&File::open(&fixture.tree).unwrap(), &mut byte, at).unwrap();
+        byte[0] ^= 1;
+        write_at(&tree, &byte, at).unwrap();
+        resident.verify(0, &fixture.data).unwrap();
+        assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
+    }
+
+    #[test]
+    fn a_bad_late_leaf_never_publishes_a_partly_checked_copy() {
+        let fixture = Fixture::new("late-leaf", (2 * FAN as usize + 1) * BLOCK);
+        let mut verifier = fixture.verifier();
+        let tree = std::fs::OpenOptions::new().write(true).open(&fixture.tree).unwrap();
+        let bad = verifier.geometry.starts[0] + 2 * BLOCK as u64;
+        let mut byte = [0];
+        read_exact_at(&File::open(&fixture.tree).unwrap(), &mut byte, bad).unwrap();
+        byte[0] ^= 1;
+        write_at(&tree, &byte, bad).unwrap();
+        assert!(verifier.preload_level0(u64::MAX).unwrap_err().contains("(0, 2)"));
+        assert!(verifier.resident.is_none());
+        verifier.verify(0, &fixture.data[..BLOCK]).unwrap();
+        let at = 2 * FAN as usize * BLOCK;
+        assert!(verifier.verify(at as u64, &fixture.data[at..at + BLOCK]).is_err());
+    }
+
+    #[test]
+    fn empty_single_block_and_single_leaf_roots_still_authenticate() {
+        for size in [0, BLOCK, BLOCK + 1, 2 * BLOCK] {
+            let fixture = Fixture::new(&format!("small-{size}"), size);
+            let mut verifier = fixture.verifier();
+            assert_eq!(verifier.preload_level0(0).unwrap(), 0);
+            let expected = if size > BLOCK { BLOCK as u64 } else { 0 };
+            assert_eq!(verifier.preload_level0(BLOCK as u64).unwrap(), expected);
+            verifier.verify(0, &fixture.data).unwrap();
+            if size > 0 {
+                let mut changed = fixture.data.clone();
+                changed[0] ^= 1;
+                assert!(verifier.verify(0, &changed).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod refused_read_tests {
+    use super::*;
+
+    fn quota(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(1453)
+    }
+
+    /// A read of `source` that `fail` can refuse: it is given the number of the call and the bytes asked, and the calls are kept.
+    fn read_of<'a>(source: &'a [u8], calls: &'a mut Vec<(u64, usize)>, fail: &'a dyn Fn(usize, usize) -> Option<std::io::Error>)
+                   -> impl FnMut(&mut [u8], u64) -> std::io::Result<usize> + 'a {
+        move |piece: &mut [u8], at: u64| {
+            let number = calls.len();
+            calls.push((at, piece.len()));
+            if let Some(error) = fail(number, piece.len()) {
+                return Err(error);
+            }
+            piece.copy_from_slice(&source[at as usize..at as usize + piece.len()]);
+            Ok(piece.len())
+        }
+    }
+
+    /// Decides: a read the working-set quota refused goes on a block at a time from where it was, a block refused again is tried a few times more and then fails
+    /// with the quota's error, and anything else that goes wrong (another error, a file that ends early) is what it was: no retry, no pieces.
+    #[test]
+    fn a_tree_read_the_working_set_refused_goes_on_a_block_at_a_time_and_gives_up_after_a_few_tries() {
+        let size = 3 * BLOCK + 500;
+        let source: Vec<u8> = (0..size + 64).map(|at| (at * 13 % 251) as u8).collect();
+        let refusal = || std::io::Error::from_raw_os_error(1453);
+        let mut buffer = vec![0u8; size];
+        // not refused: one read
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 8, quota, &mut read_of(&source, &mut calls, &|_, _| None)).unwrap();
+        assert_eq!(calls, vec![(8, size)]);
+        assert_eq!(buffer[..], source[8..8 + size]);
+        // the whole refused: the rest in blocks, the last what is left of it
+        buffer.fill(0);
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 8, quota, &mut read_of(&source, &mut calls, &|number, _| (number == 0).then(refusal))).unwrap();
+        let step = BLOCK as u64;
+        assert_eq!(calls, vec![(8, size), (8, BLOCK), (8 + step, BLOCK), (8 + 2 * step, BLOCK), (8 + 3 * step, 500)]);
+        assert_eq!(buffer[..], source[8..8 + size]);
+        // a block refused twice, then read: the same block is asked again, from where it was
+        buffer.fill(0);
+        let mut calls = Vec::new();
+        read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|number, _| matches!(number, 0 | 2 | 3).then(refusal))).unwrap();
+        assert_eq!(calls, vec![(0, size), (0, BLOCK), (step, BLOCK), (step, BLOCK), (step, BLOCK), (2 * step, BLOCK), (3 * step, 500)]);
+        assert_eq!(buffer[..], source[..size]);
+        // refused every time: `REFUSED_TRIES` refusals are put up with, then the quota's own error comes back with the next
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|_, _| Some(refusal()))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(1453));
+        assert_eq!(calls.len(), 1 + REFUSED_TRIES as usize);
+        assert_eq!(calls[1..], vec![(0, BLOCK); REFUSED_TRIES as usize][..], "after the first, a block each, from the start");
+        // another error is returned at once; so is the quota's where nothing is a quota refusal (not Windows)
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, quota, &mut read_of(&source, &mut calls, &|_, _| Some(std::io::Error::from_raw_os_error(5)))).unwrap_err();
+        assert_eq!((error.raw_os_error(), calls.len()), (Some(5), 1));
+        let mut calls = Vec::new();
+        let error = read_exact_with(&mut buffer, 0, |_| false, &mut read_of(&source, &mut calls, &|_, _| Some(refusal()))).unwrap_err();
+        assert_eq!((error.raw_os_error(), calls.len()), (Some(1453), 1));
+        // a read that gets less than it was asked goes on from there; none at all is the end of the file
+        let mut calls = Vec::new();
+        let mut short = |piece: &mut [u8], at: u64| -> std::io::Result<usize> {
+            calls.push((at, piece.len()));
+            let count = piece.len().min(1000);
+            piece[..count].copy_from_slice(&source[at as usize..at as usize + count]);
+            Ok(count)
+        };
+        read_exact_with(&mut buffer, 0, quota, &mut short).unwrap();
+        assert_eq!(buffer[..], source[..size]);
+        assert_eq!(calls.iter().map(|call| call.0).collect::<Vec<_>>(), vec![0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000]);
+        let error = read_exact_with(&mut buffer, 0, quota, &mut |_, _| Ok(0)).unwrap_err();
+        assert_eq!((error.kind(), error.to_string().as_str()), (std::io::ErrorKind::UnexpectedEof, "file shorter than its tree"));
+        // (and the production read, on a file, is what it was)
+        let path = std::env::temp_dir().join(format!("straydog-refused-{}", std::process::id()));
+        std::fs::write(&path, &source).unwrap();
+        let mut again = vec![0u8; size];
+        read_exact_at(&File::open(&path).unwrap(), &mut again, 8).unwrap();
+        assert_eq!(again[..], source[8..8 + size]);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// Decides: a copy of the whole blocks around a range is checked by the same checker as the mapping is: it passes where the mapping passes, a byte
+    /// changed anywhere in the blocks around the range fails it as it fails the mapping, and a copy that does not hold those blocks is refused.
+    #[test]
+    fn a_copy_of_the_blocks_around_a_range_is_checked_as_the_mapping_is() {
+        let size = (9 << 20) + 321;
+        let data: Vec<u8> = (0..size).map(|at| (at * 31 % 253) as u8).collect();
+        let file = std::env::temp_dir().join(format!("straydog-auth-copy-{}.data", std::process::id()));
+        let tree = file.with_extension("tree");
+        std::fs::write(&file, &data).unwrap();
+        let digest = build(&File::open(&file).unwrap(), &tree, &|_| {}).unwrap();
+        let verifier = Verifier::open(&tree, size as u64, &digest, 4 * BLOCK).unwrap();
+        assert_eq!(verifier.size(), size as u64);
+        let block = BLOCK as u64;
+        // a range in a block, one over two blocks, a large one, the file's end, and a range that begins in the file's last whole block
+        let last = size as u64;
+        for (offset, length) in [(0, 5000), (4095, 2), (100_000, 3 << 20), (last - 700, 700), (last - 3 * block - 5, 3 * block + 5), (block, block)] {
+            let (start, end) = covering_blocks(last, offset, length).unwrap();
+            assert!(start % block == 0 && (end % block == 0 || end == last), "{start}..{end}");
+            assert!(start <= offset && offset + length <= end);
+            let copy = data[start as usize..end as usize].to_vec();
+            for threads in [1, 3] {
+                verify_copy_at(&copy, start, &verifier, offset, length, threads, Priority::Normal).unwrap();
+            }
+            for at in [start, offset, offset + length - 1, end - 1] {
+                let mut bad = copy.clone();
+                bad[(at - start) as usize] ^= 1;
+                assert!(verify_copy_at(&bad, start, &verifier, offset, length, 2, Priority::Normal).is_err(), "a byte changed at {at} in {start}..{end}");
+                // (the mapping of the same bytes says the same)
+                let mut whole = data.clone();
+                whole[at as usize] ^= 1;
+                assert!(verify_mapped_at(&whole, &verifier, offset, length, 2, Priority::Normal).is_err());
+            }
+            // not the blocks around the range: shorter at the end, or beginning after the first block
+            assert!(verify_copy_at(&copy[..copy.len() - 1], start, &verifier, offset, length, 1, Priority::Normal).is_err());
+            assert!(verify_copy_at(&copy, start + block, &verifier, offset, length, 1, Priority::Normal).is_err());
+        }
+        assert_eq!(covering_blocks(10, 5, 6), None, "past the file's end");
+        assert_eq!(covering_blocks(10, 5, 5), Some((0, 10)));
+        assert_eq!(covering_blocks(3 * block, block + 7, 5), Some((block, 2 * block)));
         drop(verifier);
         std::fs::remove_file(file).unwrap();
         std::fs::remove_file(tree).unwrap();

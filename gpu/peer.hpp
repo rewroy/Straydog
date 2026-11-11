@@ -81,6 +81,29 @@ struct StreamScope {
     StreamScope& operator=(const StreamScope&) = delete;
 };
 
+// WDDM can hold a CUDA stream's queued kernels until the driver is asked about that stream.
+// A peer may already be spinning on a flag those kernels will publish, so submit the producer
+// promptly. HIP launches do not need this query.
+inline void flush_launches(Device& d) {
+#if !defined(__HIPCC__)
+    const hipError_t state = hipStreamQuery(d.stream);
+    if (state != hipSuccess && state != hipErrorNotReady) check(state);
+#else
+    (void)d;
+#endif
+}
+
+// Graph capture records a peer wait for later replay; querying that stream during capture is invalid.
+inline void flush_if_not_capturing(Device& d) {
+#if !defined(__HIPCC__)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    check(cudaStreamIsCapturing(d.stream, &capture));
+    if (capture == cudaStreamCaptureStatusNone) flush_launches(d);
+#else
+    (void)d;
+#endif
+}
+
 inline float* peer_inputs(PeerLink& link) { return link.inbox; }
 inline float* peer_partials(PeerLink& link) { return link.inbox + link.rows * 2560; }
 inline float* peer_remote_partials(PeerLink& link) { return link.peer_inbox + link.rows * 2560; }
@@ -177,7 +200,10 @@ void attach_peer(Device& a, Device& b, size_t rows) {
     int ab = 0, ba = 0;
     check(hipDeviceCanAccessPeer(&ab, a.ordinal, b.ordinal));
     check(hipDeviceCanAccessPeer(&ba, b.ordinal, a.ordinal));
-    const bool direct = ab && ba;
+    // STRAYDOG_PEER_DIRECT=0 links them through page-locked host memory even where they reach each other directly: the link two
+    // GPUs get on Windows (WDDM), measured on a pair that has the direct one.
+    const char* peer_direct = std::getenv("STRAYDOG_PEER_DIRECT");
+    const bool direct = ab && ba && !(peer_direct && std::string(peer_direct) == "0");
     // Inputs, partial sums, then the owner's routes (rows x 21 words).
     const size_t inbox_bytes = rows * (2560 * 2 + 21) * 4;
     auto enable = [](int from, int to) {

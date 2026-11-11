@@ -192,7 +192,12 @@ struct ResidentMoe {
     // Partial residency: routed experts live in device slots (null data when absent)
     // and are otherwise read from the authenticated host mapping.
     bool hybrid=false;
+    bool layer_prefill=false;   // this layer's routed banks are held for every prompt chunk
     const uint8_t* host[3]{};
+    // host points at the engine's page-locked copies of the banks, not at the model's mapping (sd_hybrid_repoint): nothing is read ahead of them.
+    bool host_copy=false;
+    // With host_copy: the start of the allocation each bank of the copy lies in (a bank begins inside it; sd_hybrid_assist maps an allocation by its start).
+    const uint8_t* host_base[3]{};
     size_t host_bytes[3]{};
     std::vector<int32_t> slot_of;
     uint8_t slot_group=0;   // the slots its experts take (expert_slots_carve)
@@ -292,11 +297,12 @@ constexpr size_t gemm_elements = 32 * 1024 * 1024, blas_workspace_bytes = 16 * 1
 // A pass reads from a mirror the rows at least this many newer than the ring's oldest: a verification's last rows taken back (up to
 // verify_max) leave what it reads in place, with nothing to copy again.
 constexpr size_t kv_mirror_margin = 8;
-// Qwen3.8's attention K/V (its planes of `context` positions, each K/V head's keys, then each one's values) holds FP16 values: a
-// plane's row of a position is 256 halves, 128 of its allocation's floats. The prompt's flash rounded the keys and values to FP16
-// already; decode and verification read them as such. (Copies, stage and mirrors count in these elements.)
-typedef __half kv_t;
-constexpr size_t kv_row_floats = 256 * sizeof(kv_t) / 4;
+// Qwen3.8's attention K/V: its planes of `context` positions (each K/V head's keys, then each one's values), a plane's row of a
+// position one head's 256 values in the device's format (Device::kv_row, sd_kv_format): FP16, a row of 512 bytes; or Q8_0, the 256
+// values as int8 and then the FP16 scales of their eight 32-value blocks, 272 bytes (17 pieces of 16: every row stays 16-byte aligned
+// and is read in one run). kv_t is a byte of it; copies, stage and mirrors count in rows of Device::kv_row bytes.
+typedef uint8_t kv_t;
+constexpr unsigned kv_row_f16 = 512, kv_row_q8 = 272;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
@@ -520,6 +526,12 @@ struct Device {
     // check accumulates in flags[1] until sd_prefill_settle. `handoff` orders a row handoff
     // between this device's stream and its peer's.
     bool prefill_deferred = false;
+    ResidentMoe* layer_prefill_plan = nullptr;
+    void* layer_prefill_storage = nullptr;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    sd_prefill_observer prefill_observer = nullptr;
+    void* prefill_observer_context = nullptr;
+#endif
     // A sequence with images (sd_rope_delta, sd_rope_rows). The table is allocated at its first image, beside the budget:
     // a few KiB the runtime's reserve holds, needed when the slots have taken all that is counted.
     uint32_t rope_delta = 0;
@@ -595,6 +607,10 @@ struct Device {
     // Planes of a host K/V state (each K/V head's keys, then each one's values): 4 for a whole layer, 2 for a part
     // (QwenHeads<2>::kv); set as its layer registers.
     std::unordered_map<const void*,size_t> kv_planes;
+    unsigned kv_row = kv_row_f16;   // bytes of a K/V row: its format (sd_kv_format), set before any layer registers
+    // Layer order's hidden rows to the device (sd_prefill_rows) and back (prefill_span's output), wall nanoseconds and bytes so far
+    // (sd_prefill_row_transfers): each timed between waits the transfers make anyway, none added.
+    uint64_t rows_up_ns = 0, rows_up_bytes = 0, rows_down_ns = 0, rows_down_bytes = 0;
     size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
     // A draft's vocabulary on the device holding the head (sd_draft_vocabulary): the head's first `draft_rows` rows, and
     // `draft_extra_count` rows of tokens past them, copied into `draft_extras` (their tokens in `draft_extra_tokens`).
@@ -643,6 +659,7 @@ struct Device {
     hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
+    std::atomic<uint32_t> bank_readers{0};   // the CPU's workers reading banks' bytes now (BankReading): sd_hybrid_repoint waits for none
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
     uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
@@ -725,6 +742,15 @@ struct Device {
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
         for (auto event : {kv_released, kv_prefetched, side_fork, side_join}) if (event) cleanup(hipEventDestroy(event));
     }
+};
+// Held while the CPU's workers read the bytes of a layer's banks (the CPU experts' routes, a gather into the staging mirror): the engine moves a layer's
+// banks to other memory and frees the old only after none is held (sd_hybrid_repoint).
+struct BankReading {
+    std::atomic<uint32_t>& count;
+    explicit BankReading(Device& d) : count(d.bank_readers) { count.fetch_add(1); }
+    ~BankReading() { count.fetch_sub(1); }
+    BankReading(const BankReading&) = delete;
+    BankReading& operator=(const BankReading&) = delete;
 };
 
 __device__ float half_at(const uint8_t* p) {
@@ -975,14 +1001,50 @@ __global__ void cast_half(const float* input, __half* output, size_t count) {
     if (index < count) output[index] = __float2half(input[index]);
 }
 
-// A K/V value as it is held (kv_t), and as it is read.
-__device__ __forceinline__ kv_t kv_value(float value) { return __float2half_rn(value); }
-__device__ __forceinline__ float kv_load(const kv_t* at) { return __half2float(*at); }
+// A K/V row's values as they are read: FP16, or Q8_0's int8 times its block's scale. `kv_row`: the row's bytes, its format.
+__device__ __forceinline__ float kv_scale(const kv_t* row, size_t column) {
+    return __half2float(reinterpret_cast<const __half*>(row + 256)[column / 32]);
+}
+__device__ __forceinline__ float kv_load(const kv_t* row, size_t column, unsigned kv_row) {
+    if (kv_row == kv_row_q8) return float(reinterpret_cast<const int8_t*>(row)[column]) * kv_scale(row, column);
+    return __half2float(reinterpret_cast<const __half*>(row)[column]);
+}
+// Four values from `column` (a multiple of four, so in one block) as FP16, eight bytes as the WMMA prefill stages them.
+__device__ __forceinline__ uint2 kv_half4(const kv_t* row, size_t column, unsigned kv_row) {
+    if (kv_row != kv_row_q8) return *reinterpret_cast<const uint2*>(row + column * 2);
+    const uint32_t word = *reinterpret_cast<const uint32_t*>(row + column);
+    const float scale = kv_scale(row, column);
+    uint32_t halves[4];
+    #pragma unroll
+    for (unsigned b = 0; b < 4; ++b) halves[b] = __half_as_ushort(__float2half_rn(float(int8_t(word >> (8 * b))) * scale));
+    return uint2{halves[0] | halves[1] << 16, halves[2] | halves[3] << 16};
+}
+// A value to store. Q8_0 takes its block's scale from the largest magnitude of the block's 32 values, which the 32 lanes of a warp
+// hold (lane = column % 32): every lane of the warp encodes together. The scale is rounded to FP16 first and the value divided by
+// that, so what is read back is what the int8 meant (its error at most half a scale).
+struct KvValue { float value; __half scale; int q; };
+__device__ __forceinline__ KvValue kv_encode(float value, unsigned kv_row) {
+    KvValue out{value, __float2half_rn(0.0f), 0};
+    if (kv_row != kv_row_q8) return out;
+    float top = fabsf(value);
+    for (unsigned offset = 16; offset; offset /= 2) top = fmaxf(top, __shfl_xor(top, offset, 32));
+    out.scale = __float2half_rn(top / 127.0f);
+    const float scale = __half2float(out.scale);
+    const int q = scale > 0.0f ? __float2int_rn(value / scale) : 0;
+    out.q = q > 127 ? 127 : q < -127 ? -127 : q;
+    return out;
+}
+__device__ __forceinline__ void kv_put(kv_t* row, size_t column, const KvValue& value, unsigned kv_row) {
+    if (kv_row != kv_row_q8) { reinterpret_cast<__half*>(row)[column] = __float2half_rn(value.value); return; }
+    reinterpret_cast<int8_t*>(row)[column] = int8_t(value.q);
+    if (column % 32 == 0) reinterpret_cast<__half*>(row + 256)[column / 32] = value.scale;
+}
 
 // values (optional) holds the rows' values instead of the packed input. A layer's K/V is
 // 2 * QwenHeads<P>::kv planes of `context` rows: each K/V head's keys, then each one's values.
+// (a warp's 32 threads are one block of a row: whole warps return, `steps * width` being a multiple of 256)
 template<int P=1>
-__global__ void write_attention_kv(kv_t* state, size_t context, size_t base, size_t steps, const float* input,
+__global__ void write_attention_kv(unsigned kv_row, kv_t* state, size_t context, size_t base, size_t steps, const float* input,
                                    const uint32_t* position=nullptr, const float* values=nullptr,
                                    kv_t* mirror=nullptr, size_t mirror_rows=0) { SD_KERNEL_ACQUIRE;
     constexpr size_t K = QwenHeads<P>::kv, width = K * 256;
@@ -991,17 +1053,18 @@ __global__ void write_attention_kv(kv_t* state, size_t context, size_t base, siz
     if (index >= steps * width) return;
     const size_t step = index / width, head = (index % width) / 256, column = index % 256;
     const size_t keys_start = steps * QwenHeads<P>::query * 256;
-    const kv_t key = kv_value(input[keys_start + index]), value = kv_value(values ? values[index] : input[keys_start + steps * width + index]);
-    state[(head * context + base + step) * 256 + column] = key;
-    state[context * width + (head * context + base + step) * 256 + column] = value;
+    const KvValue key = kv_encode(input[keys_start + index], kv_row);
+    const KvValue value = kv_encode(values ? values[index] : input[keys_start + steps * width + index], kv_row);
+    kv_put(state + (head * context + base + step) * kv_row, column, key, kv_row);
+    kv_put(state + ((K + head) * context + base + step) * kv_row, column, value, kv_row);
     if (mirror_rows) {
         const size_t slot=unsigned(base+step)%unsigned(mirror_rows);
-        mirror[(head*mirror_rows+slot)*256+column]=key;
-        mirror[((K+head)*mirror_rows+slot)*256+column]=value;
+        kv_put(mirror+(head*mirror_rows+slot)*kv_row,column,key,kv_row);
+        kv_put(mirror+((K+head)*mirror_rows+slot)*kv_row,column,value,kv_row);
     }
 }
 
-__global__ void attention_scores(const kv_t* state, size_t context, size_t base, size_t steps,
+__global__ void attention_scores(unsigned kv_row, const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, float* scores, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24;
@@ -1015,7 +1078,7 @@ __global__ void attention_scores(const kv_t* state, size_t context, size_t base,
                 const size_t token = size_t(raw);
                 result = 0;
                 for (size_t column = 0; column < 256; ++column)
-                    result += kv_load(&state[((head / 12) * context + token) * 256 + column])
+                    result += kv_load(state + ((head / 12) * context + token) * kv_row, column, kv_row)
                             * input[item * 256 + column];
                 result *= 0.0625f;
             }
@@ -1024,7 +1087,7 @@ __global__ void attention_scores(const kv_t* state, size_t context, size_t base,
     }
 }
 
-__global__ void attention_reduce(const kv_t* state, size_t context, size_t base, size_t steps,
+__global__ void attention_reduce(unsigned kv_row, const kv_t* state, size_t context, size_t base, size_t steps,
                                  size_t selected, const float* input, const float* scores, float* output, const uint32_t* position=nullptr) {
     if (position) base=*position;
     const size_t item = blockIdx.x, step = item / 24, head = item % 24, column = threadIdx.x;
@@ -1062,7 +1125,7 @@ __global__ void attention_reduce(const kv_t* state, size_t context, size_t base,
         if (raw >= 0 && raw <= float(base + step) && raw < float(context)) {
             const size_t token = size_t(raw);
             result += probabilities[slot]
-                    * kv_load(&state[context * 512 + ((head / 12) * context + token) * 256 + column]);
+                    * kv_load(state + (2 * context + (head / 12) * context + token) * kv_row, column, kv_row);
         }
     }
     output[item * 256 + column] = result;
@@ -1726,6 +1789,141 @@ int sd_copy_allocation(void* handle,void* target,const void* source) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage) {
+    try {
+        if (!storage || !bytes) throw std::runtime_error("invalid layer bank allocation");
+        *storage = nullptr;
+        auto& d = device(handle);
+        if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes) return 1;
+        const hipError_t status = hipMalloc(storage, size_t(bytes) + allocation_tail);
+        if (status == hipErrorOutOfMemory) { (void)hipGetLastError(); *storage = nullptr; return 1; }
+        check(status);
+        try { d.allocations.emplace(*storage, size_t(bytes)); }
+        catch (...) { cleanup(hipFree(*storage)); *storage = nullptr; throw; }
+        d.used += size_t(bytes) + allocation_tail;
+        check(hipMemsetAsync(static_cast<uint8_t*>(*storage) + bytes, 0, allocation_tail, d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes) {
+    try { load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
+                         const uint8_t* const* sources, const uint64_t* source_bytes) {
+    try {
+        if (!sources || !source_bytes) throw std::runtime_error("missing copied layer bank sources");
+        load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes), sources, source_bytes);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank_clear(void* handle) {
+    try { clear_prefill_bank(device(handle)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_observe(void* handle, sd_prefill_observer observer, void* context) {
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    try {
+        auto& d = device(handle);
+        check(hipStreamSynchronize(d.stream));
+        d.prefill_observer = observer;
+        d.prefill_observer_context = observer ? context : nullptr;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+#else
+    (void)handle; (void)context;
+    if (!observer) return 0;
+    last_error = "prefill observer is not included in this build";
+    return -1;
+#endif
+}
+int sd_prefill_rows(void* handle, uint64_t layer, const float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const auto found = d.decoder.find(size_t(layer));
+        if (!rows || found == d.decoder.end() || !steps || steps > found->second.capacity)
+            throw std::runtime_error("invalid prefill hidden rows");
+        // (the stream is idle: the span before this one waited for its output. The last piece's copy lands under the next span)
+        const auto started = std::chrono::steady_clock::now();
+        upload(d, found->second.workspace, rows, size_t(steps) * 10240 * 4);
+        d.rows_up_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_up_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Layer order's hidden rows held in VRAM for a pass (an allocation of sd_prefill_bank_allocate): rows [first, first + steps) of `storage`,
+// 10240 floats a row.
+static float* held_layer_rows(Device& d, void* storage, uint64_t first, uint64_t steps) {
+    auto found = d.allocations.find(storage);
+    if (!storage || found == d.allocations.end() || !steps || first + steps > found->second / (10240 * 4))
+        throw std::runtime_error("invalid layer rows held in VRAM");
+    return static_cast<float*>(storage) + size_t(first) * 10240;
+}
+// A pass's rows from the host into the rows held in VRAM (the embeddings, once a pass).
+int sd_layer_rows_put(void* handle, void* storage, uint64_t first, const float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        float* held = held_layer_rows(d, storage, first, steps);
+        if (!rows) throw std::runtime_error("no layer rows to put");
+        const auto started = std::chrono::steady_clock::now();
+        upload(d, held, rows, size_t(steps) * 10240 * 4);
+        d.rows_up_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_up_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The rows held in VRAM back to the host (the last layer's output, once a pass), after the work queued before them.
+int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const float* held = held_layer_rows(d, storage, first, steps);
+        if (!rows) throw std::runtime_error("no place for the layer rows");
+        // (the wait the download makes anyway, first: what is timed is the copy alone)
+        check(hipStreamSynchronize(d.stream));
+        const auto started = std::chrono::steady_clock::now();
+        download(d, rows, held, size_t(steps) * 10240 * 4);
+        d.rows_down_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        d.rows_down_bytes += uint64_t(steps) * 10240 * 4;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_rows from rows held in VRAM: a device copy into the layer's workspace.
+int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        const auto found = d.decoder.find(size_t(layer));
+        if (found == d.decoder.end() || !steps || steps > found->second.capacity)
+            throw std::runtime_error("invalid prefill hidden rows");
+        const float* held = held_layer_rows(d, storage, first, steps);
+        check(hipMemcpyAsync(found->second.workspace, held, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_span of the rows a workspace holds, its output copied back into the rows held in VRAM: the same span, with its check of
+// the values each span (as with an output to the host), and a device copy where the host's was.
+int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
+    auto& d = device(handle);
+    const bool deferred = d.prefill_deferred;
+    try {
+        float* held = held_layer_rows(d, storage, first, steps);
+        const auto found = d.decoder.find(size_t(begin));
+        if (found == d.decoder.end()) throw std::runtime_error("prefill span has no compatible resident layer");
+        d.prefill_deferred = false;
+        prefill_span(d, size_t(begin), size_t(end), size_t(position), size_t(steps), nullptr, nullptr, 0, nullptr);
+        d.prefill_deferred = deferred;
+        check(hipMemcpyAsync(held, found->second.workspace, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+        return 0;
+    } catch (const std::exception& e) { d.prefill_deferred = deferred; last_error=e.what(); return -1; }
+}
+// Layer order's hidden rows moved so far: up nanoseconds, up bytes, down nanoseconds, down bytes.
+int sd_prefill_row_transfers(void* handle, uint64_t* out) {
+    try {
+        auto& d = device(handle);
+        if (!out) throw std::runtime_error("no place for the row transfers");
+        out[0] = d.rows_up_ns; out[1] = d.rows_up_bytes; out[2] = d.rows_down_ns; out[3] = d.rows_down_bytes;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,
                      const float* input,float* output,uint64_t output_rows,double* timings) {
     try {
@@ -1796,6 +1994,11 @@ int sd_prefill_handoff(void* from,void* to,uint64_t from_layer,uint64_t to_layer
             check(hipEventRecord(b.handoff,b.stream));
         });
         on_device(a.ordinal,[&]() { check(hipStreamWaitEvent(a.stream,b.handoff,0)); });
+        // Both sides of the handoff now have their work queued.
+#if !defined(__HIPCC__)
+        on_device(a.ordinal,[&]() { flush_launches(a); });
+        on_device(b.ordinal,[&]() { flush_launches(b); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1883,8 +2086,8 @@ void* sd_hybrid_moe_create(void* handle,void* const* pointers,const int* kinds,c
     try { return create_hybrid_moe(device(handle),pointers,kinds,routed_kinds,size_t(experts),host,workspace,size_t(capacity)); }
     catch (const std::exception& e) { last_error=e.what(); return nullptr; }
 }
-int sd_expert_slots(void* handle,uint64_t cache,uint64_t stage,uint64_t slot_bytes) {
-    try { create_expert_slots(device(handle),size_t(cache),size_t(stage),size_t(slot_bytes)); return 0; }
+int sd_expert_slots(void* handle,uint64_t cache,uint64_t stage,uint64_t slot_bytes,int mirror) {
+    try { create_expert_slots(device(handle),size_t(cache),size_t(stage),size_t(slot_bytes), mirror != 0); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // A K/V growth takes the VRAM of the expert slots for its longer indexers and gives back what is left.
@@ -2029,6 +2232,14 @@ int sd_hybrid_refresh(void* handle,uint64_t max_swaps,uint64_t* pending,uint64_t
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_hybrid_cache_bytes(void* handle,uint64_t* bytes) {
+    try {
+        if (!bytes) throw std::runtime_error("invalid hybrid cache bytes");
+        auto& d=device(handle);
+        *bytes=d.slots.base ? d.slots.arena : 0;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The pool's size and occupation, as sd_hybrid_refresh reports them.
 int sd_hybrid_slots(void* handle,uint64_t* slots,uint64_t* held) {
     try {
@@ -2086,8 +2297,13 @@ int sd_hybrid_assist(void* handle,uint32_t assist,uint64_t* mapped) {
             if (plan.mapped[0]) { ++*mapped; continue; }
             void* views[3]{};
             bool ok=true;
-            for (size_t role=0;role<3 && ok;++role)
-                ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host[role]),0)==hipSuccess;
+            for (size_t role=0;role<3 && ok;++role) {
+                if (plan.host_copy && plan.host_base[role]) {
+                    // A copy's bank lies inside its allocation: the runtime maps the allocation, not an address in it, and the bank's view is at the same offset.
+                    ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host_base[role]),0)==hipSuccess;
+                    if (ok) views[role]=static_cast<uint8_t*>(views[role])+(plan.host[role]-plan.host_base[role]);
+                } else ok=hipHostGetDevicePointer(&views[role],const_cast<uint8_t*>(plan.host[role]),0)==hipSuccess;
+            }
             (void)hipGetLastError();   // clear the failed lookup
             for (size_t role=0;role<3;++role) plan.mapped[role]=ok ? static_cast<const uint8_t*>(views[role]) : nullptr;
             *mapped+=ok;
@@ -2133,6 +2349,42 @@ int sd_hybrid_unmap(void* handle,const void* gate,uint64_t* found) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The plan whose host banks begin at `from` (its gate bank's address) reads the same banks from `host` (gate, up and down) from now on: the engine
+// holds page-locked copies of the banks where the GPU cannot page-lock the model's read-only mapping (`copy` 1, with `base`: the start of the allocation
+// each bank lies in, which the assist maps), and points the plan back at the mapping before it frees them (`copy` 0, `base` not read). Nothing may read the old memory when this returns: the swap copies in flight (the device's thread and the copy
+// stream) and the kernels that read the banks in place or hold the view in a captured graph (the device) are waited for, and so are the CPU's workers
+// (BankReading; they run inside the engine's calls on this thread, so a count above zero is a fault, and the plan is left as it was). The plan's view
+// for the GPU's assist is dropped: sd_hybrid_assist maps the new memory. `found` is 1 where this device holds the plan.
+int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,const uint8_t* const* base,int copy,uint64_t* found) {
+    try {
+        if (!from || !host || !host[0] || !host[1] || !host[2] || !found) throw std::runtime_error("invalid hybrid repoint");
+        if (copy && (!base || !base[0] || !base[1] || !base[2])) throw std::runtime_error("invalid hybrid repoint: a copy's allocations");
+        auto& d=device(handle);
+        *found=0;
+        ResidentMoe* target=nullptr;
+        for (auto& item : d.resident)
+            if (item.second->hybrid && item.second->host[0]==from) { target=item.second.get(); break; }
+        if (!target) return 0;
+        *found=1;
+        if (d.copier) d.copier->wait();
+        if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+        hybrid_drop_graphs(d);   // (it waits for the stream: no kernel is still reading the banks)
+        check(hipDeviceSynchronize());
+        for (unsigned waited=0;d.bank_readers.load()!=0;++waited) {
+            if (waited>5000) throw std::runtime_error("the CPU's experts are still reading the layer's banks");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (size_t role=0;role<3;++role) {
+            target->mapped[role]=nullptr; target->host[role]=host[role]; target->host_base[role]=copy ? base[role] : nullptr;
+        }
+        target->host_copy=copy!=0;
+        target->prefetched.clear();
+        bool any=false;
+        for (const auto& item : d.resident) any|=item.second->hybrid && item.second->mapped[0];
+        d.hint_experts=!any;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The assist level alone, once sd_hybrid_assist has mapped the banks (mapping them again is the dear part of that call). A level past
 // the cap is refused.
 int sd_hybrid_assist_level(void* handle,uint32_t assist) {
@@ -2170,6 +2422,28 @@ int sd_host_register_on(int ordinal,void* pointer,uint64_t bytes) {
     try {
         check(hipSetDevice(ordinal));
         return sd_host_register(pointer,bytes);
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped): the engine's copies of the expert banks where
+// the GPU cannot register the model's read-only mapping (sd_hybrid_repoint). Allocated under the context of device `ordinal`, from any thread.
+int sd_host_alloc_on(int ordinal,uint64_t bytes,void** pointer) {
+    try {
+        if (!pointer || !bytes) throw std::runtime_error("invalid host allocation");
+        *pointer=nullptr;
+        check(hipSetDevice(ordinal));
+        void* value=nullptr;
+        check(hipHostMalloc(&value,size_t(bytes),hipHostMallocPortable|hipHostMallocMapped));
+        *pointer=value;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Give back memory sd_host_alloc_on returned, once nothing reads it.
+int sd_host_free(int ordinal,void* pointer) {
+    try {
+        if (!pointer) throw std::runtime_error("invalid host free");
+        check(hipSetDevice(ordinal));
+        check(hipHostFree(pointer));
+        return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Page-lock host memory that devices may also write (downloads into it).
@@ -2380,6 +2654,48 @@ const char* sd_error() { return last_error.c_str(); }
 int sd_device_count() {
     try { int count = 0; check(hipGetDeviceCount(&count)); return count; }
     catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_prime_qwen_prefill_gemm(int ordinal, uint64_t prompt_tokens) {
+    try {
+        if (prompt_tokens < 2 || prompt_tokens > 4096) throw std::runtime_error("invalid prefill GEMM batch");
+        check(hipSetDevice(ordinal));
+        struct Resources {
+            hipStream_t stream = nullptr;
+            hipblasHandle_t blas = nullptr;
+            void* weights = nullptr;
+            void* inputs = nullptr;
+            void* outputs = nullptr;
+            void* workspace = nullptr;
+            ~Resources() {
+                if (stream) (void)hipStreamSynchronize(stream);
+                if (blas) (void)hipblasDestroy(blas);
+                if (stream) (void)hipStreamDestroy(stream);
+                for (void* allocation : {weights, inputs, outputs, workspace}) {
+                    if (allocation) (void)hipFree(allocation);
+                }
+            }
+        } prime;
+        constexpr int rows = 320, width = 10240;
+        const int tokens = int(prompt_tokens);
+        check(hipStreamCreate(&prime.stream));
+        check(hipMalloc(&prime.weights, size_t(rows) * width * 2));
+        check(hipMalloc(&prime.inputs, size_t(tokens) * width * 2));
+        check(hipMalloc(&prime.outputs, size_t(rows) * tokens * 4));
+        check(hipMalloc(&prime.workspace, blas_workspace_bytes));
+        check(hipMemset(prime.weights, 0, size_t(rows) * width * 2));
+        check(hipMemset(prime.inputs, 0, size_t(tokens) * width * 2));
+        blas_check(hipblasCreate(&prime.blas));
+        blas_check(hipblasSetStream(prime.blas, prime.stream));
+        blas_check(hipblasSetWorkspace(prime.blas, prime.workspace, blas_workspace_bytes));
+        blas_check(hipblasSetMathMode(prime.blas, HIPBLAS_DEFAULT_MATH));
+        const float alpha = 1, beta = 0;
+        blas_check(hipblasGemmEx(prime.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, rows, tokens, width, &alpha,
+            prime.weights, HIP_R_16F, width, prime.inputs, HIP_R_16F, width, &beta,
+            prime.outputs, HIP_R_32F, rows, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+        check(hipStreamSynchronize(prime.stream));
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
 #if defined(_WIN32) && !defined(__HIPCC__)
@@ -2683,11 +2999,24 @@ int sd_fill_rows(void* filler, void* pointer, uint64_t offset, uint64_t pitch, c
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// The device bytes sd_release would give back for `pointer` (its size and the allocation tail), without releasing it.
+int sd_allocation_bytes(void* handle, const void* pointer, uint64_t* bytes) {
+    try {
+        auto& value = device(handle);
+        if (!bytes) throw std::runtime_error("invalid allocation bytes");
+        auto found = value.allocations.find(const_cast<void*>(pointer));
+        if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        *bytes = uint64_t(found->second + allocation_tail);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_release(void* handle, void* pointer) {
     try {
         auto& value = device(handle);
         auto found = value.allocations.find(pointer);
         if (found == value.allocations.end()) throw std::runtime_error("unknown Straydog allocation");
+        if (pointer == value.layer_prefill_storage) throw std::runtime_error("cannot release an active layer prefill bank");
         written(value, pointer);
         if (value.kv_prefetching && (pointer == value.kv_stage || pointer == value.kv_stage_owner)) {
             check(hipStreamSynchronize(value.kv_stream));
@@ -2875,7 +3204,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown = nullptr;
         // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
         // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (host_allocate(&grown, to * 1024 * sizeof(kv_t) + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+        if (host_allocate(&grown, to * 4 * d.kv_row + allocation_tail, hipHostMallocMapped) != hipSuccess) {
             (void)hipGetLastError();
             throw std::runtime_error(kv_no_memory);
         }
@@ -2883,10 +3212,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown_index = nullptr;
         void* grown_scratch = nullptr;
         try {
-            std::memset(grown, 0, to * 1024 * sizeof(kv_t) + allocation_tail);
+            std::memset(grown, 0, to * 4 * d.kv_row + allocation_tail);
             for (size_t plane = 0; plane < 4; ++plane)
-                std::memcpy(static_cast<kv_t*>(grown) + plane * to * 256, static_cast<const kv_t*>(host->second) + plane * from * 256,
-                            valid * 256 * sizeof(kv_t));
+                std::memcpy(static_cast<kv_t*>(grown) + plane * to * d.kv_row, static_cast<const kv_t*>(host->second) + plane * from * d.kv_row,
+                            valid * d.kv_row);
             check(hipHostGetDevicePointer(&pointer, grown, 0));
             // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
             std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
@@ -2907,7 +3236,7 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         kv_clear_graphs(d);
         check(hipHostFree(host->second));
         d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
-        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 1024 * sizeof(kv_t));
+        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 4 * d.kv_row);
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
         plan.states[0] = pointer; plan.context = to;
         if (grown_index) {
@@ -2993,6 +3322,17 @@ int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint
         }
         *moe = new_moe; *decoder = new_decoder;
         return refused ? 1 : 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// The format of the K/V: the bytes of its rows, 512 (FP16) or 272 (Q8_0). Before any decoder layer registers.
+int sd_kv_format(void* handle, uint32_t row) {
+    try {
+        auto& value = device(handle);
+        if ((row != kv_row_f16 && row != kv_row_q8) || !value.decoder.empty() || !value.host_states.empty())
+            throw std::runtime_error("invalid Straydog K/V format");
+        value.kv_row = row;
+        return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
@@ -3100,7 +3440,7 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
             !steps || steps > max_batch || base > context || steps > context - base || !selected || selected > 2052)
             throw std::runtime_error("invalid Straydog attention dimensions");
         auto found = value.allocations.find(state);
-        if (found == value.allocations.end() || found->second != context * 1024 * sizeof(kv_t))
+        if (found == value.allocations.end() || found->second != context * 4 * value.kv_row)
             throw std::runtime_error("Straydog attention state size mismatch");
         if (input_count != steps * (24 * 256 + 1024 + selected + 1) || output_count != steps * 24 * 256 ||
             input_count > value.input_capacity || output_count > value.output_capacity)
@@ -3114,11 +3454,11 @@ int sd_attention_sequence(void* handle, void* state, uint64_t context, uint64_t 
         }
         upload(value, value.input, input, size_t(input_count) * 4);
         kv_invalidate_write(value,state,size_t(base));
-        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(static_cast<kv_t*>(state),
+        write_attention_kv<<<unsigned((steps*512+255)/256),256,0,value.stream>>>(value.kv_row, static_cast<kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), value.input);
-        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
+        attention_scores<<<unsigned(steps*24),256,0,value.stream>>>(value.kv_row, static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores);
-        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(static_cast<const kv_t*>(state),
+        attention_reduce<<<unsigned(steps*24),256,0,value.stream>>>(value.kv_row, static_cast<const kv_t*>(state),
             size_t(context), size_t(base), size_t(steps), size_t(selected), value.input, value.attention_scores, value.output);
         check(hipGetLastError());
         download(value, output, value.output, size_t(output_count) * 4);
@@ -3376,6 +3716,10 @@ int sd_buffer_copy_peer(void* to, void* target, void* from, const void* source, 
             check(hipEventRecord(b.handoff, b.stream));
         });
         on_device(a.ordinal, [&]() { check(hipStreamWaitEvent(a.stream, b.handoff, 0)); });
+#if !defined(__HIPCC__)
+        on_device(a.ordinal, [&]() { flush_launches(a); });
+        on_device(b.ordinal, [&]() { flush_launches(b); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -3511,6 +3855,22 @@ int sd_graph_run(void* handle, uint64_t key) {
         if (found == value.graphs.end()) return 1;
         graph_launch(value, found->second);
         ++value.graph_replays;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_devices_flush(void* const* handles, uint64_t devices) {
+    try {
+#if !defined(__HIPCC__)
+        if (!handles || !devices || devices > 8) throw std::runtime_error("invalid Straydog devices");
+        for (size_t i = 0; i < devices; ++i) {
+            Device& d = device(handles[i]);
+            on_device(d.ordinal, [&]() { flush_launches(d); });
+        }
+#else
+        (void)handles;
+        (void)devices;
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4530,6 +4890,10 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 on_device(list[i]->ordinal, [&]() {
                     if (sd_op_link_sum(handles[i], parts[i], count, outs[i], 0)) throw std::runtime_error(last_error);
                 });
+            // Either link sum may wait for the other device's flag.
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
             return 0;
         }
         link_peers(list);
@@ -4539,6 +4903,10 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+        // A consumer's stream waits for each peer's parts_ready event below.
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4549,6 +4917,9 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4565,6 +4936,9 @@ int sd_devices_settle(void* const* handles, uint64_t devices) {
                 for (Device* other : list)
                     if (other != d && other->parts_read) check(hipStreamWaitEvent(d->stream, other->parts_read, 0));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4620,6 +4994,9 @@ int sd_op_gather_columns(void* const* handles, void* const* outs, const void* co
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4630,6 +5007,9 @@ int sd_op_gather_columns(void* const* handles, void* const* outs, const void* co
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4687,6 +5067,9 @@ int sd_op_gather_owned(void* const* handles, float* const* outs, const float* co
                 if (!d->parts_ready) check(hipEventCreateWithFlags(&d->parts_ready, hipEventDisableTiming));
                 check(hipEventRecord(d->parts_ready, d->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         for (size_t i = 0; i < devices; ++i)
             on_device(list[i]->ordinal, [&]() {
                 for (size_t j = 0; j < devices; ++j)
@@ -4697,6 +5080,9 @@ int sd_op_gather_owned(void* const* handles, float* const* outs, const float* co
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
             });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

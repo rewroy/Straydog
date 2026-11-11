@@ -266,6 +266,15 @@ impl Drop for ReadPermit {
     }
 }
 
+/// Disjoint borrowed destinations: every block must verify before this call returns them.
+pub(crate) struct VerifiedRead<'a> {
+    pub file: Arc<File>,
+    pub file_index: usize,
+    pub offset: u64,
+    pub target: &'a mut [u8],
+    pub verifier: Verifier,
+}
+
 /// Threads reading expert chunks, with optional data-I/O admission separate from hashing.
 pub struct Reader {
     queue: Queue,
@@ -325,6 +334,52 @@ impl Reader {
             })
         }).collect();
         Reader { queue, workers }
+    }
+
+    /// Large cached reads for a temporary layer copy. Return only after every job has
+    /// stopped writing, including failure: the destinations are borrowed for this call.
+    pub(crate) fn read_verified(&self, ranges: &mut [VerifiedRead<'_>]) -> Result<()> {
+        const PIECE: usize = 4 << 20;
+        for range in ranges.iter() {
+            if !range.offset.is_multiple_of(ALIGN as u64) || !range.target.len().is_multiple_of(ALIGN)
+                || range.offset.checked_add(range.target.len() as u64).is_none() {
+                return Err("a copied bank read must cover whole blocks".into());
+            }
+        }
+        let (done, completed) = channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut jobs = Vec::new();
+        for (slot, range) in ranges.iter_mut().enumerate() {
+            for first in (0..range.target.len()).step_by(PIECE) {
+                let len = PIECE.min(range.target.len() - first);
+                // SAFETY: the ranges are disjoint mutable borrows, subdivided into
+                // disjoint pieces. All their completions are drained before returning.
+                let target = HostPointer(unsafe { range.target.as_mut_ptr().add(first) });
+                jobs.push(ReadJob {
+                    file: range.file.clone(), offset: range.offset + first as u64, len: len as u64, target,
+                    verifier: Some((range.verifier.clone(), range.file_index)), done: done.clone(), slot,
+                    chunk: Chunk { host: first as u64, vram: 0, bytes: len as u64, head: false },
+                    latency: false, cancelled: cancelled.clone(),
+                });
+            }
+        }
+        let count = jobs.len();
+        drop(done);
+        self.submit(jobs, true);
+        let mut failure = None;
+        for _ in 0..count {
+            match completed.recv() {
+                Ok((_, _, Landed::Read)) => {},
+                Ok((_, _, Landed::Failed(error))) => {
+                    failure.get_or_insert(error);
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok((_, _, Landed::Skipped)) => {},
+                // Every sender is gone, hence no job can still access a destination.
+                Err(_) => { failure.get_or_insert("a copied bank reader stopped".into()); break; }
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Pass reads precede prefetches. The shared pool is FIFO across devices' heads, with bounded
@@ -3056,5 +3111,92 @@ mod warm_tests {
         assert_eq!(taken_up_to(0, &at, keys.len()), 0);
         assert_eq!(taken_up_to(1, &at, keys.len()), 2);
         assert_eq!(taken_up_to(3, &at, keys.len()), 5);
+    }
+}
+
+#[cfg(test)]
+mod copied_reader_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Fixture { file: Arc<File>, path: std::path::PathBuf, tree: std::path::PathBuf, data: Vec<u8>, verifier: Verifier }
+    impl Fixture {
+        fn new() -> Self {
+            let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("straydog-copied-reader-{}-{id}", std::process::id()));
+            let tree = path.with_extension("tree");
+            let data: Vec<u8> = (0..(11 << 20) + 321).map(|at| (at * 31 % 253) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            let file = Arc::new(storage::reader(&File::open(&path).unwrap()).unwrap());
+            let digest = crate::verity::build(&file, &tree, &|_| {}).unwrap();
+            let check = crate::verity::Verifier::open(&tree, data.len() as u64, &digest, 4 << 20).unwrap();
+            let verifier: Verifier = Arc::new(move |_, at, bytes| check.verify(at, bytes));
+            Self { file, path, tree, data, verifier }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.tree);
+        }
+    }
+
+    #[test]
+    fn copied_ranges_verify_their_own_bytes_including_the_last_partial_block() {
+        let fixture = Fixture::new();
+        let reader = Reader::new(8);
+        let mut first = storage::Buffer::new(5 << 20);
+        let offset = 7 << 20;
+        let tail = fixture.data.len() - offset;
+        let mut last = storage::Buffer::new(tail.next_multiple_of(ALIGN));
+        let mut ranges = [
+            VerifiedRead { file: fixture.file.clone(), file_index: 0, offset: 0,
+                target: first.as_mut_slice(), verifier: fixture.verifier.clone() },
+            VerifiedRead { file: fixture.file.clone(), file_index: 0, offset: offset as u64,
+                target: last.as_mut_slice(), verifier: fixture.verifier.clone() },
+        ];
+        reader.read_verified(&mut ranges).unwrap();
+        assert_eq!(first.as_slice(), &fixture.data[..5 << 20]);
+        assert_eq!(&last.as_slice()[..tail], &fixture.data[offset..]);
+        assert!(last.as_slice()[tail..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_bad_copy_is_refused_and_the_same_pool_and_buffer_can_read_again() {
+        let fixture = Fixture::new();
+        let reader = Reader::new(8);
+        let mut buffer = storage::Buffer::new(fixture.data.len().next_multiple_of(ALIGN));
+        let mut bad = fixture.data.clone();
+        bad[(4 << 20) + 4095] ^= 1;
+        std::fs::write(&fixture.path, &bad).unwrap();
+        let read = |buffer: &mut storage::Buffer| reader.read_verified(&mut [VerifiedRead {
+            file: fixture.file.clone(), file_index: 0, offset: 0,
+            target: buffer.as_mut_slice(), verifier: fixture.verifier.clone(),
+        }]);
+        assert!(read(&mut buffer).unwrap_err().contains("does not verify"));
+        std::fs::write(&fixture.path, &fixture.data).unwrap();
+        read(&mut buffer).unwrap();
+        assert_eq!(&buffer.as_slice()[..fixture.data.len()], &fixture.data);
+    }
+
+    #[test]
+    fn a_failure_waits_for_other_inflight_reads_before_releasing_the_borrow() {
+        let fixture = Fixture::new();
+        let reader = Reader::new(2);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let (seen, gate) = (active.clone(), barrier.clone());
+        let check: Verifier = Arc::new(move |_, offset, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            gate.wait();
+            if offset != 0 { std::thread::sleep(std::time::Duration::from_millis(25)); }
+            seen.fetch_sub(1, Ordering::SeqCst);
+            if offset == 0 { Err("deliberate verification refusal".into()) } else { Ok(()) }
+        });
+        let mut buffer = storage::Buffer::new(8 << 20);
+        let result = reader.read_verified(&mut [VerifiedRead { file: fixture.file.clone(), file_index: 0, offset: 0,
+            target: buffer.as_mut_slice(), verifier: check }]);
+        assert!(result.unwrap_err().contains("deliberate verification refusal"));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "a job outlived the borrowed destination");
     }
 }

@@ -429,7 +429,7 @@ function render({ now, server, engine, host, samples: fresh = [] }) {
     lastSample = sample.time;
   }
   while (samples.length > WINDOW + 30) samples.shift();
-  $("model-line").textContent = [server.alias, `${server.backend} · v${server.version}`].join(" · ");
+  $("model-line").textContent = [server.alias, `${server.backend} · v${server.version}${server.commit ? ` (${server.commit})` : ""}`].join(" · ");
   $("uptime").textContent = duration(now - server.started);
   if (engine.state === "loading") {
     const progress = engine.progress || {};
@@ -952,7 +952,7 @@ function renderEnvironment(engine, host, server) {
   const key = JSON.stringify([server, speculation]);
   if (key === settingsShown) return;
   settingsShown = key;
-  $("version-chip").textContent = `v${server.version} · ${server.backend}`;
+  $("version-chip").textContent = `v${server.version}${server.commit ? ` (${server.commit})` : ""} · ${server.backend}`;
   facts($("settings-facts"), [
     [t("model"), server.model, "path"],
     [t("quantization"), server.quantization],

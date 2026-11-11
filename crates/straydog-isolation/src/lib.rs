@@ -23,12 +23,26 @@ pub use tree::{prepare, ProcessTree};
 /// phase timing, which a request's log line reports), DeepSeek-V4.1's drafts (DS41_DRAFTS, DS41_DSPARK, DS41_DSPARK_RESIDENT),
 /// STRAYDOG_DIRECT (the GPU queues written directly), STRAYDOG_ENGRAM (the engram table Qwen3.8 reads), STRAYDOG_EXPERT_FLOOR (speed
 /// first's router weight floor), STRAYDOG_CPU_INT8 (=0: the CPU experts' F32 path), STRAYDOG_CPU_AVX512 (=0: their kernels of a
-/// CPU without AVX-512, to measure those on one with it) and STRAYDOG_PROMPT_CPU (=0: a prompt batch streams every expert beyond the
-/// slots, none to the CPU). One list for both: a switch named on one
-/// system's list alone never reached the other's worker (speed first and the engram table did nothing in a Linux worker).
-pub const ENGINE_VARIABLES: [&str; 10] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+/// CPU without AVX-512, to measure those on one with it), STRAYDOG_PROMPT_CPU (=0: a prompt batch streams every expert beyond the
+/// slots, none to the CPU), STRAYDOG_PEER_DIRECT (=0: two GPUs linked through host memory, as on Windows) and STRAYDOG_HOST_REGISTER_READ_ONLY
+/// (=0: the GPUs are taken as unable to register host memory read-only, so the expert banks are page-locked as copies, to try that on a GPU that
+/// can); a prompt's layer order (STRAYDOG_LAYER_PREFILL, the rows of its passes STRAYDOG_LAYER_PREFILL_ROWS, where they are held
+/// STRAYDOG_LAYER_ROWS_VRAM, and STRAYDOG_LOCK_DURING_PREFILL, the
+/// locking behind "ready" going on meanwhile, which the worker's own code reads); STRAYDOG_KV (=f16: Qwen3.8's K/V held as
+/// FP16, not Q8_0); and the engines' development switches, each the one place
+/// the engine reads it: Qwen3.8's STRAYDOG_Q8, STRAYDOG_HC_Q8, STRAYDOG_PARTS, STRAYDOG_MTP_PARTS and STRAYDOG_DRAFT_VOCABULARY, and
+/// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
+/// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
+/// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
+pub const ENGINE_VARIABLES: [&str; 40] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
-                                         "STRAYDOG_PROMPT_CPU"];
+                                         "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
+                                         "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",
+                                         "STRAYDOG_Q8", "STRAYDOG_HC_Q8", "STRAYDOG_PARTS", "STRAYDOG_MTP_PARTS", "STRAYDOG_DRAFT_VOCABULARY",
+                                         "DS41_CHECK_SLOTS", "DS41_COUNT_VIEWS", "DS41_EXPANSIONS", "DS41_FP16_CHECKS", "DS41_FULL_DECODER",
+                                         "DS41_GATE_UP_FIRST", "DS41_HEADS_FIRST", "DS41_HITS_FIRST", "DS41_LEND", "DS41_LEND_ROWS",
+                                         "DS41_LEND_STATE", "DS41_LINK", "DS41_NO_GRAPHS", "DS41_PREDICT", "DS41_PREDICT_DRIVE", "DS41_Q8",
+                                         "DS41_ROUTE_READBACK", "DS41_SLOT_WMMA", "STRAYDOG_LAYER_ROWS_VRAM"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;
@@ -395,5 +409,73 @@ mod tests {
             0x82, 0xdc, 0x82, 0xb5, 0x82, 0xbd, 0x81, 0x42,
         ];
         assert_eq!(win32::decode(&cp932, 932).as_deref(), Some("アクセスが拒否されました。"));
+    }
+}
+
+#[cfg(test)]
+mod engine_variables_tests {
+    use super::ENGINE_VARIABLES;
+    use std::path::{Path, PathBuf};
+
+    /// What the engine's code reads that no worker needs, and why: a test's own paths, set by hand where the test runs in-process.
+    const TEST_ONLY: [(&str, &str); 5] = [
+        ("STRAYDOG_TOKENIZER_JSON", "a test's tokenizer file (text.rs)"),
+        ("STRAYDOG_QWEN_MMPROJ", "a test's vision projector (qwen_vision.rs)"),
+        ("STRAYDOG_DRAFTER", "the layer-order diagnostic test's drafter (layer_prefill_diagnostics.rs)"),
+        ("STRAYDOG_LAYER_MODEL", "the layer-order diagnostic test's model directory (layer_prefill_diagnostics.rs)"),
+        ("STRAYDOG_LAYER_DIAGNOSTIC_OUT", "the layer-order diagnostic test's output directory (layer_prefill_diagnostics.rs)"),
+    ];
+
+    /// What the worker's own code reads beside the engine's (behind.rs: the locking behind "ready").
+    const WORKER_READS: [&str; 1] = ["STRAYDOG_LOCK_DURING_PREFILL"];
+
+    /// The names given as string literals to `calls` in the files under `root` with one of `extensions`, with the file each is read in.
+    fn names_read(root: &Path, extensions: &[&str], calls: &[&str]) -> Vec<(String, PathBuf)> {
+        let mut found = Vec::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if !path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extensions.contains(&extension)) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for call in calls {
+                    for (at, _) in text.match_indices(call) {
+                        let rest = &text[at + call.len()..];
+                        if let Some(end) = rest.find('"') {
+                            found.push((rest[..end].to_string(), path.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Decides: every variable the engine reads by name (its Rust, and its GPU code's getenv) reaches the worker, or is a test's, named here
+    /// with why; the worker's own reads are on the list too; and the list names nothing twice, nor a test's. A switch the worker never got
+    /// measured nothing: the layer order's rows and the K/V's format on 2026-11-11.
+    #[test]
+    fn every_variable_the_engine_reads_reaches_the_worker() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut read = names_read(&repository.join("crates/straydog-engine/src"), &["rs"], &["env::var(\"", "env::var_os(\""]);
+        read.extend(names_read(&repository.join("gpu"), &["cpp", "hpp", "h"], &["getenv(\""]));
+        assert!(read.len() > 20, "the scan found the engine's reads: {read:?}");
+        let missing: Vec<&(String, PathBuf)> = read.iter()
+            .filter(|(name, _)| !ENGINE_VARIABLES.contains(&name.as_str()) && !TEST_ONLY.iter().any(|(test, _)| test == name))
+            .collect();
+        assert!(missing.is_empty(), "read by the engine, not passed to the worker (ENGINE_VARIABLES) nor a test's (TEST_ONLY): {missing:?}");
+        for name in WORKER_READS {
+            assert!(ENGINE_VARIABLES.contains(&name), "{name}");
+        }
+        for (at, name) in ENGINE_VARIABLES.iter().enumerate() {
+            assert!(!ENGINE_VARIABLES[..at].contains(name), "{name} twice");
+            assert!(!TEST_ONLY.iter().any(|(test, _)| test == name), "{name} is a test's");
+        }
     }
 }

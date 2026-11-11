@@ -5,6 +5,21 @@ __global__ void decoder_residual(float* hidden,const float* mixed,const float* b
     if (index<10240) hidden[index]+=mixed[2560+index/2560]*branch[index%2560];
 }
 
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+// A validation observer is absent from normal execution. Downloads deliberately settle the stream: these are not performance runs.
+void observe_prefill(Device& d, size_t layer, size_t phase, size_t position, size_t steps, size_t width, const float* values) {
+    if (!d.prefill_observer) return;
+    std::vector<float> rows(steps * width);
+    download(d, rows.data(), values, rows.size() * sizeof(float));
+    if (d.prefill_observer(d.prefill_observer_context, layer, phase, position, steps, width, rows.data()))
+        throw std::runtime_error("prefill validation observer failed");
+}
+
+#define SD_PREFILL_OBSERVE(...) observe_prefill(__VA_ARGS__)
+#else
+#define SD_PREFILL_OBSERVE(...) ((void)0)
+#endif
+
 // Layer 48 is the MTP draft layer: full (QSA) attention like every fourth layer.
 bool decoder_linear(size_t layer) { return layer % 4 != 3 && layer < 48; }
 
@@ -59,7 +74,7 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
             if (found==d.allocations.end() || found->second<bytes)
                 throw std::runtime_error("invalid decoder layer allocation");
         };
-        allocation(states[0],context*1024/parts*sizeof(kv_t)); room(states[1],((context/4+1)*128+qsa_history*128)*4);
+        allocation(states[0],context*4/parts*d.kv_row); room(states[1],((context/4+1)*128+qsa_history*128)*4);
         room(states[2],256*(context/4+1)*4);
     }
     DecoderLayer plan{}; plan.index=layer; plan.context=context; plan.capacity=capacity; plan.moe=moe;
@@ -79,18 +94,6 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
     plan.dependencies.insert(plan.dependencies.end(),expert.dependencies.begin(),expert.dependencies.end());
     plan.dependencies.push_back(expert.table); plan.dependencies.push_back(expert.workspace);
     d.decoder.emplace(layer,std::move(plan));
-}
-
-// WDDM (Windows) holds submitted work until the driver is next asked about the
-// stream, and the export wait asks only every few thousand spins: query right after
-// a launch so the GPU starts it now.
-inline void flush_launches(Device& d) {
-#if !defined(__HIPCC__)
-    const hipError_t state = hipStreamQuery(d.stream);
-    if (state != hipSuccess && state != hipErrorNotReady) check(state);
-#else
-    (void)d;
-#endif
 }
 
 // With prelaunch, layer L+1's graph is launched before the host computes layer L's
@@ -312,7 +315,7 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
     };
     if (input) upload(d,hidden,input,steps*10240*4);
     // The span's first host-K/V attention layer stages its prefix while the layers before it run.
-    if (steps>1) kv_prefetch_from(d,begin,position);
+    if (steps>1 && !d.layer_prefill_plan) kv_prefetch_from(d,begin,position);
     for (size_t layer=begin;layer<end;++layer) {
         const auto& plan=d.decoder.find(layer)->second;
         auto* pointers=plan.pointers.data(); const int* kinds=plan.kinds.data();
@@ -322,7 +325,9 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         if (steps*std::max({hc_batch_floats,gdn_batch_floats,qsa_batch_floats})>experts.capacity*49302+65536)
             throw std::runtime_error("prefill batch exceeds the resident expert workspace");
         const bool linear=decoder_linear(layer);
+        SD_PREFILL_OBSERVE(d,layer,0,position,steps,10240,hidden);
         record(0,[&]() { hc_prefill(d,pointers,kinds,steps,hidden,mixed,scratch); });
+        SD_PREFILL_OBSERVE(d,layer,1,position,steps,2560,mixed);
         record(linear ? 1 : 2,[&]() {
             if (linear) {
                 const size_t chunk=d.input_capacity>=16*1024*1024 ? 512 : 128;
@@ -330,16 +335,21 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
             } else {
                 qsa_prefill(d,pointers+4,kinds+4,plan.states[0],plan.states[1],plan.states[2],
                             plan.context,position,steps,mixed,branch,scratch);
-                if (steps>1) kv_prefetch_from(d,layer+1,position);
+                if (steps>1 && !d.layer_prefill_plan) kv_prefetch_from(d,layer+1,position);
             }
         });
+        SD_PREFILL_OBSERVE(d,layer,2,position,steps,2560,branch);
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        SD_PREFILL_OBSERVE(d,layer,3,position,steps,10240,hidden);
         record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch); });
+        SD_PREFILL_OBSERVE(d,layer,4,position,steps,2560,mixed);
         record(3,[&]() {
             if (d.resident.find(plan.moe)->second->part) resident_moe_parts(d,plan.moe,layer,steps,mixed,branch);
             else resident_moe(d,plan.moe,steps,mixed,branch,true);
         });
+        SD_PREFILL_OBSERVE(d,layer,5,position,steps,2560,branch);
         decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        SD_PREFILL_OBSERVE(d,layer,6,position,steps,10240,hidden);
     }
     const bool parts=span_has_parts(d,begin,end);
     if (d.prefill_deferred && !output_rows && !timings) {
@@ -353,10 +363,18 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
     if (parts) finish_with_helper(d);
     unsigned flag=0;
     download(d,&flag,d.flags,4);
-    if (output_rows) download(d,output,hidden+(steps-output_rows)*10240,output_rows*10240*4);
+    if (output_rows) {
+        // (the flag's read above waited for the span: what follows is the rows' copy alone)
+        const auto started=std::chrono::steady_clock::now();
+        download(d,output,hidden+(steps-output_rows)*10240,output_rows*10240*4);
+        d.rows_down_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+        d.rows_down_bytes+=uint64_t(output_rows)*10240*4;
+    }
     if (flag) throw std::runtime_error("Straydog GPU produced non-finite decoder state");
     for (size_t i=0;i<categories.size();++i) {
         float elapsed=0; check(hipEventElapsedTime(&elapsed,events[i]->first,events[i]->last));
         timings[categories[i]]+=double(elapsed)/1000.0;
     }
 }
+
+#undef SD_PREFILL_OBSERVE
