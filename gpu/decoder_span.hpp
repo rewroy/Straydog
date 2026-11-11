@@ -363,7 +363,13 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
     if (parts) finish_with_helper(d);
     unsigned flag=0;
     download(d,&flag,d.flags,4);
-    if (output_rows) download(d,output,hidden+(steps-output_rows)*10240,output_rows*10240*4);
+    if (output_rows) {
+        // (the flag's read above waited for the span: what follows is the rows' copy alone)
+        const auto started=std::chrono::steady_clock::now();
+        download(d,output,hidden+(steps-output_rows)*10240,output_rows*10240*4);
+        d.rows_down_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+        d.rows_down_bytes+=uint64_t(output_rows)*10240*4;
+    }
     if (flag) throw std::runtime_error("Straydog GPU produced non-finite decoder state");
     for (size_t i=0;i<categories.size();++i) {
         float elapsed=0; check(hipEventElapsedTime(&elapsed,events[i]->first,events[i]->last));

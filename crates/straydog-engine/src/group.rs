@@ -877,6 +877,7 @@ impl Group {
     pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
+    pub fn prefill_row_transfers(&self) -> Result<[u64; 4]> { self.backends[0].prefill_row_transfers() }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
         if self.backends.len() == 2 {

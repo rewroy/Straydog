@@ -562,7 +562,15 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
             (Some(passes), Some(rows)) => format!(" in {passes} passes of up to {rows} rows,"),
             _ => String::new(),
         };
-        format!("; prefill layers first,{passes} {} rows a batch", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+        // (the hidden rows to the GPU and back: their bytes and the wall time of the copies)
+        let number = |key: &str| timings[key].as_f64();
+        let moved = match (number("prefill_rows_up_bytes"), number("prefill_rows_up_seconds"), number("prefill_rows_down_bytes"),
+                           number("prefill_rows_down_seconds")) {
+            (Some(up), Some(up_seconds), Some(down), Some(down_seconds)) =>
+                format!(", hidden rows up {:.1} GB in {up_seconds:.1} s and down {:.1} GB in {down_seconds:.1} s", up / 1e9, down / 1e9),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
     } else {
         // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
         let policy = &timings["layer_prefill_policy"];
@@ -1998,6 +2006,13 @@ mod tests {
         };
         let with = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536})), None);
         assert!(with.contains("; prefill layers first, in 4 passes of up to 65536 rows, 2048 rows a batch"), "{with}");
+        // (and the hidden rows it moved to the GPU and back, where the engine timed them)
+        let moved = request_summary(&event(json!({"prefill_layer_passes": 16, "prefill_layer_rows": 16384, "prefill_rows_up_bytes": 491.2e9,
+                                                  "prefill_rows_up_seconds": 31.04, "prefill_rows_down_bytes": 491.2e9,
+                                                  "prefill_rows_down_seconds": 28.4})), None);
+        assert!(moved.contains("; prefill layers first, in 16 passes of up to 16384 rows, 2048 rows a batch, hidden rows up 491.2 GB in 31.0 s \
+                                and down 491.2 GB in 28.4 s"), "{moved}");
+        assert_eq!(moved.lines().count(), 1);
         let without = request_summary(&event(json!({})), None);
         assert!(without.contains("; prefill layers first, 2048 rows a batch"), "{without}");
     }
