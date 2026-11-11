@@ -3473,6 +3473,7 @@ impl Model {
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
                 output = self.forward(&tokens[position..end], end == tokens.len())?;
+                self.metric_count("prefill_batches", 1);
                 if cancelled() {
                     return Ok(None);
                 }
@@ -3684,6 +3685,10 @@ impl Model {
 
     /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
     fn assist_pass(&mut self, seconds: f64) {
+        // (a request whose passes the assist's round timed: decode rates of such a request are no other's, its drafts left out)
+        if self.assist_probing() {
+            self.metric_count("assist_round_passes", 1);
+        }
         if self.assist_script.is_some() {
             return self.assist_scripted(seconds);
         }

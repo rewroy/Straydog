@@ -487,7 +487,12 @@ fn prefill_summary(usage: &Value, timings: &Value) -> String {
     match (fresh, timings["prefill_seconds"].as_f64()) {
         (Some(fresh), Some(seconds)) => {
             let rate = if fresh >= PREFILL_RATE_TOKENS && seconds > 0.0 { format!(" ({:.0} tok/s)", fresh as f64 / seconds) } else { String::new() };
-            format!("new {fresh} in {:.0} ms{rate}", seconds * 1e3)
+            // (the batches it ran in, and how wide: a partially resident prompt streams nearly every expert outside the slots once a batch)
+            let batches = match (timings["prefill_batches"].as_u64(), timings["prefill_batch_rows"].as_u64()) {
+                (Some(batches), Some(rows)) if batches > 0 => format!(" in {batches} batch{} of up to {rows} rows", if batches == 1 { "" } else { "es" }),
+                _ => String::new(),
+            };
+            format!("new {fresh} in {:.0} ms{rate}{batches}", seconds * 1e3)
         }
         (Some(fresh), None) => format!("new {fresh}"),
         _ => "new -".into(),
@@ -553,7 +558,20 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     let drafts = detail["drafts"].as_u64().map_or_else(String::new, |drafts| format!("; drafts in force: {drafts}"));
     let order = if timings["prefill_order"] == "layer" {
         format!("; prefill layers first, {} rows a batch", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
-    } else { String::new() };
+    } else {
+        // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
+        let policy = &timings["layer_prefill_policy"];
+        match (policy["selected"].as_bool(), policy["layer_batch_rows"].as_u64()) {
+            (Some(false), Some(rows)) => {
+                let gib = |key: &str| policy[key].as_f64().map_or("-".into(), |bytes| format!("{:.1} GiB", bytes / (1u64 << 30) as f64));
+                format!("; layer order not taken: {rows} rows a batch, banks {}, room {}", gib("bank_bytes"), gib("bank_room"))
+            }
+            _ => String::new(),
+        }
+    };
+    // (decode passes the assist's round timed, one row each with no drafts: this request's decode rate is not its usual)
+    let round = timings["assist_round_passes"].as_u64().filter(|passes| *passes > 0)
+        .map_or_else(String::new, |passes| format!("; assist round: {passes} passes timed"));
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => format!("; memory: {resident:.1} GiB resident, {available:.1} GiB available, {} page faults", detail["page_faults"].as_u64().unwrap_or(0)),
         _ => String::new(),
@@ -584,7 +602,7 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     // over; and its resident experts, which run beside the CPU)
     let wait_parts = Some(number("layer_ms")).filter(|ms| *ms >= 0.05)
         .map_or_else(String::new, |ms| format!(" (the GPU's layer work {ms:.1}, its experts {:.1} beside the CPU)", number("gpu_experts_ms")));
-    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}",
+    format!("; ms a token: GPU wait {wait:.1}{wait_parts}, CPU {cpu:.1}{cpu_parts}, other {:.1}{other_parts}; routes a token: GPU {:.0}, CPU {:.0}, assisted {:.0}{assist}, swaps {:.1}, in {} slots; passes: {} of 1 row ({:.1} ms), {} of 2 ({:.1} ms){wider}{drafts}; prompt streamed {:.0} experts{prompt_cpu}; graphs {} ({} replays){read_aheads}{memory}{order}{round}",
             (decode - wait - cpu).max(0.0), number("gpu_routes"), number("cpu_routes"), number("assisted_routes"), number("swaps"), detail["slots"].as_u64().unwrap_or(0),
             passes.0 .0, passes.0 .1, passes.1 .0, passes.1 .1, number("streamed"), detail["graphs"].as_u64().unwrap_or(0), detail["replays"].as_u64().unwrap_or(0))
 }
@@ -623,10 +641,16 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         prefill_summary(usage, timings),
         number(&timings["ttft_seconds"], 2),
-        // (of which restoring a checkpoint and saving the request's: copies of the whole state)
+        // (of which restoring a checkpoint and saving the request's: copies of the whole state; and what is neither the prompt's reading
+        // nor that: encoding the rendered conversation, growing the K/V, putting the expert slots back)
         match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
             (restore, save) if restore + save >= 0.05 => format!(" (checkpoints: restore {restore:.2} s, save {save:.2} s)"),
             _ => String::new(),
+        } + &{
+            let parts: Vec<String> = [("encode", "encode_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
+                .into_iter().filter_map(|(name, key)| timings[key].as_f64().filter(|seconds| *seconds >= 0.05).map(|seconds| format!("{name} {seconds:.2} s")))
+                .collect();
+            if parts.is_empty() { String::new() } else { format!(" (besides reading: {})", parts.join(", ")) }
         },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
@@ -1888,6 +1912,25 @@ mod tests {
         assert!(summary.contains("decode phases (ms a token): step: layers 26.500, step: head 1.250, hybrid: CPU routes (count) 307.0"), "{summary}");
         assert!(summary.contains("prefill phases: shared expert 0.545 s, attention 0.021 s, fills: waves (count) 1420"),
                 "{summary}");
+    }
+
+    /// Decides: a log alone tells a prompt's batches, the time beside its reading, a layer order not taken and an assist round (the questions
+    /// 2026-11-11's investigation answered from the API's timings or rebuilt diagnostic binaries).
+    #[test]
+    fn a_request_line_says_what_its_prompt_did_besides_the_tokens() {
+        let detail = json!({"wait_ms": 6.0, "cpu_ms": 11.0, "gpu_routes": 300.0, "cpu_routes": 240.0, "assisted_routes": 0.0, "swaps": 15.0,
+                            "slots": 3454, "passes": [10, 157], "pass_ms": [48.5, 33.7], "streamed": 23408.0});
+        let event = json!({"event": "done", "tokens": [], "usage": {"prompt_tokens": 250387, "cached_tokens": 249988, "completion_tokens": 291},
+            "timings": {"prefill_tokens": 399, "prefill_seconds": 5.657, "prefill_batches": 2, "prefill_batch_rows": 256, "ttft_seconds": 6.08,
+                        "encode_seconds": 0.337, "rebalance_seconds": 0.423, "kv_growth_seconds": 0.01, "decode_tokens_per_second": 46.4,
+                        "assist_round_passes": 63,
+                        "layer_prefill_policy": {"selected": false, "layer_batch_rows": 128, "bank_bytes": 42283827200u64, "bank_room": 49477619712u64},
+                        "partial_detail": detail}});
+        let line = request_summary(&event, None);
+        assert!(line.contains("new 399 in 5657 ms (71 tok/s) in 2 batches of up to 256 rows"), "{line}");
+        assert!(line.contains("first token 6.08 s (besides reading: encode 0.34 s, slots back 0.42 s)"), "{line}");
+        assert!(line.contains("; layer order not taken: 128 rows a batch, banks 39.4 GiB, room 46.1 GiB"), "{line}");
+        assert!(line.contains("; assist round: 63 passes timed"), "{line}");
     }
 
     /// A partially resident request's line says the assist level its decode ended at, where the GPU may take the CPU's routes.

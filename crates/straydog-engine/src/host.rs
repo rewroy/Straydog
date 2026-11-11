@@ -427,6 +427,15 @@ pub fn lockable(memory: u64, vram_room: u64) -> u64 {
     }
 }
 
+/// Whether a working-set refusal (the GiB asked, the GiB taken) differs from the one logged last: the watcher asks four times a second, and the
+/// same refusal logged each time took 479 to 500 lines of a run on a 62 GiB PC.
+#[cfg(windows)]
+fn refusal_changed(share: u64, taken: u64) -> bool {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = (share >> 30) << 32 | (taken >> 30);
+    LAST.swap(now, std::sync::atomic::Ordering::Relaxed) != now
+}
+
 /// Ask the system to leave this process what its share of `memory` holds beside `pinned` bytes of
 /// page-locked state: pages it trims from the working set come back one fault at a time under the
 /// CPU's expert threads (Windows at 32 GiB: 800K faults/s and 3 tokens/s at the worst, with no
@@ -451,14 +460,16 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
             // SAFETY: the pseudo handle of this process and plain values.
             let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), (wanted / 8 * 7) as usize, wanted as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) };
             if done != 0 {
-                if wanted < share {
+                if wanted < share && refusal_changed(share, wanted) {
                     eprintln!("a working set of {} GiB was refused; {} GiB taken", share >> 30, wanted >> 30);
                 }
                 return;
             }
             wanted = wanted / 4 * 3;
         }
-        eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
+        if refusal_changed(share, 0) {
+            eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
+        }
     }
     #[cfg(not(windows))]
     let _ = (memory, pinned, banks);
