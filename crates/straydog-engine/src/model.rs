@@ -364,6 +364,30 @@ fn layer_prefill_rows() -> usize {
     *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref()))
 }
 
+/// Where a layer-order pass loads a layer's banks from.
+#[derive(Debug, PartialEq, Eq)]
+enum BankSource {
+    /// The reader's checked copy, read ahead.
+    Copy,
+    /// The mapping, whose pages the layer's registration keeps checked (held for the load).
+    Registered,
+    /// A checked copy read now: the reader passed the layer by while it was registered, and its registration was given up since.
+    ReadNow,
+    /// The mapping, as with no reader at all.
+    Mapping,
+}
+
+/// [`BankSource`] of a layer: whether the reader `copied` it ahead, whether the model's marks hold it `registered` now, and whether there is a
+/// `reader`. A layer the reader skipped for its mark and that is no longer registered is not read from the mapping it no longer keeps.
+fn bank_source(copied: bool, registered: bool, reader: bool) -> BankSource {
+    match (copied, registered, reader) {
+        (true, _, _) => BankSource::Copy,
+        (false, true, _) => BankSource::Registered,
+        (false, false, true) => BankSource::ReadNow,
+        (false, false, false) => BankSource::Mapping,
+    }
+}
+
 /// Whether a prompt is going through the layers in layer order now: the locking behind "ready" may take its turns meanwhile
 /// (STRAYDOG_LOCK_DURING_PREFILL), as the prompt reads every layer's banks and no CPU expert of a generating request is in the way.
 pub static LAYER_PREFILL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3503,23 +3527,33 @@ impl Model {
 
     fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
         let waiting = Instant::now();
-        let copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
+        let mut copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
         self.metric_add("prefill_bank_wait_seconds", waiting.elapsed().as_secs_f64());
-        match &copy {
-            Some(copy) => {
-                self.group.load_layer_bank_from(layer, copy.sources())?;
-                self.metric_add("prefill_bank_copied_layers", 1.0);
-            }
-            None => {
-                // (a layer registered in place: the mapping's pages, which its locks keep checked, not the file's again; the read holds the
-                // registration until the load's copies are done, which it waits for)
-                let held = self.registered.read(layer);
-                if held.is_some() {
-                    self.metric_add("prefill_bank_registered_layers", 1.0);
-                }
+        // (a layer registered in place: the read holds the registration until the load's copies are done, which it waits for)
+        let held = if copy.is_none() { self.registered.read(layer) } else { None };
+        match bank_source(copy.is_some(), held.is_some(), reader.is_some()) {
+            BankSource::Copy => {}
+            // (the mapping's pages, which its locks keep checked, not the file's again)
+            BankSource::Registered => {
+                self.metric_add("prefill_bank_registered_layers", 1.0);
                 self.group.load_layer_bank(layer)?;
-                drop(held);
             }
+            // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
+            BankSource::ReadNow => {
+                let reading = Instant::now();
+                copy = reader.as_mut().map(|reader| reader.read_now(layer)).transpose()?.flatten();
+                self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
+                self.metric_add("prefill_bank_read_late_layers", 1.0);
+                if copy.is_none() {
+                    self.group.load_layer_bank(layer)?;
+                }
+            }
+            BankSource::Mapping => self.group.load_layer_bank(layer)?,
+        }
+        drop(held);
+        if let Some(copy) = &copy {
+            self.group.load_layer_bank_from(layer, copy.sources())?;
+            self.metric_add("prefill_bank_copied_layers", 1.0);
         }
         if let Some(reader) = reader {
             // The GPU now owns the entire bank: the same host buffer can receive the
@@ -4635,6 +4669,29 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_chunks(0, 1025, 512), [(0,512),(512,1023),(1023,1025)]);
         assert_eq!(layer_prefill_chunks(7, 16, 8), [(7,14),(14,16)]);
         assert_eq!(layer_prefill_chunks(0, 1024, 512), [(0,512),(512,1024)]);
+    }
+
+    /// Decides: where a layer's banks come from. A copy read ahead is used; else a layer the model's marks hold registered is read from the
+    /// mapping its locks keep checked; one whose registration was given up between the reader passing it by and its load is read now as a
+    /// checked copy, never from the mapping it no longer keeps; with no reader, the mapping as before.
+    #[test]
+    fn a_layer_whose_registration_went_after_it_was_passed_by_is_read_as_a_checked_copy() {
+        use super::{bank_source, BankSource};
+        use crate::banks::Registered;
+        assert_eq!(bank_source(true, true, true), BankSource::Copy);
+        assert_eq!(bank_source(true, false, true), BankSource::Copy);
+        assert_eq!(bank_source(false, true, true), BankSource::Registered);
+        assert_eq!(bank_source(false, true, false), BankSource::Registered);
+        assert_eq!(bank_source(false, false, true), BankSource::ReadNow);
+        assert_eq!(bank_source(false, false, false), BankSource::Mapping);
+        // (the race: registered when the reader passes it by, given up before its load)
+        let registered = std::sync::Arc::new(Registered::default());
+        registered.mark(9);
+        let passed_by = registered.is_registered(9);
+        registered.release(9);
+        let held = registered.read(9);
+        assert!(passed_by && held.is_none());
+        assert_eq!(bank_source(false, held.is_some(), true), BankSource::ReadNow);
     }
 
     /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the
