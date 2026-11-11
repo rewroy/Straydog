@@ -14,6 +14,11 @@ pub mod serve;
 /// read back as the model wrote it.
 pub const CHAT_TEMPLATE: &str = include_str!("chat_template.jinja");
 
+/// The most tokens of context a DeepSeek-V4.1 model is served with: the 1,048,576 its bundles
+/// declare (`deepseek41.context_length`), which its YaRN rope scaling stretches the original
+/// context to. Qwen3.8's own limit is [`crate::weights::CONTEXT_LIMIT`].
+pub const CONTEXT_LIMIT: usize = 1_048_576;
+
 use super::{Keys, Tensors};
 use straydog_gguf::ModelHeader;
 

@@ -1,3 +1,4 @@
+#include "layer_trace.hpp"
 // Partially resident experts. Dense layer operands, the router and the shared
 // expert stay pinned on the GPU; routed experts occupy a bounded pool of device
 // slots chosen from routing statistics. Decode evaluates resident experts on the
@@ -26,6 +27,8 @@ size_t expert_slot_bytes(const ResidentMoe& plan) {
 // even for resident pages, so an expert hinted within the last 30 s is skipped. Linux hints on the
 // device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
 void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count) {
+    // A layer held as page-locked copies (sd_hybrid_repoint) no longer reads the mapping: there is nothing to ask the OS for.
+    if (plan.host_copy) return;
 #if defined(_WIN32) || defined(__linux__)
     const auto now = std::chrono::steady_clock::now();
     if (plan.prefetched.size() != plan.experts) plan.prefetched.assign(plan.experts, {});
@@ -141,7 +144,22 @@ void expert_slots_carve(Device& d, size_t arena) {
     d.slots.cache = d.slots.at.size();
     d.slots.owner.assign(d.slots.cache, {nullptr, -1});
 }
-void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_bytes) {
+// A failed attempt leaves the pool as it was: empty. The caller retries a smaller one. This does not shrink the cache itself.
+void rollback_expert_slots(Device& d, size_t added) {
+    d.copier.reset();
+    if (d.swapped) { cleanup(hipEventDestroy(d.swapped)); d.swapped = nullptr; }
+    if (d.copy_stream) { cleanup(hipStreamDestroy(d.copy_stream)); d.copy_stream = nullptr; }
+    if (d.exchange) { cleanup(hipHostFree(d.exchange)); d.exchange = nullptr; }
+    d.exchange_device = nullptr;
+    if (d.slots.host) { cleanup(hipHostFree(d.slots.host)); d.slots.host = nullptr; }
+    if (d.cpu_partial) { cleanup(hipFree(d.cpu_partial)); d.cpu_partial = nullptr; }
+    if (d.slots.base) { cleanup(hipFree(d.slots.base)); d.slots.base = nullptr; }
+    d.used -= added;
+    d.slots.stage = 0; d.slots.bytes = 0; d.slots.cache = 0; d.slots.arena = 0;
+    d.slots.at.clear(); d.slots.group.clear(); d.slots.owner.clear(); d.slots.pending.clear();
+    d.hybrid_sequence = 0;
+}
+void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_bytes, bool mirror) {
     if (d.slots.base || !slot_bytes || slot_bytes % 256 || stage < 2 || cache + stage > 65536)
         throw std::runtime_error("invalid Straydog expert slot pool");
     for (const auto& entry : d.resident)
@@ -151,23 +169,36 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
     const size_t extra = hybrid_exchange_floats * 4;
     if (bytes > d.budget - d.used || extra > d.budget - d.used - bytes)
         throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
-    check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
-    d.used += bytes;
-    d.slots.stage = stage; d.slots.bytes = slot_bytes;
-    expert_slots_carve(d, cache * slot_bytes);
-    check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
-    d.used += extra;
-    // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
-    check(hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault));
-    check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
-    std::memset(d.exchange, 0, hybrid_exchange_floats * 4);
-    check(hipHostGetDevicePointer(reinterpret_cast<void**>(&d.exchange_device), d.exchange, 0));
-    check(hipMemsetAsync(d.flags, 0, 16, d.stream));
-    check(hipStreamSynchronize(d.stream));
-    d.hybrid_sequence = 0;
-    check(hipStreamCreate(&d.copy_stream));
-    check(hipEventCreateWithFlags(&d.swapped, hipEventDisableTiming));
-    d.copier = std::make_unique<Background>(d.ordinal);
+    size_t added = 0;
+    try {
+        check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
+        d.used += bytes;
+        added += bytes;
+        d.slots.stage = stage; d.slots.bytes = slot_bytes;
+        expert_slots_carve(d, cache * slot_bytes);
+        check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
+        d.used += extra;
+        added += extra;
+        // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
+        // A refusal here is named, so the caller can start without the mirror instead of shrinking the cache.
+        if (mirror) {
+            const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault);
+            if (pinned != hipSuccess)
+                throw std::runtime_error(std::string(hipGetErrorString(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
+        }
+        check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
+        std::memset(d.exchange, 0, hybrid_exchange_floats * 4);
+        check(hipHostGetDevicePointer(reinterpret_cast<void**>(&d.exchange_device), d.exchange, 0));
+        check(hipMemsetAsync(d.flags, 0, 16, d.stream));
+        check(hipStreamSynchronize(d.stream));
+        d.hybrid_sequence = 0;
+        check(hipStreamCreate(&d.copy_stream));
+        check(hipEventCreateWithFlags(&d.swapped, hipEventDisableTiming));
+        d.copier = std::make_unique<Background>(d.ordinal);
+    } catch (...) {
+        rollback_expert_slots(d, added);
+        throw;
+    }
 }
 
 // Spin until the GPU publishes this export (pinned memory written by stream-ordered
@@ -243,14 +274,16 @@ struct StreamEvents {
 extern "C" int sd_cpu_gather(void*, const uint8_t* const*, uint8_t* const*, const uint64_t*, uint32_t);
 extern "C" const char* sd_cpu_error();
 // Gather experts' gate, up and down slices from the mapped banks into the slot images at `slots`.
-void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, size_t count, uint8_t* const* slots) {
+void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, size_t count, uint8_t* const* slots,
+                   const uint8_t* const* bank_sources = nullptr) {
+    BankReading reading(d);   // (sd_hybrid_repoint waits for the CPU's workers)
     std::vector<const uint8_t*> sources;
     std::vector<uint8_t*> targets;
     std::vector<uint64_t> bytes;
     for (size_t i = 0; i < count; ++i) {
         size_t offset = 0;
         for (size_t role = 0; role < 3; ++role) {
-            sources.push_back(plan.host[role] + experts[i] * plan.host_bytes[role]);
+            sources.push_back((bank_sources ? bank_sources[role] : plan.host[role]) + experts[i] * plan.host_bytes[role]);
             targets.push_back(slots[i] + offset);
             bytes.push_back(plan.host_bytes[role]);
             offset += plan.host_bytes[role];
@@ -555,4 +588,114 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         d.prompt_gather_ns = d.prompt_gather_ns > 0 ? 0.7 * d.prompt_gather_ns + 0.3 * sample : sample;
     }
     return uint64_t(double(ms) * 1e6);
+}
+
+// A whole prompt segment uses one layer at a time. Its table may point into a borrowed bank pool only until it is cleared.
+void clear_prefill_bank(Device& d) {
+    if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+    check(hipStreamSynchronize(d.stream));
+    if (!d.layer_prefill_plan) return;
+    auto& plan = *d.layer_prefill_plan;
+    std::vector<std::pair<size_t, const uint8_t*>> absent;
+    for (size_t expert = 0; expert < plan.experts; ++expert) absent.emplace_back(expert, nullptr);
+    hybrid_point_list(d, plan, absent);
+    check(hipStreamSynchronize(d.stream));
+    plan.layer_prefill = false;
+    d.layer_prefill_plan = nullptr;
+    d.layer_prefill_storage = nullptr;
+}
+void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
+                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr) {
+    clear_prefill_bank(d);
+    const auto decoder = d.decoder.find(layer);
+    const auto allocation = d.allocations.find(storage);
+    if (decoder == d.decoder.end() || allocation == d.allocations.end() || bytes > allocation->second || d.qwen_parts != 1)
+        throw std::runtime_error("invalid layer prefill bank storage");
+    auto& plan = *d.resident.at(decoder->second.moe);
+    const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
+    if (!plan.hybrid || required > bytes || d.slots.cache || !d.slots.host || d.slots.stage < 2 || !d.cpu)
+        throw std::runtime_error("layer prefill bank needs empty expert cache and staging");
+    if (sources) {
+        for (size_t role = 0; role < 3; ++role)
+            if (!source_bytes || !sources[role] || source_bytes[role] != plan.host_bytes[role] * plan.experts)
+                throw std::runtime_error("invalid copied layer bank source");
+    }
+    if (d.copier) d.copier->wait();
+    std::vector<size_t> experts(plan.experts);
+    for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    LayerBankTrace trace(d, layer, required);
+    const uint64_t hint_started = layer_trace_tick();
+#endif
+    if (!sources) prefetch_experts(d, plan, experts.data(), experts.size());
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    trace.hint_ns += layer_trace_tick() - hint_started;
+#endif
+    auto* bank = static_cast<uint8_t*>(storage);
+    if (!sources && plan.mapped[0]) {
+        size_t offset = 0;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.before_copy(0);
+#endif
+        for (size_t role = 0; role < 3; ++role) {
+            check(hipMemcpy2DAsync(bank + offset, entry, plan.host[role], plan.host_bytes[role], plan.host_bytes[role], plan.experts,
+                                   hipMemcpyHostToDevice, d.copy_stream));
+            offset += plan.host_bytes[role];
+        }
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.after_copy(0);
+#endif
+    } else {
+        // The same authenticated mapping/file gather as ordinary streaming, overlapped with the previous half's DMA.
+        const size_t half = d.slots.stage / 2;
+        StreamEvents events;
+        for (size_t first = 0, chunk = 0; first < plan.experts; first += half, ++chunk) {
+            const size_t count = std::min(half, plan.experts - first), buffer = chunk % 2;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            const uint64_t wait_started = layer_trace_tick();
+#endif
+            if (chunk >= 2) check(hipEventSynchronize(events.loaded[buffer]));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.wait_ns += layer_trace_tick() - wait_started;
+#endif
+            uint8_t* host = d.slots.host + buffer * half * d.slots.bytes;
+            std::vector<uint8_t*> targets;
+            for (size_t i = 0; i < count; ++i) targets.push_back(host + i * d.slots.bytes);
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            const uint64_t gather_started = layer_trace_tick();
+#endif
+            hybrid_gather(d, plan, experts.data() + first, count, targets.data(), sources);
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.gather_ns += layer_trace_tick() - gather_started;
+            trace.before_copy(buffer);
+            const uint64_t submit_started = layer_trace_tick();
+#endif
+            for (size_t i = 0; i < count; ++i)
+                check(hipMemcpyAsync(bank + (first + i) * entry, targets[i], entry, hipMemcpyHostToDevice, d.copy_stream));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+            trace.submit_ns += layer_trace_tick() - submit_started;
+            trace.after_copy(buffer);
+#endif
+            check(hipEventRecord(events.loaded[buffer], d.copy_stream));
+        }
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        const uint64_t drain_started = layer_trace_tick();
+#endif
+        check(hipStreamSynchronize(d.copy_stream));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+        trace.wait_ns += layer_trace_tick() - drain_started;
+#endif
+    }
+    check(hipStreamSynchronize(d.copy_stream));
+    std::vector<std::pair<size_t, const uint8_t*>> loaded;
+    for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
+    d.layer_prefill_plan = &plan;
+    d.layer_prefill_storage = storage;
+    hybrid_point_list(d, plan, loaded);
+    check(hipStreamSynchronize(d.stream));
+    plan.layer_prefill = true;
+    d.streamed_experts += plan.experts;
+#if defined(STRAYDOG_PREFILL_OBSERVER)
+    trace.emit();
+#endif
 }

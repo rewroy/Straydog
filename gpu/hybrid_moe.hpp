@@ -367,6 +367,7 @@ extern "C" int sd_cpu_read_ahead(void*, const uint8_t* const*, const uint64_t*, 
 // rows' CPU routes in one call of the CPU engine, so an expert that rows share is read once and the engine's phases hand over once.
 void hybrid_host_experts_rows(Device& d, ResidentMoe& plan, size_t rows, const float* const* exported, float* const* result) {
     if (rows > 16) throw std::runtime_error("invalid hybrid rows");
+    BankReading reading(d);   // (the CPU's workers read the banks' bytes in here: sd_hybrid_repoint waits)
     const uint8_t* gate[160]; const uint8_t* up[160]; const uint8_t* down[160]; float weights[160];
     uint32_t counts[16];
     size_t count = 0;
@@ -391,7 +392,8 @@ void hybrid_host_experts_rows(Device& d, ResidentMoe& plan, size_t rows, const f
             up[count] = plan.host[1] + expert * plan.host_bytes[1];
             down[count] = plan.host[2] + expert * plan.host_bytes[2];
             weights[count++] = e[16 + route];
-            if (d.hint_experts) {
+            // (a layer held as page-locked copies has nothing to read ahead: the copies are in memory)
+            if (d.hint_experts && !plan.host_copy) {
                 // Only experts unread for 64 tokens: 15% of the routes, and 98-100% of the misses of an LRU of 15 to 27 GiB in a
                 // 5592-token trace. Hinting every route costs 3% here and 5.4 ms a token on Windows with the pages in memory.
                 const bool old = plan.host_token - plan.host_read[expert] > 64;

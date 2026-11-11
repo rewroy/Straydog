@@ -56,6 +56,8 @@ pub enum Rows<'a> {
 
 /// The native library pads every VRAM allocation (allocation_tail in kernels.cpp).
 pub const ALLOCATION_TAIL: u64 = 64;
+/// The largest batch the ordinary partially resident prefill can borrow cache VRAM for.
+pub(crate) const LONG_PREFILL_ROWS: u64 = 4096;
 const MOE_ROW: u64 = 11 * 4480 + 22;
 /// Rows of the peer's batch one pass of expert-parallel help takes (see `@moe:helper`).
 const HELP_ROWS: u64 = 2048;
@@ -69,6 +71,28 @@ const DECODE_HEAD_FLAGS: u64 = 64;
 /// The workspace of the fully resident decoder's spans for a prefill capacity.
 pub fn decoder_workspace_bytes(capacity: u64) -> u64 {
     (capacity * 15364 + 1024 * 2564 + 8) * 4
+}
+
+fn prefill_workspace_bytes(capacity: u64) -> u64 {
+    (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity)
+}
+
+fn widened_prefill_rows(current: u64, free: u64) -> u64 {
+    [LONG_PREFILL_ROWS, 2048, 1024].into_iter()
+        .find(|&capacity| capacity > current && prefill_workspace_bytes(capacity) + 2 * ALLOCATION_TAIL <= free)
+        .unwrap_or(current)
+}
+
+/// The rows of a layer-order pass's hidden state (40 KB each) that `free` bytes of VRAM hold beside the slots' `margin`.
+pub(crate) fn layer_rows_room(free: u64, margin: u64) -> u64 {
+    free.saturating_sub(margin + 2 * ALLOCATION_TAIL) / (WIDTH as u64 * 4)
+}
+
+/// Why `rows` rows do not fit in `free` bytes beside `margin` ([`layer_rows_room`]); None where they do.
+pub(crate) fn layer_rows_refusal(rows: u64, free: u64, margin: u64) -> Option<String> {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    (rows > layer_rows_room(free, margin))
+        .then(|| format!("{:.2} GiB of rows, {:.2} GiB of VRAM free", gib(rows * WIDTH as u64 * 4), gib(free)))
 }
 
 /// What `sd_create` counts of a device's budget from 2 GiB up: its input and output (64 MiB each), the expanded GEMMs (128), half input (32),
@@ -297,9 +321,81 @@ pub struct Entry {
     pub cols: u64,
 }
 
-/// Qwen3.8's attention K/V holds FP16 values: a plane's row of a position is 256 halves, this many of its state's floats (each layer
-/// state `@qsa:` has its planes' rows of this width; `kv_row_floats` natively).
-pub const KV_ROW_FLOATS: u64 = 128;
+/// The format of Qwen3.8's attention K/V: a plane's row of a position (one head's 256 values) as FP16, 512 bytes, or as Q8_0, the 256
+/// values as int8 and then the FP16 scales of their eight 32-value blocks, 272 bytes: half the memory and half what decode reads of
+/// a K/V in host memory over the bus. Each layer state `@qsa:` has its planes' rows of [`KvFormat::row_floats`] floats (`kv_row`
+/// natively, `sd_kv_format`). Q8_0 unless STRAYDOG_KV=f16 when the process starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFormat {
+    F16,
+    Q8,
+}
+
+impl KvFormat {
+    /// The process's format: STRAYDOG_KV=f16 keeps FP16.
+    pub fn selected() -> KvFormat {
+        static SELECTED: std::sync::OnceLock<KvFormat> = std::sync::OnceLock::new();
+        *SELECTED.get_or_init(|| KvFormat::named(std::env::var("STRAYDOG_KV").ok().as_deref()))
+    }
+
+    fn named(name: Option<&str>) -> KvFormat {
+        match name {
+            Some("f16" | "fp16") => KvFormat::F16,
+            _ => KvFormat::Q8,
+        }
+    }
+
+    /// Bytes of a row: a position's 256 values of one head.
+    pub const fn row_bytes(self) -> u64 {
+        match self {
+            KvFormat::F16 => 512,
+            KvFormat::Q8 => 272,
+        }
+    }
+
+    /// A row in a state's floats.
+    pub const fn row_floats(self) -> u64 {
+        self.row_bytes() / 4
+    }
+}
+
+/// A K/V row's floats in FP16: what the placement and the plans count until the Q8_0 rows are measured (the rows held are
+/// [`kv_row_floats`]).
+pub const KV_ROW_FLOATS_F16: u64 = 128;
+
+/// A K/V row's floats in the format the K/V is held in.
+pub fn kv_row_floats() -> u64 {
+    KvFormat::selected().row_floats()
+}
+
+/// A row of 256 K/V values as Q8_0, by the device's arithmetic (`kv_encode`): each 32-value block's scale is the F16 of its largest
+/// magnitude over 127, and each value the int8 nearest (ties to even) its quotient by that scale.
+pub fn kv_q8_row(values: &[f32; 256]) -> [u8; 272] {
+    let mut row = [0u8; 272];
+    for block in 0..8 {
+        let part = &values[block * 32..block * 32 + 32];
+        let top = part.iter().fold(0f32, |top, value| top.max(value.abs()));
+        let half = formats::f32_to_f16(top / 127.0);
+        let scale = formats::f16_to_f32(half);
+        for (at, value) in part.iter().enumerate() {
+            let q = if scale > 0.0 { (value / scale).round_ties_even().clamp(-127.0, 127.0) as i8 } else { 0 };
+            row[block * 32 + at] = q as u8;
+        }
+        row[256 + 2 * block..258 + 2 * block].copy_from_slice(&half.to_le_bytes());
+    }
+    row
+}
+
+/// The values a Q8_0 row holds, as the device reads them (`kv_load`).
+pub fn kv_q8_values(row: &[u8; 272]) -> [f32; 256] {
+    let mut values = [0f32; 256];
+    for (column, value) in values.iter_mut().enumerate() {
+        let block = column / 32;
+        let scale = formats::f16_to_f32(u16::from_le_bytes([row[256 + 2 * block], row[257 + 2 * block]]));
+        *value = f32::from(row[column] as i8) * scale;
+    }
+    values
+}
 
 /// Floats of a sequence state copied out: `height` runs of `width` floats, `pitch` floats apart
 /// in the state, from float `offset`; `first` the first position they hold. They lie in `device`
@@ -345,12 +441,18 @@ pub struct Backend {
     slot_bytes: u64,
     /// `create_expert_slots`' arguments, for a K/V growth to make the pool again (0: no pool).
     slot_stage: u64,
+    /// The staging slots have a page-locked host mirror. Layer order gathers through it.
+    slot_mirror: bool,
     /// The pool could not come back after giving up its VRAM.
     slots_absent: bool,
     slot_margin: u64,
     slot_size: u64,
     /// The prefill rows before a long prompt's batches took the slots' VRAM (see [`Backend::begin_long_prefill`]).
     long_prefill: Option<u64>,
+    /// Temporary routed-bank allocation for a layer-ordered prompt.
+    layer_prefill_pool: Option<(*mut c_void, u64)>,
+    /// A layer-order pass's hidden rows held in VRAM ([`Backend::hold_layer_rows`]), and their count: until finish_layer_prefill.
+    layer_rows: Option<(*mut c_void, u64)>,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
     pub logical_capacity: usize,
@@ -425,7 +527,7 @@ impl Backend {
         if budget >= 2 << 30 {
             output_capacity *= 2;
         }
-        Ok(Backend {
+        let backend = Backend {
             handle,
             ordinal,
             cache: HashMap::new(),
@@ -440,9 +542,12 @@ impl Backend {
             prefill_capacity: 1024,
             slot_bytes: 0,
             slot_stage: 0,
+            slot_mirror: true,
             slots_absent: false,
             slot_margin: 0,
             long_prefill: None,
+            layer_prefill_pool: None,
+            layer_rows: None,
             slot_size: 0,
             registered: Vec::new(),
             batch_capacity,
@@ -455,7 +560,10 @@ impl Backend {
             mtp_parts: false,
             pending_host: Vec::new(),
             deferred: None,
-        })
+        };
+        // SAFETY: a live handle, before any state or layer.
+        check(unsafe { ffi::sd_kv_format(backend.handle, KvFormat::selected().row_bytes() as u32) })?;
+        Ok(backend)
     }
 
     pub fn handle(&self) -> *mut c_void {
@@ -799,7 +907,7 @@ impl Backend {
                     plan.push((format!("@conv:blk.{layer}."), 4, WIDTH as u64 / parts, false));
                 }
             } else {
-                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, KV_ROW_FLOATS, host_attention));
+                plan.push((format!("@qsa:blk.{layer}."), context * 4 / parts, kv_row_floats(), host_attention));
                 plan.push((format!("@indexer:blk.{layer}."), (context / 4 + 1) * 128 + INDEX_HISTORY, 1, false));
             }
         }
@@ -944,11 +1052,26 @@ impl Backend {
         Ok(())
     }
 
+    /// Predict the ordinary single-device batch after lending the cache, without reallocating or changing a decoder plan.
+    pub(crate) fn ordinary_prefill_rows(&self, batch: u64) -> Result<u64> {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || batch >= LONG_PREFILL_ROWS {
+            return Ok(batch.max(self.prefill_capacity));
+        }
+        let mut arena = 0;
+        // SAFETY: a live device and a valid out-parameter; this only reads its current allocation accounting.
+        check(unsafe { ffi::sd_hybrid_cache_bytes(self.handle, &mut arena) })?;
+        let (used, budget) = self.memory()?;
+        // release_expert_slots then restore_slots(0) retains staging and removes exactly the cache arena.
+        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_add(self.slot_margin))
+            .saturating_add(prefill_workspace_bytes(self.prefill_capacity));
+        Ok(batch.max(widened_prefill_rows(self.prefill_capacity, free)))
+    }
+
     /// A long prompt borrows the expert cache's VRAM to widen its batches. On multiple devices it
     /// fills the cache again with what fits beside the wider workspaces; one device uses only
     /// the staging pool until [`Backend::end_long_prefill`] restores its original cache.
     pub fn begin_long_prefill(&mut self, keep_cache: bool) -> Result<u64> {
-        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || (keep_cache && self.prefill_capacity >= 4096) {
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() || (keep_cache && self.prefill_capacity >= LONG_PREFILL_ROWS) {
             return Ok(self.prefill_capacity);
         }
         // SAFETY: a live handle, between batches.
@@ -956,14 +1079,9 @@ impl Backend {
         self.long_prefill = Some(self.prefill_capacity);
         self.restore_slots(0)?;
         let (used, budget) = self.memory()?;
-        let bytes = |capacity: u64| (capacity * MOE_ROW + 65536) * 4 + decoder_workspace_bytes(capacity);
-        let free = budget.saturating_sub(used + self.slot_margin) + bytes(self.prefill_capacity);
-        for capacity in [4096, 2048, 1024] {
-            if capacity > self.prefill_capacity && bytes(capacity) + 2 * ALLOCATION_TAIL <= free {
-                self.prefill_buffers(capacity)?;
-                break;
-            }
-        }
+        let free = budget.saturating_sub(used + self.slot_margin) + prefill_workspace_bytes(self.prefill_capacity);
+        let capacity = widened_prefill_rows(self.prefill_capacity, free);
+        if capacity > self.prefill_capacity { self.prefill_buffers(capacity)?; }
         if keep_cache {
             // The stage-only pool made room for the workspaces. Put the remaining expert cache
             // back for this device's layers, instead of streaming every route from host memory.
@@ -974,6 +1092,211 @@ impl Backend {
             }
         }
         Ok(self.prefill_capacity)
+    }
+
+    /// Lend the vocabulary projection, whose authenticated host copy the model keeps. No decoder plan owns it.
+    pub fn lend_prefill_head(&mut self) -> Result<()> {
+        let key = "output.weight:None";
+        if let Some(entry) = self.cache.get(key).copied() {
+            // SAFETY: an owned allocation; native code refuses resident/decoder dependencies and drops dependent graphs.
+            check(unsafe { ffi::sd_release(self.handle, entry.pointer) })?;
+            self.cache.remove(key);
+            self.resident.remove(key);
+        }
+        Ok(())
+    }
+
+    /// The widest layer-order batch whose workspaces fit beside a bank pool of `bank_bytes` in `free` bytes.
+    fn layer_prefill_capacity(&self, bank_bytes: u64, free: u64) -> Option<u64> {
+        [2048, 1024, 512, 256, 128, 64, 32, 16, 8].into_iter()
+            .find(|rows| bank_bytes + prefill_workspace_bytes(*rows) + self.slot_margin + 3 * ALLOCATION_TAIL <= free)
+    }
+
+    /// Predict [`Backend::begin_layer_prefill`]'s rows after [`Backend::lend_prefill_head`], without allocating or changing anything: what it
+    /// frees first (the expert cache's arena, the staging slots unless `staging`, the lent head and the current workspaces) and sizes the
+    /// bank and the rows into. 0 where it would refuse.
+    pub(crate) fn layer_prefill_rows(&self, bank_bytes: u64, staging: bool) -> Result<u64> {
+        if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+            return Ok(0);
+        }
+        let mut arena = 0;
+        // SAFETY: a live device and a valid out-parameter; this only reads its current allocation accounting.
+        check(unsafe { ffi::sd_hybrid_cache_bytes(self.handle, &mut arena) })?;
+        let mut head = 0;
+        if let Some(entry) = self.cache.get("output.weight:None") {
+            // SAFETY: a live device, one of its allocations and a valid out-parameter; read only.
+            check(unsafe { ffi::sd_allocation_bytes(self.handle, entry.pointer, &mut head) })?;
+        }
+        let stage = if staging || self.slots_absent { 0 } else { self.slot_stage * self.slot_size };
+        let (used, budget) = self.memory()?;
+        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_sub(stage).saturating_sub(head))
+            + prefill_workspace_bytes(self.prefill_capacity);
+        Ok(self.layer_prefill_capacity(bank_bytes, free).unwrap_or(0))
+    }
+
+    /// Borrow cache VRAM and a layer bank pool. The caller restores the head before end_long_prefill restores the cache.
+    /// A refused allocation returns None without advancing any model state; the same cleanup is still required.
+    /// Without `staging` the staging slots' VRAM goes to the rows as well: layer order loads its banks through the host mirror and
+    /// streams no expert, so only an ordinary pass in it (a segment under [`crate::model`]'s minimum) needs them.
+    pub fn begin_layer_prefill(&mut self, bank_bytes: u64, staging: bool) -> Result<Option<u64>> {
+        if self.slot_stage == 0 || !self.slot_mirror || self.parts != 1 || self.long_prefill.is_some() || bank_bytes == 0 {
+            return Ok(None);
+        }
+        self.long_prefill = Some(self.prefill_capacity);
+        // SAFETY: between passes, no decoder work in flight.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        // (the restore also drops the captured graphs that held the pool's addresses)
+        self.restore_slots(0)?;
+        if !staging {
+            // SAFETY: as above; end_long_prefill puts the whole pool back.
+            check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        }
+        self.prefill_buffers(2)?;
+        let (used, budget) = self.memory()?;
+        let free = budget.saturating_sub(used) + prefill_workspace_bytes(self.prefill_capacity);
+        let Some(capacity) = self.layer_prefill_capacity(bank_bytes, free) else { return Ok(None) };
+        self.prefill_buffers(capacity)?;
+        if self.prefill_capacity < 8 { return Ok(None); }
+        let mut pool = std::ptr::null_mut();
+        // SAFETY: a live device and out-parameter, with no references published until load_layer_bank.
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, bank_bytes, &mut pool) };
+        if !pool.is_null() { self.layer_prefill_pool = Some((pool, bank_bytes)); }
+        if check(status)? == 1 { return Ok(None); }
+        pointer(pool)?;
+        Ok(Some(self.prefill_capacity))
+    }
+
+    /// Hold `rows` rows of a layer-order pass's hidden state in VRAM, beside what layer order holds (after begin_layer_prefill): None where they
+    /// are held, else why not (the pass then moves them to the host and back, as before).
+    pub fn hold_layer_rows(&mut self, rows: u64) -> Result<Option<String>> {
+        if self.layer_rows.is_some() {
+            return Ok(Some("rows already held".into()));
+        }
+        let (used, budget) = self.memory()?;
+        if let Some(reason) = layer_rows_refusal(rows, budget.saturating_sub(used), self.slot_margin) {
+            return Ok(Some(reason));
+        }
+        let mut storage = std::ptr::null_mut();
+        // SAFETY: a live device and out-parameter; nothing reads the rows before they are put.
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, rows * WIDTH as u64 * 4, &mut storage) };
+        if !storage.is_null() { self.layer_rows = Some((storage, rows)); }
+        if check(status)? == 1 { return Ok(Some("the device refused the allocation".into())); }
+        pointer(storage)?;
+        Ok(None)
+    }
+
+    fn held_rows(&self) -> Result<*mut c_void> {
+        self.layer_rows.map(|(storage, _)| storage).ok_or_else(|| "no layer rows held in VRAM".into())
+    }
+
+    /// Rows from `first` of the held rows, from the host.
+    pub fn put_layer_rows(&mut self, first: u64, rows: &[f32]) -> Result<()> {
+        let storage = self.held_rows()?;
+        if rows.len() % WIDTH != 0 { return Err("invalid layer rows".into()); }
+        // SAFETY: the held allocation (checked natively against the rows' range) and host rows alive through the call.
+        check(unsafe { ffi::sd_layer_rows_put(self.handle, storage, first, rows.as_ptr(), (rows.len() / WIDTH) as u64) }).map(drop)
+    }
+
+    /// Rows from `first` of the held rows, to the host (after the work queued before).
+    pub fn get_layer_rows(&mut self, first: u64, rows: &mut [f32]) -> Result<()> {
+        let storage = self.held_rows()?;
+        if rows.len() % WIDTH != 0 { return Err("invalid layer rows".into()); }
+        // SAFETY: as put_layer_rows, with a host place of the rows' size.
+        check(unsafe { ffi::sd_layer_rows_get(self.handle, storage, first, rows.as_mut_ptr(), (rows.len() / WIDTH) as u64) }).map(drop)
+    }
+
+    /// [`Backend::prefill_rows`] from the held rows `first..first + steps`: a device copy into `layer`'s workspace.
+    pub fn prefill_rows_held(&mut self, layer: usize, first: u64, steps: u64) -> Result<()> {
+        let storage = self.held_rows()?;
+        if !(1..=self.prefill_capacity).contains(&steps) { return Err("invalid layer prefill hidden rows".into()); }
+        // SAFETY: the held allocation, its range checked natively, and a registered decoder layer.
+        check(unsafe { ffi::sd_prefill_rows_held(self.handle, layer as u64, storage, first, steps) }).map(drop)
+    }
+
+    /// [`Backend::prefill_layers_into`] of one layer, its output copied back into the held rows `first..first + steps`.
+    pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
+        let storage = self.held_rows()?;
+        if layer >= 49 || !(2..=self.prefill_capacity).contains(&steps) || position > 262144 - steps {
+            return Err("invalid Straydog resident prefill span".into());
+        }
+        // SAFETY: the held allocation, its range checked natively; the span's own checks as sd_prefill_span's.
+        check(unsafe { ffi::sd_prefill_span_held(self.handle, layer as u64, layer as u64 + 1, position, steps, storage, first) }).map(drop)
+    }
+
+    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> {
+        let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
+        // SAFETY: owned storage retained until clear_layer_bank/finish_layer_prefill, and a registered decoder layer.
+        check(unsafe { ffi::sd_prefill_bank(self.handle, layer as u64, pool, bytes) }).map(drop)
+    }
+
+    /// A scoped authenticated host copy; native code settles every staging/H2D read before returning.
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
+        let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
+        let pointers = sources.map(|source| source.as_ptr());
+        let sizes = sources.map(|source| source.len() as u64);
+        // SAFETY: all three slices stay alive for this synchronous call, as does the owned pool.
+        check(unsafe { ffi::sd_prefill_bank_from(self.handle, layer as u64, pool, bytes, pointers.as_ptr(), sizes.as_ptr()) }).map(drop)
+    }
+
+    pub fn clear_layer_bank(&mut self) -> Result<()> {
+        // SAFETY: settles pending transfers and removes table references before returning.
+        check(unsafe { ffi::sd_prefill_bank_clear(self.handle) }).map(drop)
+    }
+
+    /// End the temporary bank's lifetime and restore workspace sizes; leave cache restoration until the head is back.
+    pub fn finish_layer_prefill(&mut self) -> Result<()> {
+        self.clear_layer_bank()?;
+        if let Some((storage, _)) = self.layer_rows.take() {
+            // SAFETY: the held rows' allocation; clear_layer_bank waited for the device's work, the last that read them.
+            check(unsafe { ffi::sd_release(self.handle, storage) })?;
+        }
+        if let Some((pool, _)) = self.layer_prefill_pool {
+            // SAFETY: clear_layer_bank has removed all references and waited for transfers/readers.
+            check(unsafe { ffi::sd_release(self.handle, pool) })?;
+            self.layer_prefill_pool = None;
+        }
+        if let Some(capacity) = self.long_prefill {
+            if capacity != self.prefill_capacity {
+                self.prefill_buffers(capacity)?;
+                if capacity != self.prefill_capacity { return Err("could not restore layer prefill workspace".into()); }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "prefill-observer"))]
+    pub(crate) fn test_prefill_capacity(&mut self, rows: u64) -> Result<()> {
+        self.prefill_buffers(rows)?;
+        if self.prefill_capacity != rows { return Err("validation prefill capacity was refused".into()); }
+        Ok(())
+    }
+
+    /// The test owns context until it detaches the callback, whose borrowed rows are valid only during the native call.
+    #[cfg(all(test, feature = "prefill-observer"))]
+    pub(crate) unsafe fn test_prefill_observer(&mut self, observer: ffi::sd_prefill_observer, context: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller upholds the callback/context lifetime and no-unwind contract.
+        check(unsafe { ffi::sd_prefill_observe(self.handle, observer, context) }).map(drop)
+    }
+
+    /// Load complete four-stream rows before a layer's PLE and span.
+    /// The hidden rows layer order moved to and from the host so far: (nanoseconds up, bytes up, nanoseconds down, bytes down).
+    pub fn prefill_row_transfers(&self) -> Result<[u64; 4]> {
+        let mut out = [0u64; 4];
+        // SAFETY: a live handle and a place for four values.
+        check(unsafe { ffi::sd_prefill_row_transfers(self.handle, out.as_mut_ptr()) })?;
+        Ok(out)
+    }
+
+    pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> {
+        let steps = rows.len() / WIDTH;
+        if rows.len() % WIDTH != 0 || !(1..=self.prefill_capacity as usize).contains(&steps) {
+            return Err("invalid layer prefill hidden rows".into());
+        }
+        // (the rows are the device's own output of the layer before, or embeddings of checked weights: a scan of every value on one CPU
+        // thread, for every chunk of every layer, took 29 GB of reads at 15K tokens; the ordinary path keeps the same rows in VRAM unchecked)
+        debug_assert!(rows.iter().all(|v| v.is_finite()), "non-finite layer prefill hidden rows");
+        // SAFETY: rows have the registered workspace width and capacity, and remain alive through the upload.
+        check(unsafe { ffi::sd_prefill_rows(self.handle, layer as u64, rows.as_ptr(), steps as u64) }).map(drop)
     }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
@@ -1046,9 +1369,9 @@ impl Backend {
     /// 4 to 8 ms a four-row pass where the sixteenth of the budget mirrors 37K to 43K of them).
     pub fn grow_kv_stage(&mut self, context: u64) -> Result<()> {
         let Some(stage) = self.states.get("@kv:stage").copied() else { return Ok(()) };
-        // (in the stage's rows of 1024 floats: a position takes a row of KV_ROW_FLOATS a plane, four planes for a whole layer, a part's two)
+        // (in the stage's rows of 1024 floats: a position takes a row of kv_row_floats() a plane, four planes for a whole layer, a part's two)
         let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:"))
-            .map(|key| (self.kv_planes(key) * context * KV_ROW_FLOATS).div_ceil(1024)).sum();
+            .map(|key| (self.kv_planes(key) * context * kv_row_floats()).div_ceil(1024)).sum();
         let (used, budget) = self.memory()?;
         let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
         let rows = (stage.rows / 4 + free / 4096).min(needed);
@@ -1352,14 +1675,48 @@ impl Backend {
             }
         }
         let mut output = vec![0f32; output_rows as usize * WIDTH];
+        self.prefill_span_into(begin, end, values, position, steps, output_rows, &mut output)?;
+        Ok(output)
+    }
+
+    /// [`Backend::prefill_layers`] with all `steps` rows written into `output` (`steps` rows of [`WIDTH`]) instead of a new vector: the
+    /// layer-ordered prefill writes each layer's rows back where they were read from, and a fresh vector a chunk is every row's pages
+    /// zeroed and faulted in again for each layer (32K rows: 1.2 GiB a layer, 16 million faults a prefill on Windows).
+    pub fn prefill_layers_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
+                               output: &mut [f32]) -> Result<()> {
+        if begin >= end || end > 49 || end - begin > 4 || !(2..=self.prefill_capacity).contains(&steps)
+            || position > 262144 - steps || output.len() as u64 != steps * WIDTH as u64
+        {
+            return Err("invalid Straydog resident prefill span".into());
+        }
+        if let Some(values) = values {
+            if values.len() as u64 != steps * WIDTH as u64 || !values.iter().all(|value| value.is_finite()) {
+                return Err("invalid Straydog resident prefill input".into());
+            }
+        }
+        self.prefill_span_into(begin, end, values, position, steps, steps, output)
+    }
+
+    /// The span's work, its `output_rows` rows written into `output` (sized by the callers).
+    fn prefill_span_into(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64, output_rows: u64,
+                         output: &mut [f32]) -> Result<()> {
         let target = if output_rows > 0 { output.as_mut_ptr() } else { std::ptr::null_mut() };
-        // SAFETY: input rows (or none) and output rows sized above.
+        let mut phase_seconds = [0.0f64; 4];
+        let observed = cfg!(feature = "prefill-observer");
+        // SAFETY: input rows (or none) checked by the callers; `output` holds `output_rows` rows (prefill_layers sizes it,
+        // prefill_layers_into checks it).
         check(unsafe {
             ffi::sd_prefill_span(self.handle, begin as u64, end as u64, position, steps,
                                  values.map_or(std::ptr::null(), <[f32]>::as_ptr), target, output_rows,
-                                 std::ptr::null_mut())
+                                 if observed { phase_seconds.as_mut_ptr() } else { std::ptr::null_mut() })
         })?;
-        Ok(output)
+        if observed {
+            eprintln!("Straydog layer trace: {}", serde_json::json!({"source":"gpu", "phase":"compute",
+                "layer":begin,"layer_end":end,"position":position,"steps":steps,
+                "hc_seconds":phase_seconds[0],"gdn_seconds":phase_seconds[1],
+                "qsa_seconds":phase_seconds[2],"moe_seconds":phase_seconds[3]}));
+        }
+        Ok(())
     }
 
     fn ple_operands(&mut self, prefix: &str, operands: &[Operand]) -> Result<(Vec<*mut c_void>, Vec<c_int>, Entry)> {
@@ -1870,7 +2227,7 @@ impl Backend {
     /// Bytes [`save_positions`](Self::save_positions) copies per position.
     pub fn position_bytes(&self) -> u64 {
         self.states.keys().map(|key| {
-            if key.starts_with("@qsa:") { self.kv_planes(key) * KV_ROW_FLOATS * 4 } else if key.starts_with("@indexer:") { 128 } else { 0 }
+            if key.starts_with("@qsa:") { self.kv_planes(key) * kv_row_floats() * 4 } else if key.starts_with("@indexer:") { 128 } else { 0 }
         }).sum()
     }
 
@@ -1909,11 +2266,11 @@ impl Backend {
         for (key, entry) in &self.states {
             let floats = entry.rows * entry.cols;
             if key.starts_with("@qsa:") {
-                // Four planes (each head's keys, then each head's values; a part's two), a position's KV_ROW_FLOATS a row.
+                // Four planes (each head's keys, then each head's values; a part's two), a position's kv_row_floats() a row.
                 let planes = self.kv_planes(key);
                 let context = entry.rows / planes;
-                parts.push(StatePart { key: key.clone(), offset: from * KV_ROW_FLOATS, pitch: context * KV_ROW_FLOATS,
-                                       width: (to - from) * KV_ROW_FLOATS,
+                parts.push(StatePart { key: key.clone(), offset: from * kv_row_floats(), pitch: context * kv_row_floats(),
+                                       width: (to - from) * kv_row_floats(),
                                        height: planes, first: from, data: Vec::new(), device: None });
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
@@ -2030,11 +2387,11 @@ impl Backend {
                 for low in (0..to).step_by(RUN as usize) {
                     let high = (low + RUN).min(to);
                     parts.push((format!("{key} rows {low}..{high}"),
-                                part(low * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, (high - low) * KV_ROW_FLOATS, planes)));
+                                part(low * kv_row_floats(), entry.rows / planes * kv_row_floats(), (high - low) * kv_row_floats(), planes)));
                 }
                 // (and the last few one by one: where a sequence's writes end)
                 for row in to.saturating_sub(8)..to {
-                    parts.push((format!("{key} row {row}"), part(row * KV_ROW_FLOATS, entry.rows / planes * KV_ROW_FLOATS, KV_ROW_FLOATS, planes)));
+                    parts.push((format!("{key} row {row}"), part(row * kv_row_floats(), entry.rows / planes * kv_row_floats(), kv_row_floats(), planes)));
                 }
             } else if key.starts_with("@indexer:") {
                 let pool = (floats - INDEX_HISTORY) / 128;
@@ -2234,13 +2591,38 @@ impl Backend {
     }
 
     /// Give the remaining budget to expert cache slots; the cache slot count.
+    ///
+    /// A device allocation that answers code 2 is rolled back in the library, then tried again here: the staging count
+    /// halves from `stage` down to 2, and only then the cache halves down to 0. The cache is never shrunk inside the
+    /// library. When the only refusal left at stage 2 is the page-locked staging mirror, the pool starts without that
+    /// mirror ([`Self::expert_slot_mirror`]).
     pub fn create_expert_slots(&mut self, stage: u64, margin: u64) -> Result<u64> {
         let slot = (if self.slot_bytes > 0 { self.slot_bytes } else { expert_bytes([42, 42, 42]) }).div_ceil(256) * 256;
-        let cache = self.slots_that_fit(stage, margin, slot)?;
-        // SAFETY: a live handle.
-        check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot) })?;
-        (self.slot_stage, self.slot_margin, self.slot_size) = (stage, margin, slot);
-        Ok(cache)
+        let mut stage = stage.max(2);
+        let mut cache = self.slots_that_fit(stage, margin, slot)?;
+        let mut mirror = true;
+        loop {
+            // SAFETY: a live handle. A code 2 refusal rolls the partial pool back before it returns.
+            match check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot, c_int::from(mirror)) }) {
+                Ok(_) => {
+                    (self.slot_stage, self.slot_margin, self.slot_size, self.slot_mirror) = (stage, margin, slot, mirror);
+                    return Ok(cache);
+                }
+                Err(error) => {
+                    let Some(next) = next_slot_attempt(stage, cache, mirror, &error) else { return Err(error) };
+                    let cache_next = if next.refit { self.slots_that_fit(next.stage, margin, slot)? } else { next.cache };
+                    eprintln!("Straydog expert slots: stage {stage} cache {cache} mirror {mirror} was refused; trying stage {} cache {cache_next} mirror {}", next.stage, next.mirror);
+                    stage = next.stage;
+                    cache = cache_next;
+                    mirror = next.mirror;
+                }
+            }
+        }
+    }
+
+    /// The staging slots were given a page-locked host mirror.
+    pub fn expert_slot_mirror(&self) -> bool {
+        self.slot_mirror
     }
 
     fn slots_that_fit(&self, stage: u64, margin: u64, slot: u64) -> Result<u64> {
@@ -2383,6 +2765,20 @@ impl Backend {
         Ok(found != 0)
     }
 
+    /// Point the plan on this device whose gate bank is at `from_gate` at the same banks in `to` (gate, up, down): the engine's page-locked copies
+    /// (`copy`), or the model's mapping again before the copies are freed. Nothing on the device reads the old memory when it returns (the in-flight
+    /// copies, the kernels and graphs that read the banks in place, and the CPU's workers are waited for); the assist's view of the layer is dropped, and
+    /// [`Backend::enable_assist`] maps the new memory. Whether this device holds the layer.
+    pub fn repoint_banks(&mut self, from_gate: *const u8, to: crate::banks::Banks, copy: bool) -> Result<bool> {
+        let mut found = 0;
+        // SAFETY: a live handle, an address that is only compared, six addresses the caller keeps alive (the allocations' starts are read only for copies)
+        // and an out-parameter.
+        check(unsafe {
+            ffi::sd_hybrid_repoint(self.handle, from_gate.cast(), to.start.as_ptr(), to.base.as_ptr(), c_int::from(copy), &mut found)
+        })?;
+        Ok(found != 0)
+    }
+
     /// Give up the page lock of a range this device adopted ([`Backend::adopt_host`]), after [`Backend::unmap_banks`]: the pages are the system's
     /// to page again and the commit they held is given back. A range that was not adopted is left alone.
     pub fn release_host(&mut self, range: &[u8]) -> Result<()> {
@@ -2433,6 +2829,40 @@ impl Backend {
 pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// Whether the GPU `ordinal` registers host memory read-only, as the model's file mapping must be to page-lock it in place: None where the runtime cannot
+/// say (HIP has no such attribute, and a query that failed), which is taken as it being able to.
+pub fn host_registers_read_only(ordinal: usize) -> Option<bool> {
+    #[cfg(feature = "cuda")]
+    {
+        straydog_gpu::host_register_read_only_supported(ordinal).ok()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        None
+    }
+}
+
+/// `bytes` of page-locked host memory that every device sees (portable) and can read in place (mapped), allocated under the context of device `ordinal`
+/// from any thread; the runtime's reason if it refused. For the copies of the expert banks ([`crate::banks::PinnedMemory`]).
+pub fn host_alloc(ordinal: usize, bytes: u64) -> Result<*mut u8> {
+    let mut pointer: *mut c_void = std::ptr::null_mut();
+    // SAFETY: an out-parameter.
+    check(unsafe { ffi::sd_host_alloc_on(ordinal as c_int, bytes, &mut pointer) })?;
+    Ok(pointer.cast())
+}
+
+/// Give back memory [`host_alloc`] returned.
+///
+/// # Safety
+/// `pointer` came from [`host_alloc`] of this `ordinal`, once, and nothing reads it any more.
+pub unsafe fn host_free(ordinal: usize, pointer: *mut u8) {
+    // SAFETY: the caller's.
+    if let Err(error) = check(unsafe { ffi::sd_host_free(ordinal as c_int, pointer.cast()) }) {
+        eprintln!("WARN Straydog host banks: a page-locked copy could not be freed ({error})");
+    }
 }
 
 /// The end of the error of a copy of a conversation's state into host memory that the system had none for (see [`Backend::save_positions`]): the devices
@@ -2649,6 +3079,142 @@ fn bytemuck_bytes(values: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }
 
+/// One more try after an expert-slot allocation answered `code 2`. `refit` means the cache count has to be measured
+/// again for the new staging count. Nothing here asks the device.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SlotAttempt {
+    pub stage: u64,
+    pub cache: u64,
+    pub mirror: bool,
+    pub refit: bool,
+}
+
+pub(crate) fn next_slot_attempt(stage: u64, cache: u64, mirror: bool, error: &str) -> Option<SlotAttempt> {
+    if !error.contains(", code 2)") {
+        return None;
+    }
+    // Halve the staging count first, and never below 2: a stage of 1 cannot gather a prefill.
+    if stage > 2 {
+        return Some(SlotAttempt { stage: (stage / 2).max(2), cache, mirror: true, refit: true });
+    }
+    if stage != 2 {
+        return None;
+    }
+    // The mirror's bytes do not depend on the cache, so a pin that fails at stage 2 is not helped by a smaller cache.
+    if mirror && error.contains("expert slot staging mirror, code 2") {
+        return Some(SlotAttempt { stage, cache, mirror: false, refit: false });
+    }
+    if cache == 0 {
+        return None;
+    }
+    Some(SlotAttempt { stage, cache: cache / 2, mirror, refit: false })
+}
+
+#[cfg(test)]
+mod kv_format_tests {
+    use super::*;
+
+    /// Decides: the rows' sizes. Q8_0's row is 272 bytes, a multiple of 16 (the 16-byte pieces the kernels read and copy), a
+    /// position of a whole layer 1,088 bytes against FP16's 2,048, and Qwen3.8's 262,144-position K/V of thirteen layers 3.45 GiB
+    /// against 6.5. FP16 keeps the rows the K/V had (128 floats); STRAYDOG_KV=f16 selects it and anything else Q8_0.
+    #[test]
+    fn rows_are_sized_for_their_format() {
+        assert_eq!((KvFormat::F16.row_bytes(), KvFormat::F16.row_floats()), (512, KV_ROW_FLOATS_F16));
+        assert_eq!((KvFormat::Q8.row_bytes(), KvFormat::Q8.row_floats()), (272, 68));
+        assert_eq!(KvFormat::Q8.row_bytes() % 16, 0);
+        assert_eq!(4 * KvFormat::Q8.row_bytes(), 1088);
+        assert_eq!(13 * 262_144 * 4 * KvFormat::F16.row_bytes(), 13 << 29);
+        let q8 = 13 * 262_144 * 4 * KvFormat::Q8.row_bytes();
+        assert_eq!(q8, 3_707_764_736);
+        assert_eq!(format!("{:.2}", q8 as f64 / (1u64 << 30) as f64), "3.45");
+        assert_eq!(KvFormat::named(Some("f16")), KvFormat::F16);
+        assert_eq!(KvFormat::named(Some("fp16")), KvFormat::F16);
+        assert_eq!(KvFormat::named(None), KvFormat::Q8);
+        assert_eq!(KvFormat::named(Some("q8")), KvFormat::Q8);
+    }
+
+    fn row(seed: u32, magnitude: f32) -> [f32; 256] {
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        std::array::from_fn(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * magnitude
+        })
+    }
+
+    /// Decides: the layout. The int8 of column c is byte c; the eight F16 scales follow at 256 + 2 * block, little-endian; a
+    /// block's largest magnitude is held as ±127 times its scale.
+    #[test]
+    fn a_q8_row_holds_its_values_then_its_scales() {
+        let mut values = [0f32; 256];
+        for (column, value) in values.iter_mut().enumerate() {
+            *value = (column as f32 - 128.0) / 16.0;
+        }
+        let packed = kv_q8_row(&values);
+        for block in 0..8 {
+            let part = &values[block * 32..block * 32 + 32];
+            let top = part.iter().fold(0f32, |top, value| top.max(value.abs()));
+            let scale = u16::from_le_bytes([packed[256 + 2 * block], packed[257 + 2 * block]]);
+            assert_eq!(scale, formats::f32_to_f16(top / 127.0), "block {block}'s scale");
+            let largest = (0..32).map(|at| block * 32 + at).max_by(|a, b| values[*a].abs().total_cmp(&values[*b].abs())).unwrap();
+            assert_eq!((packed[largest] as i8).unsigned_abs(), 127, "block {block}'s largest value");
+            assert_eq!((packed[largest] as i8) < 0, values[largest] < 0.0);
+        }
+        assert_eq!(packed[128] as i8, 0, "the zero at column 128");
+    }
+
+    /// Decides: the round trip. Every value comes back within half its block's scale (and the F16 scale's own rounding), a block
+    /// that is all zero comes back zero with a zero scale, and a large value in one block leaves the others' precision alone.
+    #[test]
+    fn q8_rows_come_back_within_half_a_scale() {
+        for seed in 1..200 {
+            let magnitude = [1e-3f32, 0.1, 1.0, 30.0, 600.0][seed as usize % 5];
+            let values = row(seed, magnitude);
+            let packed = kv_q8_row(&values);
+            let back = kv_q8_values(&packed);
+            for block in 0..8 {
+                let scale = formats::f16_to_f32(u16::from_le_bytes([packed[256 + 2 * block], packed[257 + 2 * block]]));
+                for column in block * 32..block * 32 + 32 {
+                    let error = (back[column] - values[column]).abs();
+                    assert!(error <= scale * 0.5 * 1.001 + values[column].abs() * 1e-3, "seed {seed} column {column}: {} -> {}",
+                            values[column], back[column]);
+                }
+            }
+        }
+        let zero = kv_q8_values(&kv_q8_row(&[0f32; 256]));
+        assert!(zero.iter().all(|value| *value == 0.0));
+        assert!(kv_q8_row(&[0f32; 256]).iter().all(|byte| *byte == 0));
+        let mut values = row(7, 1.0);
+        let before = kv_q8_row(&values);
+        values[3] = 500.0;
+        let after = kv_q8_row(&values);
+        assert_eq!(before[32..256], after[32..256], "the other blocks' values");
+        assert_eq!(before[258..272], after[258..272], "the other blocks' scales");
+        assert_eq!(after[3] as i8, 127);
+    }
+}
+
+#[cfg(test)]
+mod layer_rows_tests {
+    use super::{layer_rows_refusal, layer_rows_room, ALLOCATION_TAIL};
+
+    /// Decides: how many of a pass's hidden rows (40 KB each) the VRAM layer order leaves holds beside the slots' margin, and that a pass of
+    /// more is refused with why: 65,536 rows (2.5 GiB) in 3.5 GiB, not 131,072 (5 GiB); nothing in less than the margin.
+    #[test]
+    fn a_pass_holds_its_rows_in_vram_where_they_fit() {
+        const GIB: u64 = 1 << 30;
+        let margin = 64 << 20;
+        assert_eq!(layer_rows_room(GIB + margin + 2 * ALLOCATION_TAIL, margin), GIB / 40_960);
+        assert_eq!(layer_rows_room(margin, margin), 0);
+        assert!(layer_rows_refusal(65_536, 7 * GIB / 2, margin).is_none());
+        let refused = layer_rows_refusal(131_072, 7 * GIB / 2, margin).unwrap();
+        assert_eq!(refused, "5.00 GiB of rows, 3.50 GiB of VRAM free");
+        assert!(layer_rows_refusal(16_384, 640 << 20, margin).is_some());
+        assert!(layer_rows_refusal(16_384, (640 << 20) + margin + 2 * ALLOCATION_TAIL, margin).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Decides: zeroed floats come zeroed and in the number asked for, and a size no machine has is refused where `vec![0f32; n]` would end the process.
@@ -2661,5 +3227,39 @@ mod tests {
         assert!(super::zeroed_floats(usize::MAX / 2).is_none(), "a layout that overflows");
         // (the result goes through black_box: an allocation that is only checked for null may be assumed to succeed, and never made)
         assert!(std::hint::black_box(super::zeroed_floats(std::hint::black_box(1 << 46))).is_none(), "a valid layout of 256 TiB, more than a process can address");
+    }
+
+    /// Code 2 halves the staging count down to 2, then the cache down to 0. Only the staging mirror's own refusal at
+    /// stage 2 drops the mirror, and the cache stays. Any other refusal is not retried.
+    #[test]
+    fn an_expert_slot_pool_refused_with_code_2_shrinks_then_drops_its_mirror() {
+        let refused = "out of memory (hybrid_slots.hpp:157, code 2)";
+        let pin = "out of memory (expert slot staging mirror, code 2)";
+        let next = super::next_slot_attempt;
+        assert_eq!(next(32, 1000, true, refused), Some(super::SlotAttempt { stage: 16, cache: 1000, mirror: true, refit: true }));
+        assert_eq!(next(4, 50, true, refused), Some(super::SlotAttempt { stage: 2, cache: 50, mirror: true, refit: true }));
+        assert_eq!(next(2, 40, true, refused), Some(super::SlotAttempt { stage: 2, cache: 20, mirror: true, refit: false }));
+        assert_eq!(next(2, 1, true, refused), Some(super::SlotAttempt { stage: 2, cache: 0, mirror: true, refit: false }));
+        assert_eq!(next(2, 0, true, refused), None);
+        assert_eq!(next(2, 40, true, pin), Some(super::SlotAttempt { stage: 2, cache: 40, mirror: false, refit: false }));
+        assert_eq!(next(2, 40, false, refused), Some(super::SlotAttempt { stage: 2, cache: 20, mirror: false, refit: false }));
+        assert_eq!(next(2, 0, false, pin), None);
+        assert_eq!(next(32, 10, true, "invalid Straydog expert slot pool"), None);
+        assert_eq!(next(1, 10, true, refused), None);
+    }
+}
+
+#[cfg(test)]
+mod ordinary_prefill_estimate_tests {
+    use super::*;
+    #[test]
+    fn predicted_borrowed_batches_share_the_actual_workspace_boundaries() {
+        let full=prefill_workspace_bytes(LONG_PREFILL_ROWS)+2*ALLOCATION_TAIL;
+        assert_eq!(widened_prefill_rows(256,full),4096);
+        assert_eq!(widened_prefill_rows(256,full-1),2048);
+        let half=prefill_workspace_bytes(2048)+2*ALLOCATION_TAIL;
+        assert_eq!(widened_prefill_rows(256,half-1),1024);
+        assert_eq!(widened_prefill_rows(256,0),256);
+        assert_eq!(widened_prefill_rows(8192,full),8192);
     }
 }

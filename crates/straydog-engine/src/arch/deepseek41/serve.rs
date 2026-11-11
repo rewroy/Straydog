@@ -14,8 +14,8 @@ use serde_json::json;
 
 use super::drafter::{self, Drafter, Policy, Rings, MAX_SLOTS};
 use super::dspark::Dspark;
-use super::engine::{divided, forward_split, pass_row_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot, ATTENTION_ROWS, EXPANSIONS,
-                    OWN_ROWS, TAP_LAYERS, TAP_ROWS};
+use super::engine::{divided, forward_split, full_snapshot_bytes, pass_row_bytes, score_bytes, verify_split, Engine, Settings as EngineSettings, Snapshot,
+                    ATTENTION_ROWS, EXPANSIONS, OWN_ROWS, TAP_LAYERS, TAP_ROWS};
 use super::Hparams;
 use crate::arch::served::{self, Draw, Placed, Proposal, Session, Settings};
 use crate::bundle;
@@ -34,13 +34,25 @@ pub type Model = Session<Engines>;
 /// conversation switched away from comes back from there), one where the last long system prompt
 /// ended (a new conversation with it starts from there).
 pub const CHECKPOINTS: usize = 4;
-/// Host memory the checkpoints take at most, together and at any moment (a 20K-token
-/// conversation's ~140 MB): the oldest give theirs up before a new one is taken, and one alone
-/// over it is not taken. Enough for one at the full 262144-token context (~1.7 GiB): at 1 GiB a
-/// conversation past ~160K tokens kept none, and each new turn there (the template drops the last
-/// reply's reasoning) read the conversation again from an older checkpoint, 43K tokens in 48 s.
-/// The expert host tier gives up what this takes.
+/// Host memory the checkpoints take at most, together and at any moment, up to a context of 262144
+/// tokens (a 20K-token conversation's ~140 MB): the oldest give theirs up before a new one is taken,
+/// and one alone over it is not taken. Enough for one at the full 262144-token context (~0.85 GB: the
+/// compressed rows and index keys are BF16): at 1 GiB a conversation past ~160K tokens kept none, and
+/// each new turn there (the template drops the last reply's reasoning) read the conversation again from
+/// an older checkpoint, 43K tokens in 48 s. A longer context takes more: [`checkpoint_budget`].
 pub const CHECKPOINT_BYTES: u64 = 2 << 30;
+
+/// Host memory the checkpoints of a server with `context` tokens take at most: [`CHECKPOINT_BYTES`], or
+/// when more, room for two at the full context, so that the checkpoint a conversation comes back to is
+/// still held while its next turn's is taken (the oldest give theirs up before a new one is taken). A
+/// checkpoint grows with the context: ~0.85 GB at 262144 tokens, ~3.4 GB at 1048576, where 2 GiB
+/// held none past ~660K tokens and each new turn there read the conversation again from an older
+/// checkpoint. At 262144 tokens and below this is [`CHECKPOINT_BYTES`]. The expert host tier gives up
+/// what this takes.
+pub fn checkpoint_budget(hp: &Hparams, context: usize) -> u64 {
+    CHECKPOINT_BYTES.max(2 * full_snapshot_bytes(hp, context))
+}
+
 /// VRAM left free on each card, as the runtime reports it, when the spare is lent to the expert
 /// stores ([`Engines::lend_spare`], after the first passes). The least margin an automatic budget
 /// leaves is 512 MiB; the driver counts 204 MiB of a card's memory used that the runtime's free
@@ -69,7 +81,7 @@ pub struct Engines {
     order: Vec<usize>,
     /// The slot given up last ([`served::Engines::keep_checkpoint`]).
     kept: Option<usize>,
-    /// Host bytes they may take ([`CHECKPOINT_BYTES`]).
+    /// Host bytes they may take ([`checkpoint_budget`]).
     budget: u64,
     /// Floats a step between requests copies of their pending rows ([`CHECKPOINT_STEP`]).
     step: usize,
@@ -709,6 +721,21 @@ fn auto_batch(budget: u64, per_row: u64) -> usize {
     AUTO_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 8).unwrap_or(AUTO_BATCHES[AUTO_BATCHES.len() - 1])
 }
 
+/// A context the model is served with: within [`super::CONTEXT_LIMIT`], and no more than the first
+/// shard's header declares (`deepseek41.context_length`) when it declares one, the context its
+/// rope scaling was made for.
+fn check_context(context: usize, declared: Option<u64>) -> Result<(), String> {
+    if !(1..=super::CONTEXT_LIMIT).contains(&context) {
+        return Err(format!("Straydog context {context} must be between 1 and {} tokens for DeepSeek-V4.1", super::CONTEXT_LIMIT));
+    }
+    match declared {
+        Some(declared) if context as u64 > declared => {
+            Err(format!("Straydog context {context} is above the {declared} tokens this DeepSeek-V4.1 bundle declares"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn layer_of(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
@@ -724,9 +751,22 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         pins.sidecars.push(bundle::Sidecar { asset: vision.asset, verity: vision.verity, architecture: bundle::VISION_ARCHITECTURE.into() });
     }
     let mut files = Pinned::open(root, data_dir, &pins)?;
+    check_context(settings.context, files.header.declared_context)?;
+    // A row read may otherwise fetch a cold 4 KiB proof for its 4 KiB data. Keep the leaves
+    // before expert arenas are pinned, bounded by both the host plan and current headroom.
+    // An explicitly sized expert tier is left as given; a mapping-only row table stays as given.
+    let proof_budget = if settings.host_expert_bytes.is_none() && settings.row_cache_bytes > 0 {
+        (settings.host_memory_bytes / 64).min(1 << 30).min(crate::host::prefetch_available_bytes() / 8)
+    } else { 0 };
+    let saving = Instant::now();
+    let row_proofs = files.preload_row_proofs(proof_budget)?;
+    if row_proofs > 0 {
+        eprintln!("Straydog row proofs: {} MiB checked and kept in host memory in {:.2} s", row_proofs >> 20, saving.elapsed().as_secs_f64());
+    }
     files.cache_tables(settings.row_cache_bytes)?;
     let open_seconds = started.elapsed().as_secs_f64();
     let hp = Hparams::from_model(&files.header, &files)?;
+    let checkpoints = checkpoint_budget(&hp, settings.context);
     let layers = hp.layers.len();
     // Per layer: the routed experts' bytes, and the resident bytes kept whole on every device
     // and divided among an engine's devices; the same for the head.
@@ -810,7 +850,10 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
         let rows = (batch + OWN_ROWS.min(batch)) as u64 * pass_row_bytes(&hp, devices.len(), range.clone());
         // Reserved on each device, so it comes out of that device's expert slots.
         let expansions = if settings.half_gemm { EXPANSIONS } else { 0 };
-        let fixed = resident + state(range) + rows + SCRATCH + expansions + RESERVE + dspark_bytes(index);
+        // (and the index scores of a pass's rows over the whole context: lent to the store past what a pass
+        // reaches, as the pass buffers are, but taken from the card like them)
+        let scores = score_bytes(batch.min(ATTENTION_ROWS), settings.context);
+        let fixed = resident + state(range) + rows + scores + SCRATCH + expansions + RESERVE + dspark_bytes(index);
         let free = vram.checked_sub(fixed)
             .ok_or_else(|| format!("DeepSeek-V4.1 layers {range:?} need more than {:.1} GiB of VRAM on GPU {devices:?}", vram as f64 / (1u64 << 30) as f64))?;
         // Each device's share of an expert is 1/parts of a slot: free / share experts.
@@ -824,7 +867,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     // experts an agent's turn, to read them from the drive the next)
     let host = match settings.host_expert_bytes {
         Some(_) => served::host_tier(settings, total_experts.saturating_sub(in_vram)),
-        None => served::host_tier(settings, u64::MAX).saturating_sub(CHECKPOINT_BYTES).min(total_experts),
+        None => served::host_tier(settings, u64::MAX).saturating_sub(checkpoints + row_proofs).min(total_experts),
     };
     // (the vision encoder's tensors are read with the first image, not at the start)
     let whole_bytes = files.whole_bytes(|name| !["vision.", "aligner.", "image_", "layers."].iter().any(|prefix| name.starts_with(prefix))
@@ -920,17 +963,35 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: CHECKPOINT_BYTES, step: CHECKPOINT_STEP, files, drafting },
+                           budget: checkpoints, step: CHECKPOINT_STEP, files, drafting },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
-        load_seconds: [("open".to_string(), open_seconds), ("place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
+        load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::engine::snapshot_bytes;
+    use super::super::{Compressed, Gating, Layer, Rope};
     use super::*;
+
+    /// DeepSeek-V4.1's 40 layers as the checkpoints see them: a window of 128, rows of 512 and index keys of 128, the first two layers
+    /// of the window alone, and the kv sources 2, 8 and 14 at ratio 2 and 20 at ratio 1 (the layers after each reading its rows).
+    fn hparams() -> Hparams {
+        let layers = (0..40).map(|layer| {
+            let source = [2, 8, 14, 20].into_iter().rev().find(|&source| layer >= source);
+            let compressed = source.map(|kv_source| Compressed { ratio: if kv_source == 20 { 1 } else { 2 }, kv_source, index_source: kv_source });
+            Layer { compressed, engram: None, clamp_routed: 0.0, clamp_shared: 0.0 }
+        }).collect();
+        let rope = Rope { base: 10000.0, yarn: None };
+        Hparams {
+            vocabulary: 1, width: 1, heads: 1, head_dim: 512, rope_dims: 64, q_rank: 1, out_groups: 1, out_rank: 1, window: 128, norm_eps: 1e-6,
+            experts: 1, experts_used: 1, expert_ff: 1, shared_experts: 0, gating: Gating::Softmax, route_scale: 1.0, route_normalize: false,
+            index_heads: 64, index_dim: 128, index_top_k: 512, candidates: None, hc: 1, sinkhorn_iterations: 1, hc_eps: 1e-6,
+            compressed_rope: rope.clone(), rope, engram: None, layers,
+        }
+    }
 
     /// A checkpoint at the full 262144-token context (DeepSeek-V4.1's 40 layers, sources 2, 8, 14
     /// at ratio 2 and 20 at ratio 1) fits the budget: the oldest give theirs up for it, no more.
@@ -950,6 +1011,72 @@ mod tests {
         assert_eq!(evictions(&held, 1400 << 20, CHECKPOINT_BYTES), Some(vec![0]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES, CHECKPOINT_BYTES), Some(vec![0, 1, 2]));
         assert_eq!(evictions(&held, CHECKPOINT_BYTES + 1, CHECKPOINT_BYTES), None);
+    }
+
+    /// The checkpoints' budget is 2 GiB up to a context of 262144 tokens, so that today's servers are as they were, and grows with the
+    /// context beyond: room for two full-context checkpoints, ~3.4 GB each at 1048576 tokens, which 2 GiB would not hold past ~660K.
+    #[test]
+    fn the_checkpoint_budget_follows_the_context() {
+        let hp = hparams();
+        // (the same count as the full-context checkpoint above, from the layers)
+        let position = 262_144;
+        let groups = [position / 2, position / 2, position / 2, position];
+        assert_eq!(full_snapshot_bytes(&hp, position), snapshot_bytes(position, 128, 40, 512, 128, &groups, position));
+        for context in [1, 4096, 32_768, 131_072, 262_144] {
+            assert_eq!(checkpoint_budget(&hp, context), 2 << 30, "{context}");
+        }
+        let full = full_snapshot_bytes(&hp, 1_048_576);
+        assert!(full > 3_300_000_000 && full < 3_450_000_000, "{full}");
+        let budget = checkpoint_budget(&hp, 1_048_576);
+        assert_eq!(budget, 2 * full);
+        assert!(budget > 6 << 30 && budget < 7 << 30, "{budget}");
+        // (more context, never less budget; 2 GiB held one checkpoint alone up to ~660K)
+        let contexts = [262_144, 300_000, 400_000, 524_288, 786_432, 1_048_576];
+        assert!(contexts.windows(2).all(|pair| checkpoint_budget(&hp, pair[0]) <= checkpoint_budget(&hp, pair[1])));
+        assert!(full_snapshot_bytes(&hp, 660_000) < CHECKPOINT_BYTES && full_snapshot_bytes(&hp, 680_000) > CHECKPOINT_BYTES);
+        assert!(contexts.iter().all(|&context| full_snapshot_bytes(&hp, context) < checkpoint_budget(&hp, context)));
+    }
+
+    /// At 1048576 tokens a full checkpoint is taken: with the oldest given up when room is needed, as at 262144, and where 2 GiB took none.
+    #[test]
+    fn a_full_checkpoint_at_a_million_tokens_fits_its_budget() {
+        let hp = hparams();
+        let full = full_snapshot_bytes(&hp, 1_048_576);
+        let budget = checkpoint_budget(&hp, 1_048_576);
+        assert_eq!(evictions(&[], full, CHECKPOINT_BYTES), None, "2 GiB held none");
+        assert_eq!(evictions(&[], full, budget), Some(vec![]));
+        // the previous turn's, as large, stays while this turn's is taken; a small one beside them makes the oldest give up
+        let held = [(0, full), (1, 300 << 20)];
+        assert_eq!(evictions(&held[..1], full, budget), Some(vec![]));
+        assert_eq!(evictions(&held, full, budget), Some(vec![0]));
+        assert_eq!(evictions(&[(0, 300 << 20), (1, full), (2, 300 << 20)], full, budget), Some(vec![0, 1]));
+        assert_eq!(evictions(&held, budget, budget), Some(vec![0, 1]));
+        assert_eq!(evictions(&held, budget + 1, budget), None);
+    }
+
+    /// The index scores of a pass's rows span the whole context, so placement counts them with the rest a device holds:
+    /// 256 MiB a device at 262144 tokens, 1 GiB at 1048576 (a gigabyte the expert slots had counted as theirs).
+    #[test]
+    fn the_index_scores_grow_with_the_context() {
+        assert_eq!(score_bytes(ATTENTION_ROWS, 262_144), (256 << 20) + 1024);
+        assert_eq!(score_bytes(ATTENTION_ROWS, 1_048_576), (1 << 30) + 1024);
+        assert_eq!(score_bytes(ATTENTION_ROWS.min(64), 4096), 64 * 4097 * 4);
+    }
+
+    /// A context up to the model's 1048576 is served when the bundle declares as much (or does not say); one above the
+    /// bundle's declaration, above the model's, or of nothing is refused.
+    #[test]
+    fn a_context_above_what_the_bundle_declares_is_refused() {
+        const DECLARED: Option<u64> = Some(1_048_576);
+        assert_eq!(check_context(262_144, DECLARED), Ok(()));
+        assert_eq!(check_context(1_048_576, DECLARED), Ok(()));
+        assert_eq!(check_context(1_048_576, None), Ok(()));
+        assert!(check_context(1_048_577, DECLARED).unwrap_err().contains("must be between 1 and 1048576"));
+        assert!(check_context(1_048_577, None).is_err() && check_context(0, DECLARED).is_err());
+        // (a bundle that declares less holds the context to that)
+        assert_eq!(check_context(131_072, Some(131_072)), Ok(()));
+        let error = check_context(131_073, Some(131_072)).unwrap_err();
+        assert!(error.contains("131073") && error.contains("above the 131072 tokens"), "{error}");
     }
 
     /// With 0.32 MB a row, 32768 rows are chosen for a 31 GiB budget, 16384 for 24 GiB, 8192 below that,
