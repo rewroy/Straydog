@@ -204,7 +204,7 @@ pub fn bundle(id: Id) -> Result<Bundle, String> {
 /// and the `tables` read by row from the drive (Qwen3.8's PLE table, DeepSeek-V4.1's Engram).
 /// Headers and alignment are the little that is left of the shards' sizes. The sequence state grows
 /// with the context by `state_per_token` bytes a token (K/V and the like, from the model's
-/// hyperparameters).
+/// hyperparameters: DeepSeek-V4.1's from the table, Qwen3.8's from the engine's own count, [`crate::model::state_per_token`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
     pub dense: u64,
@@ -222,7 +222,13 @@ pub fn footprint(id: Id) -> Result<Footprint, String> {
     if table["schema"] != 3 {
         return Err("unsupported Straydog footprint table".into());
     }
-    Ok(Footprint { dense: bytes("dense")?, experts: bytes("experts")?, tables: bytes("tables")?, state_per_token: bytes("state_per_token")? })
+    // (Qwen3.8's state is the engine's: the table's copy of it, 54,912 bytes, was made when the K/V was F32 and outlived it)
+    let state_per_token = if architecture_of(id).as_deref() == Ok("qwen4exp") {
+        crate::model::state_per_token(true)
+    } else {
+        bytes("state_per_token")?
+    };
+    Ok(Footprint { dense: bytes("dense")?, experts: bytes("experts")?, tables: bytes("tables")?, state_per_token })
 }
 
 /// The pinned chunk digests of the file whose whole SHA-256 is `sha256`, if any.
@@ -964,9 +970,14 @@ mod tests {
             assert!(tensors <= files && files - tensors < files / 500, "{id}: {tensors} of {files}");
             assert!(footprint.dense > 0 && footprint.experts > footprint.dense, "{id}");
         }
-        // the state a token of context takes, which a model's bundles share: Qwen3.8's 13 GiB at 262144 (host
-        // memory), DeepSeek-V4.1's compressed rows
-        assert_eq!(footprint(qw("Q2_0")).unwrap().state_per_token * 262_144 / (1 << 30), 13);
+        // the state a token of context takes, which a model's bundles share: Qwen3.8's, the engine's own count (FP16 K/V and
+        // the indexer keys of thirteen layers, 6.91 GiB at 262144, in host memory), DeepSeek-V4.1's compressed rows
+        assert_eq!(footprint(qw("Q2_0")).unwrap().state_per_token, 28_288);
+        assert_eq!(crate::model::state_per_token(true), 28_288);
+        assert_eq!(crate::model::state_per_token(false), 26_112);
+        assert_eq!(format!("{:.2}", (28_288u64 * 262_144) as f64 / (1u64 << 30) as f64), "6.91");
+        assert!(bundles().into_iter().filter(|id| architecture_of(*id).as_deref() == Ok("qwen4exp"))
+            .all(|id| footprint(id).unwrap().state_per_token == 28_288));
         assert!((3000..3500).contains(&footprint(ds("IQ2_XXS")).unwrap().state_per_token));
         assert_eq!(footprint(ds("IQ2_XXS")).unwrap().state_per_token, footprint(ds("UD-IQ2_XXS")).unwrap().state_per_token);
         // the tables read from the drive: Engram (DeepSeek-V4.1's own file), the PLE table (Qwen3.8's)
