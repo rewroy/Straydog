@@ -510,29 +510,83 @@ fn turn_lowered(priority: Priority) -> Lowered {
     Lowered::begin_reading(priority)
 }
 
-/// The layers whose banks are registered in place (the register mode's locks), one bit a layer: set when a layer's turn has locked and checked them,
-/// cleared when they are given up, whether the model has taken the layer yet or not. A layer-order prompt reads such a layer's banks from the
-/// mapping, whose pages the locks keep in memory, instead of reading them from the file again ([`crate::layer_bank::Prefetch`]).
-static REGISTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One model's layers whose banks are registered in place (the register mode's locks), and the reads under way of each: a layer is marked when
+/// its turn has locked and checked its banks, whether the model has taken it yet or not, and the mark goes when they are given up. A layer-order
+/// prompt reads a marked layer's banks from the mapping, whose pages the locks keep in memory and checked, instead of reading them from the file
+/// again ([`crate::layer_bank::Prefetch`]); so that no read finds them unlocked halfway (a page back from the drive is no checked byte), a read
+/// holds the layer ([`Registered::read`]) and giving the locks up waits for it ([`Registered::release`]). The model owns it: another model's
+/// marks are never this one's, and they end with it.
+#[derive(Default)]
+pub struct Registered {
+    state: std::sync::Mutex<RegisteredState>,
+    released: std::sync::Condvar,
+}
 
-fn mark_registered(layer: usize, registered: bool) {
-    if layer < 64 {
-        if registered {
-            REGISTERED.fetch_or(1 << layer, Ordering::SeqCst);
-        } else {
-            REGISTERED.fetch_and(!(1u64 << layer), Ordering::SeqCst);
+struct RegisteredState {
+    layers: u64,
+    readers: [u32; 64],
+}
+
+impl Default for RegisteredState {
+    fn default() -> RegisteredState {
+        RegisteredState { layers: 0, readers: [0; 64] }
+    }
+}
+
+impl Registered {
+    fn state(&self) -> std::sync::MutexGuard<'_, RegisteredState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn mark(&self, layer: usize) {
+        if layer < 64 {
+            self.state().layers |= 1 << layer;
+        }
+    }
+
+    /// Whether `layer`'s banks are registered in place now.
+    pub fn is_registered(&self, layer: usize) -> bool {
+        layer < 64 && self.state().layers & (1 << layer) != 0
+    }
+
+    /// Hold `layer` registered for a read of its banks from the mapping, while the guard lives: None if it is not registered (read it as any
+    /// other layer).
+    pub fn read(self: &Arc<Self>, layer: usize) -> Option<RegisteredRead> {
+        let mut state = self.state();
+        if layer >= 64 || state.layers & (1 << layer) == 0 {
+            return None;
+        }
+        state.readers[layer] += 1;
+        Some(RegisteredRead { registered: self.clone(), layer })
+    }
+
+    /// `layer`'s registrations are about to be given up: no read takes it from now on, and the reads under way are waited for.
+    pub fn release(&self, layer: usize) {
+        if layer >= 64 {
+            return;
+        }
+        let mut state = self.state();
+        state.layers &= !(1u64 << layer);
+        while state.readers[layer] > 0 {
+            state = self.released.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 }
 
-/// Whether `layer`'s banks are registered in place now ([`REGISTERED`]).
-pub fn registered(layer: usize) -> bool {
-    layer < 64 && REGISTERED.load(Ordering::SeqCst) & (1 << layer) != 0
+/// A read of a registered layer's banks under way ([`Registered::read`]): the layer stays registered until it drops.
+pub struct RegisteredRead {
+    registered: Arc<Registered>,
+    layer: usize,
 }
 
-/// The model gave `layer`'s registrations up (it took them back for memory): its banks are the page cache's again.
-pub fn unregistered(layer: usize) {
-    mark_registered(layer, false);
+impl Drop for RegisteredRead {
+    fn drop(&mut self) {
+        let mut state = self.registered.state();
+        state.readers[self.layer] -= 1;
+        if state.readers[self.layer] == 0 {
+            self.registered.released.notify_all();
+        }
+    }
 }
 
 /// A layer whose banks were page-locked and checked, and whose locks are the caller's until [`Model::banks_locked`](crate::model::Model::banks_locked)
@@ -544,8 +598,9 @@ pub struct Locked {
     banks: [Bank; 3],
     /// The copy mode: the layer's page-locked copies, checked, that nothing reads yet.
     copy: Option<LayerCopy>,
-    /// The register mode: how the banks were registered, to give the registrations up.
+    /// The register mode: how the banks were registered, to give the registrations up, and the model's marks of them.
     registrar: Option<Registrar>,
+    registered: Option<Arc<Registered>>,
 }
 
 // SAFETY: as [`BankLocks`]'s: the banks address mappings that the holder keeps alive.
@@ -559,8 +614,11 @@ impl Locked {
     /// The weights the plan was made from must still be mapped.
     pub unsafe fn unlock(self) {
         if let Some(registrar) = self.registrar {
+            // (the mark first, and the reads under way waited for: then the locks)
+            if let Some(registered) = &self.registered {
+                registered.release(self.layer);
+            }
             BankLocks::release(&registrar, &self.banks);
-            mark_registered(self.layer, false);
         }
     }
 
@@ -616,8 +674,9 @@ pub struct BankLocks {
     kv_ahead: Arc<AtomicU64>,
     /// The copy mode: where the copies are made. None: the mapping itself is registered ([`LockMode::Register`]).
     copies: Option<Arc<dyn HostMemory>>,
-    /// How the mapping is registered in the register mode.
+    /// How the mapping is registered in the register mode, and where the layers registered are marked (the model's, [`Registered`]).
     registrar: Registrar,
+    registered: Arc<Registered>,
     /// The layers of this plan handed out so far, and where a refusal is kept for the model ([`Refusal`]).
     taken: usize,
     refusal: Option<Refusal>,
@@ -629,8 +688,8 @@ unsafe impl Send for BankLocks {}
 impl BankLocks {
     pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
         BankLocks {
-            layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default(), copies: None, registrar: Registrar::SYSTEM, taken: 0,
-            refusal: None,
+            layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default(), copies: None, registrar: Registrar::SYSTEM,
+            registered: Arc::default(), taken: 0, refusal: None,
         }
     }
 
@@ -659,6 +718,12 @@ impl BankLocks {
     }
 
     /// The plan tied to a model: it stops when `halt` is set, and `kv_ahead` says what K/V is still to grow ([`locking_room`]).
+    /// The plan marks the layers it registers in `registered` (the model's).
+    pub(crate) fn marking(mut self, registered: Arc<Registered>) -> BankLocks {
+        self.registered = registered;
+        self
+    }
+
     pub(crate) fn tied_to(mut self, halt: Arc<AtomicBool>, kv_ahead: Arc<AtomicU64>) -> BankLocks {
         (self.halt, self.kv_ahead) = (halt, kv_ahead);
         self
@@ -783,8 +848,8 @@ impl BankLocks {
             }
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
-        mark_registered(layer, true);
-        Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar) })
+        self.registered.mark(layer);
+        Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar), registered: Some(self.registered.clone()) })
     }
 
     /// The copy mode's turn: read the layer's banks from their file into page-locked memory, then check the copies against the file's tree. The mapping is
@@ -796,7 +861,7 @@ impl BankLocks {
             return Err(Stop::Unverified { layer, error });
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
-        Ok(Locked { layer, bytes, banks, copy: Some(copy), registrar: None })
+        Ok(Locked { layer, bytes, banks, copy: Some(copy), registrar: None, registered: None })
     }
 
     /// Give up the registrations of `banks`, made by [`BankLocks::lock_next`].
@@ -1934,21 +1999,52 @@ mod tests {
 
 #[cfg(test)]
 mod registered_tests {
-    use super::{mark_registered, registered, unregistered};
+    use super::Registered;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    /// Decides: a layer is registered in place from its turn until it is given up, by the model or by the locking; the others are not
-    /// touched, and a layer past the mask is never taken as registered. (Layers 60 to 62: the other tests' turns register low ones.)
+    /// Decides: a model's marks are its own: a layer one model registered is not another's (a second model in the process, or the model made
+    /// again), and a new model has none; a layer is marked until it is released, and one past the mask never is.
     #[test]
-    fn a_layer_is_registered_from_its_turn_until_it_is_given_up() {
-        assert!(!registered(60) && !registered(61));
-        mark_registered(60, true);
-        mark_registered(61, true);
-        assert!(registered(60) && registered(61) && !registered(62));
-        unregistered(60);
-        assert!(!registered(60) && registered(61));
-        mark_registered(61, false);
-        assert!(!registered(61));
-        mark_registered(70, true);
-        assert!(!registered(70));
+    fn a_models_marks_are_its_own_and_last_until_released() {
+        let (one, other) = (Arc::new(Registered::default()), Arc::new(Registered::default()));
+        one.mark(5);
+        assert!(one.is_registered(5) && !other.is_registered(5));
+        assert!(one.read(5).is_some() && other.read(5).is_none());
+        one.release(5);
+        assert!(!one.is_registered(5) && one.read(5).is_none());
+        one.mark(70);
+        assert!(!one.is_registered(70) && one.read(70).is_none());
+        assert!(!Arc::new(Registered::default()).is_registered(5));
+    }
+
+    /// Decides: giving a layer's locks up waits for the reads of its banks under way, and no read begins once it has started; the reads of
+    /// other layers are not waited for.
+    #[test]
+    fn giving_the_locks_up_waits_for_the_reads_under_way() {
+        let registered = Arc::new(Registered::default());
+        registered.mark(3);
+        registered.mark(4);
+        let read = registered.read(3).unwrap();
+        let other = registered.read(4).unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let releasing = {
+            let (registered, released) = (registered.clone(), released.clone());
+            std::thread::spawn(move || {
+                registered.release(3);
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!released.load(Ordering::SeqCst), "the release waits for the read");
+        assert!(registered.read(3).is_none(), "no read begins once the release has");
+        drop(read);
+        releasing.join().unwrap();
+        assert!(released.load(Ordering::SeqCst));
+        assert!(registered.is_registered(4));
+        drop(other);
+        registered.release(4);
+        assert!(!registered.is_registered(4));
     }
 }
