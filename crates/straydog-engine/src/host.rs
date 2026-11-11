@@ -1183,6 +1183,15 @@ mod paging_watch_tests {
 mod fault_read_tests {
     use super::FaultReads;
 
+    /// Decides: Linux's count is read from this process's stat (majflt, past the command's parenthesis), not left out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reads_its_major_faults() {
+        let before = super::fault_reads().expect("majflt from /proc/self/stat");
+        assert!(!before.system);
+        assert_eq!(super::fault_reads().unwrap().since(before).1, false);
+    }
+
     /// Decides: a request's pages read back are the counter's difference: Windows's count of every process's is 32 bits and wraps, and
     /// a wrap between a request's two readings is no huge read; Linux's is the process's own and never wraps.
     #[test]
