@@ -413,7 +413,11 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     auto* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
     const auto& experts = *d.resident.find(plan.moe)->second;
     float* scratch = experts.workspace;
-    if (steps * std::max({hc_batch_floats, gdn_batch_floats, qsa_batch_floats}) > experts.capacity * 49302 + 65536)
+    // (the workspace holds the rows' scratch of every stage but the experts', which run in chunks of the plan's capacity, below: a part's, with the
+    // HyperConnections' over this device's half of the rows)
+    const auto workspace = d.allocations.find(scratch);
+    if (workspace == d.allocations.end() || steps > prefill_rows_max ||
+        std::max({(steps + 1) / 2 * hc_batch_floats, steps * gdn_batch_floats_of<2>(), steps * qsa_batch_floats_of<2>()}) > workspace->second / 4)
         throw std::runtime_error("prefill batch exceeds the resident expert workspace");
     const bool linear = decoder_linear(layer);
     const BatchRows own = batch_rows(steps, plan.part), other = batch_rows(steps, 1 - plan.part);
@@ -435,13 +439,22 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed, fold ? &second_next : nullptr);
     hc_prefill(d, second, kinds + 4 + (linear ? 9 : 10), own.count, hidden + own.first * 10240, branch, scratch, fold);
     qwen_gather_mixed(d, branch, steps, own, other, mixed);
-    const StepMoe moe = step_moe(d, plan.moe, steps);
-    moe_steps_route(d, moe, steps, mixed);
-    moe_steps_compute(d, moe, steps, mixed);
-    const bool half = moe.plan->half[0].data != nullptr;
-    if (half) moe_half_batch(d, moe, steps, mixed);
-    moe_part_partial<<<dim3(10, unsigned(steps)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, steps,
-                                                                     true, moe.plan->shared || half, branch);
+    // The experts of at most `experts.capacity` rows at a time (a batch of no more is one chunk, as ever): each row's routes and outputs are its own,
+    // so the chunks give a row the sum a batch of its own would; a wider batch's chunks read the experts again, as the batches of that width do. The
+    // chunks are as even as can be, none of a lone row (a row alone takes the decode layout of the experts' outputs).
+    const size_t chunks = (steps + experts.capacity - 1) / experts.capacity;
+    for (size_t chunk_index = 0, first = 0; chunk_index < chunks; ++chunk_index) {
+        const size_t count = steps / chunks + (chunk_index < steps % chunks ? 1 : 0);
+        const float* rows = mixed + first * 2560;
+        const StepMoe moe = step_moe(d, plan.moe, count);
+        moe_steps_route(d, moe, count, rows);
+        moe_steps_compute(d, moe, count, rows);
+        const bool half = moe.plan->half[0].data != nullptr;
+        if (half) moe_half_batch(d, moe, count, rows);
+        moe_part_partial<<<dim3(10, unsigned(count)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, count,
+                                                                         true, moe.plan->shared || half, branch + first * 2560);
+        first += count;
+    }
     if (fold && next) {
         const auto& following = d.decoder.find(layer + 1)->second;
         const HcNext first_next = hc_next(static_cast<const float*>(following.pointers[0]),
@@ -460,7 +473,7 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
 // them waits for both devices (a batch's spans then run with no host round trip between them).
 void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t position, size_t steps, const float* input,
                         float* output, size_t output_rows) {
-    if (begin >= end || end > 49 || !steps || steps > 4096 || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
+    if (begin >= end || end > 49 || !steps || steps > prefill_rows_max || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
         a.sums.peer != &b || b.sums.peer != &a)
         throw std::runtime_error("invalid prefill span of parts");
     Device* sides[2] = {&a, &b};

@@ -59,6 +59,25 @@ pub const ALLOCATION_TAIL: u64 = 64;
 /// The largest batch the ordinary partially resident prefill can borrow cache VRAM for.
 pub(crate) const LONG_PREFILL_ROWS: u64 = 4096;
 const MOE_ROW: u64 = 11 * 4480 + 22;
+/// The rows of a prompt batch a fully resident decoder's workspaces hold at most (the native `prefill_rows_max`).
+pub const PREFILL_ROWS_MAX: u64 = 16384;
+/// The rows whose experts a layer part of a batch runs at once (the native `moe_chunk_rows`): a wider batch runs them in chunks of this many.
+pub const MOE_CHUNK_ROWS: u64 = 4096;
+/// The floats of the row scratch a batch's stages other than the experts take a row, of whole layers and of a layer in parts (the native
+/// `batch_scratch_row` and `part_scratch_row`).
+const BATCH_SCRATCH_ROW: u64 = 25924;
+const PART_SCRATCH_ROW: u64 = 13000;
+/// The floats of a resident MoE workspace a row of the experts' chunk takes in a layer in parts (the native `moe_compact_row`): MOE_ROW less the F32
+/// product rows (7040 floats a row) and the gate and up scratch the grouped FP16 path does not use (9280): its products and inputs are halves, 4800.
+const MOE_PART_ROW: u64 = 4800 + 11 * 2560 + 22;
+
+/// The floats of a resident MoE workspace for batches of up to `rows` rows (the native `moe_workspace_floats`): the experts' of a chunk and their
+/// tables, the row scratch of the batch's other stages, and what a decode pass reads (49302 floats a row of up to sixteen, which keeps what every batch
+/// had). `rows` * MOE_ROW + 65536 up to a chunk, where the layers are whole.
+fn moe_workspace_floats(rows: u64, parts: bool) -> u64 {
+    let (row, scratch) = if parts { (MOE_PART_ROW, PART_SCRATCH_ROW) } else { (MOE_ROW, BATCH_SCRATCH_ROW) };
+    (rows.min(MOE_CHUNK_ROWS) * row + 65536).max(rows * scratch).max(rows.min(16) * MOE_ROW + 65536)
+}
 /// Rows of the peer's batch one pass of expert-parallel help takes (see `@moe:helper`).
 const HELP_ROWS: u64 = 2048;
 pub const VERIFY_MAX: usize = 8;
@@ -895,7 +914,7 @@ impl Backend {
                   -> Result<Vec<(String, u64, u64, bool)>> {
         let mut plan = Vec::new();
         if self.batch_capacity == 256 {
-            plan.push(("@moe:workspace".into(), context.min(prefill) * MOE_ROW + 65536, 1, false));
+            plan.push(("@moe:workspace".into(), moe_workspace_floats(context.min(prefill), self.parts == 2), 1, false));
             if self.expert_parallel && self.parts == 1 {
                 // Help for batches up to 2048 rows at once, longer ones in pieces (layers in parts have no helper).
                 plan.push(("@moe:helper".into(), context.min(prefill).min(HELP_ROWS) * MOE_ROW + 65536, 1, false));
@@ -1452,7 +1471,8 @@ impl Backend {
             Some(entry) => *entry,
             None => self.state("@moe:workspace", 1024 * MOE_ROW + 65536, 1, false)?,
         };
-        Ok((workspace, (workspace.rows - 65536) / MOE_ROW))
+        // (the experts' chunk of a batch wider than that: its workspace holds the other stages' rows too)
+        Ok((workspace, self.prefill_capacity.min(MOE_CHUNK_ROWS)))
     }
 
     /// Pin three packed expert banks (or, under expert parallelism, experts [first, first +
@@ -1740,7 +1760,7 @@ impl Backend {
     /// PLE in place on the rows resident in `layer`'s decoder workspace.
     pub fn prefill_ple(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand], layer: u64) -> Result<()> {
         let steps = embeddings.len() / HIDDEN;
-        if !embeddings.len().is_multiple_of(HIDDEN) || !(2..=4096).contains(&steps) {
+        if !embeddings.len().is_multiple_of(HIDDEN) || !(2..=PREFILL_ROWS_MAX as usize).contains(&steps) {
             return Err("invalid Straydog PLE geometry".into());
         }
         let (pointers, kinds, state) = self.ple_operands(prefix, operands)?;
@@ -3268,5 +3288,55 @@ mod ordinary_prefill_estimate_tests {
         assert_eq!(widened_prefill_rows(256,half-1),1024);
         assert_eq!(widened_prefill_rows(256,0),256);
         assert_eq!(widened_prefill_rows(8192,full),8192);
+    }
+}
+
+#[cfg(test)]
+mod wide_batch_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn the_experts_workspace_of_whole_layers_is_what_it_was_up_to_a_chunk() {
+        for rows in [1, 256, 1024, 2048, 4095, 4096] {
+            assert_eq!(moe_workspace_floats(rows, false), rows * MOE_ROW + 65536, "{rows} rows");
+        }
+        // (a chunk, 4096 rows, whatever the batch; the other stages' scratch a row beyond it)
+        assert_eq!(moe_workspace_floats(6144, false), 4096 * MOE_ROW + 65536);
+        assert_eq!(moe_workspace_floats(8192, false), 8192 * BATCH_SCRATCH_ROW);
+    }
+
+    #[test]
+    fn a_layer_in_parts_takes_a_third_less_of_the_experts_workspace_and_none_more_for_a_wide_batch() {
+        assert_eq!(MOE_PART_ROW, 32982);
+        for rows in [24, 256, 1024, 2048, 4095, 4096] {
+            assert_eq!(moe_workspace_floats(rows, true), rows * MOE_PART_ROW + 65536, "{rows} rows");
+        }
+        // (up to sixteen rows keep the size they had)
+        for rows in 1..=16 {
+            assert_eq!(moe_workspace_floats(rows, true), rows * MOE_ROW + 65536, "{rows} rows");
+        }
+        // (4096 rows' 808 MB are 540: the room a wide batch's rows take; 8192 and up to 10300 rows' other scratch is within the chunk's)
+        assert_eq!(moe_workspace_floats(4096, true) * 4 >> 20, 515);
+        for rows in [8192, 10_000, 10_300] {
+            assert_eq!(moe_workspace_floats(rows, true), moe_workspace_floats(4096, true), "{rows} rows");
+        }
+        assert!(moe_workspace_floats(PREFILL_ROWS_MAX, true) > moe_workspace_floats(4096, true));
+        // (a decode pass's eight rows keep token_moe's layout whatever the batch: 49302 floats a row)
+        for rows in 1..=64 {
+            assert!(moe_workspace_floats(rows, true) >= rows.min(8) * MOE_ROW + 65536, "{rows} rows");
+        }
+        // (the native sizes: whole layers 49302 and a layer in parts 32982 floats a row of the chunk, 65536 for the tables)
+        assert_eq!((MOE_ROW, MOE_PART_ROW), (49302, 32982));
+    }
+
+    #[test]
+    fn the_workspace_holds_the_experts_chunk_and_the_other_stages_rows_at_every_width() {
+        for parts in [false, true] {
+            let (row, scratch) = if parts { (MOE_PART_ROW, PART_SCRATCH_ROW) } else { (MOE_ROW, BATCH_SCRATCH_ROW) };
+            for rows in (1..=PREFILL_ROWS_MAX).step_by(7).chain([PREFILL_ROWS_MAX]) {
+                let floats = moe_workspace_floats(rows, parts);
+                assert!(floats >= rows.min(MOE_CHUNK_ROWS) * row + 65536 && floats >= rows * scratch, "{rows} rows, parts {parts}");
+            }
+        }
     }
 }

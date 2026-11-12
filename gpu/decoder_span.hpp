@@ -43,7 +43,11 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
         (scratch->second/4-extra)%15364)
         throw std::runtime_error("invalid decoder workspace allocation");
     const size_t capacity=(scratch->second/4-extra)/15364;
-    if (capacity>4096 || capacity>d.resident.find(moe)->second->capacity)
+    // (a batch wider than the plan's experts' chunk: their workspace holds its row scratch all the same, moe_workspace_floats)
+    const auto& expert_plan=*d.resident.find(moe)->second;
+    const auto moe_workspace=d.allocations.find(expert_plan.workspace);
+    if (capacity>prefill_rows_max || moe_workspace==d.allocations.end() ||
+        moe_workspace->second/4<moe_workspace_floats(capacity,d.qwen_parts==2 && expert_plan.part))
         throw std::runtime_error("invalid decoder workspace capacity");
     const size_t hc_rows[4]={1,320,10240,4},hc_cols[4]={10240,10240,320,10240};
     const size_t gd_rows[9]={10240/parts,6144/parts,48/parts,48/parts,2560,10240/parts,1,1,1};

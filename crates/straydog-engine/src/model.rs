@@ -789,6 +789,10 @@ pub struct Model {
     chunked_scan_from: usize,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
+    /// The rows of a long read's batches where the workspaces hold more than `prefill_batch_size` (0: they do not, or the batch was given: see
+    /// [`wide_placement`]), and what the widest wanted would have needed when they do not.
+    pub wide_batch_size: usize,
+    pub wide_note: Option<String>,
     /// What the placement's first choice would have needed, when the VRAM left did not hold it (see `resident_placement`).
     pub placement_note: Option<String>,
     pub history: Vec<u32>,
@@ -951,6 +955,7 @@ impl Model {
         let (mut host, mut batch) = (attention_capable && !fits && host_capable, asked);
         let mut placement_note = None;
         let mut resident = false;
+        let (mut wide, mut wide_note) = (0, None);
         if host_capable && state_bytes - recurrent_bytes <= settings.state_budget_bytes {
             // The layers in parts on two GPUs that hold them so (Group::enable_parts), else split by layers.
             let mut placed = (None, None);
@@ -966,9 +971,15 @@ impl Model {
                 placed = (split.0, if split.0.is_some() { split.1 } else { placed.1.or(split.1) });
             }
             placement_note = placed.1;
-            if let Some((_, resident_host, resident_batch)) = placed.0 {
+            if let Some((keep, resident_host, resident_batch)) = placed.0 {
                 (host, batch) = (resident_host, resident_batch);
                 resident = true;
+                // The workspaces of a long read's wider batches, where the layers are in parts and what the placement left holds them.
+                // (the rows named by STRAYDOG_PREFILL_WIDE are tried whatever batch was given: a measurement of what a width is worth)
+                let named = std::env::var("STRAYDOG_PREFILL_WIDE").is_ok_and(|rows| rows != "off" && rows != "0");
+                if (derived || named) && group.parts() {
+                    (wide, wide_note) = wide_placement(&weights, &group, context64, batch, keep, drafting, host)?;
+                }
             }
         }
         // (on 48 GiB of budgets and more, where the derived batch is the widest, a partial placement keeps what it had at 2048: its room goes to
@@ -987,7 +998,7 @@ impl Model {
         if state_bytes > settings.state_budget_bytes {
             return Err(format!("Straydog context state needs {state_bytes} bytes, over its RAM budget"));
         }
-        group.reserve_model_state(context64, batch as u64, drafting, host)?;
+        group.reserve_model_state(context64, batch.max(wide) as u64, drafting, host)?;
         let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len() + PARK_SLOTS.len())?;
         let mut load_seconds = vec![("state", lap(&mut clock))];
         crate::host::commit_note("states and checkpoints");
@@ -1011,6 +1022,8 @@ impl Model {
             chunked_scan_from: chunked_scan_from_named(std::env::var("STRAYDOG_DELTA_SCAN").ok().as_deref()),
             layer_prefill_restore_failure: None,
             host_kv: host,
+            wide_batch_size: wide,
+            wide_note,
             placement_note,
             history: Vec::new(),
             final_hidden: None,
@@ -2396,7 +2409,7 @@ impl Model {
     /// Start reading the PLE rows of `tokens` (after `before`) as soon as they are known: the
     /// pass that decodes them then waits only for rows still on their way.
     fn prefetch_ple(&self, before: &[u32], tokens: &[u32]) -> Result<()> {
-        // A batch is at most 4096 tokens (the n-gram rows' limit); longer runs go in pieces.
+        // The PLE rows are read 4096 tokens at a time: a wider batch's go in pieces.
         for start in (0..tokens.len()).step_by(4096) {
             let before = if start == 0 { before } else { &tokens[..start] };
             let part = &tokens[start..(start + 4096).min(tokens.len())];
@@ -3324,6 +3337,11 @@ impl Model {
         // (a pass over an image's rows is one of at least two)
         if !self.images.is_empty() {
             batch = batch.max(2);
+        }
+        // A long read's batches are as wide as the workspaces were made (the batch asked for is the default's: a short read, an image, the warm-up
+        // pass and a batch given are not widened).
+        if self.wide_batch_size > batch && tokens.len() - position >= WIDE_READ_TOKENS && self.images.is_empty() && self.warm_stop.is_none() {
+            batch = self.wide_batch_size;
         }
         // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
         let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
@@ -4414,6 +4432,13 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
 const NARROW_BATCH: usize = 2048;
 /// The GPU budgets in all from which the derived prefill batch is the widest.
 const WIDE_BATCH_BUDGET: u64 = 48 << 30;
+/// The rows a long read's batches may be, widest first, where the workspaces hold them (`wide_placement`).
+/// A multiple of the experts' chunk (4096 rows, `MOE_CHUNK_ROWS`): between two, the experts of a batch are read from VRAM in two chunks that are each
+/// narrower than 4096 and the batch pays them over more rows (two R9700s, `--vram 30`, a fresh 242K read: 50.0 s at 4096 rows, 5120 rows (2 x 2560)
+/// 51.0 s, 6144 (2 x 3072) 50.05 s, 8192 (2 x 4096) 49.1 s).
+const WIDE_ROWS: [usize; 2] = [12288, 8192];
+/// The new tokens a read has from which its batches are the wide ones: two wide batches (a 20K read in 3.78 s against 3.81 at 4096 rows).
+pub const WIDE_READ_TOKENS: usize = 16_384;
 /// [`Settings::prefill_batch_size`] when the batch is not given: derived from the GPU budgets.
 pub const DERIVED_BATCH: usize = 0;
 
@@ -4478,6 +4503,34 @@ fn resident_placement(weights: &Weights, group: &Group, context: u64, prefill: u
         }
     }
     Ok((None, last.map(|least| format!("fully resident: {least}"))))
+}
+
+/// The rows of a long read's batches wider than `batch`, for a fully resident placement in parts whose workspaces hold them (the first of
+/// `WIDE_ROWS` that fits, with the same measure as `resident_placement`: the weights and the state a placement still allocates, with the margin kept for
+/// what the runtime allocates outside the budget), else 0 and what the widest wanted would have needed. The K/V stage grows into the VRAM the placement
+/// leaves, so what the wider workspaces take is taken from its growth (beyond the 64th of the budget it starts at). `STRAYDOG_PREFILL_WIDE` names the rows
+/// to try instead (`off`: none). The workspaces are allocated at that width once (a wide batch runs the experts in chunks of `MOE_CHUNK_ROWS`, so what
+/// grows with the rows is the decoder's rows and the MTP layer's), and decode never sees them.
+fn wide_placement(weights: &Weights, group: &Group, context: u64, batch: usize, keep: bool, drafting: bool, host: bool)
+                  -> Result<(usize, Option<String>)> {
+    let rows: Vec<usize> = match std::env::var("STRAYDOG_PREFILL_WIDE").ok().as_deref() {
+        Some("off" | "0") => return Ok((0, None)),
+        Some(rows) => rows.parse().ok().into_iter().collect(),
+        None => WIDE_ROWS.to_vec(),
+    };
+    let requirements = weights.resident_requirements(keep && weights.drafter);
+    let mut note = None;
+    for rows in rows.into_iter().filter(|rows| *rows > batch && *rows as u64 <= crate::gpu::PREFILL_ROWS_MAX) {
+        let planned = group.planned_state_bytes(context, rows as u64, drafting, host)?;
+        let lack = group.pin_lack_model(&requirements, Some(&planned))?;
+        if lack == 0 {
+            return Ok((rows, note));
+        }
+        if note.is_none() && lack != u64::MAX {
+            note = Some(format!("a long read's batches of {rows} rows would need {:.2} GiB more VRAM", lack as f64 / (1u64 << 30) as f64));
+        }
+    }
+    Ok((0, note))
 }
 
 fn validate_geometry(weights: &Weights) -> Result<()> {

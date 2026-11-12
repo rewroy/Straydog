@@ -179,6 +179,21 @@ void qsa_share_signal(Device& d);
 
 // Scratch: q/gate 12288 + k/v/index-q 1536 + index-k 128 + attended 6144 + half 3072 floats per row (a part's fewer).
 constexpr size_t qsa_batch_floats = 12288 + 1536 + 128 + 6144 + 3072;
+// (the workspace of a resident MoE plan holds the rows' scratch of a batch's stages, sized by batch_scratch_row a row in kernels.cpp and Backend::state_plan)
+static_assert(std::max({hc_batch_floats, gdn_batch_floats, qsa_batch_floats}) <= batch_scratch_row, "a batch's row scratch outgrew batch_scratch_row");
+// A part's (QwenHeads<P>) scratch a row of the batch: gdn_prefill's and qsa_prefill's layouts for the heads it holds, its HyperConnections' over half the rows.
+// A layer in parts checks its batch against these (prefill_layer_part); the workspace is sized by part_scratch_row a row.
+template<int P> constexpr size_t gdn_batch_floats_of() {
+    using H = QwenHeads<P>;
+    return H::channels + H::gate + 2 * H::value + H::gate + (std::max<size_t>(2560, H::gate) + 1) / 2;
+}
+template<int P> constexpr size_t qsa_batch_floats_of() {
+    using H = QwenHeads<P>;
+    constexpr size_t Q = H::query * 256, K = H::kv * 256;
+    return 2 * Q + 2 * K + 512 + 128 + Q + (std::max<size_t>(2560, Q) + 1) / 2;
+}
+static_assert(gdn_batch_floats_of<1>() == gdn_batch_floats && qsa_batch_floats_of<1>() == qsa_batch_floats, "the part's scratch rows are the layouts' of gdn_prefill and qsa_prefill");
+static_assert(std::max({(hc_batch_floats + 1) / 2, gdn_batch_floats_of<2>(), qsa_batch_floats_of<2>()}) <= part_scratch_row, "a part's row scratch outgrew part_scratch_row");
 // `part` (a part's prefill, QwenHeads<2>): which of the two devices this is, when the pair share the indexer (qsa_mark_send): each
 // span of more than one chunk has its chunks scored and selected by one device in turn, and the selected blocks go to the other
 // through the sum link's inbox, so each makes the whole span's marks. The other's selections are waited for by the device's stream,

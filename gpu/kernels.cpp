@@ -161,6 +161,23 @@ namespace {
 thread_local std::string last_error;
 constexpr size_t max_cols = 16384, max_rows = 262144;
 constexpr size_t max_batch = 256;
+// The rows of a prompt batch a decoder workspace holds at most. The experts of a batch run in chunks of at most moe_chunk_rows rows (a layer part of
+// qwen_parts.hpp), so a wider batch costs the experts' workspace no more than a batch of that many does: the other stages' row scratch (a row of whole
+// layers takes batch_scratch_row floats, the largest of hc_batch_floats, gdn_batch_floats and qsa_batch_floats; a row of a layer in parts part_scratch_row,
+// checked where they are declared) is what grows with it.
+constexpr size_t prefill_rows_max = 16384, moe_chunk_rows = 4096, batch_scratch_row = 25924, part_scratch_row = 13000;
+// The floats of a resident MoE plan's workspace a row of its experts' chunk takes: the gate and up rows' scratch, the route outputs and the rest of
+// step_moe's layout, 49302; a layer in parts runs its prompt batches on the grouped FP16 path, whose products and inputs are halves within the gate and up
+// scratch (11 routes x 640 and 2560 halves a row, 4800 floats) and which has no F32 product rows: 32982.
+constexpr size_t moe_compact_gate_up_row = 4800, moe_compact_row = moe_compact_gate_up_row + 11 * 2560 + 22;
+constexpr size_t moe_row_floats(bool parts) { return parts ? moe_compact_row : 49302; }
+// The floats of a resident MoE plan's workspace, which also holds a batch's row scratch, for batches of up to `rows` rows: its experts' chunk and the
+// 65536 of their tables (step_moe), the other stages' row scratch, and what a decode pass of up to eight rows reads (token_moe's layout, 49302 a row, and
+// moe_tokens_experts' scores beyond them; up to sixteen rows keep the size every batch had, whichever the layers).
+constexpr size_t moe_workspace_floats(size_t rows, bool parts) {
+    return std::max({std::min(rows, moe_chunk_rows) * moe_row_floats(parts) + 65536, rows * (parts ? part_scratch_row : batch_scratch_row),
+                     std::min<size_t>(rows, 16) * 49302 + 65536});
+}
 struct Matrix {
     const uint8_t* data;
     size_t row_bytes, rows, cols, input_offset, output_offset, launch_offset;

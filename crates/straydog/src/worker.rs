@@ -891,6 +891,9 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "vision_refusal": vision.as_ref().err(),
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
+                      // (a long read's wider batches: their rows, from how many new tokens, and what they lacked when they were not made)
+                      "prefill_wide_rows": model.wide_batch_size, "prefill_wide_from": straydog_engine::model::WIDE_READ_TOKENS,
+                      "prefill_wide_note": model.wide_note,
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" },
                       "note": model.placement_note},
         "load_seconds": seconds,

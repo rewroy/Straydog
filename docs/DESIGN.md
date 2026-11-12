@@ -1424,6 +1424,41 @@ layer (§6.2).
   takes `DERIVED_BATCH` (0) as the batch to derive and narrow, any other as asked, which is tried at
   its rows with the K/V in VRAM, then in host memory at the rows halved to 1024 (as before 4096 was the
   default; the `one-gpu-partial` golden's 4096 on a 24 GiB card stays 4096).
+- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (16384) new tokens or more is read in batches of up to
+  `Model::wide_batch_size` rows when the batch was derived, the layers are in parts (§8 above) and the VRAM left holds the
+  workspaces of more (`wide_placement`; the ready line says the rows, or what they lack, and the request line the batches it
+  ran in; `STRAYDOG_PREFILL_WIDE=off` or N rows). What a batch pays once, whatever its rows, is the FP16 expansion of every
+  dense weight (`expand_matrix`, 25.4 us a token at 2048 rows in the 242K kernel table, halving with each doubling), the
+  exchanges of the two devices (a wait of 56-89 us each) and the launches. What grows with the rows is the decoder's workspace
+  (hidden, mixed and branch rows, 15364 floats), the MTP layer's kept rows and embeddings (12800) and the sums' inbox; the
+  experts' workspace (11 routes of 4480 floats a row) does not, because a layer part runs the experts of a wide batch in
+  chunks of 4096 rows (`moe_chunk_rows`; a batch of no more is one chunk, as ever, and its bits are as they were) and the
+  workspace holds only the other stages' row scratch (13000 floats a row of a part) beyond a chunk. A chunk reads every expert
+  of the layer once, so a width between two chunks gains nothing and costs the experts' second read over fewer rows: two
+  R9700s, `--vram 30`, a fresh 242K read, 50.0 s at 4096 rows, 50.97 s at 5120 (2 x 2560), 50.05 s at 6144 (2 x 3072),
+  49.1 s at 8192 (2 x 4096; 48.9 after a pause, three reads in a row 50.5, 49.12, 49.13), 95K 18.4 and 18.1 s (4096, 8192),
+  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096: 12288 and 8192.
+  What a row of a batch cost in VRAM on each device was 350908 bytes: the experts' workspace 197208 (49302 floats), the decoder's
+  61456, the MTP rows 40960 and embeddings 10240, the sums' inbox 20480 (two slots of a row's 2560 floats) and the peer link's
+  20564 (inputs, partials and routes), 1.34 GiB at 4096 rows and 2.68 at 8192. Beside the weights, with the drafter and K/V in
+  host memory, the placement had 145 MB left at 4096 rows (6144 rows lacked 0.08 GiB, 8192 0.33, 12288 1.16, 16384 1.98): the
+  K/V stage, which grows into what is left and decode reads its prefixes from, took it. Three workspaces were larger than
+  what they hold. The sums' inbox needs the halves of a batch's rows (2568 FP16 values a row, half of them each: 5136 bytes a
+  row, `sums_capacity`) and the shared indexer's selections of a span (a 2048-row span's 512 blocks of 16 bits): 21 MB at 4096
+  rows, not 84. The peer link of layers in parts carries only a decode pass's rows (its split output head's half of the
+  vocabulary for eight rows is 388 rows of the inbox): 1024 rows, 21 MB, not 84. The experts' workspace of a layer in parts
+  needs 32982 floats a row (`moe_compact_row`): its prompt batches run the grouped FP16 path, whose products and inputs are halves
+  in 4800 of the gate and up scratch's 14080 floats, with no F32 product rows (7040), so 16320 floats a row were never
+  read: 515 MiB at 4096 rows, not 771. The same bits (every digest of a batch up to 4096 rows is as it was, layer split included)
+  and 0.54 GiB left at 4096 rows instead of 145 MB: the stage grows into it (decode of 200 tokens after a 95K read, 22.21 ms a
+  pass with the stage at 625 MB, 21.81 with 1059; the passes after shorter prompts the same). 8192 rows take 482 MB of it (the
+  decoder's 252, the MTP's 210, the sums' 21), which leaves the stage 97 MB beyond its start (decode at 95K 22.09 ms a pass, as
+  it was); 12288 rows lack 0.49 GiB and 16384 rows 1.14. A short read, an image, the warm-up pass, a batch given, partial
+  residency, one GPU, the layer split and DeepSeek are not widened. The first wide read of a process pins the staging buffers of
+  its rows (a served read of 18862 tokens took 4.54 s the first time and 4.0 at 4096 rows; a 32K read in the example 7.5 s against
+  7.3 and then 5.97), and a 242K read ran in 49.1 s. Of the kernels' time of a 242K read (400.8 us a token at 4096 rows, both
+  devices, 394.3 at 8192) the weights' expansion went from 14.4 to 9.0 us, the devices' signals from 15.3 to 11.3 and the large
+  GEMMs from 71.1 to 68.8; the casts took 1.5 more, the experts' kernels 0.9, the residual updates 1.1.
 - **Fewer, fuller launches in a pass** (from a kernel trace at 20K). Every Q8 unit of Q4_K, Q6_K and IQ4_XS is
   staged with Q5_K's pad: a row's lanes read its units 128 or 64 bytes apart, on the same LDS banks, so four
   vectors took twice one's time (a 2560 x 6144 Q6_K out projection 50 to 29 us at four rows). The shared

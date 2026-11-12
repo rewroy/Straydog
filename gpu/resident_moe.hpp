@@ -316,7 +316,7 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
         first>experts || count>experts-first)
         throw std::runtime_error("invalid resident MoE plan");
     auto storage=d.allocations.find(workspace);
-    if (storage==d.allocations.end() || storage->second<(capacity*49302+65536)*4)
+    if (storage==d.allocations.end() || storage->second<moe_workspace_floats(capacity,d.qwen_parts==2 && (count<experts || !shared))*4)
         throw std::runtime_error("invalid resident MoE workspace");
     auto plan=std::make_unique<ResidentMoe>(); plan->experts=experts; plan->capacity=capacity;
     plan->part=count<experts || !shared; plan->shared=shared;
@@ -723,7 +723,8 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     // Layers in parts (qwen_parts.hpp): the shared expert's half, gate and up, runs in the router's launch (the same row read;
     // one launch a layer less), the scores after the decode workspace with the gate and up rows' stride.
     const size_t room=tokens<=4 ? 4 : size_t(gemv_wide_vectors), scores=room*11*4480+512;
-    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && plan.capacity*49302+65536>=scores+room*11*1280;
+    const auto scratch=d.allocations.find(plan.workspace);
+    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && scratch!=d.allocations.end() && scratch->second/4>=scores+room*11*1280;
     if (together) {
         Matrix list[4]={projections[0],projections[1],plan.weights[experts*3],plan.weights[experts*3+1]};
         list[0].output_offset=scores; list[1].output_offset=scores+experts;
@@ -909,8 +910,10 @@ StepMoe step_moe(Device& d,void* handle,size_t steps) {
     const size_t experts=plan.experts,routes=steps*11;
     StepMoe moe{};
     moe.plan=&plan; moe.groups=static_cast<MoeGroup*>(plan.batch_table ? plan.batch_table : plan.table);
-    moe.gate_up=plan.workspace; float* product=moe.gate_up+routes*1280;
-    moe.outputs=product+routes*640; moe.probabilities=moe.outputs+routes*2560;
+    // (a layer in parts' prompt batch: the grouped FP16 path's halves in a gate and up scratch of 4800 floats a row, and no F32 product rows)
+    const bool compact=plan.part && d.qwen_parts==2 && steps>1;
+    moe.gate_up=plan.workspace; float* product=moe.gate_up+(compact ? steps*moe_compact_gate_up_row : routes*1280);
+    moe.outputs=compact ? product : product+routes*640; moe.probabilities=moe.outputs+routes*2560;
     moe.positions=reinterpret_cast<int32_t*>(moe.probabilities+steps*11);
     moe.selected=moe.positions+routes;
     moe.cursors=reinterpret_cast<unsigned*>(moe.selected+steps*10);

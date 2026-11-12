@@ -766,8 +766,9 @@ impl Weights {
         let [width, count] = tensor.dims[..] else {
             return Err(error("invalid Straydog embedding row batch"));
         };
-        if !(1..=65536).contains(&indices.len())
-            || indices.len() as u64 * width > 16 << 20
+        // (a batch's token rows, or its PLE rows, sixteen a token: up to the widest batch's)
+        if !(1..=16 * crate::gpu::PREFILL_ROWS_MAX as usize).contains(&indices.len())
+            || indices.len() as u64 * width > 64 << 20
             || indices.iter().any(|index| *index < 0 || *index as u64 >= count)
         {
             return Err(error("invalid Straydog embedding row batch"));
@@ -957,7 +958,7 @@ pub fn ngram_rows(history: &[i64], tokens: &[i64], arrays: &BTreeMap<String, Vec
     if multipliers.len() != 3 || offsets.len() != 16 || sizes.len() != 16 || sizes.iter().any(|size| *size <= 0) {
         return Err("invalid Straydog PLE constants".into());
     }
-    if tokens.is_empty() || tokens.len() > 4096 {
+    if tokens.is_empty() || tokens.len() > crate::gpu::PREFILL_ROWS_MAX as usize {
         return Err("invalid Straydog PLE token batch".into());
     }
     let mut previous: Vec<i128> = history[history.len().saturating_sub(2)..].iter().map(|&value| value.into()).collect();
