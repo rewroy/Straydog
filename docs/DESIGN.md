@@ -1466,9 +1466,15 @@ layer (§6.2).
   pass with the stage at 625 MB, 21.81 with 1059; the passes after shorter prompts the same). 8192 rows take 482 MB of it (the
   decoder's 252, the MTP's 210, the sums' 21), which leaves the stage 97 MB beyond its start (decode at 95K 22.09 ms a pass, as
   it was); 12288 rows lack 0.49 GiB and 16384 rows 1.14. A short read, an image, the warm-up pass, a batch given, partial
-  residency, one GPU, the layer split and DeepSeek are not widened. The first wide read of a process pins the staging buffers of
-  its rows (a served read of 18862 tokens took 4.54 s the first time and 4.0 at 4096 rows; a 32K read in the example 7.5 s against
-  7.3 and then 5.97), and a 242K read ran in 49.1 s. Of the kernels' time of a 242K read (400.8 us a token at 4096 rows, both
+  residency, one GPU, the layer split and DeepSeek are not widened. The staging buffers of the rows (two page-locked buffers each
+  for the MTP layer's, the first layer's and the PLE layer's embeddings, 84 MB each at 8192 rows, a GiB over the two devices) are
+  pinned on a thread of each device from the end of the load (`sd_row_staging_prefetch`), at the size of the widest batch, and the
+  first batch that stages rows takes them. The first wide read otherwise grew them as its batches asked: 0.06-0.08 s for each of
+  the six pairs, and the MTP layer's asked 8191 rows in its first batch and 8192 in the next, so it grew once more: device 0's
+  growths of it took 1.34 s each, with a batch queued on that device (device 1's 0.07-0.08 s). A 32K read after an 8K one in the example
+  took 6.30 s the first time and 5.62 the second, now 5.64 and 5.62; a served 32K read 6.47 s, now 5.77. Pinned beside the
+  weights' reading (the first try) it held the load up by 0.3 s, so it starts once they are read, and the warm-up's first batch
+  waits for it. A 242K read ran in 49.1 s. Of the kernels' time of a 242K read (400.8 us a token at 4096 rows, both
   devices, 394.3 at 8192) the weights' expansion went from 14.4 to 9.0 us, the devices' signals from 15.3 to 11.3 and the large
   GEMMs from 71.1 to 68.8; the casts took 1.5 more, the experts' kernels 0.9, the residual updates 1.1.
 - **Fewer, fuller launches in a pass** (from a kernel trace at 20K). Every Q8 unit of Q4_K, Q6_K and IQ4_XS is

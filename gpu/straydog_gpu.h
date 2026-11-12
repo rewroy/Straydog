@@ -70,6 +70,9 @@ int sd_hybrid_route_check(void* handle, const void* router, int router_kind, con
                           float* probabilities, float* exported);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
+// The row stagings of batches of `floats` floats (the MTP layer's, the first layer's and the PLE layer's rows, two page-locked buffers each) pinned on a
+// thread of their own, for the first batch that stages rows to take, where a wide read would otherwise pin them in its first batch.
+int sd_row_staging_prefetch(void* handle, uint64_t floats);
 // A decoder layer's host K/V grown to `capacity` positions, its `valid` positions kept, and its indexer laid out for them in
 // its allocation; the new K/V's pointer in `state`. Its plans and captured graphs follow.
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state);

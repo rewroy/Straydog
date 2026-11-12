@@ -1183,6 +1183,12 @@ impl Model {
         // (a partially resident model's rows cost it far more: as many as it drafts)
         model.copy_drafts = if model.partial || most == 0 { start } else { VERIFY_ROWS - 1 };
         model.refresh_kv_ahead();
+        // A read of wide batches grows the rows' stagings as its batches ask (0.4 s of pinning, and a growth waits for the batch queued on its device):
+        // they are page-locked from here on a thread of each device, at the size that read would pin them at, which stay pinned after it all the same
+        // (beside the weights' reading it held the load up by 0.3 s).
+        if model.wide_batch_size > model.prefill_batch_size {
+            model.group.prefetch_row_staging(model.wide_batch_size as u64)?;
+        }
         Ok(model)
     }
 

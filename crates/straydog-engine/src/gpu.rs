@@ -442,6 +442,9 @@ const HOST_COPY_BYTES: u64 = 256 << 10;
 /// VRAM a device keeps free when parked positions go to VRAM instead of host memory.
 const PARK_MARGIN: u64 = 512 << 20;
 
+/// The floats of a row the MTP layer's, the first layer's and the PLE layer's embeddings are staged in (`stage_rows`): the embedding width.
+const STAGED_ROW_FLOATS: u64 = 2560;
+
 /// One device, its stream and an explicit VRAM budget.
 pub struct Backend {
     handle: *mut c_void,
@@ -984,6 +987,14 @@ impl Backend {
             check(unsafe { ffi::sd_host_states_prefetch(self.handle, sizes.as_ptr(), sizes.len() as u64) })?;
         }
         Ok(())
+    }
+
+    /// Start page-locking the row stagings of batches of `rows` rows (the MTP layer's, the first layer's and the PLE layer's, two buffers each of `rows`
+    /// rows of [`STAGED_ROW_FLOATS`] floats) on a thread of their own, for the first batch that stages rows to take: the first read of batches that wide
+    /// would otherwise pin them as its batches ask for them.
+    pub fn prefetch_row_staging(&self, rows: u64) -> Result<()> {
+        // SAFETY: a live handle; the thread keeps only the size.
+        check(unsafe { ffi::sd_row_staging_prefetch(self.handle, rows * STAGED_ROW_FLOATS) }).map(drop)
     }
 
     /// The MTP layer's K/V and indexer, planned before the placement dropped the drafter: no plan

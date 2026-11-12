@@ -204,6 +204,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_row_staging_prefetch(
+        handle: *mut ::std::os::raw::c_void,
+        floats: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_kv_grow(
         handle: *mut ::std::os::raw::c_void,
         layer: u64,
