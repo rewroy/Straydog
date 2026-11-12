@@ -496,6 +496,7 @@ struct Device {
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
     bool gdn_chunked = false;   // a long prompt read's DeltaNet layers scan in chunks (gated_delta_chunk.hpp; RDNA4), set around the read (sd_prompt_options)
+    bool hc_fused = false;   // a long prompt read's HyperConnection up projection and finish run as one kernel (hc_fused.hpp; RDNA4), set around the read (sd_prompt_options)
     bool half_decode = false;   // a decode or verify pass's index and attention scores through WMMA, FP16 operands (RDNA4: the FP16 prompt pass's)
     bool q8_wide = false;   // a decode row's Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 GEMVs on the Q8 kernels, mixed lists with BF16 rows in one launch (RDNA4 and CUDA: Qwen3.8)
     bool q8_decode = false;   // a decode row's Q5_K GEMVs, IQ2 experts' gate/up and down (IQ2_S's down excepted) and Q5_K shared expert on the Q8 kernels (RDNA4)
@@ -1400,6 +1401,7 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "graph_cache.hpp"
 #include "hc_decode.hpp"
 #include "hyperconnection.hpp"
+#include "hc_fused.hpp"
 #include "gated_delta.hpp"
 #include "gated_delta_chunk.hpp"
 #include "ple.hpp"
@@ -3504,8 +3506,9 @@ int sd_decode_options(void* handle, int flags) {
 int sd_prompt_options(void* handle, int flags) {
     try {
         auto& value = device(handle);
-        if (flags & ~1) throw std::runtime_error("invalid Straydog prompt options");
+        if (flags & ~3) throw std::runtime_error("invalid Straydog prompt options");
         value.gdn_chunked = (flags & 1) && value.rdna4;
+        value.hc_fused = (flags & 2) && value.rdna4;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

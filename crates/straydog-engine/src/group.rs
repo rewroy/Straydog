@@ -255,8 +255,8 @@ impl Group {
     }
 
     /// [`Backend::prompt_scan`] on every device: the same on all, so a pair of parts sum alike.
-    pub fn prompt_scan(&self, chunked: bool) -> Result<()> {
-        self.backends.iter().try_for_each(|backend| backend.prompt_scan(chunked))
+    pub fn prompt_scan(&self, chunked: bool, hc_fused: bool) -> Result<()> {
+        self.backends.iter().try_for_each(|backend| backend.prompt_scan(chunked, hc_fused))
     }
 
     pub fn configure_gemm(&mut self, minimum_batch: u64, half: bool) -> Result<()> {

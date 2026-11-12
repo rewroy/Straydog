@@ -671,10 +671,12 @@ impl Backend {
     }
 
     /// With `chunked`, a prompt pass's DeltaNet layers scan in chunks of 16 tokens (the same recurrence, summed in another order, its
-    /// products against the state in bf16 pieces; RDNA4 only, elsewhere a no-op). A read sets it before its batches and clears it after.
-    pub fn prompt_scan(&self, chunked: bool) -> Result<()> {
+    /// products against the state in bf16 pieces; RDNA4 only, elsewhere a no-op), and with `hc_fused` its HyperConnections' up projection and
+    /// finish run as one kernel (the projection's sums on the matrix cores in their own order, the rest the finish's arithmetic; RDNA4
+    /// only). A read sets them before its batches and clears them after.
+    pub fn prompt_scan(&self, chunked: bool, hc_fused: bool) -> Result<()> {
         // SAFETY: a live handle.
-        check(unsafe { ffi::sd_prompt_options(self.handle, c_int::from(chunked)) }).map(drop)
+        check(unsafe { ffi::sd_prompt_options(self.handle, c_int::from(chunked) | c_int::from(hc_fused) << 1) }).map(drop)
     }
 
     /// A decode row's Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 GEMVs on the Q8 kernels (INT8 activations, a scale per 32 values),
