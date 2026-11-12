@@ -566,6 +566,11 @@ struct Device {
     // between a long prompt's batches). The MTP layer's embeddings (sd_mtp_embed), the first layer's (sd_prefill_embed) and the
     // PLE layer's (sd_prefill_ple).
     RowStaging mtp_rows, prefill_rows, ple_rows;
+    // Those three's page-locked buffers (two each) for a wide batch's rows, pinned on a thread of their own beside the weights' reading
+    // (sd_row_staging_prefetch) and taken by the first stage_rows, so that the first wide read does not pin them.
+    std::thread staging_prefetch;
+    float* staging_ready[3][2] = {};
+    size_t staging_ready_floats = 0;
     uint64_t gemm_calls = 0, gemm_vectors = 0;
     std::unordered_map<void*, size_t> allocations;
     // `allocations` by address, for the ops' range checks (ops.hpp: op_span); rebuilt when stale.
@@ -696,6 +701,8 @@ struct Device {
         cleanup(hipSetDevice(ordinal));
         if (host_prefetch.joinable()) host_prefetch.join();
         for (auto& ready : host_ready) cleanup(hipHostFree(ready.second));
+        if (staging_prefetch.joinable()) staging_prefetch.join();
+        for (auto& pair : staging_ready) for (float* ready : pair) if (ready) cleanup(hipHostFree(ready));
         copier.reset();
         transfers.reset();   // waits for its copies before the allocations go
         if (stream) cleanup(hipStreamSynchronize(stream));
@@ -1678,11 +1685,32 @@ int sd_mtp_keep(void* handle,uint64_t layer,uint64_t steps,void* rows,uint64_t p
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The buffers sd_row_staging_prefetch pinned become the three stagings' (each given its two, at the size they were pinned at), where nothing was
+// staged yet; freed where a staging has buffers already.
+void adopt_staging_prefetch(Device& d) {
+    if (!d.staging_prefetch.joinable()) return;
+    d.staging_prefetch.join();
+    RowStaging* stagings[3] = {&d.mtp_rows, &d.prefill_rows, &d.ple_rows};
+    for (int k = 0; k < 3; ++k) {
+        RowStaging& staging = *stagings[k];
+        float** ready = d.staging_ready[k];
+        const bool free_to_take = d.staging_ready_floats && ready[0] && ready[1] && !staging.floats && !staging.host[0] && !staging.host[1];
+        for (int i = 0; i < 2; ++i) {
+            if (free_to_take) {
+                if (!staging.staged[i]) check(hipEventCreateWithFlags(&staging.staged[i], hipEventDisableTiming));
+                staging.host[i] = ready[i];
+            } else if (ready[i]) cleanup(hipHostFree(ready[i]));
+            ready[i] = nullptr;
+        }
+        if (free_to_take) staging.floats = d.staging_ready_floats;
+    }
+}
 // `count` embedding rows into `target`, staged without waiting for the device's stream.
 // `floats` rows from the host into `device` on the stream, through one of `staging`'s two page-locked buffers: the host waits only
 // for that buffer's copy before (two batches back), never for the stream. Pinned at the size first asked, grown when asked more;
 // a machine short of memory copies straight from the caller's memory, which the driver stages.
 void stage_rows(Device& d, RowStaging& staging, float* device, const float* host, size_t floats) {
+    adopt_staging_prefetch(d);
     if (floats > staging.floats && (!staging.refused || floats < staging.refused)) {
         for (int i = 0; i < 2; ++i) {
             if (!staging.staged[i]) check(hipEventCreateWithFlags(&staging.staged[i], hipEventDisableTiming));
@@ -3103,6 +3131,33 @@ int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count)
                     std::memset(host, 0, bytes + allocation_tail);
                 }
             } catch (const std::exception& e) { value.host_prefetch_error = e.what(); }
+        });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// Page-lock the row stagings of batches of `floats` floats (two buffers for each of the MTP layer's, the first layer's and the PLE layer's rows) on a
+// thread of their own, for the first stage_rows to take: a read of wide batches would otherwise pin them in its first batch (0.2-0.5 s, 8192 rows). Where a
+// buffer is refused, none is kept, and the stagings grow when a batch asks, as they do without this.
+int sd_row_staging_prefetch(void* handle, uint64_t floats) {
+    try {
+        auto& value = device(handle);
+        if (!floats || value.staging_prefetch.joinable() || value.staging_ready_floats)
+            throw std::runtime_error("invalid Straydog row staging prefetch");
+        const int ordinal = value.ordinal;
+        value.staging_prefetch = std::thread([&value, floats, ordinal]() {
+            float* ready[3][2] = {};
+            bool pinned = hipSetDevice(ordinal) == hipSuccess;
+            for (auto& pair : ready)
+                for (float*& host : pair)
+                    pinned = pinned && host_allocate(reinterpret_cast<void**>(&host), size_t(floats) * 4, hipHostMallocDefault) == hipSuccess;
+            if (!pinned) {
+                (void)hipGetLastError();
+                for (auto& pair : ready) for (float* host : pair) if (host) cleanup(hipHostFree(host));
+                return;
+            }
+            std::memcpy(value.staging_ready, ready, sizeof(ready));
+            value.staging_ready_floats = size_t(floats);
         });
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

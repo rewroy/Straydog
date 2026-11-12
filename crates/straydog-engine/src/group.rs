@@ -1117,6 +1117,11 @@ impl Group {
         Ok(())
     }
 
+    /// Start page-locking every device's row stagings of batches of `rows` rows (see [`Backend::prefetch_row_staging`]).
+    pub fn prefetch_row_staging(&self, rows: u64) -> Result<()> {
+        self.backends.iter().try_for_each(|backend| backend.prefetch_row_staging(rows))
+    }
+
     /// Start page-locking every device's planned host states (see [`Backend::prefetch_host_states`]).
     pub fn prefetch_host_states(&self) -> Result<()> {
         self.backends.iter().try_for_each(Backend::prefetch_host_states)
