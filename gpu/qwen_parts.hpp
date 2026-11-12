@@ -481,10 +481,17 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     const bool fold = batch_half(d, own.count);
     // (the HyperConnections' rows in `branch` before they are gathered: the last sum has read the branch there)
     hc_prefill(d, pointers, kinds, own.count, hidden + own.first * 10240, branch, scratch, fold && normalized);
-    qwen_gather_mixed(d, branch, steps, own, other, mixed);
+    // A DeltaNet layer's big projections (qkv, gate) of this device's rows run while its rows go to the other (qwen_gather_fork), the other's after
+    // they have come: for the halves of a batch of 8192 rows, whose GEMMs over 4096 rows give each row the bits they do over 8192 (the beta and
+    // alpha products of a few rows each, whose GEMMs do not, stay over the whole batch). A batch of 4096 rows was slower so (2048-row GEMMs).
+    const bool project_first = linear && d.parts_overlap && batch_half(d, steps) && fold && own.count == other.count && own.count == 4096;
+    if (project_first) qwen_gather_fork(d, branch, steps, own, other, mixed);
+    else qwen_gather_mixed(d, branch, steps, own, other, mixed);
     if (linear) {
         const size_t chunk = d.input_capacity >= 16 * 1024 * 1024 ? 512 : 128;
-        gdn_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], steps, chunk, mixed, branch, scratch);
+        GdnSplit split{{own.first, other.first}, {own.count, other.count}, [&]() { qwen_gather_complete(d, steps, other, mixed); }};
+        gdn_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], steps, chunk, mixed, branch, scratch,
+                       project_first ? &split : nullptr);
     } else {
         qsa_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], plan.states[2], plan.context, position, steps, mixed,
                        branch, scratch, int(plan.part));
