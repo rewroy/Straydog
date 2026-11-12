@@ -3197,6 +3197,32 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
             throw std::runtime_error("Straydog state copy outside its state");
         float* base = static_cast<float*>(state) + offset;
         kv_stage_settle(value);
+        // A K/V state in host memory saved to host memory is copied by the CPU, on the copier's threads: the runtime pins the pageable
+        // destination for a copy it makes into it, and a conversation of 94000 positions (1.66 GB over two devices) took 0.79 s that way, 2.1 GB/s.
+        // Nothing is in flight once the stream is idle, and the bytes are the same ones.
+        const auto host_state = value.host_states.find(state);
+        if (save && host_state != value.host_states.end() && !value.allocations.count(host)) {
+            check(hipStreamSynchronize(value.stream));
+            const auto* source = static_cast<const uint8_t*>(host_state->second) + offset * 4;
+            auto* target = reinterpret_cast<uint8_t*>(host);
+            for (uint64_t run = 0; run < height; ++run)
+                StagingCopier::instance().copy(target + run * width * 4, source + run * pitch * 4, size_t(width) * 4);
+            return 0;
+        }
+        // Device memory saved to host memory goes through the page-locked arena, as large downloads do (8-12 GB/s), a run of rows at a time, where a row
+        // fits it (the indexer's blocks of 94000 positions, 0.3 GB over two devices: 0.03 s of the 0.23 s that were left with the K/V's copy alone).
+        if (save && !value.allocations.count(host) && width * 4 <= io_arena_bytes) {
+            const size_t row_bytes = size_t(width) * 4, rows_per_run = io_arena_bytes / row_bytes;
+            check(hipStreamSynchronize(value.stream));   // (the staged uploads have landed: the whole arena is free)
+            for (uint64_t run = 0; run < height; run += rows_per_run) {
+                const size_t rows = size_t(std::min<uint64_t>(rows_per_run, height - run));
+                check(hipMemcpy2DAsync(value.io, row_bytes, base + run * pitch, pitch * 4, row_bytes, rows, hipMemcpyDeviceToHost, value.stream));
+                check(hipStreamSynchronize(value.stream));
+                StagingCopier::instance().copy(reinterpret_cast<uint8_t*>(host) + run * row_bytes, value.io, rows * row_bytes);
+            }
+            value.io_used = 0;
+            return 0;
+        }
         if (!save) kv_invalidate_write(value, state, size_t(first));
         if (save)
             check(hipMemcpy2DAsync(host, width * 4, base, pitch * 4, width * 4, height, hipMemcpyDefault, value.stream));

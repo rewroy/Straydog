@@ -686,12 +686,13 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         prefill_summary(usage, timings),
         number(&timings["ttft_seconds"], 2),
         // (of which restoring a checkpoint and saving the request's: copies of the whole state; and what is neither the prompt's reading
-        // nor that: encoding the rendered conversation, growing the K/V, putting the expert slots back)
+        // nor that: encoding the rendered conversation, copying out the earlier conversation's positions this prompt overwrites, growing the K/V,
+        // putting the expert slots back)
         match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
             (restore, save) if restore + save >= 0.05 => format!(" (checkpoints: restore {restore:.2} s, save {save:.2} s)"),
             _ => String::new(),
         } + &{
-            let parts: Vec<String> = [("encode", "encode_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
+            let parts: Vec<String> = [("encode", "encode_seconds"), ("parking", "park_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
                 .into_iter().filter_map(|(name, key)| timings[key].as_f64().filter(|seconds| *seconds >= 0.05).map(|seconds| format!("{name} {seconds:.2} s")))
                 .collect();
             if parts.is_empty() { String::new() } else { format!(" (besides reading: {})", parts.join(", ")) }
@@ -1973,6 +1974,12 @@ mod tests {
         let line = request_summary(&event, None);
         assert!(line.contains("new 399 in 5657 ms (71 tok/s) in 2 batches of up to 256 rows"), "{line}");
         assert!(line.contains("first token 6.08 s (besides reading: encode 0.34 s, slots back 0.42 s)"), "{line}");
+        // (the earlier conversation's positions a long prompt overwrites are copied out before it is read: 0.59 s at 94027 positions)
+        let mut parked = event.clone();
+        parked["timings"]["park_seconds"] = json!(0.59);
+        assert!(request_summary(&parked, None).contains("(besides reading: encode 0.34 s, parking 0.59 s, slots back 0.42 s)"));
+        parked["timings"]["park_seconds"] = json!(0.004);
+        assert!(request_summary(&parked, None).contains("(besides reading: encode 0.34 s, slots back 0.42 s)"));
         assert!(line.contains("; layer order not taken: 128 rows a batch, banks 39.4 GiB, room 46.1 GiB"), "{line}");
         assert!(line.contains("; assist round: 63 passes timed"), "{line}");
     }

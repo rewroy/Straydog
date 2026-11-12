@@ -438,6 +438,12 @@ The engine holds one sequence.
     it), and its recurrent state to a page-locked slot.
   - A later prompt that resumes further on the parked sequence than on the held one brings it
     back (`parked`: `saved` or `restored`, with `park_seconds`).
+  - The copy into host memory is made by the CPU's threads: a K/V in host memory straight from
+    its page-locked memory, VRAM's indexer blocks through the page-locked arena (as a large
+    download), where the runtime's own copy into pageable memory pins its destination and ran
+    at 2 GB/s. A 242K read after a 95K conversation copies its 94027 positions (1.66 GB over
+    two R9700s) before its first batch: 0.79 s that way (`park_seconds`, "parking" on the
+    request line), 0.20 s now, the bytes the same (every part compared with the runtime's copy).
   - So a one-off request with another prefix (a title, a summary, a subagent) does not cost the
     conversation it interrupted its whole prompt again.
 - A request may mark itself one-off (`"straydog": {"checkpoint": false}`) so it saves no
