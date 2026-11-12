@@ -418,6 +418,12 @@ fn layer_rows_vram_named(value: Option<&str>) -> bool {
     value.map_or(true, |value| value.trim() != "0")
 }
 
+/// STRAYDOG_HC=blas: every read keeps its HyperConnections' up projection (hipblasGemmEx) and finish as two kernels (anything else: one kernel
+/// from [`CHUNKED_SCAN_READ`] new tokens, gpu/hc_fused.hpp).
+fn hc_fused_from_named(value: Option<&str>) -> usize {
+    if value.is_some_and(|value| value.trim() == "blas") { usize::MAX } else { CHUNKED_SCAN_READ }
+}
+
 /// STRAYDOG_DELTA_SCAN=token: every read scans its DeltaNet layers token by token (anything else: in chunks from [`CHUNKED_SCAN_READ`] new tokens).
 fn chunked_scan_from_named(value: Option<&str>) -> usize {
     if value.is_some_and(|value| value.trim() == "token") { usize::MAX } else { CHUNKED_SCAN_READ }
@@ -787,6 +793,9 @@ pub struct Model {
     layer_rows_vram: bool,
     /// New tokens from which a read scans its DeltaNet layers in chunks ([`CHUNKED_SCAN_READ`]; [`Model::chunked_scan_from`] for a test).
     chunked_scan_from: usize,
+    /// New tokens from which a read's HyperConnections run their up projection and finish as one kernel ([`CHUNKED_SCAN_READ`], never with
+    /// STRAYDOG_HC=blas; [`Model::hc_fused_from`] for a test).
+    hc_fused_from: usize,
     layer_prefill_restore_failure: Option<String>,
     pub host_kv: bool,
     /// The rows of a long read's batches where the workspaces hold more than `prefill_batch_size` (0: they do not, or the batch was given: see
@@ -1020,6 +1029,7 @@ impl Model {
             layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
             layer_rows_vram: layer_rows_vram_named(std::env::var("STRAYDOG_LAYER_ROWS_VRAM").ok().as_deref()),
             chunked_scan_from: chunked_scan_from_named(std::env::var("STRAYDOG_DELTA_SCAN").ok().as_deref()),
+            hc_fused_from: hc_fused_from_named(std::env::var("STRAYDOG_HC").ok().as_deref()),
             layer_prefill_restore_failure: None,
             host_kv: host,
             wide_batch_size: wide,
@@ -3327,9 +3337,10 @@ impl Model {
     /// chunks of tokens on every device (the same sums in another order), a shorter read token by token.
     fn prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<Option<Vec<f32>>>> {
-        self.group.prompt_scan(tokens.len().saturating_sub(position) >= self.chunked_scan_from)?;
+        let new_tokens = tokens.len().saturating_sub(position);
+        self.group.prompt_scan(new_tokens >= self.chunked_scan_from, new_tokens >= self.hc_fused_from)?;
         let output = self.prefill_read(tokens, position, plan, cancelled, progress);
-        let cleared = self.group.prompt_scan(false);
+        let cleared = self.group.prompt_scan(false, false);
         let output = output?;
         cleared?;
         Ok(output)
@@ -3438,6 +3449,12 @@ impl Model {
     #[doc(hidden)]
     pub fn chunked_scan_from(&mut self, tokens: usize) {
         self.chunked_scan_from = tokens;
+    }
+
+    /// The read length (new tokens) from which the HyperConnections' up projection and finish are one kernel: `usize::MAX` for never, 0 for always.
+    #[doc(hidden)]
+    pub fn hc_fused_from(&mut self, tokens: usize) {
+        self.hc_fused_from = tokens;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4923,6 +4940,16 @@ mod layer_prefill_tests {
         assert_eq!(chunked_scan_from_named(Some("chunks")), CHUNKED_SCAN_READ);
         assert_eq!(chunked_scan_from_named(Some(" token ")), usize::MAX);
         assert!(CHUNKED_SCAN_READ > 8192 && CHUNKED_SCAN_READ <= 16_384);
+    }
+
+    /// Decides: reads of 16384 new tokens or more run the HyperConnections' up projection and finish as one kernel, shorter ones keep the pair
+    /// (the pinned tests' prompts keep their bits), and STRAYDOG_HC=blas keeps every read on the pair.
+    #[test]
+    fn long_reads_fuse_the_hyperconnection_unless_the_variable_says_blas() {
+        use super::{hc_fused_from_named, CHUNKED_SCAN_READ};
+        assert_eq!(hc_fused_from_named(None), CHUNKED_SCAN_READ);
+        assert_eq!(hc_fused_from_named(Some("fused")), CHUNKED_SCAN_READ);
+        assert_eq!(hc_fused_from_named(Some(" blas ")), usize::MAX);
     }
 
     /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.

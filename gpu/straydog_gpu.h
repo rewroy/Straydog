@@ -107,7 +107,9 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision);
 int sd_decode_options(void* handle, int flags);
 // Prompt-read options (RDNA4 only), flags: 1 a prompt pass's DeltaNet layers scan in chunks of 16 tokens (the same recurrence, its sums
 // in another order, the products against the state on the matrix cores in bf16 pieces that carry F32's bits), for a read long enough
-// to be worth it. Set before the read's batches, cleared after.
+// to be worth it; 2 a prompt pass's HyperConnection up projection and finish as one kernel (the projection's sums on the matrix cores in
+// their own order, the rest hc_finish_hidden's arithmetic), for a read long enough to be worth it. Set before the read's batches,
+// cleared after.
 int sd_prompt_options(void* handle, int flags);
 int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);
