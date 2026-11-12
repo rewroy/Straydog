@@ -1191,6 +1191,18 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   F32 fused multiply-adds with g_end as two floats, and the real kernel's error matches a staged F64 emulation of the same
   algorithm (every stage rounded as the GPU rounds it, run on the same activations). The first logits after a 95K read differ
   from the token scan's by KL 6.7e-4 (242K: 1.6e-5), where the token scan at another batch width differs by 4.4e-2 (1.6e-5).
+- A read of 16384 new tokens or more (`STRAYDOG_HC=blas` keeps the pair below) runs each HyperConnection's up projection and
+  its finish as one kernel (`hc_up_finish`, `gpu/hc_fused.hpp`, RDNA4 with FP16 projections). The pair was hipblasGemmEx for the
+  10240 x 320 projection, which wrote its F32 rows (168 MB for a part's 4096 rows), and `hc_finish_hidden`, which read them again with
+  the rows' hidden values (168 MB more) and wrote the mixed rows (42 MB): 0.97 ms for 4096 rows on an R9700 (0.35 and 0.62), bound by
+  memory. A block takes 32 columns of each of the four residual streams (128 rows of the weights, laid out so that a wave's accumulator
+  fragments are the four streams of the same 16 columns: a lane holds a token's eight columns of all four streams) and 128 tokens, sums
+  K = 320 in five steps of 64 through LDS, and finishes in registers with `hc_finish_hidden`'s expressions in its order: the F32
+  projection is never written, and the block reads only its hidden values (the rows' F32 values it needs) and the denominators. 0.48-0.50 ms
+  for the pair's 0.97 ms, on both GPUs at once as on one. The products are summed in the order of a plain WMMA kernel's (the sum a lane's
+  fragment holds over K in steps of 16 from a zero accumulator), which is not rocBLAS's, so the projection's last bits move; the
+  rest is bit for bit the finish's (`gpu/tests/hc_fused_test.cpp` compares the kernel with `hc_finish_hidden` on a plain kernel's
+  projection: no bit of 10.5M differs, the injections included), and the error against an F64 sum is the pair's (README, Numerics).
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
