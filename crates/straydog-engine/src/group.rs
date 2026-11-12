@@ -1145,11 +1145,12 @@ impl Group {
     }
 
     /// Per device, the VRAM of the links' inboxes for batches of up to `prefill` rows: expert parallelism links the GPUs with an inbox of the batch's
-    /// rows each (peer VRAM); the parts' sums have two slots of a batch's halves more.
+    /// rows each (peer VRAM); the parts' sums have three slots of a batch's halves more (two the sums alternate between, and the one a prompt's gather
+    /// copy goes to).
     fn inbox_bytes(&self, context: u64, prefill: u64) -> Result<u64> {
         let mut inbox = if self.expert_parallel()? { peer_rows(context, prefill, self.parts) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
         if self.parts {
-            inbox += sums_capacity(context, prefill) * 2 * 4 + 256;
+            inbox += sums_capacity(context, prefill) * 3 * 4 + 256;
         }
         Ok(inbox)
     }

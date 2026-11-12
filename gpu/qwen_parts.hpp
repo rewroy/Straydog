@@ -217,10 +217,12 @@ __global__ void qwen_gather_send(const float* local, size_t steps, size_t first,
         }
     }
 }
-// The other's rows [first, first + count) of mixed from this device's inbox slot.
+// The other's rows [first, first + count) of mixed from this device's inbox slot (`fixed`: from `inbox` as given, one of the slots past
+// the two the sums alternate between).
+template<bool fixed = false>
 __global__ void qwen_gather_receive(size_t steps, size_t first, size_t count, const uint32_t* state, const __half* inbox, size_t capacity,
                                     float* mixed) {
-    const __half* slot = inbox + size_t(state[0] & 1) * capacity;
+    const __half* slot = fixed ? inbox : inbox + size_t(state[0] & 1) * capacity;
     for (size_t g = size_t(blockIdx.x) * blockDim.x + threadIdx.x; g < count * 641; g += size_t(gridDim.x) * blockDim.x) {
         if (g < count * 640) reinterpret_cast<float4*>(mixed + first * 2560)[g] = qwen_inbox_half4(slot + 4 * g);
         else {
@@ -277,8 +279,62 @@ void qwen_gather_mixed(Device& d, const float* local, size_t steps, BatchRows ow
     qwen_gather_send<<<unsigned(std::min<size_t>((own.count * 321 + 255) / 256, 1024)), 256, 0, d.stream>>>(
         local, steps, own.first, own.count, mixed, reinterpret_cast<__half*>(link.peer_inbox), link.state, link.capacity * 2);
     link_signal_kernel<<<1, 1, 0, d.stream>>>(link.state, link.peer_flag, d.await_timeout);
-    qwen_gather_receive<<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
+    qwen_gather_receive<false><<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
         steps, other.first, other.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed);
+    check(hipGetLastError());
+}
+// qwen_gather_mixed in the experts' order (prefill_layer_part): the send of this device's rows to the other goes on the send stream while
+// the device stream goes on with them, and once it has done what it can with its own rows alone it signals and takes the other's.
+// The send is a copy (the copy engine, which takes no compute units: a send as a kernel did not overlap a GEMM, 1.4 ms for two
+// that take 0.7 ms each) of this device's rows as an inbox slot holds them, staged by qwen_gather_stage in the other's rows of
+// `mixed`, which nothing reads until qwen_gather_receive; into a slot of its own in the other's inbox (past the two the sums alternate
+// between: the copy's address is the host's, the alternating slot's the device's count). The slot is free to write once this device's
+// last signal has returned: the other raised its flag for it after it had read the slot's last use (the gather before), as with every slot.
+__global__ void qwen_gather_stage(const float* local, size_t steps, size_t first, size_t count, float* mixed, __half* stage) {
+    for (size_t g = size_t(blockIdx.x) * blockDim.x + threadIdx.x; g < count * 321; g += size_t(gridDim.x) * blockDim.x) {
+        if (g < count * 320) {
+            reinterpret_cast<uint4*>(stage)[g] = qwen_round8(local + 8 * g, mixed + first * 2560 + 8 * g);
+        } else {
+            const size_t j = g - count * 320;
+            const float4 mixes = reinterpret_cast<const float4*>(local + count * 2560)[j];
+            reinterpret_cast<float4*>(mixed + steps * 2560 + first * 4)[j] = mixes;
+            reinterpret_cast<float4*>(stage + count * 2560)[j] = mixes;
+        }
+    }
+}
+constexpr size_t qwen_gather_slot = 2;   // (in slots of `capacity` floats from the inbox's start)
+void qwen_send_streams(Device& d) {
+    if (d.send_stream) return;
+    check(hipStreamCreate(&d.send_stream));
+    check(hipEventCreateWithFlags(&d.send_fork, hipEventDisableTiming));
+    check(hipEventCreateWithFlags(&d.send_done, hipEventDisableTiming));
+}
+void qwen_gather_fork(Device& d, const float* local, size_t steps, BatchRows own, BatchRows other, float* mixed) {
+    SumLink& link = d.sums;
+    if (!link.peer || d.send_pending || own.count * 2568 > link.capacity * 2 || link.capacity % 8 || own.count * 2568 * 2 > other.count * 2560 * 4)
+        throw std::runtime_error("invalid Straydog row gather");
+    qwen_send_streams(d);
+    auto* stage = reinterpret_cast<__half*>(mixed + other.first * 2560);
+    qwen_gather_stage<<<unsigned(std::min<size_t>((own.count * 321 + 255) / 256, 1024)), 256, 0, d.stream>>>(local, steps, own.first, own.count,
+                                                                                                             mixed, stage);
+    check(hipGetLastError());
+    // (after the stream's last signal and the stage: the slot is free, and the copy reads what the stage wrote)
+    check(hipEventRecord(d.send_fork, d.stream));
+    check(hipStreamWaitEvent(d.send_stream, d.send_fork, 0));
+    check(hipMemcpyAsync(link.peer_inbox + qwen_gather_slot * link.capacity, stage, own.count * 2568 * 2, hipMemcpyDefault, d.send_stream));
+    check(hipEventRecord(d.send_done, d.send_stream));
+    d.send_pending = true;
+}
+// The signal waits for the copy (an event after it on the send stream); then the other's rows.
+void qwen_gather_complete(Device& d, size_t steps, BatchRows other, float* mixed) {
+    SumLink& link = d.sums;
+    if (!link.peer || !d.send_pending || other.count * 2568 > link.capacity * 2) throw std::runtime_error("invalid Straydog row gather");
+    check(hipStreamWaitEvent(d.stream, d.send_done, 0));
+    d.send_pending = false;
+    link_signal_kernel<<<1, 1, 0, d.stream>>>(link.state, link.peer_flag, d.await_timeout);
+    qwen_gather_receive<true><<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
+        steps, other.first, other.count, link.state, reinterpret_cast<const __half*>(link.inbox + qwen_gather_slot * link.capacity),
+        link.capacity * 2, mixed);
     check(hipGetLastError());
 }
 void qsa_share_signal(Device& d) {
@@ -438,13 +494,31 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     const HcNext second_next = hc_next(static_cast<const float*>(second[0]), scratch, own.count);
     qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed, fold ? &second_next : nullptr);
     hc_prefill(d, second, kinds + 4 + (linear ? 9 : 10), own.count, hidden + own.first * 10240, branch, scratch, fold);
-    qwen_gather_mixed(d, branch, steps, own, other, mixed);
     // The experts of at most `experts.capacity` rows at a time (a batch of no more is one chunk, as ever): each row's routes and outputs are its own,
     // so the chunks give a row the sum a batch of its own would; a wider batch's chunks read the experts again, as the batches of that width do. The
     // chunks are as even as can be, none of a lone row (a row alone takes the decode layout of the experts' outputs).
     const size_t chunks = (steps + experts.capacity - 1) / experts.capacity;
+    struct Chunk { size_t first, count; };
+    std::vector<Chunk> order(chunks);
     for (size_t chunk_index = 0, first = 0; chunk_index < chunks; ++chunk_index) {
-        const size_t count = steps / chunks + (chunk_index < steps % chunks ? 1 : 0);
+        order[chunk_index] = {first, steps / chunks + (chunk_index < steps % chunks ? 1 : 0)};
+        first += order[chunk_index].count;
+    }
+    // Where the chunks fall within the devices' rows (BatchRows), this device's rows' chunks run first, beside its send of them to the other
+    // (qwen_gather_fork), and the other's rows' chunks once those have arrived: only the order of the chunks changes.
+    size_t own_chunks = 0;
+    if (d.parts_overlap && chunks >= 2)
+        for (size_t at = 1; at < chunks; ++at)
+            if (order[at].first == batch_rows(steps, 0).count) own_chunks = plan.part ? chunks - at : at;
+    if (own_chunks) {
+        if (plan.part) std::rotate(order.begin(), order.begin() + (chunks - own_chunks), order.end());
+        qwen_gather_fork(d, branch, steps, own, other, mixed);
+    } else {
+        qwen_gather_mixed(d, branch, steps, own, other, mixed);
+    }
+    for (size_t at = 0; at < chunks; ++at) {
+        if (own_chunks && at == own_chunks) qwen_gather_complete(d, steps, other, mixed);
+        const size_t first = order[at].first, count = order[at].count;
         const float* rows = mixed + first * 2560;
         const StepMoe moe = step_moe(d, plan.moe, count);
         moe_steps_route(d, moe, count, rows);
@@ -453,7 +527,6 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
         if (half) moe_half_batch(d, moe, count, rows);
         moe_part_partial<<<dim3(10, unsigned(count)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, count,
                                                                          true, moe.plan->shared || half, branch + first * 2560);
-        first += count;
     }
     if (fold && next) {
         const auto& following = d.decoder.find(layer + 1)->second;
@@ -492,6 +565,8 @@ void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t p
     for (size_t side = 0; side < 2; ++side) {
         Device& d = *sides[side];
         on_device(d.ordinal, [&]() {
+            // (a send left queued by a span that failed half way: finished, and forgotten)
+            if (d.send_pending) { check(hipStreamSynchronize(d.send_stream)); d.send_pending = false; }
             if (input) upload(d, workspaces[side], input, steps * 10240 * 4);
             if (steps > 1) kv_prefetch_from(d, begin, position);
         });
@@ -538,6 +613,9 @@ int sd_qwen_parts(void* handle, uint64_t parts) {
         if (parts == 2) throw std::runtime_error("Straydog splits Qwen3.8's layers on RDNA4 only");
 #endif
         d.qwen_parts = size_t(parts);
+        // STRAYDOG_PARTS_OVERLAP=off: a prompt batch's sends stay in the device stream's order.
+        const char* overlap = std::getenv("STRAYDOG_PARTS_OVERLAP");
+        d.parts_overlap = !(overlap && std::string(overlap) == "off");
         check(hipMemset(d.flags + 3, 0, 4));   // (prefill_span_parts' accumulated check)
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
