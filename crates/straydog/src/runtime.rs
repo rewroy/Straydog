@@ -451,8 +451,13 @@ pub fn ready_summary(ready: &Value) -> String {
         .map_or_else(String::new, |precision| format!(", engram {precision} ({})", ready["engram"]["file"].as_str().unwrap_or("-")));
     // (what the placement's first choice would have needed: a little more VRAM, a faster start)
     let note = placement["note"].as_str().map_or_else(String::new, |note| format!(" ({note})"));
+    // (a read of enough new tokens is read in wider batches than the ones asked for, where the workspaces hold them)
+    let wide = match (placement["prefill_wide_rows"].as_u64(), placement["prefill_wide_from"].as_u64()) {
+        (Some(rows), Some(from)) if rows > 0 => format!(", up to {rows} rows from a read of {from} new tokens"),
+        _ => placement["prefill_wide_note"].as_str().map_or_else(String::new, |note| format!(" ({note})")),
+    };
     format!(
-        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}{note}; {devices} using {:.1} of {:.1} GiB",
+        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}{wide}{note}; {devices} using {:.1} of {:.1} GiB",
         ready["quantization"].as_str().unwrap_or("-"),
         ready["context"],
         if drafts > 0 { format!("MTP {drafts}") } else { "no speculation".into() },
@@ -2160,6 +2165,21 @@ mod tests {
         let mut first = ready.clone();
         first["placement"]["note"] = Value::Null;
         assert!(ready_summary(&first).contains("prefill batch 2048; "), "{}", ready_summary(&first));
+    }
+
+    /// The ready line says how wide a long read's batches are where the workspaces hold more than the batch asked for, or what they lacked.
+    #[test]
+    fn the_ready_line_says_how_wide_a_long_reads_batches_are() {
+        let ready = json!({"quantization": "q", "context": 1, "gpu": {"name": "g"}, "speculative_drafts": 3,
+                           "placement": {"resident": true, "host_kv": true, "prefill_batch_size": 4096, "prefill_wide_rows": 8192, "prefill_wide_from": 16384}});
+        assert!(ready_summary(&ready).contains("prefill batch 4096, up to 8192 rows from a read of 16384 new tokens; "), "{}", ready_summary(&ready));
+        let mut lacking = ready.clone();
+        lacking["placement"]["prefill_wide_rows"] = json!(0);
+        lacking["placement"]["prefill_wide_note"] = json!("a long read's batches of 8192 rows would need 0.40 GiB more VRAM");
+        assert!(ready_summary(&lacking).contains("prefill batch 4096 (a long read's batches of 8192 rows would need 0.40 GiB more VRAM); "), "{}", ready_summary(&lacking));
+        let mut plain = ready.clone();
+        plain["placement"]["prefill_wide_rows"] = json!(0);
+        assert!(ready_summary(&plain).contains("prefill batch 4096; "), "{}", ready_summary(&plain));
     }
 
     /// `/props` counts DSpark's drafts as it counts MTP's: a model that drafts is not reported as one that does not.

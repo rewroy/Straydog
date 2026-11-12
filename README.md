@@ -112,7 +112,11 @@ UD-IQ3_XXS reads a 95K-token prompt in 19.6 s fully resident; at `--vram 26` it 
 and an 8K prompt takes 6.0 s instead of 2.5. The ready line says which placement a start took and,
 when the first choice did not fit, what it would have needed: `prefill batch 4096 (K/V in VRAM,
 prefill batch 4096, MTP drafter would need 2.6 GiB more VRAM)`, or for a partial placement
-`(fully resident: K/V in host memory, prefill batch 1024 would need 2.3 GiB more VRAM)`.
+`(fully resident: K/V in host memory, prefill batch 1024 would need 2.3 GiB more VRAM)`. A read of 16384 new
+tokens or more on the layers in parts is read in wider batches where the VRAM left beside the weights
+holds their workspaces (`prefill batch 4096, up to 8192 rows from a read of 16384 new tokens`; what
+they lacked otherwise): a 242K-token read takes 49.1 s instead of 50.0 on two R9700s at `--vram 30`.
+A batch given with `--batch-size` is read as given, and `STRAYDOG_PREFILL_WIDE=off` turns the wide batches off.
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
@@ -242,6 +246,7 @@ Where it rounds, and how to turn it off:
 | Where | Default | Exact |
 | --- | --- | --- |
 | Qwen products over prompt batches (2 rows or more) | FP16 operands, F32 sums (`--gemm fp16`) | `--gemm fp32` |
+| Qwen products over a batch of more than 4096 rows (a read of 16384 new tokens or more on the layers in parts) | as above, the products tiled for the wider batch, so the bits are those of a batch of that width (UD-IQ3_XXS, first logits against the F32 products: KL 2.0e-6, 2.0e-2, 1.0e-4 at 32K, 95K, 242K tokens against 6.6e-6, 2.6e-2, 2.9e-5 at 4096 rows; the same top token, KL between them 3.7e-6, 1.0e-3, 2.5e-5) | `STRAYDOG_PREFILL_WIDE=off` |
 | Qwen's long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
 | Qwen's DeltaNet layers over a prompt read of 16384 new tokens or more (RDNA4) | the recurrence in chunks of 16 tokens, the products against the state in bf16 pieces (three to a value, six of nine products) with F32 sums: another order of sums, which the model amplifies as it does any other (first logits after a 95K / 242K read against the token-by-token scan's: KL 2.8e-2 / 1.0e-5; against the token-by-token scan at another batch width: 4.4e-2 / 1.6e-5). On the activations of a 95K read, against an F64 scan of 4 heads in 12 layers, the outputs' largest error is 2e-6 to 7e-4 of the largest output (the token-by-token scan's: 5e-7 to 1.6e-4). Shorter reads keep the token-by-token scan, bit for bit | `STRAYDOG_DELTA_SCAN=token` |
 | Qwen decode and speculative verification: the inputs of the dense Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 projections (RDNA4 and CUDA) | INT8 per 32 values with an F32 scale; the dots exact in INT32, then scaled in F32. A row's sum does not depend on what shares its launch, so a verification is still the tokens fed one at a time; the bits are no longer the F32 kernels' (CUDA, UD-IQ1_S, 356 decode steps: KL mean 1.1e-3, p99 1.2e-2; greedy continuations part after 19, 23 and 30 tokens in three of six prompts and agree for 128 in the others) | `STRAYDOG_Q8=0` |
