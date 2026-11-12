@@ -118,7 +118,7 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
                 static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
             gdn_chunk_scan<P><<<unsigned(H::key * 8), 192, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows,
                 static_cast<float*>(conv));
-            gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
+            gdn_post_rows<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
                 post + first * H::gate);
             continue;
         }

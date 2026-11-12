@@ -428,4 +428,24 @@ __global__ void __launch_bounds__(192) gdn_chunk_scan(float* state, size_t count
 }
 #undef GDN_FETCH
 #undef GDN_STAGE
+
+// gdn_post (the output's RMS norm and gate) with its bits and fewer barriers: its sum of squares is the same tree over the 128 channels (the
+// strides 64 and 32 through LDS, the rest of the tree within the first wave by shuffles instead of five more barriers).
+__global__ void __launch_bounds__(128) gdn_post_rows(const float* recurrent, const float* gate, const float* norm, float* output) {
+    const size_t head = blockIdx.x, col = threadIdx.x, index = head * 128 + col;
+    const float x = recurrent[index];
+    __shared__ float sum[128];
+    sum[col] = x * x;
+    __syncthreads();
+    if (col < 64) sum[col] += sum[col + 64];
+    __syncthreads();
+    if (col < 32) {
+        float v = sum[col] + sum[col + 32];
+        #pragma unroll
+        for (unsigned stride = 16; stride; stride /= 2) v += __shfl_down(v, stride, 32);
+        if (col == 0) sum[0] = v;
+    }
+    __syncthreads();
+    output[index] = x / sqrtf(sum[0] / 128.0f + 1e-6f) * norm[col] * hc_sigmoid(gate[index]);
+}
 #endif
