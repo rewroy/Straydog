@@ -1169,6 +1169,10 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   would round every product to 11). The F32 FMA form of the same algebra measured 1.3x slower than delta_split_sequence
   on an R9700: its operands stream through LDS a float an FMA, and a chunk's products are too small to tile (24 heads x
   128 columns of state).
+  The layer's output norm after it (`gdn_post_rows`) is `gdn_post`'s tree of sums with five of its seven barriers replaced by shuffles:
+  the same bits (the logits of a 95K and a 242K read are the same), 35.6 -> 28.6 us a 512-token launch. A wave a row, which sums
+  the 128 channels in another association, takes 14.4 us and changes one value in 25 by a last bit, which every read's bits
+  would show.
   One R9700, 512 tokens, QwenHeads<2> shapes, random q/k/v: convolution, normalization, packing and scan 340-385 us,
   the two kernels 187-228 us; against an F64 scan the outputs' largest error is 2.3e-7 to 4.8e-7 of the largest output
   (the token scan's: 1.0e-7 to 2.0e-7). On the activations of a 95K read (4 heads of 12 layers against an F64 scan) the
