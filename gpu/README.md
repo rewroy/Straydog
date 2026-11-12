@@ -26,3 +26,8 @@ uses hipBLAS or cuBLAS, in FP32 or, when configured, FP16 inputs with FP32
 accumulation. DeltaNet recurrence and sparse attention have their own kernels. The
 engine's pinned GPU generations (`crates/straydog-engine/tests/model_gpu.rs`) check them
 end to end, bit for bit.
+
+On RDNA4 a prompt chunk's indexer selects its blocks from FP16 matrix products with a proven bound
+(`qsa_interval.hpp`, docs/DESIGN.md §8); `tests/qsa_interval_test.cpp` (the `straydog_qsa_interval_test`
+target of `cmake -DSTRAYDOG_GPU_TESTS=ON`) checks, on synthetic keys with exact ties, near ties, zero
+queries and elements beyond FP16, that it selects what the exact kernels do, block for block.
