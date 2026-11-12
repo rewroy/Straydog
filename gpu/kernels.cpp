@@ -649,6 +649,12 @@ struct Device {
     // A stage's work beside the device stream's (the shared expert's gate and up, resident_expert_launch), forked and joined by events.
     hipStream_t side_stream = nullptr;
     hipEvent_t side_fork = nullptr, side_join = nullptr;
+    // A prompt batch's sends to the other device of a layer in parts (qwen_parts.hpp) run on a stream of their own beside the device's
+    // compute (STRAYDOG_PARTS_OVERLAP=off keeps them in the device stream's order), forked and joined by events.
+    hipStream_t send_stream = nullptr;
+    hipEvent_t send_fork = nullptr, send_done = nullptr;
+    bool send_pending = false;   // a send is queued on send_stream that the device stream has not yet waited for
+    bool parts_overlap = true;
     hipEvent_t kv_released = nullptr, kv_prefetched = nullptr;
     bool kv_prefetching = false;
     // Decode partitions the same stage into fixed per-host-state F32 prefixes.
@@ -710,6 +716,7 @@ struct Device {
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         if (kv_stream) cleanup(hipStreamSynchronize(kv_stream));
         if (side_stream) cleanup(hipStreamSynchronize(side_stream));
+        if (send_stream) cleanup(hipStreamSynchronize(send_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -766,7 +773,8 @@ struct Device {
         if (helper_stream) cleanup(hipStreamDestroy(helper_stream));
         if (kv_stream) cleanup(hipStreamDestroy(kv_stream));
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
-        for (auto event : {kv_released, kv_prefetched, side_fork, side_join}) if (event) cleanup(hipEventDestroy(event));
+        if (send_stream) cleanup(hipStreamDestroy(send_stream));
+        for (auto event : {kv_released, kv_prefetched, side_fork, side_join, send_fork, send_done}) if (event) cleanup(hipEventDestroy(event));
     }
 };
 // Held while the CPU's workers read the bytes of a layer's banks (the CPU experts' routes, a gather into the staging mirror): the engine moves a layer's

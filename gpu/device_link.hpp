@@ -150,7 +150,8 @@ int sd_link_sums(void* first, void* second, uint64_t capacity) {
         link_peers(a, b);
         for (Device* side : {&a, &b}) {
             on_device(side->ordinal, [&]() {
-                side->sums.inbox = static_cast<float*>(allocate(*side, capacity * 2 * 4));
+                // (two slots the sums alternate between, and one a prompt's gather copy goes to: qwen_parts.hpp)
+                side->sums.inbox = static_cast<float*>(allocate(*side, capacity * 3 * 4));
                 side->sums.state = static_cast<uint32_t*>(allocate(*side, 256));
                 check(hipMemset(side->sums.state, 0, 256));
                 check(hipDeviceSynchronize());
