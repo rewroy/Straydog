@@ -1096,6 +1096,49 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   makes and the two paths give the same bits as one device selecting every chunk. The attended
   values replace the queries in place: a workgroup reads its token's queries before it writes its
   values, and no two share a token and K/V head.
+- From 6144 complete blocks (24576 tokens), in a span where each token attends its own selection, an
+  RDNA4 chunk's indexer makes its selection from FP16 matrix products with a provable bound
+  (`qsa_interval.hpp`) and selects the very blocks the exact kernels do, in the same order and with
+  the same ties. The exact scores (128 columns of F32 fused multiply-adds for each block and head,
+  `qsa_block_scores_tiled`) took 27.7 us a prompt token of a 242K read (both GPUs, 13 layers) and
+  the selection of the best 512 (`qsa_select_rows`) 13.3: 41.0 in all, 11.1 now.
+  - A block's four heads are WMMA products of the keys and queries rounded to FP16 (F32 sums), their
+    positive parts added. With h the rounding and r its residual (exact in F32), the exact score of
+    a head differs from the product of the rounded operands by at most |h(k)||r(q)| + |r(k)||h(q)| +
+    |r(k)||r(q)| (Cauchy-Schwarz) and by 2^-15 |h(k)||h(q)| for the F32 sums (the matrix unit's
+    accumulation measured at 4e-8 to 8e-8 of it), and the positive part is 1-Lipschitz, so a score
+    lies within d = |h(k)| (M + 2^-15 N) + |r(k)| (N + M) of the matrix unit's (N and M the heads'
+    norms of the rounded queries and their residuals; norms taken up, the whole 2% over). No
+    distribution is assumed: elements under FP16's smallest normal count as zero, and an element
+    beyond FP16 or not a number leaves its row to the exact kernels. On a 242K prompt's indexer |a -
+    e| reaches 0.10 to 0.16 of d, and d is some 2e-4 of the product of the norms.
+  - With L = a - d and U = a + d, the 512th largest L is at most the 512th best exact score T and
+    the 512th largest U at least it: blocks with L above the second are certainly selected, those
+    with U below the first certainly not, and the rest (the band, 45 blocks a row on average and 96
+    at most, in 3066 sampled rows of the 95K and 242K reads past 48K tokens) are scored exactly from
+    an F32 copy of the keys in the exact kernel's order of operations. T is the (512 - certain)th of
+    the band, ties take the earliest blocks and the selection is listed in block order, as
+    `qsa_select_rows` lists it.
+  - The 512th largest bounds need every block's interval, which would be as large as the exact
+    scores to keep. A sample of one block in 32 (scored the same way) gives a threshold at about the
+    1000th best score instead; the scan (`qsa_iv_scan`: a workgroup of 8 waves, 128 rows, tiles of
+    64 blocks staged as FP16, the keys' loads in flight) keeps as a bit and a score the blocks whose
+    upper bound reaches it with the chunk's largest interval taken off (1135 a row on average, 1770
+    at most of the sampled rows), and the selection (`qsa_iv_select`: a workgroup a row) checks that
+    512 blocks certainly reach the threshold. A row where that fails or that has more than 2048
+    candidates (203 of the 3.8 million rows scored in the 32K, 95K and 242K reads, 190 of them with
+    2049 to 2332), a band over 512 or an operand beyond FP16 is left to the exact kernels, which run
+    for the chunk and leave all but those rows: the time of the exact kernels, not another result.
+    Nothing waits for the host.
+  - The F32 copy of the keys and their norms (`qsa_iv_keys`) live in the attention scratch, which
+    nothing else holds while the tokens attend their own selections, and a layer's chunks in a row
+    take up from the blocks the one before left there.
+  - Two Radeon AI PRO R9700, UD-IQ3_XXS, MTP, 262144 context, in one window, the old and the new
+    kernels alternating: a fresh 242K read at batch 2048 53.53 s to 49.87 s, at batch 4096 50.02 s
+    to 46.34 s, 95K 19.73 s to 19.27 s (batch 2048), 32K unchanged; the bits are the same in every
+    arm. The scan runs at about 105 TFLOPS of FP16 where the matrix unit gives 170 in a loop of its
+    own: its 235 registers leave one workgroup of 8 waves to a workgroup processor, and a micro-
+    benchmark finds a SIMD's vector work not overlapping its matrix products.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
 - Past the stage's positions (a 64th of the budget, grown into what the slots leave: some 45K at 6 GiB),

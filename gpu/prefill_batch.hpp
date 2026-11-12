@@ -215,6 +215,9 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
     const Device* peer = d.sums.peer;
     const bool sharing = P == 2 && part >= 0 && batched && peer && peer->rdna4 && peer->half_gemm && peer->attention_scores &&
                          context <= 262144 && d.sums.capacity % 8 == 0 && d.sums.capacity == peer->sums.capacity;
+    // (the interval indexer's F32 keys and norms, which the attention scratch holds for this layer's chunks in a row: the blocks a chunk's call
+    // found complete, as of the last call of this one)
+    size_t iv_valid = 0;
     for (size_t span = 0; span < steps; span += 2048) {
         const size_t span_rows = std::min<size_t>(2048, steps - span), groups = (span_rows + qsa_group - 1) / qsa_group;
         // (a row's blocks as 16 bits in a slot of the inbox: a thousand bytes against the 2560 of a row of the sums)
@@ -267,7 +270,7 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             else if (completed)
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
-            if (own) qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input);
+            if (own) qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input, per_token, &iv_valid);
             write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity, position, count, d.input,
                 nullptr, nullptr, kv.mirror, kv.mirror_rows);
             if (per_token) {

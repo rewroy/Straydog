@@ -171,7 +171,8 @@ __device__ unsigned qsa_block_scan(unsigned value, unsigned* waves) {
 
 template<int P=1>
 __global__ void qsa_select(const float* scores, size_t pool, size_t base, size_t steps,
-                           size_t selected, float* packed, const uint32_t* dynamic_position=nullptr) {
+                           size_t selected, float* packed, const uint32_t* dynamic_position=nullptr, const unsigned* only=nullptr) {
+    if (only && !(only[256] && only[blockIdx.x])) return;   // (the intervals' fallback: the rows they flagged)
     if (dynamic_position) base=*dynamic_position;
     const size_t token=blockIdx.x, position=base+token, complete=(position+1)/4, lane=threadIdx.x;
     const size_t index_start=steps*QwenHeads<P>::packed;
@@ -244,10 +245,15 @@ __global__ void qsa_select(const float* scores, size_t pool, size_t base, size_t
 // sixteen columns at a time. Every dot product adds its columns in order with the fused
 // multiply-adds of qsa_block_scores, so the scores are the same bits.
 __global__ void __launch_bounds__(256) qsa_block_scores_tiled(const float* queries, const float* blocks, size_t pool,
-                                                              size_t base, size_t steps, float* scores) {
+                                                              size_t base, size_t steps, float* scores, const unsigned* only = nullptr) {
     const size_t first_token = size_t(blockIdx.y) * 32, first_block = size_t(blockIdx.x) * 128;
     const size_t complete = (base + std::min(steps, first_token + 32)) / 4;
     if (complete <= 512 || first_block >= complete) return;
+    if (only) {   // (the intervals' fallback: tiles with a row they flagged)
+        bool flagged = false;
+        if (only[256]) for (unsigned i = 0; i < 32; ++i) flagged |= first_token + i < steps && only[first_token + i];
+        if (!flagged) return;
+    }
     __shared__ SD_ALIGN(16) float keys[16][128];
     __shared__ SD_ALIGN(16) float query[16][132];   // [column][token * 4 + head], padded against bank conflicts
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32;
@@ -307,7 +313,9 @@ __device__ inline unsigned qsa_ballot(bool predicate) {
 constexpr unsigned qsa_select_run = 64;
 template <unsigned threads, int P = 1>
 __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, size_t pool, size_t base, size_t steps,
-                                                          size_t selected, float* packed, const uint32_t* dynamic_position = nullptr) { SD_KERNEL_ACQUIRE;
+                                                          size_t selected, float* packed, const uint32_t* dynamic_position = nullptr,
+                                                          const unsigned* only = nullptr) { SD_KERNEL_ACQUIRE;
+    if (only && !(only[256] && only[blockIdx.x])) return;   // (the intervals' fallback: the rows they flagged)
     if (dynamic_position) base = *dynamic_position;
     constexpr unsigned waves = threads / 32;
     const size_t token = blockIdx.x, position = base + token, complete = (position + 1) / 4;
@@ -390,19 +398,42 @@ __global__ void __launch_bounds__(threads) qsa_select_rows(const float* scores, 
     for (size_t i = t; complete * 4 + i <= position; i += threads) indices[head + i] = float(complete * 4 + i);
     if (t == 0) packed[index_start + steps * selected + token] = float(head + position + 1 - complete * 4);
 }
-// The block scores and selection of a prefill chunk. Rows of up to 6144 blocks select fastest
-// with qsa_select's rereads; longer ones in registers, 256 threads while a row fits them.
+// The exact scores and selection of a prefill chunk (of the rows `only` flags, when it is given; its flag of row 256 says whether
+// any is). Rows of up to 6144 blocks select fastest with qsa_select's rereads; longer ones in registers, 256 threads while a row fits them.
 template<int P = 1>
-void qsa_index_chunk(Device& d, const float* queries, const float* blocks, size_t pool, size_t base, size_t steps,
-                     size_t selected, float* scores, float* packed) {
+void qsa_index_exact(Device& d, const float* queries, const float* blocks, size_t pool, size_t base, size_t steps, size_t selected,
+                     float* scores, float* packed, const unsigned* only = nullptr) {
     const size_t complete = (base + steps) / 4;
     if (complete > 512)
         qsa_block_scores_tiled<<<dim3(unsigned((complete + 127) / 128), unsigned((steps + 31) / 32)), 256, 0, d.stream>>>(
-            queries, blocks, pool, base, steps, scores);
-    if (complete <= 6144) qsa_select<P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+            queries, blocks, pool, base, steps, scores, only);
+    if (complete <= 6144) qsa_select<P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed, nullptr, only);
     else if (complete <= 256 * qsa_select_run)
-        qsa_select_rows<256, P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
-    else qsa_select_rows<1024, P><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed);
+        qsa_select_rows<256, P><<<unsigned(steps), 256, 0, d.stream>>>(scores, pool, base, steps, selected, packed, nullptr, only);
+    else qsa_select_rows<1024, P><<<unsigned(steps), 1024, 0, d.stream>>>(scores, pool, base, steps, selected, packed, nullptr, only);
+}
+#include "qsa_interval.hpp"
+// The block scores and selection of a prefill chunk. From qsa_iv_from complete blocks on RDNA4 the selection is made from FP16 matrix
+// products with a provable bound (qsa_interval.hpp), the exact kernels running on the rows it leaves to them; the bits are the exact
+// kernels' either way. The attention scratch is theirs while the caller says it holds nothing (a prompt's chunks attended each by its own selection);
+// `iv_valid` carries the blocks of the keys it still holds from one call to the next of a span's chunks.
+constexpr size_t qsa_iv_from = 6144;
+template<int P = 1>
+void qsa_index_chunk(Device& d, const float* queries, const float* blocks, size_t pool, size_t base, size_t steps,
+                     size_t selected, float* scores, float* packed, bool attention_scratch_free = false, size_t* iv_valid = nullptr) {
+#if defined(__HIPCC__)
+    if (attention_scratch_free && d.rdna4 && d.attention_scores && qsa_iv_floats(pool) * 4 <= attention_score_bytes &&
+        (base + steps) / 4 > qsa_iv_from) {
+        size_t none = 0;
+        qsa_iv_chunk<P>(d, queries, blocks, pool, base, steps, selected, scores, packed, iv_valid ? *iv_valid : none);
+        qsa_index_exact<P>(d, queries, blocks, pool, base, steps, selected, scores, packed,
+                           reinterpret_cast<const unsigned*>(d.attention_scores + qsa_iv_flags_at(pool)));
+        return;
+    }
+#else
+    (void)attention_scratch_free; (void)iv_valid;
+#endif
+    qsa_index_exact<P>(d, queries, blocks, pool, base, steps, selected, scores, packed);
 }
 
 __global__ void qsa_gate(float* output, const float* query_gate, size_t count) { SD_KERNEL_ACQUIRE;
