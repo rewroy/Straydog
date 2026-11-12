@@ -3,14 +3,17 @@
 // causal convolution, recurrence, selection and attention still advance in bounded
 // physical chunks. The idle MoE workspace of the device provides the row scratch.
 
-// Contiguous-row projection. In FP16 mode `half` must already hold the inputs.
-void batch_project(Device& d, const Matrix& m, size_t steps, const float* input, const __half* half, float* output) {
+// Contiguous-row projection. In FP16 mode `half` must already hold the inputs. `kept` (FP16 mode): the matrix's expansion is in (or goes into) this
+// part of d.expanded, not at its start, and stays there for the next call over other rows of the same matrix (`expand_again` false: it is there already).
+void batch_project(Device& d, const Matrix& m, size_t steps, const float* input, const __half* half, float* output,
+                   __half* kept = nullptr, bool expand_again = true) {
     if (d.blas && steps >= d.gemm_min_batch && m.rows * m.cols <= gemm_elements) {
         const float alpha = 1, beta = 0;
         if (d.half_gemm) {
-            expand(m, d.expanded, d.stream, true);
+            __half* weights = kept ? kept : reinterpret_cast<__half*>(d.expanded);
+            if (expand_again) expand(m, reinterpret_cast<float*>(weights), d.stream, true);
             blas_check(hipblasGemmEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(m.rows), int(steps), int(m.cols), &alpha,
-                d.expanded, HIP_R_16F, int(m.cols), half, HIP_R_16F, int(m.cols), &beta,
+                weights, HIP_R_16F, int(m.cols), half, HIP_R_16F, int(m.cols), &beta,
                 output, HIP_R_32F, int(m.rows), HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
         } else {
             const float* weights = reinterpret_cast<const float*>(m.data);
@@ -96,9 +99,12 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
 
 // Scratch: qkv 10240 + gate 6144 + beta 48 + alpha 48 + post 6144 + half 3072 floats per row (a part's, QwenHeads<P>, fewer).
 constexpr size_t gdn_batch_floats = 10240 + 6144 + 96 + 6144 + 3072;
+// A layer in parts whose input rows are not all here yet (the other device's are on the way): the rows that are (first[0], count[0]) go through
+// the big projections, qkv and gate, as a batch of their own; `between` brings in the rest (first[1], count[1]), which then do the same.
+struct GdnSplit { size_t first[2], count[2]; std::function<void()> between; };
 template<int P = 1>
 void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv, void* recurrent, size_t steps,
-                 size_t chunk, const float* mixed, float* branch, float* scratch) {
+                 size_t chunk, const float* mixed, float* branch, float* scratch, const GdnSplit* split = nullptr) {
     using H = QwenHeads<P>;
     const Matrix qkv_weights = batch_matrix(pointers, kinds, 0, H::channels, 2560), gate_weights = batch_matrix(pointers, kinds, 1, H::gate, 2560);
     const Matrix beta_weights = batch_matrix(pointers, kinds, 2, H::value, 2560), alpha_weights = batch_matrix(pointers, kinds, 3, H::value, 2560);
@@ -110,9 +116,25 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     float* post = alpha + steps * H::value;
     auto* half = reinterpret_cast<__half*>(post + steps * H::gate);
     const bool cast = batch_half(d, steps);
-    if (cast) batch_cast(d, mixed, half, steps * 2560);
-    batch_project(d, qkv_weights, steps, mixed, half, qkv);
-    batch_project(d, gate_weights, steps, mixed, half, gate);
+    if (split && cast) {
+        // (the same FP16 products over a row range as over the batch, the bits of each row: checked for the ranges the caller gives)
+        // (each matrix expanded once, the two expansions side by side in d.expanded: nothing else uses it until the second range's products)
+        __half* qkv_kept = reinterpret_cast<__half*>(d.expanded);
+        __half* gate_kept = qkv_kept + H::channels * 2560;
+        if ((H::channels + H::gate) * 2560 * 2 > d.expanded_bytes) throw std::runtime_error("expansions exceed the GEMM workspace");
+        for (size_t turn = 0; turn < 2; ++turn) {
+            if (turn) split->between();
+            const size_t first = split->first[turn], count = split->count[turn];
+            batch_cast(d, mixed + first * 2560, half + first * 2560, count * 2560);
+            batch_project(d, qkv_weights, count, mixed + first * 2560, half + first * 2560, qkv + first * H::channels, qkv_kept, turn == 0);
+            batch_project(d, gate_weights, count, mixed + first * 2560, half + first * 2560, gate + first * H::gate, gate_kept, turn == 0);
+        }
+    } else {
+        if (split) split->between();
+        if (cast) batch_cast(d, mixed, half, steps * 2560);
+        batch_project(d, qkv_weights, steps, mixed, half, qkv);
+        batch_project(d, gate_weights, steps, mixed, half, gate);
+    }
     batch_project(d, beta_weights, steps, mixed, half, beta);
     batch_project(d, alpha_weights, steps, mixed, half, alpha);
     for (size_t first = 0; first < steps; first += chunk) {
