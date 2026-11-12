@@ -305,7 +305,12 @@ __global__ void qwen_gather_stage(const float* local, size_t steps, size_t first
 constexpr size_t qwen_gather_slot = 2;   // (in slots of `capacity` floats from the inbox's start)
 void qwen_send_streams(Device& d) {
     if (d.send_stream) return;
-    check(hipStreamCreate(&d.send_stream));
+    // (of the highest priority: the runtime shares a few hardware queues among the streams of a priority, in the order they were made, so a
+    // stream of the device's default priority may share one with its compute stream, as the stream of the copy did after the GEMM priming of the
+    // worker's start had moved the order; the helper stream, made so too, is not used by a prompt batch of parts)
+    int least = 0, greatest = 0;
+    check(hipDeviceGetStreamPriorityRange(&least, &greatest));
+    check(hipStreamCreateWithPriority(&d.send_stream, hipStreamDefault, greatest));
     check(hipEventCreateWithFlags(&d.send_fork, hipEventDisableTiming));
     check(hipEventCreateWithFlags(&d.send_done, hipEventDisableTiming));
 }
