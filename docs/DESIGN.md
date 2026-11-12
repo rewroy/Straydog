@@ -1133,7 +1133,7 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   - The F32 copy of the keys and their norms (`qsa_iv_keys`) live in the attention scratch, which
     nothing else holds while the tokens attend their own selections, and a layer's chunks in a row
     take up from the blocks the one before left there.
-  - Two Radeon AI PRO R9700, UD-IQ3_XXS, MTP, 262144 context, in one window, the old and the new
+  - Two Radeon AI PRO R9700, UD-IQ3_XXS, MTP, 262144 context, in one session, the old and the new
     kernels alternating: a fresh 242K read at batch 2048 53.53 s to 49.87 s, at batch 4096 50.02 s
     to 46.34 s, 95K 19.73 s to 19.27 s (batch 2048), 32K unchanged; the bits are the same in every
     arm. The scan runs at about 105 TFLOPS of FP16 where the matrix unit gives 170 in a loop of its
