@@ -859,6 +859,9 @@ pub struct Model {
     kv_capacity: usize,
     /// What is page-locked, for the thread that keeps the working set's limit.
     pinned_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The bytes of the banks page-locked in place now (not the layers held as copies, which are the process's own memory): what the working set's
+    /// limit is never under, with that memory ([`crate::host::keep_resident`]).
+    in_place_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
     memory_watch: std::sync::Arc<crate::host::WorkingSetWatch>,
     /// Page-locked host bytes besides the K/V.
     pinned_other: u64,
@@ -1067,6 +1070,7 @@ impl Model {
             cpu_phases_before: [0; 3],
             kv_capacity: context,
             pinned_now: Default::default(),
+            in_place_now: Default::default(),
             memory_watch: Default::default(),
             pinned_other: checkpoint_bytes,
             banks_bytes: 0,
@@ -1793,6 +1797,7 @@ impl Model {
         }
         self.lock_pending.retain(|pending| *pending != layer);
         self.locked_layers.push(layer);
+        self.count_in_place();
         let before = self.assist_mapped;
         let mapped = self.start_assist()?;
         // (a copy the runtime would not map for the GPU is a locked layer that assists nothing, and its prompts gather it through the CPU: say so for that
@@ -1826,12 +1831,19 @@ impl Model {
         self.hold_banks();
     }
 
+    /// Count the bytes of the banks page-locked in place (the locked layers that are not held as copies) for the working set's limit.
+    fn count_in_place(&mut self) {
+        let bytes: u64 = self.locked_layers.iter().filter(|layer| !self.copies.holds(**layer))
+            .filter_map(|&layer| Self::host_banks(&self.weights, layer).ok()).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).sum();
+        self.in_place_now.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Keep the working set's limit ([`crate::host::keep_resident`]) from here on, now and as memory moves. It comes once the banks that are to be
     /// locked are: locked pages are not trimmed, but the mapped pages around them are, and a limit that came first would have trimmed what
     /// the locking reads next.
     fn hold_banks(&mut self) {
         let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
-        crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+        crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes, self.in_place_now.load(std::sync::atomic::Ordering::Relaxed));
         self.memory_watch.allow_quota();
     }
 
@@ -1965,7 +1977,7 @@ impl Model {
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
         // Paging must be observed even while a request holds up bank locking. The quota alone waits for the locks.
-        crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes, &self.memory_watch);
+        crate::host::watch_working_set(self.weights.host_memory_bytes, self.pinned_now.clone(), self.banks_bytes, self.in_place_now.clone(), &self.memory_watch);
         // (with nothing to lock the limit comes now; else when the locking is over: `Model::banks_lock_ended`)
         if self.lock_pending.is_empty() {
             self.hold_banks();
@@ -2585,6 +2597,7 @@ impl Model {
         }
         // (each layer given back took its mapped plan with it, if it had one: a count kept too high would make the next copy's turn look unmapped)
         self.assist_mapped = if self.locked_layers.is_empty() { 0 } else { self.assist_mapped.saturating_sub(gave.layers.len() as u64) };
+        self.count_in_place();
         gave.left = self.locked_layers.len();
         gave.left_bytes = sizes.iter().filter(|(layer, _)| self.locked_layers.contains(layer)).map(|(_, bytes)| bytes).sum();
         if self.locked_layers.is_empty() {
@@ -2667,7 +2680,7 @@ impl Model {
                 let pinned = self.pinned_other + attention_layers(self.weights.drafter) * capacity as u64 * kv_position_bytes();
                 // (the limit waits for the locking behind "ready", whose reads it would cut short)
                 if self.lock_pending.is_empty() {
-                    crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes);
+                    crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes, self.in_place_now.load(std::sync::atomic::Ordering::Relaxed));
                 }
                 begun = Some(capacity);
                 self.group.grow_kv(capacity as u64, self.history.len() as u64).map(|()| capacity)
