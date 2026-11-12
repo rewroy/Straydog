@@ -29,12 +29,12 @@ pub use tree::{prepare, ProcessTree};
 /// can); a prompt's layer order (STRAYDOG_LAYER_PREFILL, the rows of its passes STRAYDOG_LAYER_PREFILL_ROWS, where they are held
 /// STRAYDOG_LAYER_ROWS_VRAM, and STRAYDOG_LOCK_DURING_PREFILL, the
 /// locking behind "ready" going on meanwhile, which the worker's own code reads); STRAYDOG_KV (=f16: Qwen3.8's K/V held as
-/// FP16, not Q8_0); and the engines' development switches, each the one place
+/// FP16, not Q8_0); STRAYDOG_PREFILL_WIDE (=off: a long read's batches are not widened; N: the rows to try); and the engines' development switches, each the one place
 /// the engine reads it: Qwen3.8's STRAYDOG_Q8, STRAYDOG_HC_Q8, STRAYDOG_PARTS, STRAYDOG_MTP_PARTS and STRAYDOG_DRAFT_VOCABULARY, and
 /// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
 /// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
 /// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
-pub const ENGINE_VARIABLES: [&str; 40] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 41] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
                                          "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
                                          "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",
@@ -42,7 +42,7 @@ pub const ENGINE_VARIABLES: [&str; 40] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_D
                                          "DS41_CHECK_SLOTS", "DS41_COUNT_VIEWS", "DS41_EXPANSIONS", "DS41_FP16_CHECKS", "DS41_FULL_DECODER",
                                          "DS41_GATE_UP_FIRST", "DS41_HEADS_FIRST", "DS41_HITS_FIRST", "DS41_LEND", "DS41_LEND_ROWS",
                                          "DS41_LEND_STATE", "DS41_LINK", "DS41_NO_GRAPHS", "DS41_PREDICT", "DS41_PREDICT_DRIVE", "DS41_Q8",
-                                         "DS41_ROUTE_READBACK", "DS41_SLOT_WMMA", "STRAYDOG_LAYER_ROWS_VRAM"];
+                                         "DS41_ROUTE_READBACK", "DS41_SLOT_WMMA", "STRAYDOG_LAYER_ROWS_VRAM", "STRAYDOG_PREFILL_WIDE"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;

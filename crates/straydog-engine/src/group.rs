@@ -507,7 +507,7 @@ impl Group {
     pub fn prefill_layers(&mut self, begin: usize, end: usize, values: Option<&[f32]>, position: u64, steps: u64,
                           output_rows: u64) -> Result<Vec<f32>> {
         if self.in_parts(begin, end) {
-            if !(2..=4096).contains(&steps) {
+            if !(2..=crate::gpu::PREFILL_ROWS_MAX).contains(&steps) {
                 return Err("invalid Straydog prefill span of parts".into());
             }
             return crate::gpu::prefill_parts(&self.backends[0], &self.backends[1], begin, end, position, steps, values, output_rows);
@@ -1107,10 +1107,10 @@ impl Group {
         }
         if self.expert_parallel()? && !self.linked {
             let (first, second) = self.backends.split_at_mut(1);
-            first[0].link_peer(&mut second[0], context.min(prefill))?;
+            first[0].link_peer(&mut second[0], peer_rows(context, prefill, self.parts))?;
             if self.parts {
                 // The parts' sums: a prefill batch's rows.
-                Backend::link_sums(&mut first[0], &mut second[0], context.min(prefill) * WIDTH as u64 / 4)?;
+                Backend::link_sums(&mut first[0], &mut second[0], sums_capacity(context, prefill))?;
             }
             self.linked = true;
         }
@@ -1130,18 +1130,23 @@ impl Group {
     /// Per device, the VRAM a placement would still allocate.
     pub fn planned_state_bytes(&self, context: u64, prefill: u64, drafter: bool, host_attention: bool)
                                -> Result<Vec<u64>> {
-        // Expert parallelism links the GPUs with inboxes of two prefill batches each (peer VRAM); the parts' sums with two
-        // slots of a batch's rows more.
-        let mut inbox = if self.expert_parallel()? { context.min(prefill) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
-        if self.parts {
-            inbox += context.min(prefill) * 2560 * 2 * 4 + 256;
-        }
+        let inbox = self.inbox_bytes(context, prefill)?;
         (0..self.backends.len())
             .map(|index| {
                 let layers = self.owned_layers(index, drafter);
                 Ok(self.backends[index].planned_state_bytes(context, &layers, prefill, host_attention)? + inbox)
             })
             .collect()
+    }
+
+    /// Per device, the VRAM of the links' inboxes for batches of up to `prefill` rows: expert parallelism links the GPUs with an inbox of the batch's
+    /// rows each (peer VRAM); the parts' sums have two slots of a batch's halves more.
+    fn inbox_bytes(&self, context: u64, prefill: u64) -> Result<u64> {
+        let mut inbox = if self.expert_parallel()? { peer_rows(context, prefill, self.parts) * (2560 * 2 + 21) * 4 + 256 } else { 0 };
+        if self.parts {
+            inbox += sums_capacity(context, prefill) * 2 * 4 + 256;
+        }
+        Ok(inbox)
     }
 
     pub fn host_state_supported(&self) -> Result<bool> {
@@ -1329,6 +1334,28 @@ impl Group {
     }
 }
 
+/// The rows of a prefill batch the linked devices' inboxes hold at once (the native peer link takes at most 4096). The layer split's helper takes a
+/// batch's rows through it, in pieces of its own; the layers in parts take only a decode pass's few rows (a split output head's half of the vocabulary
+/// for each of at most 8 rows of a pass is 388 rows of the inbox's 2560 floats), their prefill batches go through the sums' inbox: 1024 rows,
+/// 21 MB where 4096 were 84 MB on each device.
+fn peer_rows(context: u64, prefill: u64, parts: bool) -> u64 {
+    context.min(prefill).min(if parts { PARTS_PEER_ROWS } else { crate::gpu::MOE_CHUNK_ROWS })
+}
+
+/// The rows of the peer link the layers in parts keep (see `peer_rows`).
+const PARTS_PEER_ROWS: u64 = 1024;
+/// The floats of a sums inbox slot a span of 2048 rows' selected blocks need when the devices share the attention indexer (512 blocks a row as FP16:
+/// `span_rows * qsa_share_blocks * 2 <= capacity * 4`).
+const SHARED_BLOCKS_FLOATS: u64 = 2048 * 512 / 2;
+
+/// The floats of one slot of the parts' sums inbox for a batch of up to `prefill` rows: a batch's rows halved between the devices, 2568 values a row, in FP16
+/// (two to a float) and whole 32 bytes (`qwen_gather_mixed`), and not less than what the shared indexer's blocks of a span take. A row's 2560 floats were
+/// allocated up to 4096 rows, four times what the halves take: 84 MB on each device, 21 MB now.
+fn sums_capacity(context: u64, prefill: u64) -> u64 {
+    let rows = context.min(prefill);
+    ((rows.div_ceil(2) * 2568).div_ceil(2)).max(SHARED_BLOCKS_FLOATS).next_multiple_of(8)
+}
+
 /// Rows of 10240 in `values`.
 pub fn row_count(values: &[f32]) -> usize {
     values.len() / WIDTH
@@ -1357,5 +1384,35 @@ impl crate::banks::HostPointers for Group {
             }
         }
         Ok(!moved.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod wide_batch_link_tests {
+    use super::*;
+    use crate::gpu::{MOE_CHUNK_ROWS, PREFILL_ROWS_MAX};
+
+    #[test]
+    fn the_peer_link_of_the_parts_keeps_the_rows_a_decode_pass_needs_and_the_layer_splits_the_batch() {
+        assert_eq!((peer_rows(262144, 4096, false), peer_rows(262144, 4096, true)), (4096, 1024));
+        assert_eq!((peer_rows(262144, 8192, false), peer_rows(262144, 8192, true)), (MOE_CHUNK_ROWS, 1024));
+        // (a context or a batch shorter than the rows bounds both; what a split output head's half of the vocabulary takes of 8 rows, a pass's most (`verify_max`), fits)
+        assert_eq!((peer_rows(1000, 4096, true), peer_rows(262144, 256, true)), (1000, 256));
+        assert!(8 * 124_160 + 64 <= PARTS_PEER_ROWS * 2560);
+    }
+
+    #[test]
+    fn the_sums_inbox_holds_the_halves_of_a_batch_and_a_spans_shared_blocks_as_the_native_checks_ask() {
+        for rows in (2..=PREFILL_ROWS_MAX).step_by(3).chain([PREFILL_ROWS_MAX]) {
+            let capacity = sums_capacity(262144, rows);
+            let own = rows.div_ceil(2);
+            // (qwen_scatter_prefill: a row's 2560 halves; qwen_gather_mixed: with its four mixes; a slot of `capacity` floats holds twice as many halves;
+            // qsa_prefill's shared selections: a span of 2048 rows' 512 blocks of 16 bits)
+            assert!(own * 2560 <= capacity * 2 && own * 2568 <= capacity * 2 && capacity % 8 == 0, "{rows} rows");
+            assert!(2048.min(rows) * 512 * 2 <= capacity * 4, "{rows} rows");
+        }
+        // (4096 rows' sums were 84 MB on each device, now 21 MB; 8192 rows' are 42)
+        assert_eq!(sums_capacity(262144, 4096) * 8 >> 20, 20);
+        assert_eq!(sums_capacity(262144, 8192) * 8 >> 20, 40);
     }
 }
