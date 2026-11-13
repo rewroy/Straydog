@@ -419,8 +419,10 @@ mod engine_variables_tests {
     use std::path::{Path, PathBuf};
 
     /// What the engine's code reads that no worker needs, and why: a test's own paths, set by hand where the test runs in-process.
-    const TEST_ONLY: [(&str, &str); 5] = [
+    const TEST_ONLY: [(&str, &str); 7] = [
         ("STRAYDOG_TOKENIZER_JSON", "a test's tokenizer file (text.rs)"),
+        ("STRAYDOG_MODEL", "the wait-recovery test's model directory (model.rs)"),
+        ("STRAYDOG_MODEL_QUANT", "the wait-recovery test's quantization (model.rs)"),
         ("STRAYDOG_QWEN_MMPROJ", "a test's vision projector (qwen_vision.rs)"),
         ("STRAYDOG_DRAFTER", "the layer-order diagnostic test's drafter (layer_prefill_diagnostics.rs)"),
         ("STRAYDOG_LAYER_MODEL", "the layer-order diagnostic test's model directory (layer_prefill_diagnostics.rs)"),
