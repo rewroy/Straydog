@@ -49,14 +49,18 @@ fn weights(values: &[f32], kind: u32) -> Vec<u8> {
 
 /// What the two kernels did with `router` and `gate` on `input`: bits against bits, then the separate kernels against a host's reading.
 fn compare(label: &str, check: &RouteCheck, input: &[f32], experts: usize, assist: usize) {
-    assert!(check.fused, "{label}: the one kernel took these shapes");
+    // (the one kernel is the CUDA build's; a HIP build runs the separate kernels alone, and its second copies are zeros: there the
+    // separate kernels are held against the host's reading below, and nothing against the one kernel)
+    assert_eq!(check.fused, cfg!(feature = "cuda"), "{label}: the one kernel took these shapes where the build has it");
     let rows = input.len() / 2560;
     let (scores_n, selected_n, probabilities_n, exported_n) = (rows * (experts + 1), rows * 10, rows * 11, rows * ROUTE_ROW_FLOATS);
     let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
-    assert_eq!(bits(&check.scores[..scores_n]), bits(&check.scores[scores_n..]), "{label}: scores");
-    assert_eq!(check.selected[..selected_n], check.selected[selected_n..], "{label}: selected experts");
-    assert_eq!(bits(&check.probabilities[..probabilities_n]), bits(&check.probabilities[probabilities_n..]), "{label}: route weights");
-    assert_eq!(bits(&check.exported[..exported_n]), bits(&check.exported[exported_n..]), "{label}: exported rows");
+    if check.fused {
+        assert_eq!(bits(&check.scores[..scores_n]), bits(&check.scores[scores_n..]), "{label}: scores");
+        assert_eq!(check.selected[..selected_n], check.selected[selected_n..], "{label}: selected experts");
+        assert_eq!(bits(&check.probabilities[..probabilities_n]), bits(&check.probabilities[probabilities_n..]), "{label}: route weights");
+        assert_eq!(bits(&check.exported[..exported_n]), bits(&check.exported[exported_n..]), "{label}: exported rows");
+    }
 
     for row in 0..rows {
         let scores = &check.scores[row * (experts + 1)..][..experts];
