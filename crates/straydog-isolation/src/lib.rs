@@ -34,7 +34,7 @@ pub use tree::{prepare, ProcessTree};
 /// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
 /// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
 /// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
-pub const ENGINE_VARIABLES: [&str; 44] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 45] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
                                          "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
                                          "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",
@@ -43,7 +43,7 @@ pub const ENGINE_VARIABLES: [&str; 44] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_D
                                          "DS41_GATE_UP_FIRST", "DS41_HEADS_FIRST", "DS41_HITS_FIRST", "DS41_LEND", "DS41_LEND_ROWS",
                                          "DS41_LEND_STATE", "DS41_LINK", "DS41_NO_GRAPHS", "DS41_PREDICT", "DS41_PREDICT_DRIVE", "DS41_Q8",
                                          "DS41_ROUTE_READBACK", "DS41_SLOT_WMMA", "STRAYDOG_LAYER_ROWS_VRAM", "STRAYDOG_PREFILL_WIDE", "STRAYDOG_DELTA_SCAN",
-                                         "STRAYDOG_HC", "STRAYDOG_PARTS_OVERLAP"];
+                                         "STRAYDOG_HC", "STRAYDOG_PARTS_OVERLAP", "STRAYDOG_VRAM_DIAGNOSTIC"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;
@@ -428,7 +428,7 @@ mod engine_variables_tests {
     ];
 
     /// What the worker's own code reads beside the engine's (behind.rs: the locking behind "ready").
-    const WORKER_READS: [&str; 1] = ["STRAYDOG_LOCK_DURING_PREFILL"];
+    const WORKER_READS: [&str; 2] = ["STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_VRAM_DIAGNOSTIC"];
 
     /// The names given as string literals to `calls` in the files under `root` with one of `extensions`, with the file each is read in.
     fn names_read(root: &Path, extensions: &[&str], calls: &[&str]) -> Vec<(String, PathBuf)> {

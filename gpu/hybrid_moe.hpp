@@ -70,9 +70,11 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
         const uint32_t expected = counters[hybrid_awaited_slot] + 1;
         counters[hybrid_awaited_slot] = expected;
         const uint64_t start = await_clock();
-        ready = 1;
-        while (counters[hybrid_published_slot] != expected) {
-            if (await_clock() - start > timeout) { counters[hybrid_await_failed_slot] = 1; ready = 0; break; }
+        ready = counters[hybrid_await_failed_slot] == 0;
+        while (ready && counters[hybrid_published_slot] != expected) {
+            if (counters[hybrid_await_failed_slot] || await_clock() - start > timeout) {
+                counters[hybrid_await_failed_slot] = 1; ready = 0; break;
+            }
 #if defined(__HIPCC__)
             __builtin_amdgcn_s_sleep(2);
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
@@ -105,10 +107,17 @@ __global__ void hybrid_stage(const volatile float* result, float* target) {
 // Host side of hybrid_await for one span. Counts restart from the GPU's awaited count
 // (the stream is idle between spans); a span that unwinds still publishes every
 // result its launched graphs await, then drains the stream.
+struct HybridWaitTimeout : std::runtime_error {
+    HybridWaitTimeout() : std::runtime_error("hybrid CPU result was not published in time") {}
+};
+// Development fault injection, consumed only at the host's checked wait boundary.
+std::atomic<uint64_t> test_hybrid_timeouts{0};
+
 struct HybridAwait {
     Device& d;
     volatile uint32_t* counters;
     uint32_t launched = 0, published = 0;
+    bool timed_out = false;
     const int unwinding = std::uncaught_exceptions();
     explicit HybridAwait(Device& device)
         : d(device), counters(reinterpret_cast<volatile uint32_t*>(device.exchange + hybrid_sequence_slot)) {
@@ -120,13 +129,24 @@ struct HybridAwait {
         counters[hybrid_published_slot] = counters[hybrid_published_slot] + 1;
         ++published;
     }
-    void check_failed() const {
-        if (counters[hybrid_await_failed_slot]) throw std::runtime_error("hybrid CPU result was not published in time");
+    void check_failed() {
+        uint64_t left = test_hybrid_timeouts.load();
+        while (left && !test_hybrid_timeouts.compare_exchange_weak(left, left - 1)) {}
+        if (left) {
+            counters[hybrid_await_failed_slot] = 1;
+            std::atomic_thread_fence(std::memory_order_release);
+        }
+        if (counters[hybrid_await_failed_slot]) {
+            timed_out = true;
+            throw HybridWaitTimeout();
+        }
     }
     ~HybridAwait() {
         if (std::uncaught_exceptions() == unwinding) return;
         while (published < launched) publish();
-        cleanup(hipStreamSynchronize(d.stream));
+        // A timeout is drained with checked errors by its C ABI catch. The first
+        // CUDA/HIP failure must reach that catch instead of being discarded here.
+        if (!timed_out) cleanup(hipStreamSynchronize(d.stream));
     }
 };
 

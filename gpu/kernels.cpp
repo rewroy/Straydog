@@ -128,6 +128,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>   // PrefetchVirtualMemory: read-ahead hints for mapped expert banks
+#include <dxgi1_4.h>
 #endif
 #endif
 #if defined(__linux__)
@@ -1435,6 +1436,29 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "ds_attention_wmma.hpp"
 #include "transfer.hpp"
 
+// HybridAwait has already published every launched graph's missing CPU result.
+// A successful drain makes the interrupted pass disposable and aligns the next export.
+int recover_hybrid_wait(void* handle) {
+    try {
+        auto& d = device(handle);
+        check(hipStreamSynchronize(d.stream));
+        hybrid_settle(d, true);
+        check(hipStreamSynchronize(d.stream));
+        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream})
+            if (stream) check(hipStreamSynchronize(stream));
+        auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        d.hybrid_sequence = counters[0];
+        counters[hybrid_published_slot] = counters[hybrid_awaited_slot];
+        counters[hybrid_await_failed_slot] = 0;
+        std::atomic_thread_fence(std::memory_order_release);
+        last_error = "the GPU wait timed out; the interrupted pass was discarded";
+    } catch (const std::exception& error) {
+        last_error = error.what();
+    }
+    return -1;
+}
+
 // The attention rope table: forward[row, pair], then the inverse at the same stride, one allocation
 // for the pass. Publishing consumes an arm from sd_attention_turns_arm.
 struct AttentionTurnsView {
@@ -1513,11 +1537,13 @@ int sd_decoder_layer(void* handle,uint64_t layer,uint64_t context,void* const* p
 }
 int sd_decode_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,const float* input,float* output) {
     try { decode_span(device(handle),size_t(begin),size_t(end),size_t(position),input,output); return 0; }
+    catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_verify_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,
                    const float* input,float* output) {
     try { verify_span(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,output); return 0; }
+    catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_verify_reserve(void* handle) {
@@ -1648,7 +1674,8 @@ int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t la
         draft_step(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,
                    size_t(previous),head,head_kinds,size_t(vocabulary),size_t(split),peer_head,token,confidence,unsigned(top),best);
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
                    const float* embeddings,const float* hidden,uint64_t previous) {
@@ -1658,7 +1685,8 @@ int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t l
         draft_queue(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,size_t(previous),parts);
         if (parts) throw std::runtime_error("a queued drafting step needs a layer in parts");
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_draft_head(void* handle,void* const* head,const int* head_kinds,uint64_t layer,uint64_t row,uint64_t vocabulary,
                   uint64_t split,void* peer_head,int32_t* token,float* confidence,uint64_t top,float* best) {
@@ -1790,7 +1818,8 @@ int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void*
         check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
         prefill_span(d,size_t(layer),size_t(layer)+1,size_t(position),size_t(count),nullptr,nullptr,0);
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_mtp_prompt_rows(void* handle,void* const* pointers,const int* kinds,void* stash,uint64_t stash_layer,
                        uint64_t first,uint64_t count,const float* previous,const float* embeddings,
@@ -1827,7 +1856,8 @@ int sd_mtp_prompt_rows(void* handle,void* const* pointers,const int* kinds,void*
         check(hipMemcpyAsync(target->second.workspace,hidden,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
         prefill_span(d,size_t(layer),size_t(layer)+1,size_t(position),size_t(count),nullptr,nullptr,0);
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_ple_rows(void* handle,void* const* pointers,const int* kinds,void* history,uint64_t steps,
                 const float* embeddings,const float* hidden,float* output) {
@@ -2527,6 +2557,57 @@ int sd_test_refuse_host(uint64_t count) {
     refuse_host_allocations.store(count);
     return 0;
 }
+int sd_test_hybrid_timeout(uint64_t count) {
+    test_hybrid_timeouts.store(count);
+    return 0;
+}
+int sd_hybrid_wait_check(void* handle) {
+    try {
+        auto& d = device(handle);
+        if (d.exchange || !d.resident.empty() || !d.graphs.empty())
+            throw std::runtime_error("the hybrid wait check needs a fresh device");
+        create_expert_slots(d, 0, 2, 256, false);
+        auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
+        auto* gpu_counters = reinterpret_cast<volatile uint32_t*>(d.exchange_device + hybrid_sequence_slot);
+        bool failed = false;
+        try {
+            HybridAwait await(d);
+            await.launched = 2;
+            d.hybrid_sequence = 1; // The host consumed one export, while two are in flight.
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0);
+            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
+            // This wait must also abort, even if unwinding publishes beyond its expected count.
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0);
+            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
+            check(hipStreamSynchronize(d.stream));
+            await.check_failed();
+        } catch (const HybridWaitTimeout&) {
+            recover_hybrid_wait(handle);
+            failed = last_error == "the GPU wait timed out; the interrupted pass was discarded";
+        }
+        if (!failed || d.hybrid_sequence != 2 || counters[0] != 2 ||
+            counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot])
+            throw std::runtime_error("the expired hybrid wait was not recovered");
+        {
+            HybridAwait await(d);
+            for (size_t i = 0; i < 2560; ++i) d.exchange[i] = 42.0f;
+            await.launched = 1;
+            await.publish();
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout);
+            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
+            hybrid_wait_export(d, ++d.hybrid_sequence);
+            check(hipStreamSynchronize(d.stream));
+            await.check_failed();
+        }
+        std::vector<float> result(2560);
+        check(hipMemcpy(result.data(), d.cpu_partial, result.size() * sizeof(float), hipMemcpyDeviceToHost));
+        if (d.hybrid_sequence != 3 || counters[0] != 3 ||
+            counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot] ||
+            std::any_of(result.begin(), result.end(), [](float value) { return value != 42.0f; }))
+            throw std::runtime_error("the hybrid wait after recovery failed");
+        return 0;
+    } catch (const std::exception& error) { last_error = error.what(); return -1; }
+}
 // Development (tests/router_gpu.rs): a partially resident layer's router on the given weights, once as the separate kernels run it and then as
 // the one kernel (hybrid_router) runs it, `repeats` launches of a captured graph with the buffers cleared between them. `router` is `experts` rows of
 // 2560 values and `gate` one row, of kind 30 (BF16) or 0 (F32); `input` is `rows` rows of 2560 floats. Every result holds two copies, the separate
@@ -2784,6 +2865,58 @@ static bool nvml_free_bytes(const hipDeviceProp_t& prop, uint64_t& free_bytes) {
     free_bytes = memory.free;
     return true;
 }
+
+struct DxgiMemoryInfo {
+    HRESULT status = DXGI_ERROR_UNSUPPORTED;
+    const char* reason = "unavailable";
+    UINT node = 0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+};
+
+// Match CUDA's adapter and physical node before asking for this process's LOCAL budget.
+static DxgiMemoryInfo dxgi_memory_info(const hipDeviceProp_t& prop) {
+    DxgiMemoryInfo result;
+    if (prop.tccDriver) { result.reason = "tcc"; return result; }
+    const unsigned mask = prop.luidDeviceNodeMask;
+    if (!mask || (mask & (mask - 1))) { result.reason = "node_mask"; return result; }
+    if (std::all_of(prop.luid, prop.luid + sizeof(prop.luid), [](char byte) { return byte == 0; })) {
+        result.reason = "luid_unavailable";
+        return result;
+    }
+    while (!(mask & (1u << result.node))) ++result.node;
+    using CreateFactory = HRESULT (WINAPI*)(REFIID, void**);
+    static const CreateFactory create = []() {
+        const HMODULE library = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return library ? reinterpret_cast<CreateFactory>(GetProcAddress(library, "CreateDXGIFactory1")) : nullptr;
+    }();
+    if (!create) { result.reason = "factory_unavailable"; return result; }
+    IDXGIFactory1* factory = nullptr;
+    result.status = create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+    if (FAILED(result.status)) { result.reason = "create_factory"; return result; }
+    result.reason = "adapter_not_found";
+    for (UINT index = 0; ; ++index) {
+        IDXGIAdapter1* adapter = nullptr;
+        result.status = factory->EnumAdapters1(index, &adapter);
+        if (FAILED(result.status)) break;
+        DXGI_ADAPTER_DESC1 description{};
+        const HRESULT described = adapter->GetDesc1(&description);
+        if (SUCCEEDED(described) && std::memcmp(&description.AdapterLuid, prop.luid, sizeof(LUID)) == 0) {
+            IDXGIAdapter3* adapter3 = nullptr;
+            result.status = adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter3));
+            result.reason = "adapter3";
+            if (SUCCEEDED(result.status)) {
+                result.status = adapter3->QueryVideoMemoryInfo(result.node, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &result.memory);
+                result.reason = SUCCEEDED(result.status) ? "ok" : "query_memory";
+                adapter3->Release();
+            }
+            adapter->Release();
+            break;
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return result;
+}
 #endif
 // A build holds code only for the GPU architectures it was compiled for. The device is current.
 static void require_code_for(int ordinal) {
@@ -2819,6 +2952,77 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
 #if defined(_WIN32) && !defined(__HIPCC__)
         uint64_t measured = 0;
         if (nvml_free_bytes(prop, measured)) *free_bytes = std::min<uint64_t>(available, measured);
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_device_memory_diagnostic(int ordinal, int ready) {
+    try {
+#if defined(_WIN32) && !defined(__HIPCC__)
+        check(hipSetDevice(ordinal));
+        hipDeviceProp_t prop{};
+        check(hipGetDeviceProperties(&prop, ordinal));
+        size_t raw_free = 0, raw_total = 0;
+        const hipError_t runtime_status = hipMemGetInfo(&raw_free, &raw_total);
+        char name[256]{};
+        uint64_t reported_free = 0, reported_total = 0;
+        const int reported_status = sd_device_info(ordinal, name, sizeof(name), &reported_free, &reported_total);
+        const DxgiMemoryInfo dxgi = dxgi_memory_info(prop);
+        char runtime_values[96], reported_values[96], dxgi_values[256];
+        if (runtime_status == hipSuccess)
+            std::snprintf(runtime_values, sizeof(runtime_values), "%llu,\"cuda_total_bytes\":%llu",
+                          static_cast<unsigned long long>(raw_free), static_cast<unsigned long long>(raw_total));
+        else std::strcpy(runtime_values, "null,\"cuda_total_bytes\":null");
+        if (reported_status == 0)
+            std::snprintf(reported_values, sizeof(reported_values), "%llu,\"device_info_total_bytes\":%llu",
+                          static_cast<unsigned long long>(reported_free), static_cast<unsigned long long>(reported_total));
+        else std::strcpy(reported_values, "null,\"device_info_total_bytes\":null");
+        if (SUCCEEDED(dxgi.status))
+            std::snprintf(dxgi_values, sizeof(dxgi_values), "%llu,\"dxgi_current_usage_bytes\":%llu,"
+                          "\"dxgi_available_for_reservation_bytes\":%llu,\"dxgi_current_reservation_bytes\":%llu",
+                          static_cast<unsigned long long>(dxgi.memory.Budget), static_cast<unsigned long long>(dxgi.memory.CurrentUsage),
+                          static_cast<unsigned long long>(dxgi.memory.AvailableForReservation),
+                          static_cast<unsigned long long>(dxgi.memory.CurrentReservation));
+        else std::strcpy(dxgi_values, "null,\"dxgi_current_usage_bytes\":null,"
+                         "\"dxgi_available_for_reservation_bytes\":null,\"dxgi_current_reservation_bytes\":null");
+        LUID luid{};
+        std::memcpy(&luid, prop.luid, sizeof(luid));
+        std::fprintf(stderr, "Straydog VRAM diagnostic: {\"stage\":\"%s\",\"pid\":%lu,\"gpu\":%d,"
+                     "\"cuda_status\":%d,\"cuda_free_bytes\":%s,\"device_info_status\":%d,"
+                     "\"device_info_free_bytes\":%s,\"dxgi_status\":\"0x%08lx\",\"dxgi_reason\":\"%s\","
+                     "\"dxgi_budget_bytes\":%s,\"luid\":\"%08lx%08lx\",\"node_mask\":%u,\"node\":%u}\n",
+                     ready ? "ready" : "startup", GetCurrentProcessId(), ordinal, int(runtime_status), runtime_values,
+                     reported_status, reported_values, static_cast<unsigned long>(dxgi.status), dxgi.reason, dxgi_values,
+                     static_cast<unsigned long>(luid.HighPart), static_cast<unsigned long>(luid.LowPart),
+                     prop.luidDeviceNodeMask, dxgi.node);
+#else
+        (void)ordinal; (void)ready;
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget) {
+    try {
+        if (!bytes || !process_budget) throw std::runtime_error("invalid memory headroom buffers");
+        char name[256]{};
+        uint64_t free = 0, total = 0;
+        if (sd_device_info(ordinal, name, sizeof(name), &free, &total) < 0) return -1;
+        const uint64_t most = uint64_t(std::numeric_limits<int64_t>::max());
+        *bytes = int64_t(std::min(free, most));
+        *process_budget = 0;
+#if defined(_WIN32) && !defined(__HIPCC__)
+        hipDeviceProp_t prop{};
+        check(hipGetDeviceProperties(&prop, ordinal));
+        const DxgiMemoryInfo dxgi = dxgi_memory_info(prop);
+        if (SUCCEEDED(dxgi.status)) {
+            const uint64_t budget = dxgi.memory.Budget, used = dxgi.memory.CurrentUsage;
+            const int64_t headroom = budget >= used ? int64_t(std::min(budget - used, most))
+                                                    : -int64_t(std::min(used - budget, most));
+            *bytes = std::min(*bytes, headroom);
+            *process_budget = 1;
+        }
 #endif
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
