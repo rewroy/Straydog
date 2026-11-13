@@ -4,6 +4,7 @@
 //! stdin; events leave as JSON lines on stdout. One generation runs at a time on its own
 //! thread, so a cancellation is read while it runs. Every model byte is authenticated first.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings, WarmStart, END_TOKENS, ROUTED_EXPERTS, ROUTED_LAYERS};
 use straydog_engine::pyjson;
 use straydog_engine::qwen_vision::{Encoder, ImageSpan};
-use straydog_engine::routes::Routes;
+use straydog_engine::routes::{self, Routes};
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
@@ -139,6 +140,10 @@ struct Engine {
     encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
     /// The route counts of the runs before this one, from the warm-up state it started with (a partially resident model's: [`straydog_engine::routes`]).
     earlier: Option<Routes>,
+    /// The draft widths that state kept, by placement, which the next state keeps beside this placement's own ([`routes::with_drafts`]).
+    earlier_drafts: BTreeMap<String, u64>,
+    /// This placement's key in those ([`placement_key`]).
+    placement: String,
     /// The requests this run has begun: a warm start's slot fill ends with the first ([`fill_slots`]).
     requests: u64,
     /// The handle the request loop shares, for a locking that memory freed since the start allows ([`Engine::lock_more`]).
@@ -237,8 +242,9 @@ impl Served for Engine {
         self.lock_more();
     }
 
-    /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own. Null for a model that holds all its experts,
-    /// and before any route was counted.
+    /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own; and the draft widths by placement: the
+    /// earlier state's, with this placement's set to the width in force once the passes have chosen it (before, its earlier one stays). Null for a model
+    /// that holds all its experts, and before any route was counted.
     fn warm_state(&mut self) -> Result<Value, String> {
         if !self.model.partial {
             return Ok(Value::Null);
@@ -246,7 +252,10 @@ impl Served for Engine {
         let run = self.model.route_counts()?;
         let earlier = self.earlier.clone().unwrap_or_else(|| Routes::new(ROUTED_LAYERS, ROUTED_EXPERTS));
         let kept = earlier.aged_with(&run);
-        Ok(if kept.total() == 0 { Value::Null } else { kept.to_state() })
+        if kept.total() == 0 {
+            return Ok(Value::Null);
+        }
+        Ok(routes::with_drafts(kept.to_state(), &self.earlier_drafts, &self.placement, self.model.chosen_drafts()))
     }
 
     fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
@@ -378,8 +387,9 @@ impl Engine {
     }
 
     /// The first step of a warm start with `state`, under the engine's lock ([`straydog_engine::model::Model::warm_start`]): the earlier counts it keeps
-    /// to save with the next state, the scores it sets, and what it plans. None for a model that holds all its experts. A state of another kind, format or
-    /// model is refused and the model starts as it would without.
+    /// to save with the next state, the scores it sets, and what it plans; and the draft width the last run on this placement chose, which the model's
+    /// passes begin at ([`straydog_engine::model::Model::start_drafts_at`]), the state's other widths kept to save beside it. None for a model that holds
+    /// all its experts. A state of another kind, format or model is refused and the model starts as it would without.
     fn warm_begin(&mut self, state: &Value) -> Result<Option<WarmStart>, String> {
         if !self.model.partial {
             return Ok(None);
@@ -387,6 +397,12 @@ impl Engine {
         let prior = Routes::from_state(state, ROUTED_LAYERS, ROUTED_EXPERTS)?;
         let start = self.model.warm_start(&prior)?;
         self.earlier = Some(prior);
+        self.earlier_drafts = routes::drafts_in(state);
+        if let Some(width) = routes::saved_drafts(state, &self.placement, self.model.speculative) {
+            if self.model.start_drafts_at(width) {
+                eprintln!("Straydog drafts: starting at {width}, as the last run on this placement chose");
+            }
+        }
         Ok(Some(start))
     }
 }
@@ -903,6 +919,28 @@ fn memory_diagnostic(devices: &[usize], ready: bool) {
     }
 }
 
+/// A VRAM budget as the key of a placement names it: its size in GiB, to hundredths, without the zeros the hundredths leave (`12G`, `11.5G`).
+fn budget_label(bytes: u64) -> String {
+    let gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64);
+    format!("{}G", gib.trim_end_matches('0').trim_end_matches('.'))
+}
+
+/// The key of this placement in the warm-up state's draft widths ([`routes::saved_drafts`]), so that another placement of the same model does not take this
+/// one's width: each GPU used (its ordinal and name) with its VRAM budget as it was given (`vram`, as the worker takes it: `auto`, or each GPU's bytes; not
+/// what `auto` took, which moves with what other programs hold), the context size, and whether a drafter is loaded: `0:NVIDIA GeForce RTX 5090@12G; ctx
+/// 32768; drafter` for one GPU given 12 GiB, `0:NVIDIA GeForce RTX 5090@auto,1:NVIDIA GeForce RTX 3090@auto; ctx 32768; drafter` for two left to `auto`.
+fn placement_key(gpus: &[(usize, String)], vram: &str, context: usize, drafter: bool) -> String {
+    let budgets: Vec<String> = if vram == "auto" {
+        vec!["auto".into(); gpus.len()]
+    } else {
+        vram.split(',').map(|part| part.parse::<u64>().map_or_else(|_| part.to_string(), budget_label)).collect()
+    };
+    let gpus: Vec<String> = gpus.iter().enumerate()
+        .map(|(index, (ordinal, name))| format!("{ordinal}:{name}@{}", budgets.get(index).map_or("?", String::as_str)))
+        .collect();
+    format!("{}; ctx {context}; {}", gpus.join(","), if drafter { "drafter" } else { "no drafter" })
+}
+
 pub fn main(args: WorkerArgs) -> Result<(), String> {
     straydog_engine::host::set_prefetch_memory_limits(args.host_memory_limit_files.clone());
     // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
@@ -1052,8 +1090,12 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "load_seconds": seconds,
         "gpu": model.info()?,
     });
-    let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0, me: me.clone(),
-                                                       vram_auto: args.vram_bytes == "auto",
+    let gpus: Vec<(usize, String)> = args.devices.iter()
+        .map(|&ordinal| (ordinal, straydog_gpu::device_info(ordinal).map_or_else(|_| "unknown GPU".into(), |(name, _, _)| name)))
+        .collect();
+    let placement = placement_key(&gpus, &args.vram_bytes, model.context, model.weights.drafter);
+    let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, earlier_drafts: BTreeMap::new(), placement,
+                                                       requests: 0, me: me.clone(), vram_auto: args.vram_bytes == "auto",
                                                        #[cfg(windows)] vram_limits }));
     #[cfg(all(windows, feature = "cuda"))]
     memory_diagnostic(&args.devices, true);
@@ -1858,6 +1900,34 @@ mod tests {
         assert_eq!(filled, Filled::CutShort);
         assert!(waited.elapsed() < Duration::from_secs(2), "{:?}", waited.elapsed());
         drop(held);
+    }
+
+    /// Decides: a placement's key names each GPU with its budget as it was given, the context and the drafter, so that no other placement of the model
+    /// has it: another GPU, budget, `auto` against a size, context or drafter makes another key; the same placement makes the same.
+    #[test]
+    fn a_placements_key_names_what_the_placement_is() {
+        let gib = |gib: u64| (gib << 30).to_string();
+        let one = vec![(0, "NVIDIA GeForce RTX 5090".to_string())];
+        let key = placement_key(&one, &gib(12), 32768, true);
+        assert_eq!(key, "0:NVIDIA GeForce RTX 5090@12G; ctx 32768; drafter");
+        assert_eq!(placement_key(&one, &gib(12), 32768, true), key);
+        assert_eq!(placement_key(&one, "auto", 32768, true), "0:NVIDIA GeForce RTX 5090@auto; ctx 32768; drafter");
+        assert_eq!(placement_key(&one, &gib(12), 32768, false), "0:NVIDIA GeForce RTX 5090@12G; ctx 32768; no drafter");
+        let others = [placement_key(&one, &gib(11), 32768, true), placement_key(&one, "auto", 32768, true), placement_key(&one, &gib(12), 65536, true),
+                      placement_key(&one, &gib(12), 32768, false), placement_key(&[(1, "NVIDIA GeForce RTX 5090".into())], &gib(12), 32768, true),
+                      placement_key(&[(0, "NVIDIA GeForce RTX 3090".into())], &gib(12), 32768, true)];
+        assert!(others.iter().all(|other| *other != key) && (0..others.len()).all(|at| (0..at).all(|before| others[at] != others[before])), "{others:?}");
+        // (two GPUs, each with its own budget; a budget between whole GiB to hundredths; a budget that is not a number, or missing for a GPU, stays as it
+        // is given, or is a mark: the worker has refused those before it comes to a key)
+        let two = vec![(0, "NVIDIA GeForce RTX 5090".to_string()), (1, "NVIDIA GeForce RTX 3090".to_string())];
+        let given = format!("{},{}", gib(12), (11.5 * (1u64 << 30) as f64) as u64);
+        assert_eq!(placement_key(&two, &given, 8192, true), "0:NVIDIA GeForce RTX 5090@12G,1:NVIDIA GeForce RTX 3090@11.5G; ctx 8192; drafter");
+        assert_eq!(placement_key(&two, "auto", 8192, true), "0:NVIDIA GeForce RTX 5090@auto,1:NVIDIA GeForce RTX 3090@auto; ctx 8192; drafter");
+        assert_eq!(placement_key(&two, &gib(12), 8192, true), "0:NVIDIA GeForce RTX 5090@12G,1:NVIDIA GeForce RTX 3090@?; ctx 8192; drafter");
+        assert_eq!(budget_label(10 << 30), "10G");
+        assert_eq!(budget_label(0), "0G");
+        assert_eq!(budget_label((6.25 * (1u64 << 30) as f64) as u64), "6.25G");
+        assert_eq!(placement_key(&one, "lots", 1, true), "0:NVIDIA GeForce RTX 5090@lots; ctx 1; drafter");
     }
 
     #[test]
