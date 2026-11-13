@@ -71,8 +71,11 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
         counters[hybrid_awaited_slot] = expected;
         const uint64_t start = await_clock();
         ready = counters[hybrid_await_failed_slot] == 0;
+        uint32_t spin = 0;
         while (ready && counters[hybrid_published_slot] != expected) {
-            if (counters[hybrid_await_failed_slot] || await_clock() - start > timeout) {
+            // Host fault injection can cancel this wait after entry, even when
+            // unwinding has published beyond expected. Avoid reading it every spin.
+            if (((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) || await_clock() - start > timeout) {
                 counters[hybrid_await_failed_slot] = 1; ready = 0; break;
             }
 #if defined(__HIPCC__)
