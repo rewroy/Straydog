@@ -118,6 +118,9 @@ fn attention_layers(drafting: bool) -> u64 {
 /// is sound, and a shorter sequence can still run.
 pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this sequence";
 
+/// The model is intact, but its fixed allocations leave too little GPU memory for a request.
+pub const VRAM_NO_MEMORY: &str = "not enough GPU memory to serve this request";
+
 /// The end of the error of what an image asked and the devices could not give, or of a prompt whose image rows would run in a
 /// pass of one row, which no pass of its kind takes (the chat template cannot render one: its images are followed by text enough).
 /// The devices are sound: the request fails, and the engine resets.
@@ -797,6 +800,8 @@ pub struct Model {
     /// STRAYDOG_HC=blas; [`Model::hc_fused_from`] for a test).
     hc_fused_from: usize,
     layer_prefill_restore_failure: Option<String>,
+    /// A failed wait recovery leaves this model unavailable for further generations.
+    recovery_failure: Option<String>,
     pub host_kv: bool,
     /// The rows of a long read's batches where the workspaces hold more than `prefill_batch_size` (0: they do not, or the batch was given: see
     /// [`wide_placement`]), and what the widest wanted would have needed when they do not.
@@ -1034,6 +1039,7 @@ impl Model {
             chunked_scan_from: chunked_scan_from_named(std::env::var("STRAYDOG_DELTA_SCAN").ok().as_deref()),
             hc_fused_from: hc_fused_from_named(std::env::var("STRAYDOG_HC").ok().as_deref()),
             layer_prefill_restore_failure: None,
+            recovery_failure: None,
             host_kv: host,
             wide_batch_size: wide,
             wide_note,
@@ -1696,10 +1702,20 @@ impl Model {
         self.group.backends.get(index).ok_or("no such Straydog GPU")?.free_bytes()
     }
 
+    /// The free memory or signed Windows process-budget headroom of this GPU.
+    pub fn vram_headroom(&self, index: usize) -> Result<(i64, bool)> {
+        self.group.backends.get(index).ok_or("no such Straydog GPU")?.headroom()
+    }
+
     /// Raise the group's `index`th GPU's budget to `budget`, its expert slots placed again at what fits ([`crate::gpu::Backend::raise_budget`]):
     /// the slots before and after.
     pub fn raise_vram(&mut self, index: usize, budget: u64) -> Result<(u64, u64)> {
         self.group.backends.get_mut(index).ok_or("no such Straydog GPU")?.raise_budget(budget)
+    }
+
+    /// Resize this GPU's expert pool between requests, preserving the fixed model state.
+    pub fn resize_vram(&mut self, index: usize, budget: u64) -> Result<(u64, u64)> {
+        self.group.backends.get_mut(index).ok_or("no such Straydog GPU")?.resize_budget(budget)
     }
 
     /// The layers that memory freed since the start's plan ([`Model::plan_host_banks`]) has room for: a program that let go of its memory, or a
@@ -2050,10 +2066,36 @@ impl Model {
     // ---- state ----
 
     pub fn reset(&mut self) -> Result<()> {
+        if let Some(failure) = &self.recovery_failure { return Err(failure.clone()); }
         if let Some(failure) = &self.layer_prefill_restore_failure { return Err(failure.clone()); }
         self.history.clear();
         self.final_hidden = None;
         self.group.reset_state()
+    }
+
+    /// Discard every saved sequence state after a pass whose native wait was recovered.
+    fn recover_hybrid_wait(&mut self) -> Result<()> {
+        let mut recovered = Ok(());
+        for (_, checkpoint) in std::mem::take(&mut self.checkpoints) {
+            let released = self.release_checkpoint(checkpoint);
+            recovered = recovered.and(released);
+        }
+        if let Some(parked) = self.parked.take() {
+            let released = self.discard(parked);
+            recovered = recovered.and(released);
+        }
+        self.mtp_kept = 0;
+        // These vocabulary rows may not have reached the GPU. Let a later sequence
+        // note them again instead of mistaking them for rows already installed.
+        for token in self.draft_pending.drain(..) { self.draft_extras.remove(&token); }
+        let reset = self.reset();
+        recovered = recovered.and(reset);
+        if let Err(error) = recovered {
+            let failure = format!("could not reset the GPU after its wait timed out: {error}; model state is unusable");
+            self.recovery_failure = Some(failure.clone());
+            return Err(failure);
+        }
+        Ok(())
     }
 
     /// Let the warm-up behind "ready" be stopped in the middle of a pass: while `stop` is set and true, a prompt batch ends between two layers
@@ -4216,6 +4258,7 @@ impl Model {
                                 cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize), turn: bool,
                                 checkpoint: bool, emit: &mut dyn FnMut(u32), constraint: Option<&mut Constraint>)
                                 -> Result<()> {
+        if let Some(failure) = &self.recovery_failure { return Err(failure.clone()); }
         if let Some(profile) = self.profile.as_mut() {
             *profile = Profile::new(profile.every);
         }
@@ -4231,6 +4274,9 @@ impl Model {
         }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
+        if result.as_ref().is_err_and(|error| error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED)) {
+            self.recover_hybrid_wait()?;
+        }
         result
     }
 
@@ -4432,6 +4478,69 @@ impl Model {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(feature = "hip", feature = "cuda")))]
+mod wait_recovery_gpu {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires model files and an exclusive GPU"]
+    fn a_recovered_hybrid_wait_discards_saved_sequences_and_serves_the_next_request() {
+        let root = std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model directory");
+        let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
+        let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(std::path::PathBuf::from);
+        let bundle = crate::bundle::Id::find(Some(crate::bundle::MODEL), None, &quant).expect("a known Qwen bundle");
+        let budget = 6 << 30;
+        let mut group = Group::new(&[0], &[budget], crate::group::SplitMode::Experts).unwrap();
+        group.configure_gemm(2, true).unwrap();
+        let weights = Weights::open(&std::path::PathBuf::from(root), bundle, drafter.as_deref(),
+                                    crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        let text = crate::text::Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
+        let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256,
+                                  speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 8, row_cache_bytes: None };
+        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+        assert!(model.partial);
+        if drafter.is_some() { assert!(model.speculative > 0, "the test must keep its MTP layer"); }
+        model.prompt_share(false).unwrap();
+        // A display GPU prelaunches waits only for spans containing mapped banks.
+        assert!(model.lock_layers_for_test(&[0]).unwrap() > 0);
+        let prompt = text.encode("<|im_start|>user\nCount from one to thirty in English.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+        let generate = |model: &mut Model, tokens: &[u32]| {
+            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |_| {})
+        };
+        generate(&mut model, &prompt).unwrap();
+        assert!(!model.history.is_empty());
+        model.save_checkpoint("root").unwrap();
+        model.save_checkpoint("turn").unwrap();
+        if let Some(old) = model.parked.take() { model.discard(old).unwrap(); }
+        model.parked = Some(model.park(0, PARK_SLOTS[0]).unwrap());
+        let mut next = model.history.clone();
+        next.extend(text.encode("\nContinue counting: ").unwrap());
+        struct ClearFault;
+        impl Drop for ClearFault {
+            fn drop(&mut self) { unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); } }
+        }
+        let _clear = ClearFault;
+        // SAFETY: a development-only counter; one GPU job holds the test's process.
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(1); }
+        let error = generate(&mut model, &next).unwrap_err();
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
+        assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
+        assert!(model.history.is_empty() && model.final_hidden.is_none());
+        assert!(model.checkpoints.is_empty() && model.parked.is_none());
+        assert_eq!(model.mtp_kept, 0);
+        assert!(model.draft_pending.is_empty() && model.recovery_failure.is_none());
+        generate(&mut model, &prompt).unwrap();
+        assert!(model.history.starts_with(&prompt));
+        let before = model.vram_budgets().unwrap()[0].2;
+        model.resize_vram(0, before - (512 << 20)).unwrap();
+        let after = model.vram_budgets().unwrap()[0].2;
+        assert!(after < before, "the budget must actually fall");
+        generate(&mut model, &next).unwrap();
+        model.raise_vram(0, before).unwrap();
+        generate(&mut model, &prompt).unwrap();
     }
 }
 

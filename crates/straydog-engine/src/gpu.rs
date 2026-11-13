@@ -26,6 +26,10 @@ fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
 }
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// A software wait timeout whose native queues were drained and export counters aligned.
+pub const HYBRID_WAIT_RECOVERED: &str = "the GPU wait timed out; the interrupted pass was discarded";
+
 /// A head's rows: each row's first maximum, its logits and its probability when asked.
 /// A verification head's rows for drawing the next tokens: every logit, or (`Top`) each row's greatest logits with their
 /// tokens, most likely first and the lower token first on a tie, which is all a draw reads when its cut keeps at most
@@ -621,9 +625,44 @@ impl Backend {
         Ok((before, self.hybrid_counts()?[3]))
     }
 
+    /// Resize the expert pool between requests. A reduction releases its old arena before
+    /// changing the budget, retaining the fixed state and the staging space a pass needs.
+    /// A refused allocation leaves the smaller budget in force and the pool retryable.
+    pub fn resize_budget(&mut self, budget: u64) -> Result<(u64, u64)> {
+        let (used, previous) = self.memory()?;
+        if budget >= previous {
+            return self.raise_budget(budget);
+        }
+        if self.long_prefill.is_some() {
+            return Err("cannot lower the GPU budget during a prompt pass".into());
+        }
+        let before = self.hybrid_counts()?[3];
+        if self.slot_stage == 0 {
+            // SAFETY: a live handle; fixed allocations remain within the enforced budget.
+            check(unsafe { ffi::sd_set_budget(self.handle, budget.max(used)) })?;
+            return Ok((before, before));
+        }
+        // SAFETY: the caller holds the model between requests. Native release settles the
+        // copies and clears every slot's table entry before freeing its arena.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.slots_absent = true;
+        let fixed = self.memory()?.0;
+        let minimum = fixed.saturating_add(self.slot_stage.saturating_mul(self.slot_size)).saturating_add(self.slot_margin);
+        let smaller = budget.max(minimum).min(previous);
+        // SAFETY: fixed allocations fit; the old arena has already been released.
+        check(unsafe { ffi::sd_set_budget(self.handle, smaller) })?;
+        self.slots_back()?;
+        Ok((before, self.hybrid_counts()?[3]))
+    }
+
     /// The device's free memory as the runtime reports it (the card's, other programs' included).
     pub fn free_bytes(&self) -> Result<u64> {
         straydog_gpu::device_info(self.ordinal).map(|(_, free, _)| free).map_err(|error| error.to_string())
+    }
+
+    /// Free memory, including a negative process-budget overrun where Windows reports one.
+    pub fn headroom(&self) -> Result<(i64, bool)> {
+        straydog_gpu::device_headroom(self.ordinal).map_err(|error| error.to_string())
     }
 
     /// Enable quality-only observers of FP16 casts once, before graphs are recorded.
