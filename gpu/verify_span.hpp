@@ -145,7 +145,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     const bool stage = ahead;
 #endif
     auto finish_previous = [&]() {
-        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0), stage ? d.cpu_partial : nullptr, d.await_timeout);
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0), stage ? d.cpu_partial : nullptr, d.await_timeout, d.flags + hybrid_await_device_failed);
 #if !defined(__HIPCC__)
         if (stage && steps > 1)
             hybrid_stage<<<dim3(1,unsigned(steps - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1), d.cpu_partial + 2560);
