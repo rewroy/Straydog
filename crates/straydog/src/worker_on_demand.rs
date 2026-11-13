@@ -116,13 +116,25 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let mut served = match load(args, data_dir, &settings, report, place) {
+            let initialized = load(args, data_dir, &settings, report, place).and_then(|(served, frame, text)| {
+                #[cfg(windows)]
+                if plan.startup_vram_reduced() {
+                    // lend_spare adds expert slots within each Backend's existing cap. Read that
+                    // enforced cap after warm-up; an expert-parallel group can use its least budget.
+                    let actual = served.model.engines.gpus().into_iter()
+                        .map(|gpu| gpu.memory().map(|(_, budget)| (gpu.ordinal, budget)))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    plan.report_startup_vram(&actual)?;
+                }
+                Ok((served, frame, text))
+            });
+            let mut served = match initialized {
                 Ok((served, frame, text)) => {
                     let _ = loaded.send(Ok((frame, text)));
                     served
                 }
                 Err(error) => {
-                    let _ = loaded.send(Err(error));
+                    let _ = loaded.send(Err(plan.startup_error(error)));
                     return;
                 }
             };
