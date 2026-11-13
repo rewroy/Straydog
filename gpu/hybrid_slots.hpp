@@ -14,6 +14,9 @@ constexpr size_t hybrid_exchange_floats = hybrid_sequence_slot + 16;
 // From hybrid_sequence_slot, as uint32: +1 CPU results published by the host, +2 results
 // awaited by the GPU (hybrid_await), +3 nonzero once an await gave up.
 constexpr size_t hybrid_published_slot = 1, hybrid_awaited_slot = 2, hybrid_await_failed_slot = 3;
+// Device::flags[4] retains an await failure across spans until checked recovery;
+// pool creation clears [0..3], timing uses [8..15], router counters start at [16].
+constexpr size_t hybrid_await_device_failed = 4;
 // Device::flags[16 + row]: the blocks of a row that hybrid_router has counted in (zero between launches, from create_hybrid_moe on).
 constexpr size_t hybrid_router_counters = 16;
 

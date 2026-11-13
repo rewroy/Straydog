@@ -64,25 +64,33 @@ __global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_st
 // `timeout` ticks (~1 s under Windows' 2 s kernel watchdog, 10 s elsewhere) it gives up
 // and marks the failure for the host instead of hanging the device; the layer's output is
 // then void.
-__global__ void hybrid_await(volatile uint32_t* counters, const volatile float* result, float* target, uint64_t timeout) { SD_KERNEL_ACQUIRE;
+__global__ void hybrid_await(volatile uint32_t* counters, const volatile float* result, float* target, uint64_t timeout,
+                             volatile uint32_t* device_failed) { SD_KERNEL_ACQUIRE;
     __shared__ uint32_t ready;
     if (threadIdx.x == 0) {
         const uint32_t expected = counters[hybrid_awaited_slot] + 1;
         counters[hybrid_awaited_slot] = expected;
         const uint64_t start = await_clock();
-        ready = counters[hybrid_await_failed_slot] == 0;
+        // The healthy entry reads only VRAM for failure state, not mapped host memory.
+        ready = *device_failed == 0;
         uint32_t spin = 0;
         while (ready && counters[hybrid_published_slot] != expected) {
             // Host fault injection can cancel this wait after entry, even when
             // unwinding has published beyond expected. Avoid reading it every spin.
             if (((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) || await_clock() - start > timeout) {
-                counters[hybrid_await_failed_slot] = 1; ready = 0; break;
+                ready = 0; break;
             }
 #if defined(__HIPCC__)
             __builtin_amdgcn_s_sleep(2);
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
             __nanosleep(256);
 #endif
+        }
+        if (!ready) {
+            *device_failed = 1;
+            // A later span may have cleared the host word in its constructor.
+            // Re-notify even when the result was already published at entry.
+            counters[hybrid_await_failed_slot] = 1;
         }
         __threadfence_system();
     }

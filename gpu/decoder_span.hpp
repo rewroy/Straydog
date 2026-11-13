@@ -154,7 +154,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
 #endif
     const float* cpu_result=stage_cpu_result ? d.cpu_partial : d.exchange_device+hybrid_result_at(0);
     auto finish_previous=[&]() {
-        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout);
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout, d.flags + hybrid_await_device_failed);
         hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,cpu_result,0,hybrid_clock(d));
     };
     // One captured graph per layer: the previous layer's residual (adding the CPU

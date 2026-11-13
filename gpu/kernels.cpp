@@ -1446,6 +1446,13 @@ int recover_hybrid_wait(void* handle) {
         check(hipStreamSynchronize(d.stream));
         for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream})
             if (stream) check(hipStreamSynchronize(stream));
+        if (d.transfers)
+            for (hipStream_t stream : d.transfers->streams)
+                if (stream) check(hipStreamSynchronize(stream));
+        // Only a fully drained recovery may clear the device latch. The next span's
+        // graphs see this reset in stream order, with no per-span clear or launch.
+        check(hipMemsetAsync(d.flags + hybrid_await_device_failed, 0, sizeof(uint32_t), d.stream));
+        check(hipStreamSynchronize(d.stream));
         auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
         std::atomic_thread_fence(std::memory_order_acquire);
         d.hybrid_sequence = counters[0];
@@ -2569,23 +2576,43 @@ int sd_hybrid_wait_check(void* handle) {
         create_expert_slots(d, 0, 2, 256, false);
         auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
         auto* gpu_counters = reinterpret_cast<volatile uint32_t*>(d.exchange_device + hybrid_sequence_slot);
+        const auto device_failed = [&]() {
+            uint32_t value = 0;
+            check(hipMemcpy(&value, d.flags + hybrid_await_device_failed, sizeof(value), hipMemcpyDeviceToHost));
+            return value;
+        };
+        if (device_failed()) throw std::runtime_error("a fresh device has a failed hybrid wait");
         bool failed = false;
         try {
             HybridAwait await(d);
             await.launched = 2;
             d.hybrid_sequence = 1; // The host consumed one export, while two are in flight.
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0);
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0, d.flags + hybrid_await_device_failed);
             hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
             // This wait must also abort, even if unwinding publishes beyond its expected count.
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0);
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0, d.flags + hybrid_await_device_failed);
             hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
             check(hipStreamSynchronize(d.stream));
+            if (device_failed() != 1) throw std::runtime_error("the expired hybrid wait did not latch on the device");
             await.check_failed();
         } catch (const HybridWaitTimeout&) {
+            bool renotified = false;
+            try {
+                HybridAwait await(d);   // clears only the host failure word
+                if (counters[hybrid_await_failed_slot]) throw std::runtime_error("the next span did not clear its host failure word");
+                await.launched = 1;
+                await.publish();   // already published: no spin or periodic host-cancel check
+                hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout, d.flags + hybrid_await_device_failed);
+                check(hipStreamSynchronize(d.stream));
+                if (device_failed() != 1 || counters[hybrid_await_failed_slot] != 1)
+                    throw std::runtime_error("the latched hybrid wait did not re-notify the next span");
+                await.check_failed();
+            } catch (const HybridWaitTimeout&) { renotified = true; }
+            if (!renotified) throw std::runtime_error("the latched hybrid wait was not rejected");
             recover_hybrid_wait(handle);
             failed = last_error == "the GPU wait timed out; the interrupted pass was discarded";
         }
-        if (!failed || d.hybrid_sequence != 2 || counters[0] != 2 ||
+        if (!failed || device_failed() || d.hybrid_sequence != 2 || counters[0] != 2 ||
             counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot])
             throw std::runtime_error("the expired hybrid wait was not recovered");
         {
@@ -2593,7 +2620,7 @@ int sd_hybrid_wait_check(void* handle) {
             for (size_t i = 0; i < 2560; ++i) d.exchange[i] = 42.0f;
             await.launched = 1;
             await.publish();
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout);
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout, d.flags + hybrid_await_device_failed);
             hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
             hybrid_wait_export(d, ++d.hybrid_sequence);
             check(hipStreamSynchronize(d.stream));
@@ -2601,7 +2628,7 @@ int sd_hybrid_wait_check(void* handle) {
         }
         std::vector<float> result(2560);
         check(hipMemcpy(result.data(), d.cpu_partial, result.size() * sizeof(float), hipMemcpyDeviceToHost));
-        if (d.hybrid_sequence != 3 || counters[0] != 3 ||
+        if (device_failed() || d.hybrid_sequence != 3 || counters[0] != 3 ||
             counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot] ||
             std::any_of(result.begin(), result.end(), [](float value) { return value != 42.0f; }))
             throw std::runtime_error("the hybrid wait after recovery failed");
