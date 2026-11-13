@@ -25,6 +25,19 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_device_memory_diagnostic(
+        ordinal: ::std::os::raw::c_int,
+        ready: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_device_headroom(
+        ordinal: ::std::os::raw::c_int,
+        bytes: *mut i64,
+        process_budget: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_host_register_read_only_supported(
         ordinal: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
@@ -170,6 +183,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sd_test_refuse_host(count: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_test_hybrid_timeout(count: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_wait_check(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_hybrid_route_check(

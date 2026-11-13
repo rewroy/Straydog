@@ -19,6 +19,10 @@ int sd_device_count(void);
 /* Load the first Qwen prompt-prefill GEMM's GPU code without reading model weights. */
 int sd_prime_qwen_prefill_gemm(int ordinal, uint64_t tokens);
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes);
+/* Log device memory at startup (ready=0) or before ready (ready=1). */
+int sd_device_memory_diagnostic(int ordinal, int ready);
+/* Signed bytes until the process's memory budget; process_budget is 1 for DXGI, 0 for reported free. */
+int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget);
 /* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
 int sd_host_register_read_only_supported(int ordinal);
 /* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
@@ -63,6 +67,10 @@ int sd_host_free(int ordinal, void* pointer);
 /* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
    refused as a machine short of memory refuses them; 0 ends it. */
 int sd_test_refuse_host(uint64_t count);
+/* Development: fail the next `count` checked hybrid waits with a software timeout; 0 ends it. */
+int sd_test_hybrid_timeout(uint64_t count);
+/* Development: on a fresh device, exercise an expired hybrid wait, recovery and a subsequent successful handshake. */
+int sd_hybrid_wait_check(void* handle);
 /* Development (tests/router_gpu.rs): a partially resident layer's router (`experts` rows of 2560 values of kind 30 or 0, and a one-row gate) run
    by the separate kernels and by the one kernel, for `rows` input rows; the results hold both, the separate kernels' first. See kernels.cpp. */
 int sd_hybrid_route_check(void* handle, const void* router, int router_kind, const void* gate, int gate_kind, uint64_t experts, uint64_t rows,
