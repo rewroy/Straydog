@@ -135,6 +135,15 @@ pub fn is_warm_stop(error: &str) -> bool {
     error.contains(WARM_STOPPED)
 }
 
+/// The chooser of a model of `most` drafts at most that begins at `saved`, the width an earlier run chose, in place of `current`: None where `current`
+/// stays. That is where the drafts are `held`, `saved` is not a width the model offers (1 to `most`), the chooser has made its first choice, or it has
+/// begun a probe: what it chose or measured is not thrown away. The passes it has seen before that are the warm-up's two (each of its prompts
+/// decodes one token through the chooser, as cold passes of one row with no draft: nothing in its windows) and a request's that came first.
+fn chooser_started_at(current: &width::Chooser, most: usize, held: bool, saved: usize) -> Option<width::Chooser> {
+    let (_, probed) = current.passes();
+    (!held && (1..=most).contains(&saved) && !current.decided() && probed == 0).then(|| width::Chooser::new(most, saved))
+}
+
 /// The rows a layer-order batch needs to beat the ordinary path when the banks fit in RAM, on Windows.
 const LAYER_PREFILL_FIT_ROWS: u64 = 512;
 /// The rows it needs where they do not: its MoE takes time inversely with them (a 3.8K follow-up under memory pressure on the RTX 5070 Ti:
@@ -845,6 +854,8 @@ pub struct Model {
     /// A partially resident model with a drafter chooses how many drafts a pass offers by what its passes cost ([`width`]); `speculative` is
     /// the most.
     width: Option<width::Chooser>,
+    /// The drafts were held by [`Model::pin_drafts`] (a test): no width an earlier run chose is taken then.
+    drafts_held: bool,
     /// Tests only: the seconds a pass is taken to have taken by its rows, in place of the clock ([`Model::script_pass_seconds`]).
     pass_clock: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
     /// The assist level's tuner, where banks are page-locked and the GPU can take some of the CPU's routes ([`crate::assist`]).
@@ -1066,6 +1077,7 @@ impl Model {
             passes_with_draft: 0,
             drafts: 0,
             width: None,
+            drafts_held: false,
             pass_clock: None,
             assist: None,
             assist_script: None,
@@ -1228,7 +1240,26 @@ impl Model {
             chooser.pin(drafts);
             self.drafts = chooser.drafts();
             self.copy_drafts = self.drafts;
+            self.drafts_held = drafts.is_some();
         }
+    }
+
+    /// The width in force of a partially resident model's drafts, once the passes have chosen it (the chooser's first table was given): the width a
+    /// later start on this placement may begin at. None before, and where nothing chooses.
+    pub fn chosen_drafts(&self) -> Option<usize> {
+        self.width.as_ref().filter(|chooser| chooser.decided()).map(width::Chooser::drafts)
+    }
+
+    /// A partially resident model begins at `drafts`, the width an earlier run on this placement chose, in place of where it started: its chooser is built
+    /// again at it, as at the load, and goes on choosing from there. Only while the width is the chooser's to take: not where the drafts are held
+    /// (a test's), nor once it has made its choice or begun a probe ([`chooser_started_at`]). Whether it did.
+    pub fn start_drafts_at(&mut self, drafts: usize) -> bool {
+        let held = self.drafts_held;
+        let Some(chooser) = self.width.as_ref().and_then(|chooser| chooser_started_at(chooser, self.speculative, held, drafts)) else { return false };
+        self.drafts = chooser.drafts();
+        self.copy_drafts = self.drafts;
+        self.width = Some(chooser);
+        true
     }
 
     /// Tests only: take a decode pass of `rows` rows to have cost `seconds(rows)`, in place of its time (None: the clock again). The chooser
@@ -4830,6 +4861,67 @@ mod layer_prefill_policy_tests {
         // Linux keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
         assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,false));
         assert!(!layer_prefill_needed(30000,0,0,0,None,0,true));
+    }
+}
+
+#[cfg(test)]
+mod saved_width_tests {
+    use super::chooser_started_at;
+    use crate::width::{Chooser, Plan};
+
+    /// One pass of a machine whose pass costs 16 ms and 4 more for each row past the first, every draft kept.
+    fn pass(chooser: &mut Chooser) {
+        let plan = chooser.plan();
+        let rows = plan.drafts + 1;
+        chooser.record(plan, plan.drafts, rows, plan.drafts, 0.016 + 0.004 * (rows - 1) as f64);
+    }
+
+    /// Decides: a chooser that has made no choice and begun no probe starts at the saved width, whatever passes it has seen (the warm-up's two among
+    /// them), and the new one is as a chooser built at that width at the load: nothing seen, nothing chosen, that width in force.
+    #[test]
+    fn a_chooser_that_has_chosen_nothing_starts_at_the_saved_width() {
+        let mut current = Chooser::new(3, 1);
+        let started = chooser_started_at(&current, 3, false, 2).expect("a new chooser takes it");
+        assert_eq!((started.drafts(), started.passes(), started.decided()), (2, (0, 0), false));
+        assert_eq!(chooser_started_at(&current, 3, false, 1).map(|chooser| chooser.drafts()), Some(1), "the width it has");
+        // (the warm-up: two requests of two tokens, a pass of one row and no draft each, the first pass of a request left out of the windows)
+        for _ in 0..2 {
+            current.begin_request();
+            pass(&mut current);
+        }
+        assert_eq!(current.passes(), (2, 0));
+        let started = chooser_started_at(&current, 3, false, 3).expect("the warm-up's passes are not a choice");
+        assert_eq!((started.drafts(), started.passes()), (3, (0, 0)));
+        // (a request's passes that came before the warm start, short of a probe: nothing chosen yet either)
+        for _ in 0..100 {
+            pass(&mut current);
+        }
+        assert_eq!(current.passes(), (102, 0));
+        assert!(chooser_started_at(&current, 3, false, 2).is_some());
+    }
+
+    /// Decides: nothing is taken where the drafts are held, where the saved width is not one the model offers (1 to its most), or once the chooser
+    /// has begun a probe or made its first choice, which the saved width would throw away.
+    #[test]
+    fn a_saved_width_is_not_taken_where_it_would_replace_what_is_held_or_chosen() {
+        let current = Chooser::new(3, 1);
+        assert!(chooser_started_at(&current, 3, true, 2).is_none(), "held");
+        assert!(chooser_started_at(&current, 3, false, 0).is_none(), "no drafts is not a width to start at");
+        assert!(chooser_started_at(&current, 3, false, 4).is_none(), "more than the model offers");
+        assert!(chooser_started_at(&current, 0, false, 1).is_none(), "a model that offers none");
+        let mut probing = Chooser::new(3, 1);
+        probing.record(Plan { drafts: 2, probe: true }, 2, 3, 2, 0.02);
+        assert_eq!(probing.passes(), (1, 1));
+        assert!(chooser_started_at(&probing, 3, false, 2).is_none(), "a probe has begun");
+        let mut chosen = Chooser::new(3, 1);
+        let mut passes = 0;
+        while !chosen.decided() && passes < 20_000 {
+            pass(&mut chosen);
+            passes += 1;
+        }
+        assert!(chosen.decided(), "the machine's passes were not enough to choose by");
+        assert!(chooser_started_at(&chosen, 3, false, 2).is_none(), "the first choice was made");
+        assert!(chosen.passes().1 > 0 && chosen.passes().0 >= crate::width::FIRST_PROBE_AFTER);
     }
 }
 

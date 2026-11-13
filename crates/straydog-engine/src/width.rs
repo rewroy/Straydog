@@ -480,6 +480,11 @@ impl Chooser {
         let costs = (1..=self.most + 1).map(|rows| self.pass_seconds(rows).map(|(seconds, _)| seconds)).collect();
         Some(Outcome { first, from, chosen: self.drafts, estimates, kept, costs })
     }
+
+    /// Whether the first table has been given: from then on the width in force is what the windows chose, not the width it began at.
+    pub fn decided(&self) -> bool {
+        self.decided
+    }
 }
 
 #[cfg(test)]
