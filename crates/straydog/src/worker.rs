@@ -149,9 +149,13 @@ struct Engine {
     /// The handle the request loop shares, for a locking that memory freed since the start allows ([`Engine::lock_more`]).
     me: Weak<Mutex<Engine>>,
     /// The GPUs' budgets were `auto`: GPU memory freed since the start is taken too ([`Engine::more_vram`]).
+    #[cfg(not(windows))]
     vram_auto: bool,
     #[cfg(windows)]
     vram_limits: Vec<Option<VramLimit>>,
+    /// Original per-device ceilings for explicit budgets, independent of pressure cooldowns.
+    #[cfg(windows)]
+    vram_caps: Option<Vec<u64>>,
 }
 
 /// Bytes of image rows kept for the turns after ([`Engine::encoded`]): about 40 full screens (1440x900 is 1260 rows of 2560 values).
@@ -318,17 +322,17 @@ const WARM_PATIENCE: Duration = Duration::from_millis(100);
 const WARM_LONGEST: Duration = Duration::from_secs(120);
 
 impl Engine {
-    /// Reconcile an automatic budget with current headroom. Only the pause after a completed request may grow it.
+    /// Reconcile a partial model's budget with current headroom. Only the pause after a completed request may grow it.
     fn more_vram(&mut self, allow_grow: bool, phase: &str) -> Result<(), String> {
-        if !self.vram_auto || !self.model.partial {
+        if !self.model.partial {
             return Ok(());
         }
         #[cfg(windows)]
-        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, self.requests, allow_grow, phase);
+        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, self.vram_caps.as_deref(), self.requests, allow_grow, phase);
         #[cfg(not(windows))]
         {
             let _ = phase;
-            if !allow_grow { return Ok(()); }
+            if !self.vram_auto || !allow_grow { return Ok(()); }
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             for (index, (ordinal, used, budget)) in self.model.vram_budgets().unwrap_or_default().into_iter().enumerate() {
                 let Ok(free) = self.model.vram_free(index) else { continue };
@@ -349,12 +353,14 @@ impl Engine {
 
     #[cfg(windows)]
     fn backoff_vram(&mut self) -> Result<bool, String> {
-        if !self.vram_auto || !self.model.partial { return Ok(false); }
+        if !self.model.partial { return Ok(false); }
         let devices = self.model.vram_budgets()?;
+        validate_vram_caps(self.vram_caps.as_deref(), devices.len())?;
         self.vram_limits.resize(devices.len(), None);
         let mut lowered = false;
         for (index, (ordinal, _, budget)) in devices.into_iter().enumerate() {
-            let wanted = budget.saturating_sub(VRAM_GROWTH);
+            let cap = self.vram_caps.as_ref().map(|caps| caps[index]);
+            let wanted = budget.saturating_sub(VRAM_GROWTH).min(cap.unwrap_or(u64::MAX));
             let (before, after) = self.model.resize_vram(index, wanted)?;
             let actual = self.model.vram_budgets()?[index].2;
             if actual >= budget {
@@ -752,24 +758,40 @@ impl VramLimit {
 /// DXGI's headroom already excludes other allocations and may be negative. Leave a runtime margin
 /// within that allowance; the larger desktop margin is still used when only runtime free bytes exist.
 #[cfg(any(windows, test))]
-fn headroom_budget(used: u64, headroom: i64, process_budget: bool, total: u64) -> u64 {
-    if !process_budget {
-        return auto_budget(true, used.saturating_add(headroom.max(0) as u64), total);
-    }
-    let available = (i128::from(used) + i128::from(headroom)).clamp(0, i128::from(total)) as u64;
-    let step = if total < 12 << 30 { 64 << 20 } else { 256 << 20 };
-    available.saturating_sub(margin_on(false, total)) / step * step
+fn headroom_budget(used: u64, headroom: i64, process_budget: bool, total: u64, cap: Option<u64>) -> u64 {
+    let wanted = if !process_budget {
+        auto_budget(true, used.saturating_add(headroom.max(0) as u64), total)
+    } else {
+        let available = (i128::from(used) + i128::from(headroom)).clamp(0, i128::from(total)) as u64;
+        let step = if total < 12 << 30 { 64 << 20 } else { 256 << 20 };
+        available.saturating_sub(margin_on(false, total)) / step * step
+    };
+    wanted.min(cap.unwrap_or(u64::MAX))
 }
 
 #[cfg(any(windows, test))]
-fn vram_target(budget: u64, wanted: u64, requests: u64, allow_grow: bool, limit: Option<VramLimit>) -> u64 {
+fn vram_target(budget: u64, wanted: u64, requests: u64, allow_grow: bool, limit: Option<VramLimit>, cap: Option<u64>) -> u64 {
+    let ceiling = cap.unwrap_or(u64::MAX);
+    let (budget, wanted) = (budget.min(ceiling), wanted.min(ceiling));
     if wanted < budget { return wanted; }
-    if !allow_grow || wanted < budget.saturating_add(VRAM_GROWTH) { return budget; }
+    // Only reaching the original ceiling may use a smaller final growth step.
+    let reaches_cap = cap.is_some_and(|cap| wanted == cap && budget < cap);
+    if !allow_grow || (wanted < budget.saturating_add(VRAM_GROWTH) && !reaches_cap) { return budget; }
     if let Some(limit) = limit {
         if requests <= limit.retry_after { return budget; }
-        return wanted.min(budget.saturating_add(VRAM_GROWTH)).min(limit.bytes.saturating_add(VRAM_GROWTH)).max(budget);
+        return wanted.min(budget.saturating_add(VRAM_GROWTH)).min(limit.bytes.saturating_add(VRAM_GROWTH)).max(budget).min(ceiling);
     }
-    wanted.min(budget.saturating_add(VRAM_GROWTH))
+    wanted.min(budget.saturating_add(VRAM_GROWTH)).min(ceiling)
+}
+
+#[cfg(any(windows, test))]
+fn validate_vram_caps(caps: Option<&[u64]>, devices: usize) -> Result<(), String> {
+    if let Some(caps) = caps {
+        if caps.len() != devices {
+            return Err(format!("{} explicit GPU memory ceilings do not match {devices} devices", caps.len()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -780,16 +802,21 @@ fn vram_refused(ordinal: usize, why: &str) -> String {
 /// Runs between passes with the model exclusively held. Every reduction is followed by a fresh
 /// measurement: releasing the pool may change Windows' process budget as well as its usage.
 #[cfg(windows)]
-fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, requests: u64,
+fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, caps: Option<&[u64]>, requests: u64,
                        allow_grow: bool, phase: &str) -> Result<(), String> {
-    limits.resize(model.vram_budgets()?.len(), None);
-    for index in 0..limits.len() {
+    let devices = model.vram_budgets()?;
+    validate_vram_caps(caps, devices.len())?;
+    limits.resize(devices.len(), None);
+    let explicit_startup = caps.is_some() && phase == "ready";
+    for (index, (ordinal, _, specified)) in devices.into_iter().enumerate() {
+        let cap = caps.map(|caps| caps[index]);
+        let mut startup_change = None;
         loop {
-            let (ordinal, used, budget) = model.vram_budgets()?[index];
+            let (_, used, budget) = model.vram_budgets()?[index];
             let (headroom, process_budget) = model.vram_headroom(index)?;
             let (_, _, total) = straydog_gpu::device_info(ordinal).map_err(|error| error.to_string())?;
-            let wanted = headroom_budget(used, headroom, process_budget, total);
-            let target = vram_target(budget, wanted, requests, allow_grow, limits[index]);
+            let wanted = headroom_budget(used, headroom, process_budget, total, cap);
+            let target = vram_target(budget, wanted, requests, allow_grow, limits[index], cap);
             if std::env::var("STRAYDOG_VRAM_DIAGNOSTIC").as_deref() == Ok("1") {
                 eprintln!("Straydog VRAM diagnostic: phase={phase} GPU={ordinal} used={used} budget={budget} headroom={headroom} \
                            process_budget={} wanted={wanted} target={target}", u8::from(process_budget));
@@ -803,10 +830,19 @@ fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, r
             }
             if actual != budget {
                 if shrinking || limits[index].is_some() { limits[index] = Some(VramLimit::new(actual, requests)); }
-                eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.2} -> {:.2} GiB; observed headroom {headroom} bytes; expert slots {before} -> {after}",
-                          budget as f64 / (1u64 << 30) as f64, actual as f64 / (1u64 << 30) as f64);
+                if explicit_startup {
+                    let first = startup_change.map_or(before, |(first, _, _, _)| first);
+                    startup_change = Some((first, after, actual, headroom));
+                } else {
+                    eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.2} -> {:.2} GiB; observed headroom {headroom} bytes; expert slots {before} -> {after}",
+                              budget as f64 / (1u64 << 30) as f64, actual as f64 / (1u64 << 30) as f64);
+                }
             }
             if !shrinking { break; }
+        }
+        if let Some((before, after, actual, headroom)) = startup_change {
+            eprintln!("Straydog VRAM: GPU {ordinal}'s given {:.2} GiB is above the usable Windows budget after leaving its safety margin; using {:.2} GiB at startup; observed headroom {headroom} bytes; expert slots {before} -> {after}",
+                      cap.unwrap_or(specified) as f64 / (1u64 << 30) as f64, actual as f64 / (1u64 << 30) as f64);
         }
     }
     Ok(())
@@ -1046,16 +1082,19 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
     let (text, model) = (Arc::new(text?), model?);
     #[cfg(windows)]
-    let (model, vram_limits, ready_budgets) = {
+    let (model, vram_limits, vram_caps, ready_budgets) = {
         let mut model = model;
-        let mut limits = vec![None; args.devices.len()];
-        if args.vram_bytes == "auto" && model.partial {
-            adjust_windows_vram(&mut model, &mut limits, 0, false, "ready")?;
+        let caps = (args.vram_bytes != "auto").then(|| plan.budgets.clone());
+        let devices = model.vram_budgets()?.len();
+        validate_vram_caps(caps.as_deref(), devices)?;
+        let mut limits = vec![None; devices];
+        if model.partial {
+            adjust_windows_vram(&mut model, &mut limits, caps.as_deref(), 0, false, "ready")?;
         }
-        let budgets = if args.vram_bytes == "auto" && model.partial {
+        let budgets = if model.partial {
             model.vram_budgets()?.into_iter().map(|(_, _, budget)| budget).collect::<Vec<_>>()
         } else { plan.budgets.clone() };
-        (model, limits, budgets)
+        (model, limits, caps, budgets)
     };
     #[cfg(not(windows))]
     let ready_budgets = &plan.budgets;
@@ -1095,8 +1134,10 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         .collect();
     let placement = placement_key(&gpus, &args.vram_bytes, model.context, model.weights.drafter);
     let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, earlier_drafts: BTreeMap::new(), placement,
-                                                       requests: 0, me: me.clone(), vram_auto: args.vram_bytes == "auto",
-                                                       #[cfg(windows)] vram_limits }));
+                                                       requests: 0, me: me.clone(),
+                                                       #[cfg(not(windows))] vram_auto: args.vram_bytes == "auto",
+                                                       #[cfg(windows)] vram_limits,
+                                                       #[cfg(windows)] vram_caps }));
     #[cfg(all(windows, feature = "cuda"))]
     memory_diagnostic(&args.devices, true);
     output.send(&ready);
@@ -1780,38 +1821,94 @@ mod tests {
     #[test]
     fn signed_headroom_counts_over_budget_usage_and_keeps_the_runtime_margin() {
         let total = 16 << 30;
-        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total), 10 * (1 << 30) + 512 * MIB);
-        assert_eq!(headroom_budget(1 << 30, -(2 << 30), true, total), 0);
-        assert_eq!(headroom_budget(u64::MAX, i64::MAX, true, total), total - 512 * MIB);
-        assert_eq!(headroom_budget(8 << 30, 3 << 30, false, total), auto_budget(true, 11 << 30, total));
-        assert_eq!(headroom_budget(8 << 30, -1, false, total), auto_budget(true, 8 << 30, total));
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, None), 10 * (1 << 30) + 512 * MIB);
+        assert_eq!(headroom_budget(1 << 30, -(2 << 30), true, total, None), 0);
+        assert_eq!(headroom_budget(u64::MAX, i64::MAX, true, total, None), total - 512 * MIB);
+        assert_eq!(headroom_budget(8 << 30, 3 << 30, false, total, None), auto_budget(true, 11 << 30, total));
+        assert_eq!(headroom_budget(8 << 30, -1, false, total, None), auto_budget(true, 8 << 30, total));
         // Small cards keep 64 MiB granularity; larger ones keep 256 MiB and a 3% margin when greater.
-        assert_eq!(headroom_budget(2000 * MIB, 0, true, 8 << 30), 1472 * MIB);
-        assert_eq!(headroom_budget(2000 * MIB, 0, true, total), 1280 * MIB);
+        assert_eq!(headroom_budget(2000 * MIB, 0, true, 8 << 30, None), 1472 * MIB);
+        assert_eq!(headroom_budget(2000 * MIB, 0, true, total, None), 1280 * MIB);
         let large = 80 << 30;
-        assert_eq!(headroom_budget(70 << 30, 0, true, large), ((70 << 30) - margin_on(false, large)) / (256 * MIB) * (256 * MIB));
+        assert_eq!(headroom_budget(70 << 30, 0, true, large, None), ((70 << 30) - margin_on(false, large)) / (256 * MIB) * (256 * MIB));
     }
 
     #[test]
     fn budget_reductions_ignore_cooldown_but_growth_waits_two_more_requests() {
         let budget = 8 << 30;
         let limit = VramLimit::new(budget, 0);
-        assert_eq!(vram_target(budget, budget - MIB, 1, false, Some(limit)), budget - MIB);
-        assert_eq!(vram_target(budget, budget + (2 << 30), 3, false, Some(limit)), budget);
+        assert_eq!(vram_target(budget, budget - MIB, 1, false, Some(limit), None), budget - MIB);
+        assert_eq!(vram_target(budget, budget + (2 << 30), 3, false, Some(limit), None), budget);
         for requests in [0, 1, 2] {
-            assert_eq!(vram_target(budget, budget + (2 << 30), requests, true, Some(limit)), budget);
+            assert_eq!(vram_target(budget, budget + (2 << 30), requests, true, Some(limit), None), budget);
         }
-        let grown = vram_target(budget, budget + (2 << 30), 3, true, Some(limit));
+        let grown = vram_target(budget, budget + (2 << 30), 3, true, Some(limit), None);
         assert_eq!(grown, budget + VRAM_GROWTH);
-        // The cap is the actual resulting budget, even if it was less than the requested one.
+        // The retry limit follows the actual resulting budget, even if it was less than requested.
         let actual = grown - 64 * MIB;
         let next = VramLimit::new(actual, 3);
         assert_eq!(next.retry_after, 5);
-        assert_eq!(vram_target(actual, budget + (2 << 30), 5, true, Some(next)), actual);
-        assert_eq!(vram_target(actual, budget + (2 << 30), 6, true, Some(next)), actual + VRAM_GROWTH);
-        assert_eq!(vram_target(budget, budget + VRAM_GROWTH - 1, 10, true, None), budget);
-        assert_eq!(vram_target(budget, budget + (4 << 30), 10, true, None), budget + VRAM_GROWTH);
+        assert_eq!(vram_target(actual, budget + (2 << 30), 5, true, Some(next), None), actual);
+        assert_eq!(vram_target(actual, budget + (2 << 30), 6, true, Some(next), None), actual + VRAM_GROWTH);
+        assert_eq!(vram_target(budget, budget + VRAM_GROWTH - 1, 10, true, None, None), budget);
+        assert_eq!(vram_target(budget, budget + (4 << 30), 10, true, None, None), budget + VRAM_GROWTH);
         assert_eq!(VramLimit::new(0, u64::MAX).retry_after, u64::MAX);
+    }
+
+    #[test]
+    fn explicit_vram_caps_bound_signed_headroom_and_keep_the_safety_margin() {
+        let total = 16 << 30;
+        assert_eq!(headroom_budget(8 << 30, 4 << 30, true, total, Some(10 << 30)), 10 << 30);
+        assert_eq!(headroom_budget(8 << 30, 4 << 30, true, total, Some(12 << 30)), (11 << 30) + 512 * MIB);
+        // Positive raw headroom can still leave too little room after the runtime reserve.
+        assert_eq!(headroom_budget(8 << 30, 256 * MIB as i64, true, total, Some(8 << 30)), (7 << 30) + 768 * MIB);
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, Some(12 << 30)), (10 << 30) + 512 * MIB);
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, Some(8 << 30)), 8 << 30);
+        assert_eq!(headroom_budget(1 << 30, -(2 << 30), true, total, Some(8 << 30)), 0);
+    }
+
+    #[test]
+    fn explicit_vram_caps_keep_cooldowns_and_allow_only_the_final_small_growth() {
+        let (budget, cap) = (8 << 30, 10 << 30);
+        let limit = VramLimit::new(budget, 0);
+        assert_eq!(vram_target(budget, 7 << 30, 1, false, Some(limit), Some(cap)), 7 << 30);
+        for requests in [0, 1, 2] {
+            assert_eq!(vram_target(budget, 20 << 30, requests, true, Some(limit), Some(cap)), budget);
+        }
+        assert_eq!(vram_target(budget, 20 << 30, 3, false, Some(limit), Some(cap)), budget);
+        assert_eq!(vram_target(budget, 20 << 30, 3, true, Some(limit), Some(cap)), budget + VRAM_GROWTH);
+        assert_eq!(vram_target(12 << 30, 20 << 30, 0, false, None, Some(cap)), cap);
+        let near = cap - 128 * MIB;
+        let last = VramLimit::new(near, 0);
+        assert_eq!(vram_target(near, cap, 2, true, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap, 3, false, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap - 1, 3, true, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap, 3, true, Some(last), Some(cap)), cap);
+        assert_eq!(vram_target(near, cap, 3, true, Some(last), None), near);
+        assert_eq!(vram_target(cap, 20 << 30, 3, true, None, Some(cap)), cap);
+    }
+
+    #[test]
+    fn explicit_vram_caps_stay_per_device_and_bound_every_target_path() {
+        let caps = [6 << 30, 10 << 30];
+        assert!(validate_vram_caps(Some(&caps), 2).is_ok());
+        assert!(validate_vram_caps(None, 2).is_ok());
+        for devices in [0, 1, 3] { assert!(validate_vram_caps(Some(&caps), devices).is_err()); }
+        // Runtime free-memory fallback retains the larger desktop reserve, then each GPU's own ceiling.
+        let wanted = caps.map(|cap| headroom_budget(8 << 30, 3 << 30, false, 16 << 30, Some(cap)));
+        assert_eq!(wanted, [6 << 30, 9 << 30]);
+        assert_eq!(headroom_budget(8 << 30, -1, false, 16 << 30, Some(caps[1])), auto_budget(true, 8 << 30, 16 << 30));
+        for cap in [0, caps[0], caps[1]] {
+            for budget in [0, 5 << 30, 12 << 30] {
+                for wanted in [0, 9 << 30, 20 << 30] {
+                    for allow_grow in [false, true] {
+                        for limit in [None, Some(VramLimit::new(5 << 30, 0))] {
+                            assert!(vram_target(budget, wanted, 3, allow_grow, limit, Some(cap)) <= cap);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A model's side of a warm start's slot fill: its request count, and the swaps it still wants.
