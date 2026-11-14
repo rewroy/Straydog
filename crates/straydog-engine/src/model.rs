@@ -1156,6 +1156,8 @@ pub struct Model {
     cpu_second: Option<CpuExperts>,
     /// The pipelined verification's settings (STRAYDOG_PIPELINE and the rest, read at the start).
     pipeline: pipeline::PipelineConfig,
+    /// What the last pipelined request's gate left for the next one's ([`pipeline::GateMemory`]).
+    gate_memory: Option<pipeline::GateMemory>,
     /// The seed of the request under way (the keyed draws of `sampling::accept_keyed`).
     sample_seed: u64,
     /// Whether the request under way holds what the pipeline holds (the expert slots' swaps, the assist level, the head on one GPU): the requests
@@ -1445,6 +1447,7 @@ impl Model {
             cpu: None,
             cpu_second: None,
             pipeline: pipeline::PipelineConfig::from_env().for_devices(devices),
+            gate_memory: None,
             sample_seed: 0,
             pipeline_live: true,
             copies: Copies::default(),

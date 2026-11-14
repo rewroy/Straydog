@@ -274,13 +274,28 @@ struct Gate {
     cost: [[f64; 2]; 2],
     /// Passes by mode, for the share of them that speculated.
     passes: [u64; 2],
-    /// How many times longer than its base the settled mode's run is: it doubles (to 8) each time the probe of the other mode found it dearer by
+    /// How many times longer than its base the settled mode's run is: it doubles (to [`Gate::LONGEST`]) each time the probe of the other mode found it dearer by
     /// a tenth or more (a probe costs the saving it measures, which is largest where the mode wins by most), and is 1 again where the two were close.
     backoff: usize,
 }
 
+/// What a request's gate leaves the next request's ([`Gate::memory`], [`Gate::resumed`]): the two modes' decayed costs, how long the pipeline's
+/// runs had become, and how far into its run the request ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct GateMemory {
+    cost: [[f64; 2]; 2],
+    backoff: usize,
+    in_mode: usize,
+}
+
 impl Gate {
     const WINDOW: usize = 16;
+    /// The most a settled mode's run is lengthened by. A request's gate began afresh, at 8 at the most: every request ran 40 passes, probed the
+    /// ordinary order for 12, ran 160 and probed again, and on two RTX 3090 with slow host cores, where a probe's passes take 27 to 49 ms against
+    /// the pipeline's 10, the two probes were 0.6 to 0.9 s of a 900-token request's 6 s. The gate's verdict is the machine's and the model's more
+    /// than the request's, so it is handed on ([`GateMemory`]) and the runs may grow to this: a probe every 5,120 passes where the pipeline wins
+    /// by a tenth or more each time.
+    const LONGEST: usize = 32;
     const FIRST_RUN: usize = 40;
     const PROBE: usize = 12;
     const SPECULATING_RUN: usize = 160;
@@ -292,6 +307,30 @@ impl Gate {
         // (a floor above 1: never speculate, the ordinary order through the pipeline's loop, a test's)
         Gate { held: std::collections::VecDeque::with_capacity(Self::WINDOW), floor, speculating: floor <= 1.0, probing: false, in_mode: 0, skip: 0,
                cost: [[0.0; 2]; 2], passes: [0; 2], backoff: 1 }
+    }
+
+    /// The gate of a request after one whose gate kept the pipeline's mode by a margin: it goes on from that gate's costs and run, so that its
+    /// first probe of the ordinary order comes when that run is over, not after the first 40 passes. (A gate held open or shut takes nothing.)
+    fn resumed(floor: f32, memory: GateMemory) -> Gate {
+        let mut gate = Gate::new(floor);
+        if gate.hands_over() {
+            (gate.cost, gate.backoff, gate.in_mode) = (memory.cost, memory.backoff.clamp(1, Self::LONGEST), memory.in_mode);
+        }
+        gate
+    }
+
+    /// What the next request's gate goes on from: where this one ends in the pipeline's mode, lengthened by a probe that found the ordinary order
+    /// dearer by a tenth or more, or in the probe of the ordinary order that such a run ended with (that probe is then made again after a whole
+    /// run). A gate that settled in the ordinary order, or never probed, leaves nothing: the next request begins as a first one.
+    fn memory(&self) -> Option<GateMemory> {
+        if !self.hands_over() || self.backoff < 2 {
+            return None;
+        }
+        match (self.speculating, self.probing) {
+            (true, false) => Some(GateMemory { cost: self.cost, backoff: self.backoff, in_mode: self.in_mode }),
+            (false, true) => Some(GateMemory { cost: self.cost, backoff: self.backoff, in_mode: 0 }),
+            _ => None,
+        }
     }
 
     /// Guess ahead now.
@@ -392,7 +431,7 @@ impl Gate {
             };
             // (the mode that stays was cheaper by a margin: its next run is longer; one that was nearly as dear as the other's is probed as often as before)
             let stays = speculating == self.probing_from_speculating();
-            self.backoff = if wide && stays { (self.backoff * 2).min(8) } else { 1 };
+            self.backoff = if wide && stays { (self.backoff * 2).min(Self::LONGEST) } else { 1 };
             self.switch(speculating, false);
         } else {
             // The stretch is over: a short probe of the other mode.
@@ -1412,7 +1451,11 @@ impl Model {
         let (mut parity, mut guesses) = (0usize, 0usize);
         let mut current: Option<Current> = None;
         let mut clock_period = Instant::now();
-        let mut gate = Gate::new(self.pipeline.gate);
+        // (the gate goes on from the last request's where that one kept the pipeline's mode by a margin: see `Gate::LONGEST`)
+        let mut gate = match self.gate_memory.take() {
+            Some(memory) => Gate::resumed(self.pipeline.gate, memory),
+            None => Gate::new(self.pipeline.gate),
+        };
         let mut costs = Costs::default();
         let mut roles = Roles::default();
         let profiling = self.profile.as_ref().is_some_and(|profile| profile.every);
@@ -1722,6 +1765,7 @@ impl Model {
         if !slots_held && !self.pipeline.free_slots {
             self.on_first_device(link, |model| model.group.hold_slots(true))?;
         }
+        self.gate_memory = gate.memory();
         let count = |key: &str| self.last_metrics.get(key).and_then(Value::as_u64).unwrap_or(0);
         eprintln!("Straydog pipelined verification: passes in the pipeline's mode {} of {}; {} passes, guesses right {} of {} made (the gate's rate, the shut \
                    gate's included), passes run ahead {} of which {} continued and {} given up, {} drafts offered, {} kept{}",
@@ -2118,6 +2162,37 @@ mod gate_tests {
         let mut gate = after_first_run(0.010);
         gate.stretch_done(0.0102 * Gate::PROBE as f64, 2 * Gate::PROBE);
         assert!(gate.open() && gate.backoff == 1);
+    }
+
+    /// Decides: a gate that kept the pipeline's mode by a margin hands its costs and its run to the next request's gate, which probes the
+    /// ordinary order when that run is over and not after its own first 40 passes; one that never found a margin hands on nothing.
+    #[test]
+    fn a_gate_that_won_by_a_margin_goes_on_in_the_next_request() {
+        let mut gate = after_first_run(0.010);
+        assert_eq!(gate.memory(), None, "in its first probe, with no margin found yet");
+        gate.stretch_done(0.014 * Gate::PROBE as f64, 2 * Gate::PROBE);
+        assert_eq!(gate.backoff, 2);
+        for _ in 0..100 {
+            gate.pass_done(0.010, 2, true);
+        }
+        let memory = gate.memory().expect("settled in the pipeline's mode, its run doubled");
+        let mut next = Gate::resumed(0.3, memory);
+        assert!(next.open() && !next.probing && next.backoff == 2);
+        // (the two passes a mode's start leaves out of its means are passes of the run all the same)
+        for _ in 0..Gate::SPECULATING_RUN * 2 - 100 - 1 {
+            next.pass_done(0.010, 2, true);
+        }
+        assert!(next.open() && !next.probing, "the run the last request began is not over");
+        next.pass_done(0.010, 2, true);
+        assert!(!next.open() && next.probing, "the probe comes when the carried run is over");
+        // a request that ends inside that probe: the next one begins a whole run before it probes again
+        let inside = next.memory().expect("the probe a lengthened run ended with");
+        assert_eq!(inside.in_mode, 0);
+        // nothing is handed on by a gate that found the two modes close, or by one held open or shut
+        let mut close = after_first_run(0.010);
+        close.stretch_done(0.0102 * Gate::PROBE as f64, 2 * Gate::PROBE);
+        assert_eq!(close.memory(), None);
+        assert_eq!(Gate::resumed(0.0, memory).backoff, 1);
     }
 
     #[test]
