@@ -392,6 +392,14 @@ fn front_chain_mode() -> Option<&'static str> {
     MODE.get_or_init(|| std::env::var("STRAYDOG_FRONT_CHAIN").ok()).as_deref()
 }
 
+/// STRAYDOG_PROMPT_PASSES (development): the longest prompt batch a partially resident model reads as passes of PROMPT_ROWS rows, as its
+/// decoding verifies, rather than as a batch (unset or 0: none, every batch of two rows or more is a batch). A batch's expert kernels expand
+/// each expert its rows touch, which for a few rows is most of the bank for a handful of routes.
+fn prompt_passes() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
+}
+
 fn front_chain_wanted() -> bool {
     front_chain_mode() != Some("0")
 }
@@ -3229,7 +3237,8 @@ impl Model {
         // Inside a pipelined prompt the last batch's rows stayed on the GPUs: a batch on the
         // verified or the one-token path pairs its first token with that batch's last row, read
         // back from where the MTP layer's device kept it (the next batch pairs from this one's).
-        let verified = tokens.len() > 1 && self.resident && tokens.len() <= VERIFIED_PREFILL && !touches_image;
+        let passes = if self.resident { VERIFIED_PREFILL } else if self.partial { prompt_passes() } else { 0 };
+        let verified = tokens.len() > 1 && tokens.len() <= passes && !touches_image;
         let previous = match previous {
             None if verified || tokens.len() == 1 => {
                 let kept = self.kept_hidden()?;
