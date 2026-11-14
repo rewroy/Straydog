@@ -1000,9 +1000,10 @@ impl Model {
         Ok(())
     }
 
-    /// Whether this request's passes are pipelined: greedy or sampled (its drafts point proposals and its tokens the target's draws keyed by
-    /// position, from the whole rows' logits or from the rows' greatest where the draw reads only those), nothing constraining it, no image,
-    /// the layers split between two devices with a CPU engine for each.
+    /// Whether this request's passes are pipelined: greedy or sampled (in its pipelined passes its drafts are point proposals and its tokens
+    /// the target's draws keyed by position, from the whole rows' logits or from the rows' greatest where the draw reads only those; a
+    /// stretch handed over to the ordinary loop draws as that loop does), nothing constraining it, no image, the layers split between two
+    /// devices with a CPU engine for each.
     pub(super) fn pipeline_applies(&self, sampling: &Sampling, constraint: Option<&Constraint>) -> bool {
         self.pipeline.enabled(self.group.backends.len())
             && self.partial
