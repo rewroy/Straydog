@@ -209,6 +209,81 @@ __device__ __forceinline__ void moe_grid16(const uint8_t* data, size_t k0, const
     }
 }
 
+// Sixteen consecutive values from column k0 (a multiple of 16) of a row in the SoA layout (expert_soa.hpp), as packed FP16 pairs, for a format
+// known when compiling (16, 18, 21 or 22). The sixteen share one 32-value unit (groups l and l + 1 of it, l even): its fields are read once
+// (expert_soa_fields), where sixteen calls of expert_soa_weight switched on the kind and read them again for every value, and each value is
+// formed as expert_soa_weight<Mode> forms it, db * g * sign in F32, then rounded to FP16 by __floats2half2_rn: the same FP16 values as the
+// native layout's. IQ2_S with its grid staged (`table`, `pairs`: moe_stage_grid16) forms them as moe_grid16 does, which are the same values
+// (c * g / 8 is exact in FP16, and so is the product d * c * g / 8 in F32 that the scalar form rounds once, as the FP16 product does).
+template<int Mode>
+__device__ __forceinline__ void moe_soa16(const Matrix& m, size_t row, size_t k0, uint32_t (&words)[8], const uint16_t* table, const uint32_t* pairs) {
+    static_assert(Mode == 16 || Mode == 18 || Mode == 21 || Mode == 22);
+    const ExpertSoaFields f = expert_soa_fields<Mode>(m, row, k0 / 32);
+    const unsigned l0 = unsigned(k0 % 32) / 8;
+    if constexpr (Mode == 22) {
+        if (table) {
+            const unsigned nibble = (f.scale >> (4 * (l0 / 2))) & 15;
+            const __half2 d2 = moe_bits_h2(uint32_t(f.d) | uint32_t(f.d) << 16);
+            const uint32_t* scaled = pairs + 16 * nibble;
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const unsigned l = l0 + h;
+                const unsigned codes = table[((f.q0 >> (8 * l)) & 255) | ((f.high << (8 - 2 * l)) & 0x300)];
+                const unsigned signs = (f.signs >> (8 * l)) & 255;
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint32_t sign = ((signs >> (2 * q)) & 1u) << 15 | ((signs >> (2 * q + 1)) & 1u) << 31;
+                    words[4 * h + q] = moe_h2_bits(__hmul2(moe_bits_h2(scaled[(codes >> (4 * q)) & 15] | sign), d2));
+                }
+            }
+            return;
+        }
+    }
+    const float d = gemv_half(f.d);
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const unsigned l = l0 + h;
+        float db;
+        uint8_t g[8];
+        unsigned signs;
+        if constexpr (Mode == 16) {
+            db = d * (0.5f + float(f.signs >> 28)) * 0.25f;
+            const uint2 grid = reinterpret_cast<const uint2*>(iq_grid2xxs)[(f.q0 >> (8 * l)) & 255];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) g[j] = uint8_t((j < 4 ? grid.x : grid.y) >> (8 * (j % 4)));
+            signs = iq_signs((f.signs >> (7 * l)) & 127);
+        } else if constexpr (Mode == 22) {
+            db = d * (0.5f + float((f.scale >> (4 * (l / 2))) & 15)) * 0.25f;
+            const uint2 grid = reinterpret_cast<const uint2*>(iq_grid2s)[((f.q0 >> (8 * l)) & 255) | ((f.high << (8 - 2 * l)) & 0x300)];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) g[j] = uint8_t((j < 4 ? grid.x : grid.y) >> (8 * (j % 4)));
+            signs = (f.signs >> (8 * l)) & 255;
+        } else {
+            const uint32_t pair = (l < 2 ? f.q0 : f.q1) >> (16 * (l & 1));
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                unsigned index = (pair >> (8 * half)) & 255;
+                if constexpr (Mode == 21) index |= (f.high << (8 - 2 * l - half)) & 256;
+                const uint32_t grid = reinterpret_cast<const uint32_t*>(Mode == 18 ? iq_grid3xxs : iq_grid3s)[index];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) g[4 * half + j] = uint8_t(grid >> (8 * j));
+            }
+            if constexpr (Mode == 18) {
+                db = d * (0.5f + float(f.signs >> 28)) * 0.5f;
+                signs = iq_signs((f.signs >> (7 * l)) & 127);
+            } else {
+                db = d * float(1 + 2 * f.scale);
+                signs = (f.signs >> (8 * l)) & 255;
+            }
+        }
+        float values[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) values[j] = db * float(g[j]) * (((signs >> j) & 1) ? -1.0f : 1.0f);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) words[4 * h + i] = moe_h2_bits(__floats2half2_rn(values[2 * i], values[2 * i + 1]));
+    }
+}
+
 // A Q2_0 quarter has one scale and four consecutive code bytes. Read it once,
 // rather than reloading the scale and a code byte for each scalar weight. The
 // two u16 reads are aligned even when an 18-byte block starts at address 2 mod 4.
@@ -220,13 +295,17 @@ __device__ __forceinline__ void moe_store16(const Matrix& m, size_t row, size_t 
     uint32_t words[8];
     if constexpr (allow_soa) {
         if (m.layout == 1) {
-            float values[16];
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) values[i] = expert_soa_weight(m, row, k0 + i);
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                union { __half2 h; uint32_t u; } pair = {__floats2half2_rn(values[2 * i], values[2 * i + 1])};
-                words[i] = pair.u;
+            if constexpr (Mode == 16 || Mode == 18 || Mode == 21 || Mode == 22) {
+                moe_soa16<Mode>(m, row, k0, words, table, pairs);
+            } else {
+                float values[16];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) values[i] = expert_soa_weight(m, row, k0 + i);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    union { __half2 h; uint32_t u; } pair = {__floats2half2_rn(values[2 * i], values[2 * i + 1])};
+                    words[i] = pair.u;
+                }
             }
             reinterpret_cast<uint4*>(out)[0] = make_uint4(words[0], words[1], words[2], words[3]);
             reinterpret_cast<uint4*>(out)[1] = make_uint4(words[4], words[5], words[6], words[7]);
