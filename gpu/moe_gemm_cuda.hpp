@@ -34,6 +34,24 @@ __device__ __forceinline__ void moe_copy8(__half* dst, const __half* src, const 
     *reinterpret_cast<uint4*>(dst) = v;
 #endif
 }
+// Sixteen bytes to shared memory, the first `bytes` (0 to 16) of them from `src` and the rest zero (a chunk of a window that reaches past the end of
+// a matrix); both addresses 16-byte aligned. The copies are committed together by moe_copy_commit.
+__device__ __forceinline__ void moe_copy16(void* dst, const void* src, unsigned bytes) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned address = unsigned(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(address), "l"(src), "r"(bytes) : "memory");
+#else
+    uint4 v = {};
+    if (bytes == 16) v = *reinterpret_cast<const uint4*>(src);
+    else for (unsigned i = 0; i < bytes; ++i) reinterpret_cast<uint8_t*>(&v)[i] = reinterpret_cast<const uint8_t*>(src)[i];
+    *reinterpret_cast<uint4*>(dst) = v;
+#endif
+}
+__device__ __forceinline__ void moe_copy_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
 __device__ __forceinline__ void moe_copy_wait() {
 #if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -321,9 +339,8 @@ __device__ __forceinline__ uint32_t moe_word_at(const uint8_t* p) {
 // even offsets: a 16-bit load or moe_word_at), where iq_decode8 read a byte at a time (iq_u32 four of them) with a row's blocks 660 to 1100 bytes
 // from the next row's. The values are moe_form16's.
 template<int Mode>
-__device__ __forceinline__ void moe_native16(const uint8_t* data, size_t k0, uint32_t (&words)[8], const uint16_t* table, const uint32_t* pairs) {
+__device__ __forceinline__ void moe_native16_block(const uint8_t* block, size_t k0, uint32_t (&words)[8], const uint16_t* table, const uint32_t* pairs) {
     static_assert(Mode == 16 || Mode == 18 || Mode == 21 || Mode == 22);
-    const uint8_t* block = data + (k0 / 256) * iq_block_bytes(Mode);
     const unsigned ib = unsigned(k0 % 256) / 32, l0 = unsigned(k0 % 32) / 8;
     MoeLane16 f{};
     f.d = *reinterpret_cast<const uint16_t*>(block);
@@ -345,6 +362,11 @@ __device__ __forceinline__ void moe_native16(const uint8_t* data, size_t k0, uin
         f.scale = (block[106 + ib / 2] >> (4 * (ib % 2))) & 15;
     }
     moe_form16<Mode>(f, l0, words, table, pairs);
+}
+// moe_native16_block of the row's block that column k0 is in.
+template<int Mode>
+__device__ __forceinline__ void moe_native16(const uint8_t* data, size_t k0, uint32_t (&words)[8], const uint16_t* table, const uint32_t* pairs) {
+    moe_native16_block<Mode>(data + (k0 / 256) * iq_block_bytes(Mode), k0, words, table, pairs);
 }
 
 // A Q2_0 quarter has one scale and four consecutive code bytes. Read it once,
@@ -439,13 +461,25 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
     // (IQ2_S and IQ2_XXS: the grid's codes and the pair products, read by every row this block decodes in the K steps, and so beside
     // their activations and weights, under the output that is written after them: 18.4 KB a block, five to an SM's 100 KB. After w,
     // so that x and w keep the 32-byte alignment of every format's wide copies and fragment loads)
+    // (IQ2_S, IQ3_XXS and IQ3_S in the native layout: the block's 128 weight rows' super-blocks of 256 columns, copied whole into `native` by 16-byte
+    // cp.async over each row's window, aligned down to 16 bytes, so that a warp's sixteen rows are not sixteen cache lines a field; a slot is the
+    // window's chunks, padded to an odd number of 16 bytes so that rows a slot apart fall in eight banks, not one. 29.7 KB of shared memory in all
+    // for IQ3_XXS, 32.8 KB IQ2_S and 33.8 KB IQ3_S)
+    constexpr bool Stage = allow_soa && UpMode == Mode && (Mode == 18 || Mode == 21 || Mode == 22);
+    constexpr int NB = int(iq_block_bytes(Mode)), CHUNKS = (NB + 14 + 15) / 16, SLOT = (CHUNKS % 2 ? CHUNKS : CHUNKS + 1) * 16;
     __shared__ SD_ALIGN(32) union {
-        struct { __half x[M * L]; __half w[128 * L]; uint16_t grid[moe_grid_rows<Mode> > 0 ? moe_grid_rows<Mode> : 1];
+        struct { __half x[M * L]; __half w[128 * L]; uint8_t native[Stage ? 128 * SLOT : 16];
+                 uint16_t grid[moe_grid_rows<Mode> > 0 ? moe_grid_rows<Mode> : 1];
                  uint32_t pairs[moe_grid_rows<Mode> > 0 ? 256 : 1]; } in;
         float out[M * 68];
     } lds;
     __shared__ int odd;
     const bool staged = moe_stage_grid16<Mode>(lds.in.grid, lds.in.pairs, &odd);
+    // (a block stages only banks in the native layout whose rows start at 16-byte multiples: the windows then never start before a matrix)
+    bool natstage = false;
+    if constexpr (Stage)
+        natstage = group.weights[0].layout == 0 && group.weights[1].layout == 0 &&
+                   ((reinterpret_cast<uintptr_t>(group.weights[0].data) | reinterpret_cast<uintptr_t>(group.weights[1].data)) & 15) == 0;
     const int arow = t / (LOAD_K / 8), acol = (t % (LOAD_K / 8)) * 8;
     const int brow = t / (LOAD_K / 16), bunit = t % (LOAD_K / 16);
     const __half* source = nullptr;
@@ -460,11 +494,43 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
     // in the layer-ordered prefill a tile holds 10 to 20 of an expert's routes, so two or three of its four row groups are empty.
     const bool rows = tile.first + size_t(wm) * 16 < count;
     for (size_t k = 0; k < 2560; k += K) {
+        if constexpr (Stage) {
+            if (natstage && k % 256 == 0) {
+                // (the last step of the super-block before ended with a barrier: nothing reads the slots now)
+                const size_t blk = k / 256;
+                for (int i = t; i < 128 * CHUNKS; i += 256) {
+                    const int srow = i / CHUNKS, c = i % CHUNKS;
+                    const Matrix& wmat = group.weights[srow / 64];
+                    const uint8_t* at = wmat.data + (j0 + srow % 64) * wmat.row_bytes + blk * NB;
+                    const uint8_t* window = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(at) & ~uintptr_t(15)) + 16 * c;
+                    const ptrdiff_t left = wmat.data + wmat.rows * wmat.row_bytes - window;
+                    const unsigned bytes = left <= 0 ? 0u : left >= 16 ? 16u : unsigned(left);
+                    moe_copy16(&lds.in.native[srow * SLOT + 16 * c], bytes ? window : wmat.data, bytes);
+                }
+                moe_copy_commit();
+                moe_copy_wait();
+                __syncthreads();
+            }
+        }
         #pragma unroll
         for (int chunk = 0; chunk < K; chunk += LOAD_K) {
             moe_copy8(&lds.in.x[arow * L + chunk + acol], source ? source + k + chunk : nullptr, input);
             #pragma unroll
             for (int row = brow; row < 128; row += 256 / (LOAD_K / 16)) {
+                if constexpr (Stage) {
+                    if (natstage) {
+                        // (decoded from the staged super-block: the row's window starts at its slot, the block `off` bytes in)
+                        const Matrix& wmat = group.weights[row / 64];
+                        const uint8_t* at = wmat.data + (j0 + row % 64) * wmat.row_bytes + (k / 256) * NB;
+                        uint32_t words[8];
+                        moe_native16_block<Mode>(&lds.in.native[row * SLOT + (reinterpret_cast<uintptr_t>(at) & 15)], k + chunk + bunit * 16, words,
+                                                 staged ? lds.in.grid : nullptr, lds.in.pairs);
+                        __half* out = &lds.in.w[row * L + chunk + bunit * 16];
+                        reinterpret_cast<uint4*>(out)[0] = make_uint4(words[0], words[1], words[2], words[3]);
+                        reinterpret_cast<uint4*>(out)[1] = make_uint4(words[4], words[5], words[6], words[7]);
+                        continue;
+                    }
+                }
                 // (a warp's rows are all gate's or all up's: 64 rows a half of the block's 128)
                 if (UpMode == Mode || row < 64)
                     moe_store16<Mode, allow_soa>(group.weights[row / 64], j0 + row % 64, k + chunk + bunit * 16,
