@@ -154,6 +154,17 @@ fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_ne
     let (mut never, prompt) = open(&root);
     let reference = decode(&mut never, &prompt);
     drop(never);
+    // (the same start once more, for what two runs of one configuration differ by: the comparisons below are held to the tolerance the test
+    // above uses. The flat floor of 0.15 was at what two such runs differ by here: 0.12, 0.16, 0.12, 0.06 and 0.15 on an R9700, where the
+    // slots' swaps are packed after their copies and land a pass later than they did (0, 0, 0.06, 0.05 and 0 before that). Six of those
+    // ten runs had the logits of a run of the build before bit for bit, the other four its first eight rows: the same sums, with a route
+    // in a slot a pass sooner or later.)
+    let (mut again, _) = open(&root);
+    let (compared, noise) = compare(&decode(&mut again, &prompt), &reference);
+    drop(again);
+    let tolerance = (4.0 * noise).max(NOISE_FLOOR);
+    eprintln!("never locked, twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
+    assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
 
     let (mut model, prompt) = open(&root);
     model.lock_layers_for_test(&LOCKED).unwrap();
@@ -173,13 +184,13 @@ fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_ne
     assert_eq!(assist_level(&model), None, "no layer is locked: nothing is assisted or tuned");
     let (compared, worst) = compare(&run, &reference);
     eprintln!("the next request, against a model that never locked: {compared} passes compared, the worst relative difference {worst:.2e}");
-    assert!(compared >= 6 && worst < NOISE_FLOOR, "{compared} passes, {worst}");
+    assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
     // and a growth that is not refused
     model.ensure_kv_for_test(GROWN).unwrap();
     assert!(model.kv_positions() >= GROWN, "the K/V grew to {}", model.kv_positions());
     let run = decode(&mut model, &prompt);
     let (compared, worst) = compare(&run, &reference);
-    assert!(compared >= 6 && worst < NOISE_FLOOR, "{compared} passes, {worst}");
+    assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
 }
 
 /// A give-back ends the locking behind "ready": its plan has no layer left, and a layer its thread locked meanwhile is let go when the model is handed it,
