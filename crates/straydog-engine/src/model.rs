@@ -341,6 +341,16 @@ const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 /// memory twice their size; with at least 1.25 times, half the memory less the page-locked
 /// sequence state; else none (the unlocked layers and the PLE table would thrash).
 pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
+    // (development: STRAYDOG_LOCK_BUDGET=all, or a number of GiB, in place of the rule -- to measure what the layers the rule leaves
+    // unlocked cost: a layer that is not page-locked has no route staged to the GPU and no layer launched ahead of its CPU experts)
+    if let Ok(asked) = std::env::var("STRAYDOG_LOCK_BUDGET") {
+        if asked == "all" {
+            return banks;
+        }
+        if let Ok(gib) = asked.parse::<u64>() {
+            return (gib << 30).min(banks);
+        }
+    }
     if memory == 0 || 4 * memory < 5 * banks {
         return 0;
     }
