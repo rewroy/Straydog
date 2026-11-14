@@ -21,7 +21,7 @@ size_t gemv_unit(int kind, size_t& alignment) {
 // 512 waves. A call site passes a fixed concurrency, so a matrix's reduction tree
 // -- and with it the result -- does not depend on the batch or on what else shares
 // the launch. Measured on RDNA4 decode shapes; units need not divide evenly.
-unsigned gemv_lanes(const Matrix& m, const float* input, size_t concurrent = 1) {
+unsigned gemv_lanes(const Matrix& m, const float* input, size_t concurrent) {
     size_t alignment = 0;
     const size_t unit = gemv_unit(m.kind, alignment);
     const uintptr_t data = reinterpret_cast<uintptr_t>(m.data);
@@ -273,8 +273,8 @@ bool gemv_linked_launch(Device& d, const Matrix& matrix, const float* input, flo
 // power of two) widens a row that gemv_lanes splits over only two lanes, when it has at least 32
 // units: two lanes read short runs of many rows at once.
 void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, float* output,
-          size_t vectors=1, size_t input_stride=0, size_t output_stride=0, const GemvResidual& residual={},
-          unsigned min_lanes=0) {
+          size_t vectors, size_t input_stride, size_t output_stride, const GemvResidual& residual,
+          unsigned min_lanes) {
     if (!count || count > gemv_fixed_items || !vectors || vectors > size_t(gemv_wide_vectors) ||
         (vectors > 1 && (input_stride % 4 || !input_stride || (!output_stride && !residual.hidden) ||
                          input_stride > UINT32_MAX || output_stride > UINT32_MAX)) ||

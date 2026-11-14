@@ -524,7 +524,7 @@ void hybrid_route_export_separate(Device& d, ResidentMoe& plan, const float* inp
     Matrix projections[2] = {plan.weights[(experts + 1) * 3], plan.weights[(experts + 1) * 3 + 1]};
     projections[1].output_offset = experts;
     gemv(d, projections, 2, input, d.output, rows, input_stride, experts + 1);
-    resident_route<<<unsigned(rows), 256, 0, d.stream>>>(d.output, d.output + experts, experts, s.selected, s.probabilities, experts + 1, experts + 1);
+    launch_resident_route(unsigned(rows), d.stream, d.output, d.output + experts, experts, s.selected, s.probabilities, experts + 1, experts + 1);
     hybrid_export<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.selected, s.probabilities, input, input_stride,
                                                                  static_cast<const MoeGroup*>(plan.table), hybrid_assist(d, plan, true),
                                                                  d.exchange_device + slot * hybrid_slot_floats);
@@ -667,13 +667,13 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
         // beside the copy: the resident routes' gate and up, and with level 2 their products and down
         resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes, assign, 1);
         if (overlap >= 2) {
-            moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, routes, s.product);
+            launch_moe_product(unsigned((routes * 640 + 255) / 256), d.stream, s.gate_up, routes, s.product);
             resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, rows, 11 * 640, 11 * 2560, false, stage, d.slots.bytes, assign, 1);
         }
         check(hipStreamWaitEvent(d.stream, d.stage_join, 0));
         // after it: the staged routes', and the products of all routes (the staged routes' gate and up are in now; the resident routes' products come out as before)
         resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes, assign, 2);
-        moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, routes, s.product);
+        launch_moe_product(unsigned((routes * 640 + 255) / 256), d.stream, s.gate_up, routes, s.product);
         resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, rows, 11 * 640, 11 * 2560, false, stage, d.slots.bytes, assign,
                                overlap >= 2 ? 2 : 0);
         if (hybrid_check() && hybrid_check_scratch_floats()) {
@@ -682,7 +682,7 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
             float* reference_product = reference + routes * 1280;
             float* reference_outputs = reference_product + routes * 640;
             resident_expert_launch(d, plan, groups, s.selected, false, input, reference, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes, assign);
-            moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(reference, routes, reference_product);
+            launch_moe_product(unsigned((routes * 640 + 255) / 256), d.stream, reference, routes, reference_product);
             resident_expert_launch(d, plan, groups, s.selected, true, reference_product, reference_outputs, rows, 11 * 640, 11 * 2560, false, stage,
                                    d.slots.bytes, assign);
             hybrid_check_outputs<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.outputs, reference_outputs, s.selected, groups, hybrid_assist(d, plan),
@@ -691,7 +691,7 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
 #endif
     } else {
         resident_expert_launch(d, plan, groups, s.selected, false, input, s.gate_up, rows, input_stride, 11 * 1280, false, stage, d.slots.bytes, assign);
-        moe_product<<<unsigned((routes * 640 + 255) / 256), 256, 0, d.stream>>>(s.gate_up, routes, s.product);
+        launch_moe_product(unsigned((routes * 640 + 255) / 256), d.stream, s.gate_up, routes, s.product);
         resident_expert_launch(d, plan, groups, s.selected, true, s.product, s.outputs, rows, 11 * 640, 11 * 2560, false, stage, d.slots.bytes, assign);
     }
     hybrid_combine<<<dim3(10, unsigned(rows)), 256, 0, d.stream>>>(s.outputs, s.probabilities, s.selected, groups, hybrid_assist(d, plan), partial,
