@@ -645,6 +645,9 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     const auto weakest = [&](const Entry& a, const Entry& b) { return order(b, a); };
     size_t group_count = 0;
     for (const uint8_t group : d.slots.group) group_count = std::max(group_count, size_t(group) + 1);
+    // A layer's size group can have no slots, including a stage-only pool.
+    for (const auto& item : d.resident)
+        if (item.second->hybrid) group_count = std::max(group_count, size_t(item.second->slot_group) + 1);
     std::vector<std::vector<Entry>> residents(group_count), waiting(group_count);
     std::vector<std::vector<size_t>> free_slots(group_count);
     // Bounded refreshes only need each group's strongest candidates and weakest residents: the `max_swaps` first of each order are kept as
