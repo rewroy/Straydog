@@ -786,6 +786,10 @@ fn ple_indices_of(weights: &Weights, before: &[u32], tokens: &[u32]) -> Result<V
 /// A batch's first-layer rows and PLE rows, read from the weights ahead of the batch (the overlapped read's thread for it): what
 /// [`Model::rows_at`] and [`Model::ple_embeddings`] make for a text batch, and the PLE rows of the batch after it asked for.
 fn prepare_batch(weights: &Weights, tokens: &[u32], start: usize, end: usize, next: usize) -> Result<(Arc<Vec<f32>>, Vec<f32>)> {
+    // (this batch's own rows are asked for before the next one's: the reads are served in the order they are asked for, and the first
+    // device waits for these)
+    let own = ple_indices_of(weights, &tokens[..start], &tokens[start..end])?;
+    weights.prefetch_rows(PLE_TABLE, &own)?;
     for from in (end..next).step_by(4096) {
         let part = &tokens[from..(from + 4096).min(next)];
         let before = if from == end { &tokens[..end] } else { &tokens[end..from] };
@@ -793,7 +797,7 @@ fn prepare_batch(weights: &Weights, tokens: &[u32], start: usize, end: usize, ne
     }
     let ids: Vec<i64> = tokens[start..end].iter().map(|token| i64::from(*token)).collect();
     let rows = weights.rows("token_embd.weight", &ids)?;
-    let ple = weights.rows(PLE_TABLE, &ple_indices_of(weights, &tokens[..start], &tokens[start..end])?)?;
+    let ple = weights.rows(PLE_TABLE, &own)?;
     Ok((Arc::new(rows), ple))
 }
 
@@ -848,6 +852,8 @@ struct StageSeconds {
     ple: f64,
     span_calls: f64,
     last_span: f64,
+    /// The first device's thread waiting for a batch's rows (the token rows and the PLE table's, read beside it), within `first`.
+    rows_wait: f64,
 }
 
 struct Checkpoint {
@@ -4479,7 +4485,10 @@ impl Model {
                 first_half.blocked += waiting.elapsed().as_secs_f64();
                 let busy = Instant::now();
                 let mut token_rows = None;
-                let staged = prepared.recv().map_err(|_| "the overlapped read's batch preparation ended early".to_string()).and_then(|read| read)
+                let reading = Instant::now();
+                let read = prepared.recv().map_err(|_| "the overlapped read's batch preparation ended early".to_string()).and_then(|read| read);
+                first_half.rows_wait += reading.elapsed().as_secs_f64();
+                let staged = read
                     .and_then(|read| {
                         token_rows = Some(read.0.clone());
                         overlap_first_half(first_device, ple_operands, tokens, start, end, spans_a, &mut rows[..(end - start) * WIDTH], read, &mut first_half)
@@ -4516,6 +4525,7 @@ impl Model {
         self.metric_add("prefill_overlap_first_seconds", first_half.first);
         self.metric_add("prefill_overlap_first_blocked_seconds", first_half.blocked);
         self.metric_add("prefill_overlap_first_prep_seconds", first_half.prep);
+        self.metric_add("prefill_overlap_first_rows_wait_seconds", first_half.rows_wait);
         self.metric_add("prefill_overlap_first_ple_seconds", first_half.ple);
         self.metric_add("prefill_overlap_first_span_calls_seconds", first_half.span_calls);
         self.metric_add("prefill_overlap_first_last_span_seconds", first_half.last_span);
