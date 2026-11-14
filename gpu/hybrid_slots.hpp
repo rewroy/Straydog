@@ -187,7 +187,7 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
         if (mirror) {
             const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault);
             if (pinned != hipSuccess)
-                throw std::runtime_error(std::string(hipGetErrorString(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
+                throw std::runtime_error(std::string(gpu_error_text(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
         }
         check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
         std::memset(d.exchange, 0, hybrid_exchange_floats * 4);

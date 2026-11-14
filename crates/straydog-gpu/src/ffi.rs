@@ -188,6 +188,14 @@ unsafe extern "C" {
     pub fn sd_test_hybrid_timeout(count: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_test_gpu_error_text(
+        code: ::std::os::raw::c_int,
+        runtime_null: ::std::os::raw::c_int,
+        out: *mut ::std::os::raw::c_char,
+        capacity: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_wait_check(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

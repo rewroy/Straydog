@@ -324,11 +324,29 @@ constexpr unsigned kv_row_f16 = 512, kv_row_q8 = 272;
 constexpr size_t attention_score_bytes = max_batch * 24 * 2052 * 4;   // decode attention partials (QSA prefill marks)
 constexpr size_t io_arena_bytes = size_t(32) << 20;   // page-locked transfer staging per device
 
+// What a failed GPU call says, never NULL. The CUDA runtime returns NULL from cudaGetErrorString when the NVIDIA driver cannot be loaded
+// (and std::string(NULL) reads address 0), and its own words for a driver that is too old do not say what to do. `runtime` is what the
+// runtime answered (it may be NULL). The CUDA codes mapped to the driver sentence: cudaErrorStubLibrary 34 (a stub nvcuda loaded),
+// cudaErrorInsufficientDriver 35 (the driver is missing or older than the runtime: what cudaGetDeviceCount returns without nvcuda.dll)
+// and cudaErrorSystemDriverMismatch 803; cudaErrorNoDevice 100 is a driver with no NVIDIA GPU.
+const char* gpu_error_text_of(hipError_t error, const char* runtime) {
+#if !defined(__HIPCC__)
+    if (error == cudaErrorInsufficientDriver || error == cudaErrorStubLibrary || error == cudaErrorSystemDriverMismatch)
+        return "The NVIDIA driver is missing or too old to run CUDA 13: install or update the NVIDIA driver to version 580 or later (the latest is recommended)";
+    if (error == cudaErrorNoDevice) return "No NVIDIA GPU was found";
+#endif
+    if (runtime != nullptr && *runtime != '\0') return runtime;
+    thread_local std::string unknown;
+    unknown = "GPU error " + std::to_string(int(error));
+    return unknown.c_str();
+}
+const char* gpu_error_text(hipError_t error) { return gpu_error_text_of(error, hipGetErrorString(error)); }
+
 // The site and the code go with the message: the same words can mean memory that ran out or a device that was reset.
 void check_at(hipError_t error, const char* file, int line) {
     if (error == hipSuccess) return;
     const std::string path(file);
-    throw std::runtime_error(std::string(hipGetErrorString(error)) + " (" + path.substr(path.find_last_of("/\\") + 1) + ":" + std::to_string(line) +
+    throw std::runtime_error(std::string(gpu_error_text(error)) + " (" + path.substr(path.find_last_of("/\\") + 1) + ":" + std::to_string(line) +
                              ", code " + std::to_string(int(error)) + ")");
 }
 #define check(error) check_at((error), __FILE__, __LINE__)
@@ -339,7 +357,7 @@ void blas_check(hipblasStatus_t status) {
 }
 
 void cleanup(hipError_t error) noexcept {
-    if (error != hipSuccess) std::fprintf(stderr, "Straydog GPU cleanup: %s\n", hipGetErrorString(error));
+    if (error != hipSuccess) std::fprintf(stderr, "Straydog GPU cleanup: %s\n", gpu_error_text(error));
 }
 
 // Page-locked host memory for what a request asks (a K/V growth, the MTP rows' staging, a read's buffer). Tests make the next
@@ -2563,6 +2581,17 @@ int sd_host_unregister(void* pointer) {
 int sd_test_refuse_host(uint64_t count) {
     refuse_host_allocations.store(count);
     return 0;
+}
+// Development: the text a failed call with `code` carries when the runtime answers NULL (runtime_null != 0) or its own text; copied into
+// `out` (NUL-terminated, cut to `capacity`); the length, or -1 for a bad buffer. Touches no device and no driver.
+int sd_test_gpu_error_text(int code, int runtime_null, char* out, size_t capacity) {
+    if (out == nullptr || capacity == 0) return -1;
+    const hipError_t error = static_cast<hipError_t>(code);
+    const std::string text(gpu_error_text_of(error, runtime_null != 0 ? nullptr : "the runtime's own words"));
+    const size_t length = std::min(text.size(), capacity - 1);
+    std::memcpy(out, text.data(), length);
+    out[length] = '\0';
+    return int(length);
 }
 int sd_test_hybrid_timeout(uint64_t count) {
     test_hybrid_timeouts.store(count);
