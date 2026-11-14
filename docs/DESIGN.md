@@ -1148,6 +1148,36 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   2048: the attention 75 us a token (flash 71, union 3, marks 1) to 19.6; a fresh 242K read 64.7 s
   to 58.8 s, 95K 22.3 s to 20.6 s, 32K 8.07 s to 7.82 s. The pinned generations' prompts end
   before 5.3K, so they keep their bits.
+- On CUDA from sm_80, over Q8_0 K/V, each token attends its own selection on the tensor cores (`qsa_flash_mma`,
+  `gpu/sparse_attention_compute.hpp`; `STRAYDOG_QSA_MMA=0` keeps `qsa_flash_wide`, as do FP16 K/V and HIP). It is
+  `qsa_prompt_attention`'s design with mma.sync m16n8k16:
+  - A block is a token and a K/V head. Each of its four warps takes every fourth tile of 16 selected keys, all 256 dimensions,
+    with its own online softmax, and the warps merge at the end in warp order, so the result does not depend on timing.
+  - The twelve query heads are the M = 16 rows, four of them zeros.
+  - For S = Q K^T a lane reads 64 consecutive bytes of a key row, its B operand for all 16 k-steps. The dimensions of k-step s
+    are 64 q + 4 s + 0..3 for the lane quad's q, and the queries are permuted the same way.
+  - For O += P V, S's C fragments are P's A fragment. A lane reads 32 consecutive bytes of each of its four key rows, so n-tile j
+    of the output holds the dimensions 32 n + j.
+  - Q8_0 becomes FP16 as on RDNA4: the int8 + 128 behind 0x64 is the half 1024 + b + 128, minus 1152 exactly, times the scale.
+  - 230 registers on sm_120, no stack; the K/V rows go from memory straight into the operands, with no staging in shared memory.
+
+  Numerics: the same FP16 keys, values, queries and probabilities as RDNA4's, with F32 softmax and sums, so not
+  `qsa_flash_wide`'s bits.
+  - A layer's output against the F32 kernel's: RMS 2.7-3.2e-4, the worst head's row 4.0-4.8e-4, FP16's rounding.
+  - The first logits after 8192- and 32768-token prompts (GSQ IQ2_XS, RTX 5070 Ti) against the F32 kernel: KL 0.0008-0.0020 on
+    average and 0.012-0.038 at the most, where two runs of the F32 kernel differ by 0.0012 and 0.043. The first token was the
+    same in every run.
+
+  Why the F32 kernel was slow: it ran F32 SIMT at 10-11 TFLOP/s on an RTX 5070 Ti, with 128 registers (two blocks an SM) and
+  three block barriers per 64 keys. With its reads and its products both left out it still took 2.45 ms of 10.1.
+
+  Measured:
+  - One layer of 4096 rows at position 98304, P = 2: RTX 5070 Ti 9.3-10.2 ms -> 2.5-2.7 ms; RTX 3090 16.0-17.1 -> 3.0-4.4
+    (selections shared by 16 tokens, random, or the most recent).
+  - An RTX 5070 Ti's 32K read: the attention phase 1943.9 ms -> 503.8 ms.
+  - Two RTX 3090 served, the switch alone: a 32K read 1.7-1.9 s shorter, a 100K read 4.1-4.6 s shorter.
+
+  What did not help: prefetching the next tile's rows to L2 made it slower (2.55 -> 3.49 ms).
 - In parts the two devices share the indexer (a span's chunks of 256 rows in turn), and from 8192
   tokens a device attends its own chunks' tokens in the chunk loop, from the selection it made, and
   sends the selected blocks (`qsa_send_blocks`) into the other's inbox. The other's chunks it
@@ -1296,6 +1326,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   and 3.0e-7 (95K), the same top token, where the token scan against itself at batch widths of 1024, 2048 and 3072 differs by 3.9e-6, 2.9e-6 and
   7.5e-6 at 32K (a 95K read at a narrower batch than the default fails in the example, as it does before this change: "invalid Straydog MTP
   rows", so that noise is not measured). The kernel's outputs have not been compared with an F64 scan on CUDA, as the RDNA4 kernel's were.
+  Since then the tile is read without bank conflicts, and a block has four warps (64 columns).
+  - The conflict: the two lanes of a column read the rows `own + key` (own 0 or 64) as float4. Rows 64 apart are 4096 bytes apart and
+    fall in the same banks, a 2-way conflict on every LDS.128 of the scan.
+  - The fix: the tile puts key (and query) row r at r * 16 + (r / 64) * 4 floats, the second half's rows 16 bytes further.
+  - The sums and their order are unchanged, so the outputs and states have the same bits. A standalone benchmark compares the old
+    text with the new one by digest.
+  - One layer of 4096 rows, P = 2: RTX 5070 Ti 1.42-1.47 -> 0.95 ms (0.99 with two warps); RTX 3090 2.28 -> 1.87 ms (1.97 with two).
+    The scan phase of an RTX 5070 Ti's 32K read: 883 -> 521 ms.
+  - Four, eight or sixteen lanes a column stayed slower, shifted too: 1.6-2.1 ms on the RTX 5070 Ti, 2.2-2.8 on the RTX 3090.
 - A read of 16384 new tokens or more (`STRAYDOG_HC=blas` keeps the pair below) runs each HyperConnection's up projection and
   its finish as one kernel (`hc_up_finish`, `gpu/hc_fused.hpp`, RDNA4 with FP16 projections). The pair was hipblasGemmEx for the
   10240 x 320 projection, which wrote its F32 rows (168 MB for a part's 4096 rows), and `hc_finish_hidden`, which read them again with
@@ -1308,6 +1347,18 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   fragment holds over K in steps of 16 from a zero accumulator), which is not rocBLAS's, so the projection's last bits move; the
   rest is bit for bit the finish's (`gpu/tests/hc_fused_test.cpp` compares the kernel with `hc_finish_hidden` on a plain kernel's
   projection: no bit of 10.5M differs, the injections included), and the error against an F64 sum is the pair's (README, Numerics).
+- On CUDA from sm_80, every prompt batch with FP16 projections takes the same fusion, `hc_up_finish_mma` (`gpu/hc_fused.hpp`).
+  `STRAYDOG_HC_FUSED=0` keeps the pair there; `STRAYDOG_HC=blas` is RDNA4's switch.
+  - Its blocks are hc_up_finish's, on mma.sync m16n8k16: 128 weight rows (32 columns of each stream) by 128 tokens, eight warps,
+    and K = 320 in five steps of 64 through shared memory.
+  - The block's sigmoid(sums) go through shared memory 64 tokens at a time, so the finish reads and writes 16 bytes at a time.
+    A finish straight from the accumulators wrote 4 bytes a lane and was slower than the pair: 1.36 ms on an RTX 5070 Ti, 1.41 on
+    an RTX 3090.
+  - It runs two blocks an SM, at 128 registers and 96 bytes of stack on sm_120.
+  - 4096 rows: RTX 5070 Ti 0.85 ms (cublasGemmEx 0.34 + hc_finish_hidden 0.50) -> 0.48; RTX 3090 1.05 -> 0.66.
+  - The mixed rows are the pair's bit for bit on both: cuBLAS sums K in steps of 16 from zero, ascending, at this shape. Checked by
+    digests in a standalone benchmark.
+  - An RTX 5070 Ti's 32K read: hc_up + hc_finish 705 ms -> hc_up_finish 442 ms.
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
