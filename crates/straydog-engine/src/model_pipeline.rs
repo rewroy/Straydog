@@ -32,6 +32,11 @@ pub(super) struct PipelineConfig {
     assist: Option<u32>,
     /// STRAYDOG_PIPELINE_LONE=0: a pass after a wrong guess waits for its drafts as before (the lone row is sent at once by default).
     lone: bool,
+    /// STRAYDOG_PIPELINE_DRAWN_GUESSES=1 (to measure): a prediction of the chain is what the target's keyed draw would give on the drafter's
+    /// logits (sampling::guess_keyed), where it is the drafter's most likely token by default. With the model card's sampling for answers
+    /// (temperature 0.7, top_p 0.8) the target's cut distribution is mostly one candidate and the two guessed alike (80.5% against
+    /// 80.3% to 82.1% right); a reasoning request's sampling (temperature 1.0, top_p 0.95) draws past the most likely token far more often.
+    keyed_guesses: bool,
     /// STRAYDOG_PIPELINE_SWAPS=free: the expert slots swap as in the ordinary loop, not held while passes are run ahead (to measure what holding costs).
     free_slots: bool,
     /// STRAYDOG_PIPELINE_RECOVER=0: a pass given up behind one whose only miss was its bonus is put back by the forced replay, not by the snapshots.
@@ -95,7 +100,8 @@ impl PipelineConfig {
                          hand_test: match std::env::var("STRAYDOG_PIPELINE_HANDOVER").as_deref() { Ok("start") => 1, Ok("zero") => 2, _ => 0 },
                          no_copy: std::env::var("STRAYDOG_PIPELINE_NO_COPY").is_ok_and(|value| value == "1"),
                          pass_log: std::env::var("STRAYDOG_PIPELINE_PASS_LOG").is_ok_and(|value| value == "1"),
-                         head_share: head_share_named(std::env::var("STRAYDOG_PIPELINE_HEAD_SHARE").ok().as_deref()) }
+                         head_share: head_share_named(std::env::var("STRAYDOG_PIPELINE_HEAD_SHARE").ok().as_deref()),
+                         keyed_guesses: std::env::var("STRAYDOG_PIPELINE_DRAWN_GUESSES").is_ok_and(|value| value == "1") }
     }
 
     /// The expert slots and the assist level held as they are.
@@ -935,6 +941,17 @@ struct Tools {
     stats: std::cell::RefCell<[[[f64; 2]; 4]; 2]>,
     /// Whether the chain being made is that of a pass begun after a wrong guess (else that of a pass that follows one): which half of `stats`.
     started: std::cell::Cell<bool>,
+    /// What the chain's predictions are drawn with (sampling::guess_keyed), set where a chain begins: None where they are the drafter's most
+    /// likely tokens (the request's choice is the greatest logit, or STRAYDOG_PIPELINE_DRAWN_GUESSES=0).
+    drawing: std::cell::RefCell<Option<Drawing>>,
+}
+
+/// The request's sampling, the tokens generated so far with the ones the chain has been fed since (each joins when it is fed: the target's
+/// penalty at a row counts the tokens before it), and the seed of the keyed draws.
+struct Drawing {
+    sampling: Sampling,
+    generated: Generated,
+    seed: u64,
 }
 
 /// The drafter's chain from the second device alone: the catch-up of the pairs of a pass, the tokens fed in turn, then each
@@ -1051,7 +1068,9 @@ impl Model {
             } else { result }
         } else {
             // Default-off requests retain the original step, without a queue, idle poll or split-head pin.
-            self.group.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, None, 0)
+            // (the drafter's greatest logits with the step, where the prediction is drawn from them)
+            let top = if head && tools.drawing.borrow().is_some() { sampling::GUESS_TOP } else { 0 };
+            self.group.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, None, top)
         };
         let mut stats = tools.stats.borrow_mut();
         let slot = &mut stats[usize::from(tools.started.get())][kind];
@@ -1060,9 +1079,32 @@ impl Model {
         step
     }
 
-    fn predicted(draft: Option<crate::gpu::Draft>) -> Result<(u32, f32)> {
+    /// A step's prediction: the token after the one at `position` (the last the chain was fed), and the probability of the drafter's most
+    /// likely token. Drawn as the target will draw at that row where the chain draws (`Tools::drawing`), else the most likely token.
+    fn predicted(tools: &Tools, draft: Option<crate::gpu::Draft>, position: u64) -> Result<(u32, f32)> {
         let draft = draft.ok_or("Straydog drafter head returned no token")?;
+        if let Some(drawing) = tools.drawing.borrow().as_ref() {
+            if let Some(guess) = sampling::guess_keyed(&draft.top, &drawing.sampling, &drawing.generated, &mut Rng::keyed(drawing.seed, position)) {
+                return Ok(guess);
+            }
+        }
         Ok((u32::try_from(draft.token).map_err(|_| "Straydog drafter head returned no token")?, draft.confidence))
+    }
+
+    /// The chain begins: its predictions are drawn as the target's keyed draws where the request's choice is not the greatest logit.
+    fn chain_drawing(&self, tools: &Tools, sampling: &Sampling, generated: &Generated) {
+        let drawing = (self.pipeline.keyed_guesses && sampling::guesses_keyed(sampling))
+            .then(|| Drawing { sampling: sampling.clone(), generated: generated.clone(), seed: self.sample_seed });
+        tools.drawing.replace(drawing);
+    }
+
+    /// A token the chain is fed joins the tokens its later predictions' penalty counts.
+    fn chain_fed(tools: &Tools, tokens: &[u32]) {
+        if let Some(drawing) = tools.drawing.borrow_mut().as_mut() {
+            for token in tokens {
+                drawing.generated.insert(*token);
+            }
+        }
     }
 
     /// The noted tokens' rows into the draft's vocabulary, on the second device alone: the first is the worker's while the loop runs, so the
@@ -1087,16 +1129,17 @@ impl Model {
         self.phase("draft: catch-up and first draft", &mut clock);
         let mut chain = Chain { first: None, last: *tokens.last().unwrap_or(&0), previous: tokens.len() as u64, position: position + tokens.len() as u64 };
         if forced.is_empty() {
-            chain.first = Some(Self::predicted(step)?);
+            chain.first = Some(Self::predicted(tools, step, chain.position)?);
             return Ok(chain);
         }
         for (index, token) in forced.iter().enumerate() {
             let embedded = self.token_embeddings(&[*token])?;
+            Self::chain_fed(tools, &[*token]);
             let step = self.chain_step(link, tools, &embedded, None, chain.previous, chain.position, index + 1 == forced.len(), 1)?;
             chain.last = *token;
             (chain.previous, chain.position) = (1, chain.position + 1);
             if index + 1 == forced.len() {
-                chain.first = Some(Self::predicted(step)?);
+                chain.first = Some(Self::predicted(tools, step, chain.position)?);
             }
         }
         self.phase("draft: forced steps", &mut clock);
@@ -1113,6 +1156,7 @@ impl Model {
         let mut clock = Instant::now();
         let rows: Vec<f32> = hidden.iter().chain(stash).copied().collect();
         let all: Vec<u32> = tokens.iter().chain(forced).copied().collect();
+        Self::chain_fed(tools, forced);
         let mut chain = Chain { first: None, last: 0, previous: 0, position };
         let mut at = 0;
         while at < all.len() {
@@ -1123,7 +1167,7 @@ impl Model {
             chain.last = all[end - 1];
             (chain.previous, chain.position) = ((end - at) as u64, position + end as u64);
             if last {
-                chain.first = Some(Self::predicted(step)?);
+                chain.first = Some(Self::predicted(tools, step, chain.position)?);
             }
             at = end;
         }
@@ -1139,11 +1183,12 @@ impl Model {
         }
         let mut clock = Instant::now();
         let embedded = self.token_embeddings(&[chain.last])?;
+        Self::chain_fed(tools, &[chain.last]);
         let step = self.chain_step(link, tools, &embedded, None, chain.previous, chain.position, true, 2)?;
         self.phase("draft: next draft", &mut clock);
-        let prediction = Self::predicted(step)?;
-        chain.last = prediction.0;
         (chain.previous, chain.position) = (1, chain.position + 1);
+        let prediction = Self::predicted(tools, step, chain.position)?;
+        chain.last = prediction.0;
         Ok(prediction)
     }
 
@@ -1257,7 +1302,7 @@ impl Model {
         let mut tools = unsafe {
             Tools { head: std::mem::transmute(self.head_operands()?), draft_with_head: std::mem::transmute(self.draft_operands(true)?),
                     draft_without_head: std::mem::transmute(self.draft_operands(false)?), lower_head: None,
-                    stats: Default::default(), started: Default::default() }
+                    stats: Default::default(), started: Default::default(), drawing: Default::default() }
         };
         if self.pipeline.head_share {
             tools.lower_head = self.group.pin_head(&tools.draft_with_head[7])?;
@@ -1431,7 +1476,7 @@ impl Model {
                     }
                     let started = Instant::now();
                     tools.started.set(true);
-                    let current = self.pipelined_start(link, tools, token, &mtp_hidden, &mtp_tokens, mtp_position, produced, max_new, sampling, rng,
+                    let current = self.pipelined_start(link, tools, token, &mtp_hidden, &mtp_tokens, mtp_position, produced, max_new, sampling, rng, generated,
                                                        &gate, &mut parity, &mut guesses, after_miss)?;
                     after_miss = false;
                     chain_time += started.elapsed().as_secs_f64();
@@ -1546,7 +1591,7 @@ impl Model {
                 let chaining = Instant::now();
                 tools.started.set(false);
                 let next = self.pipelined_follow(link, tools, &gate, &pass, &spec, &hidden, &emitted, produced, max_new, &mut parity,
-                                                 &mut guesses)?;
+                                                 &mut guesses, sampling, generated)?;
                 chain_time += chaining.elapsed().as_secs_f64();
                 following_pass = Some(Current { pass: spec, spec: next, guess: None, lone: false });
                 let committing = Instant::now();
@@ -1684,8 +1729,9 @@ impl Model {
     /// token), sent after it. Nothing is in flight.
     #[allow(clippy::too_many_arguments)]
     fn pipelined_start(&mut self, link: &mut Link, tools: &Tools, token: &u32, hidden: &[f32], tokens: &[u32], position: u64, produced: usize,
-                       max_new: usize, sampling: &Sampling, rng: &mut Rng, gate: &Gate, parity: &mut usize, guesses: &mut usize, lone: bool)
-                       -> Result<Current> {
+                       max_new: usize, sampling: &Sampling, rng: &mut Rng, generated: &Generated, gate: &Gate, parity: &mut usize,
+                       guesses: &mut usize, lone: bool) -> Result<Current> {
+        self.chain_drawing(tools, sampling, generated);
         let room = self.context.saturating_sub(self.history.len() + 1);
         // After a wrong guess the pass goes to the first device at once, with the one row that is known (the token the verdict gave) and no
         // drafts: the drafter's steps then run on the second device while the first device works, and the pass behind it is made from their
@@ -1763,7 +1809,9 @@ impl Model {
     /// states), takes `spec`'s drafts in turn and goes on from its bonus guess; the pass goes to the first device behind `spec`'s.
     #[allow(clippy::too_many_arguments)]
     fn pipelined_follow(&mut self, link: &mut Link, tools: &Tools, gate: &Gate, pass: &Pass, spec: &Pass, hidden: &[f32], emitted: &[u32],
-                        produced: usize, max_new: usize, parity: &mut usize, guesses: &mut usize) -> Result<Option<Pass>> {
+                        produced: usize, max_new: usize, parity: &mut usize, guesses: &mut usize, sampling: &Sampling, generated: &Generated)
+                        -> Result<Option<Pass>> {
+        self.chain_drawing(tools, sampling, generated);
         // `produced` counts what this pass emitted: the next pass emits its own rows at most, and a pass behind it is wanted if more is.
         let history = self.history.len() + pass.rows.len();
         let after = produced + spec.rows.len();
@@ -1944,7 +1992,7 @@ mod config_tests {
 
     fn on() -> PipelineConfig {
         PipelineConfig { mode: Mode::On, drafts: None, force_miss: 0, cpu_threads: None, gate: 0.3, assist: None, lone: true, free_slots: false,
-                         recover: true, batch: false, handover: true, hand_held: false, hand_test: 0, no_copy: false, pass_log: false, head_share: false }
+                         recover: true, batch: false, handover: true, hand_held: false, hand_test: 0, no_copy: false, pass_log: false, head_share: false, keyed_guesses: true }
     }
 
     #[test]
