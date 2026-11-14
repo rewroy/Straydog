@@ -72,15 +72,14 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
         hc_activate_low<<<unsigned((steps * 320 + 255) / 256), 256, 0, d.stream>>>(low, steps * 320);
         batch_cast(d, low, half, steps * 320);
         phase(d, "hc_down");
-#if defined(__HIPCC__)
-        // A long read's rows: the up projection and the finish in one kernel (hc_fused.hpp), the F32 projection never written.
-        if (d.hc_fused && d.rdna4) {
+        // The up projection and the finish in one kernel (hc_fused.hpp: RDNA4 on a long read, CUDA from sm_80), the F32 projection never written.
+        if (hc_fused_enabled(d)) {
             expand(up, d.expanded, d.stream, true);
             hc_up_finish_launch(d, reinterpret_cast<const __half*>(d.expanded), half, hidden, norm, denominators, injection, steps, mixed);
             ++d.gemm_calls; d.gemm_vectors += steps;
+            phase(d, "hc_up_finish");
             return;
         }
-#endif
         batch_project(d, up, steps, low, half, projected);
         phase(d, "hc_up");
         hc_finish_hidden<<<unsigned((steps * 2560 + 255) / 256), 256, 0, d.stream>>>(hidden, norm, denominators, projected, injection,
