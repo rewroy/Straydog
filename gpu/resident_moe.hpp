@@ -265,6 +265,12 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     bool q8=false;
     if (!down && only!=2 && resident_gate_up_q8_takes(d,plan,input,tokens,input_stride)) {
         if (with_shared) {
+            // (a HIP build's development switch: the stream made at its first use, as the layers in parts make it)
+            if (!d.side_stream) {
+                check(hipStreamCreate(&d.side_stream));
+                check(hipEventCreateWithFlags(&d.side_fork,hipEventDisableTiming));
+                check(hipEventCreateWithFlags(&d.side_join,hipEventDisableTiming));
+            }
             check(hipEventRecord(d.side_fork,d.stream));
             check(hipStreamWaitEvent(d.side_stream,d.side_fork,0));
             {
