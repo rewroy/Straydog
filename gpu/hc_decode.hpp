@@ -2,10 +2,6 @@
 // injection projections by residual stream, so each block owns its stream's RMS;
 // stage two rebuilds the activated low-rank vector and finishes all four
 // streams per output column. Arithmetic stays F32 with the same equations.
-__device__ float hc_sigmoid(float x) {
-    const float e = expf(-fabsf(x));
-    return x >= 0 ? 1.0f / (1.0f + e) : e / (1.0f + e);
-}
 
 // A Q8_0 unit's eight bytes, two-byte aligned in its block.
 #if defined(__HIPCC__)

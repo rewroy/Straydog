@@ -1249,3 +1249,11 @@ template<int kind> void launch_gemv_decode_shared(unsigned blocks, hipStream_t s
 template<int V, int ROWS> void launch_gemv_q8_rows_wave(unsigned blocks, size_t lds, hipStream_t stream, const FixedGemv& list, const float* input, float* output);
 template<int kind> void launch_gemv_decode_shared_rdna4(unsigned blocks, hipStream_t stream, const Matrix& matrix, unsigned lanes, const float* input, float* output, const GemvResidual& residual);
 #endif
+
+
+// ---- The dispatch (gemv.hpp, in kernels.cpp) that the other units call ----
+unsigned gemv_lanes(const Matrix& m, const float* input, size_t concurrent = 1);
+size_t gemv_waves(const Matrix& m, unsigned lanes);
+void gemv(Device& d, const Matrix* matrices, size_t count, const float* input, float* output,
+          size_t vectors=1, size_t input_stride=0, size_t output_stride=0, const GemvResidual& residual={},
+          unsigned min_lanes=0);
