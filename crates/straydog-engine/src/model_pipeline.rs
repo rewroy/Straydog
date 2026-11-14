@@ -1713,20 +1713,20 @@ impl Model {
         let mut chain = self.chain_open(link, tools, hidden, tokens, position, &[])?;
         let mut drafts = Vec::new();
         let mut product = 1.0f32;
-        // The drafts while their product stays at the cut; the prediction that ends them is the guess of the bonus token (none is asked for
-        // in the ordinary order: the steps are the ordinary loop's).
-        let guess = loop {
-            if !gate.open() && drafts.len() == limit {
-                break None;
-            }
+        // The drafts while their product stays at the cut. A prediction the cut refuses is the guess of the bonus token.
+        let mut guess = None;
+        while drafts.len() < limit {
             let (next, probability) = self.chain_next(link, tools, &mut chain)?;
             product *= probability;
-            if drafts.len() == limit || product < self.draft_cut(false, drafts.len() + 1) {
-                break Some(next);
+            if product < self.draft_cut(false, drafts.len() + 1) {
+                guess = Some(next);
+                break;
             }
             drafts.push(next);
-        };
-        // (the pass goes to the first device now, and the drafter goes on while it runs)
+        }
+        // (the pass goes to the first device now, as soon as its own drafts are there, and the drafter goes on while it runs: the guess of
+        // the bonus token is the step after the last draft, which the pass does not wait for -- a drafting step on the second device, 1 ms
+        // of two RTX 3090, that the first device then spends on the pass)
         let pass = match early.take() {
             Some(pass) => pass,
             None => {
@@ -1734,6 +1734,10 @@ impl Model {
                 self.pipelined_send(link, rows, self.history.len(), None, parity, plan)?
             }
         };
+        // (none is asked for in the ordinary order: the steps are the ordinary loop's)
+        if guess.is_none() && gate.open() {
+            guess = Some(self.chain_next(link, tools, &mut chain)?.0);
+        }
         let after = produced + pass.rows.len();
         let next_room = self.context.saturating_sub(self.history.len() + pass.rows.len() + 1);
         let most = self.speculative.min(PARTIAL_ROWS - 1);
