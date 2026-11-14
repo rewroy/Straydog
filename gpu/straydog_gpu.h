@@ -82,6 +82,11 @@ int sd_hybrid_wait_check(void* handle);
 int sd_hybrid_route_check(void* handle, const void* router, int router_kind, const void* gate, int gate_kind, uint64_t experts, uint64_t rows,
                           const float* input, uint32_t repeats, uint32_t assist, int* fused, float* scores, int32_t* selected,
                           float* probabilities, float* exported);
+/* Development, one-off (tests/resident_cost.rs): what the decode gate and up launch of a partially resident layer costs on CUDA, run with the engine's own
+   kernels on a plan formed by hand over synthetic bytes. The modes, `selected`, `slot_of` and the 32 `out` doubles are described at the function in
+   kernels.cpp; HIP has none. */
+int sd_bench_resident(void* handle, const int* kinds, uint32_t experts, const int32_t* slot_of, uint32_t rows, const int32_t* selected,
+                      uint32_t mode, uint32_t only, uint32_t warmup, uint32_t reps, double* out);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
 // The row stagings of batches of `floats` floats (the MTP layer's, the first layer's and the PLE layer's rows, two page-locked buffers each) pinned on a

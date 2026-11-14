@@ -8,6 +8,7 @@
 //!
 //! A floor may end in @f32 or @q8 (after a q): that run takes the GPU projections on the F32 kernels (STRAYDOG_Q8=0) or the Q8 kernels
 //! (INT8 activations), whatever the environment says. `0.04@f32,0.04@q8` is the KL of the Q8 kernels against the F32 ones, at one floor.
+//! @e0, @e1 and @e2 set the routed experts' gate and up the same way (STRAYDOG_EXPERT_Q8 unset, 1, 2).
 
 use std::path::PathBuf;
 
@@ -37,14 +38,19 @@ fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floo
     match mode {
         Some("f32") => std::env::set_var("STRAYDOG_Q8", "0"),
         Some("q8") => std::env::remove_var("STRAYDOG_Q8"),
-        Some(other) => return Err(format!("no mode {other}: @f32 or @q8")),
+        Some("e0") => std::env::remove_var("STRAYDOG_EXPERT_Q8"),
+        Some("e1") => std::env::set_var("STRAYDOG_EXPERT_Q8", "1"),
+        Some("e2") => std::env::set_var("STRAYDOG_EXPERT_Q8", "2"),
+        Some(other) => return Err(format!("no mode {other}: @f32, @q8, @e0, @e1 or @e2")),
         None => {}
     }
     let mut group = Group::new(devices, &vec![budget; devices.len()], SplitMode::Experts)?;
     group.configure_gemm(2, true)?;
-    let weights = Weights::open(model_dir, id, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    // (QWEN_FLOOR_DRAFTER=<MTP drafter file>: the continuations by speculative decoding, three drafts, its verification passes of several rows)
+    let drafter = std::env::var_os("QWEN_FLOOR_DRAFTER").map(PathBuf::from);
+    let weights = Weights::open(model_dir, id, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let text = Text::new(weights.resources.get("tokenizer.json").ok_or("no tokenizer")?).map_err(|exc| exc.0)?;
-    let settings = Settings { context: 32_768, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: 0, cpu_threads: 0,
+    let settings = Settings { context: 32_768, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
     model.lock_banks_now()?;

@@ -2031,11 +2031,16 @@ impl Model {
         // (STRAYDOG_PIPELINE_ASSIST: the level the pipeline and `freeze` hold, which no tuner chooses there)
         let held = if self.pipeline.frozen_slots() { self.pipeline.assist() } else { None };
         let forced = held.or_else(|| std::env::var("STRAYDOG_ASSIST").ok().and_then(|value| value.parse::<u32>().ok())).map(|value| value.min(cap));
-        let fixed = forced.or(cfg!(feature = "cuda").then_some(CUDA_ASSIST.min(cap)));
-        let level = self.assist.as_ref().map_or(fixed.unwrap_or(cap), assist::Tuner::level);
+        // (STRAYDOG_ASSIST=tune: a CUDA build's level is tuned as a HIP build's is, from CUDA_ASSIST. On a slow host a missed route costs the CPU a
+        // millisecond and the level decides a sixth of the speed -- two RTX 3090 on 20 shared vCPUs: 52 to 59 tok/s at 0, 63 to 67 at 4 -- where
+        // an RTX 4090 beside a fast CPU could not tell the levels apart.)
+        let tune = std::env::var("STRAYDOG_ASSIST").is_ok_and(|value| value == "tune");
+        let fixed = forced.or((cfg!(feature = "cuda") && !tune).then_some(CUDA_ASSIST.min(cap)));
+        let first = fixed.unwrap_or(if cfg!(feature = "cuda") { CUDA_ASSIST.min(cap) } else { cap });
+        let level = self.assist.as_ref().map_or(first, assist::Tuner::level);
         let mapped = self.group.enable_assist(level)?;
         if mapped > 0 && self.assist.is_none() {
-            self.assist = Some(assist::Tuner::new(if fixed.is_some() { Vec::new() } else { assist::levels(cap) }, fixed.unwrap_or(cap)));
+            self.assist = Some(assist::Tuner::new(if fixed.is_some() { Vec::new() } else { assist::levels(cap) }, first));
         }
         self.assist_mapped = mapped;
         Ok(mapped)
