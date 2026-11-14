@@ -400,6 +400,13 @@ fn prompt_passes() -> usize {
     *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
 }
 
+/// STRAYDOG_PROMPT_PASSES_OVERLAP=0 (development): a prompt batch's passes run through the two devices one after the other, where the two
+/// would take different passes at once ([`Model::prefill_passes_overlapped`]): the comparison's other side.
+fn prompt_passes_overlapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES_OVERLAP").map_or(true, |value| value.trim() != "0"))
+}
+
 /// STRAYDOG_PROMPT_REFRESH_AHEAD (development): a prompt of at most this many new tokens re-picks the expert slots from its routes without
 /// waiting for the swaps' copies (unset or 0: every prompt waits, as before). The wait is 0.09 s of a short prompt's 0.24 s to the first
 /// token on two RTX 3090; the experts on their way are the CPU's or staged until they land.
@@ -3264,7 +3271,7 @@ impl Model {
         };
         let hidden = if verified {
             let start = self.history.len();
-            let rows = self.prefill_verified(tokens)?;
+            let rows = if self.prompt_passes_overlap() { self.prefill_passes_overlapped(tokens)? } else { self.prefill_verified(tokens)? };
             // forward records the tokens below, after the MTP layer has read the prompt.
             self.history.truncate(start);
             if self.speculative > 0 {
@@ -4549,6 +4556,80 @@ impl Model {
             self.commit(chunk, chunk.len(), &first, &embeddings)?;
             rows.extend_from_slice(&hidden);
         }
+        Ok(rows)
+    }
+
+    /// Whether a prompt batch's passes can run on both devices at once ([`Model::prefill_passes_overlapped`]): the layers split between two
+    /// devices that each have a CPU engine of their own (the pipeline's configuration), a text batch.
+    fn prompt_passes_overlap(&self) -> bool {
+        self.partial && self.cpu_second.is_some() && self.group.backends.len() == 2 && !self.group.parts() && self.images.is_empty()
+            && self.rope_delta == 0 && !self.rope_table && self.warm_stop.is_none() && !self.deferred
+            && self.group.split().is_some_and(|split| split >= 2) && prompt_passes_overlapped()
+    }
+
+    /// [`Model::prefill_verified`] with the two devices on different passes at once: the first device runs a pass's layers up to the split and
+    /// hands its rows to the second through host memory, which runs the rest while the first has the next pass. Every row of a prompt is known
+    /// before its pass, so no pass waits for the one before it to be decided: each device runs its own layers in order, a pass at a time, with
+    /// the kernels, rows and sums of the serial passes (a pass's rows go through the host between the first layer, the PLE layer and the spans,
+    /// as the pipelined decoding's do). The rows after the last layer come back in order.
+    fn prefill_passes_overlapped(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let position = self.history.len();
+        let split = self.group.split().ok_or("Straydog overlapped passes: no layer split")?;
+        let mut context: Vec<u32> = self.history[position.saturating_sub(2)..].to_vec();
+        let kept = context.len();
+        context.extend_from_slice(tokens);
+        let weights: &Weights = &self.weights;
+        let ple_operands = ple_operands_of(weights)?;
+        let (first_device, second_device) = self.group.backend_pair()?;
+        let mut failure: Option<String> = None;
+        let outcome: Result<Vec<f32>> = std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, Vec<f32>)>(1);
+            let total = tokens.len();
+            let worker = scope.spawn(move || -> Result<Vec<f32>> {
+                let mut rows = Vec::with_capacity(total * WIDTH);
+                for (start, hidden) in receiver {
+                    let steps = row_count(&hidden) as u64;
+                    let hidden = second_device.verify_span(split, 48, &hidden, (position + start) as u64)?;
+                    second_device.verify_commit(split, 48, steps)?;
+                    rows.extend_from_slice(&hidden);
+                }
+                Ok(rows)
+            });
+            for start in (0..tokens.len()).step_by(PROMPT_ROWS) {
+                let end = (start + PROMPT_ROWS).min(tokens.len());
+                let pass = (|| -> Result<Vec<f32>> {
+                    let ids: Vec<i64> = tokens[start..end].iter().map(|token| i64::from(*token)).collect();
+                    let hidden = tile(&weights.rows("token_embd.weight", &ids)?);
+                    let embeddings = weights.rows(PLE_TABLE, &ple_indices_of(weights, &context[..kept + start], &tokens[start..end])?)?;
+                    let at = (position + start) as u64;
+                    let first = first_device.verify_span(0, 1, &hidden, at)?;
+                    first_device.copy_state("@ple-snapshot:blk.1.", "@ple:blk.1.")?;
+                    let hidden = first_device.ple_rows("blk.1.", &first, &embeddings, &ple_operands)?;
+                    let hidden = first_device.verify_span(1, split, &hidden, at)?;
+                    first_device.verify_commit(0, 1, (end - start) as u64)?;
+                    first_device.verify_commit(1, split, (end - start) as u64)?;
+                    Ok(hidden)
+                })();
+                match pass {
+                    Ok(hidden) => {
+                        if sender.send((start, hidden)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            drop(sender);
+            worker.join().unwrap_or_else(|_| Err("a Straydog stage thread panicked".into()))
+        });
+        let rows = finish_device_work(outcome, failure.map_or(Ok(()), Err))?;
+        if row_count(&rows) != tokens.len() {
+            return Err("Straydog overlapped passes lost rows".into());
+        }
+        self.metric_count("prefill_overlapped_passes", tokens.len().div_ceil(PROMPT_ROWS) as u64);
         Ok(rows)
     }
 
