@@ -108,8 +108,10 @@ fn main() -> Result<(), String> {
         Some(file) => std::fs::read_to_string(file).map_err(|exc| exc.to_string())?,
         None => {
             let mut corpus = std::fs::read_to_string(source.join("docs/DESIGN.md")).map_err(|exc| exc.to_string())?;
+            // (the sources alone: the folder also holds tables that are no text)
             let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("crates/straydog-engine/src"))
-                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect();
+                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path())
+                .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "rs")).collect();
             files.sort();
             for file in files {
                 corpus += &std::fs::read_to_string(file).map_err(|exc| exc.to_string())?;
