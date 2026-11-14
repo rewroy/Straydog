@@ -53,6 +53,9 @@ const VERIFIED_PREFILL: usize = 16;
 /// 32 rows costs about what its eight passes do. One GPU whose passes wait for the CPU's experts (RTX 5070 Ti, 16 of 48 layers
 /// page-locked) read 60 tokens in 520 ms as batches and 630 ms as passes: it keeps the batches.
 const PARTIAL_PROMPT_PASSES: usize = 32;
+/// The CPU's routes a row in a prompt batch's first pass from which the slots are taken not to hold the prompt's experts, and the rest of
+/// the batch is read as a batch ([`Model::forward`]). A prompt the slots know leaves the CPU a route a row or none.
+const COLD_PROMPT_ROUTES: usize = 8;
 /// The tokens that end a reply.
 pub const END_TOKENS: [u32; 2] = [248044, 248046];
 const IM_START: u32 = 248045;
@@ -1274,6 +1277,8 @@ pub struct Model {
     /// whether a table of rope positions is up (`sd_rope_rows`). A sequence without any costs a test of these two.
     rope_delta: u32,
     rope_table: bool,
+    /// Inside a prompt batch that is read as passes: whether its first pass found the slots without the prompt's experts (None outside one).
+    prompt_cold: Option<bool>,
     /// Set only while the warm-up behind "ready" runs its passes ([`Model::set_warm_stop`]): the flag a request's arrival sets.
     warm_stop: Option<&'static std::sync::atomic::AtomicBool>,
 }
@@ -1496,6 +1501,7 @@ impl Model {
             images: Vec::new(),
             rope_delta: 0,
             rope_table: false,
+            prompt_cold: None,
             warm_stop: None,
         };
         // Placement allocates every weight before any is read; reading then fills them.
@@ -3252,6 +3258,25 @@ impl Model {
     /// everything the batches before it read: a 90K prompt read for 17 minutes on an 8 GB GPU went whole, and its next request read it all
     /// again.)
     fn forward(&mut self, tokens: &[u32], logits: bool) -> Result<Option<Vec<f32>>> {
+        // A partially resident model's batch that would be read as passes: its first pass says whether the slots hold this prompt's experts.
+        // Where they do not (a new subject), every pass leaves routes to the CPU that a batch would stream to the GPU at once: 105 tokens of
+        // a subject the slots had none of took 3.5 s as passes on two RTX 3090 (a slow host, a millisecond a CPU route) and 0.73 s as batches,
+        // where a prompt the slots knew took 0.11 s as passes and 0.44 s as batches. The rest is then read as a batch.
+        if self.partial && self.prompt_cold.is_none() && tokens.len() > 2 * PROMPT_ROWS && self.images.is_empty()
+            && tokens.len() <= prompt_passes(self.prompt_passes_overlap())
+        {
+            let before = self.route_totals()[2];
+            self.prompt_cold = Some(false);
+            let first = self.forward(&tokens[..PROMPT_ROWS], false);
+            let cold = first.is_ok() && self.route_totals()[2].saturating_sub(before) > (PROMPT_ROWS * COLD_PROMPT_ROUTES) as u64;
+            self.prompt_cold = Some(cold);
+            let rest = first.and_then(|_| self.forward(&tokens[PROMPT_ROWS..], logits));
+            self.prompt_cold = None;
+            if cold {
+                self.metric_count("prefill_cold_batches", 1);
+            }
+            return rest;
+        }
         if self.history.len() + tokens.len() > self.context
             || tokens.iter().any(|token| *token as usize >= VOCABULARY && (*token < IMAGE_TOKEN || self.images.is_empty()))
         {
@@ -3272,7 +3297,9 @@ impl Model {
         // Inside a pipelined prompt the last batch's rows stayed on the GPUs: a batch on the
         // verified or the one-token path pairs its first token with that batch's last row, read
         // back from where the MTP layer's device kept it (the next batch pairs from this one's).
-        let passes = if self.resident { VERIFIED_PREFILL } else if self.partial { prompt_passes(self.prompt_passes_overlap()) } else { 0 };
+        let passes = if self.resident { VERIFIED_PREFILL }
+                     else if self.partial && self.prompt_cold != Some(true) { prompt_passes(self.prompt_passes_overlap()) }
+                     else { 0 };
         let verified = tokens.len() > 1 && tokens.len() <= passes && !touches_image;
         let previous = match previous {
             None if verified || tokens.len() == 1 => {
