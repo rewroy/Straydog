@@ -412,10 +412,13 @@ inline void prestage_regions(const Device& d, const ResidentMoe& plan, uint8_t* 
     regions[1] = regions[0] + capacity * plan.host_bytes[0];
     regions[2] = regions[1] + capacity * plan.host_bytes[1];
 }
-// Whether this layer's prompt batch of `steps` rows may prestage: wide, the banks page-locked copies the copy engine reads asynchronously,
-// and no mirror to gather through.
+// Whether this layer's prompt batch of `steps` rows may prestage: wide, the banks page-locked, which the copy engine reads asynchronously (the
+// engine's copies of them, or the model's mapping registered in place, which sd_hybrid_assist has then mapped), and no mirror to gather through.
+// (The mapping registered in place was left out: two RTX 3090 on Linux, whose driver registers host memory read-only, never prestaged, and
+// streamed every expert beyond their slots in chunks whose copies wait for the GEMMs two chunks back.)
 inline bool prestage_wanted(const Device& d, const ResidentMoe& plan, size_t steps) {
-    return prestage_capacity(d) > 0 && steps >= 2048 && plan.hybrid && !plan.layer_prefill && plan.host_copy && d.slots.base &&
+    const bool locked = plan.host_copy || plan.mapped[0];
+    return prestage_capacity(d) > 0 && steps >= 2048 && plan.hybrid && !plan.layer_prefill && locked && d.slots.base &&
            !(d.slots.host && d.cpu && !plan.mapped[0]) && d.copy_stream;
 }
 void prestage_issue(Device& d, ResidentMoe& plan) {
