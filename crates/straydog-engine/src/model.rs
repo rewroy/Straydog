@@ -1101,7 +1101,7 @@ fn tile(embeddings: &[f32]) -> Vec<f32> {
 
 /// A verification pass: the first layer's rows, the PLE embeddings, the final rows, each
 /// row's argmax and, when sampling, the rows' logits.
-type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Scores>);
+type Verified = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>, Option<Scores>, Option<f64>);
 
 /// Seconds since `clock`, which restarts.
 fn lap(clock: &mut Instant) -> f64 {
@@ -2304,7 +2304,7 @@ impl Model {
         }
         // (what a round measured was of the layers locked then)
         if self.assist_tuning() {
-            self.assist_restart()?;
+            self.assist_restart("banks_locked", Some((before, mapped)))?;
         }
         Ok(mapped)
     }
@@ -3127,7 +3127,7 @@ impl Model {
             self.assist = None;
         } else if self.assist_tuning() {
             // (what a round measured was of the layers locked then)
-            self.assist_restart()?;
+            self.assist_restart("give_back", None)?;
         }
         eprintln!("{}", crate::banks::give_back_line(&gave));
         self.gave_back.push(gave.clone());
@@ -3271,7 +3271,7 @@ impl Model {
     /// shares it goes on from there. (Stopped between a batch's spans, the recurrent state the batch had begun could only be reset, with
     /// everything the batches before it read: a 90K prompt read for 17 minutes on an 8 GB GPU went whole, and its next request read it all
     /// again.)
-    fn forward(&mut self, tokens: &[u32], logits: bool) -> Result<Option<Vec<f32>>> {
+    fn forward(&mut self, tokens: &[u32], logits: bool) -> Result<(Option<Vec<f32>>, Option<f64>)> {
         // A partially resident model's batch that would be read as passes: its first pass says whether the slots hold this prompt's experts.
         // Where they do not (a new subject), every pass leaves routes to the CPU that a batch would stream to the GPU at once: 105 tokens of
         // a subject the slots had none of took 3.5 s as passes on two RTX 3090 (a slow host, a millisecond a CPU route) and 0.73 s as batches,
@@ -3291,6 +3291,7 @@ impl Model {
             }
             return rest;
         }
+        let mut assist_layers = None;
         if self.history.len() + tokens.len() > self.context
             || tokens.iter().any(|token| *token as usize >= VOCABULARY && (*token < IMAGE_TOKEN || self.images.is_empty()))
         {
@@ -3365,7 +3366,13 @@ impl Model {
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
                 self.phase(["step: layers (first device)", "step: layers (second device)"][index.min(1)], &mut clock);
             }
-            self.assist_pass(layers.elapsed().as_secs_f64())?;
+            let seconds = layers.elapsed().as_secs_f64();
+            if !cfg!(feature = "cuda") || self.assist_script.is_some() {
+                self.assist_pass(seconds)?;
+            } else if self.assist_probing() {
+                // Only a decode caller consumes this sample; prefill callers discard it.
+                assist_layers = Some(seconds);
+            }
             if self.speculative > 0 {
                 // The MTP layer's pair of the row before, its token now known (the longer
                 // prompts' paths write theirs from there too).
@@ -3377,9 +3384,9 @@ impl Model {
         self.draft_note(tokens);
         self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
         if !logits {
-            return Ok(None);
+            return Ok((None, assist_layers));
         }
-        self.head_logits(last_row(&hidden), tokens.len() == 1).map(Some)
+        self.head_logits(last_row(&hidden), tokens.len() == 1).map(|logits| (Some(logits), assist_layers))
     }
 
     fn head_logits(&mut self, row: &[f32], step: bool) -> Result<Vec<f32>> {
@@ -4341,7 +4348,7 @@ impl Model {
                 // The next batch's PLE rows arrive while this one runs.
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
-                output = self.forward(&tokens[position..end], end == tokens.len())?;
+                output = self.forward(&tokens[position..end], end == tokens.len())?.0;
                 self.metric_count("prefill_batches", 1);
                 if cancelled() {
                     return Ok(None);
@@ -4564,9 +4571,9 @@ impl Model {
                 group.output_head_chained(operands, 47, tokens.len(), sampling, top, false)
             })?;
             self.phase("verify: head", &mut clock);
-            return Ok((Vec::new(), embeddings, hidden, targets, scores));
+            return Ok((Vec::new(), embeddings, hidden, targets, scores, None));
         }
-        let (first, embeddings, rows) = self.verify_rows(tokens, true)?;
+        let (first, embeddings, rows, assist_layers) = self.verify_rows(tokens, true)?;
         let mut clock = Instant::now();
         // (STRAYDOG_PIPELINE: the head on the second GPU alone, as the pipelined passes run it, so that two runs are the same arithmetic)
         let alone = self.frozen_now() && self.group.backends.len() == 2;
@@ -4590,7 +4597,7 @@ impl Model {
             }
         };
         self.phase("verify: head", &mut clock);
-        Ok((first, embeddings, hidden, targets, scores))
+        Ok((first, embeddings, hidden, targets, scores, assist_layers))
     }
 
     /// Re-read only the verification head from the retained, unmodified hidden rows.
@@ -4613,7 +4620,7 @@ impl Model {
     fn prefill_verified(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let mut rows = Vec::with_capacity(tokens.len() * WIDTH);
         for chunk in tokens.chunks(PROMPT_ROWS) {
-            let (first, embeddings, hidden) = self.verify_rows(chunk, false)?;
+            let (first, embeddings, hidden, _) = self.verify_rows(chunk, false)?;
             let hidden = hidden.ok_or("Straydog verification has no rows")?;
             self.commit(chunk, chunk.len(), &first, &embeddings)?;
             rows.extend_from_slice(&hidden);
@@ -4729,7 +4736,7 @@ impl Model {
 
     /// The rows through the first layer, the PLE layer and the spans. With `keep`, a partially resident model's rows may stay on the device
     /// after the last span (`None`: in its workspace, for [`Group::output_head_chained`]).
-    fn verify_rows(&mut self, tokens: &[u32], keep: bool) -> Result<(Vec<f32>, Vec<f32>, Option<Vec<f32>>)> {
+    fn verify_rows(&mut self, tokens: &[u32], keep: bool) -> Result<(Vec<f32>, Vec<f32>, Option<Vec<f32>>, Option<f64>)> {
         // (every row verified is written, kept or not)
         let mut clock = Instant::now();
         self.ensure_kv(self.history.len() + tokens.len())?;
@@ -4809,10 +4816,12 @@ impl Model {
         if !chain && hidden.is_none() {
             return Err("Straydog verification has no rows".into());
         }
-        if tokens.len() == 1 {
-            self.assist_pass(layers.elapsed().as_secs_f64())?;
+        let seconds = layers.elapsed().as_secs_f64();
+        let assist_layers = (cfg!(feature = "cuda") && keep && self.assist_probing()).then_some(seconds);
+        if tokens.len() == 1 && (!cfg!(feature = "cuda") || self.assist_script.is_some()) {
+            self.assist_pass(seconds)?;
         }
-        Ok((first, embeddings, if chain { None } else { hidden }))
+        Ok((first, embeddings, if chain { None } else { hidden }, assist_layers))
     }
 
     /// Keep the first `kept` verified tokens; replay DeltaNet and PLE state for the rest.
@@ -4894,7 +4903,9 @@ impl Model {
 
     /// Invalidate measurements after the mapped layers change. A CUDA probe must be restored
     /// on the GPU before the tuner acknowledges the held level.
-    fn assist_restart(&mut self) -> Result<()> {
+    fn assist_restart(&mut self, reason: &str, mapped: Option<(u64, u64)>) -> Result<()> {
+        let profile = self.assist.as_ref().is_some_and(assist::Tuner::profiling);
+        if profile { eprintln!("Straydog assist profile: restart reason={reason} mapped_before_after={mapped:?}"); }
         if let Some(tuner) = self.assist.as_mut() {
             if let Some(level) = tuner.restart() {
                 if let Err(error) = self.group.set_assist_level(level) {
@@ -4911,7 +4922,10 @@ impl Model {
     /// Put in force the assist level a round of [`crate::assist`] asks for and say what it
     /// found. CUDA invalidates a failed round and restores its held level; HIP tries the next best.
     fn assist_apply(&mut self, mut next: Option<u32>) -> Result<()> {
+        let profile = self.assist.as_ref().is_some_and(assist::Tuner::profiling);
+        let routes = (profile && next.is_some()).then(|| self.route_totals());
         let Some(tuner) = self.assist.as_mut() else { return Ok(()) };
+        if routes.is_some() { tuner.profile_state("window_routes", routes); }
         while let Some(level) = next.take() {
             match self.group.set_assist_level(level) {
                 Ok(()) => tuner.set(level),
@@ -4927,7 +4941,7 @@ impl Model {
             }
         }
         if let Some(outcome) = tuner.outcome().filter(assist::Outcome::worth_saying) {
-            eprintln!("{}", outcome.line());
+            eprintln!("{}", if cfg!(feature = "cuda") { outcome.line_per_token() } else { outcome.line() });
         }
         Ok(())
     }
@@ -4948,6 +4962,24 @@ impl Model {
         }
         if let Some(next) = self.assist.as_mut().map(|tuner| tuner.pass(seconds)) {
             self.assist_apply(next)?;
+        }
+        Ok(())
+    }
+
+    /// CUDA consumes each decode measurement only after its useful output is known and
+    /// committed. A pass measured inside a round does not also tick the interval outside it,
+    /// even if this feedback completes the round. HIP retains its existing pass/token calls.
+    fn assist_complete(&mut self, layers: Option<f64>, useful_tokens: u64) -> Result<()> {
+        if let Some(seconds) = layers {
+            if self.assist_probing() && useful_tokens > 0 {
+                self.metric_count("assist_round_passes", 1);
+                self.metric_count("assist_round_tokens", useful_tokens);
+                if let Some(next) = self.assist.as_mut().map(|tuner| tuner.pass_tokens(seconds, useful_tokens)) {
+                    self.assist_apply(next)?;
+                }
+            }
+        } else {
+            self.assist_tokens(useful_tokens);
         }
         Ok(())
     }
@@ -4976,9 +5008,13 @@ impl Model {
         self.forced_rows.is_none() && self.assist_script.is_none() && !self.frozen_now()
     }
 
-    /// Whether the passes now are timed as windows of a round: those of a speculating model have no drafts, so that each has one row.
+    /// Whether a round is measuring, at the current draft width on CUDA.
     fn assist_probing(&self) -> bool {
         self.assist_tuning() && self.assist.as_ref().is_some_and(assist::Tuner::probing)
+    }
+
+    fn assist_force_single_row(&self) -> bool {
+        self.assist_tuning() && self.assist.as_ref().is_some_and(assist::Tuner::force_single_row)
     }
 
     /// `count` decode tokens were generated.
@@ -4993,8 +5029,10 @@ impl Model {
     /// A request begins to decode.
     fn assist_request(&mut self) {
         if self.assist_tuning() {
+            let routes = self.assist.as_ref().is_some_and(assist::Tuner::profiling).then(|| self.route_totals());
             if let Some(tuner) = self.assist.as_mut() {
                 tuner.request();
+                tuner.profile_state("request", routes);
             }
         }
     }
@@ -5055,25 +5093,26 @@ impl Model {
                 return Ok(Some(pipeline::Hand { generated, token, produced, mtp_hidden, mtp_tokens, mtp_position }));
             }
             let pass_started = Instant::now();
-            // (while a round of the assist's tuner times decode passes of one row, none has drafts: crate::assist)
-            let probing = self.assist_probing();
+            // The assist round holds the width chooser, while CUDA keeps the width already in force.
+            let measuring = self.assist_probing();
+            let force_single_row = self.assist_force_single_row();
             // How many drafts this pass offers: the width in force, or a stretch of a probe that keeps what the windows hold of the others
             // current. The passes of a verified known sequence and of an assist round are not the chooser's.
             let plan = match self.width.as_mut() {
-                Some(chooser) if !probing && self.forced_rows.is_none() => chooser.plan(),
+                Some(chooser) if !measuring && self.forced_rows.is_none() => chooser.plan(),
                 _ => width::Plan { drafts: self.drafts, probe: false },
             };
             // (a pass of a probe at a width not in force: the request's decode rate is not the width's in force)
             if plan.probe {
                 self.metric_count("drafts_probe_passes", 1);
             }
-            let limit = if probing { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            let limit = if force_single_row { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let copy_limit = if probing || plan.probe || self.pipeline.no_copy() { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            let copy_limit = if force_single_row || plan.probe || self.pipeline.no_copy() { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
@@ -5109,7 +5148,7 @@ impl Model {
             let read_logits = self.forced_rows.as_ref().is_some_and(|forced| forced.read_logits);
             let top = if held.is_some() || (sampling.presence_penalty != 0.0 && read_logits) { 0 }
                       else { sampling.target_read_top().unwrap_or(0) };
-            let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some() || read_logits, top)?;
+            let (first, embeddings, hidden, targets, mut scores, assist_layers) = self.verify(&rows, sampling.needs_logits() || held.is_some() || read_logits, top)?;
             let mut clock = Instant::now();
             let penalty_top = (sampling.presence_penalty != 0.0 || (self.frozen_now() && proposed.is_empty()))
                 && matches!(scores.as_ref(), Some(Scores::Top(_)));
@@ -5160,6 +5199,10 @@ impl Model {
                 forced.passes.push((rows.len(), 1e3 * pass_started.elapsed().as_secs_f64()));
             }
             self.final_hidden = Some(hidden[(kept - 1) * WIDTH..kept * WIDTH].to_vec());
+            let assist_measured = assist_layers.is_some();
+            if assist_measured {
+                self.assist_complete(assist_layers, emitted.len() as u64)?;
+            }
             self.metric_count("speculative_passes", 1);
             self.metric_count("drafted_tokens", drafts.len() as u64);
             self.metric_count("accepted_tokens", accepted as u64);
@@ -5172,7 +5215,7 @@ impl Model {
             }
             self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
             // What the pass cost and kept goes to the windows the drafts are chosen by; the end of a probe may change them.
-            if !probing && !copied && self.forced_rows.is_none() {
+            if !measuring && !copied && self.forced_rows.is_none() {
                 let outcome = self.width.as_mut().and_then(|chooser| chooser.record(plan, limit, rows.len(), accepted, seconds));
                 if let Some(outcome) = outcome {
                     if outcome.worth_saying() {
@@ -5185,7 +5228,9 @@ impl Model {
                     }
                 }
             }
-            self.assist_tokens(emitted.len() as u64);
+            if !assist_measured {
+                self.assist_complete(None, emitted.len() as u64)?;
+            }
             if let Some(count) = self.pass_counts.get_mut(rows.len().wrapping_sub(1)) {
                 *count += 1;
             }
@@ -5474,6 +5519,9 @@ impl Model {
             return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit, constraint, None, None).map(|_| ());
         }
         let mut generated = Generated::new(VOCABULARY);
+        // CUDA credits the previous forward only after its next token is emitted.
+        // Some(None) is an outside-round token; None is the initial prefill token.
+        let mut pending_assist: Option<Option<f64>> = None;
         for index in 0..max_new {
             if cancelled() {
                 return Ok(());
@@ -5488,10 +5536,29 @@ impl Model {
             }
             self.metric_count("generated_tokens", 1);
             emit(token);
+            if cfg!(feature = "cuda") {
+                if let Some(layers) = pending_assist.take() {
+                    let applying = Instant::now();
+                    let applied = self.assist_complete(layers, 1);
+                    // The setter moved past forward's timer; keep its full wall cost in
+                    // the request's decode time even when restoration returns an error.
+                    let seconds = applying.elapsed().as_secs_f64();
+                    self.metric_add("decode_seconds", seconds);
+                    if let Some(profile) = self.profile.as_mut() {
+                        profile.rows[1].1 += seconds;
+                    }
+                    self.update_rate();
+                    applied?;
+                }
+            }
             if index + 1 < max_new {
                 let decode_started = Instant::now();
-                let next = self.forward(&[token], true)?.ok_or("Straydog decode step returned no logits")?;
+                let (next, assist_layers) = self.forward(&[token], true)?;
+                let next = next.ok_or("Straydog decode step returned no logits")?;
                 self.logits_spare = std::mem::replace(&mut logits, next);
+                if cfg!(feature = "cuda") {
+                    pending_assist = Some(assist_layers);
+                }
                 let seconds = decode_started.elapsed().as_secs_f64();
                 self.metric_add("decode_seconds", seconds);
                 if let Some(profile) = self.profile.as_mut() {
@@ -5501,7 +5568,9 @@ impl Model {
                 self.pass_counts[0] += 1;
                 self.pass_seconds[0] = if self.pass_seconds[0] > 0.0 { self.pass_seconds[0] + (seconds.min(3.0 * self.pass_seconds[0]) - self.pass_seconds[0]) / 16.0 } else { seconds };
                 self.metric_count("decode_forward_tokens", 1);
-                self.assist_tokens(1);
+                if !cfg!(feature = "cuda") {
+                    self.assist_complete(None, 1)?;
+                }
                 self.update_rate();
             }
         }

@@ -539,7 +539,8 @@ fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
-     "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:"]
+     "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
+     "Straydog assist profile:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2072,6 +2073,8 @@ mod tests {
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
         assert!(!stays_in_the_log("Straydog host paging: 4.5 GiB available; the CPU's experts are read ahead from now"));
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
+        assert!(stays_in_the_log("Straydog assist profile: decision round=2 held=0 qualified=4 chosen=4"));
+        assert!(stays_in_the_log("Straydog assist profile: setter_succeeded from=0 to=4"));
         assert!(!stays_in_the_log("some other line"));
     }
 
