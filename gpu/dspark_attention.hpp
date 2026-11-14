@@ -4,7 +4,7 @@
 // the 512 dims in order, the weights' sum the same tree, an output dim one chain over the keys in order) with
 // the loads wide and several in flight: that kernel waits on each load in turn, which kept a block ~100 us
 // busy over 262 KB of keys.
-namespace {
+namespace sdgpu {
 constexpr size_t dspark_dim = 512, dspark_ring_rows = 128;
 __global__ void __launch_bounds__(256) dspark_attention_kernel(const float* q, const float* ring, const float* block,
                                                                const float* sinks, size_t heads, size_t slots, uint32_t anchor,

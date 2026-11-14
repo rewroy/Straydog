@@ -11,7 +11,7 @@
 // Included in the GPU TU after device_link.hpp; its steps join the TU's anonymous namespace (verify_span.hpp declares
 // verify_layer_part there).
 
-namespace {
+namespace sdgpu {
 
 // A part's sum for a pass's rows (at most ROWS, 4 or 8): this device's part of `steps` rows of 2560 goes into the other's inbox slot,
 // the other's flag is raised, and once this device's is, each row's two parts are added and go into the four residual streams
@@ -613,7 +613,7 @@ void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t p
     if (flags[0] || flags[1]) throw std::runtime_error("Straydog GPU produced non-finite decoder state");
 }
 
-} // namespace
+} // namespace sdgpu
 
 // Split Qwen3.8's layers across this many GPUs (1 or 2): before any of its layers or K/V states are registered.
 int sd_qwen_parts(void* handle, uint64_t parts) {

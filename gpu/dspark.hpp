@@ -1,5 +1,5 @@
 // DSpark head orchestration over the existing BF16 GEMV, add and row argmax.
-namespace {
+namespace sdgpu {
 __global__ void dspark_features(const float* hidden, const uint16_t* w1, const int32_t* tokens,
                                 size_t slot, size_t vocabulary, size_t rank, size_t width,
                                 uint32_t anchor, const int32_t* anchor_at, float* features) { SD_KERNEL_ACQUIRE;
@@ -31,7 +31,7 @@ __global__ void dspark_finish(const int32_t* tokens, float* confidences, size_t 
     }
     *count = kept >= minimum ? kept : 0;
 }
-} // namespace
+} // namespace sdgpu
 
 int sd_op_dspark_head(void* handle, const float* body, const float* body_tail, uint64_t tail_first, const float* hidden,
                       const void* w1, const void* w2, const float* conf, uint64_t slots, uint64_t vocabulary, uint64_t rank,
