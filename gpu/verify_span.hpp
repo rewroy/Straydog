@@ -722,11 +722,88 @@ __global__ void head_confidence(const float* own, const float* other, size_t ste
 // The rows come from the host (`input`) or, when that is null, from device memory (`source`).
 // With `top` (at most head_top_max), each row's `top` greatest logits and their tokens (row_top) come back in `best`.
 constexpr size_t head_top_floats = verify_max * 2 * head_top_max + verify_max * argmax_chunks * head_top_max * 2;
+// Diagnostics and their cleanup restore the caller's device with checked errors.
+template <class Function>
+void head_on_device(int ordinal, Function&& work) {
+    int current = 0;
+    check(hipGetDevice(&current));
+    if (current != ordinal) check(hipSetDevice(ordinal));
+    std::exception_ptr failure;
+    try { work(); } catch (...) { failure = std::current_exception(); }
+    if (current != ordinal) check(hipSetDevice(current));
+    if (failure) std::rethrow_exception(failure);
+}
+
+// Events exist only for explicit diagnostics, outside capture, on their owning GPU.
+class HeadEventTimer {
+public:
+    HeadEventTimer(Device& d, bool enabled) : d_(d), stream_(d.stream) {
+        if (!enabled) return;
+        try {
+            head_on_device(d_.ordinal, [&]() {
+                check(d_.head_timing_error);
+                hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+                check(hipStreamIsCapturing(stream_, &capture));
+                if (d_.op_recording || capture != hipStreamCaptureStatusNone)
+                    throw std::runtime_error("head timing requires an uncaptured stream");
+                check(hipEventCreate(&start_));
+                check(hipEventCreate(&stop_));
+            });
+        } catch (...) { release(); throw; }
+    }
+    ~HeadEventTimer() { release(); }
+    HeadEventTimer(const HeadEventTimer&) = delete;
+    HeadEventTimer& operator=(const HeadEventTimer&) = delete;
+    void begin() {
+        if (start_) head_on_device(d_.ordinal, [&]() { check(hipEventRecord(start_, stream_)); });
+    }
+    void end() {
+        if (stop_) head_on_device(d_.ordinal, [&]() { check(hipEventRecord(stop_, stream_)); });
+    }
+    double milliseconds() {
+        if (!stop_) return 0;
+        float elapsed = 0;
+        head_on_device(d_.ordinal, [&]() {
+            check(hipEventSynchronize(stop_));
+            check(hipEventElapsedTime(&elapsed, start_, stop_));
+        });
+        return double(elapsed);
+    }
+    void close() { check(release()); }
+private:
+    Device& d_;
+    hipStream_t stream_;
+    hipEvent_t start_ = nullptr, stop_ = nullptr;
+    hipError_t release() noexcept {
+        if (!start_ && !stop_) return hipSuccess;
+        hipError_t first = hipSuccess;
+        auto note = [&](hipError_t error) {
+            if (error != hipSuccess) {
+                if (first == hipSuccess) first = error;
+                if (d_.head_timing_error == hipSuccess) d_.head_timing_error = error;
+            }
+        };
+        int previous = -1;
+        const hipError_t current = hipGetDevice(&previous);
+        note(current);
+        const hipError_t selected = hipSetDevice(d_.ordinal);
+        note(selected);
+        if (selected == hipSuccess) {
+            if (start_) note(hipEventDestroy(start_));
+            if (stop_) note(hipEventDestroy(stop_));
+        }
+        if (current == hipSuccess && previous != d_.ordinal) note(hipSetDevice(previous));
+        start_ = stop_ = nullptr;
+        return first;
+    }
+};
+
 // `source` rows on the device (rather than `input`'s on the host) come back in `rows` when asked, with the tokens.
 // `allocated` (a draft's vocabulary on one device, draft_head): the head's rows the allocation holds, where `vocabulary` rows of it are read.
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
                  const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr,
-                 unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr, size_t allocated = 0) {
+                 unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr, size_t allocated = 0,
+                 bool draft_timing = false) {
     if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max + head_top_floats > d.input_capacity ||
         top_count > head_top_max || (top_count && !best))
@@ -740,13 +817,17 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     }
     auto found = d.allocations.find(pointers[3]);
     if (found == d.allocations.end() || found->second != (allocated ? allocated : vocabulary) * head.row_bytes) throw std::runtime_error("invalid head operand");
+    const bool timed = draft_timing && d.head_timing_enabled;
+    HeadEventTimer total_time(d, timed), projection_time(d, timed);
     float* rows = d.input; float* mixed = rows + steps * 10240;
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
     if (input) upload(d, rows, input, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
+    total_time.begin(); projection_time.begin();
     gemv(d, &head, 1, mixed, d.output, steps, 2564, vocabulary);
+    projection_time.end();
     row_argmax(d, d.output, steps, vocabulary, vocabulary, partial, chosen);
     float* top = reinterpret_cast<float*>(chosen + verify_max);
     if (confidence) {
@@ -756,6 +837,7 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     float* ranked = top + 4 * verify_max;
     if (top_count) row_top(d, d.output, steps, vocabulary, vocabulary, top_count, ranked + verify_max * 2 * head_top_max, ranked);
     check(hipGetLastError());
+    total_time.end();
     Piece pieces[5]; size_t count = 0;
     if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
     pieces[count++] = {tokens, chosen, steps * 4};
@@ -763,6 +845,12 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     if (logits) pieces[count++] = {logits, d.output, steps * vocabulary * 4};
     if (top_count) pieces[count++] = {best, ranked, steps * 2 * top_count * 4};
     download_pieces(d, pieces, count);
+    if (timed) {
+        const double projection = projection_time.milliseconds(), total = total_time.milliseconds();
+        projection_time.close(); total_time.close();
+        ++d.head_timing_calls[0];
+        d.head_timing_ms[0] += projection; d.head_timing_ms[1] += total;
+    }
 }
 
 // The non-finite values among `count` floats: each block's verdict into flags[block].
@@ -833,7 +921,7 @@ struct HeadRows { size_t low = 0, first = 0, end = 0, extra_count = 0; const uin
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
                        void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence,
                        const float* source = nullptr, unsigned top_count = 0, float* best_out = nullptr, float* rows_out = nullptr,
-                       HeadRows rows_of = {}) {
+                       HeadRows rows_of = {}, bool draft_timing = false) {
     Device* peer = d.link.peer;
     if (!rows_of.end) rows_of = {split, split, vocabulary};
     if (rows_of.low > split || !rows_of.low || rows_of.first >= rows_of.end || rows_of.end > vocabulary ||
@@ -861,6 +949,8 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     if (found == d.allocations.end() || found->second != vocabulary * row_bytes ||
         lower == peer->allocations.end() || lower->second != split * row_bytes)
         throw std::runtime_error("invalid head operand");
+    const bool timed = draft_timing && d.head_timing_enabled;
+    HeadEventTimer total_time(d, timed), local_time(d, timed), peer_time(*peer, timed);
     float* rows = d.input; float* mixed = rows + steps * 10240;
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
@@ -868,6 +958,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     if (input) upload(d, rows, input, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
+    total_time.begin();
     peer_send(d, mixed, steps, 2560, 2564, 0);
     // (WDDM holds what is queued until the stream is asked about: the peer's half waits for these rows, and this device's
     // kernels below wait for the peer's half, so each stream is asked as soon as its part is queued)
@@ -876,7 +967,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     // The logits of the lower half reach the host through this device's inbox only over a direct link (the inbox in its VRAM).
     const bool host_logits = logits && !d.link.direct;
     uint8_t* helper_slots[verify_max] = {};
-    on_device(peer->ordinal, [&]() {
+    head_on_device(peer->ordinal, [&]() {
         Device& h = *peer;
         const Matrix low{static_cast<const uint8_t*>(peer_head), row_bytes, low_rows, 2560, 0, 0, 0, kinds[3]};
         float* scratch = h.input;
@@ -891,7 +982,9 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
             peer_copy<<<unsigned((steps * 2560 + 255) / 256), 256, 0, h.stream>>>(local, mixed_rows, steps, 2560, 2560);
             mixed_rows = local;
         }
+        peer_time.begin();
         gemv(h, &low, 1, mixed_rows, h.output, steps, 2560, low_rows);
+        peer_time.end();
         row_argmax(h, h.output, steps, low_rows, low_rows, scratch, best);
         head_part<<<1, 32, 0, h.stream>>>(h.output, low_rows, best, steps, peer_remote_partials(h.link));
         // The lower half's (logit, sum) pairs follow its choices, before the logits at 64.
@@ -917,7 +1010,9 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     });
     const Matrix own[2] = {{static_cast<const uint8_t*>(pointers[3]) + rows_of.first * row_bytes, row_bytes, high_rows, 2560, 0, 0, 0, kinds[3]},
                            {rows_of.extras, row_bytes, rows_of.extra_count, 2560, 0, high_rows, 0, kinds[3]}};
+    local_time.begin();
     gemv(d, own, rows_of.extra_count ? 2 : 1, mixed, d.output, steps, 2564, own_rows);
+    local_time.end();
     row_argmax(d, d.output, steps, own_rows, own_rows, partial, chosen);
     peer_receive(d);
     head_choose<<<1, 32, 0, d.stream>>>(d.output, own_rows, rows_of.first, chosen, received, steps, final_tokens, high_rows,
@@ -935,12 +1030,13 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
                                                              top_count, merged);
     }
     check(hipGetLastError());
+    total_time.end();
     // (finish_with_helper's waits with the read-back's: both links' counters ride along, the peer's queued after its part, where
     // peer_settle read each with a blocking copy after the streams' waits: a draft step's head ended 0.13 ms after its last
     // kernel, now 0.06)
     uint32_t counters[2][8] = {};
     uint8_t* peer_counters = nullptr;
-    on_device(peer->ordinal, [&]() {
+    head_on_device(peer->ordinal, [&]() {
         peer_counters = io_slot(*peer, 32);
         check(hipMemcpyAsync(peer_counters, peer->link.counters, 32, hipMemcpyDeviceToHost, peer->stream));
     });
@@ -957,7 +1053,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         }
     download_pieces(d, pieces, count);
     check(hipStreamSynchronize(d.helper_stream));
-    on_device(peer->ordinal, [&]() {
+    head_on_device(peer->ordinal, [&]() {
         check(hipStreamSynchronize(peer->stream)); check(hipStreamSynchronize(peer->helper_stream));
         std::memcpy(counters[1], peer_counters, 32);
     });
@@ -968,6 +1064,13 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     }
     peer->io_used = 0;   // (its stream is idle: download's, and its read-backs are copied out)
     peer_counters_check(d, counters);
+    if (timed) {
+        const double local = local_time.milliseconds(), remote = peer_time.milliseconds(), total = total_time.milliseconds();
+        local_time.close(); peer_time.close(); total_time.close();
+        ++d.head_timing_calls[1];
+        d.head_timing_ms[2] += local; d.head_timing_ms[3] += remote; d.head_timing_ms[4] += total;
+        d.head_timing_ms[5] += total - std::max(local, remote);
+    }
 }
 
 __global__ void mtp_norm(const float* input, size_t width, const float* weight, float* output) {
@@ -1062,6 +1165,10 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     }
     return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
 }
+size_t draft_read_rows(const Device& d, size_t vocabulary, unsigned top) {
+    return d.pipelined_chain && !top && d.draft_rows && d.draft_rows < vocabulary && !d.draft_extra_count
+        ? d.draft_rows : vocabulary;
+}
 // The vocabulary head on a draft's row `last` (on this device), its token and probability back; with `top`, instead of the
 // probability, the row's `top` greatest logits and their tokens for the host to draw the draft from (sampling::accept_top_drawn).
 void draft_head(Device& d, void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
@@ -1079,12 +1186,13 @@ void draft_head(Device& d, void* const* head, const int* head_kinds, size_t voca
     float* probability = top ? nullptr : confidence_row;
     confidence_row[0] = 1;
     if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, probability, last,
-                                 top, best, nullptr, rows_of);
+                                 top, best, nullptr, rows_of, true);
     else {
         // (pipelined verification: the other device is busy, so the draft's vocabulary is read on this one alone: its first rows, where no
         // token past them was noted for it; the head of every row otherwise. The probability is under those rows' softmax, as in the split head.)
-        const size_t read = d.pipelined_chain && !top && d.draft_rows && d.draft_rows < vocabulary && !d.draft_extra_count ? d.draft_rows : vocabulary;
-        output_head(d, head, head_kinds, 1, read, nullptr, token_row, nullptr, probability, last, top, best, nullptr, read < vocabulary ? vocabulary : 0);
+        const size_t read = draft_read_rows(d, vocabulary, top);
+        output_head(d, head, head_kinds, 1, read, nullptr, token_row, nullptr, probability, last, top, best, nullptr,
+                    read < vocabulary ? vocabulary : 0, true);
         if (parts) finish_with_helper(d);
     }
     *token = token_row[0]; *confidence = confidence_row[0];
