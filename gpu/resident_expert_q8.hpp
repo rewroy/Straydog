@@ -373,9 +373,18 @@ inline int expert_q8_level() {
 }
 // The switch as the environment has it: read when a device's scratch is made (a model's load), not at every layer's launches, and again at
 // the next load (a process that loads a model twice may have changed it between: examples/qwen_floor does).
+// Unset, a CUDA build takes level 2 (the routed and the shared gate and up on INT8 activations) and a HIP build none; STRAYDOG_EXPERT_Q8=0
+// keeps the F32 kernels, 1 or 2 names the level. On two RTX 3090 (IQ3_S, pipelined) the level took decoding from 132.7 to 146.0 tok/s; its
+// outputs against F32's (RTX 5070 Ti, IQ2_XS, 64 tokens of six prompts): KL mean 0.002-0.004 where two F32 runs of that placement differ by
+// 0.001 (README, Numerics).
 inline void expert_q8_read_environment() {
     const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
-    expert_q8_asked = p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
+#if defined(__HIPCC__)
+    const int unset = 0;
+#else
+    const int unset = 2;
+#endif
+    expert_q8_asked = !p ? unset : (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
 }
 // The device's scratch: made with the device (a launch may be recorded into a graph, where nothing can be allocated), for rows of
 // expert_q8_scratch_cols values at the most.
