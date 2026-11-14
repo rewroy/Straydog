@@ -214,6 +214,14 @@ template<> struct MoeUnit<16> {   // IQ2_XXS: a half is four (grid bytes, sign/s
         for (int i = 0; i < 4; ++i) { qs[i] = q0[i]; qs[4 + i] = q1[i]; }
         d = moe_u16(b);
     }
+    __device__ void load_soa(const Matrix& m, size_t row, size_t unit, unsigned half) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const ExpertSoaFields f = expert_soa_fields<16>(m, row, unit * 8 + half * 4 + i);
+            qs[2 * i] = f.q0; qs[2 * i + 1] = f.signs;
+            if (i == 0) d = f.d;
+        }
+    }
     __device__ void decode(int p, const uint32_t* table, uint32_t (&out)[4]) const {
         const int i = p / 4, g = p % 4;
         const uint32_t aux = qs[2 * i + 1];
@@ -541,7 +549,7 @@ constexpr int moe_wave_n = 2;
 // SoA only changes a specialized unit's fields: its span and the activation K order stay native.
 template<int kind, bool allow_soa>
 __device__ __forceinline__ void moe_load_unit(MoeUnit<kind>& unit, const Matrix& weights, size_t row, size_t index, unsigned half) {
-    if constexpr (allow_soa && (kind == 18 || kind == 21 || kind == 22)) {
+    if constexpr (allow_soa && (kind == 16 || kind == 18 || kind == 21 || kind == 22)) {
         if (weights.layout == 1) {
             unit.load_soa(weights, row, index, half);
             return;
