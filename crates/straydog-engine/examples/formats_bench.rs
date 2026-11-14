@@ -101,7 +101,7 @@ fn main() {
     straydog_engine::gpu::load_iq_tables().unwrap();
     let device = Device::new(0, 8 << 30).unwrap();
     // SAFETY: plain values; null on failure.
-    let engines = [1u32, 6].map(|threads| (threads, unsafe { ffi::sd_cpu_experts_create(threads) }));
+    let engines = [1u32, 6].map(|threads| (threads, unsafe { ffi::sd_cpu_experts_create(threads, 0) }));
     let mut random = Random(0x5eed);
     // Layers covering every expert format: gate/up, down.
     let mut cases: Vec<(String, [Role; 3])> = [0, 1, 2, 10, 20, 25].iter().map(|layer| {

@@ -39,6 +39,9 @@ pub struct Group {
     parts: bool,
     /// The MTP layer split as well: a draft step on both devices.
     mtp_parts: bool,
+    /// Staging slots beyond the chunks' two buffers, on each device, for the experts of a wide read's layer asked for ahead (see
+    /// `crate::model::PRESTAGE_SLOTS`).
+    prestage: u64,
 }
 
 /// Where a layer tensor goes when the layers are in parts: halves (rows or columns of its heads, of the shared expert's width), or
@@ -88,7 +91,7 @@ impl Group {
         let baseline = backends.iter().map(|backend| backend.memory().map(|(used, _)| used)).collect::<Result<_>>()?;
         // An even split until the weights are balanced.
         let starts = (0..devices.len()).map(|index| (index * 48).div_ceil(devices.len())).collect();
-        let mut group = Group { backends, starts, baseline, split_mode, linked: false, parts: false, mtp_parts: false };
+        let mut group = Group { backends, starts, baseline, split_mode, linked: false, parts: false, mtp_parts: false, prestage: 0 };
         group.assign_roles()?;
         Ok(group)
     }
@@ -445,6 +448,16 @@ impl Group {
         self.parts && begin < end && (end <= 48 || (self.mtp_parts && (begin, end) == (48, 49)))
     }
 
+    /// The two devices of a pair, each as a `&mut` of its own (the Vec split once, so that two threads take one each, with nothing but the
+    /// Group's other fields left to the caller).
+    pub fn backend_pair(&mut self) -> Result<(&mut Backend, &mut Backend)> {
+        if self.backends.len() != 2 {
+            return Err("Straydog: the layers are not on two devices".into());
+        }
+        let (first, second) = self.backends.split_at_mut(1);
+        Ok((&mut first[0], &mut second[0]))
+    }
+
     /// `first` on the first device and `second` on the second at once, from two threads: queueing a pass's span takes the host
     /// up to a millisecond a device (graph launch, K/V mirror copies), which the other device's first sum would otherwise
     /// wait (a pass at 20K took ~1 ms longer queued one device after the other).
@@ -480,6 +493,12 @@ impl Group {
         }
         let owner = self.owner_of_span(begin, end)?;
         self.backends[owner].verify_span(begin, end, values, position)
+    }
+
+    /// [`Group::verify_span`] over the rows the first layer and the PLE layer left in the span's device's workspace (see [`Group::front_chained`]).
+    pub fn verify_span_in_place(&mut self, begin: usize, end: usize, steps: usize, position: u64) -> Result<Vec<f32>> {
+        let owner = self.owner_of_span(begin, end)?;
+        self.backends[owner].verify_span_in_place(begin, end, steps, position)
     }
 
     pub fn verify_reserve(&mut self) -> Result<()> {
@@ -742,6 +761,18 @@ impl Group {
         Ok(head)
     }
 
+    /// [`Group::output_head_chained`] with the head's rows read on the last device alone (as [`Group::output_head_alone`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn output_head_chained_alone(&mut self, operands: &[Operand], layer: usize, steps: usize, logits: bool, top: usize,
+                                     confidence: bool) -> Result<(Head, Vec<f32>)> {
+        let last = self.backends.len() - 1;
+        if self.owner(layer) != last {
+            return Err("Straydog chained head is not on the last layer's device".into());
+        }
+        self.backends[last].pin(std::slice::from_ref(&operands[3]))?;
+        self.backends[last].output_head_rows(operands, crate::gpu::Rows::Layer(layer), steps, logits, top, confidence, None)
+    }
+
     /// The PLE layer replayed over the first rows [`Group::ple_front`] kept, after a partial acceptance (queued).
     pub fn ple_replay(&mut self, prefix: &str, embeddings: &[f32], operands: &[Operand]) -> Result<()> {
         for index in self.ple_devices(prefix) {
@@ -796,6 +827,20 @@ impl Group {
         let last = self.backends.len() - 1;
         let lower = self.pin_head(&operands[3])?;
         self.backends[last].output_head(operands, values, logits, top, confidence, lower)
+    }
+
+    /// Every device's expert slots held as they are (no swaps at the end of a span), or let swap (pipelined verification, whose passes are run
+    /// ahead only while the gate is open).
+    pub fn hold_slots(&mut self, held: bool) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.hold_slots(held))
+    }
+
+    /// [`Group::output_head`] on the last GPU alone (its whole vocabulary, nothing on the first: pipelined verification, whose first device is
+    /// busy with the next pass).
+    pub fn output_head_alone(&mut self, operands: &[Operand], values: &[f32], logits: bool, top: usize, confidence: bool) -> Result<Head> {
+        let last = self.backends.len() - 1;
+        self.backends[last].pin(std::slice::from_ref(&operands[3]))?;
+        self.backends[last].output_head(operands, values, logits, top, confidence, None)
     }
 
     /// Pin the vocabulary head on the last GPU and, in the two-GPU mode, its lower half of the
@@ -923,6 +968,11 @@ impl Group {
         self.backends.iter_mut().map(Backend::take_pending).collect()
     }
 
+    /// Fix the resident banks' layouts once every backend's verified uploads have completed.
+    pub fn experts_finalize(&mut self) -> Result<()> {
+        self.backends.iter_mut().try_for_each(Backend::experts_finalize)
+    }
+
     pub fn mtp_prologue(&mut self, operands: &[Operand], embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {
         let last = self.backends.len() - 1;
         self.backends[last].mtp_prologue(operands, embeddings, hidden)
@@ -980,7 +1030,33 @@ impl Group {
     }
 
     pub fn create_expert_slots(&mut self) -> Result<u64> {
-        self.backends.iter_mut().map(|backend| backend.create_expert_slots(crate::model::STAGING_SLOTS, crate::model::SLOTS_MARGIN)).sum()
+        let mut cache = 0;
+        for index in 0..self.backends.len() {
+            let stage = crate::model::STAGING_SLOTS + self.prestage_for(index)?;
+            cache += self.backends[index].create_expert_slots(stage, crate::model::SLOTS_MARGIN)?;
+        }
+        Ok(cache)
+    }
+
+    /// The staging slots device `index` adds for a wide read's prestaged experts: up to the count asked for ([`Group::set_prestage`]), and for a
+    /// device whose layers have fewer experts beyond the slots than that, what they have (a quarter more, from 32): its VRAM goes to the cache.
+    fn prestage_for(&self, index: usize) -> Result<u64> {
+        if self.prestage == 0 {
+            return Ok(0);
+        }
+        let end = self.starts.get(index + 1).copied().unwrap_or(48);
+        let layers = (end - self.starts[index]) as u64;
+        let beyond = self.backends[index].experts_beyond_slots(layers, crate::model::STAGING_SLOTS, crate::model::SLOTS_MARGIN)?;
+        Ok(if beyond == 0 { 0 } else { ((beyond * 5 / 4).max(32).min(self.prestage) + 1) & !1 })
+    }
+
+    /// Before the slots are made: this many staging slots a device adds for a wide read's prestaged experts.
+    pub fn set_prestage(&mut self, slots: u64) {
+        self.prestage = slots;
+    }
+
+    pub fn prestage_slots(&self) -> u64 {
+        self.prestage
     }
 
     /// Every device's expert pool has the page-locked staging mirror. Layer order gathers through it.
@@ -1001,6 +1077,22 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.attach_cpu(engine))
     }
 
+    /// [`Group::attach_cpu`] for device `index` alone (pipelined verification: each device's host thread has an engine of its own).
+    pub fn attach_cpu_for(&mut self, index: usize, engine: &crate::gpu::CpuExperts) -> Result<()> {
+        self.backends[index].attach_cpu(engine)
+    }
+
+    /// Pipelined verification (two devices, CUDA's partially resident layers; before [`Group::verify_reserve`]): the first device
+    /// keeps a second window of DeltaNet snapshots; with `freeze`, no device swaps its expert slots at the end of a pass.
+    pub fn pipeline_setup(&mut self, windows: bool, freeze: bool) -> Result<()> {
+        let last = self.backends.len() - 1;
+        for (index, backend) in self.backends.iter_mut().enumerate() {
+            // (the second device's drafter reads the draft's vocabulary alone while the first runs the next pass)
+            backend.pipeline_setup(windows && index == 0, freeze, windows && index == last)?;
+        }
+        Ok(())
+    }
+
     pub fn route_floor(&mut self, floor: f32) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.route_floor(floor))
     }
@@ -1010,6 +1102,14 @@ impl Group {
     }
 
     pub fn rebalance(&mut self, max_swaps: u64) -> Result<()> {
+        if cfg!(feature = "cuda") && max_swaps == 0 && self.backends.len() > 1 {
+            // Finish earlier swaps so each nonblocking refresh can pick the whole cache.
+            for backend in &mut self.backends {
+                backend.drain_slot_copies()?;
+            }
+            // Issue every device's refresh before the blocking pass settles their copies.
+            self.refresh_slots(u64::MAX)?;
+        }
         self.backends.iter_mut().try_for_each(|backend| backend.rebalance(max_swaps))
     }
 

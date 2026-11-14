@@ -29,12 +29,13 @@ pub use tree::{prepare, ProcessTree};
 /// can); a prompt's layer order (STRAYDOG_LAYER_PREFILL, the rows of its passes STRAYDOG_LAYER_PREFILL_ROWS, where they are held
 /// STRAYDOG_LAYER_ROWS_VRAM, and STRAYDOG_LOCK_DURING_PREFILL, the
 /// locking behind "ready" going on meanwhile, which the worker's own code reads); STRAYDOG_KV (=f16: Qwen3.8's K/V held as
-/// FP16, not Q8_0); STRAYDOG_PREFILL_WIDE (=off: a long read's batches are not widened; N: the rows to try); STRAYDOG_DELTA_SCAN (=token: a long read scans its DeltaNet layers token by token); STRAYDOG_HC (=blas: a long read's HyperConnections keep their two kernels, hipblasGemmEx and the finish); STRAYDOG_PARTS_OVERLAP (=off: a long read's sends between the two GPUs of Qwen3.8's layers in parts stay in the compute's order, none beside it); and the engines' development switches, each the one place
+/// FP16, not Q8_0); STRAYDOG_KV_START (=N: the positions a partially resident Qwen3.8's K/V starts with, 32768 where it is not set; 0 or the
+/// context: the whole context from the start); STRAYDOG_PREFILL_WIDE (=off: a long read's batches are not widened; N: the rows to try); STRAYDOG_DELTA_SCAN (=token: a long read scans its DeltaNet layers token by token); STRAYDOG_HC (=blas: a long read's HyperConnections keep their two kernels, hipblasGemmEx and the finish); STRAYDOG_PARTS_OVERLAP (=off: a long read's sends between the two GPUs of Qwen3.8's layers in parts stay in the compute's order, none beside it); STRAYDOG_PREFILL_OVERLAP (=0: a partially resident read on two NVIDIA GPUs takes their layers one after the other, not different batches at once); STRAYDOG_PRESTAGE (the staging slots a wide read on two NVIDIA GPUs asks its layer's experts ahead into, 0: none); STRAYDOG_SPLIT (=N: the second GPU's first layer of a partially resident Qwen3.8 on two GPUs, in place of the balance of weight bytes); STRAYDOG_PIPELINE (=1: greedy verification passes of a partially resident Qwen3.8 on two NVIDIA GPUs overlap, the first GPU starting the next pass on a guess of its tokens; STRAYDOG_PIPELINE_FORCE_MISS=N, a test's: the guess made wrong every Nth pass); STRAYDOG_FRONT_CHAIN (=0: a partially resident Qwen3.8's first layer and PLE layer of a verification go through the host on NVIDIA GPUs, as before they were chained on the device; =check: chained, and the PLE layer's rows again through the host, the floats that differ counted); STRAYDOG_ASSIST (=N, the missed experts the GPU takes over the bus: on a CUDA build a layer's pass whose rows miss at most N distinct experts has the GPU take them all, and one that misses more leaves them all to the CPU; on a HIP build N is the most of a row's misses the GPU takes, a share of them, the CPU taking the rest; 0: the CPU takes every miss; a CUDA build's MTP draft layer leaves its misses to the CPU whatever N is; where it is not set a CUDA build takes 0 and a HIP build lets its tuner choose); and the engines' development switches, each the one place
 /// the engine reads it: Qwen3.8's STRAYDOG_Q8, STRAYDOG_HC_Q8, STRAYDOG_PARTS, STRAYDOG_MTP_PARTS and STRAYDOG_DRAFT_VOCABULARY, and
 /// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
 /// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
 /// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
-pub const ENGINE_VARIABLES: [&str; 45] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 67] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
                                          "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
                                          "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",
@@ -43,7 +44,9 @@ pub const ENGINE_VARIABLES: [&str; 45] = ["DS41_PROFILE", "DS41_DRAFTS", "DS41_D
                                          "DS41_GATE_UP_FIRST", "DS41_HEADS_FIRST", "DS41_HITS_FIRST", "DS41_LEND", "DS41_LEND_ROWS",
                                          "DS41_LEND_STATE", "DS41_LINK", "DS41_NO_GRAPHS", "DS41_PREDICT", "DS41_PREDICT_DRIVE", "DS41_Q8",
                                          "DS41_ROUTE_READBACK", "DS41_SLOT_WMMA", "STRAYDOG_LAYER_ROWS_VRAM", "STRAYDOG_PREFILL_WIDE", "STRAYDOG_DELTA_SCAN",
-                                         "STRAYDOG_HC", "STRAYDOG_PARTS_OVERLAP", "STRAYDOG_VRAM_DIAGNOSTIC"];
+                                         "STRAYDOG_HC", "STRAYDOG_PARTS_OVERLAP", "STRAYDOG_PRESTAGE", "STRAYDOG_SPLIT", "STRAYDOG_PIPELINE",
+                                         "STRAYDOG_PIPELINE_FORCE_MISS", "STRAYDOG_PREFILL_OVERLAP", "STRAYDOG_FRONT_CHAIN", "STRAYDOG_ASSIST",
+                                         "STRAYDOG_PREFILL_PHASES", "STRAYDOG_MOE_EAGER", "STRAYDOG_PIPELINE_DRAFTS", "STRAYDOG_PIPELINE_CPU_THREADS", "STRAYDOG_PIPELINE_GATE", "STRAYDOG_PIPELINE_ASSIST", "STRAYDOG_PIPELINE_LONE", "STRAYDOG_PIPELINE_SWAPS", "STRAYDOG_PIPELINE_RECOVER", "STRAYDOG_PIPELINE_MTP_BATCH", "STRAYDOG_STATE_DIGEST", "STRAYDOG_PIPELINE_HANDOVER", "STRAYDOG_PIPELINE_NO_COPY", "STRAYDOG_PIPELINE_PASS_LOG", "STRAYDOG_KV_START", "STRAYDOG_VRAM_DIAGNOSTIC"];
 
 #[cfg(any(windows, test))]
 mod appcontainer;
@@ -421,8 +424,8 @@ mod engine_variables_tests {
     /// What the engine's code reads that no worker needs, and why: a test's own paths, set by hand where the test runs in-process.
     const TEST_ONLY: [(&str, &str); 7] = [
         ("STRAYDOG_TOKENIZER_JSON", "a test's tokenizer file (text.rs)"),
-        ("STRAYDOG_MODEL", "the wait-recovery test's model directory (model.rs)"),
-        ("STRAYDOG_MODEL_QUANT", "the wait-recovery test's quantization (model.rs)"),
+        ("STRAYDOG_MODEL", "the wait-recovery and KV-placement tests' model directory (model.rs)"),
+        ("STRAYDOG_MODEL_QUANT", "the wait-recovery and KV-placement tests' quantization (model.rs)"),
         ("STRAYDOG_QWEN_MMPROJ", "a test's vision projector (qwen_vision.rs)"),
         ("STRAYDOG_DRAFTER", "the layer-order diagnostic test's drafter (layer_prefill_diagnostics.rs)"),
         ("STRAYDOG_LAYER_MODEL", "the layer-order diagnostic test's model directory (layer_prefill_diagnostics.rs)"),
