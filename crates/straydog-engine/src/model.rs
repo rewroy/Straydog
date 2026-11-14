@@ -4463,7 +4463,7 @@ impl Model {
     }
 
     /// The rows through every layer and the head: with `sampling`, each row's logits for the draw, or its `top` greatest
-    /// when the draw reads only those (sampling::Sampling::top_candidates: the GPU picks them, the host reads a few pairs a row).
+    /// when the draw can use those (Sampling::target_read_top: penalty candidates still need a host-side completeness proof).
     fn verify(&mut self, tokens: &[u32], sampling: bool, top: usize) -> Result<Verified> {
         if !self.partial && self.group.chains_verification() {
             let embeddings = self.verify_chained(tokens)?;
@@ -4499,6 +4499,21 @@ impl Model {
         };
         self.phase("verify: head", &mut clock);
         Ok((first, embeddings, hidden, targets, scores))
+    }
+
+    /// Re-read only the verification head from the retained, unmodified hidden rows.
+    /// Keep the same split/single-device arithmetic as the head in `verify`; no decoder layer runs again.
+    fn verified_full_scores(&mut self, hidden: &[f32]) -> Result<Scores> {
+        let chained = !self.partial && self.group.chains_verification();
+        let alone = !chained && self.frozen_now() && self.group.backends.len() == 2;
+        let (_, scores, _) = self.with_operands(Model::head_operands, |group, operands| {
+            if alone { group.output_head_alone(operands, hidden, true, 0, false) }
+            else { group.output_head(operands, hidden, true, 0, false) }
+        })?;
+        match scores {
+            Some(scores @ Scores::Logits(_)) => Ok(scores),
+            _ => Err("Straydog verification head returned no full logits".into()),
+        }
     }
 
     /// A short prompt through the verification spans, up to [`PROMPT_ROWS`] rows per pass and every row
@@ -4678,6 +4693,27 @@ impl Model {
             return (accepted, targets[accepted] as u32);
         };
         sampling::accept(drafts, scores, VOCABULARY, sampling, generated, rng)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_penalty_top(&mut self, drafts: &[u32], proposed: &[Vec<(f32, u32)>], top: &[Vec<(f32, u32)>], sampling: &Sampling,
+                       generated: &mut Generated, rng: &mut Rng, position: u64, keyed: bool) -> Option<(usize, u32)> {
+        self.metric_count("penalty_top_passes", 1);
+        // Sampling proves every reachable accepted prefix before touching the real Generated/RNG.
+        // None preserves their complete pre-pass state, so a full-logit retry needs no second snapshot.
+        let accepted = if !proposed.is_empty() {
+            None // This optimization preserves the existing point-draft policy for penalized requests.
+        } else if keyed {
+            let seed = self.sample_seed;
+            sampling::try_accept_top_keyed(drafts, top, VOCABULARY, sampling, generated,
+                                           &|index| Rng::keyed(seed, position + index as u64))
+        } else {
+            sampling::try_accept_top(drafts, top, VOCABULARY, sampling, generated, rng)
+        };
+        if accepted.is_none() {
+            self.metric_count("penalty_top_fallback_passes", 1);
+        }
+        accepted
     }
 
     fn metric_add(&mut self, key: &str, amount: f64) {
@@ -4880,18 +4916,32 @@ impl Model {
                 return Err("Straydog prompt plus output exceeds the allocated context".into());
             }
             let position = self.history.len() as u64;
-            let top = if held.is_some() { 0 } else { sampling.top_candidates().unwrap_or(0) };
             let read_logits = self.forced_rows.as_ref().is_some_and(|forced| forced.read_logits);
+            let top = if held.is_some() || (sampling.presence_penalty != 0.0 && read_logits) { 0 }
+                      else { sampling.target_read_top().unwrap_or(0) };
             let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some() || read_logits, top)?;
             let mut clock = Instant::now();
-            let (accepted, following) = match (held.as_deref_mut(), scores.as_mut()) {
-                (Some(held), Some(Scores::Logits(logits))) => held.accept_rows(&drafts, &proposed, logits, VOCABULARY, sampling, &mut generated, rng)?,
-                // (STRAYDOG_PIPELINE: the tokens are the target's draws keyed by position, the scheme the pipelined passes use too)
-                (None, Some(Scores::Logits(logits))) if self.frozen_now() && proposed.is_empty() => {
-                    let seed = self.sample_seed;
-                    sampling::accept_keyed(&drafts, logits, VOCABULARY, sampling, &mut generated, &|index| Rng::keyed(seed, position + index as u64))
-                }
-                _ => Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng),
+            let penalty_top = sampling.presence_penalty != 0.0 && matches!(scores.as_ref(), Some(Scores::Top(_)));
+            let certified = if let Some(Scores::Top(top)) = scores.as_ref().filter(|_| penalty_top) {
+                let keyed = self.frozen_now() && proposed.is_empty();
+                self.try_penalty_top(&drafts, &proposed, top, sampling, &mut generated, rng, position, keyed)
+            } else { None };
+            if penalty_top && certified.is_none() {
+                self.phase("accept", &mut clock);
+                scores = Some(self.verified_full_scores(&hidden)?);
+                self.phase("verify: head", &mut clock);
+            }
+            let (accepted, following) = match certified {
+                Some(accepted) => accepted,
+                None => match (held.as_deref_mut(), scores.as_mut()) {
+                    (Some(held), Some(Scores::Logits(logits))) => held.accept_rows(&drafts, &proposed, logits, VOCABULARY, sampling, &mut generated, rng)?,
+                    // (STRAYDOG_PIPELINE: the tokens are the target's draws keyed by position, the scheme the pipelined passes use too)
+                    (None, Some(Scores::Logits(logits))) if self.frozen_now() && proposed.is_empty() => {
+                        let seed = self.sample_seed;
+                        sampling::accept_keyed(&drafts, logits, VOCABULARY, sampling, &mut generated, &|index| Rng::keyed(seed, position + index as u64))
+                    }
+                    _ => Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng),
+                },
             };
             self.phase("accept", &mut clock);
             if self.pipeline.pass_log() {
@@ -5160,6 +5210,10 @@ impl Model {
         .as_object()
         .unwrap()
         .clone();
+        if sampling.presence_penalty != 0.0 && sampling.target_read_top().is_some() {
+            self.metric_count("penalty_top_passes", 0);
+            self.metric_count("penalty_top_fallback_passes", 0);
+        }
         // The parked sequence's positions this request may write, copied out before anything
         // runs: from where it resumes (the MTP layer's pair before that) to its last possible
         // output (the rows of a verification later rejected among them).

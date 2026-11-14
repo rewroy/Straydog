@@ -711,6 +711,9 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                        _ => String::new(),
                                                    }),
             _ => String::new(),
+        } + &match (timings["penalty_top_passes"].as_u64(), timings["penalty_top_fallback_passes"].as_u64()) {
+            (Some(passes), Some(retries)) => format!("; penalized top: {passes} passes, {retries} full-logit retries"),
+            _ => String::new(),
         },
         // (an engine that streams experts says where the prefill's came from: what the first token waited on)
         match &timings["prefill_experts"] {

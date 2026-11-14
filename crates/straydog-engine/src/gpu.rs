@@ -32,8 +32,8 @@ pub const HYBRID_WAIT_RECOVERED: &str = "the GPU wait timed out; the interrupted
 
 /// A head's rows: each row's first maximum, its logits and its probability when asked.
 /// A verification head's rows for drawing the next tokens: every logit, or (`Top`) each row's greatest logits with their
-/// tokens, most likely first and the lower token first on a tie, which is all a draw reads when its cut keeps at most
-/// that many (sampling::Sampling::top_candidates).
+/// tokens, most likely first and the lower token first on a tie. Penalized draws must prove these raw candidates are
+/// complete after the penalty, or re-read full logits from retained hidden rows (Sampling::target_read_top).
 pub enum Scores {
     Logits(Vec<f32>),
     Top(Vec<Vec<(f32, u32)>>),
@@ -2356,7 +2356,8 @@ impl Backend {
     }
 
     /// The head (`operands`: its four) on row `row` of the rows [`Backend::draft_queue`] left in `layer`'s workspace: the
-    /// draft's token and its probability.
+    /// draft's token and its probability. A split call requires exclusive ownership of the actual peer Backend too;
+    /// the native operation mutates its scratch, staging and link state.
     pub fn draft_head(&mut self, operands: &[Operand], layer: usize, row: u64, split: Option<(u64, *mut c_void)>, top: usize)
                       -> Result<Draft> {
         let vocabulary = operands.get(3).map_or(0, |operand| operand.rows);
@@ -2376,6 +2377,31 @@ impl Backend {
         })?;
         Self::finite(&[confidence], "draft probability")?;
         Ok(Draft { token, confidence, top: top_pairs(&best, top) })
+    }
+
+    /// Drain queued drafting work when the request fails before its head runs.
+    pub(crate) fn draft_drain(&mut self) -> Result<()> {
+        // SAFETY: this Backend exclusively owns its live device and every stream being drained.
+        check(unsafe { ffi::sd_draft_drain(self.handle) }).map(drop)
+    }
+
+    pub(crate) fn draft_vocabulary_info(&self, vocabulary: u64, top: u64) -> Result<(u64, u64, u64)> {
+        let (mut rows, mut extras, mut read_rows) = (0, 0, 0);
+        // SAFETY: a live device and three output counters; the query reads native metadata only.
+        check(unsafe { ffi::sd_draft_vocabulary_info(self.handle, vocabulary, top, &mut rows, &mut extras, &mut read_rows) })?;
+        Ok((rows, extras, read_rows))
+    }
+
+    pub(crate) fn head_timing_enable(&mut self, enabled: bool) -> Result<()> {
+        // SAFETY: this Backend exclusively owns its device; native timing requires explicit profiling outside capture.
+        check(unsafe { ffi::sd_head_timing_enable(self.handle, c_int::from(enabled)) }).map(drop)
+    }
+
+    pub(crate) fn head_timing(&self) -> Result<([u64; 2], [f64; 6])> {
+        let (mut calls, mut milliseconds) = ([0; 2], [0.0; 6]);
+        // SAFETY: two call counters and the six timing accumulators defined in the native header.
+        check(unsafe { ffi::sd_head_timing_read(self.handle, calls.as_mut_ptr(), milliseconds.as_mut_ptr()) })?;
+        Ok((calls, milliseconds))
     }
 
     /// A draft's vocabulary when the head is split (see `sd_draft_vocabulary`): `head`'s rows [0, rows) and the rows of `tokens`
