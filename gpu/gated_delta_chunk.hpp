@@ -477,18 +477,22 @@ __device__ __forceinline__ void gdn_copy_commit() { asm volatile("cp.async.commi
 __device__ __forceinline__ void gdn_copy_wait() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
 
 // The scan over a launch's chunks of 16 tokens on CUDA, in F32 FMAs (gdn_chunk_prep's U, W, B, g and e and the normalized keys and queries as floats
-// are its inputs): a block of two warps takes 32 columns of one value head, a warp 16 of them, two lanes a column, each its column's state for 64 of
+// are its inputs): a block of four warps takes 64 columns of one value head, a warp 16 of them, two lanes a column, each its column's state for 64 of
 // the 128 keys in registers. Per chunk every product against the state is formed at once, 16 tokens' keys and queries over the keys with 32
 // independent sums where the token scan's sums are one chain a token (and a barrier between tokens): P = M0^T k, S = M0^T q (a lane's half of the
 // keys in ascending order from zero, the two halves added), C = U - W P, out = g S + B C and M = g_end M0 + sum_t k_t (x) e_t C_t, the state's decay as
 // fused multiply-adds with g_end as two floats (as the RDNA4 kernel's). The chunk's inputs (the keys and queries, W, B, g, e: 18 KB) come to shared
-// memory for both warps by cp.async, the next chunk's while this one's products are formed. Another order of sums than the token scan's, the same
+// memory for the warps by cp.async, the next chunk's while this one's products are formed. Another order of sums than the token scan's, the same
 // recurrence (docs/DESIGN.md, README: Numerics).
-constexpr unsigned gdn_scan_warps = 2;
+// The tile puts key (and query) row r of 0..127 at r * 16 + (r / 64) * 4 floats in its region: the two lanes of a column read the rows `own + key`
+// (own 0 or 64) as float4, and rows 64 apart are 4096 bytes apart, the same banks, a 2-way conflict on every LDS.128 of the scan; the second half's
+// rows 4 floats (16 bytes) further read apart. With four warps a block instead of two (the grid's y halves), one layer of 4096 rows, P = 2, RTX 5070 Ti:
+// 1.42 ms -> 0.95 ms (the shifted layout with two warps 0.99); outputs and states the bits of the unshifted kernel's (the same sums in the same order).
+constexpr unsigned gdn_scan_warps = 4;
 template<int P>
 __global__ void __launch_bounds__(32 * gdn_scan_warps) gdn_chunk_scan_f32(float* state, size_t count, const float* scratch, float* output, float* history) {
     using H = QwenHeads<P>;
-    constexpr unsigned CT = gdn_chunk_tokens, KEYS = 64, COLS = 16, KQ = 2 * 128 * CT, TILE = KQ + 2 * CT * CT + 2 * CT, THREADS = 32 * gdn_scan_warps;
+    constexpr unsigned CT = gdn_chunk_tokens, KEYS = 64, COLS = 16, REGION = 128 * CT + 8, KQ = 2 * REGION, TILE = KQ + 2 * CT * CT + 2 * CT, THREADS = 32 * gdn_scan_warps;
     const GdnChunkLayout<P> layout(count);
     const unsigned thread = threadIdx.x, warp = thread / 32, lane = thread % 32, half = lane & 1, own = half * KEYS, own_col = lane >> 1;
     const size_t head = blockIdx.x, kh = head % H::key, chunks = (count + CT - 1) / CT;
@@ -504,7 +508,10 @@ __global__ void __launch_bounds__(32 * gdn_scan_warps) gdn_chunk_scan_f32(float*
         const size_t at = (chunk * H::value + head) * 256;
         float* target = tile[buffer];
         #pragma unroll
-        for (unsigned i = thread; i < KQ / 4; i += THREADS) gdn_copy16(target + 4 * i, keys + 4 * i);
+        for (unsigned i = thread; i < 2 * 128 * CT / 4; i += THREADS) {
+            const unsigned row = 4 * i / CT, region = row / 128, r = row % 128;
+            gdn_copy16(target + region * REGION + r * CT + (r / KEYS) * 4 + 4 * i % CT, keys + 4 * i);
+        }
         if (thread < CT * CT / 4) {
             gdn_copy16(target + KQ + 4 * thread, scratch + layout.w + at + 4 * thread);
             gdn_copy16(target + KQ + CT * CT + 4 * thread, scratch + layout.b + at + 4 * thread);
@@ -541,8 +548,8 @@ __global__ void __launch_bounds__(32 * gdn_scan_warps) gdn_chunk_scan_f32(float*
         for (unsigned t = 0; t < CT; ++t) { p[t] = 0.0f; q[t] = 0.0f; }
         #pragma unroll
         for (unsigned key = 0; key < KEYS; ++key) {
-            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT);
-            const float4* qq = reinterpret_cast<const float4*>(skq + 128 * CT + (own + key) * CT);
+            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT + half * 4);
+            const float4* qq = reinterpret_cast<const float4*>(skq + REGION + (own + key) * CT + half * 4);
             const float value = m[key];
             #pragma unroll
             for (unsigned v = 0; v < CT / 4; ++v) {
@@ -581,7 +588,7 @@ __global__ void __launch_bounds__(32 * gdn_scan_warps) gdn_chunk_scan_f32(float*
         const float gend = sg[CT - 1], gend_low = se[CT - 1];
         #pragma unroll
         for (unsigned key = 0; key < KEYS; ++key) {
-            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT);
+            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT + half * 4);
             float acc = 0.0f;
             #pragma unroll
             for (unsigned v = 0; v < CT / 4; ++v) {
