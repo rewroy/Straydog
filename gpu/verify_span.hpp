@@ -798,6 +798,48 @@ private:
     }
 };
 
+// The launches of a head or of a drafter's prologue as one cached graph where that is cheaper to issue: a CUDA build's, outside a capture
+// and with no phase marks in them (a mark is an event of the profile's own). Each is eight to twelve launches of small kernels between two
+// waits of the host: on a host whose cores are shared and slow a launch costs 12 us to issue and a graph's replay 10 us whatever it holds
+// (two RTX 3090: about fifty such launches a pass of the pipeline). A HIP build issues them as it did.
+template<class Function>
+void run_small_graph(Device& d, const char* tag, void* const* dependencies, size_t count, size_t variant, Function&& submit) {
+#if !defined(__HIPCC__)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    check(cudaStreamIsCapturing(d.stream, &capture));
+    if (capture == cudaStreamCaptureStatusNone && !d.phase_on) { run_graph(d, tag, dependencies, count, variant, submit); return; }
+#else
+    (void)tag; (void)dependencies; (void)count; (void)variant;
+#endif
+    submit();
+}
+
+// A head's graph holds the count of a draft vocabulary's extra rows: when that count has changed, the graphs of the same head at the counts
+// before are dropped, so that a long conversation's heads (a token past the vocabulary's first rows noted now and then) do not fill the
+// device's graph cache, which the layers' graphs share.
+constexpr size_t output_head_extras_at = 8192, output_head_extras_bits = size_t(0x7fff) * output_head_extras_at;
+inline void output_head_forget(Device& d, size_t variant) {
+#if !defined(__HIPCC__)
+    const std::string tag = "output-head";
+    for (auto graph = d.graphs.begin(); graph != d.graphs.end();) {
+        size_t held = 0;
+        if (graph->first.size() >= tag.size() + sizeof(held) && graph->first.compare(0, tag.size(), tag) == 0) {
+            std::memcpy(&held, graph->first.data() + tag.size(), sizeof(held));
+            if (held != variant && (held & ~output_head_extras_bits) == (variant & ~output_head_extras_bits)) {
+                check(hipStreamSynchronize(d.stream));
+                check(hipGraphExecDestroy(graph->second.executable));
+                check(hipGraphDestroy(graph->second.graph));
+                graph = d.graphs.erase(graph);
+                continue;
+            }
+        }
+        ++graph;
+    }
+#else
+    (void)d; (void)variant;
+#endif
+}
+
 // `source` rows on the device (rather than `input`'s on the host) come back in `rows` when asked, with the tokens.
 // `allocated` (a draft's vocabulary on one device, draft_head): the head's rows the allocation holds, where `vocabulary` rows of it are read.
 // `extras` (a draft's vocabulary on one device as well): `extra_count` more rows, of the tokens `extra_tokens`, read after the head's first
@@ -837,22 +879,37 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
     if (input) upload(d, rows, input, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
-    hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
-    total_time.begin(); projection_time.begin();
-    const Matrix own[2] = {head, {extras, head.row_bytes, extra_count, 2560, 0, vocabulary, 0, kinds[3]}};
-    gemv(d, own, extra_count ? 2 : 1, mixed, d.output, steps, 2564, read);
-    projection_time.end();
-    row_argmax(d, d.output, steps, read, read, partial, chosen);
     float* top = reinterpret_cast<float*>(chosen + verify_max);
-    if (confidence) {
-        row_exp_sum(d, d.output, steps, read, read, chosen, partial, top);
-        head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
-    }
     float* ranked = top + 4 * verify_max;
-    if (top_count) row_top(d, d.output, steps, read, read, top_count, ranked + verify_max * 2 * head_top_max, ranked);
-    // (after the probability, which is read at the chosen row: the rows past the head's become their tokens)
-    if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens, top_count);
-    check(hipGetLastError());
+    const Matrix own[2] = {head, {extras, head.row_bytes, extra_count, 2560, 0, vocabulary, 0, kinds[3]}};
+    auto launches = [&]() {
+        hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
+        total_time.begin(); projection_time.begin();
+        gemv(d, own, extra_count ? 2 : 1, mixed, d.output, steps, 2564, read);
+        projection_time.end();
+        row_argmax(d, d.output, steps, read, read, partial, chosen);
+        if (confidence) {
+            row_exp_sum(d, d.output, steps, read, read, chosen, partial, top);
+            head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
+        }
+        if (top_count) row_top(d, d.output, steps, read, read, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+        // (after the probability, which is read at the chosen row: the rows past the head's become their tokens)
+        if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens, top_count);
+        check(hipGetLastError());
+    };
+    if (timed) launches();   // (the timers' events are this call's own)
+    else {
+        // (what the launches hold beside the operands: the rows read, the extra rows, the rows of the pass, the pairs asked for)
+        void* dependencies[8] = {pointers[0], pointers[1], pointers[2], pointers[3], const_cast<uint8_t*>(extras), const_cast<int32_t*>(extra_tokens),
+                                 d.input, d.output};
+        const size_t variant = steps + 32 * top_count + 32 * 128 * size_t(confidence != nullptr) + output_head_extras_at * extra_count +
+                               (vocabulary << 32);
+        if (extra_count && extra_count != d.head_graph_extras) {
+            output_head_forget(d, variant);
+            d.head_graph_extras = extra_count;
+        }
+        run_small_graph(d, "output-head", dependencies, 8, variant, launches);
+    }
     total_time.end();
     Piece pieces[5]; size_t count = 0;
     if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
@@ -1129,24 +1186,32 @@ void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, siz
     mtp_prologue_check(d, pointers, kinds, steps);
     float* e = mtp_prologue_embeddings(d); float* h = mtp_prologue_hidden(d, steps);
     float* ne = h + steps * 10240; float* nh = ne + steps * 2560;
-    mtp_norm<<<unsigned(steps),256,0,d.stream>>>(e, 2560, static_cast<const float*>(pointers[0]), ne);
-    mtp_norm<<<unsigned(steps),256,0,d.stream>>>(h, 10240, static_cast<const float*>(pointers[2]), nh);
-    phase(d, "pro_norm");
-    const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
-    const Matrix fh{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),2560,2560,0,0,0,kinds[3]};
-    float* projected = d.output;   // steps x 10240 streams, then steps x 2560 embeddings
-    if (exact || steps <= size_t(gemv_max_vectors)) {
-        gemv(d, &fe, 1, ne, projected + steps * 10240, steps, 2560, 2560);
-        for (size_t b = 0; b < steps; ++b) gemv(d, &fh, 1, nh + b * 10240, projected + b * 10240, 4, 2560, 2560);
-    } else {   // prompt rows: drafter numerics never change verified tokens
-        Matrix descriptors[max_batch]{};
-        hc_project(d, fe, steps, ne, projected + steps * 10240, descriptors);
-        hc_project(d, fh, steps * 4, nh, projected, descriptors);
-    }
-    phase(d, "pro_gemm");
-    mtp_combine<<<dim3(40, unsigned(steps)),256,0,d.stream>>>(projected, projected + steps * 10240, h);
-    phase(d, "pro_combine");
-    check(hipGetLastError());
+    const bool rows_exact = exact || steps <= size_t(gemv_max_vectors);
+    auto launches = [&]() {
+        mtp_norm<<<unsigned(steps),256,0,d.stream>>>(e, 2560, static_cast<const float*>(pointers[0]), ne);
+        mtp_norm<<<unsigned(steps),256,0,d.stream>>>(h, 10240, static_cast<const float*>(pointers[2]), nh);
+        phase(d, "pro_norm");
+        const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
+        const Matrix fh{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),2560,2560,0,0,0,kinds[3]};
+        float* projected = d.output;   // steps x 10240 streams, then steps x 2560 embeddings
+        if (rows_exact) {
+            gemv(d, &fe, 1, ne, projected + steps * 10240, steps, 2560, 2560);
+            for (size_t b = 0; b < steps; ++b) gemv(d, &fh, 1, nh + b * 10240, projected + b * 10240, 4, 2560, 2560);
+        } else {   // prompt rows: drafter numerics never change verified tokens
+            Matrix descriptors[max_batch]{};
+            hc_project(d, fe, steps, ne, projected + steps * 10240, descriptors);
+            hc_project(d, fh, steps * 4, nh, projected, descriptors);
+        }
+        phase(d, "pro_gemm");
+        mtp_combine<<<dim3(40, unsigned(steps)),256,0,d.stream>>>(projected, projected + steps * 10240, h);
+        phase(d, "pro_combine");
+        check(hipGetLastError());
+    };
+    // (a drafting step's rows: one graph. A prompt's rows keep their launches: their count varies and they are not a pass's.)
+    if (rows_exact) {
+        void* dependencies[6] = {pointers[0], pointers[1], pointers[2], pointers[3], d.input, d.output};
+        run_small_graph(d, "mtp-prologue", dependencies, 6, steps, launches);
+    } else launches();
 }
 void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* embeddings,
                   const float* hidden, float* output) {

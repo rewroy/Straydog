@@ -800,6 +800,7 @@ struct Device {
     uint64_t hybrid_verify_balanced=0;   // hybrid_tokens at a verification's last swaps
     // The routes that missed the slots (the CPU's and the staged ones) and the tokens at the last refresh of the slots (hybrid_refresh_due)
     uint64_t refresh_misses=0, refresh_tokens=0;
+    size_t head_graph_extras=SIZE_MAX;   // the extra rows of the draft's head whose graph is cached (output_head_forget)
     hipEvent_t swapped=nullptr;   // the pending swaps' copies have landed
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
     std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
