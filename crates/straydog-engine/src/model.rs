@@ -335,8 +335,13 @@ pub const CHUNKED_SCAN_READ: usize = 16_384;
 const PASSES_BETWEEN_LONE_ROWS: u32 = 64;
 
 /// Expert bank bytes to page-lock given the host memory (0 if unknown): all of them with
-/// memory twice their size; with at least 1.25 times, half the memory less the page-locked
-/// sequence state; else none (the unlocked layers and the PLE table would thrash).
+/// memory twice their size; with at least 1.25 times, three quarters of the memory less the
+/// page-locked sequence state, and no more than the banks; else none (the unlocked layers and
+/// the PLE table would thrash). Each layer's lock still asks what is free when it is taken
+/// (`host::lockable`). Half the memory left 9 of IQ3_S's 48 layers unlocked beside two RTX 3090
+/// and 80 GiB: a layer that is not page-locked has none of its missed routes staged to the GPU
+/// and is not launched ahead of its CPU experts, and with every layer locked the same machine
+/// decoded 100 tok/s where it had 81 (117.5 to 129 with the two devices pipelined).
 pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
     // (development: STRAYDOG_LOCK_BUDGET=all, or a number of GiB, in place of the rule -- to measure what the layers the rule leaves
     // unlocked cost: a layer that is not page-locked has no route staged to the GPU and no layer launched ahead of its CPU experts)
@@ -354,7 +359,7 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
     if memory >= 2 * banks {
         return banks;
     }
-    (memory / 2).saturating_sub(pinned_state)
+    (memory / 4 * 3).saturating_sub(pinned_state).min(banks)
 }
 
 /// The part of a partially resident request's "other" (the request line's ms a token apart from the GPU wait and the CPU) that a decode

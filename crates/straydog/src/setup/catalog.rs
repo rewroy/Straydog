@@ -858,10 +858,14 @@ pub(crate) mod tests {
         // the banks are more than half of 32, 62 and 64 GiB of memory: the row cache is 1 GiB, and it is not page-locked whole
         assert_eq!(row_cache(&ours, RAM_32, ours.footprint.state_per_token * DEFAULT_CONTEXT), SCARCE_ROW_CACHE);
         assert_eq!(row_cache(&ours, 64 << 30, ours.footprint.state_per_token * DEFAULT_CONTEXT), SCARCE_ROW_CACHE);
-        // no bank is page-locked at 32 GiB (under 1.25 times the banks), at 48 half the memory is
+        // no bank is page-locked at 32 GiB (under 1.25 times the banks); from there three quarters of the memory less the page-locked
+        // state are, and no more than the banks
         use straydog_engine::model::lock_budget;
         assert_eq!(lock_budget(RAM_32, ours.footprint.experts, 2 << 30), 0);
-        assert_eq!(lock_budget(48 << 30, ours.footprint.experts, 2 << 30), 22 << 30);
+        assert_eq!(lock_budget(48 << 30, ours.footprint.experts, 2 << 30), (34u64 << 30).min(ours.footprint.experts));
+        assert_eq!(lock_budget(48 << 30, ours.footprint.experts, 12 << 30), 24 << 30);
+        assert_eq!(lock_budget(64 << 30, big.footprint.experts, 4 << 30), 44 << 30);
+        assert_eq!(lock_budget(80 << 30, big.footprint.experts, 4 << 30), big.footprint.experts);
         // 96 GiB, more than twice these banks: half of what the K/V leaves, up to the table's rows
         let wide = row_cache(&ours, 96 << 30, ours.footprint.state_per_token * DEFAULT_CONTEXT);
         assert!(wide > 30 << 30 && wide < 40 << 30, "{wide}");
