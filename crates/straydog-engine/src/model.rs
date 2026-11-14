@@ -1957,7 +1957,15 @@ impl Model {
             self.group.register_hybrid_moe(&prefix, &operands, banks, 512, *kinds)?;
         }
         if self.weights.drafter {
-            self.register_hybrid_drafter()?;
+            // (development: STRAYDOG_DRAFTER_RESIDENT=1 pins the MTP layer's whole bank, as a fully resident model does, where it is a
+            // partially resident layer by default. A drafting step then has no CPU route and no host step in its layer: on two RTX 3090 a
+            // step's GPU work is 0.6 ms of its 1.05 ms. The bank is 0.6 GB of the slots' VRAM at Q2_0.)
+            if std::env::var("STRAYDOG_DRAFTER_RESIDENT").is_ok_and(|value| value == "1") {
+                self.register_resident_layer(48)?;
+                eprintln!("Straydog MTP layer: its whole bank is pinned (STRAYDOG_DRAFTER_RESIDENT=1)");
+            } else {
+                self.register_hybrid_drafter()?;
+            }
         }
         // The head and its mixing are not decoder-layer operands; keep them resident too.
         let head: Vec<Operand<'static>> = unsafe {
