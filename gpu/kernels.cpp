@@ -909,9 +909,15 @@ __device__ float half_at(const uint8_t* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
 
+// Entry `code` (below 16) of sixteen signed bytes held in four words (byte i of word w is entry 4w + i), picked in registers: a table
+// indexed by a run-time code is built in local memory, and a kernel with such a decoder in it has a stack frame for it.
+__device__ __forceinline__ int table16_s8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, unsigned code) {
+    const uint32_t word = (code & 8) ? ((code & 4) ? w3 : w2) : ((code & 4) ? w1 : w0);
+    return int(int8_t(uint8_t(word >> ((code & 3) * 8))));
+}
 __device__ int nonlinear(unsigned code) {
-    const int values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
-    return values[code];
+    // {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113}
+    return table16_s8(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u, code);
 }
 
 // IQ1/IQ2/IQ3 lattice grids, one byte per value: the gguf reference tables, uploaded to
@@ -1072,8 +1078,9 @@ __device__ float weight(const uint8_t* data, size_t col) {
     if (kind == 39) {   // MXFP4: doubled E2M1 values times 2^(e - 128) (subnormal below e = 2)
         const uint8_t* b = data + (col / 32) * 17;
         const unsigned i = unsigned(col % 32), e = b[0];
-        const int values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-        return float(values[(b[1 + i % 16] >> (4 * (i / 16))) & 15]) * __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        // (values {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12})
+        const int value = table16_s8(0x03020100u, 0x0c080604u, 0xfdfeff00u, 0xf4f8fafcu, (b[1 + i % 16] >> (4 * (i / 16))) & 15);
+        return float(value) * __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
     }
     if (kind == 2 || kind == 6 || kind == 8 || kind == 20) {
         const size_t stride = kind == 6 ? 22 : kind == 8 ? 34 : 18;

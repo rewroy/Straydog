@@ -19,10 +19,10 @@ __global__ void hybrid_combine(const float* outputs, const float* probabilities,
     if (column >= 2560) return;
     outputs += size_t(blockIdx.y) * 11 * 2560; probabilities += size_t(blockIdx.y) * 11; selected += size_t(blockIdx.y) * 10;
     result += size_t(blockIdx.y) * 2560;
-    if (plan.assign) plan.assign += size_t(blockIdx.y) * 10;
+    const ExpertRow row{plan.stage, plan.assign ? plan.assign + size_t(blockIdx.y) * 10 : nullptr};
     float sum = 0;
     for (size_t route = 0; route < 10; ++route)
-        if (expert_source(groups, selected, route, 0, plan)) sum += probabilities[route] * outputs[route * 2560 + column];
+        if (expert_source(groups, selected, route, 0, plan, row)) sum += probabilities[route] * outputs[route * 2560 + column];
     result[column] = sum + probabilities[10] * outputs[10 * 2560 + column];
 }
 // The GPU exports which routes it evaluates, so host decisions always follow the
@@ -625,10 +625,10 @@ __global__ void hybrid_check_outputs(const float* outputs, const float* referenc
     const size_t row = blockIdx.y, column = size_t(blockIdx.x) * 256 + threadIdx.x;
     if (column >= 2560) return;
     selected += row * 10; outputs += row * 11 * 2560; reference += row * 11 * 2560;
-    if (plan.assign) plan.assign += row * 10;
+    const ExpertRow staging{plan.stage, plan.assign ? plan.assign + row * 10 : nullptr};
     int32_t differing = 0;
     for (size_t route = 0; route < 11; ++route)
-        if (route == 10 || expert_source(groups, selected, route, 0, plan))
+        if (route == 10 || expert_source(groups, selected, route, 0, plan, staging))
             differing += __float_as_uint(outputs[route * 2560 + column]) != __float_as_uint(reference[route * 2560 + column]);
     if (differing) atomicAdd(const_cast<int32_t*>(bad), differing);
 }

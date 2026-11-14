@@ -85,12 +85,16 @@ struct ExpertGemv {
     // in either launch, so the sums are those of one launch for all.
     uint32_t only;
 };
+// A row's staging: where its assisted experts are staged (`stage`, after the earlier rows') or its slice of the pass's staging plan
+// (`assign`), each null where the plan has none (expert_row_stage). A value the helpers are passed: the plan itself, a kernel's by-value
+// argument, is never written.
+struct ExpertRow { const uint8_t* stage; const int32_t* assign; };
 // Whether the GPU evaluates `route`: resident, or among the first assisted absent routes.
-// (No array of the plan is read at an index the thread computes, here or in expert_wave: with one such read nvcc keeps the whole plan, a
-// kernel's argument, in every thread's stack and writes it there at the kernel's entry -- 17 stores of local memory before the first branch
-// of resident_expert_gemv_kind, 136 bytes a thread, some 30 MB a launch of a four-row down, as much as the weights it reads.)
+// (No array of the plan is read at an index the thread computes, here or in expert_wave, and the plan is not written: with either nvcc keeps
+// the whole plan, a kernel's argument, in every thread's stack and writes it there at the kernel's entry -- 17 stores of local memory before
+// the first branch of resident_expert_gemv_kind, 136 bytes a thread, some 30 MB a launch of a four-row down, as much as the weights it reads.)
 __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
-                                                        size_t role,const ExpertGemv& plan) {
+                                                        size_t role,const ExpertGemv& plan,const ExpertRow& row) {
     const size_t expert=size_t(selected[route]);
     const uint8_t* data=groups[expert].weights[role].data;
     const uint8_t* mapped=role==0 ? plan.mapped[0] : role==1 ? plan.mapped[1] : plan.mapped[2];
@@ -102,10 +106,10 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
         return data;
     }
     if (plan.only==1 || !plan.assist || !mapped) return nullptr;
-    if (plan.assign) {
-        const int32_t slot=plan.assign[route];
+    if (row.assign) {
+        const int32_t slot=row.assign[route];
         if (slot<0) return nullptr;
-        if (plan.stage) return plan.stage+size_t(slot)*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
+        if (row.stage) return row.stage+size_t(slot)*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
         return mapped+expert*bytes;
     }
     // Balance the PCIe-bound GPU share against the CPU: about 5 of every 12 absent routes.
@@ -116,13 +120,19 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
     }
     const uint32_t share=min(plan.assist,(5*absent+4)/12);
     if (earlier>=share) return nullptr;
-    if (plan.stage) return plan.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
+    if (row.stage) return row.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
     return mapped+expert*bytes;
 }
-// A row's assisted experts stage after the earlier rows' (hybrid_stage_assist).
-__device__ __forceinline__ void expert_row_stage(ExpertGemv& plan) {
-    if (plan.assign) plan.assign+=size_t(blockIdx.y)*10;
-    else if (plan.stage) plan.stage+=size_t(blockIdx.y)*plan.assist*plan.slot_bytes;
+// The plan's own staging, for a caller whose rows are not offset.
+__device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
+                                                        size_t role,const ExpertGemv& plan) {
+    return expert_source(groups,selected,route,role,plan,ExpertRow{plan.stage,plan.assign});
+}
+// A row's assisted experts stage after the earlier rows' (hybrid_stage_assist): the row's staging, the plan's moved to blockIdx.y.
+__device__ __forceinline__ ExpertRow expert_row_stage(const ExpertGemv& plan) {
+    if (plan.assign) return ExpertRow{plan.stage,plan.assign+size_t(blockIdx.y)*10};
+    if (plan.stage) return ExpertRow{plan.stage+size_t(blockIdx.y)*plan.assist*plan.slot_bytes,plan.assign};
+    return ExpertRow{plan.stage,plan.assign};
 }
 // A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
 // (The roles one after another, written out: a loop over them would read the plan's arrays at its counter, see expert_source.)
@@ -144,11 +154,11 @@ __device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGe
 }
 // The wave's matrix (null data: a partially resident expert the host evaluates) at its input and output places.
 __device__ __forceinline__ Matrix expert_matrix(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
-                                                const ExpertGemv& plan,size_t route,size_t role) {
+                                                const ExpertGemv& plan,const ExpertRow& row,size_t route,size_t role) {
     const size_t expert=route<10 ? size_t(selected[route]) : experts;
     Matrix matrix=groups[expert].weights[role];
     if (route<10) {
-        matrix.data=expert_source(groups,selected,route,role,plan);
+        matrix.data=expert_source(groups,selected,route,role,plan,row);
         // An absent route's mapped or staging image is still the host's native layout.
         if (!groups[expert].weights[role].data) matrix.layout=0;
     }
@@ -162,10 +172,10 @@ __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selec
                                      size_t input_stride=0,size_t output_stride=0) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
-    expert_row_stage(plan);
+    const ExpertRow row=expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
-    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,row,route,role);
     if (!matrix.data) return;
     resident_wave<1>(matrix,local,lanes,input,0,output,0);
 }
@@ -182,10 +192,10 @@ __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup*
                                                                  size_t input_stride,size_t output_stride) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
-    expert_row_stage(plan);
+    const ExpertRow row=expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
-    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,row,route,role);
     if (!matrix.data) return;
     const size_t first=local*(32/lanes);
     if (route<10) { resident_rows<routed,1>(matrix,first,lanes,input,0,output,0,{}); return; }
