@@ -37,7 +37,11 @@ __device__ inline uint64_t exchange_clock() {
 // stores reach system scope before the barrier; the count follows the barrier.
 __global__ void exchange_export_kernel(ExchangeExport parts, volatile float* target, uint32_t* count, volatile uint32_t* header) {
     size_t at = 0;
-    for (uint32_t part = 0; part < parts.parts; ++part) {
+    // (the parts at constant indices, the loop unrolled to its most: an index the thread computes into the argument keeps the whole argument in the
+    // thread's stack, written at the kernel's entry)
+    #pragma unroll
+    for (uint32_t part = 0; part < exchange_parts; ++part) {
+        if (part >= parts.parts) break;
         for (size_t i = threadIdx.x; i < parts.counts[part]; i += blockDim.x) target[at + i] = parts.sources[part][i];
         at += parts.counts[part];
     }

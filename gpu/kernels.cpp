@@ -6013,7 +6013,10 @@ __global__ void sum_devices_kernel(DeviceParts list, unsigned devices, size_t co
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
     float sum = link_load(list.parts[0] + index);
-    for (unsigned d = 1; d < devices; ++d) sum += link_load(list.parts[d] + index);
+    // (the devices at constant indices, the loop unrolled to its most, as exchange_export_kernel's parts: no copy of the argument in the stack)
+    #pragma unroll
+    for (unsigned d = 1; d < sum_devices_max; ++d)
+        if (d < devices) sum += link_load(list.parts[d] + index);
     out[index] = sum;
 }
 
@@ -6124,17 +6127,24 @@ __global__ void gather_columns_kernel(DeviceHalves list, unsigned devices, size_
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x, pairs = full / 2;
     if (index >= rows * pairs) return;
     const size_t row = index / pairs, column = (index % pairs) * 2;
-    for (unsigned d = 0; d < devices; ++d) {
-        if (column < list.firsts[d] || column >= list.firsts[d] + share) continue;
-        const uint32_t* at = list.parts[d] + (row * share + column - list.firsts[d]) / 2;
-#if defined(__HIPCC__)
-        out[index] = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#else
-        out[index] = *static_cast<const volatile uint32_t*>(at);
-#endif
-        return;
+    // (the first device whose columns hold this one, its part and first column picked at constant indices, the loop unrolled to its most)
+    const uint32_t* part = nullptr;
+    uint64_t first = 0;
+    bool found = false;
+    #pragma unroll
+    for (unsigned d = 0; d < sum_devices_max; ++d) {
+        const bool take = !found && d < devices && column >= list.firsts[d] && column < list.firsts[d] + share;
+        part = take ? list.parts[d] : part;
+        first = take ? list.firsts[d] : first;
+        found |= take;
     }
-    out[index] = 0;
+    if (!found) { out[index] = 0; return; }
+    const uint32_t* at = part + (row * share + column - first) / 2;
+#if defined(__HIPCC__)
+    out[index] = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    out[index] = *static_cast<const volatile uint32_t*>(at);
+#endif
 }
 
 int sd_op_gather_columns(void* const* handles, void* const* outs, const void* const* parts, const uint64_t* firsts, uint64_t devices,
@@ -6198,12 +6208,19 @@ __global__ void gather_owned_kernel(DeviceColumns list, unsigned devices, unsign
     const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
     const size_t column = index % full;
-    for (unsigned d = 0; d < devices; ++d) {
-        if (column - list.firsts[d] >= share) continue;   // (unsigned: a column before firsts[d] too)
-        out[index] = d == self ? list.parts[d][index] : link_load(list.parts[d] + index);
-        return;
+    // (as gather_columns_kernel: the first device whose columns hold this one, found at constant indices, then read from)
+    const float* part = nullptr;
+    unsigned owner = 0;
+    bool found = false;
+    #pragma unroll
+    for (unsigned d = 0; d < sum_devices_max; ++d) {
+        const bool take = !found && d < devices && column - list.firsts[d] < share;   // (unsigned: a column before firsts[d] too)
+        part = take ? list.parts[d] : part;
+        owner = take ? d : owner;
+        found |= take;
     }
-    out[index] = 0;
+    if (!found) { out[index] = 0; return; }
+    out[index] = owner == self ? part[index] : link_load(part + index);
 }
 
 int sd_op_gather_owned(void* const* handles, float* const* outs, const float* const* parts, const uint64_t* firsts, uint64_t devices,
