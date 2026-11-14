@@ -268,11 +268,8 @@ const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
-/// The most distinct experts a layer's pass may miss for the GPU to take them all (CUDA; [`Model::start_assist`]): none. A staged expert costs
-/// the GPU its copy over the bus, in series (80 to 105 us), where the CPU computes a layer's misses side by side. Measured on the second to
-/// fifth of five equal requests to one server (the first runs the draft width's start and says little): two RTX 4090s, IQ3_S, 148 to 155
-/// tok/s with none against 137 to 151 with two (four and six servers); one RTX 5070 Ti at 10 GiB, IQ2_XS, 84.1 with none, 81.0 with two,
-/// 76.7 with four and 72.2 with eight. STRAYDOG_ASSIST=N still takes N.
+/// CUDA starts with missed routes on the CPU. Its tuner changes this level only after
+/// the same candidate saves at least 3% in two consecutive rounds. STRAYDOG_ASSIST=N holds N instead.
 const CUDA_ASSIST: u32 = 0;
 
 /// The staging slots a wide partial read (batches of [`PRESTAGE_BATCH`] rows and more, on two NVIDIA GPUs) adds for the experts of the layer under
@@ -1123,7 +1120,7 @@ pub struct Model {
     /// STRAYDOG_HC=blas; [`Model::hc_fused_from`] for a test).
     hc_fused_from: usize,
     layer_prefill_restore_failure: Option<String>,
-    /// A failed wait recovery leaves this model unavailable for further generations.
+    /// A failed GPU state restoration leaves this model unavailable for further generations.
     recovery_failure: Option<String>,
     pub host_kv: bool,
     /// The rows of a long read's batches where the workspaces hold more than `prefill_batch_size` (0: they do not, or the batch was given: see
@@ -2029,28 +2026,26 @@ impl Model {
         Ok(WarmFill { pending, slots, held, swapped: self.group.swapped_experts()? })
     }
 
-    /// Let the GPU assist from the page-locked banks, from the most a layer is given at first: the plans mapped (none, and nothing is tuned,
-    /// when no bank is page-locked). Called again as layers are locked, it maps those that are new, at the level in force.
+    /// Let the GPU assist from the page-locked banks: CUDA starts at zero, HIP at the cap, unless a level is held explicitly. The plans mapped
+    /// (none, and nothing is tuned, when no bank is page-locked). Called again as layers are locked, it maps those that are new at the level in force.
     fn start_assist(&mut self) -> Result<u64> {
         let cap = crate::gpu::Backend::assist_cap();
         // On CUDA the level is the most distinct experts a layer's pass may miss for the GPU to take them all over the bus (with more, the CPU
-        // takes them all: staging costs the GPU about 95 us an expert, in series, where the CPU computes a layer's misses in parallel), fixed
-        // at CUDA_ASSIST, untuned: the windows of a round could not tell the levels apart on an RTX 4090 and picked one by noise.
+        // takes them all: staging costs the GPU about 95 us an expert, in series, where the CPU computes a layer's misses in parallel). CUDA
+        // starts at CUDA_ASSIST and requires two consecutive rounds' confirmed 3% saving before adopting another level.
         // STRAYDOG_ASSIST=N holds the level at N on any build (0: every missed route to the CPU; the cap, 8, is the most). A CUDA build's MTP draft
         // layer takes none of it (hybrid_level in gpu/resident_moe.hpp).
         // (STRAYDOG_PIPELINE_ASSIST: the level the pipeline and `freeze` hold, which no tuner chooses there)
         let held = if self.pipeline.frozen_slots() { self.pipeline.assist() } else { None };
         let forced = held.or_else(|| std::env::var("STRAYDOG_ASSIST").ok().and_then(|value| value.parse::<u32>().ok())).map(|value| value.min(cap));
-        // (STRAYDOG_ASSIST=tune: a CUDA build's level is tuned as a HIP build's is, from CUDA_ASSIST. On a slow host a missed route costs the CPU a
-        // millisecond and the level decides a sixth of the speed -- two RTX 3090 on 20 shared vCPUs: 52 to 59 tok/s at 0, 63 to 67 at 4 -- where
-        // an RTX 4090 beside a fast CPU could not tell the levels apart.)
-        let tune = std::env::var("STRAYDOG_ASSIST").is_ok_and(|value| value == "tune");
-        let fixed = forced.or((cfg!(feature = "cuda") && !tune).then_some(CUDA_ASSIST.min(cap)));
+        // STRAYDOG_ASSIST=tune remains the automatic policy, as is an unset value.
+        let fixed = forced;
         let first = fixed.unwrap_or(if cfg!(feature = "cuda") { CUDA_ASSIST.min(cap) } else { cap });
         let level = self.assist.as_ref().map_or(first, assist::Tuner::level);
         let mapped = self.group.enable_assist(level)?;
         if mapped > 0 && self.assist.is_none() {
-            self.assist = Some(assist::Tuner::new(if fixed.is_some() { Vec::new() } else { assist::levels(cap) }, first));
+            let levels = if fixed.is_some() { Vec::new() } else { assist::levels(cap) };
+            self.assist = Some(if cfg!(feature = "cuda") { assist::Tuner::new_cuda(levels, first) } else { assist::Tuner::new(levels, first) });
         }
         self.assist_mapped = mapped;
         Ok(mapped)
@@ -2238,9 +2233,7 @@ impl Model {
         }
         // (what a round measured was of the layers locked then)
         if self.assist_tuning() {
-            if let Some(tuner) = self.assist.as_mut() {
-                tuner.restart();
-            }
+            self.assist_restart()?;
         }
         Ok(mapped)
     }
@@ -3063,9 +3056,7 @@ impl Model {
             self.assist = None;
         } else if self.assist_tuning() {
             // (what a round measured was of the layers locked then)
-            if let Some(tuner) = self.assist.as_mut() {
-                tuner.restart();
-            }
+            self.assist_restart()?;
         }
         eprintln!("{}", crate::banks::give_back_line(&gave));
         self.gave_back.push(gave.clone());
@@ -3281,7 +3272,7 @@ impl Model {
                 hidden = self.group.decode_span(begin, end, &hidden, position)?;
                 self.phase(["step: layers (first device)", "step: layers (second device)"][index.min(1)], &mut clock);
             }
-            self.assist_pass(layers.elapsed().as_secs_f64());
+            self.assist_pass(layers.elapsed().as_secs_f64())?;
             if self.speculative > 0 {
                 // The MTP layer's pair of the row before, its token now known (the longer
                 // prompts' paths write theirs from there too).
@@ -4644,7 +4635,7 @@ impl Model {
             return Err("Straydog verification has no rows".into());
         }
         if tokens.len() == 1 {
-            self.assist_pass(layers.elapsed().as_secs_f64());
+            self.assist_pass(layers.elapsed().as_secs_f64())?;
         }
         Ok((first, embeddings, if chain { None } else { hidden }))
     }
@@ -4726,13 +4717,34 @@ impl Model {
         self.last_metrics.insert(key.into(), json!(value));
     }
 
-    /// Put in force the assist level a round of [`crate::assist`] asks for, or the next best where one cannot be set, and say what a
-    /// round found when it is worth saying.
-    fn assist_apply(&mut self, mut next: Option<u32>) {
-        let Some(tuner) = self.assist.as_mut() else { return };
+    /// Invalidate measurements after the mapped layers change. A CUDA probe must be restored
+    /// on the GPU before the tuner acknowledges the held level.
+    fn assist_restart(&mut self) -> Result<()> {
+        if let Some(tuner) = self.assist.as_mut() {
+            if let Some(level) = tuner.restart() {
+                if let Err(error) = self.group.set_assist_level(level) {
+                    let failure = format!("Straydog assist: could not restore held level {level}: {error}");
+                    self.recovery_failure = Some(failure.clone());
+                    return Err(failure);
+                }
+                tuner.set(level);
+            }
+        }
+        Ok(())
+    }
+
+    /// Put in force the assist level a round of [`crate::assist`] asks for and say what it
+    /// found. CUDA invalidates a failed round and restores its held level; HIP tries the next best.
+    fn assist_apply(&mut self, mut next: Option<u32>) -> Result<()> {
+        let Some(tuner) = self.assist.as_mut() else { return Ok(()) };
         while let Some(level) = next.take() {
             match self.group.set_assist_level(level) {
                 Ok(()) => tuner.set(level),
+                Err(error) if tuner.restoring(level) => {
+                    let failure = format!("Straydog assist: could not restore held level {level}: {error}");
+                    self.recovery_failure = Some(failure.clone());
+                    return Err(failure);
+                }
                 Err(error) => {
                     eprintln!("Straydog assist: level {level} cannot be set ({error}); it is left out");
                     next = tuner.cannot_set(level);
@@ -4742,24 +4754,27 @@ impl Model {
         if let Some(outcome) = tuner.outcome().filter(assist::Outcome::worth_saying) {
             eprintln!("{}", outcome.line());
         }
+        Ok(())
     }
 
     /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
-    fn assist_pass(&mut self, seconds: f64) {
+    fn assist_pass(&mut self, seconds: f64) -> Result<()> {
         // (STRAYDOG_PIPELINE: the assist level and the slots stay as they are, so that two runs are the same arithmetic)
         if self.frozen_now() {
-            return;
+            return Ok(());
         }
         // (a request whose passes the assist's round timed: decode rates of such a request are no other's, its drafts left out)
         if self.assist_probing() {
             self.metric_count("assist_round_passes", 1);
         }
         if self.assist_script.is_some() {
-            return self.assist_scripted(seconds);
+            self.assist_scripted(seconds);
+            return Ok(());
         }
         if let Some(next) = self.assist.as_mut().map(|tuner| tuner.pass(seconds)) {
-            self.assist_apply(next);
+            self.assist_apply(next)?;
         }
+        Ok(())
     }
 
     /// A scripted pass ended: what it assisted, and the next level of the script.
