@@ -485,7 +485,8 @@ __global__ void __launch_bounds__(640) resident_down_q8(const uint8_t* scratch, 
                 const uint32_t codes = odd ? words[i + 1] : gemv_realign(words[i], words[i + 1], 2);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const uint32_t byte = (codes >> (8 * j)) & 255u, spread = (byte * 0x00041041u) & 0x03030303u;
+                    // (the four fields a byte each, by shifts and ORs: a multiplication would carry where the shifted copies overlap)
+                    const uint32_t byte = (codes >> (8 * j)) & 255u, spread = (byte | byte << 6 | byte << 12 | byte << 18) & 0x03030303u;
                     if (i < 2) first = gemv_dot_s8s8(spread, x[unit * 16 + 4 * i + j], first);
                     else second = gemv_dot_s8s8(spread, x[unit * 16 + 4 * i + j], second);
                 }
@@ -508,8 +509,17 @@ __global__ void __launch_bounds__(640) resident_down_q8(const uint8_t* scratch, 
 inline int expert_q8_forced = -1;   // (the benchmark's: a level whatever the environment says)
 inline int expert_q8_level() {
     if (expert_q8_forced >= 0) return expert_q8_forced;
-    const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
-    return p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
+    // (read once: the launches of every layer ask)
+    static const int level = [] {
+        const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
+        return p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
+    }();
+    return level;
+}
+// (development: STRAYDOG_EXPERT_Q8_DOWN=0 leaves the routed down to the F32 kernels, to measure the two stages apart)
+inline bool expert_q8_down_on() {
+    static const bool on = [] { const char* p = std::getenv("STRAYDOG_EXPERT_Q8_DOWN"); return !(p && p[0] == '0' && !p[1]); }();
+    return on;
 }
 // The device's scratch: made with the device (a launch may be recorded into a graph, where nothing can be allocated), for rows of
 // expert_q8_scratch_cols values at the most.
@@ -520,12 +530,16 @@ inline void expert_q8_scratch_make(Device& d) {
         check(hipMalloc(&pointer, expert_q8_scratch_bytes(expert_q8_scratch_cols)));
         d.expert_q8_scratch = static_cast<uint8_t*>(pointer);
     }
-    // (the stream the shared expert's gate and up run on beside the routed ones, resident_expert_launch)
+#if !defined(__HIPCC__)
+    // (the stream the shared expert's gate and up run on beside the routed ones, resident_expert_launch: made here on CUDA, where a launch
+    // may be recorded into a graph. Not on HIP: a stream made this early takes a hardware queue the streams made after it then share
+    // differently, and the kernels on INT8 activations are not a HIP build's)
     if (!d.side_stream) {
         check(hipStreamCreate(&d.side_stream));
         check(hipEventCreateWithFlags(&d.side_fork, hipEventDisableTiming));
         check(hipEventCreateWithFlags(&d.side_join, hipEventDisableTiming));
     }
+#endif
 }
 // Whether the pass's stage is one the kernels above take (the caller's kernel where it is not).
 inline bool resident_gate_up_q8_takes(const Device& d, const ResidentMoe& plan, const float* input, size_t tokens, size_t input_stride) {
@@ -535,7 +549,7 @@ inline bool resident_gate_up_q8_takes(const Device& d, const ResidentMoe& plan, 
     // a lane, and they stay with the F32 kernel)
     return expert_q8_level() && expert_q8_kind(kind) && expert_soa_eligible(kind, gate.rows, gate.cols) && up.kind == kind &&
            gate.rows == up.rows && gate.cols == up.cols && gate.rows == 640 && gate.cols % 256 == 0 && gate.cols / 32 <= 256 &&
-           gate.cols <= expert_q8_scratch_cols && d.expert_q8_scratch && d.side_stream && expert_q8_row_words(gate.cols) <= 4 * 256 &&
+           gate.cols <= expert_q8_scratch_cols && d.expert_q8_scratch && expert_q8_row_words(gate.cols) <= 4 * 256 &&
            expert_q8_shared_bytes(kind, gate.cols, tokens) <= gemv_q8_lds_limit && tokens && tokens <= expert_q8_rows_most &&
            reinterpret_cast<uintptr_t>(input) % 16 == 0 && (input_stride * 4) % 16 == 0;
 }
@@ -579,7 +593,7 @@ inline void resident_gate_up_q8_launch(Device& d, const ResidentMoe& plan, const
 // Whether the pass's down stage is one resident_down_q8 takes: the kinds it reads, the shape, the scratch, and a product it can load aligned.
 inline bool resident_down_q8_takes(const Device& d, const ResidentMoe& plan, const float* product, size_t tokens, size_t product_stride) {
     const Matrix& down = plan.weights[2];
-    return expert_q8_level() && expert_q8_down_kind(down.kind) && down.rows == 2560 && down.cols == expert_q8_down_cols && d.expert_q8_scratch &&
+    return expert_q8_level() && expert_q8_down_on() && expert_q8_down_kind(down.kind) && down.rows == 2560 && down.cols == expert_q8_down_cols && d.expert_q8_scratch &&
            tokens && tokens <= expert_q8_rows_most && reinterpret_cast<uintptr_t>(product) % 16 == 0 && (product_stride * 4) % 16 == 0;
 }
 // Launches it for the pass's rows: every routed down the GPU evaluates, a resident one or a staged one.
