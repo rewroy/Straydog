@@ -30,9 +30,13 @@ static GPUS: Mutex<()> = Mutex::new(());
 const LOCKED: [usize; 4] = [44, 45, 46, 47];
 /// The decode passes a run compares.
 const PASSES: usize = 12;
-/// As in `behind_gpu.rs`: the least relative difference of logits that two runs of one configuration are allowed (which experts the slots hold
-/// at a moment depends on timing, and where a route goes moves a pass's logits by that much).
-const NOISE_FLOOR: f64 = 0.15;
+/// The least relative difference of logits that two runs of one configuration are allowed (which experts the slots hold at a moment depends
+/// on timing, and where a route goes moves a pass's logits by that much). Two runs of one start differed by 0, by 0.05 to 0.08 or by 0.12
+/// to 0.16 on an R9700 (eighteen differences measured, the largest 0.163; of ten of the runs, six had the logits of some earlier run bit
+/// for bit and four for the first eight rows: a route in a slot a pass sooner or later). One pair is measured for the tolerance and can be
+/// a pair that agreed, and the floor is then all there is: 0.15 failed a run whose next request differed by 0.160 from a reference that
+/// had differed by 0 from its twin. A bank read wrongly moves the logits past 1 and parts the tokens at once (`behind_gpu.rs`).
+const NOISE_FLOOR: f64 = 0.30;
 /// The positions the growth is asked for: past the first capacity, within the context.
 const GROWN: usize = 40000;
 
