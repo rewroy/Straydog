@@ -992,6 +992,20 @@ __device__ inline int nonlinear(unsigned code) {
 SD_IQ_GRID_STORAGE SD_ALIGN(16) uint8_t iq_grid2xxs[256 * 8], iq_grid2xs[512 * 8], iq_grid2s[1024 * 8];
 SD_IQ_GRID_STORAGE SD_ALIGN(16) uint8_t iq_grid3xxs[256 * 4], iq_grid3s[512 * 4], iq_grid1s[2048 * 8];
 #undef SD_IQ_GRID_STORAGE
+// The tables are device variables, and the units are not linked as one module: each unit that includes this header has a set of its own, which its
+// kernels read, and fills it with an upload of its own (sd_create calls them all). SD_IQ_GRIDS_UPLOAD(name) defines a unit's: the six tables, in
+// the order sd_create reads them (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_M) with their sizes.
+#define SD_IQ_GRIDS_UPLOAD(name) \
+    void name(const uint8_t* const* grids, const size_t* bytes) { \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid2xxs), grids[0], bytes[0])); \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid2xs), grids[1], bytes[1])); \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid2s), grids[2], bytes[2])); \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid3xxs), grids[3], bytes[3])); \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid3s), grids[4], bytes[4])); \
+        check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid1s), grids[5], bytes[5])); \
+    }
+void iq_grids_upload_gemv_a(const uint8_t* const* grids, const size_t* bytes);
+void iq_grids_upload_gemv_b(const uint8_t* const* grids, const size_t* bytes);
 extern "C" const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 inline std::atomic<bool> iq_uploaded{false};
 __host__ __device__ inline bool iq_kind(int kind) {
