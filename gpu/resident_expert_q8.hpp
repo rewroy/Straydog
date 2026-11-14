@@ -507,24 +507,27 @@ __global__ void __launch_bounds__(640) resident_down_q8(const uint8_t* scratch, 
 // Whether a pass's routed gate and up take the kernels above: STRAYDOG_EXPERT_Q8=1; 2, with every (row, route) reading its expert itself
 // (the sums a row has are the same either way: the measurement of what the sharing saves, and the check that it changes nothing).
 inline int expert_q8_forced = -1;   // (the benchmark's: a level whatever the environment says)
+inline int expert_q8_asked = 0;     // (the environment's level and whether the down is taken, as expert_q8_read_environment found them)
+inline bool expert_q8_down_asked = true;
 inline int expert_q8_level() {
     if (expert_q8_forced >= 0) return expert_q8_forced;
-    // (read once: the launches of every layer ask)
-    static const int level = [] {
-        const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
-        return p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
-    }();
-    return level;
+    return expert_q8_asked;
 }
 // (development: STRAYDOG_EXPERT_Q8_DOWN=0 leaves the routed down to the F32 kernels, to measure the two stages apart)
-inline bool expert_q8_down_on() {
-    static const bool on = [] { const char* p = std::getenv("STRAYDOG_EXPERT_Q8_DOWN"); return !(p && p[0] == '0' && !p[1]); }();
-    return on;
+inline bool expert_q8_down_on() { return expert_q8_down_asked; }
+// The two switches as the environment has them: read when a device's scratch is made (a model's load), not at every layer's launches, and
+// again at the next load (a process that loads a model twice may have changed them between: examples/qwen_floor does).
+inline void expert_q8_read_environment() {
+    const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
+    expert_q8_asked = p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
+    const char* down = std::getenv("STRAYDOG_EXPERT_Q8_DOWN");
+    expert_q8_down_asked = !(down && down[0] == '0' && !down[1]);
 }
 // The device's scratch: made with the device (a launch may be recorded into a graph, where nothing can be allocated), for rows of
 // expert_q8_scratch_cols values at the most.
 constexpr size_t expert_q8_scratch_cols = 2560;
 inline void expert_q8_scratch_make(Device& d) {
+    expert_q8_read_environment();
     if (!d.expert_q8_scratch) {
         void* pointer = nullptr;
         check(hipMalloc(&pointer, expert_q8_scratch_bytes(expert_q8_scratch_cols)));
