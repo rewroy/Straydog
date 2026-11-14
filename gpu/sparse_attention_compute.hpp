@@ -413,7 +413,7 @@ __global__ void __launch_bounds__(256) qsa_flash_wide(unsigned kv_row,const kv_t
     #pragma unroll
     for (size_t h=0;h<12;++h) output[(token*H::query+kv*12+h)*256+t]=accumulator[h]/running[12+h];
 }
-// The prompt's QSA attention on tensor cores (qsa_flash_mma, STRAYDOG_QSA_MMA=1, Q8_0 K/V): qsa_flash_wide's attention with FP16 operands in
+// The prompt's QSA attention on tensor cores (qsa_flash_mma, Q8_0 K/V, from sm_80; STRAYDOG_QSA_MMA=0 keeps qsa_flash_wide): its attention with FP16 operands in
 // mma.sync m16n8k16 and F32 accumulation, softmax and merge, the numeric form of the RDNA4 kernel (qsa_prompt_attention), not qsa_flash_wide's
 // bits. A block is a token and a K/V head; each of its 4 warps takes every 4th tile of 16 selected keys, all 256 dimensions, with its own
 // online softmax, and the warps merge at the end in warp order (the result does not depend on timing). The twelve query heads are the M = 16
@@ -584,14 +584,14 @@ __global__ void __launch_bounds__(128) qsa_flash_mma(unsigned kv_row, const kv_t
 }
 #endif
 // qsa_flash over `grid` (a block a token and K/V head): qsa_flash_wide on CUDA for the two K/V formats, qsa_flash where it is not compiled;
-// over Q8_0 rows qsa_flash_mma when STRAYDOG_QSA_MMA=1 (development; read once per Device). Only a prompt's batches come here: decode and
+// over Q8_0 rows qsa_flash_mma from sm_80 unless STRAYDOG_QSA_MMA=0 (read once per Device). Only a prompt's batches come here: decode and
 // verification passes attend through qsa_decode_parts (qsa_attention_rows).
 template<int P=1>
 void qsa_flash_launch(Device& d,dim3 grid,const kv_t* state,size_t context,size_t base,size_t steps,size_t selected,const float* input,
                       float* output,size_t first_token=0) {
 #if !defined(__HIPCC__)
     if (d.kv_row==kv_row_q8) {
-        if (d.qsa_mma<0) { const char* mode=std::getenv("STRAYDOG_QSA_MMA"); d.qsa_mma=mode && std::string(mode)=="1" ? 1 : 0; }
+        if (d.qsa_mma<0) { const char* mode=std::getenv("STRAYDOG_QSA_MMA"); d.qsa_mma=mode && std::string(mode)=="0" ? 0 : 1; }
         if (d.qsa_mma && d.mma_f16) {
             qsa_flash_mma<P><<<grid,128,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
             return;

@@ -9,8 +9,8 @@
 //! A floor may end in @f32 or @q8 (after a q): that run takes the GPU projections on the F32 kernels (STRAYDOG_Q8=0) or the Q8 kernels
 //! (INT8 activations), whatever the environment says. `0.04@f32,0.04@q8` is the KL of the Q8 kernels against the F32 ones, at one floor.
 //! @e0, @e1 and @e2 set the routed experts' gate and up the same way (STRAYDOG_EXPERT_Q8 unset, 1, 2).
-//! @mma sets STRAYDOG_QSA_MMA=1 (the prompt's sparse attention on tensor cores); a run without it has the variable removed, so `0,0@mma` is
-//! the KL of that kernel against the default one.
+//! @mma leaves the prompt's sparse attention on tensor cores (a CUDA build's default from sm_80); a run without it sets STRAYDOG_QSA_MMA=0
+//! (the F32 kernel), so `0,0@mma` is the KL of the tensor-core kernel against the F32 one.
 //!
 //! QWEN_FLOOR_PROMPT_FILE and QWEN_FLOOR_PROMPT_TOKENS (a comma list such as 8192,32768): the prompts are the file's first N tokens each
 //! instead of the six short ones (the context grows to hold the longest and its continuation).
@@ -40,14 +40,14 @@ fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floo
     let (floor, int8) = floor.strip_suffix('q').map_or((floor, "0"), |floor| (floor, "1"));
     std::env::set_var("STRAYDOG_EXPERT_FLOOR", floor);
     std::env::set_var("STRAYDOG_CPU_INT8", int8);
-    std::env::remove_var("STRAYDOG_QSA_MMA");
+    std::env::set_var("STRAYDOG_QSA_MMA", "0");
     match mode {
         Some("f32") => std::env::set_var("STRAYDOG_Q8", "0"),
         Some("q8") => std::env::remove_var("STRAYDOG_Q8"),
         Some("e0") => std::env::remove_var("STRAYDOG_EXPERT_Q8"),
         Some("e1") => std::env::set_var("STRAYDOG_EXPERT_Q8", "1"),
         Some("e2") => std::env::set_var("STRAYDOG_EXPERT_Q8", "2"),
-        Some("mma") => std::env::set_var("STRAYDOG_QSA_MMA", "1"),
+        Some("mma") => std::env::remove_var("STRAYDOG_QSA_MMA"),
         Some(other) => return Err(format!("no mode {other}: @f32, @q8, @e0, @e1, @e2 or @mma")),
         None => {}
     }
