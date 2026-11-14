@@ -1164,9 +1164,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   Numerics: the same FP16 keys, values, queries and probabilities as RDNA4's, with F32 softmax and sums, so not
   `qsa_flash_wide`'s bits.
   - A layer's output against the F32 kernel's: RMS 2.7-3.2e-4, the worst head's row 4.0-4.8e-4, FP16's rounding.
-  - The first logits after 8192- and 32768-token prompts (GSQ IQ2_XS, RTX 5070 Ti) against the F32 kernel: KL 0.0008-0.0020 on
-    average and 0.012-0.038 at the most, where two runs of the F32 kernel differ by 0.0012 and 0.043. The first token was the
-    same in every run.
+  - The first logits after 8192- and 32768-token prompts (GSQ IQ2_XS, RTX 5070 Ti, the prefill example, each kernel in a process of
+    its own) against the F32 kernel: KL 1.27e-3 and 2.16e-3, the largest logit difference 0.58 and 0.83, the same first token. Two
+    runs of either kernel are bit for bit the same.
+  - The FP16 operands widen what reaches them a few F32 bits apart. The chunked DeltaNet scan's first logits against the token scan's
+    (3001 tokens, UD-IQ1_S, one GPU) are KL 1.73e-3 apart under this kernel and 8.6e-4 under the F32 one, while the token scan under
+    the two kernels differs by 2.8e-5 (tests/chunked_scan_gpu.rs holds the first to four times the second).
+  - On Windows the switch must be set before the process starts. A Rust `std::env::set_var` inside the process does not reach the
+    engine's `std::getenv` (the C runtime reads its own copy of the environment), and an earlier measurement that flipped it in the
+    process compared the kernel with itself.
 
   Why the F32 kernel was slow: it ran F32 SIMT at 10-11 TFLOP/s on an RTX 5070 Ti, with 128 registers (two blocks an SM) and
   three block barriers per 64 keys. With its reads and its products both left out it still took 2.45 ms of 10.1.
