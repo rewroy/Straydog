@@ -69,6 +69,9 @@ int sd_host_free(int ordinal, void* pointer);
 int sd_test_refuse_host(uint64_t count);
 /* Development: fail the next `count` checked hybrid waits with a software timeout; 0 ends it. */
 int sd_test_hybrid_timeout(uint64_t count);
+/* Development: the text a failed GPU call with `code` carries when the runtime answers NULL (runtime_null != 0) or text of its own, copied into
+   `out` (NUL-terminated, cut to `capacity`); its length, or -1 for a bad buffer. Touches no device and no driver. */
+int sd_test_gpu_error_text(int code, int runtime_null, char* out, size_t capacity);
 /* Development: on a fresh device, exercise an expired hybrid wait, recovery and a subsequent successful handshake. */
 int sd_hybrid_wait_check(void* handle);
 /* Development (tests/router_gpu.rs): a partially resident layer's router (`experts` rows of 2560 values of kind 30 or 0, and a one-row gate) run
