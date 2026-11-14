@@ -22,7 +22,9 @@
 //! draft only at none), a few percent of all passes ([`PROBE_SHARE`]), the widths never probed first and none before the
 //! [`FIRST_PROBE_AFTER`]th pass (a machine's first passes are slow while its memory fills). A probe is a stretch of passes at the width
 //! asked for with the cut in force as in any: what it measures is what that width does, and every stretch feeds the shares that the widths
-//! up to it have in common. A width replaces the one in force only if it is [`MARGIN`] faster and the difference is more than
+//! up to it have in common. A probe whose width looks [`MARGIN`] faster than the one in force when its stretch ends, without the windows
+//! telling the two apart, goes on to [`PROBE_LONG`] passes and is judged then (the probe after it waits as much longer). A width replaces
+//! the one in force only if it is [`MARGIN`] faster and the difference is more than
 //! [`CONFIDENCE`] standard errors of it, as the assist level's tuner has it (`crate::assist`): passes vary by a quarter from one to the next,
 //! and a width not told apart from the one in force by its windows never replaces it.
 //!
@@ -39,13 +41,19 @@ pub const MARGIN: f64 = 0.03;
 /// model runs: at two, a run of equal widths moved on noise in one decision of twenty.
 pub const CONFIDENCE: f64 = 2.5;
 /// Passes a cost window holds, by rows; and the outcomes a share's window holds, by position.
-pub const COST_WINDOW: usize = 64;
+pub const COST_WINDOW: usize = 128;
 pub const SHARE_WINDOW: usize = 128;
 /// The fewest passes (or offers) a window must hold to be believed.
 pub const LEAST_SAMPLES: usize = 8;
 /// Passes of a probe, and the share of all passes the probes may take.
 pub const PROBE_PASSES: usize = 24;
 pub const PROBE_SHARE: f64 = 0.03;
+/// The passes of a probe that goes on: one whose width, after [`PROBE_PASSES`], looks [`MARGIN`] faster than the one in force without its
+/// windows telling the two apart is timed to this many, a share's window, and judged then, once (not as soon as the windows agree: a stretch
+/// ended at the first pass that looks sure is sure too often). Each probe starts its width's windows afresh, so a gain of a tenth that two
+/// dozen passes cannot tell apart was never found by the probes that came after: on two RTX 4090s three of eight servers stayed at one
+/// draft where three took a tenth less. The probe after a long one waits as much longer ([`gap_after`]): probes keep their share.
+pub const PROBE_LONG: usize = SHARE_WINDOW;
 /// The passes after which the first probe may begin: a request that ends sooner is run as the width in force asks, and what a machine's
 /// first passes cost (its memory still filling with the model's experts) is not what it costs.
 pub const FIRST_PROBE_AFTER: u64 = 256;
@@ -58,7 +66,12 @@ const FEW_DOUBT: f64 = 0.15;
 /// Normal passes between the end of a probe and the start of the next, so that probes (the pass at the start of a stretch, which is not
 /// timed, included) take [`PROBE_SHARE`] of the passes.
 pub fn probe_gap() -> u64 {
-    ((PROBE_PASSES + 1) as f64 * (1.0 - PROBE_SHARE) / PROBE_SHARE).ceil() as u64
+    gap_after(PROBE_PASSES)
+}
+
+/// The normal passes after a probe of `taken` timed passes, for probes to take [`PROBE_SHARE`] of all.
+pub fn gap_after(taken: usize) -> u64 {
+    ((taken + 1) as f64 * (1.0 - PROBE_SHARE) / PROBE_SHARE).ceil() as u64
 }
 
 /// The latest `capacity` values of something measured.
@@ -191,6 +204,8 @@ struct Probe {
     skip: usize,
     /// Passes timed so far.
     taken: usize,
+    /// Passes it is timed for: [`PROBE_PASSES`], or [`PROBE_LONG`] once it goes on.
+    until: usize,
 }
 
 /// The width in force and the windows that choose it.
@@ -211,6 +226,8 @@ pub struct Chooser {
     passes: u64,
     probe_passes: u64,
     last_probe: u64,
+    /// Normal passes before the next probe: [`gap_after`] the last one's passes.
+    gap: u64,
     probe: Option<Probe>,
     /// Widths a probe has been at, and the one the last was.
     probed: Vec<bool>,
@@ -263,6 +280,7 @@ impl Chooser {
             passes: 0,
             probe_passes: 0,
             last_probe: 0,
+            gap: probe_gap(),
             probe: None,
             probed: vec![false; most + 1],
             cursor: 0,
@@ -389,7 +407,7 @@ impl Chooser {
         if let Some(&width) = wanted.iter().find(|&&width| !self.probed[width]) {
             return Some(width);
         }
-        if self.passes.saturating_sub(self.last_probe) < probe_gap() {
+        if self.passes.saturating_sub(self.last_probe) < self.gap {
             return None;
         }
         wanted.iter().copied().find(|&width| width > self.cursor).or_else(|| wanted.first().copied())
@@ -416,7 +434,7 @@ impl Chooser {
                         self.kept[width - 1].clear();
                     }
                 }
-                self.probe = Some(Probe { width, skip: 1, taken: 0 });
+                self.probe = Some(Probe { width, skip: 1, taken: 0, until: PROBE_PASSES });
                 return Plan { drafts: width, probe: true };
             }
         }
@@ -459,12 +477,26 @@ impl Chooser {
                 probe.taken += 1;
             }
         }
-        let probe = self.probe.filter(|probe| probing && probe.taken >= PROBE_PASSES)?;
+        let probe = self.probe.filter(|probe| probing && probe.taken >= probe.until)?;
+        if probe.until < PROBE_LONG && self.undecided(probe.width) {
+            if let Some(probe) = self.probe.as_mut() {
+                probe.until = PROBE_LONG;
+            }
+            return None;
+        }
+        self.gap = gap_after(probe.taken);
         self.probe = None;
         self.probed[probe.width] = true;
         self.cursor = probe.width;
         self.last_probe = self.passes;
         self.decide()
+    }
+
+    /// Whether `width` looks [`MARGIN`] faster than the width in force while the windows do not tell the two apart ([`choose`] would keep the
+    /// width in force for want of [`CONFIDENCE`] alone): more passes at it would say.
+    fn undecided(&self, width: usize) -> bool {
+        let (Some(held), Some(other)) = (self.estimate(self.drafts), self.estimate(width)) else { return false };
+        other.seconds <= held.seconds * (1.0 - MARGIN) && held.seconds - other.seconds <= CONFIDENCE * held.error.hypot(other.error)
     }
 
     /// The width in force after what the windows hold, once every width a probe is of use at has been probed.
@@ -620,6 +652,33 @@ mod tests {
     /// A machine where drafts are wasted: a row costs as much as the token it adds, and drafts are kept half the time.
     fn drafts_wasted() -> Machine {
         Machine::new(30.0, [31.0, 62.0, 93.0, 124.0], [0.5, 0.5, 0.5])
+    }
+
+    /// A machine as two RTX 4090s were with a model they hold in part (Qwen3.8 IQ3_S, 2026-11-13): a row costs four to five ms on eleven for the
+    /// first, and three drafts take a tenth less a token than one.
+    fn rows_cheap() -> Machine {
+        Machine::new(10.2, [11.0, 14.5, 19.3, 22.6], [0.93, 0.86, 0.80])
+    }
+
+    /// Where three drafts take a tenth less than the one in force, the chooser leaves one draft at its first round of probes nearly always
+    /// (passes varying by a quarter, the drafts kept as their chances draw), and always by the probes after it. With probes of
+    /// [`PROBE_PASSES`] alone and cost windows of 64 passes, 6 of these 24 runs were still at one draft after 2000 passes, and stayed.
+    #[test]
+    fn a_tenth_is_found_from_one_draft() {
+        let truth = rows_cheap().truth();
+        assert!(truth[3] < truth[1] * 0.91 && truth[3] < truth[2], "{truth:?}");
+        for (passes, most_stuck) in [(2000, 2), (16000, 0)] {
+            let mut ends = Vec::new();
+            for seed in 0..24 {
+                let mut machine = rows_cheap().noisy(0.25, seed);
+                let mut chooser = Chooser::new(3, 1);
+                let run = run(&mut chooser, &mut machine, passes);
+                no_change_loses(&run, &machine);
+                ends.push(run.drafts);
+            }
+            let stuck = ends.iter().filter(|&&drafts| drafts == 1).count();
+            assert!(stuck <= most_stuck, "{stuck} of 24 runs still at one draft after {passes} passes: {ends:?}");
+        }
     }
 
     #[test]
@@ -779,8 +838,9 @@ mod tests {
         }
         assert!(first.unwrap() >= FIRST_PROBE_AFTER, "the first probe at pass {first:?}");
         let (passes, probes) = chooser.passes();
-        // (the first round probes the three widths there are to probe at once; after it the share is the one asked for)
-        let first_round = 3 * (PROBE_PASSES as u64 + 1);
+        // (the first round probes the three widths there are to probe at once, each for as long as a probe that goes on; after it the share
+        // is the one asked for)
+        let first_round = 3 * (PROBE_LONG as u64 + 1);
         assert!(probes as f64 <= PROBE_SHARE * passes as f64 + first_round as f64, "{probes} probe passes of {passes}");
         assert!(probes as f64 >= 0.5 * PROBE_SHARE * passes as f64, "{probes} probe passes of {passes}: the widths are no longer timed");
     }

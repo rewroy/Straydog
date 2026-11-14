@@ -1789,10 +1789,11 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let message = message.into();
     // A void pass leaves the devices sound: the request fails and the engine resets, so the next
     // request restores from the checkpoints instead of waiting for a server restart. So does a
-    // K/V that found no memory to grow into: only sequences that long are refused. Nor does a copy of the conversation's state that found none.
+    // K/V that found no memory (host or VRAM) to grow into: only sequences that long are refused. Nor does a copy of the conversation's state that found none.
     // Nor does a prompt found too long before anything ran.
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
+        && !message.ends_with(straydog_engine::model::KV_NO_VRAM)
         && !message.ends_with(straydog_engine::model::VRAM_NO_MEMORY)
         && !message.ends_with(straydog_engine::gpu::HOST_NO_MEMORY)
         && !message.ends_with(straydog_engine::gpu::HYBRID_WAIT_RECOVERED)
@@ -2496,6 +2497,7 @@ mod tests {
         assert!(engine_failed("an illegal memory access was encountered", "site").fatal);
         // (a K/V that found no memory to grow into, and a copy of the conversation that found none: the devices are sound)
         assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_MEMORY), "site").fatal);
+        assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_VRAM), "site").fatal);
         assert!(!engine_failed(format!("GPU 0 could not reduce its budget; {}", straydog_engine::model::VRAM_NO_MEMORY), "site").fatal);
         assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HOST_NO_MEMORY), "site").fatal);
         assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HYBRID_WAIT_RECOVERED), "site").fatal);

@@ -539,7 +539,7 @@ fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
-     "Straydog row proofs:"]
+     "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:"]
         .iter().any(|start| line.starts_with(start))
 }
 

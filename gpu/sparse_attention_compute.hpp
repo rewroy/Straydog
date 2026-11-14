@@ -277,13 +277,166 @@ __global__ void __launch_bounds__(256) qsa_flash(unsigned kv_row,const kv_t* sta
     #pragma unroll
     for (size_t h=0;h<12;++h) output[(token*H::query+kv*12+h)*256+t]=accumulator[h]/running[12+h];
 }
+#if !defined(__HIPCC__)
+// qsa_flash with the K/V format known when compiling and each lane's 32 key values read as 16-byte pieces (kv_load32) where the scores took
+// them a value at a time: a warp's lanes read 32 different rows, so each scalar load was a request to 32 cache lines (L1 serves a line a
+// cycle). The arithmetic is qsa_flash's, value for value and in the same order, so the outputs are its bits (random selections over 20K
+// positions, 256 tokens, 0 of 1.5 M outputs differ): on an RTX 4090 256 tokens' attention takes 0.98 ms over Q8_0 rows (1.52) and 0.65 over
+// FP16 rows (1.43).
+template<bool Q8>
+__device__ __forceinline__ void kv_load32c(const kv_t* row, size_t first, float* out) {
+    if constexpr (!Q8) {
+        const uint4* words = reinterpret_cast<const uint4*>(row + first * 2);
+        #pragma unroll
+        for (size_t d = 0; d < 4; ++d) kv_unpack8(words[d], out + 8 * d);
+    } else {
+        const uint4* words = reinterpret_cast<const uint4*>(row + first);
+        const float scale = kv_scale(row, first);
+        #pragma unroll
+        for (size_t w = 0; w < 2; ++w) {
+            const uint4 word = words[w];
+            const uint32_t parts[4] = {word.x, word.y, word.z, word.w};
+            #pragma unroll
+            for (size_t p = 0; p < 4; ++p)
+                #pragma unroll
+                for (size_t b = 0; b < 4; ++b) out[w * 16 + p * 4 + b] = float(int8_t(parts[p] >> (8 * b))) * scale;
+        }
+    }
+}
+template<bool Q8>
+__device__ __forceinline__ float kv_loadc(const kv_t* row, size_t column) {
+    if constexpr (Q8) return float(reinterpret_cast<const int8_t*>(row)[column]) * kv_scale(row, column);
+    else return __half2float(reinterpret_cast<const __half*>(row)[column]);
+}
+template<int P=1,bool Q8=true>
+__global__ void __launch_bounds__(256) qsa_flash_wide(unsigned kv_row,const kv_t* state,size_t context,size_t base,size_t steps,
+                                                 size_t selected,const float* input,float* output,size_t first_token=0) {
+    using H=QwenHeads<P>;
+    const size_t token=first_token+blockIdx.x,kv=blockIdx.y,t=threadIdx.x,lane=t%32,wave=t/32;
+    const size_t index_start=steps*H::packed;
+    const size_t count=size_t(input[index_start+steps*selected+token]);
+    const size_t limit=base+token;
+    __shared__ SD_ALIGN(16) float query[12*256];
+    __shared__ SD_ALIGN(16) float sums[8*12*qsa_flash_chunk];
+    __shared__ SD_ALIGN(16) float probabilities[12*qsa_flash_chunk];
+    __shared__ float rescale[12],running[2*12];
+    __shared__ int tokens[qsa_flash_chunk];
+    for (size_t i=t;i<12*256;i+=256) query[i]=input[(token*H::query+kv*12)*256+i];
+    if (t<12) { running[t]=-INFINITY; running[12+t]=0; }
+    float accumulator[12]={};
+    const kv_t* keys_base=state+kv*context*kv_row;
+    const kv_t* values_base=state+(H::kv+kv)*context*kv_row;
+    for (size_t first=0;first<count;first+=qsa_flash_chunk) {
+        if (t<qsa_flash_chunk) {
+            const size_t slot=first+t;
+            int index=-1;
+            if (slot<count && slot<selected) {
+                const float raw=input[index_start+token*selected+slot];
+                if (raw>=0 && raw<=float(limit) && raw<float(context)) index=int(raw);
+            }
+            tokens[t]=index;
+        }
+        __syncthreads();
+        // Scores: each lane owns two keys, each wave 32 of the 256 dimensions.
+        {
+            const int key0=tokens[lane],key1=tokens[32+lane];
+            float p0[12]={},p1[12]={};
+            const kv_t* k0=keys_base+size_t(key0<0 ? 0 : key0)*kv_row;
+            const kv_t* k1=keys_base+size_t(key1<0 ? 0 : key1)*kv_row;
+            float ka[32],kb[32];
+            kv_load32c<Q8>(k0,wave*32,ka);
+            kv_load32c<Q8>(k1,wave*32,kb);
+            #pragma unroll
+            for (size_t d=0;d<32;d+=4) {
+                const float a[4]={ka[d],ka[d+1],ka[d+2],ka[d+3]};
+                const float b[4]={kb[d],kb[d+1],kb[d+2],kb[d+3]};
+                #pragma unroll
+                for (size_t h=0;h<12;++h) {
+                    const float4 q=*reinterpret_cast<const float4*>(&query[h*256+wave*32+d]);
+                    p0[h]=fmaf(a[0],q.x,fmaf(a[1],q.y,fmaf(a[2],q.z,fmaf(a[3],q.w,p0[h]))));
+                    p1[h]=fmaf(b[0],q.x,fmaf(b[1],q.y,fmaf(b[2],q.z,fmaf(b[3],q.w,p1[h]))));
+                }
+            }
+            #pragma unroll
+            for (size_t h=0;h<12;++h) {
+                sums[(wave*12+h)*qsa_flash_chunk+lane]=p0[h];
+                sums[(wave*12+h)*qsa_flash_chunk+32+lane]=p1[h];
+            }
+        }
+        __syncthreads();
+        for (size_t h=wave;h<12;h+=8) {
+            float s0=-INFINITY,s1=-INFINITY;
+            if (tokens[lane]>=0) {
+                s0=0;
+                #pragma unroll
+                for (size_t part=0;part<8;++part) s0+=sums[(part*12+h)*qsa_flash_chunk+lane];
+                s0*=0.0625f;
+            }
+            if (tokens[32+lane]>=0) {
+                s1=0;
+                #pragma unroll
+                for (size_t part=0;part<8;++part) s1+=sums[(part*12+h)*qsa_flash_chunk+32+lane];
+                s1*=0.0625f;
+            }
+            float maximum=fmaxf(s0,s1);
+            for (unsigned offset=16;offset;offset/=2) maximum=fmaxf(maximum,__shfl_xor(maximum,offset,32));
+            const float previous=running[h], updated=fmaxf(previous,maximum);
+            const float e0=s0==-INFINITY ? 0.0f : expf(s0-updated), e1=s1==-INFINITY ? 0.0f : expf(s1-updated);
+            float total=e0+e1;
+            for (unsigned offset=16;offset;offset/=2) total+=__shfl_xor(total,offset,32);
+            probabilities[h*qsa_flash_chunk+lane]=e0; probabilities[h*qsa_flash_chunk+32+lane]=e1;
+            if (lane==0) {
+                const float scale=previous==-INFINITY ? 0.0f : expf(previous-updated);
+                rescale[h]=scale; running[h]=updated; running[12+h]=running[12+h]*scale+total;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (size_t h=0;h<12;++h) accumulator[h]*=rescale[h];
+        // A prvalue: std::min binds references, and CUDA device code cannot ODR-use the host constant.
+        const size_t valid=std::min(size_t(qsa_flash_chunk),count-first);
+        for (size_t key=0;key<valid;key+=4) {
+            float v[4];
+            #pragma unroll
+            for (int j=0;j<4;++j) {
+                const int index=tokens[key+j];
+                v[j]=index<0 ? 0.0f : kv_loadc<Q8>(values_base+size_t(index)*kv_row,t);
+            }
+            #pragma unroll
+            for (size_t h=0;h<12;++h) {
+                const float4 p=*reinterpret_cast<const float4*>(&probabilities[h*qsa_flash_chunk+key]);
+                accumulator[h]=fmaf(p.x,v[0],fmaf(p.y,v[1],fmaf(p.z,v[2],fmaf(p.w,v[3],accumulator[h]))));
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (size_t h=0;h<12;++h) output[(token*H::query+kv*12+h)*256+t]=accumulator[h]/running[12+h];
+}
+#endif
+// qsa_flash over `grid` (a block a token and K/V head): qsa_flash_wide on CUDA for the two K/V formats, qsa_flash where it is not compiled.
+template<int P=1>
+void qsa_flash_launch(Device& d,dim3 grid,const kv_t* state,size_t context,size_t base,size_t steps,size_t selected,const float* input,
+                      float* output,size_t first_token=0) {
+#if !defined(__HIPCC__)
+    if (d.kv_row==kv_row_q8) {
+        qsa_flash_wide<P,true><<<grid,256,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
+        return;
+    }
+    if (d.kv_row==kv_row_f16) {
+        qsa_flash_wide<P,false><<<grid,256,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
+        return;
+    }
+#endif
+    qsa_flash<P><<<grid,256,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
+}
 template<int P=1>
 void qsa_attention(Device& d,void* kv,size_t context,size_t base,size_t steps,size_t selected,
                     const float* input,float* output,const uint32_t* position=nullptr,
                     const kv_t* mirror=nullptr,size_t mirror_rows=0) {
     using H=QwenHeads<P>;
     if (steps>1) {
-        qsa_flash<P><<<dim3(unsigned(steps),unsigned(H::kv)),256,0,d.stream>>>(d.kv_row,static_cast<const kv_t*>(kv),context,base,steps,selected,input,output);
+        qsa_flash_launch<P>(d,dim3(unsigned(steps),unsigned(H::kv)),static_cast<const kv_t*>(kv),context,base,steps,selected,input,output);
         return;
     }
     const size_t chunks=(selected+qsa_decode_chunk-1)/qsa_decode_chunk;

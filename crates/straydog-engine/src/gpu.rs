@@ -592,6 +592,45 @@ impl Backend {
         Ok(backend)
     }
 
+    /// A backend with no device behind it (a null handle), to stand where the device has been lent to another thread by value: every call on it
+    /// that reaches the native side is refused there ("null Straydog device"), so that none can touch the real device from this one.
+    pub fn vacant(ordinal: usize) -> Backend {
+        Backend {
+            handle: std::ptr::null_mut(),
+            ordinal,
+            cache: HashMap::new(),
+            resident: HashSet::new(),
+            plans: HashMap::new(),
+            helper_plans: HashMap::new(),
+            decoder_layers: HashSet::new(),
+            states: IndexMap::new(),
+            checkpoints: Vec::new(),
+            checkpoint_states: Vec::new(),
+            checkpoint_bytes: 0,
+            prefill_capacity: 1024,
+            slot_bytes: 0,
+            slot_stage: 0,
+            slot_mirror: true,
+            slots_absent: false,
+            slot_margin: 0,
+            long_prefill: None,
+            layer_prefill_pool: None,
+            layer_rows: None,
+            slot_size: 0,
+            registered: Vec::new(),
+            batch_capacity: 32,
+            logical_capacity: 1024,
+            output_capacity: 262144,
+            keeps_mtp_rows: false,
+            expert_parallel: false,
+            parts: 1,
+            part: 0,
+            mtp_parts: false,
+            pending_host: Vec::new(),
+            deferred: None,
+        }
+    }
+
     pub fn handle(&self) -> *mut c_void {
         self.handle
     }
@@ -880,6 +919,13 @@ impl Backend {
         self.deferred.take().unwrap_or_default()
     }
 
+    /// Finalize resident expert layouts after the verified load filled every weight allocation.
+    pub fn experts_finalize(&mut self) -> Result<()> {
+        // SAFETY: the caller owns this backend between placement and its first inference;
+        // deferred fillers have returned, and the native boundary checks stream completion.
+        check(unsafe { ffi::sd_experts_finalize(self.handle) }).map(drop)
+    }
+
     /// A filler for one thread's copies into pending uploads.
     pub fn filler(&self) -> Result<Filler<'_>> {
         // SAFETY: a live handle.
@@ -1052,32 +1098,42 @@ impl Backend {
         Ok(())
     }
 
-    /// Plan the host K/V for `capacity` positions of the context reserved (its indexers keep their whole allocation):
-    /// [`Backend::grow_kv`] adds the rest as a sequence reaches it.
+    /// Plan the K/V for `capacity` positions of the context reserved (its indexers keep their whole allocation): the host K/V of a layer that is
+    /// not placed yet, and the VRAM K/V of a layer that was, which is allocated again at that size ([`Backend::grow_kv`] adds the rest as a
+    /// sequence reaches it, and the expert slots, made after this, take the VRAM the context's rest would have held).
     pub fn start_kv(&mut self, capacity: u64) -> Result<()> {
         for (_, rows, _) in &mut self.pending_host {
             *rows = capacity * 4;
         }
         // The indexers start at that size too: on a small budget what they would hold for the whole context is a third of the slots.
-        let indexers: Vec<(String, *mut std::ffi::c_void)> = self.states.iter()
-            .filter(|(key, _)| key.starts_with("@indexer:") || *key == "@scratch:qsa")
+        let resized: Vec<(String, *mut std::ffi::c_void)> = self.states.iter()
+            // (a K/V state is in VRAM if the cache has it: a host state is planned in `pending_host` and never cached)
+            .filter(|(key, _)| key.starts_with("@indexer:") || (key.starts_with("@qsa:") && self.cache.contains_key(key.as_str())) || *key == "@scratch:qsa")
             .map(|(key, entry)| (key.clone(), entry.pointer))
             .collect();
-        for (key, pointer) in indexers {
+        for (key, pointer) in resized {
             // (in its place: a sequence's parts are read and restored in this order)
             let at = self.states.get_index_of(&key).ok_or("no such Straydog state")?;
             self.states.shift_remove(&key);
             self.cache.remove(&key);
             // SAFETY: an allocation of this device; no plan holds it yet.
             check(unsafe { ffi::sd_release(self.handle, pointer) })?;
-            let rows = if key == "@scratch:qsa" { 256 * (capacity / 4 + 1) } else { (capacity / 4 + 1) * 128 + INDEX_HISTORY };
-            self.state(&key, rows, 1, false)?;
+            let (rows, cols) = if key == "@scratch:qsa" {
+                (256 * (capacity / 4 + 1), 1)
+            } else if key.starts_with("@qsa:") {
+                // (a layer in VRAM: whole layers only, four planes; a part's two are for fully resident layers, which never start small)
+                (capacity * 4, kv_row_floats())
+            } else {
+                ((capacity / 4 + 1) * 128 + INDEX_HISTORY, 1)
+            };
+            self.state(&key, rows, cols, false)?;
             self.states.move_index(self.states.len() - 1, at);
         }
         Ok(())
     }
 
-    /// Every layer's host K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`).
+    /// Every layer's K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`), where the K/V is: in host memory or in VRAM. The
+    /// slots give up the VRAM and take what is left after, so a K/V in VRAM takes its bytes from them for good, a host K/V's longer indexers only.
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
         // The slots give up their VRAM for the longer indexers and take what is left, whether every layer grew or memory ran out.
         crate::host::commit_note("K/V growth");
@@ -1108,6 +1164,10 @@ impl Backend {
             check(unsafe { ffi::sd_kv_grow(self.handle, layer, capacity, valid, &mut state, &mut index_state) })?;
             let entry = self.states.get_mut(&key).ok_or("no such Straydog state")?;
             (entry.pointer, entry.rows) = (state, capacity * 4);
+            // (a K/V in VRAM is cached like the indexer: a host K/V is not)
+            if let Some(cached) = self.cache.get_mut(&key) {
+                (cached.pointer, cached.rows) = (state, capacity * 4);
+            }
             let index = key.replace("@qsa:", "@indexer:");
             let rows = (capacity / 4 + 1) * 128 + INDEX_HISTORY;
             let entry = self.states.get_mut(&index).ok_or("no such Straydog state")?;
@@ -1965,6 +2025,31 @@ impl Backend {
         Ok(output)
     }
 
+    /// [`Backend::verify_span`] with its rows left in the workspace, nothing read back (the head reads them there, [`Rows::Layer`]).
+    pub fn verify_span_kept(&mut self, begin: usize, end: usize, values: &[f32], position: u64) -> Result<()> {
+        let steps = Self::rows(values, WIDTH)?;
+        if begin >= end || end > 49 || position > 262144 - steps as u64 {
+            return Err("invalid Straydog verification span".into());
+        }
+        // SAFETY: `steps` rows in; no rows out.
+        check(unsafe { ffi::sd_verify_span(self.handle, begin as u64, end as u64, position, steps as u64, values.as_ptr(), std::ptr::null_mut()) }).map(drop)
+    }
+
+    /// [`Backend::verify_span`] over the rows the layers before it left in its workspace (a first layer and a PLE layer queued on this
+    /// device: nothing uploaded), its rows read back.
+    pub fn verify_span_in_place(&mut self, begin: usize, end: usize, steps: usize, position: u64) -> Result<Vec<f32>> {
+        if begin >= end || end > 49 || !(1..=VERIFY_MAX).contains(&steps) || position > 262144 - steps as u64 {
+            return Err("invalid Straydog verification span".into());
+        }
+        let mut output = vec![0f32; steps * WIDTH];
+        // SAFETY: `steps` rows out; no rows in (the span's workspace holds them).
+        check(unsafe {
+            ffi::sd_verify_span(self.handle, begin as u64, end as u64, position, steps as u64, std::ptr::null(), output.as_mut_ptr())
+        })?;
+        Self::finite(&output, "decoder state")?;
+        Ok(output)
+    }
+
     /// The verification buffers, ahead of what the expert slots and the K/V stage take of the VRAM left.
     pub fn verify_reserve(&mut self) -> Result<()> {
         // SAFETY: a live handle.
@@ -2046,6 +2131,75 @@ impl Backend {
     pub fn verify_commit(&mut self, begin: usize, end: usize, kept: u64) -> Result<()> {
         // SAFETY: a live handle.
         check(unsafe { ffi::sd_verify_commit(self.handle, begin as u64, end as u64, kept) }).map(drop)
+    }
+
+    /// [`Backend::verify_commit`] that puts the states back to the first `kept` tokens even where every one was kept: a pass
+    /// behind this one ran on them and is given up (pipelined verification, [`Backend::set_window`] first).
+    pub fn verify_commit_forced(&mut self, begin: usize, end: usize, kept: u64) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_verify_commit_forced(self.handle, begin as u64, end as u64, kept) }).map(drop)
+    }
+
+    /// Pipelined verification on this device (CUDA's partially resident layers; before [`Backend::verify_reserve`]): `windows` a
+    /// second window of DeltaNet snapshots for the pass behind one in flight, `freeze` the expert slots kept as they are.
+    pub fn pipeline_setup(&mut self, windows: bool, freeze: bool, chain_vocabulary: bool) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_pipeline_setup(self.handle, u64::from(windows) | u64::from(freeze) << 1 | u64::from(chain_vocabulary) << 2) }).map(drop)
+    }
+
+    /// The expert slots held as they are, or let swap again (see [`Group::hold_slots`]).
+    pub fn hold_slots(&mut self, held: bool) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_freeze_slots(self.handle, u64::from(held)) }).map(drop)
+    }
+
+    /// The window (0 or 1) of the pass this device runs or commits next (see [`Backend::pipeline_setup`]).
+    pub fn set_window(&mut self, window: usize) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_set_window(self.handle, window as u64) }).map(drop)
+    }
+
+    /// Begin a front with fresh snapshot provenance for this window and sequence position.
+    pub(crate) fn begin_verify_window(&mut self, window: usize, position: usize, rows: usize) -> Result<u64> {
+        let mut epoch = 0;
+        // SAFETY: a live handle and an output integer, owned by the front worker.
+        check(unsafe { ffi::sd_verify_window_begin(self.handle, window as u64, position as u64, rows as u64, &mut epoch) })?;
+        Ok(epoch)
+    }
+
+    /// End front tracking after the worker has joined, before ordinary model work resumes.
+    pub(crate) fn end_verify_window(&mut self) -> Result<()> {
+        let mut epoch = 0;
+        // SAFETY: a live handle, with no worker accessing it. Zero rows closes the tracking session.
+        check(unsafe { ffi::sd_verify_window_begin(self.handle, 0, 0, 0, &mut epoch) }).map(drop)
+    }
+
+    /// Recover the layers reached by this front once it has drained. None selects the replay fallback.
+    pub(crate) fn restore_verify_window(&mut self, end: usize, epoch: u64, position: usize, rows: usize) -> Result<Option<u64>> {
+        let mut touched = 0;
+        // SAFETY: a live handle and output integer. The native side validates provenance before changing state.
+        let result = check(unsafe { ffi::sd_verify_window_restore(self.handle, 0, end as u64, epoch, position as u64, rows as u64, &mut touched) })?;
+        Ok((result == 0).then_some(touched))
+    }
+
+    /// Note what this device's layers' routes have observed (their scores and counts, before a speculative pass); [`Backend::usage_restore`]
+    /// puts it back when the pass is given up.
+    pub fn usage_mark(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_hybrid_usage(self.handle, 0) }).map(drop)
+    }
+
+    /// What [`Backend::usage_mark`] noted, put back.
+    pub fn usage_restore(&mut self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_hybrid_usage(self.handle, 1) }).map(drop)
+    }
+
+    /// What tells a span running on this device to stop, from another thread ([`SpanAbort::raise`]): honoured by [`Backend::verify_span`] alone (a
+    /// span run by any other call ignores it).
+    pub fn span_abort(&self) -> SpanAbort {
+        // SAFETY: a live handle; the flag comes back with a reference of its own, which the handle gives back when it is dropped.
+        SpanAbort(std::ptr::NonNull::new(unsafe { ffi::sd_abort_flag(self.handle) }).expect("a device has a stop flag"))
     }
 
     /// The head's mixing and vocabulary rows: each row's first maximum, and when asked its
@@ -2166,6 +2320,18 @@ impl Backend {
         }
         Self::finite(&[confidence], "draft probability")?;
         Ok(Some(Draft { token, confidence, top: top_pairs(&best, top) }))
+    }
+
+    /// Rows `first..first + count` of the rows `layer`'s last drafting step left in its workspace: the drafter's own hidden states.
+    pub fn draft_rows(&mut self, layer: usize, first: usize, count: usize) -> Result<Vec<f32>> {
+        if count == 0 || first.checked_add(count).is_none_or(|end| end > VERIFY_MAX) {
+            return Err("invalid Straydog drafting rows".into());
+        }
+        let mut rows = vec![0f32; count * WIDTH];
+        // SAFETY: a live handle; `count` rows of WIDTH floats are written.
+        check(unsafe { ffi::sd_draft_rows(self.handle, layer as u64, first as u64, count as u64, rows.as_mut_ptr()) })?;
+        Self::finite(&rows, "draft rows")?;
+        Ok(rows)
     }
 
     /// [`Backend::draft_step`]'s prologue and MTP layer (`operands`: the prologue's four) queued with nothing waited for, on a
@@ -2669,6 +2835,14 @@ impl Backend {
         Ok(())
     }
 
+    /// The routed experts a layer of this device's `layers` has beyond the slots, on average, with `stage` staging slots: what a wide read's layer
+    /// has to bring over the bus, to size the staging slots for it ([`Group::create_expert_slots`]).
+    pub fn experts_beyond_slots(&self, layers: u64, stage: u64, margin: u64) -> Result<u64> {
+        let slot = (if self.slot_bytes > 0 { self.slot_bytes } else { expert_bytes([42, 42, 42]) }).div_ceil(256) * 256;
+        let cache = self.slots_that_fit(stage, margin, slot)?;
+        Ok((layers * 512).saturating_sub(cache) / layers.max(1))
+    }
+
     /// Give the remaining budget to expert cache slots; the cache slot count.
     ///
     /// A device allocation that answers code 2 is rolled back in the library, then tried again here: the staging count
@@ -2753,6 +2927,12 @@ impl Backend {
     pub fn prompt_share(&mut self, on: bool) -> Result<()> {
         // SAFETY: a live handle and a plain value.
         check(unsafe { ffi::sd_hybrid_prompt_share(self.handle, i32::from(on)) }).map(drop)
+    }
+
+    /// Finish the expert-slot copies already in flight before issuing another refresh.
+    pub(crate) fn drain_slot_copies(&mut self) -> Result<()> {
+        // SAFETY: a live handle whose copy stream and background copier belong to this backend.
+        check(unsafe { ffi::sd_hybrid_drain(self.handle) }).map(drop)
     }
 
     /// Cache the highest-scoring experts by recent routing; 0 refreshes everything and waits.
@@ -2991,6 +3171,14 @@ pub fn refuse_host_allocations(count: u64) {
     unsafe { ffi::sd_test_refuse_host(count) };
 }
 
+/// Tests only: the `count`-th streamed chunk of a prompt batch's layers from now fails (after its GEMMs are queued, its experts' table entries pointing at
+/// its buffer), once, with an error the request returns; 0 ends it. The count that was left of the one before (0: it fired).
+#[doc(hidden)]
+pub fn fail_streamed_chunk(count: u64) -> u64 {
+    // SAFETY: a plain value.
+    unsafe { ffi::sd_test_fail_streamed(count) as u64 }
+}
+
 /// Give up a lock of [`lock_host_range`] that no device has adopted.
 pub fn unlock_host_range(range: &[u8]) {
     // SAFETY: a range registered by `lock_host_range`.
@@ -3002,6 +3190,10 @@ pub const HYBRID_COUNTERS: [&str; 11] = ["gpu_experts", "cpu_experts", "streamed
 
 impl Drop for Backend {
     fn drop(&mut self) {
+        // (a vacant backend has no device to drain or destroy)
+        if self.handle.is_null() {
+            return;
+        }
         // Finish background slot copies before the host banks they read go away.
         // SAFETY: a live handle, destroyed once; page locks are released after the drain.
         unsafe {
@@ -3041,6 +3233,42 @@ pub fn cpu_error() -> String {
     unsafe { std::ffi::CStr::from_ptr(ffi::sd_cpu_error()) }.to_string_lossy().into_owned()
 }
 
+/// The flag of a device's running span (see [`Backend::span_abort`]): raised from another thread, the span stops at its next layer
+/// with the error [`SPAN_ABORTED`], its stream drained; lowered, the next span runs.
+///
+/// A counted reference to the flag's own allocation, not to the device: the handle can outlive the backend, and raising it then stores to a flag
+/// nobody reads.
+pub struct SpanAbort(std::ptr::NonNull<c_void>);
+
+// SAFETY: the flag is an atomic with an atomic reference count; every call on it is thread-safe.
+unsafe impl Send for SpanAbort {}
+unsafe impl Sync for SpanAbort {}
+
+impl Clone for SpanAbort {
+    fn clone(&self) -> SpanAbort {
+        // SAFETY: a live flag, for which this adds a reference.
+        unsafe { ffi::sd_abort_flag_retain(self.0.as_ptr()) };
+        SpanAbort(self.0)
+    }
+}
+
+impl Drop for SpanAbort {
+    fn drop(&mut self) {
+        // SAFETY: the reference this handle holds, given back once.
+        unsafe { ffi::sd_abort_flag_release(self.0.as_ptr()) };
+    }
+}
+
+/// The message of the error a stopped span returns.
+pub const SPAN_ABORTED: &str = "Straydog span aborted";
+
+impl SpanAbort {
+    pub fn raise(&self, abort: bool) {
+        // SAFETY: the flag lives as long as this reference; the call only stores to it.
+        unsafe { ffi::sd_abort_flag_set(self.0.as_ptr(), u64::from(abort)) };
+    }
+}
+
 /// The native CPU expert engine (partially resident models), shared by every device.
 pub struct CpuExperts {
     handle: *mut c_void,
@@ -3050,9 +3278,15 @@ unsafe impl Send for CpuExperts {}
 
 impl CpuExperts {
     pub fn new(threads: u32) -> Result<CpuExperts> {
+        CpuExperts::new_at(threads, 0)
+    }
+
+    /// An engine whose workers start on core `first_core` of the physical cores' list (a second engine beside one of `threads` takes the cores
+    /// after them, where the workers are pinned: Windows).
+    pub fn new_at(threads: u32, first_core: u32) -> Result<CpuExperts> {
         load_iq_tables()?;
         // SAFETY: plain value; null on failure.
-        let handle = unsafe { ffi::sd_cpu_experts_create(threads) };
+        let handle = unsafe { ffi::sd_cpu_experts_create(threads, first_core) };
         if handle.is_null() {
             return Err(format!("Straydog CPU experts: {}", cpu_error()));
         }
@@ -3061,6 +3295,16 @@ impl CpuExperts {
 
     pub fn handle(&self) -> *mut c_void {
         self.handle
+    }
+
+    /// The threads an engine made for 0 takes: one a physical core.
+    pub fn default_threads() -> Result<u32> {
+        let mut threads = 0u32;
+        // SAFETY: one output integer.
+        if unsafe { ffi::sd_cpu_default_threads(&mut threads) } != 0 {
+            return Err(cpu_error());
+        }
+        Ok(threads)
     }
 
     /// Read-ahead hints are taken (Windows) while `flag` is nonzero, which the runtime keeps true while the machine pages.

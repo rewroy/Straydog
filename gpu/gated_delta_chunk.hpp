@@ -27,7 +27,12 @@ constexpr unsigned gdn_chunk_tokens = 16;
 // part), per chunk and key head the keys and queries as bf16 pieces (gdn_piece_floats floats: three planes of 16 rows of 128, 136
 // apart, for the keys, the same for the queries, and three of 128 rows of 16 tokens, 24 apart, for the keys again, transposed), and
 // last the convolution's history after the launch (its last four inputs).
+#if defined(__HIPCC__)
 constexpr size_t gdn_piece_floats = (2 * 3 * 16 * 136 + 3 * 128 * 24) / 2;
+#else
+// (CUDA: the normalized keys, then the queries, as floats, a key's 16 tokens a row: what gdn_chunk_scan_f32 reads in place of the pieces)
+constexpr size_t gdn_piece_floats = 2 * 128 * 16;
+#endif
 template<int P>
 struct GdnChunkLayout {
     using H = QwenHeads<P>;
@@ -141,6 +146,7 @@ __global__ void __launch_bounds__(640) gdn_chunk_prep(const float* rows, const f
             row[lane + 32 * i] = query ? x[i] / sqrtf(sum + 1e-6f) / sqrtf(128.0f) : x[i] / sqrtf(sum + 1e-6f);
     }
     __syncthreads();
+#if defined(__HIPCC__)
     // The keys and queries as pieces for the scan: a wave a row of four keys a lane, then a thread a key's column of tokens.
     {
         uint16_t* pieces = reinterpret_cast<uint16_t*>(scratch + layout.pieces + (chunk * H::key + kh) * gdn_piece_floats);
@@ -169,6 +175,17 @@ __global__ void __launch_bounds__(640) gdn_chunk_prep(const float* rows, const f
                                    (p[k][8 * h + 4] >> 16) | p[k][8 * h + 5], (p[k][8 * h + 6] >> 16) | p[k][8 * h + 7]);
         }
     }
+#else
+    // The normalized keys and queries as floats for the scan, a key's 16 tokens a row (keys, then queries).
+    {
+        float* kq = scratch + layout.pieces + (chunk * H::key + kh) * gdn_piece_floats;
+        for (unsigned index = tid; index < 128 * CT; index += 640) {
+            const unsigned key = index / CT, t = index % CT;
+            kq[index] = sk[t * KS + key];
+            kq[128 * CT + index] = sq[t * KS + key];
+        }
+    }
+#endif
     // The decay products in F64, rounded once (g, R and e: the state forgets by g a chunk, and a head that forgets little keeps what F32 products
     // get wrong by a coherent 1e-7 of each chunk's decay: the F32 products put the outputs of such heads 10x further from an F64 scan than the
     // token-by-token scan's, F64 products back at its error).
@@ -447,5 +464,134 @@ __global__ void __launch_bounds__(128) gdn_post_rows(const float* recurrent, con
     }
     __syncthreads();
     output[index] = x / sqrtf(sum[0] / 128.0f + 1e-6f) * norm[col] * hc_sigmoid(gate[index]);
+}
+#endif
+
+#if !defined(__HIPCC__)
+// 16 bytes from global memory to shared memory without a register in between (Ampere and later): copies in flight while the matrix is multiplied.
+__device__ __forceinline__ void gdn_copy16(void* shared, const void* global) {
+    const unsigned address = unsigned(__cvta_generic_to_shared(shared));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(address), "l"(global) : "memory");
+}
+__device__ __forceinline__ void gdn_copy_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void gdn_copy_wait() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+
+// The scan over a launch's chunks of 16 tokens on CUDA, in F32 FMAs (gdn_chunk_prep's U, W, B, g and e and the normalized keys and queries as floats
+// are its inputs): a block of two warps takes 32 columns of one value head, a warp 16 of them, two lanes a column, each its column's state for 64 of
+// the 128 keys in registers. Per chunk every product against the state is formed at once, 16 tokens' keys and queries over the keys with 32
+// independent sums where the token scan's sums are one chain a token (and a barrier between tokens): P = M0^T k, S = M0^T q (a lane's half of the
+// keys in ascending order from zero, the two halves added), C = U - W P, out = g S + B C and M = g_end M0 + sum_t k_t (x) e_t C_t, the state's decay as
+// fused multiply-adds with g_end as two floats (as the RDNA4 kernel's). The chunk's inputs (the keys and queries, W, B, g, e: 18 KB) come to shared
+// memory for both warps by cp.async, the next chunk's while this one's products are formed. Another order of sums than the token scan's, the same
+// recurrence (docs/DESIGN.md, README: Numerics).
+constexpr unsigned gdn_scan_warps = 2;
+template<int P>
+__global__ void __launch_bounds__(32 * gdn_scan_warps) gdn_chunk_scan_f32(float* state, size_t count, const float* scratch, float* output, float* history) {
+    using H = QwenHeads<P>;
+    constexpr unsigned CT = gdn_chunk_tokens, KEYS = 64, COLS = 16, KQ = 2 * 128 * CT, TILE = KQ + 2 * CT * CT + 2 * CT, THREADS = 32 * gdn_scan_warps;
+    const GdnChunkLayout<P> layout(count);
+    const unsigned thread = threadIdx.x, warp = thread / 32, lane = thread % 32, half = lane & 1, own = half * KEYS, own_col = lane >> 1;
+    const size_t head = blockIdx.x, kh = head % H::key, chunks = (count + CT - 1) / CT;
+    const size_t first_col = (size_t(blockIdx.y) * gdn_scan_warps + warp) * COLS, col = first_col + own_col;
+    __shared__ SD_ALIGN(16) float tile[2][TILE];
+    __shared__ float su[gdn_scan_warps][CT * COLS];
+    // The convolution's history for the next launch (every chunk's prep has read the old).
+    const size_t block = size_t(blockIdx.y) * gridDim.x + blockIdx.x, blocks = size_t(gridDim.x) * gridDim.y;
+    for (size_t i = block * THREADS + thread; i < 4 * H::channels; i += blocks * THREADS) history[i] = scratch[layout.history + i];
+    // A chunk's inputs into a tile: the keys and queries (1024 pieces of 16 bytes), W and B (64 each), g and e (8).
+    auto issue = [&](size_t chunk, unsigned buffer) {
+        const float* keys = scratch + layout.pieces + (chunk * H::key + kh) * gdn_piece_floats;
+        const size_t at = (chunk * H::value + head) * 256;
+        float* target = tile[buffer];
+        #pragma unroll
+        for (unsigned i = thread; i < KQ / 4; i += THREADS) gdn_copy16(target + 4 * i, keys + 4 * i);
+        if (thread < CT * CT / 4) {
+            gdn_copy16(target + KQ + 4 * thread, scratch + layout.w + at + 4 * thread);
+            gdn_copy16(target + KQ + CT * CT + 4 * thread, scratch + layout.b + at + 4 * thread);
+        }
+        if (thread < CT / 2) gdn_copy16(target + KQ + 2 * CT * CT + 4 * thread, scratch + layout.v + (chunk * H::value + head) * 2 * CT + 4 * thread);
+        gdn_copy_commit();
+    };
+    // This warp's U for a chunk, a token's row of its 16 columns a run of 64 bytes: held in registers a chunk ahead.
+    float next_u[CT * COLS / 32];
+    auto fetch = [&](size_t chunk) {
+        #pragma unroll
+        for (unsigned j = 0; j < CT * COLS / 32; ++j) {
+            const unsigned i = lane + 32 * j;
+            next_u[j] = scratch[layout.u + ((chunk * CT + i / COLS) * H::value + head) * 128 + first_col + i % COLS];
+        }
+    };
+    float m[KEYS];
+    #pragma unroll
+    for (unsigned key = 0; key < KEYS; ++key) m[key] = state[(head * 128 + own + key) * 128 + col];
+    issue(0, 0);
+    fetch(0);
+    for (size_t chunk = 0; chunk < chunks; ++chunk) {
+        const size_t first = chunk * CT;
+        const float* skq = tile[chunk & 1];
+        const float* sw = skq + KQ, *sb = sw + CT * CT, *sg = sb + CT * CT, *se = sg + CT;
+        #pragma unroll
+        for (unsigned j = 0; j < CT * COLS / 32; ++j) su[warp][lane + 32 * j] = next_u[j];
+        gdn_copy_wait();
+        __syncthreads();   // (this chunk's tile is in, and the tile the chunk before read is free)
+        if (chunk + 1 < chunks) { issue(chunk + 1, (chunk + 1) & 1); fetch(chunk + 1); }
+        // This lane's half of M0^T k and M0^T q: 32 independent sums over its keys in order, then the two halves added.
+        float p[CT], q[CT];
+        #pragma unroll
+        for (unsigned t = 0; t < CT; ++t) { p[t] = 0.0f; q[t] = 0.0f; }
+        #pragma unroll
+        for (unsigned key = 0; key < KEYS; ++key) {
+            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT);
+            const float4* qq = reinterpret_cast<const float4*>(skq + 128 * CT + (own + key) * CT);
+            const float value = m[key];
+            #pragma unroll
+            for (unsigned v = 0; v < CT / 4; ++v) {
+                const float4 a = kk[v], b = qq[v];
+                p[4 * v] = fmaf(value, a.x, p[4 * v]); p[4 * v + 1] = fmaf(value, a.y, p[4 * v + 1]);
+                p[4 * v + 2] = fmaf(value, a.z, p[4 * v + 2]); p[4 * v + 3] = fmaf(value, a.w, p[4 * v + 3]);
+                q[4 * v] = fmaf(value, b.x, q[4 * v]); q[4 * v + 1] = fmaf(value, b.y, q[4 * v + 1]);
+                q[4 * v + 2] = fmaf(value, b.z, q[4 * v + 2]); q[4 * v + 3] = fmaf(value, b.w, q[4 * v + 3]);
+            }
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            p[t] += __shfl_xor_sync(0xffffffffu, p[t], 1);   // (both lanes of a column hold the same sum: a + b is b + a)
+            q[t] += __shfl_xor_sync(0xffffffffu, q[t], 1);
+        }
+        __syncwarp();
+        // C = U - W P (W lower triangular, its diagonal included), and the outputs g S + B C (a column's first lane writes them).
+        float c[CT];
+        #pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            float d = 0.0f;
+            #pragma unroll
+            for (unsigned s = 0; s <= t; ++s) d = fmaf(sw[t * CT + s], p[s], d);
+            c[t] = su[warp][t * COLS + own_col] - d;
+        }
+        #pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            float d = 0.0f;
+            #pragma unroll
+            for (unsigned s = 0; s <= t; ++s) d = fmaf(sb[t * CT + s], c[s], d);
+            if (half == 0 && first + t < count) output[((first + t) * H::value + head) * 128 + col] = fmaf(sg[t], q[t], d);
+        }
+        // M = g_end M0 + sum_t k_t (x) (e_t C_t): the state's decay in fused multiply-adds with g_end as two floats (e_end is 1: its slot carries g_end's low part).
+        #pragma unroll
+        for (unsigned t = 0; t < CT; ++t) c[t] = (t == CT - 1 ? 1.0f : se[t]) * c[t];
+        const float gend = sg[CT - 1], gend_low = se[CT - 1];
+        #pragma unroll
+        for (unsigned key = 0; key < KEYS; ++key) {
+            const float4* kk = reinterpret_cast<const float4*>(skq + (own + key) * CT);
+            float acc = 0.0f;
+            #pragma unroll
+            for (unsigned v = 0; v < CT / 4; ++v) {
+                const float4 a = kk[v];
+                acc = fmaf(a.x, c[4 * v], acc); acc = fmaf(a.y, c[4 * v + 1], acc); acc = fmaf(a.z, c[4 * v + 2], acc); acc = fmaf(a.w, c[4 * v + 3], acc);
+            }
+            m[key] = fmaf(m[key], gend, fmaf(m[key], gend_low, acc));
+        }
+    }
+    #pragma unroll
+    for (unsigned key = 0; key < KEYS; ++key) state[(head * 128 + own + key) * 128 + col] = m[key];
 }
 #endif

@@ -12,6 +12,7 @@
 //! request began generating).
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -63,7 +64,7 @@ const PARTIAL_DRAFT_CUT: f32 = 0.3;
 /// is kept with the overlap of the two distributions, which a flat row lowers less than it lowers that. Served IQ3_S on two GPUs,
 /// tok/s of four requests: 132 with every pass at four rows, 137 at 0.3, 134 at 0.6 (the most likely token at 0.6: 130).
 const DRAWN_DRAFT_CUT: f32 = 0.3;
-/// A draft's vocabulary with the head split across two GPUs: the head's first 100000 rows (English, code and the common CJK
+/// A draft's vocabulary with the head split across two GPUs (a fully resident model's, and a partially resident one's on CUDA): the head's first 100000 rows (English, code and the common CJK
 /// characters: every token of the served cases' replies) and the rows of the tokens past them that the sequence has held (a
 /// Japanese text's words: 97-99.6% of its tokens with the text before it, 82% without). A draft step's head reads 40% of the
 /// rows: a pass 0.6 ms shorter, the same drafts on the served cases. Verification reads the whole head.
@@ -100,8 +101,8 @@ pub fn state_per_token(drafting: bool) -> u64 {
     (context_state_bytes(2 * CONTEXT, drafting) - context_state_bytes(CONTEXT, drafting)) / CONTEXT
 }
 
-/// A whole attention layer's K/V bytes a position in FP16, four planes of KV_ROW_FLOATS_F16: what the placement counts (whether the
-/// K/V stays in VRAM) until the Q8_0 rows are measured.
+/// A whole attention layer's K/V bytes a position in FP16: the conservative estimate in
+/// [`context_state_bytes`], also subtracted from it when the K/V stays in VRAM.
 const KV_POSITION_BYTES: u64 = 4 * crate::gpu::KV_ROW_FLOATS_F16 * 4;
 
 /// A whole attention layer's K/V bytes a position as it is held ([`crate::gpu::KvFormat::selected`]): what its memory takes.
@@ -114,12 +115,32 @@ fn attention_layers(drafting: bool) -> u64 {
     12 + u64::from(drafting)
 }
 
+/// Whether the whole context's K/V, in its held format, takes at most a quarter of the
+/// GPUs' total budget. Weights, workspaces and each GPU's share are checked by placement.
+fn kv_fits_budget(context: u64, drafting: bool, format: crate::gpu::KvFormat, budget: u64) -> bool {
+    u128::from(attention_layers(drafting)) * u128::from(context) * 4 * u128::from(format.row_bytes()) <= u128::from(budget / 4)
+}
+
 /// The end of a K/V growth's error when page-locking found no memory (`sd_kv_grow`): every state
 /// is sound, and a shorter sequence can still run.
 pub const KV_NO_MEMORY: &str = "not enough host memory for the K/V of this sequence";
 
+/// The end of a K/V growth's error when the VRAM had no room for the longer K/V beside what the device holds (`sd_kv_grow`): as [`KV_NO_MEMORY`], every
+/// state is sound, and a shorter sequence can still run.
+pub const KV_NO_VRAM: &str = "not enough VRAM for the K/V of this sequence";
+
 /// The model is intact, but its fixed allocations leave too little GPU memory for a request.
 pub const VRAM_NO_MEMORY: &str = "not enough GPU memory to serve this request";
+
+/// Combine completed device work without hiding a device fault behind a recovered wait.
+/// Both calls have already finished, so choosing an error never skips another device's cleanup.
+fn finish_device_work<T>(work: Result<T>, finished: Result<()>) -> Result<T> {
+    match (work, finished) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(first), Err(second)) if first.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED) => Err(second),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
 
 /// The end of the error of what an image asked and the devices could not give, or of a prompt whose image rows would run in a
 /// pass of one row, which no pass of its kind takes (the chat template cannot render one: its images are followed by text enough).
@@ -200,9 +221,24 @@ const KV_COMMIT_MARGIN: u64 = 2 << 30;
 /// What a copy of a conversation's state into host memory leaves the machine: the stacks, heaps and page-locked buffers the rest of the engine
 /// asks for as it goes are charged to the same commit, and a process that finds it gone ends there, whatever it was doing (Windows: STATUS_NO_MEMORY).
 const COPY_COMMIT_MARGIN: u64 = KV_COMMIT_MARGIN;
-/// The positions a partially resident model's host K/V starts with: page-locked, 12 GiB at the
-/// whole context take from a small machine what the expert banks need, and few sequences reach it.
+/// The positions a partially resident model's K/V starts with, in host memory or in VRAM: page-locked, 12 GiB at the
+/// whole context take from a small machine what the expert banks need, and few sequences reach it; in VRAM, what a short conversation does not
+/// use is expert slots lost (Qwen3.8-Flash-Next at 262144: 3.45 GiB, some 1,800 slots), which a growth takes back from them as a sequence needs it.
 pub const STARTING_KV: usize = 32768;
+
+/// The positions the K/V of a model of `context` starts with: [`STARTING_KV`], or STRAYDOG_KV_START's (whole thousands of positions; 0, or the
+/// context or more, keeps the whole context from the start: what a growth is measured against).
+fn starting_kv(context: usize) -> usize {
+    starting_kv_named(std::env::var("STRAYDOG_KV_START").ok().as_deref(), context)
+}
+
+fn starting_kv_named(value: Option<&str>, context: usize) -> usize {
+    match value.and_then(|positions| positions.trim().parse::<usize>().ok()) {
+        Some(0) => context,
+        Some(positions) => positions.next_multiple_of(4096).min(context),
+        None => STARTING_KV.min(context),
+    }
+}
 
 /// A verification's buffers beside partially resident layers (`verify_reserve`), and the VRAM for expert slots a drafter must
 /// leave to stay: a pass of rows the CPU would mostly compute gains little.
@@ -232,8 +268,40 @@ const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
+/// The most distinct experts a layer's pass may miss for the GPU to take them all (CUDA; [`Model::start_assist`]): none. A staged expert costs
+/// the GPU its copy over the bus, in series (80 to 105 us), where the CPU computes a layer's misses side by side. Measured on the second to
+/// fifth of five equal requests to one server (the first runs the draft width's start and says little): two RTX 4090s, IQ3_S, 148 to 155
+/// tok/s with none against 137 to 151 with two (four and six servers); one RTX 5070 Ti at 10 GiB, IQ2_XS, 84.1 with none, 81.0 with two,
+/// 76.7 with four and 72.2 with eight. STRAYDOG_ASSIST=N still takes N.
+const CUDA_ASSIST: u32 = 0;
+
+/// The staging slots a wide partial read (batches of [`PRESTAGE_BATCH`] rows and more, on two NVIDIA GPUs) adds for the experts of the layer under
+/// way that its slots do not hold: they come over the bus beside the layer's own work (gpu/hybrid_slots.hpp, prestage). STRAYDOG_PRESTAGE
+/// names another count (0: none), to measure.
+const PRESTAGE_SLOTS: u64 = 192;
+const PRESTAGE_BATCH: usize = 2048;
+
+fn prestage_slots() -> u64 {
+    std::env::var("STRAYDOG_PRESTAGE").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|slots| *slots <= 512).unwrap_or(PRESTAGE_SLOTS)
+}
 pub(crate) const SLOTS_MARGIN: u64 = 64 << 20;
 const STAGING_GATE: u64 = 128 << 20;
+
+/// Target dense weights and the staging room a partially resident placement must keep.
+fn partial_requirements(mut dense: Vec<(String, u64)>, kinds: &[[u32; 3]], prestage: u64) -> Vec<(String, u64)> {
+    let staging = (STAGING_SLOTS + prestage) * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + STAGING_GATE;
+    dense.push(("@hybrid:staging".into(), staging));
+    dense
+}
+
+/// The requested drafter's dense weights and verification room beside the target requirements.
+fn partial_drafter_requirements(mut target: Vec<(String, u64)>, drafter: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    // Its routed experts use the same slots as the target's, not a separate resident bank.
+    target.extend(drafter.into_iter().filter(|(name, _)| !name.ends_with("_exps.weight")));
+    target.push(("@verify:buffers".into(), VERIFY_BYTES));
+    target.push(("@hybrid:slots".into(), DRAFTER_SLOT_ROOM));
+    target
+}
 
 /// The VRAM a partially resident Qwen3.8 without a drafter leaves its expert slots in a `budget` on one GPU, with `dense` bytes of pinned
 /// weights ([`crate::weights::Weights::dense_requirements`]), experts of up to `expert` bytes and a context of `context` tokens that its
@@ -287,7 +355,7 @@ pub fn lock_budget(memory: u64, banks: u64, pinned_state: u64) -> u64 {
 /// with the PLE, the acceptance and the commit, and the layers.
 fn decode_part(phase: &str) -> Option<&'static str> {
     Some(match phase {
-        "draft: embeddings" | "draft: catch-up and first draft" | "draft: next draft" => "draft",
+        "draft: embeddings" | "draft: catch-up and first draft" | "draft: next draft" | "draft: forced steps" => "draft",
         "step: head" | "verify: head" => "head",
         "step: first layer" | "step: PLE rows wait" | "step: PLE layer"
             | "verify: protect, PLE prefetch, embeddings" | "verify: first layer" | "verify: PLE rows wait" | "verify: PLE layer"
@@ -308,6 +376,21 @@ fn decode_steps(phases: &BTreeMap<&'static str, f64>, generated: f64) -> BTreeMa
         }
     }
     steps
+}
+
+/// STRAYDOG_FRONT_CHAIN: 0 keeps a partially resident verification's first layer and PLE layer going through the host; `check` chains
+/// them and also runs the PLE layer again as the host path does, counting the floats that differ (reported with the row proofs).
+fn front_chain_mode() -> Option<&'static str> {
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| std::env::var("STRAYDOG_FRONT_CHAIN").ok()).as_deref()
+}
+
+fn front_chain_wanted() -> bool {
+    front_chain_mode() != Some("0")
+}
+
+fn front_chain_checked() -> bool {
+    front_chain_mode() == Some("check")
 }
 
 /// [`Model::partial_drawn_cut`] of the draft at position `at` (1 the first) from the running means of a pass's seconds by rows (0: none yet).
@@ -501,6 +584,212 @@ fn layer_prefill_chunks(begin: usize, end: usize, batch: usize) -> Vec<(usize, u
     chunks
 }
 
+/// STRAYDOG_PREFILL_OVERLAP: 0 reads a partially resident prompt through the two devices one after the other (the comparison's other side);
+/// anything else, or unset, lets them take different batches at once ([`Model::prefill_overlapped`]; a CUDA build).
+fn prefill_overlap_named(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
+}
+
+fn prefill_overlap() -> bool {
+    cfg!(feature = "cuda") && prefill_overlap_named(std::env::var("STRAYDOG_PREFILL_OVERLAP").ok().as_deref())
+}
+
+/// The batches `position..stop` of a read in batches of `batch` rows that two devices can take at once: all of them but a last of one row,
+/// which takes the decode path as it does serially. A batch of fewer than two rows is the decode path's too (`Backend::prefill_layers_into` takes
+/// two rows or more), so a read in batches of one row takes none at once.
+fn overlap_batches(position: usize, stop: usize, batch: usize) -> Vec<(usize, usize)> {
+    if batch < 2 {
+        return Vec::new();
+    }
+    let mut batches = Vec::new();
+    let mut at = position;
+    while at < stop {
+        let end = (at + batch.max(1)).min(stop);
+        batches.push((at, end));
+        at = end;
+    }
+    if batches.last().is_some_and(|(first, end)| end - first < 2) {
+        batches.pop();
+    }
+    batches
+}
+
+/// Whether an overlapped read has been cancelled: the first device's loop saw it before a batch (`cut`), or it came while the second device drained
+/// the last batches and the MTP pairs.
+fn overlap_stopped(cut: bool, cancelled: &dyn Fn() -> bool) -> bool {
+    cut || cancelled()
+}
+
+/// The batches a segment `position..stop` takes at once, where the overlap can be taken at all (`eligible`): none, without a list built, where it
+/// cannot (HIP, one GPU, the layers in parts: the segment is then read a batch at a time, which must not cost a list of what remains each time).
+fn overlap_segment(eligible: bool, position: usize, stop: usize, batch: usize) -> Option<Vec<(usize, usize)>> {
+    if !eligible {
+        return None;
+    }
+    let batches = overlap_batches(position, stop, batch);
+    (batches.len() >= 2).then_some(batches)
+}
+
+/// The first device's share of a batch of the overlapped read: the embeddings, the PLE layer and the layers up to the split, whose rows come back to
+/// `rows` for the second device (the serial path's hand-off from one device's workspace to the other's, through host memory). Over the device alone and
+/// the PLE layer's operands, nothing of the Model: the second device's thread has the Model's other parts.
+#[allow(clippy::too_many_arguments)]
+fn overlap_first_half(device: &mut crate::gpu::Backend, ple_operands: &[Operand], tokens: &[u32], start: usize, end: usize,
+                      spans: &[(usize, (usize, usize))], rows: &mut [f32], (embeddings, ple_rows): (Arc<Vec<f32>>, Vec<f32>),
+                      times: &mut StageSeconds) -> Result<()> {
+    let steps = (end - start) as u64;
+    debug_assert_eq!(steps as usize, tokens[start..end].len());
+    let clock = Instant::now();
+    // (the rows the serial path reads here, `rows_at` and `ple_embeddings`, were read ahead by the batch's thread)
+    device.prefill_embed(0, &embeddings)?;
+    times.prep += clock.elapsed().as_secs_f64();
+    for (at, (index, (first, last))) in spans.iter().enumerate() {
+        if *index == 1 {
+            let clock = Instant::now();
+            device.prefill_ple("blk.1.", &ple_rows, ple_operands, 1)?;
+            times.ple += clock.elapsed().as_secs_f64();
+        }
+        let clock = Instant::now();
+        if at + 1 == spans.len() {
+            device.prefill_layers_into(*first, *last, None, start as u64, steps, rows)?;
+            times.last_span += clock.elapsed().as_secs_f64();
+        } else {
+            device.prefill_layers(*first, *last, None, start as u64, steps, 0)?;
+            times.span_calls += clock.elapsed().as_secs_f64();
+        }
+    }
+    Ok(())
+}
+
+/// Whether the layer split leaves the first layer and the PLE layer (the one after it, on the device of layer 1) both on the first device, as the
+/// overlapped read's stages need: the first device's thread applies the PLE layer after layer 0 and the second device's thread has no such step, so
+/// a split at layer 1 (`STRAYDOG_SPLIT=1`) reads serially.
+fn overlap_split_ok(split: Option<usize>) -> bool {
+    split.is_some_and(|split| split >= 2)
+}
+
+/// A matrix of the weights as an operand of its own bytes ([`Model::projection`]). The operands of the overlapped read are built by these functions over
+/// the weights alone: the read holds the weights shared beside the two devices (each a `&mut` for its own thread), and an operand borrows from the
+/// weights and from nothing else, which the compiler checks.
+fn projection_of<'a>(weights: &'a Weights, name: &str) -> Result<Operand<'a>> {
+    let tensor = weights.tensor(name)?;
+    let [cols, rows] = tensor.dims[..] else { return Err(format!("Straydog matrix rank mismatch: {name}")) };
+    if crate::formats::block(tensor.kind).is_none() {
+        return Err(format!("unsupported Straydog weight format {}: {name}", tensor.kind));
+    }
+    let (data, kind) = weights.raw(name, 0, None)?;
+    Ok(Operand::bytes(format!("{name}:None"), data, kind, rows, cols))
+}
+
+/// [`Model::q8_projection`] over the weights alone.
+fn q8_projection_of<'a>(weights: &'a Weights, name: &str) -> Result<Operand<'a>> {
+    let operand = projection_of(weights, name)?;
+    let float = matches!(operand.kind, 0 | 1 | 30);
+    if !(crate::weights::hc_quantized(name) || crate::weights::drafter_quantized(name) && float) || !operand.cols.is_multiple_of(32) {
+        return Ok(operand);
+    }
+    let Data::Bytes(bytes) = operand.data else { return Ok(operand) };
+    Ok(Operand { key: format!("{name}:q8"), data: Data::Quantize(bytes, operand.kind), kind: 8, rows: operand.rows, cols: operand.cols })
+}
+
+/// [`Model::vector`] over the weights alone.
+fn vector_of<'a>(weights: &'a Weights, name: &str, key: Option<&str>) -> Result<Operand<'a>> {
+    let key = key.map_or_else(|| format!("@vector:{name}"), str::to_string);
+    let (rows, cols) = weights.vector_shape(name)?;
+    let (data, kind) = weights.raw(name, 0, None)?;
+    Ok(Operand { key, data: Data::Decode(data, kind), kind: 0, rows: rows as u64, cols: cols as u64 })
+}
+
+/// The PLE layer's operands ([`Model::ple_operands`]) over the weights alone.
+fn ple_operands_of(weights: &Weights) -> Result<Vec<Operand<'_>>> {
+    let mut operands = vec![q8_projection_of(weights, "blk.1.ple_key.weight")?, q8_projection_of(weights, "blk.1.ple_value.weight")?];
+    for name in ["ple_norm_key.weight", "ple_norm_query.weight", "ple_norm_conv.weight", "ple_conv1d.weight"] {
+        operands.push(vector_of(weights, &format!("blk.1.{name}"), None)?);
+    }
+    Ok(operands)
+}
+
+/// The MTP layer's prologue operands ([`Model::mtp_operands`]) over the weights alone.
+fn mtp_operands_of(weights: &Weights) -> Result<Vec<Operand<'_>>> {
+    Ok(vec![vector_of(weights, "mtp.embed_norm.weight", None)?, q8_projection_of(weights, "mtp.fc_embedding.weight")?,
+            vector_of(weights, "mtp.hidden_norm.weight", None)?, q8_projection_of(weights, "mtp.fc_hidden.weight")?])
+}
+
+/// The PLE table rows of `tokens`, which follow `before` (see [`Model::ple_indices`]), from the weights alone.
+fn ple_indices_of(weights: &Weights, before: &[u32], tokens: &[u32]) -> Result<Vec<i64>> {
+    let id = |token: &u32| if *token >= IMAGE_TOKEN { i64::from(IMAGE_PAD) } else { i64::from(*token) };
+    let history: Vec<i64> = before[before.len().saturating_sub(2)..].iter().map(id).collect();
+    let tokens: Vec<i64> = tokens.iter().map(id).collect();
+    ngram_rows(&history, &tokens, &weights.integer_arrays)
+}
+
+/// A batch's first-layer rows and PLE rows, read from the weights ahead of the batch (the overlapped read's thread for it): what
+/// [`Model::rows_at`] and [`Model::ple_embeddings`] make for a text batch, and the PLE rows of the batch after it asked for.
+fn prepare_batch(weights: &Weights, tokens: &[u32], start: usize, end: usize, next: usize) -> Result<(Arc<Vec<f32>>, Vec<f32>)> {
+    for from in (end..next).step_by(4096) {
+        let part = &tokens[from..(from + 4096).min(next)];
+        let before = if from == end { &tokens[..end] } else { &tokens[end..from] };
+        weights.prefetch_rows(PLE_TABLE, &ple_indices_of(weights, before, part)?)?;
+    }
+    let ids: Vec<i64> = tokens[start..end].iter().map(|token| i64::from(*token)).collect();
+    let rows = weights.rows("token_embd.weight", &ids)?;
+    let ple = weights.rows(PLE_TABLE, &ple_indices_of(weights, &tokens[..start], &tokens[start..end])?)?;
+    Ok((Arc::new(rows), ple))
+}
+
+/// The rows of a pass of the MTP layer over a prompt batch's pairs on the overlapped read: the batch's all (the device runs the prologue in pieces
+/// of 512 and the layer once over them, `sd_mtp_prompt_kept`), where 512 rows at a time made each pass's fixed costs (the CPU's routes, the
+/// experts it streams, the host's reads) eight times a batch.
+const MTP_PASS_ROWS: usize = 4096;
+
+/// The MTP layer's pairs of a prompt batch on the second device, from the batch's final rows in the layer 47's workspace there: kept on the device
+/// beside the row before them (`carried` rows of the batch before, else the host's `previous` row), and fed to the layer in passes of
+/// [`MTP_PASS_ROWS`] pairs; the same pairs and the same device copies, with the device as an argument ([`Model::mtp_prompt_kept`]). `token_rows` are the
+/// batch's tokens' rows of the embedding table (the rows the first device's embeddings are, read once for both devices).
+fn mtp_prompt_pairs(backend: &mut crate::gpu::Backend, operands: &[Operand], token_rows: &[f32], tokens: &[u32], start: usize,
+                    host: Option<&[f32]>, carried: u64) -> Result<()> {
+    backend.mtp_keep(tokens.len() as u64, carried, host)?;
+    let before = carried > 0 || host.is_some();
+    let (following, first, row) = if before { (tokens, start - 1, 0) } else { (&tokens[1..], start, 1) };
+    if following.is_empty() {
+        return Ok(());
+    }
+    if token_rows.len() != tokens.len() * HIDDEN {
+        return Err("Straydog MTP pairs: the batch's token rows are not its tokens'".into());
+    }
+    backend.mtp_embed(if before { token_rows } else { &token_rows[HIDDEN..] })?;
+    for offset in (0..following.len()).step_by(MTP_PASS_ROWS) {
+        let count = (following.len() - offset).min(MTP_PASS_ROWS) as u64;
+        backend.mtp_prompt_kept(operands, (row + offset) as u64, offset as u64, count, (first + offset) as u64)?;
+    }
+    Ok(())
+}
+
+/// How an overlapped read of a segment ended ([`Model::prefill_overlapped`]).
+enum Overlapped {
+    /// No buffers for the rows between the devices: nothing was read.
+    Declined,
+    Cancelled,
+    /// Every batch was read; the logits where the last of them ends the prompt.
+    Read(Option<Vec<f32>>),
+}
+
+/// Seconds a stage of an overlapped read spent: the first device's thread (`first` working, `blocked` waiting for a buffer or for the second
+/// device to take a batch) and the second's (`second` on its layers and the rows' upload, `mtp` on the MTP pairs, `idle` waiting for a batch).
+#[derive(Default)]
+struct StageSeconds {
+    first: f64,
+    blocked: f64,
+    second: f64,
+    mtp: f64,
+    idle: f64,
+    /// The first device's thread within `first`: the embeddings' upload, the PLE layer, the span calls that queue and the last span's (with the rows' copy).
+    prep: f64,
+    ple: f64,
+    span_calls: f64,
+    last_span: f64,
+}
+
 struct Checkpoint {
     slot: usize,
     tokens: Vec<u32>,
@@ -664,6 +953,12 @@ pub struct Settings {
 pub struct Rng([u64; 4]);
 
 impl Rng {
+    /// The generator for one position of a seeded sequence (a draw that depends on the seed and the position alone: see
+    /// [`sampling::accept_keyed`]).
+    pub fn keyed(seed: u64, position: u64) -> Rng {
+        Rng::new(seed ^ position.wrapping_add(1).wrapping_mul(0xd6e8_feb8_6659_fd93))
+    }
+
     pub fn new(seed: u64) -> Rng {
         let mut state = seed;
         let mut next = || {
@@ -781,12 +1076,21 @@ pub struct Model {
     // before the mappings their native plans point into.
     group: Group,
     cpu: Option<CpuExperts>,
+    /// Pipelined verification (STRAYDOG_PIPELINE=1): the second device's CPU engine, the first device's being `cpu` (each host thread has its own).
+    cpu_second: Option<CpuExperts>,
+    /// The pipelined verification's settings (STRAYDOG_PIPELINE and the rest, read at the start).
+    pipeline: pipeline::PipelineConfig,
+    /// The seed of the request under way (the keyed draws of `sampling::accept_keyed`).
+    sample_seed: u64,
+    /// Whether the request under way holds what the pipeline holds (the expert slots' swaps, the assist level, the head on one GPU): the requests
+    /// the pipeline does not take (thinking ones, a constraint) run the ordinary loop as it is.
+    pipeline_live: bool,
     /// The page-locked copies of the banks of the layers that a GPU which cannot register host memory read-only holds in place of the mapping
     /// ([`LockMode::Copy`]). The devices' plans and the CPU engine read them, and the model has no `Drop`: this field is declared after `group` and `cpu`
     /// so that they are dropped first (the devices drain their copy thread and destroy their plans, the CPU's workers stop) and nothing reads a copy when
     /// it is freed. Keep it after them.
     copies: Copies,
-    pub weights: Weights,
+    pub weights: std::sync::Arc<Weights>,
     pub context: usize,
     pub prefill_batch_size: usize,
     pub state_bytes: u64,
@@ -854,7 +1158,7 @@ pub struct Model {
     /// A partially resident model with a drafter chooses how many drafts a pass offers by what its passes cost ([`width`]); `speculative` is
     /// the most.
     width: Option<width::Chooser>,
-    /// The drafts were held by [`Model::pin_drafts`] (a test): no width an earlier run chose is taken then.
+    /// The drafts were held by [`Model::pin_drafts`] (a test, or STRAYDOG_PIPELINE_DRAFTS): no width an earlier run chose is taken then.
     drafts_held: bool,
     /// Tests only: the seconds a pass is taken to have taken by its rows, in place of the clock ([`Model::script_pass_seconds`]).
     pass_clock: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
@@ -975,7 +1279,7 @@ impl Model {
         let mut state_bytes = context_state_bytes(context64, drafting);
         let attention_capable = group.batch_capacity() == 256;
         let kv_bytes = attention_layers(drafting) * context64 * KV_POSITION_BYTES;
-        let fits = attention_capable && kv_bytes <= group.memory()?.1 / 4;
+        let fits = attention_capable && kv_fits_budget(context64, drafting, crate::gpu::KvFormat::selected(), group.memory()?.1);
         let host_capable = attention_capable && group.host_state_supported()?;
         let recurrent_bytes = 36 * 48 * 128 * 128 * 4;
         // K/V beyond a quarter of the VRAM budget stays in mapped host memory, which the
@@ -1010,10 +1314,37 @@ impl Model {
                 }
             }
         }
+        // STRAYDOG_SPLIT=N: the second device's first layer, in place of the balance of weight bytes (two GPUs, a model that is not fully
+        // resident; nothing is placed yet). A pass's time on a device is not its dense bytes: this moves the boundary to balance by time.
+        if !resident && group.split().is_some() {
+            if let Some(split) = std::env::var("STRAYDOG_SPLIT").ok().and_then(|value| value.parse::<usize>().ok()) {
+                group.set_split(split)?;
+            } else if cfg!(feature = "cuda") {
+                // A layer's routed experts live in its own device's slots here (no expert halves), so the balance counts them: by dense
+                // bytes alone the first device had 34 layers with slots for half their experts while the second's slots stood empty.
+                let (layer_bytes, tail) = weights.placement_bytes(false);
+                group.balance_layers(&layer_bytes, tail)?;
+            }
+            eprintln!("Straydog layer split: device 0 has layers 0..{0}, device 1 {0}..48", group.split().unwrap_or(0));
+        }
         // (on 48 GiB of budgets and more, where the derived batch is the widest, a partial placement keeps what it had at 2048: its room goes to
         // its expert slots. A batch given is taken as it is, and a smaller budget's derived one is not wider than that.)
         if derived && !resident && group.memory()?.1 >= WIDE_BATCH_BUDGET {
             batch = batch.min(NARROW_BATCH);
+        } else if derived && !resident && partial_pair(cfg!(feature = "cuda"), group.backends.len(), group.memory()?.1) {
+            batch = PARTIAL_PAIR_BATCH.min(group.logical_capacity());
+        }
+        if !resident && batch >= PRESTAGE_BATCH && partial_pair(cfg!(feature = "cuda"), group.backends.len(), group.memory()?.1) {
+            group.set_prestage(prestage_slots());
+        }
+        if !resident && !host && host_capable {
+            let kinds = (0..48).map(|layer| weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
+            let requirements = partial_requirements(weights.dense_requirements(), &kinds, group.prestage_slots());
+            let requirements = if drafting { partial_drafter_requirements(requirements, weights.drafter_requirements()) } else { requirements };
+            let planned = group.planned_state_bytes(context64, batch as u64, drafting, false)?;
+            // Before any state is allocated: keep the host path if VRAM K/V crowds out dense weights
+            // or a requested drafter. Its indexers start small before the partial placement's gates.
+            host = !group.can_pin_model(&requirements, Some(&planned))?;
         }
         let gpu_attention = fits || host;
         if !gpu_attention {
@@ -1030,11 +1361,16 @@ impl Model {
         let checkpoint_bytes = group.reserve_checkpoints(CHECKPOINTS.len() + PARK_SLOTS.len())?;
         let mut load_seconds = vec![("state", lap(&mut clock))];
         crate::host::commit_note("states and checkpoints");
+        let devices = group.backends.len();
         let mut model = Model {
             group,
             cpu: None,
+            cpu_second: None,
+            pipeline: pipeline::PipelineConfig::from_env().for_devices(devices),
+            sample_seed: 0,
+            pipeline_live: true,
             copies: Copies::default(),
-            weights,
+            weights: std::sync::Arc::new(weights),
             context,
             prefill_batch_size: batch,
             state_bytes,
@@ -1117,12 +1453,20 @@ impl Model {
         model.group.defer_uploads();
         model.resident = model.prepare_resident_moe()?;
         if !model.resident {
+            let start = starting_kv(context);
+            let growing = model.group.batch_capacity() == 256 && !model.group.parts() && context > start;
             // (before the expert placement, whose gates read what the indexers hold: at the whole context, a third of the slots)
-            if model.group.batch_capacity() == 256 && host && !model.group.parts() && context > STARTING_KV {
-                model.kv_capacity = STARTING_KV;
-                model.group.start_kv(STARTING_KV as u64)?;
+            if growing && host {
+                model.kv_capacity = start;
+                model.group.start_kv(start as u64)?;
             }
             model.partial = model.group.batch_capacity() == 256 && model.prepare_hybrid_moe(settings.cpu_threads)?;
+            // A K/V in VRAM starts small after the placement's gates, which counted it at the whole context: the placement is one that the K/V can
+            // grow to fill (the slots, made below, give the VRAM back for it as it grows), and the slots start with what a short conversation leaves them.
+            if growing && !host && model.partial {
+                model.kv_capacity = start;
+                model.group.start_kv(start as u64)?;
+            }
         }
         if !model.resident && !model.partial {
             return Err("the GPU budget cannot hold the model's dense weights; raise --vram".into());
@@ -1147,14 +1491,22 @@ impl Model {
         load_seconds.push(("read and place", lap(&mut clock)));
         crate::host::commit_note("placed");
         let pending = model.group.take_pending();
-        crate::load::load(&mut model.weights, &mut model.group, pending, &keep, progress)?;
+        // (the load changes the weights and the group at once: disjoint fields, so not through `weights_mut`)
+        let loading = std::sync::Arc::get_mut(&mut model.weights).expect("the weights are held by the model alone while it loads");
+        crate::load::load(loading, &mut model.group, pending, &keep, progress)?;
         load_seconds.push(("read", lap(&mut clock)));
+        model.group.experts_finalize()?;
+        load_seconds.push(("expert layout", lap(&mut clock)));
         crate::host::commit_note("read");
         // Host K/V page-locked on a thread of its own meanwhile (see `Backend::prefetch_host_states`).
         model.group.finish_model_state()?;
         load_seconds.push(("host_state", lap(&mut clock)));
         crate::host::commit_note("host K/V");
         model.prepare_decoder(model.kv_capacity as u64, true)?;
+        if model.partial && model.pipeline.frozen_slots() {
+            // (before the verification buffers: the first device keeps a second window of them)
+            model.group.pipeline_setup(model.pipeline.windows(model.group.backends.len()), true)?;
+        }
         if model.partial && model.weights.drafter {
             model.group.verify_reserve()?;
         }
@@ -1165,7 +1517,21 @@ impl Model {
             // the locks taken, and the plan has left the commit the locks need out of what the VRAM takes)
             model.plan_host_banks(pinned)?;
             crate::host::commit_note("banks planned");
+            // A draft's vocabulary (DRAFT_ROWS) on CUDA as well: the head's split across the two GPUs is the same, and it takes its rows' room
+            // before the slots take the rest (34 MB: 17 slots of 17855).
+            if drafting && model.weights.drafter && cfg!(feature = "cuda")
+                && std::env::var("STRAYDOG_DRAFT_VOCABULARY").map_or(true, |value| value != "0")
+            {
+                model.draft_vocabulary = model.group.draft_vocabulary(&head, DRAFT_ROWS, &[], true)?;
+            }
             let slots = model.group.create_expert_slots()?;
+            if model.group.backends.len() == 2 {
+                let per_device: Vec<String> = model.group.backends.iter().map(|backend| {
+                    let used = backend.memory().map_or(0, |(used, _)| used) as f64 / (1u64 << 30) as f64;
+                    format!("{} slots, {used:.1} GiB used", backend.slots().map_or(0, |(slots, _)| slots))
+                }).collect();
+                eprintln!("Straydog expert slots by device: {}", per_device.join(" | "));
+            }
             // No staging mirror: layer order gathers through it, so a prompt keeps the ordinary batches.
             if !model.group.expert_slot_mirrors() {
                 model.layer_prefill = false;
@@ -1198,7 +1564,7 @@ impl Model {
             }
         };
         if row_cache > 0 {
-            model.weights.cache_rows(PLE_TABLE, row_cache)?;
+            model.weights_mut().cache_rows(PLE_TABLE, row_cache)?;
         }
         load_seconds.push(("plans", lap(&mut clock)));
         crate::host::commit_note("plans");
@@ -1214,6 +1580,12 @@ impl Model {
         model.width = (model.partial && most > 0).then(|| width::Chooser::new(most, start));
         // (a partially resident model's rows cost it far more: as many as it drafts)
         model.copy_drafts = if model.partial || most == 0 { start } else { VERIFY_ROWS - 1 };
+        // (STRAYDOG_PIPELINE_DRAFTS with the pipeline or `freeze`: the drafts of every pass held, not chosen by the passes' times)
+        if model.pipeline.frozen_slots() {
+            if let Some(drafts) = model.pipeline.drafts() {
+                model.pin_drafts(Some(drafts.min(most)));
+            }
+        }
         model.refresh_kv_ahead();
         // A read of wide batches grows the rows' stagings as its batches ask (0.4 s of pinning, and a growth waits for the batch queued on its device):
         // they are page-locked from here on a thread of each device, at the size that read would pin them at, which stay pinned after it all the same
@@ -1252,9 +1624,9 @@ impl Model {
 
     /// A partially resident model begins at `drafts`, the width an earlier run on this placement chose, in place of where it started: its chooser is built
     /// again at it, as at the load, and goes on choosing from there. Only while the width is the chooser's to take: not where the drafts are held
-    /// (a test's), nor once it has made its choice or begun a probe ([`chooser_started_at`]). Whether it did.
+    /// (the pipeline's or a test's), nor once it has made its choice or begun a probe ([`chooser_started_at`]). Whether it did.
     pub fn start_drafts_at(&mut self, drafts: usize) -> bool {
-        let held = self.drafts_held;
+        let held = self.drafts_held || self.pipeline.frozen_slots();
         let Some(chooser) = self.width.as_ref().and_then(|chooser| chooser_started_at(chooser, self.speculative, held, drafts)) else { return false };
         self.drafts = chooser.drafts();
         self.copy_drafts = self.drafts;
@@ -1275,26 +1647,14 @@ impl Model {
     // ---- operands ----
 
     fn projection(&self, name: &str) -> Result<Operand<'_>> {
-        let tensor = self.weights.tensor(name)?;
-        let [cols, rows] = tensor.dims[..] else { return Err(format!("Straydog matrix rank mismatch: {name}")) };
-        if crate::formats::block(tensor.kind).is_none() {
-            return Err(format!("unsupported Straydog weight format {}: {name}", tensor.kind));
-        }
-        let (data, kind) = self.weights.raw(name, 0, None)?;
-        Ok(Operand::bytes(format!("{name}:None"), data, kind, rows, cols))
+        projection_of(&self.weights, name)
     }
 
     /// A projection uploaded quantized to Q8_0 when it is a HyperConnection's down or up (BF16 in the bundle: half the bytes a
     /// decode pass reads, a quarter of a row's; `STRAYDOG_HC_Q8=0` keeps it BF16) or a float matrix of the drafter's
     /// (crate::weights::drafter_quantized); as it is otherwise.
     fn q8_projection(&self, name: &str) -> Result<Operand<'_>> {
-        let operand = self.projection(name)?;
-        let float = matches!(operand.kind, 0 | 1 | 30);
-        if !(crate::weights::hc_quantized(name) || crate::weights::drafter_quantized(name) && float) || !operand.cols.is_multiple_of(32) {
-            return Ok(operand);
-        }
-        let Data::Bytes(bytes) = operand.data else { return Ok(operand) };
-        Ok(Operand { key: format!("{name}:q8"), data: Data::Quantize(bytes, operand.kind), kind: 8, rows: operand.rows, cols: operand.cols })
+        q8_projection_of(&self.weights, name)
     }
 
     /// A MoE's router. Unsloth's bundles store Qwen3.8's in F32 though every value is a BF16 value (the model's own): it goes up as BF16,
@@ -1311,10 +1671,7 @@ impl Model {
 
     /// A vector, uploaded decoded to F32.
     fn vector(&self, name: &str, key: Option<&str>) -> Result<Operand<'_>> {
-        let key = key.map_or_else(|| format!("@vector:{name}"), str::to_string);
-        let (rows, cols) = self.weights.vector_shape(name)?;
-        let (data, kind) = self.weights.raw(name, 0, None)?;
-        Ok(Operand { key, data: Data::Decode(data, kind), kind: 0, rows: rows as u64, cols: cols as u64 })
+        vector_of(&self.weights, name, key)
     }
 
     /// A MoE's shared-expert mix as a one-row matrix of its own bytes (BF16): a decode row's router and mix are then one launch of
@@ -1442,11 +1799,7 @@ impl Model {
     }
 
     fn ple_operands(&self) -> Result<Vec<Operand<'_>>> {
-        let mut operands = vec![self.q8_projection("blk.1.ple_key.weight")?, self.q8_projection("blk.1.ple_value.weight")?];
-        for name in ["ple_norm_key.weight", "ple_norm_query.weight", "ple_norm_conv.weight", "ple_conv1d.weight"] {
-            operands.push(self.vector(&format!("blk.1.{name}"), None)?);
-        }
-        Ok(operands)
+        ple_operands_of(&self.weights)
     }
 
     fn head_operands(&self) -> Result<Vec<Operand<'_>>> {
@@ -1493,7 +1846,7 @@ impl Model {
             return Ok(false);
         }
         if self.weights.drafter && !self.group.can_pin_model(&self.resident_requirements(true), None)? {
-            self.weights.drop_drafter();
+            self.weights_mut().drop_drafter();
         }
         for layer in self.weights.layers() {
             self.register_resident_layer(layer)?;
@@ -1550,28 +1903,34 @@ impl Model {
             return Ok(false);
         }
         let kinds = (0..48).map(|layer| self.weights.expert_kinds(layer)).collect::<Result<Vec<_>>>()?;
-        let staging = STAGING_SLOTS * kinds.iter().map(|kinds| expert_bytes(*kinds)).max().unwrap() + STAGING_GATE;
-        let mut requirements = self.weights.dense_requirements();
-        requirements.push(("@hybrid:staging".into(), staging));
+        let requirements = partial_requirements(self.weights.dense_requirements(), &kinds, self.group.prestage_slots());
         // The drafter when its layer and a verification's buffers leave the expert slots their share.
-        let mut with_drafter = requirements.clone();
-        // (its routed experts take expert slots like any layer's: register_hybrid_drafter)
-        with_drafter.extend(self.weights.drafter_requirements().into_iter().filter(|(name, _)| !name.ends_with("_exps.weight")));
-        with_drafter.push(("@verify:buffers".into(), VERIFY_BYTES));
-        with_drafter.push(("@hybrid:slots".into(), DRAFTER_SLOT_ROOM));
+        let with_drafter = partial_drafter_requirements(requirements.clone(), self.weights.drafter_requirements());
         if !self.weights.drafter || !self.group.can_pin_model(&with_drafter, None)? {
-            self.weights.drop_drafter();
+            self.weights_mut().drop_drafter();
             self.group.drop_mtp_layer_state()?;
         }
         if !self.group.can_pin_model(&requirements, None)? {
             return Ok(false);
         }
-        let cpu = CpuExperts::new(cpu_threads)?;
+        // (pipelined verification: an engine for each device's host thread, half the threads each)
+        let pipelined = self.pipeline.windows(self.group.backends.len());
+        let threads = if pipelined { self.pipeline.engine_threads(if cpu_threads == 0 { CpuExperts::default_threads()? } else { cpu_threads }) } else { cpu_threads };
+        let cpu = CpuExperts::new(threads)?;
+        if pipelined {
+            // (the second engine's workers on the cores after the first's, not on the same ones)
+            self.cpu_second = Some(CpuExperts::new_at(threads, threads)?);
+            eprintln!("Straydog pipelined verification: two CPU engines of {threads} threads");
+        }
         eprintln!("Straydog CPU experts: {} kernels", cpu.isa());
         // (the same files as the mapping's, checked as it is: `Weights::check_unchanged` before every generation)
         #[cfg(windows)]
         for (map, file) in self.weights.mapped_files() {
             cpu.gather_file(map, file)?;
+            // (the second device's engine gathers from the files too: else its prefill gathers copy from the mapping)
+            if let Some(second) = self.cpu_second.as_ref() {
+                second.gather_file(map, file)?;
+            }
         }
         for (layer, kinds) in kinds.iter().enumerate() {
             let prefix = format!("blk.{layer}.");
@@ -1664,10 +2023,19 @@ impl Model {
     /// when no bank is page-locked). Called again as layers are locked, it maps those that are new, at the level in force.
     fn start_assist(&mut self) -> Result<u64> {
         let cap = crate::gpu::Backend::assist_cap();
-        let level = self.assist.as_ref().map_or(cap, assist::Tuner::level);
+        // On CUDA the level is the most distinct experts a layer's pass may miss for the GPU to take them all over the bus (with more, the CPU
+        // takes them all: staging costs the GPU about 95 us an expert, in series, where the CPU computes a layer's misses in parallel), fixed
+        // at CUDA_ASSIST, untuned: the windows of a round could not tell the levels apart on an RTX 4090 and picked one by noise.
+        // STRAYDOG_ASSIST=N holds the level at N on any build (0: every missed route to the CPU; the cap, 8, is the most). A CUDA build's MTP draft
+        // layer takes none of it (hybrid_level in gpu/resident_moe.hpp).
+        // (STRAYDOG_PIPELINE_ASSIST: the level the pipeline and `freeze` hold, which no tuner chooses there)
+        let held = if self.pipeline.frozen_slots() { self.pipeline.assist() } else { None };
+        let forced = held.or_else(|| std::env::var("STRAYDOG_ASSIST").ok().and_then(|value| value.parse::<u32>().ok())).map(|value| value.min(cap));
+        let fixed = forced.or(cfg!(feature = "cuda").then_some(CUDA_ASSIST.min(cap)));
+        let level = self.assist.as_ref().map_or(fixed.unwrap_or(cap), assist::Tuner::level);
         let mapped = self.group.enable_assist(level)?;
         if mapped > 0 && self.assist.is_none() {
-            self.assist = Some(assist::Tuner::new(assist::levels(cap), cap));
+            self.assist = Some(assist::Tuner::new(if fixed.is_some() { Vec::new() } else { assist::levels(cap) }, fixed.unwrap_or(cap)));
         }
         self.assist_mapped = mapped;
         Ok(mapped)
@@ -2047,6 +2415,11 @@ impl Model {
         }
         let cpu = self.cpu.as_ref().ok_or("Straydog partial residency has no CPU engine")?;
         cpu.watch_paging(&crate::host::PAGING)?;
+        if let Some(second) = self.cpu_second.as_ref() {
+            second.watch_paging(&crate::host::PAGING)?;
+            self.group.attach_cpu_for(0, cpu)?;
+            return self.group.attach_cpu_for(1, second);
+        }
         self.group.attach_cpu(cpu)
     }
 
@@ -2486,10 +2859,7 @@ impl Model {
     /// The PLE table rows of `tokens`, which follow `before` (its last two tokens count). An image's positions hash as
     /// `<|image_pad|>`, as the reference's PLE reads the ids before their rows are put in.
     fn ple_indices(&self, before: &[u32], tokens: &[u32]) -> Result<Vec<i64>> {
-        let id = |token: &u32| if *token >= IMAGE_TOKEN { i64::from(IMAGE_PAD) } else { i64::from(*token) };
-        let history: Vec<i64> = before[before.len().saturating_sub(2)..].iter().map(id).collect();
-        let tokens: Vec<i64> = tokens.iter().map(id).collect();
-        ngram_rows(&history, &tokens, &self.weights.integer_arrays)
+        ple_indices_of(&self.weights, before, tokens)
     }
 
     fn ple_embeddings(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -2699,6 +3069,12 @@ impl Model {
         self.kv_capacity
     }
 
+    /// Tests and measurements: the expert slots the devices have, and the experts they hold (0, 0 where there are none).
+    #[doc(hidden)]
+    pub fn slot_counts(&self) -> (u64, u64) {
+        self.group.slots().unwrap_or((0, 0))
+    }
+
     /// The K/V's next size for `positions`: twice over where the commit and the memory have room for that, else a quarter more, else what the
     /// sequence needs, which only the commit can refuse: a sequence at 66K locked 6 GiB for 131072 positions. The commit is read
     /// with the slots' VRAM still charged to it: they give it up for the growth and take it back after, so what the growth takes of it
@@ -2737,6 +3113,8 @@ impl Model {
     ///
     /// A growth that finds no memory gives locked layers back and asks again ([`Model::give_back`]): the page locks are an optimisation of the CPU's
     /// experts and the K/V of a conversation is not. Only with no layer left to give back does the request fail, with [`KV_NO_MEMORY`].
+    ///
+    /// A K/V in VRAM grows the same way and takes its bytes from the expert slots for good ([`Model::grow_vram_kv`]).
     fn ensure_kv(&mut self, positions: usize) -> Result<()> {
         if positions <= self.kv_capacity {
             return Ok(());
@@ -2744,6 +3122,11 @@ impl Model {
         let growing = Instant::now();
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
+        }
+        if !self.host_kv {
+            self.grow_vram_kv(positions, growing)?;
+            self.after_kv_growth();
+            return Ok(());
         }
         // The size a growth that has begun is for: a layer is grown or it is not, and asking again finishes what was begun (a layer grown is skipped,
         // and layers of two sizes would be left if the size were chosen anew).
@@ -2773,13 +3156,36 @@ impl Model {
         self.refresh_kv_ahead();
         // (what a growth costs a request: the case for growing by less than doubling)
         self.metric_add("kv_growth_seconds", growing.elapsed().as_secs_f64());
-        self.last_metrics.insert("kv_capacity".into(), json!(capacity));
-        // (a checkpoint's history of the MTP layer's indexer, which keeps it after its blocks)
+        self.after_kv_growth();
+        Ok(())
+    }
+
+    /// What follows a growth of the K/V to [`Model::kv_capacity`], in host memory or in VRAM: the capacity as a request's metric, and the checkpoints'
+    /// histories of the MTP layer's indexer, which keeps it after its blocks, moved to where the blocks end now.
+    fn after_kv_growth(&mut self) {
+        self.last_metrics.insert("kv_capacity".into(), json!(self.kv_capacity));
         for checkpoint in self.checkpoints.values_mut() {
             if let Some(history) = checkpoint.history.as_mut() {
-                history.move_history(capacity as u64);
+                history.move_history(self.kv_capacity as u64);
             }
         }
+    }
+
+    /// The K/V in VRAM grown for `positions`: twice over (to the context at most), as the host K/V is where the memory allows. Every device's
+    /// expert slots give up their VRAM for the layers' longer K/V and take what is left after ([`crate::gpu::Backend::grow_kv`]), so the K/V takes
+    /// its bytes from the slots for good, a slot for each 1.95 MiB of IQ3_S experts, and the pool is filled again from the experts' scores
+    /// (a read of the slots' experts from host memory, whose time is the growth's, the line below says it). A device with no VRAM for the longer
+    /// K/V refuses the request ([`KV_NO_VRAM`]) with every state as it was: what had grown stays at its size, and a later request asks again.
+    fn grow_vram_kv(&mut self, positions: usize, began: Instant) -> Result<()> {
+        let capacity = (positions + 4096).next_power_of_two().min(self.context);
+        let slots_before = self.group.slots().map_or(0, |(slots, _)| slots);
+        self.group.grow_kv(capacity as u64, self.history.len() as u64)?;
+        let (from, seconds) = (self.kv_capacity, began.elapsed().as_secs_f64());
+        self.kv_capacity = capacity;
+        self.metric_add("kv_growth_seconds", seconds);
+        let slots_after = self.group.slots().map_or(0, |(slots, _)| slots);
+        self.last_metrics.insert("kv_growth_slots".into(), json!([slots_before, slots_after]));
+        eprintln!("Straydog K/V growth: {from} -> {capacity} positions in {seconds:.2} s, {slots_before} -> {slots_after} expert slots");
         Ok(())
     }
 
@@ -3178,8 +3584,7 @@ impl Model {
     }
 
     fn mtp_operands(&self) -> Result<Vec<Operand<'_>>> {
-        Ok(vec![self.vector("mtp.embed_norm.weight", None)?, self.q8_projection("mtp.fc_embedding.weight")?,
-                self.vector("mtp.hidden_norm.weight", None)?, self.q8_projection("mtp.fc_hidden.weight")?])
+        mtp_operands_of(&self.weights)
     }
 
     fn mtp_prologue(&mut self, embeddings: &[f32], hidden: &[f32]) -> Result<Vec<f32>> {
@@ -3300,8 +3705,17 @@ impl Model {
 
     /// The noted tokens' rows into the draft's vocabulary; when it is full, the history's tokens alone (the latest first).
     fn draft_vocabulary_update(&mut self) -> Result<()> {
+        let Some((pending, reset)) = self.draft_vocabulary_pending() else { return Ok(()) };
+        self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
+            group.draft_vocabulary(&operands[0], DRAFT_ROWS, &pending, reset)
+        })?;
+        Ok(())
+    }
+
+    /// The tokens noted since the last update and whether the vocabulary starts again from the history's (taken: noted no more), or none.
+    pub(super) fn draft_vocabulary_pending(&mut self) -> Option<(Vec<u32>, bool)> {
         if self.draft_pending.is_empty() {
-            return Ok(());
+            return None;
         }
         let reset = self.draft_extras.len() > DRAFT_EXTRAS;
         if reset {
@@ -3316,11 +3730,7 @@ impl Model {
                 }
             }
         }
-        let pending = std::mem::take(&mut self.draft_pending);
-        self.with_operands(|model| Ok(vec![model.projection("output.weight")?]), |group, operands| {
-            group.draft_vocabulary(&operands[0], DRAFT_ROWS, &pending, reset)
-        })?;
-        Ok(())
+        Some((std::mem::take(&mut self.draft_pending), reset))
     }
 
     /// The cut of a partially resident model's drawn draft at position `at` (1 the first), from what the row it adds costs this machine at
@@ -3393,7 +3803,7 @@ impl Model {
         let Some((token, mut chain)) = take(step, rng)? else { return Ok((Vec::new(), Vec::new())) };
         let cut = self.draft_cut(top > 0, 1);
         // (at a cut of 0 no pass would run alone, and what a lone row costs would never be measured again)
-        if chain < cut || (self.partial && self.passes_with_draft >= PASSES_BETWEEN_LONE_ROWS) {
+        if chain < cut || (self.partial && self.passes_with_draft >= PASSES_BETWEEN_LONE_ROWS && !self.pipeline.no_copy()) {
             return Ok((Vec::new(), Vec::new()));
         }
         let mut drafts = vec![token];
@@ -3792,9 +4202,33 @@ impl Model {
         } else { false };
         let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
         for stop in stops {
+            // (Both devices at once where the segment has batches to overlap: the checkpoints between segments, and the end of the read, drain it. A read
+            // that fills empty slots takes its first batch alone and fills them (below), and the batches after it overlap: the cold first request of a
+            // process was read serially to its end.)
+            let mut declined = false;
+            let eligible = self.overlap_possible();
             while position < stop {
                 if cancelled() {
                     return Ok(None);
+                }
+                if !fill_empty_slots && !declined && self.history.len() == position {
+                    // (eligibility first: where the overlap cannot be taken the list of what remains is not built at each step)
+                    if let Some(overlapped) = overlap_segment(eligible, position, stop, batch) {
+                        match self.prefill_overlapped(tokens, &overlapped, batch, cancelled, progress)? {
+                            Overlapped::Cancelled => return Ok(None),
+                            Overlapped::Declined => declined = true,
+                            Overlapped::Read(logits) => {
+                                position = overlapped.last().map_or(position, |(_, end)| *end);
+                                if logits.is_some() {
+                                    output = logits;
+                                }
+                            }
+                        }
+                        if cancelled() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
                 }
                 let mut end = (position + batch).min(stop);
                 // (none is left to a batch of one row, which may be an image's or end a block begun in one)
@@ -3831,6 +4265,180 @@ impl Model {
         Ok(Some(output))
     }
 
+    /// Whether a partially resident read may take both devices' layers at once (see [`Model::prefill_overlapped`]): two NVIDIA GPUs, a text prompt,
+    /// no warm-up that a request may stop, no deferred pass, and STRAYDOG_PREFILL_OVERLAP not 0.
+    fn overlap_possible(&self) -> bool {
+        prefill_overlap() && self.partial && !self.group.parts() && self.group.backends.len() == 2 && self.images.is_empty()
+            && self.warm_stop.is_none() && !self.deferred && overlap_split_ok(self.group.split())
+    }
+
+    /// A read of `batches` through both devices at the same time: the first device runs the first layers of a batch and hands its rows to the
+    /// second through host memory, which runs the rest (and the MTP layer's pairs) while the first device already has the next batch. Each device
+    /// still runs its own layers in order, one batch at a time, with the kernels, rows and sums of the serial path; only which batch a device
+    /// holds meanwhile differs. The caller drains it (this returns after the second device has finished every batch) where the serial code must
+    /// run: a checkpoint, the end of the read, a cancellation. The rows between the devices travel in two buffers made once for the segment and
+    /// handed back and forth. Where the buffers cannot be had the read is declined and the caller reads serially.
+    #[allow(clippy::type_complexity)]
+    fn prefill_overlapped(&mut self, tokens: &[u32], batches: &[(usize, usize)], batch: usize, cancelled: &dyn Fn() -> bool,
+                          progress: &mut dyn FnMut(usize, usize)) -> Result<Overlapped> {
+        let (position, stop) = (batches[0].0, batches[batches.len() - 1].1);
+        if stop > self.context || tokens[position..stop].iter().any(|token| *token as usize >= VOCABULARY) {
+            return Err("Straydog token or context is out of range".into());
+        }
+        let speculative = self.speculative > 0;
+        let widest = batches.iter().map(|(first, end)| end - first).max().unwrap_or(0);
+        let (Some(first_buffer), Some(second_buffer)) = (crate::gpu::zeroed_floats(widest * WIDTH), crate::gpu::zeroed_floats(widest * WIDTH)) else {
+            return Ok(Overlapped::Declined);
+        };
+        let began = Instant::now();
+        // Everything the batches write lies in `position..stop` (see `forward`): asked for once, before the second thread starts.
+        self.set_rope(position, stop - position)?;
+        self.ensure_kv(stop)?;
+        self.protect(position.saturating_sub(usize::from(speculative)), stop)?;
+        let split = self.group.split().ok_or("Straydog overlapped read: no layer split")?;
+        let spans = prefill_spans(&self.group.decoder_spans(1), 4);
+        let (spans_a, spans_b): (Vec<(usize, (usize, usize))>, Vec<(usize, (usize, usize))>) =
+            spans.iter().copied().enumerate().partition(|(_, (first, _))| *first < split);
+        if spans_a.is_empty() || spans_b.is_empty() || spans_a.iter().any(|(_, (_, last))| *last > split) {
+            return Err("Straydog overlapped read: the spans do not follow the split".into());
+        }
+        let completed = std::sync::atomic::AtomicUsize::new(position);
+        let before = self.final_hidden.clone();
+        // The borrows are split before the threads start, each part by itself: the weights shared (the second device's thread decodes the MTP pairs'
+        // token rows and a third reads each batch's rows ahead, both with `&Weights`, and the operands of the PLE layer and the MTP layer are
+        // borrowed from them: they live no longer than the borrow, as the compiler sees), the two devices each as a `&mut` of its own (this thread
+        // takes the first, the second's thread the second), and nothing of the Model else is touched until the scope has ended: what the first
+        // thread would have noted in it (the history, the draft vocabulary's tokens, the metrics) it keeps by the way and notes after.
+        let weights: &Weights = &self.weights;
+        let mtp_operands = if speculative { mtp_operands_of(weights)? } else { Vec::new() };
+        let ple_operands = ple_operands_of(weights)?;
+        let (first_device, second_device) = self.group.backend_pair()?;
+        let mut cut = false;
+        let mut failure: Option<String> = None;
+        let mut first_half = StageSeconds::default();
+        let mut dispatched = position;
+        let outcome: Result<(Option<Vec<f32>>, StageSeconds)> = std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, usize, Vec<f32>, Arc<Vec<f32>>)>(1);
+            let (give, take) = std::sync::mpsc::channel::<Vec<f32>>();
+            let _ = give.send(first_buffer);
+            let _ = give.send(second_buffer);
+            let (spans_b, mtp_operands, completed, ple_operands, spans_a) = (&spans_b, &mtp_operands, &completed, &ple_operands, &spans_a);
+            let worker = scope.spawn(move || -> Result<(Option<Vec<f32>>, StageSeconds)> {
+                let backend = second_device;
+                let mut previous = before;
+                // (the rows the MTP layer's device has kept from the batch before, for the pair that crosses two batches)
+                let mut carried = 0u64;
+                let mut times = StageSeconds::default();
+                let mut idle = Instant::now();
+                for (start, end, rows, token_rows) in receiver {
+                    times.idle += idle.elapsed().as_secs_f64();
+                    let busy = Instant::now();
+                    let batch_tokens = &tokens[start..end];
+                    let steps = batch_tokens.len();
+                    // The rows go up and their buffer goes back to the first device's thread at once: the upload has copied them out.
+                    backend.prefill_rows(spans_b[0].1 .0, &rows[..steps * WIDTH])?;
+                    let _ = give.send(rows);
+                    let mut final_row = Vec::new();
+                    for (_, (first, last)) in spans_b.iter() {
+                        // (the last row of the last span back: the MTP layer reads the rows from the device)
+                        let wanted = u64::from(*last == 48);
+                        let output = backend.prefill_layers(*first, *last, None, start as u64, steps as u64, wanted)?;
+                        if wanted > 0 {
+                            final_row = output;
+                        }
+                    }
+                    times.second += busy.elapsed().as_secs_f64();
+                    if speculative {
+                        let pairing = Instant::now();
+                        let host = if carried == 0 { previous.as_deref().filter(|_| start > 0) } else { None };
+                        mtp_prompt_pairs(backend, mtp_operands, &token_rows, batch_tokens, start, host, carried)?;
+                        carried = steps as u64;
+                        times.mtp += pairing.elapsed().as_secs_f64();
+                    }
+                    previous = Some(final_row);
+                    completed.store(end, std::sync::atomic::Ordering::Release);
+                    idle = Instant::now();
+                }
+                Ok((previous, times))
+            });
+            // A thread reads each batch's first-layer rows and PLE rows ahead (one batch queued), where the first device's thread read them between
+            // its batches: the device waited for them, and for the batch's PLE rows beside the first layer.
+            let (prepared_send, prepared) = std::sync::mpsc::sync_channel::<Result<(Arc<Vec<f32>>, Vec<f32>)>>(1);
+            scope.spawn(move || {
+                for &(start, end) in batches {
+                    let next = (end + batch).min(tokens.len());
+                    if prepared_send.send(prepare_batch(weights, tokens, start, end, next)).is_err() {
+                        break;
+                    }
+                }
+            });
+            for &(start, end) in batches {
+                if cancelled() {
+                    cut = true;
+                    break;
+                }
+                let waiting = Instant::now();
+                let Ok(mut rows) = take.recv() else { break };
+                first_half.blocked += waiting.elapsed().as_secs_f64();
+                let busy = Instant::now();
+                let mut token_rows = None;
+                let staged = prepared.recv().map_err(|_| "the overlapped read's batch preparation ended early".to_string()).and_then(|read| read)
+                    .and_then(|read| {
+                        token_rows = Some(read.0.clone());
+                        overlap_first_half(first_device, ple_operands, tokens, start, end, spans_a, &mut rows[..(end - start) * WIDTH], read, &mut first_half)
+                    });
+                first_half.first += busy.elapsed().as_secs_f64();
+                match staged {
+                    Ok(()) => {
+                        dispatched = end;
+                        let waiting = Instant::now();
+                        let Some(token_rows) = token_rows else { break };
+                        if sender.send((start, end, rows, token_rows)).is_err() {
+                            break;
+                        }
+                        first_half.blocked += waiting.elapsed().as_secs_f64();
+                        progress(completed.load(std::sync::atomic::Ordering::Acquire), tokens.len());
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            drop(sender);
+            drop(prepared);
+            worker.join().unwrap_or_else(|_| Err("a Straydog stage thread panicked".into()))
+        });
+        // (the batches the first device took are in the history, whatever became of the rest: as the serial path has them after each batch)
+        self.history.extend_from_slice(&tokens[position..dispatched]);
+        self.draft_note(&tokens[position..dispatched]);
+        self.metric_count("prefill_batches", batches.iter().filter(|(_, end)| *end <= dispatched).count() as u64);
+        let (row, second_half) = finish_device_work(outcome, failure.map_or(Ok(()), Err))?;
+        self.metric_count("prefill_overlap_batches", batches.len() as u64);
+        self.metric_add("prefill_overlap_seconds", began.elapsed().as_secs_f64());
+        self.metric_add("prefill_overlap_first_seconds", first_half.first);
+        self.metric_add("prefill_overlap_first_blocked_seconds", first_half.blocked);
+        self.metric_add("prefill_overlap_first_prep_seconds", first_half.prep);
+        self.metric_add("prefill_overlap_first_ple_seconds", first_half.ple);
+        self.metric_add("prefill_overlap_first_span_calls_seconds", first_half.span_calls);
+        self.metric_add("prefill_overlap_first_last_span_seconds", first_half.last_span);
+        self.metric_add("prefill_overlap_second_seconds", second_half.second);
+        self.metric_add("prefill_overlap_second_mtp_seconds", second_half.mtp);
+        self.metric_add("prefill_overlap_second_idle_seconds", second_half.idle);
+        if row.is_some() {
+            self.final_hidden = row.clone();
+        }
+        // (a cancel that came while the second device drained the last batches and its MTP pairs is the request's: the serial path looks right after each batch)
+        if overlap_stopped(cut, cancelled) {
+            return Ok(Overlapped::Cancelled);
+        }
+        progress(completed.load(std::sync::atomic::Ordering::Acquire), tokens.len());
+        match row {
+            Some(row) if stop == tokens.len() => Ok(Overlapped::Read(Some(self.head_logits(&row, false)?))),
+            _ => Ok(Overlapped::Read(None)),
+        }
+    }
+
     /// Whether a prompt's batches overlap on two GPUs: the first device starts batch n+1 on its
     /// layers while the second finishes batch n on its own, nothing waiting on the host between
     /// (with experts split, each also helps the other's batch on its helper stream).
@@ -3851,11 +4459,29 @@ impl Model {
             self.phase("verify: head", &mut clock);
             return Ok((Vec::new(), embeddings, hidden, targets, scores));
         }
-        let (first, embeddings, hidden) = self.verify_rows(tokens)?;
+        let (first, embeddings, rows) = self.verify_rows(tokens, true)?;
         let mut clock = Instant::now();
-        let (targets, scores, _) = self.with_operands(Model::head_operands, |group, operands| {
-            group.output_head(operands, &hidden, sampling, top, false)
-        })?;
+        // (STRAYDOG_PIPELINE: the head on the second GPU alone, as the pipelined passes run it, so that two runs are the same arithmetic)
+        let alone = self.frozen_now() && self.group.backends.len() == 2;
+        let (targets, scores, hidden) = match rows {
+            Some(hidden) => {
+                let (targets, scores, _) = self.with_operands(Model::head_operands, |group, operands| {
+                    if alone { group.output_head_alone(operands, &hidden, sampling, top, false) } else { group.output_head(operands, &hidden, sampling, top, false) }
+                })?;
+                (targets, scores, hidden)
+            }
+            // (the last span left its rows in its device's workspace: the head reads them there, and hands them back with its answer)
+            None => {
+                let ((targets, scores, _), hidden) = self.with_operands(Model::head_operands, |group, operands| {
+                    if alone {
+                        group.output_head_chained_alone(operands, 47, tokens.len(), sampling, top, false)
+                    } else {
+                        group.output_head_chained(operands, 47, tokens.len(), sampling, top, false)
+                    }
+                })?;
+                (targets, scores, hidden)
+            }
+        };
         self.phase("verify: head", &mut clock);
         Ok((first, embeddings, hidden, targets, scores))
     }
@@ -3865,7 +4491,8 @@ impl Model {
     fn prefill_verified(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let mut rows = Vec::with_capacity(tokens.len() * WIDTH);
         for chunk in tokens.chunks(PROMPT_ROWS) {
-            let (first, embeddings, hidden) = self.verify_rows(chunk)?;
+            let (first, embeddings, hidden) = self.verify_rows(chunk, false)?;
+            let hidden = hidden.ok_or("Straydog verification has no rows")?;
             self.commit(chunk, chunk.len(), &first, &embeddings)?;
             rows.extend_from_slice(&hidden);
         }
@@ -3897,7 +4524,16 @@ impl Model {
         Ok(embeddings)
     }
 
-    fn verify_rows(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    /// Whether a verification's first layer and its PLE layer follow each other on the device (see [`Group::front_chained`]): a fully resident
+    /// model's, and a partially resident one's on CUDA, where the first layer's hybrid handshake ends in a wait and nothing is read back or
+    /// uploaded between the layers. `STRAYDOG_FRONT_CHAIN=0` keeps the rows going through the host there.
+    fn front_chained(&self) -> bool {
+        self.group.front_chained() && (!self.partial || (cfg!(feature = "cuda") && front_chain_wanted()))
+    }
+
+    /// The rows through the first layer, the PLE layer and the spans. With `keep`, a partially resident model's rows may stay on the device
+    /// after the last span (`None`: in its workspace, for [`Group::output_head_chained`]).
+    fn verify_rows(&mut self, tokens: &[u32], keep: bool) -> Result<(Vec<f32>, Vec<f32>, Option<Vec<f32>>)> {
         // (every row verified is written, kept or not)
         let mut clock = Instant::now();
         self.ensure_kv(self.history.len() + tokens.len())?;
@@ -3906,18 +4542,43 @@ impl Model {
         self.prefetch_ple(&self.history, tokens)?;
         let hidden = tile(&self.token_embeddings(tokens)?);
         self.phase("verify: protect, PLE prefetch, embeddings", &mut clock);
-        let (first, embeddings, mut hidden) = if !self.partial && self.group.front_chained() {
+        let chained = self.front_chained();
+        // (`None`: the PLE layer's rows are in the first span's workspace, which continues from them)
+        let (first, embeddings, mut hidden) = if chained {
             // The first layer runs on the device while the host waits for the PLE rows; the PLE layer then follows it
-            // there, and one wait reads back both layers' rows.
+            // there, and one wait reads back both layers' rows. (A partially resident model's: the first layer's rows are
+            // not read back, the PLE layer follows them in place, and the first span continues from the workspace.)
             self.group.verify_queue(0, 1, &hidden, position)?;
             self.phase("verify: first layer", &mut clock);
             let embeddings = self.ple_embeddings(tokens)?;
             self.phase("verify: PLE rows wait", &mut clock);
-            let (first, hidden) = self.with_operands(Model::ple_operands, |group, operands| {
-                group.ple_front("blk.1.", &embeddings, operands)
-            })?;
-            self.phase("verify: PLE layer", &mut clock);
-            (first, embeddings, hidden)
+            if self.partial && !front_chain_checked() {
+                self.with_operands(Model::ple_operands, |group, operands| group.ple_front_queue("blk.1.", &embeddings, operands))?;
+                self.phase("verify: PLE layer", &mut clock);
+                (Vec::new(), embeddings, None)
+            } else {
+                let (first, hidden) = self.with_operands(Model::ple_operands, |group, operands| {
+                    group.ple_front("blk.1.", &embeddings, operands)
+                })?;
+                if self.partial {
+                    // The check: the PLE state back to its snapshot and the layer again as the rows through the host take it.
+                    self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;
+                    let again = self.with_operands(Model::ple_operands, |group, operands| {
+                        group.ple_rows("blk.1.", &first, &embeddings, operands)
+                    })?;
+                    let differing = hidden.iter().zip(&again).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    static PROOF: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+                    let mut proof = PROOF.lock().unwrap();
+                    proof.0 += differing as u64;
+                    proof.1 += 1;
+                    if proof.1 % 100 == 0 {
+                        eprintln!("Straydog row proofs: first layer chain: {} floats differ in {} passes", proof.0, proof.1);
+                    }
+                }
+                self.phase("verify: PLE layer", &mut clock);
+                // (a partially resident model's first span continues from the workspace either way)
+                (first, embeddings, if self.partial { None } else { Some(hidden) })
+            }
         } else {
             let first = self.group.verify_span(0, 1, &hidden, position)?;
             self.phase("verify: first layer", &mut clock);
@@ -3928,17 +4589,34 @@ impl Model {
                 group.ple_rows("blk.1.", &first, &embeddings, operands)
             })?;
             self.phase("verify: PLE layer", &mut clock);
-            (first, embeddings, hidden)
+            (first, embeddings, Some(hidden))
         };
         let layers = Instant::now();
+        // The spans chained: each continues from its device's workspace, the rows crossing from the first device to the second GPU to GPU
+        // (the fully resident model's route), and the rows after the last span staying there for the head (a partially resident model's
+        // spans end in a wait, their layers' hand-off with the host being a host loop, but read nothing back).
+        let chain = keep && hidden.is_none() && self.group.chains_verification();
+        let mut after = 1;
         for (index, (begin, end)) in self.group.decoder_spans(1).into_iter().enumerate() {
-            hidden = self.group.verify_span(begin, end, &hidden, position)?;
+            if chain {
+                self.group.verify_chain(after, begin, end, tokens.len(), position)?;
+                after = end;
+            } else {
+                hidden = Some(match hidden.take() {
+                    Some(rows) => self.group.verify_span(begin, end, &rows, position)?,
+                    None if index == 0 => self.group.verify_span_in_place(begin, end, tokens.len(), position)?,
+                    None => return Err("Straydog verification lost its rows".into()),
+                });
+            }
             self.phase(["verify: layers (first device)", "verify: layers (second device)"][index.min(1)], &mut clock);
+        }
+        if !chain && hidden.is_none() {
+            return Err("Straydog verification has no rows".into());
         }
         if tokens.len() == 1 {
             self.assist_pass(layers.elapsed().as_secs_f64());
         }
-        Ok((first, embeddings, hidden))
+        Ok((first, embeddings, if chain { None } else { hidden }))
     }
 
     /// Keep the first `kept` verified tokens; replay DeltaNet and PLE state for the rest.
@@ -3950,7 +4628,7 @@ impl Model {
         self.phase("commit: DeltaNet replay", &mut clock);
         if kept < tokens.len() {
             let embeddings = &embeddings[..kept * HIDDEN];
-            if !self.partial && self.group.front_chained() {
+            if self.front_chained() {
                 self.with_operands(Model::ple_operands, |group, operands| group.ple_replay("blk.1.", embeddings, operands))?;
             } else {
                 self.group.copy_state("@ple:blk.1.", "@ple-snapshot:blk.1.", "blk.1.")?;
@@ -4017,6 +4695,10 @@ impl Model {
 
     /// A decode pass of one row took `seconds` over its layers: a window of a round, if one is under way.
     fn assist_pass(&mut self, seconds: f64) {
+        // (STRAYDOG_PIPELINE: the assist level and the slots stay as they are, so that two runs are the same arithmetic)
+        if self.frozen_now() {
+            return;
+        }
         // (a request whose passes the assist's round timed: decode rates of such a request are no other's, its drafts left out)
         if self.assist_probing() {
             self.metric_count("assist_round_passes", 1);
@@ -4050,7 +4732,7 @@ impl Model {
 
     /// Whether the tuner has the passes: not a model that verifies known rows, nor one whose levels a test scripts.
     fn assist_tuning(&self) -> bool {
-        self.forced_rows.is_none() && self.assist_script.is_none()
+        self.forced_rows.is_none() && self.assist_script.is_none() && !self.frozen_now()
     }
 
     /// Whether the passes now are timed as windows of a round: those of a speculating model have no drafts, so that each has one row.
@@ -4086,36 +4768,50 @@ impl Model {
     /// would otherwise read of them on the GPU (its argmax, its top k), for the mask on the host: 1 MB a row. (IQ3_XXS at --vram 8.5 with
     /// the drafter on CUDA, each order once: 0.7 ms a token more at the card's sampling, 2.8%; 1.3 ms greedy, 5%.)
     #[allow(clippy::too_many_arguments)]
+    /// `resume`: the request taken over from the pipelined loop where it stands (the token chosen and its pairs for the drafter, the tokens
+    /// produced so far), and `stretch`: the produced count at which to hand it back at a pass's end, with its state, instead of ending it.
+    #[allow(clippy::too_many_arguments)]
     fn generate_speculative(&mut self, logits: &[f32], max_new: usize, sampling: &Sampling, rng: &mut Rng,
-                            cancelled: &dyn Fn() -> bool, started: Instant, emit: &mut dyn FnMut(u32), mut held: Option<&mut Constraint>)
-                            -> Result<()> {
-        let mut generated = Generated::new(VOCABULARY);
-        let mut token = constraint::pick(logits, sampling, &generated, rng, &mut held)?;
-        generated.insert(token);
-        if END_TOKENS.contains(&token) {
-            return Ok(());
+                            cancelled: &dyn Fn() -> bool, started: Instant, emit: &mut dyn FnMut(u32), mut held: Option<&mut Constraint>,
+                            resume: Option<pipeline::Hand>, stretch: Option<usize>) -> Result<Option<pipeline::Hand>> {
+        let resumed = resume.is_some();
+        let (mut generated, mut token, mut produced, mut mtp_hidden, mut mtp_tokens, mut mtp_position);
+        if let Some(hand) = resume {
+            (generated, token, produced) = (hand.generated, hand.token, hand.produced);
+            (mtp_hidden, mtp_tokens, mtp_position) = (hand.mtp_hidden, hand.mtp_tokens, hand.mtp_position);
+        } else {
+            generated = Generated::new(VOCABULARY);
+            token = constraint::pick(logits, sampling, &generated, rng, &mut held)?;
+            generated.insert(token);
+            if END_TOKENS.contains(&token) {
+                return Ok(None);
+            }
+            self.last_metrics.insert("ttft_seconds".into(), json!(started.elapsed().as_secs_f64()));
+            for (key, value) in [("generated_tokens", 1), ("speculative_passes", 0), ("drafted_tokens", 0), ("accepted_tokens", 0)] {
+                self.last_metrics.insert(key.into(), json!(value));
+            }
+            emit(token);
+            produced = 1usize;
+            // The MTP layer pairs each hidden state with the token after it, at the hidden's position.
+            mtp_hidden = self.final_hidden.clone().ok_or("Straydog has no hidden state to draft from")?;
+            mtp_tokens = vec![token];
+            mtp_position = self.history.len() as u64 - 1;
         }
-        self.last_metrics.insert("ttft_seconds".into(), json!(started.elapsed().as_secs_f64()));
-        for (key, value) in [("generated_tokens", 1), ("speculative_passes", 0), ("drafted_tokens", 0), ("accepted_tokens", 0)] {
-            self.last_metrics.insert(key.into(), json!(value));
-        }
-        emit(token);
-        let mut produced = 1usize;
-        // The MTP layer pairs each hidden state with the token after it, at the hidden's position.
-        let mut mtp_hidden = self.final_hidden.clone().ok_or("Straydog has no hidden state to draft from")?;
-        let mut mtp_tokens = vec![token];
-        let mut mtp_position = self.history.len() as u64 - 1;
         // A long match with the sequence so far is copied rather than drafted (an edit repeats its source): those drafts are
         // accepted nearly always, and the drafter's steps are saved. The MTP layer still takes the kept rows' pairs.
         let mut ngrams = Ngrams::new();
         ngrams.extend(&self.history);
         let mut policy = Policy::new(self.copy_drafts + 1);
-        if let Some(chooser) = self.width.as_mut() {
+        if let Some(chooser) = self.width.as_mut().filter(|_| !resumed) {
             chooser.begin_request();
         }
         while produced < max_new {
             if cancelled() {
                 break;
+            }
+            if stretch.is_some_and(|stop| produced >= stop) {
+                // (handed back at a pass's end: the pairs the drafter has not caught up on go with it)
+                return Ok(Some(pipeline::Hand { generated, token, produced, mtp_hidden, mtp_tokens, mtp_position }));
             }
             let pass_started = Instant::now();
             // (while a round of the assist's tuner times decode passes of one row, none has drafts: crate::assist)
@@ -4136,7 +4832,7 @@ impl Model {
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let copy_limit = if probing || plan.probe { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            let copy_limit = if probing || plan.probe || self.pipeline.no_copy() { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
@@ -4175,9 +4871,17 @@ impl Model {
             let mut clock = Instant::now();
             let (accepted, following) = match (held.as_deref_mut(), scores.as_mut()) {
                 (Some(held), Some(Scores::Logits(logits))) => held.accept_rows(&drafts, &proposed, logits, VOCABULARY, sampling, &mut generated, rng)?,
+                // (STRAYDOG_PIPELINE: the tokens are the target's draws keyed by position, the scheme the pipelined passes use too)
+                (None, Some(Scores::Logits(logits))) if self.frozen_now() && proposed.is_empty() => {
+                    let seed = self.sample_seed;
+                    sampling::accept_keyed(&drafts, logits, VOCABULARY, sampling, &mut generated, &|index| Rng::keyed(seed, position + index as u64))
+                }
                 _ => Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng),
             };
             self.phase("accept", &mut clock);
+            if self.pipeline.pass_log() {
+                eprintln!("Straydog pass: position {position} rows {rows:?} accepted {accepted} following {following}");
+            }
             generated.insert(following);
             if copied {
                 policy.record(drafts.len(), accepted);
@@ -4269,7 +4973,7 @@ impl Model {
         if !mtp_tokens.is_empty() && self.forced_rows.is_none() {
             self.draft(&mtp_hidden, &mtp_tokens, mtp_position, 0, sampling, rng, None)?;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Generate without truncation or hidden retry, resuming from the longest prefix already
@@ -4300,15 +5004,34 @@ impl Model {
             self.pass_counts = [0; PARTIAL_ROWS];
             self.memory_before = crate::host::memory_note();
             self.fault_reads_before = crate::host::fault_reads();
-            self.read_aheads_before = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
-            self.cpu_phases_before = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
+            self.read_aheads_before = self.cpu_read_aheads();
+            self.cpu_phases_before = self.cpu_phase_ns();
         }
         let result = self.generate_request(tokens, max_new, sampling, seed, cancelled, progress, turn, checkpoint, emit, constraint);
         self.report_profile();
+        if result.is_ok() && self.partial {
+            self.report_state_digest();
+        }
         if result.as_ref().is_err_and(|error| error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED)) {
             self.recover_hybrid_wait()?;
         }
         result
+    }
+
+    /// The weights for a change (the drafter dropped, a table's row cache, the load): where nothing else holds them, which is everywhere but
+    /// while a pipelined request runs (its relay thread holds a counted reference to read the embeddings).
+    fn weights_mut(&mut self) -> &mut Weights {
+        std::sync::Arc::get_mut(&mut self.weights).expect("the weights are shared only while a pipelined request runs")
+    }
+
+    /// The read-aheads taken and left, and the phase times, of the CPU engines: the second device's engine (pipelined verification) adds its own.
+    fn cpu_read_aheads(&self) -> (u64, u64) {
+        [self.cpu.as_ref(), self.cpu_second.as_ref()].into_iter().flatten().map(CpuExperts::read_aheads).fold((0, 0), |sum, own| (sum.0 + own.0, sum.1 + own.1))
+    }
+
+    fn cpu_phase_ns(&self) -> [u64; 3] {
+        [self.cpu.as_ref(), self.cpu_second.as_ref()].into_iter().flatten().map(CpuExperts::phase_ns)
+            .fold([0; 3], |sum, own| [sum[0] + own[0], sum[1] + own[1], sum[2] + own[2]])
     }
 
     /// The request's PLE row counts and wait, and a partially resident model's decode step (milliseconds a generated token, its
@@ -4331,9 +5054,9 @@ impl Model {
             let read_back = crate::host::fault_reads().zip(self.fault_reads_before).map(|(now, before)| now.since(before));
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
-            let (taken, left) = self.cpu.as_ref().map_or((0, 0), CpuExperts::read_aheads);
+            let (taken, left) = self.cpu_read_aheads();
             // (the CPU's time a token by the engine's phases: where a faster kernel shows, or does not)
-            let phases = self.cpu.as_ref().map_or([0; 3], CpuExperts::phase_ns);
+            let phases = self.cpu_phase_ns();
             let cpu_phases: Vec<f64> = (0..3).map(|i| phases[i].saturating_sub(self.cpu_phases_before[i]) as f64 / 1e6 / generated).collect();
             // What the host spent outside the layers' routes in a decode step (the line's "other" is made of it and the layers' own time), on
             // every request, DS41_PROFILE or not, including a pass that verified drafts. The clocks were already taken; this only folds them.
@@ -4471,10 +5194,19 @@ impl Model {
         // (the last batch's delta was of where it began: the reply is past all of its images)
         self.set_rope_delta(self.history.len())?;
         let mut rng = Rng::new(seed);
+        self.sample_seed = seed;
         let Some(mut logits) = output else { return Ok(()) };
         self.assist_request();
+        let applies = self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token)
+            && self.pipeline_applies(sampling, constraint.as_deref());
+        self.pipeline_live_for(applies)?;
         if self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token) {
-            return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit, constraint);
+            // (greedy requests of a partially resident model on two GPUs, STRAYDOG_PIPELINE=1: the first GPU runs the next pass's
+            // layers while the second finishes this one's; any other takes the ordinary loop)
+            if applies {
+                return self.generate_pipelined(&logits, max_new, sampling, &mut rng, cancelled, started, emit);
+            }
+            return self.generate_speculative(&logits, max_new, sampling, &mut rng, cancelled, started, emit, constraint, None, None).map(|_| ());
         }
         let mut generated = Generated::new(VOCABULARY);
         for index in 0..max_new {
@@ -4509,6 +5241,28 @@ impl Model {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod device_failure_tests {
+    use super::finish_device_work;
+    use crate::gpu::HYBRID_WAIT_RECOVERED;
+
+    #[test]
+    fn a_device_fault_wins_over_a_recovered_wait_in_either_order() {
+        let fault = "an illegal memory access was encountered";
+        assert_eq!(finish_device_work::<()>(Err(HYBRID_WAIT_RECOVERED.into()), Err(fault.into())), Err(fault.into()));
+        assert_eq!(finish_device_work::<()>(Err(fault.into()), Err(HYBRID_WAIT_RECOVERED.into())), Err(fault.into()));
+        let closed = "the first device's thread ended without the device";
+        assert_eq!(finish_device_work::<()>(Err(HYBRID_WAIT_RECOVERED.into()), Err(closed.into())), Err(closed.into()));
+    }
+
+    #[test]
+    fn a_clean_finish_preserves_the_recovered_wait_or_the_work() {
+        assert_eq!(finish_device_work::<()>(Err(HYBRID_WAIT_RECOVERED.into()), Ok(())), Err(HYBRID_WAIT_RECOVERED.into()));
+        assert_eq!(finish_device_work(Ok(42), Ok(())), Ok(42));
+        assert_eq!(finish_device_work(Ok(42), Err(HYBRID_WAIT_RECOVERED.into())), Err(HYBRID_WAIT_RECOVERED.into()));
     }
 }
 
@@ -4608,6 +5362,17 @@ fn working_split(weights: &Weights, group: &mut Group, context: u64, prefill: us
 const NARROW_BATCH: usize = 2048;
 /// The GPU budgets in all from which the derived prefill batch is the widest.
 const WIDE_BATCH_BUDGET: u64 = 48 << 30;
+/// A partially resident model on two GPUs with this much budget in all (and under [`WIDE_BATCH_BUDGET`], where the batch is kept at 2048) reads in
+/// batches of [`PARTIAL_PAIR_BATCH`] rows: every batch streams the experts the slots do not hold again, whatever its rows, and the workspaces of
+/// 4096 rows take some 0.8 GiB a GPU from the slots, where borrowing them for a read (`Group::begin_long_prefill`) refilled the slots twice.
+const PARTIAL_PAIR_BUDGET: u64 = 40 << 30;
+const PARTIAL_PAIR_BATCH: usize = 4096;
+
+/// Whether a build on NVIDIA GPUs (`cuda`) with `devices` GPUs and `budget` bytes of VRAM budget in all is the pair of 24 GB cards that
+/// [`PARTIAL_PAIR_BATCH`] and [`PRESTAGE_SLOTS`] are for.
+fn partial_pair(cuda: bool, devices: usize, budget: u64) -> bool {
+    cuda && devices == 2 && (PARTIAL_PAIR_BUDGET..WIDE_BATCH_BUDGET).contains(&budget)
+}
 /// The rows a long read's batches may be, widest first, where the workspaces hold them (`wide_placement`).
 /// A multiple of the experts' chunk (4096 rows, `MOE_CHUNK_ROWS`): between two, the experts of a batch are read from VRAM in two chunks that are each
 /// narrower than 4096 and the batch pays them over more rows (two R9700s, `--vram 30`, a fresh 242K read: 50.0 s at 4096 rows, 5120 rows (2 x 2560)
@@ -4755,7 +5520,200 @@ fn validate_geometry(weights: &Weights) -> Result<()> {
 
 #[cfg(test)]
 mod placement_candidate_tests {
-    use super::{placement_candidates, resident_batch};
+    use super::{context_state_bytes, kv_fits_budget, partial_drafter_requirements, partial_requirements, placement_candidates, resident_batch, state_per_token,
+                KV_POSITION_BYTES};
+    use crate::gpu::KvFormat;
+
+    #[test]
+    fn a_whole_contexts_q8_kv_uses_its_actual_bytes_and_keeps_the_budgets_quarter() {
+        // At 262144 positions Q8 needs 3.1875 GiB, or 3.453125 GiB with MTP.
+        // FP16 still needs 6 / 6.5 GiB. Budgets here are totals, also for a pair of GPUs.
+        for (budget_gib, q8, f16) in [
+            (8, [false, false], [false, false]),
+            (10, [false, false], [false, false]),
+            (16, [true, true], [false, false]),
+            (20, [true, true], [false, false]),
+            (24, [true, true], [true, false]),
+            (32, [true, true], [true, true]),
+            (48, [true, true], [true, true]),
+        ] {
+            for (index, drafting) in [false, true].into_iter().enumerate() {
+                assert_eq!(kv_fits_budget(262144, drafting, KvFormat::Q8, budget_gib << 30), q8[index], "Q8, {budget_gib} GiB, MTP={drafting}");
+                assert_eq!(kv_fits_budget(262144, drafting, KvFormat::F16, budget_gib << 30), f16[index], "FP16, {budget_gib} GiB, MTP={drafting}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_kv_quarter_includes_its_exact_threshold_but_not_one_byte_less() {
+        // Whole-context byte counts times four: Q8's 272-byte rows, FP16's 512.
+        for (format, drafting, threshold) in [
+            (KvFormat::Q8, false, 13_690_208_256),
+            (KvFormat::Q8, true, 14_831_058_944),
+            (KvFormat::F16, false, 24u64 << 30),
+            (KvFormat::F16, true, 26u64 << 30),
+        ] {
+            assert!(!kv_fits_budget(262144, drafting, format, threshold - 1));
+            assert!(kv_fits_budget(262144, drafting, format, threshold));
+            assert!(kv_fits_budget(262144, drafting, format, threshold + 1));
+        }
+    }
+
+    #[test]
+    fn a_small_budget_still_has_host_candidates_after_the_vram_candidate() {
+        // The former host-only 5.5 GiB / 64K placement now admits Q8 in VRAM.
+        // Full residency still tries host K/V after it; this does not promise the partial gate fits.
+        let budget = 11u64 << 29;
+        for drafting in [false, true] {
+            assert!(kv_fits_budget(65536, drafting, KvFormat::Q8, budget));
+            assert_eq!(placement_candidates(256, false, kv_fits_budget(65536, drafting, KvFormat::Q8, budget)),
+                       [(false, 256), (true, 256)]);
+            // 128K retains the host-only candidate on the same card.
+            assert!(!kv_fits_budget(131072, drafting, KvFormat::Q8, budget));
+            assert_eq!(placement_candidates(256, false, kv_fits_budget(131072, drafting, KvFormat::Q8, budget)), [(true, 256)]);
+        }
+    }
+
+    #[test]
+    fn empty_kv_costs_nothing_and_nonempty_kv_never_fits_a_zero_budget() {
+        for format in [KvFormat::Q8, KvFormat::F16] {
+            for drafting in [false, true] {
+                assert!(kv_fits_budget(0, drafting, format, 0));
+                assert!(!kv_fits_budget(1, drafting, format, 0));
+                assert!(!kv_fits_budget(u64::MAX, drafting, format, u64::MAX));
+            }
+        }
+        // Four planes, one position, twelve layers: quarter-budget rounding is exact.
+        assert!(!kv_fits_budget(1, false, KvFormat::Q8, 52_223));
+        assert!(kv_fits_budget(1, false, KvFormat::Q8, 52_224));
+    }
+
+    #[test]
+    fn the_conservative_host_estimate_keeps_its_fp16_kv_subtraction() {
+        assert_eq!(state_per_token(false), 26_112);
+        assert_eq!(state_per_token(true), 28_288);
+        // Indexers, convolution and PLE remain in the host estimate after VRAM KV and recurrence are removed.
+        let recurrence = 36 * 48 * 128 * 128 * 4;
+        assert_eq!(context_state_bytes(262144, false) - 12 * 262144 * KV_POSITION_BYTES - recurrence, 409_016_320);
+        assert_eq!(context_state_bytes(262144, true) - 13 * 262144 * KV_POSITION_BYTES - recurrence, 442_575_360);
+    }
+
+    #[test]
+    fn the_partial_preflight_keeps_the_same_dense_weights_and_largest_staging_requirement() {
+        let dense = vec![("blk.0.attn_qkv.weight".into(), 12345), ("output.weight".into(), 67890)];
+        // IQ2_S gate/up + IQ4_NL down is 1971200 bytes; IQ4_XS gate/up raises it to 2662400.
+        assert_eq!(partial_requirements(dense.clone(), &[[22, 22, 20], [23, 23, 20]], 0),
+                   [dense[0].clone(), dense[1].clone(), ("@hybrid:staging".into(), 219_414_528)]);
+        // Wide reads retain their extra staging slots in the new preflight as in the partial gate.
+        assert_eq!(partial_requirements(dense.clone(), &[[22, 22, 20], [23, 23, 20]], 192),
+                   [dense[0].clone(), dense[1].clone(), ("@hybrid:staging".into(), 730_595_328)]);
+    }
+
+    #[test]
+    fn the_partial_drafter_gate_keeps_dense_weights_and_verification_room_without_its_routed_banks() {
+        let target = vec![("output.weight".into(), 67890)];
+        let drafter = vec![("mtp.fc_hidden.weight".into(), 4096), ("blk.48.ffn_gate_exps.weight".into(), 1u64 << 30)];
+        assert_eq!(partial_drafter_requirements(target.clone(), drafter),
+                   [target[0].clone(), ("mtp.fc_hidden.weight".into(), 4096),
+                    ("@verify:buffers".into(), 136_314_880), ("@hybrid:slots".into(), 134_217_728)]);
+    }
+
+    /// The same real placement gate used before reserve: a short context newly eligible for
+    /// Q8 in VRAM would crowd out dense weights that the old host path can still keep.
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore = "requires a GPU; run under the GPU lock with Q8 K/V"]
+    fn a_partial_vram_kv_refusal_keeps_the_old_host_path_with_small_indexers() {
+        use crate::gpu::Backend;
+        use crate::group::{Group, SplitMode};
+
+        assert_eq!(KvFormat::selected(), KvFormat::Q8, "this regression exercises Q8 placement");
+        let budget = 4u64 << 30;
+        let group = Group::new(&[0], &[budget], SplitMode::Layer).unwrap();
+        let (used, _) = group.memory().unwrap();
+        let kinds = [[22, 22, 20]; 48];
+        let staging = partial_requirements(Vec::new(), &kinds, 0)[0].1;
+        for drafting in [false, true] {
+            // The old FP16 estimate rejected VRAM; Q8 makes it a candidate at this budget.
+            assert!(!kv_fits_budget(65536, drafting, KvFormat::F16, budget));
+            assert!(kv_fits_budget(65536, drafting, KvFormat::Q8, budget));
+            let vram = group.planned_state_bytes(65536, 256, drafting, false).unwrap();
+            let host_start = group.planned_state_bytes(32768, 256, drafting, true).unwrap();
+            let host_full = group.planned_state_bytes(65536, 256, drafting, true).unwrap();
+            // Fill the old host path's exact available dense room, not an arbitrary safety margin.
+            let dense = budget.checked_sub(used + Backend::slack(budget) + host_start[0] + staging).unwrap();
+            let requirements = partial_requirements(vec![("blk.0.attn_qkv.weight".into(), dense)], &kinds, 0);
+            assert!(group.can_pin_model(&requirements, Some(&host_start)).unwrap());
+            assert!(!group.can_pin_model(&requirements, Some(&vram)).unwrap());
+            // Checking the fallback at full context would wrongly refuse the old viable start.
+            assert!(!group.can_pin_model(&requirements, Some(&host_full)).unwrap());
+        }
+        // A separate boundary: target dense weights fit with VRAM K/V, but a requested
+        // drafter only fits on the old host path. The preflight must include its dense gate too.
+        let vram = group.planned_state_bytes(65536, 256, true, false).unwrap();
+        let host_start = group.planned_state_bytes(32768, 256, true, true).unwrap();
+        let dense = budget.checked_sub(used + Backend::slack(budget) + vram[0] + staging).unwrap();
+        let target = partial_requirements(vec![("blk.0.attn_qkv.weight".into(), dense)], &kinds, 0);
+        let with_drafter = partial_drafter_requirements(target.clone(), vec![("mtp.fc_hidden.weight".into(), 16 << 20)]);
+        assert!(group.can_pin_model(&target, Some(&vram)).unwrap());
+        assert!(!group.can_pin_model(&with_drafter, Some(&vram)).unwrap());
+        assert!(group.can_pin_model(&with_drafter, Some(&host_start)).unwrap());
+    }
+
+    /// A real model exercises the newly admitted KV placement, not just the byte gate.
+    /// STRAYDOG_MODEL_QUANT defaults to UD-IQ1_S; STRAYDOG_DRAFTER optionally adds MTP.
+    #[cfg(any(feature = "hip", feature = "cuda"))]
+    #[test]
+    #[ignore = "requires STRAYDOG_MODEL and a GPU; run under the GPU lock with Q8 K/V"]
+    fn a_partial_model_keeps_vram_kv_and_the_requested_drafter_across_requests() {
+        use std::path::PathBuf;
+        use super::{starting_kv, Model, Settings};
+        use crate::group::{Group, SplitMode};
+        use crate::sampling::Sampling;
+        use crate::text::Text;
+        use crate::weights::Weights;
+
+        assert_eq!(KvFormat::selected(), KvFormat::Q8, "this regression requires Q8 K/V");
+        let root = PathBuf::from(std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model bundle directory"));
+        let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
+        let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(PathBuf::from);
+        let drafting = drafter.is_some();
+        let (budget, context) = (8u64 << 30, 131072);
+        assert!(!kv_fits_budget(context, drafting, KvFormat::F16, budget), "the old FP16 estimate excludes this placement");
+        assert!(kv_fits_budget(context, drafting, KvFormat::Q8, budget), "the held Q8 rows fit a quarter of the budget");
+        let id = crate::bundle::Id::find(Some(crate::bundle::MODEL), None, &quant).unwrap();
+        let weights = Weights::open(&root, id, drafter.as_deref(), crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        let text = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
+        let mut group = Group::new(&[0], &[budget], SplitMode::Experts).unwrap();
+        group.configure_gemm(2, true).unwrap();
+        let settings = Settings { context: context as usize, state_budget_bytes: 8 << 30, prefill_batch_size: 256,
+                                  speculative: if drafting { 3 } else { 0 }, cpu_threads: 0, row_cache_bytes: None };
+        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+        assert!(model.partial && !model.resident && !model.host_kv,
+                "8 GiB / 128K must keep partial VRAM K/V: partial={} resident={} host={}", model.partial, model.resident, model.host_kv);
+        assert_eq!(model.kv_positions(), starting_kv(settings.context), "partial VRAM K/V starts small and grows with the sequence");
+        assert_eq!(model.speculative, settings.speculative, "the requested MTP drafter must not be dropped");
+        if drafting { assert!(model.weights.drafter, "the requested drafter remains authenticated and in use"); }
+        eprintln!("{}", serde_json::json!({"case":"partial_vram_kv_placement", "quant":quant, "budget":budget,
+            "context":context, "mtp_requested":drafting, "speculative":model.speculative, "partial":model.partial,
+            "kv_host":model.host_kv, "kv_positions":model.kv_positions(), "devices":model.group.info().unwrap()}));
+
+        let mut prompt = text.encode("<|im_start|>user\nWrite one complete sentence about why printed books are useful.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+        for request in 0..2 {
+            let mut tokens = Vec::new();
+            model.generate(&prompt, 8, &Sampling::GREEDY, 1, &|| false, &mut |_, _| {}, true, false, &mut |token| tokens.push(token)).unwrap();
+            assert!(!tokens.is_empty(), "request {request} must emit at least one token");
+            assert!(model.history.starts_with(&prompt), "request {request} keeps its prompt in the live sequence");
+            assert!(model.final_hidden().is_some_and(|row| row.iter().all(|value| value.is_finite())), "request {request} leaves finite hidden state");
+            assert!(!model.host_kv && model.speculative == settings.speculative, "request {request} keeps the tested placement");
+            eprintln!("{}", serde_json::json!({"case":"partial_vram_kv_request", "request":request,
+                "prompt_tokens":prompt.len(), "tokens":tokens, "metrics":model.last_metrics}));
+            if request == 0 {
+                prompt.extend_from_slice(&tokens);
+                prompt.extend(text.encode("<|im_end|>\n<|im_start|>user\nGive another use for printed books.<|im_end|>\n<|im_start|>assistant\n").unwrap());
+            }
+        }
+    }
 
     #[test]
     fn the_derived_wide_batch_keeps_vram_kv_at_the_narrow_one_before_host_kv_at_any() {
@@ -4787,6 +5745,102 @@ mod placement_candidate_tests {
         assert_eq!((resident_batch(5 << 30), resident_batch(8 << 30)), (256, 1024), "a small card's batches rest narrow");
         assert_eq!((resident_batch(40 << 30), resident_batch((48 << 30) - 1), resident_batch(48 << 30), resident_batch(64 << 30)),
                    (1024, 1024, 4096, 4096));
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::{overlap_batches, overlap_segment, overlap_split_ok, overlap_stopped, prefill_overlap_named};
+
+    /// Decides: which batches of a segment two devices take at once. All of them in batches of the given rows, but a last of one row, which is
+    /// the decode path's, and a segment of one batch is nothing to overlap.
+    #[test]
+    fn a_last_row_alone_stays_serial() {
+        assert_eq!(overlap_batches(0, 10, 4), vec![(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(overlap_batches(0, 9, 4), vec![(0, 4), (4, 8)]);
+        assert_eq!(overlap_batches(100, 100, 4096), vec![]);
+        assert_eq!(overlap_batches(0, 4096, 4096).len(), 1);
+        assert_eq!(overlap_batches(5, 12, 4), vec![(5, 9), (9, 12)]);
+        assert_eq!(overlap_batches(0, 1, 4096), vec![]);
+    }
+
+    /// Decides: a read in batches of fewer than two rows takes none of them at once (a batch of one row is the decode path's, and the first
+    /// device's span call takes two rows or more), where a batch of two rows is overlapped as any other, its odd last row apart.
+    #[test]
+    fn batches_of_one_row_stay_serial() {
+        assert_eq!(overlap_batches(0, 5, 1), vec![]);
+        assert_eq!(overlap_batches(3, 100, 1), vec![]);
+        assert_eq!(overlap_batches(0, 5, 0), vec![]);
+        assert_eq!(overlap_batches(0, 5, 2), vec![(0, 2), (2, 4)]);
+        assert_eq!(overlap_batches(0, 4, 2), vec![(0, 2), (2, 4)]);
+        assert_eq!(overlap_batches(0, 3, 2), vec![(0, 2)]);
+    }
+
+    /// Decides: where the overlap cannot be taken (HIP, one GPU, the layers in parts) no list of the segment's batches is built, whatever its size
+    /// (the serial loop asks at each of its batches: a list of what remains each time was a quadratic cost on paths that must not change). A segment of
+    /// 2^60 rows in batches of 2 would not fit in memory as a list; where the overlap is eligible the list is the segment's batches, and a segment of
+    /// fewer than two batches is nothing to overlap.
+    #[test]
+    fn an_ineligible_segment_builds_no_list() {
+        assert_eq!(overlap_segment(false, 0, 1usize << 60, 2), None);
+        assert_eq!(overlap_segment(false, 0, 10, 4), None);
+        assert_eq!(overlap_segment(true, 0, 10, 4), Some(vec![(0, 4), (4, 8), (8, 10)]));
+        assert_eq!(overlap_segment(true, 0, 4, 4), None);
+        assert_eq!(overlap_segment(true, 0, 10, 1), None);
+    }
+
+    /// Decides: a cancel that comes after the first device's loop has ended (while the second device drains the last batches) stops the read, as
+    /// one before a batch does: the closure of a request that turns true after a number of looks.
+    #[test]
+    fn a_cancel_during_the_drain_is_seen() {
+        let looks = std::cell::Cell::new(0);
+        let cancelled = || { looks.set(looks.get() + 1); looks.get() > 2 };
+        assert!(!overlap_stopped(false, &cancelled));
+        assert!(!overlap_stopped(false, &cancelled));
+        assert!(overlap_stopped(false, &cancelled));
+        assert!(overlap_stopped(true, &|| false));
+        assert!(!overlap_stopped(false, &|| false));
+    }
+
+    /// Decides: the overlap needs layer 0 and the PLE layer (layer 1) on the first device, so the second device's first layer is the second or
+    /// later; a split at layer 1 or none (one device) reads serially.
+    #[test]
+    fn the_first_device_holds_layer_one() {
+        assert!(!overlap_split_ok(None));
+        assert!(!overlap_split_ok(Some(0)));
+        assert!(!overlap_split_ok(Some(1)));
+        assert!(overlap_split_ok(Some(2)));
+        assert!(overlap_split_ok(Some(26)));
+    }
+
+    /// Decides: STRAYDOG_PREFILL_OVERLAP=0 turns the overlap off; unset, empty or any other text leaves it on.
+    #[test]
+    fn the_switch_is_off_only_at_zero() {
+        assert!(prefill_overlap_named(None));
+        assert!(prefill_overlap_named(Some("1")));
+        assert!(prefill_overlap_named(Some("")));
+        assert!(!prefill_overlap_named(Some("0")));
+        assert!(!prefill_overlap_named(Some(" 0 ")));
+    }
+}
+
+#[cfg(test)]
+mod partial_pair_tests {
+    use super::{partial_pair, PRESTAGE_BATCH, PARTIAL_PAIR_BATCH, WIDE_BATCH_BUDGET};
+
+    /// Decides: the wide batch and the prestage are for two NVIDIA GPUs with 40 to 48 GiB of budget in all (two 24 GB cards); one GPU,
+    /// three, a smaller or a larger pair (which keeps its 2048-row batch), and a build for another vendor keep what they had.
+    #[test]
+    fn two_cards_of_24_gb_only() {
+        const G: u64 = 1 << 30;
+        assert!(partial_pair(true, 2, 45 * G));
+        assert!(partial_pair(true, 2, 40 * G));
+        assert!(!partial_pair(true, 2, 40 * G - 1));
+        assert!(!partial_pair(true, 2, WIDE_BATCH_BUDGET));
+        assert!(!partial_pair(true, 1, 45 * G));
+        assert!(!partial_pair(true, 3, 45 * G));
+        assert!(!partial_pair(false, 2, 45 * G));
+        assert!(PARTIAL_PAIR_BATCH >= PRESTAGE_BATCH);
     }
 }
 
@@ -5166,6 +6220,20 @@ mod layer_prefill_tests {
         assert_eq!(hc_fused_from_named(Some(" blas ")), usize::MAX);
     }
 
+    /// Decides: a K/V starts at 32768 positions (the context if that is smaller), at STRAYDOG_KV_START's in whole thousands of them, and at the whole
+    /// context where it says 0 or a number of positions the context does not have; a value that is no number is not one.
+    #[test]
+    fn the_kv_starts_at_32768_unless_the_variable_names_another_start() {
+        use super::{starting_kv_named, STARTING_KV};
+        assert_eq!(starting_kv_named(None, 262_144), STARTING_KV);
+        assert_eq!(starting_kv_named(None, 16_384), 16_384);
+        assert_eq!(starting_kv_named(Some("65536"), 262_144), 65_536);
+        assert_eq!(starting_kv_named(Some(" 40000 "), 262_144), 40_960);
+        assert_eq!(starting_kv_named(Some("0"), 262_144), 262_144);
+        assert_eq!(starting_kv_named(Some("999999"), 262_144), 262_144);
+        assert_eq!(starting_kv_named(Some("many"), 262_144), STARTING_KV);
+    }
+
     /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.
     #[test]
     fn the_rows_are_held_in_vram_unless_the_variable_says_0() {
@@ -5236,3 +6304,6 @@ mod layer_prefill_tests {
 #[cfg(all(test, feature = "prefill-observer", any(feature = "hip", feature = "cuda")))]
 #[path = "layer_prefill_diagnostics.rs"]
 mod layer_prefill_diagnostics;
+
+#[path = "model_pipeline.rs"]
+mod pipeline;

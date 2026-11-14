@@ -640,6 +640,8 @@ struct Engine {
     std::vector<Q8K> x_int;
     std::vector<Q8S> products_int;
     std::vector<float> gate_up, products, x_lanes, down_rows;
+    // The engine's scratch and its pool serve one call at a time: two GPUs' threads (a prompt read through both at once) take turns.
+    std::mutex call_lock;
     // A call's routes: each one's row and distinct expert, the distinct experts' first routes, and their routes grouped by expert.
     std::vector<uint32_t> route_row, route_expert, distinct, members_first, members, members_fill;
     uint64_t calls = 0, experts = 0, projection_ns = 0, product_ns = 0, down_ns = 0;
@@ -791,14 +793,30 @@ void quantize_q2_0_blocks(const uint16_t* input, size_t first, size_t last, uint
 extern "C" {
 const char* sd_cpu_error() { return cpu_error.c_str(); }
 
-void* sd_cpu_experts_create(uint32_t threads) {
-    try {
-        if (!threads) {
+}  // extern "C"
+
+// The threads sd_cpu_experts_create takes for 0: one a physical core (the core enumeration allocates, and may throw).
+static uint32_t default_threads() {
+    uint32_t threads = 0;
 #if defined(__linux__) || defined(_WIN32)
-            threads = uint32_t(physical_cores().size());
+    threads = uint32_t(physical_cores().size());
 #endif
-            if (!threads) threads = std::max(1u, std::thread::hardware_concurrency() / 2);
-        }
+    return threads ? threads : std::max(1u, std::thread::hardware_concurrency() / 2);
+}
+
+extern "C" {
+// The same, into `threads`: 0 and the error in sd_cpu_error, or -1 (nothing crosses this boundary as an exception).
+int sd_cpu_default_threads(uint32_t* threads) {
+    try {
+        if (!threads) throw std::runtime_error("invalid Straydog CPU thread count output");
+        *threads = default_threads();
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
+
+void* sd_cpu_experts_create(uint32_t threads, uint32_t first_core) {
+    try {
+        if (!threads) threads = default_threads();
         if (threads > 256) throw std::runtime_error("invalid Straydog CPU expert thread count");
         auto engine = std::make_unique<Engine>();
 #ifdef SD_X86
@@ -822,7 +840,7 @@ void* sd_cpu_experts_create(uint32_t threads) {
             if (engine->int_level >= 2) engine->isa = cpu_has("avx512vnni") ? "avx512-vnni-int8" : "avx512-int8";
             else engine->isa = cpu_has("avxvnni") ? "avx2-vnni-int8" : "avx2-int8";
         }
-        engine->workers = std::make_unique<Workers>(threads);
+        engine->workers = std::make_unique<Workers>(threads, first_core);
         return engine.release();
     } catch (const std::exception& e) { cpu_error = e.what(); return nullptr; }
 }
@@ -964,6 +982,7 @@ int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* coun
         if (!engine || !kinds || !rows || rows > 65536 || !counts || !gate || !up || !down || !weights || !xs || !outs || !hidden ||
             !inter || hidden > 65536 || inter > 65536)
             throw std::runtime_error("invalid Straydog CPU expert request");
+        std::lock_guard<std::mutex> turn(engine->call_lock);
         size_t count = 0;
         for (uint32_t r = 0; r < rows; ++r) {
             if (counts[r] > 64 || !xs[r] || !outs[r]) throw std::runtime_error("invalid Straydog CPU expert request");
@@ -1185,6 +1204,7 @@ int sd_cpu_read_ahead(void* handle, const uint8_t* const* ranges, const uint64_t
     try {
         auto* engine = static_cast<Engine*>(handle);
         if (!engine || !ranges || !bytes) throw std::runtime_error("invalid Straydog CPU read-ahead request");
+        std::lock_guard<std::mutex> turn(engine->call_lock);
 #if defined(__linux__)
         // Round each range's chunk count up separately: a chunk never drops the start of the next range.
         const sd_cpu::ReadAheadRanges chunks(bytes, count);
@@ -1244,6 +1264,7 @@ int sd_cpu_gather(void* handle, const uint8_t* const* sources, uint8_t* const* t
         auto* engine = static_cast<Engine*>(handle);
         if (!engine || !sources || !targets || !bytes || count > 4096)
             throw std::runtime_error("invalid Straydog CPU gather request");
+        std::lock_guard<std::mutex> turn(engine->call_lock);
         uint64_t total = 0;
         for (uint32_t i = 0; i < count; ++i) {
             if (!sources[i] || !targets[i]) throw std::runtime_error("invalid Straydog CPU gather range");

@@ -7,15 +7,38 @@
 // still computed by the GPU expert GEMM. Every routed expert always contributes.
 // Each row: selected | probabilities | activation, then its CPU result (a kernel steps through the rows by hybrid_row_floats).
 constexpr size_t hybrid_row_export = 2608, hybrid_row_floats = hybrid_row_export + 2560, hybrid_rows = 4;
-constexpr size_t hybrid_export_at(size_t row) { return row * hybrid_row_floats; }
-constexpr size_t hybrid_result_at(size_t row) { return hybrid_export_at(row) + hybrid_row_export; }
-constexpr size_t hybrid_sequence_slot = hybrid_rows * hybrid_row_floats;     // export completion counter (uint32)
+// Two layers' exchanges, by the layer's parity: a layer's router writes its export beside the one the host may still be reading, so the GPU needs
+// the host's publish of the layer before the last (hybrid_await) and not of the one before.
+constexpr size_t hybrid_slot_floats = hybrid_rows * hybrid_row_floats;
+constexpr size_t hybrid_export_at(size_t row, size_t slot = 0) { return slot * hybrid_slot_floats + row * hybrid_row_floats; }
+constexpr size_t hybrid_result_at(size_t row, size_t slot = 0) { return hybrid_export_at(row, slot) + hybrid_row_export; }
+// CUDA: an export slot to each layer of the model (the MTP layer 48 last), so that a layer's export is written where no other layer's was and nothing
+// waits for the host to have read one before the next is written; HIP: the two by parity, as above.
+#if defined(__HIPCC__)
+constexpr size_t hybrid_layer_slots = 2;
+constexpr size_t hybrid_slot_of(size_t layer) { return layer & 1; }
+#else
+constexpr size_t hybrid_layer_slots = 49;
+constexpr size_t hybrid_slot_of(size_t layer) { return layer; }
+#endif
+constexpr size_t hybrid_sequence_slot = hybrid_layer_slots * hybrid_slot_floats;     // export completion counter (uint32)
 constexpr size_t hybrid_exchange_floats = hybrid_sequence_slot + 16;
+// d.cpu_partial (device): the rows' staged CPU results and the plan's room after them, two exports' worth as before.
+constexpr size_t hybrid_partial_floats = 2 * hybrid_slot_floats + 16;
+// DS41_PROFILE=hc (CUDA): after those, a layer's gate and up, products and down once more, in one launch for all its routes (hybrid_resident_experts holds
+// the overlapped layer's outputs against them).
+#if !defined(__HIPCC__)
+inline size_t hybrid_check_scratch_floats() {
+    const char* profile = std::getenv("DS41_PROFILE");
+    return profile && std::strstr(profile, "hc") ? hybrid_rows * 11 * (1280 + 640 + 2560) : 0;
+}
+#else
+inline size_t hybrid_check_scratch_floats() { return 0; }
+#endif
 // From hybrid_sequence_slot, as uint32: +1 CPU results published by the host, +2 results
 // awaited by the GPU (hybrid_await), +3 nonzero once an await gave up.
 constexpr size_t hybrid_published_slot = 1, hybrid_awaited_slot = 2, hybrid_await_failed_slot = 3;
-// Device::flags[4] retains an await failure across spans until checked recovery;
-// pool creation clears [0..3], timing uses [8..15], router counters start at [16].
+// Device::flags[4]: a failed await stays latched until checked recovery; the existing device initialization clears it.
 constexpr size_t hybrid_await_device_failed = 4;
 // Device::flags[16 + row]: the blocks of a row that hybrid_router has counted in (zero between launches, from create_hybrid_moe on).
 constexpr size_t hybrid_router_counters = 16;
@@ -116,6 +139,17 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
     return handle;
 }
 
+bool slot_soa_plan(const ResidentMoe& plan) {
+    const Matrix& gate=plan.weights[0]; const Matrix& up=plan.weights[1];
+    return gate.kind==up.kind && expert_soa_eligible(gate.kind,gate.rows,gate.cols) &&
+           expert_soa_eligible(up.kind,up.rows,up.cols);
+}
+uint32_t slot_soa_layout(const Device& d,const ResidentMoe& plan,const uint8_t* base,size_t role) {
+    if (!base || role>=2 || !d.slots.soa_scratch || !slot_soa_plan(plan)) return 0;
+    const uintptr_t address=reinterpret_cast<uintptr_t>(base),begin=reinterpret_cast<uintptr_t>(d.slots.base);
+    return address>=begin && address-begin<d.slots.arena-d.slots.soa_scratch ? 1 : 0;
+}
+
 // The pool in slots of the sizes its layers take. A mixed bundle's layers differ by as much as 1.8 times, and a slot of the largest size for
 // all of them holds a quarter fewer experts. Sizes within a tenth share a group, a group's slots are in proportion to its layers, and an
 // expert only replaces one of its own group, so the scores compare within a group: a layer's routes want about what another's do.
@@ -143,6 +177,21 @@ void expert_slots_carve(Device& d, size_t arena) {
             d.slots.group.push_back(uint8_t(g));
         }
     }
+    size_t scratch=0;
+    for (const auto& layer:layers) if (slot_soa_plan(*layer.second))
+        for (size_t role=0;role<2;++role) {
+            const Matrix& matrix=layer.second->weights[role];
+            scratch=std::max(scratch,(matrix.rows*matrix.row_bytes+255)/256*256);
+        }
+    d.slots.soa_scratch=0;
+    // Reuse the unused tail first; at most one cache slot gives way to the
+    // private conversion buffer. Allocation bytes and the stage boundary stay.
+    if (scratch && !d.slots.at.empty()) {
+        if (arena-at<scratch && d.slots.at.size()>1) {
+            at=d.slots.at.back(); d.slots.at.pop_back(); d.slots.group.pop_back();
+        }
+        if (arena-at>=scratch) d.slots.soa_scratch=scratch;
+    }
     d.slots.arena = arena;
     d.slots.cache = d.slots.at.size();
     d.slots.owner.assign(d.slots.cache, {nullptr, -1});
@@ -152,13 +201,16 @@ void rollback_expert_slots(Device& d, size_t added) {
     d.copier.reset();
     if (d.swapped) { cleanup(hipEventDestroy(d.swapped)); d.swapped = nullptr; }
     if (d.copy_stream) { cleanup(hipStreamDestroy(d.copy_stream)); d.copy_stream = nullptr; }
+    if (d.stage_stream) { cleanup(hipStreamDestroy(d.stage_stream)); d.stage_stream = nullptr; }
+    if (d.stage_fork) { cleanup(hipEventDestroy(d.stage_fork)); d.stage_fork = nullptr; }
+    if (d.stage_join) { cleanup(hipEventDestroy(d.stage_join)); d.stage_join = nullptr; }
     if (d.exchange) { cleanup(hipHostFree(d.exchange)); d.exchange = nullptr; }
     d.exchange_device = nullptr;
     if (d.slots.host) { cleanup(hipHostFree(d.slots.host)); d.slots.host = nullptr; }
     if (d.cpu_partial) { cleanup(hipFree(d.cpu_partial)); d.cpu_partial = nullptr; }
     if (d.slots.base) { cleanup(hipFree(d.slots.base)); d.slots.base = nullptr; }
     d.used -= added;
-    d.slots.stage = 0; d.slots.bytes = 0; d.slots.cache = 0; d.slots.arena = 0;
+    d.slots.stage = 0; d.slots.chunk = 0; d.slots.bytes = 0; d.slots.cache = 0; d.slots.arena = 0; d.slots.soa_scratch=0;
     d.slots.at.clear(); d.slots.group.clear(); d.slots.owner.clear(); d.slots.pending.clear();
     d.hybrid_sequence = 0;
 }
@@ -169,7 +221,7 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
         if (entry.second->hybrid && expert_slot_bytes(*entry.second) > slot_bytes)
             throw std::runtime_error("an expert does not fit the Straydog expert slot size");
     const size_t bytes = (cache + stage) * slot_bytes;   // (`cache` slots of the largest size: expert_slots_carve makes more of it)
-    const size_t extra = hybrid_exchange_floats * 4;
+    const size_t extra = (hybrid_partial_floats + hybrid_check_scratch_floats()) * 4;
     if (bytes > d.budget - d.used || extra > d.budget - d.used - bytes)
         throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
     size_t added = 0;
@@ -178,14 +230,21 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
         d.used += bytes;
         added += bytes;
         d.slots.stage = stage; d.slots.bytes = slot_bytes;
+        // (the first 32 staging slots are the chunks' two buffers; those past them, where there are any, hold prestaged experts)
+        d.slots.chunk = std::min<size_t>(stage, 32);
         expert_slots_carve(d, cache * slot_bytes);
         check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
+#if !defined(__HIPCC__)
+        check(hipMemset(d.cpu_partial, 0, extra));   // (the counts of a layer's missed experts live here and are added to on every pass: they start at 0)
+#else
+        { const char* profile = std::getenv("DS41_PROFILE"); if (profile && std::strstr(profile, "hc")) check(hipMemset(d.cpu_partial, 0, extra)); }   // (the check's counters start at 0)
+#endif
         d.used += extra;
         added += extra;
         // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
         // A refusal here is named, so the caller can start without the mirror instead of shrinking the cache.
         if (mirror) {
-            const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), stage * slot_bytes, hipHostMallocDefault);
+            const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), d.slots.chunk * slot_bytes, hipHostMallocDefault);
             if (pinned != hipSuccess)
                 throw std::runtime_error(std::string(gpu_error_text(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
         }
@@ -197,6 +256,15 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
         d.hybrid_sequence = 0;
         check(hipStreamCreate(&d.copy_stream));
         check(hipEventCreateWithFlags(&d.swapped, hipEventDisableTiming));
+#if !defined(__HIPCC__)
+        // (the staging copy's stream and its fork and join, made here, not in a graph's capture; of the highest priority, as the send stream of qwen_parts.hpp is:
+        // the copy starts at once beside the resident experts' launches, which fill the device)
+        int least = 0, greatest = 0;
+        check(hipDeviceGetStreamPriorityRange(&least, &greatest));
+        check(hipStreamCreateWithPriority(&d.stage_stream, hipStreamDefault, greatest));
+        check(hipEventCreateWithFlags(&d.stage_fork, hipEventDisableTiming));
+        check(hipEventCreateWithFlags(&d.stage_join, hipEventDisableTiming));
+#endif
         d.copier = std::make_unique<Background>(d.ordinal);
     } catch (...) {
         rollback_expert_slots(d, added);
@@ -208,11 +276,12 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
 // copies), failing instead of hanging if the stream reports an error.
 void hybrid_wait_export(Device& d, uint32_t expected) {
     volatile uint32_t* published = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
-    for (uint64_t spin = 0; *published != expected; ++spin) {
+    // (the count may be ahead of this layer's: the GPU goes on, up to a layer, while the host has not yet read this export)
+    for (uint64_t spin = 0; int32_t(*published - expected) < 0; ++spin) {
         if ((spin & 4095) == 4095) {
             const hipError_t state = hipStreamQuery(d.stream);
             if (state != hipSuccess && state != hipErrorNotReady) check(state);
-            if (state == hipSuccess && *published != expected) throw std::runtime_error("hybrid export was not published");
+            if (state == hipSuccess && int32_t(*published - expected) < 0) throw std::runtime_error("hybrid export was not published");
         }
 #ifdef __x86_64__
         __builtin_ia32_pause();
@@ -228,6 +297,7 @@ void set_expert(Device& d, ResidentMoe& plan, size_t expert, uint8_t* base, hipS
     size_t offset = 0;
     for (size_t role = 0; role < 3; ++role) {
         plan.weights[expert * 3 + role].data = base ? base + offset : nullptr;
+        plan.weights[expert * 3 + role].layout=slot_soa_layout(d,plan,base,role);
         offset += plan.host_bytes[role];
     }
     auto* entry = static_cast<MoeGroup*>(plan.table) + expert;
@@ -236,8 +306,13 @@ void set_expert(Device& d, ResidentMoe& plan, size_t expert, uint8_t* base, hipS
 void copy_expert(Device& d, const ResidentMoe& plan, size_t expert, uint8_t* base, hipStream_t stream) {
     size_t offset = 0;
     for (size_t role = 0; role < 3; ++role) {
-        check(hipMemcpyAsync(base + offset, plan.host[role] + expert * plan.host_bytes[role], plan.host_bytes[role],
-                             hipMemcpyHostToDevice, stream));
+        const uint8_t* source=plan.host[role]+expert*plan.host_bytes[role];
+        if (slot_soa_layout(d,plan,base,role)) {
+            uint8_t* scratch=d.slots.base+d.slots.arena-d.slots.soa_scratch;
+            check(hipMemcpyAsync(scratch,source,plan.host_bytes[role],hipMemcpyHostToDevice,stream));
+            const Matrix& matrix=plan.weights[role];
+            expert_soa_pack_launch(scratch,base+offset,matrix.kind,matrix.rows,matrix.cols,stream);
+        } else check(hipMemcpyAsync(base+offset,source,plan.host_bytes[role],hipMemcpyHostToDevice,stream));
         offset += plan.host_bytes[role];
     }
 }
@@ -250,19 +325,24 @@ constexpr size_t hybrid_point_limit = 64;
 struct ExpertPointers {
     int32_t expert[hybrid_point_limit]; const uint8_t* base[hybrid_point_limit]; uint32_t count; uint64_t gate, up;
     const uint8_t* region[3]; uint64_t stride[3]; uint32_t index;
+    uint32_t layout[hybrid_point_limit][3];
 };
 __global__ void hybrid_point(MoeGroup* groups, ExpertPointers list) {
     const uint32_t i = threadIdx.x;
     if (i >= list.count) return;
     MoeGroup& group = groups[list.expert[i]];
     if (list.region[0]) {
-        for (int role = 0; role < 3; ++role) group.weights[role].data = list.region[role] + size_t(list.index + i) * list.stride[role];
+        for (int role = 0; role < 3; ++role) {
+            group.weights[role].data = list.region[role] + size_t(list.index + i) * list.stride[role];
+            group.weights[role].layout=0;
+        }
         return;
     }
     const uint8_t* base = list.base[i];
     group.weights[0].data = base;
     group.weights[1].data = base ? base + list.gate : nullptr;
     group.weights[2].data = base ? base + list.gate + list.up : nullptr;
+    for (int role=0;role<3;++role) group.weights[role].layout=list.layout[i][role];
 }
 struct StreamEvents {
     hipEvent_t loaded[2]{}, used[2]{};
@@ -312,6 +392,114 @@ void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, s
     }
     check(hipGetLastError());
 }
+#if !defined(__HIPCC__)
+// Prestage (CUDA): the staging slots past the chunks' two buffers hold, for a wide prompt batch's layer, the experts its slots do not hold
+// that the last batch through the layer used most. Their copies go over the bus from the layer's page-locked banks beside the layer's own
+// dense work (they are asked for before its router has run), and the experts the batch then needs among them are computed with the resident
+// ones, with no wait for the bus; the others stream in chunks as ever. The bytes the GEMMs read are the banks' bytes, whichever way they came.
+struct EachPointers { int32_t expert[hybrid_point_limit]; const uint8_t* data[hybrid_point_limit][3]; uint32_t count; };
+__global__ void hybrid_point_each(MoeGroup* groups, EachPointers list) {
+    const uint32_t i = threadIdx.x;
+    if (i >= list.count) return;
+    MoeGroup& group = groups[list.expert[i]];
+    for (int role = 0; role < 3; ++role) { group.weights[role].data=list.data[i][role]; group.weights[role].layout=0; }
+}
+inline size_t prestage_capacity(const Device& d) { return d.slots.stage > d.slots.chunk ? d.slots.stage - d.slots.chunk : 0; }
+inline void prestage_regions(const Device& d, const ResidentMoe& plan, uint8_t* (&regions)[3]) {
+    uint8_t* base = d.slots.base + d.slots.arena + d.slots.chunk * d.slots.bytes;
+    const size_t capacity = prestage_capacity(d);
+    regions[0] = base;
+    regions[1] = regions[0] + capacity * plan.host_bytes[0];
+    regions[2] = regions[1] + capacity * plan.host_bytes[1];
+}
+// Whether this layer's prompt batch of `steps` rows may prestage: wide, the banks page-locked copies the copy engine reads asynchronously,
+// and no mirror to gather through.
+inline bool prestage_wanted(const Device& d, const ResidentMoe& plan, size_t steps) {
+    return prestage_capacity(d) > 0 && steps >= 2048 && plan.hybrid && !plan.layer_prefill && plan.host_copy && d.slots.base &&
+           !(d.slots.host && d.cpu && !plan.mapped[0]) && d.copy_stream;
+}
+void prestage_issue(Device& d, ResidentMoe& plan) {
+    auto& ps = d.prestage;
+    ps.plan = nullptr; ps.experts.clear();
+    if (d.copier) d.copier->wait();   // the copy stream is this thread's again
+    if (!ps.event) {
+        check(hipEventCreateWithFlags(&ps.event, hipEventDisableTiming));
+    } else {
+        check(hipEventSynchronize(ps.event));   // (copies of a layer that did not use them are done before these overwrite the region)
+    }
+    const size_t capacity = prestage_capacity(d);
+    std::vector<size_t> candidates;
+    const bool history = plan.last_counts.size() == plan.experts;
+    for (size_t expert = 0; expert < plan.experts; ++expert)
+        if (plan.slot_of[expert] < 0 && (!history || plan.last_counts[expert] > 0)) candidates.push_back(expert);
+    if (candidates.size() > capacity) {
+        std::stable_sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+            return history ? plan.last_counts[a] > plan.last_counts[b] : plan.usage[a] > plan.usage[b];
+        });
+        candidates.resize(capacity);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    if (candidates.empty()) return;
+    uint8_t* regions[3];
+    prestage_regions(d, plan, regions);
+    for (size_t i = 0; i < candidates.size();) {
+        size_t j = i + 1;
+        while (j < candidates.size() && candidates[j] == candidates[j - 1] + 1) ++j;
+        for (size_t role = 0; role < 3; ++role)
+            check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], plan.host[role] + candidates[i] * plan.host_bytes[role],
+                                 (j - i) * plan.host_bytes[role], hipMemcpyHostToDevice, d.copy_stream));
+        i = j;
+    }
+    check(hipEventRecord(ps.event, d.copy_stream));
+    ps.position.assign(plan.experts, -1);
+    for (size_t i = 0; i < candidates.size(); ++i) ps.position[candidates[i]] = int32_t(i);
+    if (d.phase_on) { d.phase_prestage_issued += candidates.size(); d.phase_bus_bytes += candidates.size() * expert_slot_bytes(plan); }
+    ps.experts = std::move(candidates);
+    ps.plan = &plan;
+}
+// Point (or, `clear`, empty) the table entries of `experts` at (from) their prestaged copies.
+void hybrid_point_staged(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, bool clear) {
+    uint8_t* regions[3];
+    prestage_regions(d, plan, regions);
+    for (size_t first = 0; first < count; first += hybrid_point_limit) {
+        EachPointers list{};
+        list.count = uint32_t(std::min(hybrid_point_limit, count - first));
+        for (uint32_t i = 0; i < list.count; ++i) {
+            const size_t expert = experts[first + i];
+            list.expert[i] = int32_t(expert);
+            for (size_t role = 0; role < 3; ++role)
+                list.data[i][role] = clear ? nullptr : regions[role] + size_t(d.prestage.position[expert]) * plan.host_bytes[role];
+        }
+        hybrid_point_each<<<1, hybrid_point_limit, 0, d.stream>>>(static_cast<MoeGroup*>(plan.table), list);
+    }
+    check(hipGetLastError());
+}
+// A layer's prestage over its prompt batch, to every way out of it, an error included: the table entries pointed at prestaged copies are emptied
+// (the next layer's prestage overwrites the region they point into), the copies and GEMMs that read it drained, and the layer is no longer the
+// prestaged one. `end` is the way out without an error, the destructor the way with one (each step by itself, so that one that fails does not skip
+// the others; the failure is the caller's, already thrown).
+struct PrestageUse {
+    Device& d; ResidentMoe& plan; const bool active; std::vector<size_t> pointed; bool ended = false;
+    PrestageUse(Device& device, ResidentMoe& layer, bool wanted) : d(device), plan(layer), active(wanted) {}
+    void point(const std::vector<size_t>& experts) {
+        pointed = experts;
+        hybrid_point_staged(d, plan, pointed.data(), pointed.size(), false);
+    }
+    void end() {
+        if (!active) return;
+        if (!pointed.empty()) hybrid_point_staged(d, plan, pointed.data(), pointed.size(), true);
+        d.prestage.plan = nullptr;
+        ended = true;
+    }
+    ~PrestageUse() {
+        if (!active || ended) return;
+        try { if (!pointed.empty()) hybrid_point_staged(d, plan, pointed.data(), pointed.size(), true); } catch (...) {}
+        cleanup(hipStreamSynchronize(d.stream));
+        cleanup(hipStreamSynchronize(d.copy_stream));
+        d.prestage.plan = nullptr;
+    }
+};
+#endif
 // Routing scores are exponential moving averages over tokens (factor per token),
 // so recent prompt and decode routing decide residency and every layer's scores
 // are comparable: the cache holds the globally highest (layer, expert) scores.
@@ -352,6 +540,7 @@ void hybrid_point_list(Device& d, ResidentMoe& plan, const std::vector<std::pair
         for (uint32_t i = 0; i < list.count; ++i) {
             list.expert[i] = int32_t(items[first + i].first);
             list.base[i] = items[first + i].second;
+            for (size_t role=0;role<3;++role) list.layout[i][role]=slot_soa_layout(d,plan,list.base[i],role);
         }
         hybrid_point<<<1, hybrid_point_limit, 0, d.stream>>>(static_cast<MoeGroup*>(plan.table), list);
     }
@@ -402,15 +591,19 @@ void release_expert_slots(Device& d) {
     check(hipStreamSynchronize(d.stream));
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipFree(d.slots.base));
+    d.prestage.plan = nullptr; d.prestage.experts.clear();   // (the region went with the pool)
     d.used -= d.slots.arena + d.slots.stage * d.slots.bytes;
     d.slots.base = nullptr;
     d.slots.cache = 0;
     d.slots.arena = 0;
+    d.slots.soa_scratch=0;
     d.slots.at.clear(); d.slots.group.clear();
     d.slots.owner.clear();
 }
 // The end of the message of a growth or a pool that found no memory (crates/straydog/src/worker.rs: not fatal).
 constexpr const char* kv_no_memory = "not enough host memory for the K/V of this sequence";
+// The same for a K/V held in VRAM (sd_kv_grow): the device has no room for the longer one beside what it holds.
+constexpr const char* kv_no_vram = "not enough VRAM for the K/V of this sequence";
 void restore_expert_slots(Device& d, size_t cache) {
     if (d.slots.base || !d.slots.bytes) throw std::runtime_error("invalid Straydog expert slot pool");
     size_t bytes = (cache + d.slots.stage) * d.slots.bytes;
@@ -528,10 +721,29 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         hipEvent_t began = nullptr, ended = nullptr;
         ~Span() { if (began) cleanup(hipEventDestroy(began)); if (ended) cleanup(hipEventDestroy(ended)); }
     } span;
+    // What a layer's streamed experts leave behind on every way out of here, an error included: their table entries pointing into the chunks'
+    // buffers (the next layer's chunks go through the same buffers, and its GEMMs would read another layer's bytes through a stale entry), and
+    // both streams holding copies and GEMMs that read those buffers. `settle` is the way out without an error, the destructor the way with one
+    // (each step by itself, so that one that fails does not skip the others; the failure is the caller's, already thrown).
+    struct Settle {
+        Device& d; ResidentMoe& plan; const std::vector<size_t>& missing; bool settled = false;
+        void settle() {
+            hybrid_point_experts(d, plan, missing.data(), missing.size(), nullptr);
+            check(hipStreamSynchronize(d.copy_stream));
+            check(hipStreamSynchronize(d.stream));
+            settled = true;
+        }
+        ~Settle() {
+            if (settled) return;
+            try { hybrid_point_experts(d, plan, missing.data(), missing.size(), nullptr); } catch (...) {}
+            cleanup(hipStreamSynchronize(d.copy_stream));
+            cleanup(hipStreamSynchronize(d.stream));
+        }
+    } streamed{d, plan, missing};
     check(hipEventCreate(&span.began)); check(hipEventCreate(&span.ended));
     check(hipEventRecord(span.began, d.copy_stream));
     prefetch_experts(d, plan, missing.data(), missing.size());
-    const size_t half = std::min(d.slots.stage / 2, hybrid_point_limit);
+    const size_t half = std::min(d.slots.chunk / 2, hybrid_point_limit);
     // Pageable banks: the CPU workers gather each chunk into the page-locked mirror while the GPU
     // computes the previous one, so cold pages fault in concurrently instead of one copy at a time
     // (cached ones pay an extra pass through host memory); the experts then copy by DMA.
@@ -573,16 +785,17 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         }
         check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         check(hipStreamWaitEvent(d.stream, events.loaded[buffer], 0));
+        phase(d, "moe_stream_wait");
         hybrid_point_experts(d, plan, missing.data() + first, count, base, gather ? nullptr : regions);
         compute(first, count);
+        phase(d, "moe_stream_gemm");
+        if (fail_streamed_chunk.load() && fail_streamed_chunk.fetch_sub(1) == 1) throw std::runtime_error("Straydog test: a streamed chunk fails");
         check(hipEventRecord(events.used[buffer], d.stream));
         d.streamed_experts += count;
     }
     check(hipEventRecord(span.ended, d.stream));
     meanwhile();
-    hybrid_point_experts(d, plan, missing.data(), missing.size(), nullptr);
-    check(hipStreamSynchronize(d.copy_stream));
-    check(hipStreamSynchronize(d.stream));
+    streamed.settle();
     float ms = 0;
     check(hipEventElapsedTime(&ms, span.began, span.ended));
     // (what a gathered expert cost the CPU's workers: prompt_cpu_share weighs a route against it)
@@ -650,7 +863,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #endif
     } else {
         // The same authenticated mapping/file gather as ordinary streaming, overlapped with the previous half's DMA.
-        const size_t half = d.slots.stage / 2;
+        const size_t half = d.slots.chunk / 2;
         StreamEvents events;
         for (size_t first = 0, chunk = 0; first < plan.experts; first += half, ++chunk) {
             const size_t count = std::min(half, plan.experts - first), buffer = chunk % 2;

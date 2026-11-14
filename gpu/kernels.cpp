@@ -152,6 +152,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -160,6 +162,10 @@
 
 namespace {
 thread_local std::string last_error;
+#if !defined(__HIPCC__)
+std::mutex registered_host_allocations_mutex;
+std::set<void*> registered_host_allocations;
+#endif
 constexpr size_t max_cols = 16384, max_rows = 262144;
 constexpr size_t max_batch = 256;
 // The rows of a prompt batch a decoder workspace holds at most. The experts of a batch run in chunks of at most moe_chunk_rows rows (a layer part of
@@ -183,7 +189,10 @@ struct Matrix {
     const uint8_t* data;
     size_t row_bytes, rows, cols, input_offset, output_offset, launch_offset;
     int kind;
+    uint32_t layout=0;   // Qwen routed gate/up: 0 native, 1 capacity-preserving SoA.
 };
+static_assert(sizeof(Matrix)==64);
+struct ExpertBankLayout { int kind; size_t rows,cols,count; uint32_t layout; bool packing=false; };
 // One GEMV row range: lanes cooperating per row (0 selects the reference decoder).
 struct GemvItem { Matrix matrix; uint32_t first_wave, lanes; };
 // Every GGML type the GPU kernels decode (weight<kind>); dispatch sites expand it.
@@ -207,10 +216,15 @@ struct ResidentMoe {
     void* table=nullptr;
     float* workspace=nullptr;
     size_t experts=0, capacity=0;
+    // Original routed bank geometry, before the verified load fills its allocation.
+    Matrix routed_banks[2]{};
+    size_t routed_count=0;
+    bool pack_routed=false;
     // Partial residency: routed experts live in device slots (null data when absent)
     // and are otherwise read from the authenticated host mapping.
     bool hybrid=false;
     bool layer_prefill=false;   // this layer's routed banks are held for every prompt chunk
+    bool drafter=false;         // the MTP draft layer (48): on CUDA its missed routes go to the CPU, whatever the assist level (hybrid_level)
     const uint8_t* host[3]{};
     // host points at the engine's page-locked copies of the banks, not at the model's mapping (sd_hybrid_repoint): nothing is read ahead of them.
     bool host_copy=false;
@@ -234,6 +248,7 @@ struct ResidentMoe {
     // run without it (batch_table: the table without the shared expert) and it beside them.
     Matrix half[3]{};
     void* batch_table=nullptr;
+    std::vector<unsigned> last_counts;   // the rows each expert had in the last prompt batch through this layer (prestage's guess of the next)
 };
 #if defined(__linux__)
 // Read-ahead hints off the compute thread. One MADV_WILLNEED reads at most the device's largest
@@ -279,7 +294,9 @@ struct ExpertSlots {
     uint8_t* base=nullptr;
     uint8_t* host=nullptr;   // page-locked mirror of the staging slots: prefill gathers absent experts here
     size_t cache=0, stage=0, bytes=0;   // slots, staging slots, a staging slot's bytes
+    size_t chunk=0;                     // of the staging slots, those a prompt batch streams its experts through in chunks; the rest (prestage) hold a layer's experts ahead
     size_t arena=0;                     // the slots' bytes, all before the staging slots
+    size_t soa_scratch=0;               // private tail of this same arena, never a cache or staging slot
     std::vector<size_t> at;             // a slot's offset from base: an expert takes its own layer's size
     std::vector<uint8_t> group;         // and only a slot of its size group
     std::vector<std::pair<ResidentMoe*,int32_t>> owner;
@@ -296,6 +313,10 @@ struct DecoderLayer {
     float* projections=nullptr;   // and the tokens' DeltaNet projections for replay
     size_t verified=0;            // tokens of the last uncommitted verification
     size_t parts=1,part=0;        // the layer split across GPUs: this device's part of `parts` (QwenHeads)
+    // The other window's (Device::window): a pipelined pass keeps its own, so the pass behind it does not overwrite what a partial
+    // acceptance of the first replays from. sd_set_window swaps each pair, so `snapshot` etc. are always the window in force.
+    float* snapshot_alt=nullptr; float* projections_alt=nullptr; size_t verified_alt=0;
+    uint64_t touched_epoch=0,touched_epoch_alt=0;   // successful graph issues in the window whose snapshot is active
 };
 
 // A layer's share of Qwen3.8's heads: P = 1 the whole layer, 2 one GPU's half of it (docs/DESIGN.md §8). A half is the
@@ -363,6 +384,8 @@ void cleanup(hipError_t error) noexcept {
 // Page-locked host memory for what a request asks (a K/V growth, the MTP rows' staging, a read's buffer). Tests make the next
 // `refuse_host_allocations` of these answer as a machine short of memory does (sd_test_refuse_host).
 std::atomic<uint64_t> refuse_host_allocations{0};
+// Tests: the streamed chunk of a prompt batch's layer that fails, counted from the next one (0: none; sd_test_fail_streamed, hybrid_stream_missing).
+std::atomic<uint64_t> fail_streamed_chunk{0};
 hipError_t host_allocate(void** pointer, size_t bytes, unsigned int flags) {
     uint64_t left = refuse_host_allocations.load();
     while (left && !refuse_host_allocations.compare_exchange_weak(left, left - 1)) {}
@@ -508,6 +531,19 @@ struct RowStaging {
     size_t refused = 0;   // the size (floats) the system refused to page-lock last: not asked for again at or over it
     unsigned turn = 0;
 };
+struct Device;
+void phase_report(Device& d);
+// The flag that tells the span running on a device to stop (sd_abort_flag): its own counted allocation, one reference the device's and one
+// each holder's, so that whoever raises it from another thread can never write to freed memory, whatever became of the device.
+struct AbortFlag { std::atomic<bool> raised{false}; std::atomic<uint32_t> references{1}; };
+// A reference more (as the standard library's shared pointers do: a count past half its range means something is leaking references, and
+// continuing would let it wrap to zero and free a flag that is held).
+inline void abort_flag_retain(AbortFlag* flag) {
+    if (flag->references.fetch_add(1, std::memory_order_relaxed) >= UINT32_MAX / 2) std::abort();
+}
+inline void abort_flag_release(AbortFlag* flag) {
+    if (flag && flag->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete flag;
+}
 struct Device {
     int ordinal;
     size_t budget = 0, used = 0;
@@ -668,6 +704,10 @@ struct Device {
     // A stage's work beside the device stream's (the shared expert's gate and up, resident_expert_launch), forked and joined by events.
     hipStream_t side_stream = nullptr;
     hipEvent_t side_fork = nullptr, side_join = nullptr;
+    // CUDA: a layer's staging copy (hybrid_stage_assist) runs on a stream of its own beside the resident experts' launches, forked after the tick and
+    // joined before the staged experts' (hybrid_resident_experts).
+    hipStream_t stage_stream = nullptr;
+    hipEvent_t stage_fork = nullptr, stage_join = nullptr;
     // A prompt batch's sends to the other device of a layer in parts (qwen_parts.hpp) run on a stream of their own beside the device's
     // compute (STRAYDOG_PARTS_OVERLAP=off keeps them in the device stream's order), forked and joined by events.
     hipStream_t send_stream = nullptr;
@@ -685,9 +725,41 @@ struct Device {
     std::unordered_map<size_t,DecoderLayer> decoder;
     // A span's DeltaNet replay list (verify_span.hpp's GdnReplay entries) by (begin, end): its host bytes and its device copy.
     std::map<std::pair<size_t,size_t>,std::pair<std::vector<uint8_t>,void*>> gdn_replays;
+    std::map<std::pair<size_t,size_t>,std::pair<std::vector<uint8_t>,void*>> gdn_replays_alt;   // the other window's (sd_set_window)
+    // Pipelined verification (sd_pipeline_setup; CUDA's partially resident layers on two devices): the window of the pass in
+    // flight (0 or 1: snapshots, projections, verified marks and replay lists, which sd_set_window swaps), whether a second window
+    // is allocated, whether the expert slots stay as they are (no swaps at the end of a span), and the flag a span being abandoned
+    // is told by (set from another thread: sd_abort_span).
+    size_t window=0;
+    uint64_t front_generation=0,front_epoch[2]{}; bool front_active=false;
+    size_t front_position[2]{SIZE_MAX,SIZE_MAX},front_rows[2]{};
+    uint64_t usage_epoch=0;
+    bool pipelined=false, frozen_slots=false;
+    bool pipelined_chain=false;   // a draft's head on this device alone reads the draft's vocabulary (sd_pipeline_setup flag 4)
+    AbortFlag* abort_flag = new AbortFlag();   // this device's reference of its stop flag (released with the device)
+    // The flag is honoured by one entry alone, sd_verify_span (which drains and resyncs after a stopped span, AbortScope): a span run by any
+    // other entry (the queue, the drafter's steps, the decode and prompt paths) ignores it, so that no other caller can be stopped midway.
+    bool abortable=false;
+    bool aborted() const { return abortable && abort_flag->raised.load(std::memory_order_acquire); }
+    hipError_t span_drain_error=hipSuccess;
+    // What a speculative pass's rows observe (the layers' route scores and counts, hybrid_tokens), as it was before the pass: put back
+    // when the pass is given up (sd_hybrid_usage), so that a pass that never was leaves no trace in what the slots are chosen by.
+    struct UsageMark { std::vector<double> usage; std::vector<uint32_t> routed_gpu, routed_host, host_read; uint32_t host_token=0; };
+    std::unordered_map<ResidentMoe*,UsageMark> usage_marks;
+    uint64_t mark_tokens=0, mark_balanced=0; size_t mark_position=SIZE_MAX;
     std::unordered_map<void*,ExchangeArea> exchanges;   // host exchanges by host address (sd_exchange)
     uint64_t graph_replays=0;
     ExpertSlots slots;
+    std::unordered_map<const uint8_t*,ExpertBankLayout> expert_layouts;
+    uint64_t expert_repack_ns=0, expert_repack_bytes=0;
+    // Prestage (hybrid_slots.hpp): a wide prompt batch's layer asks for the experts its slots do not hold that its last batch used most, before
+    // its router has run, so that they come over the bus beside the layer's own work.
+    struct Prestage {
+        ResidentMoe* plan=nullptr;
+        std::vector<size_t> experts;          // ascending; the i-th is at position i of the prestage region's three role arrays
+        std::vector<int32_t> position;        // by expert: its position there, or -1
+        hipEvent_t event=nullptr;
+    } prestage;
     hipStream_t copy_stream=nullptr;
     void* cpu=nullptr;
     float* exchange=nullptr;      // pinned host: selected, probabilities, activation, CPU result
@@ -706,6 +778,7 @@ struct Device {
     bool prompt_host_pinned=false;
     std::vector<float> prompt_pageable;
     hipEvent_t prompt_rows=nullptr;   // the rows have reached prompt_host
+    hipStream_t rows_stream=nullptr;  // CUDA: the rows' copy to prompt_host runs beside the batch's GEMMs, not ahead of them (grouped_expert_prefill)
     uint32_t assist=0;
     bool hint_experts=true;   // no bank is page-locked (sd_hybrid_assist): hint a layer's absent experts (hybrid_host_experts)
     std::atomic<uint32_t> bank_readers{0};   // the CPU's workers reading banks' bytes now (BankReading): sd_hybrid_repoint waits for none
@@ -722,8 +795,26 @@ struct Device {
 #if defined(__linux__)
     std::unique_ptr<ReadAhead> read_ahead;   // started by the first expert read-ahead hint
 #endif
+    // STRAYDOG_PREFILL_PHASES (development): events between a prompt batch's phases, summed by name (phase_profile.hpp), printed when the device goes
+    bool phase_on = std::getenv("STRAYDOG_PREFILL_PHASES") != nullptr;
+    bool moe_eager = !std::getenv("STRAYDOG_MOE_EAGER") || std::getenv("STRAYDOG_MOE_EAGER")[0] != '0';
+    bool phase_mtp = false;               // the layer in hand is the MTP layer's (its phases are listed apart, mtp_ before their names)
+    std::set<std::string> phase_names;
+    hipEvent_t counts_event = nullptr;   // after a prompt batch's expert counts: the host's reads of them wait for it, not for the work queued after (eager_moe)
+    bool phase_trace = phase_on && std::getenv("STRAYDOG_PREFILL_PHASES")[0] == '2';
+    struct PhaseMark { const char* name; hipEvent_t event; };
+    std::vector<PhaseMark> phase_marks;
+    std::vector<hipEvent_t> phase_pool;
+    struct PhaseSum { double sum = 0, largest = 0; uint64_t count = 0; };
+    std::map<std::string, PhaseSum> phase_totals;
+    uint64_t phase_batches = 0, phase_layers = 0, phase_prestage_issued = 0, phase_prestage_used = 0, phase_streamed = 0, phase_bus_bytes = 0,
+             phase_cpu_routes = 0, phase_missing_layers = 0;
+    size_t phase_first = size_t(-1);
+    uint64_t phase_routes[4] = {0, 0, 0, 0};   // routes of the resident, prestaged, streamed experts and the CPU's
     explicit Device(int value) : ordinal(value) {}
     ~Device() {
+        abort_flag_release(abort_flag);
+        if (phase_on) phase_report(*this);
         cleanup(hipSetDevice(ordinal));
         if (host_prefetch.joinable()) host_prefetch.join();
         for (auto& ready : host_ready) cleanup(hipHostFree(ready.second));
@@ -735,6 +826,7 @@ struct Device {
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         if (kv_stream) cleanup(hipStreamSynchronize(kv_stream));
         if (side_stream) cleanup(hipStreamSynchronize(side_stream));
+        if (stage_stream) cleanup(hipStreamSynchronize(stage_stream));
         if (send_stream) cleanup(hipStreamSynchronize(send_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
@@ -743,9 +835,12 @@ struct Device {
         decoder.clear(); resident.clear();
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
+        if (prestage.event) cleanup(hipEventDestroy(prestage.event));
+        if (counts_event) cleanup(hipEventDestroy(counts_event));
         if (exchange) cleanup(hipHostFree(exchange));
         if (prompt_host && prompt_host_pinned) cleanup(hipHostFree(prompt_host));
         if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));
+        if (rows_stream) cleanup(hipStreamDestroy(rows_stream));
         if (readback && readback_pinned) cleanup(hipHostFree(readback));
         if (route_mailbox) cleanup(hipHostFree(route_mailbox));
         if (readback_done) cleanup(hipEventDestroy(readback_done));
@@ -792,8 +887,9 @@ struct Device {
         if (helper_stream) cleanup(hipStreamDestroy(helper_stream));
         if (kv_stream) cleanup(hipStreamDestroy(kv_stream));
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
+        if (stage_stream) cleanup(hipStreamDestroy(stage_stream));
         if (send_stream) cleanup(hipStreamDestroy(send_stream));
-        for (auto event : {kv_released, kv_prefetched, side_fork, side_join, send_fork, send_done}) if (event) cleanup(hipEventDestroy(event));
+        for (auto event : {kv_released, kv_prefetched, side_fork, side_join, stage_fork, stage_join, send_fork, send_done}) if (event) cleanup(hipEventDestroy(event));
     }
 };
 // Held while the CPU's workers read the bytes of a layer's banks (the CPU experts' routes, a gather into the staging mirror): the engine moves a layer's
@@ -1239,6 +1335,58 @@ __global__ void delta_register_sequence(float* state, size_t heads, size_t steps
     for (unsigned key = 0; key < 128; ++key) state[(head * 128 + key) * 128 + col] = memory[key];
 }
 
+#if !defined(__HIPCC__)
+// delta_register_sequence with the next token's inputs fetched a token ahead (three buffers of the shared inputs, one barrier a token, where the
+// scan above has two and waits on its global loads each token) and the next token's prediction formed in the loop that updates the state,
+// beside the result's sum, the two sums being independent chains. The same expressions on the same values in the same orders: its outputs and
+// state are the scan's bit for bit (checked on random inputs of 4096 tokens: 25 M outputs, none differing), 1.5x faster on an RTX 4090
+// (4096 tokens, 48 heads: 6.17 -> 4.09 ms).
+__global__ void delta_register_sequence_ahead(float* state, size_t heads, size_t steps, const float* packed, float* output) {
+    const size_t head = blockIdx.x, col = threadIdx.x, elements = steps * heads * 128;
+    float memory[128];
+    #pragma unroll
+    for (unsigned key = 0; key < 128; ++key) memory[key] = state[(head * 128 + key) * 128 + col];
+    __shared__ float query[3][128], keys[3][128];
+    float value, factor, beta;
+    {
+        const size_t offset = head * 128;
+        query[0][col] = packed[offset + col]; keys[0][col] = packed[elements + offset + col];
+        value = packed[2 * elements + offset + col];
+        factor = packed[3 * elements + head];
+        beta = packed[3 * elements + steps * heads + head];
+    }
+    __syncthreads();
+    float prediction = 0;
+    #pragma unroll
+    for (unsigned key = 0; key < 128; ++key) prediction += (memory[key] * factor) * keys[0][key];
+    for (size_t step = 0; step < steps; ++step) {
+        const unsigned now = step % 3, next = (step + 1) % 3;
+        const bool more = step + 1 < steps;
+        float next_value = 0, next_factor = 0, next_beta = 0;
+        if (more) {
+            const size_t offset = ((step + 1) * heads + head) * 128;
+            query[next][col] = packed[offset + col]; keys[next][col] = packed[elements + offset + col];
+            next_value = packed[2 * elements + offset + col];
+            next_factor = packed[3 * elements + (step + 1) * heads + head];
+            next_beta = packed[3 * elements + steps * heads + (step + 1) * heads + head];
+        }
+        const float correction = (value - prediction) * beta;
+        __syncthreads();
+        float result = 0, following = 0;
+        #pragma unroll
+        for (unsigned key = 0; key < 128; ++key) {
+            memory[key] = memory[key] * factor + keys[now][key] * correction;
+            result += memory[key] * query[now][key];
+            following += (memory[key] * next_factor) * keys[next][key];
+        }
+        output[(step * heads + head) * 128 + col] = result;
+        prediction = following; value = next_value; factor = next_factor; beta = next_beta;
+    }
+    #pragma unroll
+    for (unsigned key = 0; key < 128; ++key) state[(head * 128 + key) * 128 + col] = memory[key];
+}
+#endif
+
 // The delta rule's scan over a chunk's tokens, each column of a head's state split across eight lanes (16 of its 128 keys each).
 // The columns are independent, so a block takes 32 of them and a head spreads over four blocks (24 or 48 heads: 96 or 192 blocks,
 // where one block a head kept 24 or 48 CUs busy); each block stages 16 tokens' q, k, v, decay and beta in LDS while it loads the
@@ -1421,10 +1569,13 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
     return unsigned(count);
 }
 
+#include "phase_profile.hpp"
 #include "host_io.hpp"
 #include "peer.hpp"
 #include "link_tail.hpp"
 #include "gemv.hpp"
+#include "expert_soa.hpp"
+#include "resident_soa.hpp"
 #include "graph_cache.hpp"
 #include "hc_decode.hpp"
 #include "hyperconnection.hpp"
@@ -1462,19 +1613,26 @@ int recover_hybrid_wait(void* handle) {
         check(hipStreamSynchronize(d.stream));
         hybrid_settle(d, true);
         check(hipStreamSynchronize(d.stream));
-        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream})
+        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream, d.stage_stream, d.rows_stream})
             if (stream) check(hipStreamSynchronize(stream));
         if (d.transfers)
             for (hipStream_t stream : d.transfers->streams)
                 if (stream) check(hipStreamSynchronize(stream));
-        // Only a fully drained recovery may clear the device latch. The next span's
-        // graphs see this reset in stream order, with no per-span clear or launch.
-        check(hipMemsetAsync(d.flags + hybrid_await_device_failed, 0, sizeof(uint32_t), d.stream));
-        check(hipStreamSynchronize(d.stream));
         auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
         std::atomic_thread_fence(std::memory_order_acquire);
-        d.hybrid_sequence = counters[0];
+#if !defined(__HIPCC__)
+        // CUDA's awaits live in device memory and restart at zero for each span.
+        // Reset them only after every use of the interrupted pass has drained.
+        check(hipMemsetAsync(hybrid_awaited(d), 0, sizeof(uint32_t), d.stream));
+#endif
+        check(hipMemsetAsync(d.flags + hybrid_await_device_failed, 0, sizeof(uint32_t), d.stream));
+        check(hipStreamSynchronize(d.stream));
+#if defined(__HIPCC__)
         counters[hybrid_published_slot] = counters[hybrid_awaited_slot];
+#else
+        counters[hybrid_published_slot] = 0;
+#endif
+        d.hybrid_sequence = counters[0];
         counters[hybrid_await_failed_slot] = 0;
         std::atomic_thread_fence(std::memory_order_release);
         last_error = "the GPU wait timed out; the interrupted pass was discarded";
@@ -1565,9 +1723,28 @@ int sd_decode_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,co
     catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// Makes the stop flag count while this entry's span runs (and no longer).
+struct AbortScope {
+    Device& d;
+    explicit AbortScope(Device& device) : d(device) { d.abortable=true; }
+    ~AbortScope() { d.abortable=false; }
+};
 int sd_verify_span(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,
                    const float* input,float* output) {
-    try { verify_span(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,output); return 0; }
+    try {
+        Device& d=device(handle); d.span_drain_error=hipSuccess;
+        AbortScope scope(d);
+        verify_span(d,size_t(begin),size_t(end),size_t(position),size_t(steps),input,output); return 0;
+    }
+    catch (const SpanAborted& e) {
+        // The graphs launched ahead have ticked their exports by now (the unwinding drained the stream): the host's count follows them.
+        Device& d=*static_cast<Device*>(handle);
+        if (d.span_drain_error!=hipSuccess) { last_error=hipGetErrorString(d.span_drain_error); return -1; }
+        const hipError_t drained=hipStreamSynchronize(d.stream);
+        if (drained!=hipSuccess) { last_error=hipGetErrorString(drained); return -1; }
+        if (d.exchange) d.hybrid_sequence=*reinterpret_cast<volatile uint32_t*>(d.exchange+hybrid_sequence_slot);
+        last_error=e.what(); return -1;
+    }
     catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -1579,6 +1756,96 @@ int sd_verify_commit(void* handle,uint64_t begin,uint64_t end,uint64_t kept) {
     try { verify_commit(device(handle),size_t(begin),size_t(end),size_t(kept)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// sd_verify_commit that replays the kept rows even where every row was kept (a pipelined pass given up behind the one committed).
+int sd_verify_commit_forced(void* handle,uint64_t begin,uint64_t end,uint64_t kept) {
+    try { verify_commit(device(handle),size_t(begin),size_t(end),size_t(kept),true); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Pipelined verification, CUDA's partially resident layers (flags: bit 0 a second window of snapshots, made when the verification
+// buffers are (sd_verify_reserve); bit 1 the expert slots left as they are, no swaps at the end of a span).
+int sd_pipeline_setup(void* handle,uint64_t flags) {
+    try {
+        Device& d=device(handle);
+#if defined(__HIPCC__)
+        if (flags&1) throw std::runtime_error("pipelined verification is not available on this build");
+#else
+        d.pipelined=(flags&1)!=0;
+#endif
+        d.frozen_slots=(flags&2)!=0;
+        d.pipelined_chain=(flags&4)!=0;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The expert slots held as they are (1: no swaps at the end of a span) or let swap again (0).
+int sd_freeze_slots(void* handle,uint64_t frozen) {
+    try { device(handle).frozen_slots=frozen!=0; return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The window of the pass about to run or be committed on this device (0 or 1).
+int sd_set_window(void* handle,uint64_t window) {
+    try { set_window(device(handle),size_t(window)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Begin a front with a fresh generation for both of its verification spans.
+int sd_verify_window_begin(void* handle,uint64_t window,uint64_t position,uint64_t rows,uint64_t* epoch) {
+    try {
+        Device& d=device(handle);
+        if (!epoch) throw std::runtime_error("invalid verification front generation");
+        if (!rows) {
+            d.front_active=false; d.front_epoch[0]=d.front_epoch[1]=0; d.usage_epoch=0; *epoch=0;
+            return 0;
+        }
+        if (!d.pipelined || rows>hybrid_rows || d.front_generation==UINT64_MAX)
+            throw std::runtime_error("invalid verification front generation");
+        set_window(d,size_t(window));
+        d.front_active=true;
+        d.front_epoch[d.window]=++d.front_generation;
+        d.front_position[d.window]=size_t(position); d.front_rows[d.window]=size_t(rows);
+        for (auto& entry:d.decoder) entry.second.verified=0;
+        *epoch=d.front_epoch[d.window];
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// 0: recovered and the touched mask returned; 1: proof absent and the states untouched.
+int sd_verify_window_restore(void* handle,uint64_t begin,uint64_t end,uint64_t epoch,uint64_t position,uint64_t rows,uint64_t* touched) {
+    try { return verify_window_restore(device(handle),size_t(begin),size_t(end),epoch,size_t(position),size_t(rows),touched); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// restore 0: note what the layers' routes have observed so far (before a speculative pass); 1: put it back (the pass was given up).
+int sd_hybrid_usage(void* handle,uint64_t restore) {
+    try {
+        Device& d=device(handle);
+        if (!restore) {
+            d.usage_epoch=d.front_epoch[d.window];
+            d.usage_marks.clear();
+            for (auto& item : d.resident) {
+                ResidentMoe& plan=*item.second;
+                if (!plan.hybrid) continue;
+                d.usage_marks[&plan]={plan.usage,plan.routed_gpu,plan.routed_host,plan.host_read,plan.host_token};
+            }
+            d.mark_tokens=d.hybrid_tokens; d.mark_balanced=d.hybrid_verify_balanced; d.mark_position=d.hybrid_position;
+            return 0;
+        }
+        for (auto& item : d.usage_marks) {
+            ResidentMoe& plan=*item.first;
+            plan.usage=item.second.usage; plan.routed_gpu=item.second.routed_gpu; plan.routed_host=item.second.routed_host;
+            plan.host_read=item.second.host_read; plan.host_token=item.second.host_token;
+        }
+        d.hybrid_tokens=d.mark_tokens; d.hybrid_verify_balanced=d.mark_balanced; d.hybrid_position=d.mark_position;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The stop flag of this device's running span, with a reference of its own for the caller (null: none): raise it (sd_abort_flag_set, from
+// another thread) and the span stops at its next layer, lower it and the next span runs. No device call; release the reference when done.
+void* sd_abort_flag(void* handle) {
+    if (!handle) return nullptr;
+    AbortFlag* flag=static_cast<Device*>(handle)->abort_flag;
+    abort_flag_retain(flag);
+    return flag;
+}
+void sd_abort_flag_retain(void* flag) { if (flag) abort_flag_retain(static_cast<AbortFlag*>(flag)); }
+void sd_abort_flag_release(void* flag) { abort_flag_release(static_cast<AbortFlag*>(flag)); }
+void sd_abort_flag_set(void* flag,uint64_t raised) { if (flag) static_cast<AbortFlag*>(flag)->raised.store(raised!=0,std::memory_order_release); }
 // input null: the rows of layer `layer`'s workspace (the last span's), handed back in `rows`.
 const float* head_source(Device& d,const float* input,uint64_t layer) {
     if (input) return nullptr;
@@ -1628,10 +1895,21 @@ int sd_mtp_prologue(void* handle,void* const* pointers,const int* kinds,uint64_t
 // input null: the rows are in the span's workspace already (the layers before it, or sd_prefill_handoff, left them there).
 int sd_verify_queue(void* handle,uint64_t begin,uint64_t end,uint64_t position,uint64_t steps,const float* input) {
     try {
+        {
+            // A partially resident first layer: its hybrid handshake runs here and ends in a wait; the rows stay in the workspace.
+            Device& d=device(handle);
+            auto first=d.decoder.find(size_t(begin));
+            if (begin<end && first!=d.decoder.end() && d.resident.find(first->second.moe)->second->hybrid) {
+                hybrid_verify_span(d,size_t(begin),size_t(end),size_t(position),size_t(steps),input,nullptr,
+                                   input ? nullptr : verify_layout(first->second.workspace).hidden);
+                return 0;
+            }
+        }
         bool parts=false;
         verify_span_queue(device(handle),size_t(begin),size_t(end),size_t(position),size_t(steps),input,nullptr,parts);
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_ple_front(void* handle,void* const* pointers,const int* kinds,void* history,void* snapshot,void* kept,uint64_t layer,
                  uint64_t steps,const float* embeddings,float* first,float* hidden) {
@@ -1701,6 +1979,19 @@ int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t la
         return 0;
     } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Rows [first, first + count) of the rows `layer`'s last drafting step left in its workspace, to the host (the drafter's own hidden states, 10240 floats a row);
+// the range must lie within the rows that step wrote (the layer's `verified` count).
+int sd_draft_rows(void* handle,uint64_t layer,uint64_t first,uint64_t count,float* out) {
+    try {
+        Device& d=device(handle);
+        auto found=d.decoder.find(size_t(layer));
+        // (only rows the layer's last step wrote: `verified` is that step's row count)
+        if (!out || found==d.decoder.end() || !count || first>verify_max || count>verify_max-first || first+count>found->second.verified)
+            throw std::runtime_error("invalid drafting rows");
+        download(d,out,verify_layout(found->second.workspace).hidden+size_t(first)*10240,size_t(count)*10240*4);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
                    const float* embeddings,const float* hidden,uint64_t previous) {
@@ -1818,10 +2109,38 @@ int sd_mtp_prompt_kept(void* handle,void* const* pointers,const int* kinds,void*
         Device& d=device(handle);
         const float* kept=mtp_allocation(d,rows,size_t(row+count)*10240)+size_t(row)*10240;
         const float* embedded=mtp_allocation(d,embeddings,size_t(offset+count)*2560)+size_t(offset)*2560;
+        {
+            // A pass of more rows than the prologue's scratch holds (512 of its 25,600 floats a row in the input area): the prologue runs over pieces,
+            // each piece's rows into the layer's workspace at their place, and the layer takes the pass's rows at once, one pass's fixed costs (the
+            // CPU's routes, the streamed experts, the host's reads) for all of them.
+            constexpr size_t piece=512;
+            auto wide=d.decoder.find(size_t(layer));
+            if (count>piece && !(wide!=d.decoder.end() && wide->second.parts!=2 && count<=wide->second.capacity)) {
+                // (a layer that cannot take the pass whole, in parts or a workspace of fewer rows: the pass in passes of 512)
+                for (uint64_t at=0;at<count;at+=piece)
+                    if (sd_mtp_prompt_kept(handle,pointers,kinds,rows,row+at,embeddings,offset+at,std::min<uint64_t>(piece,count-at),position+at,layer)) return -1;
+                return 0;
+            }
+            if (count>piece) {
+                for (size_t at=0;at<size_t(count);at+=piece) {
+                    const size_t n=std::min(piece,size_t(count)-at);
+                    mtp_prologue_check(d,pointers,kinds,n);
+                    float* part=mtp_prologue_hidden(d,n);
+                    check(hipMemcpyAsync(part,kept+at*10240,n*10240*4,hipMemcpyDeviceToDevice,d.stream));
+                    check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded+at*2560,n*2560*4,hipMemcpyDeviceToDevice,d.stream));
+                    mtp_prologue_device(d,pointers,kinds,n);
+                    check(hipMemcpyAsync(wide->second.workspace+at*10240,part,n*10240*4,hipMemcpyDeviceToDevice,d.stream));
+                }
+                prefill_span(d,size_t(layer),size_t(layer)+1,size_t(position),size_t(count),nullptr,nullptr,0);
+                return 0;
+            }
+        }
         mtp_prologue_check(d,pointers,kinds,size_t(count));
         float* hidden=mtp_prologue_hidden(d,size_t(count));
+        phase(d,"pro_begin");
         check(hipMemcpyAsync(hidden,kept,size_t(count)*10240*4,hipMemcpyDeviceToDevice,d.stream));
         check(hipMemcpyAsync(mtp_prologue_embeddings(d),embedded,size_t(count)*2560*4,hipMemcpyDeviceToDevice,d.stream));
+        phase(d,"pro_copy");
         mtp_prologue_device(d,pointers,kinds,size_t(count));
         auto target=d.decoder.find(size_t(layer));
         // (a layer in parts: its rows into the workspace at the pairs' offset, the host running the layer on both devices once
@@ -2154,6 +2473,10 @@ int sd_prefill_ple(void* handle,void* const* pointers,const int* kinds,void* his
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_experts_finalize(void* handle) {
+    try { finalize_resident_experts(device(handle)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 void* sd_resident_moe_create(void* handle,void* const* pointers,const int* kinds,uint64_t experts,
                             void* workspace,uint64_t capacity) {
     try { return create_resident_moe(device(handle),pointers,kinds,size_t(experts),workspace,size_t(capacity)); }
@@ -2371,7 +2694,7 @@ extern "C++" {
 #if defined(__HIPCC__)
 constexpr uint32_t hybrid_assist_cap=4;
 #else
-constexpr uint32_t hybrid_assist_cap=2;
+constexpr uint32_t hybrid_assist_cap=8;   // CUDA: the distinct missed experts of a layer's pass the GPU stages (hybrid_tick_plan); the level is that many
 #endif
 // A layer's assist level and the banks it reads in place are baked into its captured graphs (hybrid_assist is passed to the layer's
 // kernels by value, in decode's graphs and in verification's alike): a change of level, or of the plans whose banks are mapped, drops
@@ -2541,10 +2864,40 @@ int sd_host_register_on(int ordinal,void* pointer,uint64_t bytes) {
 // the GPU cannot register the model's read-only mapping (sd_hybrid_repoint). Allocated under the context of device `ordinal`, from any thread.
 int sd_host_alloc_on(int ordinal,uint64_t bytes,void** pointer) {
     try {
-        if (!pointer || !bytes) throw std::runtime_error("invalid host allocation");
+        if (!pointer || !bytes || bytes>std::numeric_limits<size_t>::max()) throw std::runtime_error("invalid host allocation");
         *pointer=nullptr;
         check(hipSetDevice(ordinal));
         void* value=nullptr;
+#if !defined(__HIPCC__)
+        value=::operator new(size_t(bytes),std::align_val_t(4096),std::nothrow);
+        if (value) {
+            // Record ownership while the pointer is private, before registering its writable pages.
+            try {
+                std::lock_guard<std::mutex> lock(registered_host_allocations_mutex);
+                registered_host_allocations.insert(value);
+            } catch (const std::bad_alloc&) {
+                ::operator delete(value,std::align_val_t(4096));
+                value=nullptr;
+            } catch (...) {
+                ::operator delete(value,std::align_val_t(4096));
+                throw;
+            }
+        }
+        if (value) {
+            const cudaError_t state=cudaHostRegister(value,size_t(bytes),cudaHostRegisterPortable|cudaHostRegisterMapped);
+            if (state==cudaSuccess) {
+                *pointer=value;
+                return 0;
+            }
+            (void)cudaGetLastError();
+            {
+                std::lock_guard<std::mutex> lock(registered_host_allocations_mutex);
+                registered_host_allocations.erase(value);
+            }
+            ::operator delete(value,std::align_val_t(4096));
+            value=nullptr;
+        }
+#endif
         check(hipHostMalloc(&value,size_t(bytes),hipHostMallocPortable|hipHostMallocMapped));
         *pointer=value;
         return 0;
@@ -2555,6 +2908,22 @@ int sd_host_free(int ordinal,void* pointer) {
     try {
         if (!pointer) throw std::runtime_error("invalid host free");
         check(hipSetDevice(ordinal));
+#if !defined(__HIPCC__)
+        bool registered=false;
+        {
+            std::lock_guard<std::mutex> lock(registered_host_allocations_mutex);
+            registered=registered_host_allocations.find(pointer)!=registered_host_allocations.end();
+        }
+        if (registered) {
+            check(cudaHostUnregister(pointer));
+            {
+                std::lock_guard<std::mutex> lock(registered_host_allocations_mutex);
+                registered_host_allocations.erase(pointer);
+            }
+            ::operator delete(pointer,std::align_val_t(4096));
+            return 0;
+        }
+#endif
         check(hipHostFree(pointer));
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -2582,6 +2951,11 @@ int sd_test_refuse_host(uint64_t count) {
     refuse_host_allocations.store(count);
     return 0;
 }
+// Development (tests/stream_fault_gpu.rs): the `count`-th streamed chunk of a prompt batch's layers from now fails, once its GEMMs are queued and its
+// experts' table entries point at its buffer (0: none). The answer is the count that was left of the one before (0: it fired, or none was asked).
+int sd_test_fail_streamed(uint64_t count) {
+    return int(std::min<uint64_t>(fail_streamed_chunk.exchange(count), 1 << 30));
+}
 // Development: the text a failed call with `code` carries when the runtime answers NULL (runtime_null != 0) or its own text; copied into
 // `out` (NUL-terminated, cut to `capacity`); the length, or -1 for a bad buffer. Touches no device and no driver.
 int sd_test_gpu_error_text(int code, int runtime_null, char* out, size_t capacity) {
@@ -2605,60 +2979,86 @@ int sd_hybrid_wait_check(void* handle) {
         create_expert_slots(d, 0, 2, 256, false);
         auto* counters = reinterpret_cast<volatile uint32_t*>(d.exchange + hybrid_sequence_slot);
         auto* gpu_counters = reinterpret_cast<volatile uint32_t*>(d.exchange_device + hybrid_sequence_slot);
-        const auto device_failed = [&]() {
-            uint32_t value = 0;
-            check(hipMemcpy(&value, d.flags + hybrid_await_device_failed, sizeof(value), hipMemcpyDeviceToHost));
-            return value;
+        const int32_t needs_result = 1, no_result = 0;
+        auto launch_wait = [&](uint64_t timeout, bool cpu_result = true) {
+            check(hipMemcpyAsync(hybrid_need(d), cpu_result ? &needs_result : &no_result, sizeof(needs_result), hipMemcpyHostToDevice, d.stream));
+            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, timeout, hybrid_need(d), HYBRID_AWAITED(d),
+                                               d.flags + hybrid_await_device_failed);
+#if defined(__HIPCC__)
+            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false, hybrid_need(d), nullptr, nullptr, 0,
+                                             hybrid_plan_room(d) + hybrid_plan_histogram);
+#else
+            // No routes are needed for this handshake; the existing tick still advances the export counter.
+            hybrid_tick<<<1, 256, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false, hybrid_need(d), nullptr, nullptr, 0,
+                                               hybrid_plan_room(d) + hybrid_plan_histogram, false, nullptr, nullptr, nullptr, 0);
+#endif
+            check(hipGetLastError());
         };
-        if (device_failed()) throw std::runtime_error("a fresh device has a failed hybrid wait");
-        bool failed = false;
-        try {
+        auto awaited_count = [&]() -> uint32_t {
+#if defined(__HIPCC__)
+            return counters[hybrid_awaited_slot];
+#else
+            uint32_t count = 0;
+            check(hipMemcpy(&count, hybrid_awaited(d), sizeof(count), hipMemcpyDeviceToHost));
+            return count;
+#endif
+        };
+        auto device_failed = [&]() -> uint32_t {
+            uint32_t failed = 0;
+            check(hipMemcpy(&failed, d.flags + hybrid_await_device_failed, sizeof(failed), hipMemcpyDeviceToHost));
+            return failed;
+        };
+        if (device_failed()) throw std::runtime_error("the fresh hybrid device failure flag was not clear");
+#if defined(__HIPCC__)
+        constexpr uint32_t recovered_awaits = 3, completed_awaits = 4;
+#else
+        constexpr uint32_t recovered_awaits = 0, completed_awaits = 1;
+#endif
+        {
             HybridAwait await(d);
             await.launched = 2;
-            d.hybrid_sequence = 1; // The host consumed one export, while two are in flight.
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0, d.flags + hybrid_await_device_failed);
-            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
-            // This wait must also abort, even if unwinding publishes beyond its expected count.
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, 0, d.flags + hybrid_await_device_failed);
-            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
+            d.hybrid_sequence = 1; // The host export count has not caught up to every issued wait.
+            launch_wait(0);
+            launch_wait(0);
             check(hipStreamSynchronize(d.stream));
-            if (device_failed() != 1) throw std::runtime_error("the expired hybrid wait did not latch on the device");
+            if (!device_failed() || !counters[hybrid_await_failed_slot])
+                throw std::runtime_error("the expired hybrid wait did not latch both failure flags");
+        }
+        bool failed = false;
+        try {
+            // A new span clears the host flag, but must preserve and re-report the device failure.
+            HybridAwait await(d);
+            if (counters[hybrid_await_failed_slot] || !device_failed())
+                throw std::runtime_error("the hybrid span did not preserve its device failure latch");
+            await.launched = 1;
+            await.publish();
+            // Publication already satisfies the wait; even a no-CPU-result layer must re-report the device failure.
+            launch_wait(d.await_timeout, false);
+            check(hipStreamSynchronize(d.stream));
+            if (!device_failed() || !counters[hybrid_await_failed_slot])
+                throw std::runtime_error("the latched hybrid wait did not re-report its failure");
             await.check_failed();
         } catch (const HybridWaitTimeout&) {
-            bool renotified = false;
-            try {
-                HybridAwait await(d);   // clears only the host failure word
-                if (counters[hybrid_await_failed_slot]) throw std::runtime_error("the next span did not clear its host failure word");
-                await.launched = 1;
-                await.publish();   // already published: no spin or periodic host-cancel check
-                hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout, d.flags + hybrid_await_device_failed);
-                check(hipStreamSynchronize(d.stream));
-                if (device_failed() != 1 || counters[hybrid_await_failed_slot] != 1)
-                    throw std::runtime_error("the latched hybrid wait did not re-notify the next span");
-                await.check_failed();
-            } catch (const HybridWaitTimeout&) { renotified = true; }
-            if (!renotified) throw std::runtime_error("the latched hybrid wait was not rejected");
             recover_hybrid_wait(handle);
             failed = last_error == "the GPU wait timed out; the interrupted pass was discarded";
         }
-        if (!failed || device_failed() || d.hybrid_sequence != 2 || counters[0] != 2 ||
-            counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot])
+        if (!failed || d.hybrid_sequence != 3 || counters[0] != 3 ||
+            counters[hybrid_published_slot] != recovered_awaits || awaited_count() != recovered_awaits || counters[hybrid_await_failed_slot] || device_failed())
             throw std::runtime_error("the expired hybrid wait was not recovered");
         {
             HybridAwait await(d);
             for (size_t i = 0; i < 2560; ++i) d.exchange[i] = 42.0f;
             await.launched = 1;
             await.publish();
-            hybrid_await<<<1, 256, 0, d.stream>>>(gpu_counters, d.exchange_device, d.cpu_partial, d.await_timeout, d.flags + hybrid_await_device_failed);
-            hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, gpu_counters, hybrid_clock(d), false);
+            launch_wait(d.await_timeout);
             hybrid_wait_export(d, ++d.hybrid_sequence);
             check(hipStreamSynchronize(d.stream));
             await.check_failed();
         }
         std::vector<float> result(2560);
         check(hipMemcpy(result.data(), d.cpu_partial, result.size() * sizeof(float), hipMemcpyDeviceToHost));
-        if (device_failed() || d.hybrid_sequence != 3 || counters[0] != 3 ||
-            counters[hybrid_published_slot] != counters[hybrid_awaited_slot] || counters[hybrid_await_failed_slot] ||
+        if (d.hybrid_sequence != 4 || counters[0] != 4 ||
+            counters[hybrid_published_slot] != completed_awaits || awaited_count() != completed_awaits || counters[hybrid_await_failed_slot] || device_failed() ||
             std::any_of(result.begin(), result.end(), [](float value) { return value != 42.0f; }))
             throw std::runtime_error("the hybrid wait after recovery failed");
         return 0;
@@ -3184,7 +3584,7 @@ void* sd_create(int ordinal, uint64_t budget) {
         check(hipMalloc(reinterpret_cast<void**>(&value->output), value->output_capacity * 4));
         check(hipMalloc(reinterpret_cast<void**>(&value->matrices), value->batch_capacity * sizeof(GemvItem)));
         check(hipMalloc(reinterpret_cast<void**>(&value->flags), 256));
-        check(hipMemset(value->flags, 0, 256));   // (hybrid_clock sums from zero)
+        check(hipMemset(value->flags, 0, 256));   // (hybrid_clock sums and the hybrid wait failure latch start at zero)
         value->used = workspace_bytes + 256;
         if (budget >= 256 * 1024 * 1024) {
             check(hipMalloc(reinterpret_cast<void**>(&value->expanded), gemm_elements * 4));
@@ -3373,6 +3773,7 @@ int sd_release(void* handle, void* pointer) {
         } else {
             check(hipFree(pointer)); value.used -= found->second + allocation_tail;
         }
+        value.expert_layouts.erase(static_cast<const uint8_t*>(pointer));
         value.allocations.erase(found);
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
@@ -3559,6 +3960,9 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// A decoder layer's K/V grown to `capacity` positions, wherever it is held: in mapped host memory (the planes copied by the CPU, `valid`
+// positions of them) or in VRAM (a new allocation of the device, the planes' first `from` positions copied on the device and the old one
+// released, so the VRAM a growth takes is the new K/V and, for the length of one layer's copy, the old). Its indexer follows at the new pitch.
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state) {
     try {
         auto& d = device(handle);
@@ -3567,50 +3971,88 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         DecoderLayer& plan = found->second;
         const size_t from = plan.context, to = size_t(capacity);
         auto host = d.host_states.find(plan.states[0]);
+        const bool on_host = host != d.host_states.end();
+        auto kv = d.allocations.find(plan.states[0]);
         auto index = d.allocations.find(plan.states[1]);
-        const size_t old_pool = from / 4 + 1, pool = to / 4 + 1, history = qsa_history * 128;
-        if (host == d.host_states.end() || index == d.allocations.end() || plan.parts != 1 || to <= from || to > 262144 || valid > from)
+        const size_t old_pool = from / 4 + 1, pool = to / 4 + 1, history = qsa_history * 128, kv_bytes = to * 4 * d.kv_row;
+        if (kv == d.allocations.end() || index == d.allocations.end() || plan.parts != 1 || to <= from || to > 262144 || valid > from
+            || (!on_host && kv->second != from * 4 * d.kv_row))
             throw std::runtime_error("invalid Straydog K/V growth");
         check(hipStreamSynchronize(d.stream));
         if (d.kv_prefetching) { check(hipStreamSynchronize(d.kv_stream)); d.kv_prefetching = false; }
         void* grown = nullptr;
-        // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
-        // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (host_allocate(&grown, to * 4 * d.kv_row + allocation_tail, hipHostMallocMapped) != hipSuccess) {
-            (void)hipGetLastError();
-            throw std::runtime_error(kv_no_memory);
-        }
         void* pointer = nullptr;
         void* grown_index = nullptr;
         void* grown_scratch = nullptr;
+        // What a growth that fails gives back: nothing is handed to a plan yet, every state stays as it was.
+        const auto discard_new = [&]() {
+            if (grown && on_host) cleanup(hipHostFree(grown));
+            for (void* made : {on_host ? nullptr : grown, grown_index, grown_scratch}) {
+                const auto allocation = made ? d.allocations.find(made) : d.allocations.end();
+                if (allocation == d.allocations.end()) continue;
+                d.used -= allocation->second + allocation_tail;
+                cleanup(hipFree(made));
+                d.allocations.erase(allocation);
+            }
+        };
+        // VRAM the budget or the device cannot give: the request fails and the engine stays (see kv_no_vram).
+        const auto vram = [&](size_t bytes) {
+            try { return allocate(d, bytes); }
+            catch (const std::exception& e) {
+                (void)hipGetLastError();
+                std::fprintf(stderr, "Straydog: no VRAM for %zu MiB of K/V growth (%s)\n", bytes >> 20, e.what());
+                throw std::runtime_error(kv_no_vram);
+            }
+        };
+        // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
+        // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
+        if (on_host && host_allocate(&grown, kv_bytes + allocation_tail, hipHostMallocMapped) != hipSuccess) {
+            (void)hipGetLastError();
+            throw std::runtime_error(kv_no_memory);
+        }
         try {
-            std::memset(grown, 0, to * 4 * d.kv_row + allocation_tail);
-            for (size_t plane = 0; plane < 4; ++plane)
-                std::memcpy(static_cast<kv_t*>(grown) + plane * to * d.kv_row, static_cast<const kv_t*>(host->second) + plane * from * d.kv_row,
-                            valid * d.kv_row);
-            check(hipHostGetDevicePointer(&pointer, grown, 0));
+            if (on_host) {
+                std::memset(grown, 0, kv_bytes + allocation_tail);
+                for (size_t plane = 0; plane < 4; ++plane)
+                    std::memcpy(static_cast<kv_t*>(grown) + plane * to * d.kv_row, static_cast<const kv_t*>(host->second) + plane * from * d.kv_row,
+                                valid * d.kv_row);
+                check(hipHostGetDevicePointer(&pointer, grown, 0));
+            } else {
+                // Every position the old K/V has, not only the `valid` ones: what a later read finds is then what it would have found in a K/V
+                // that had the whole context from the start (the rows the sequence has not written are never read, whatever they hold).
+                pointer = grown = vram(kv_bytes);
+                check(hipMemsetAsync(grown, 0, kv_bytes, d.stream));
+                for (size_t plane = 0; plane < 4; ++plane)
+                    check(hipMemcpyAsync(static_cast<kv_t*>(grown) + plane * to * d.kv_row, static_cast<const kv_t*>(plan.states[0]) + plane * from * d.kv_row,
+                                         from * d.kv_row, hipMemcpyDeviceToDevice, d.stream));
+                check(hipStreamSynchronize(d.stream));
+            }
             // The indexer's blocks at their new pitch, then its rolling history: all of it through host memory, in its allocation.
             std::vector<float> before(old_pool * 128 + history), after(pool * 128 + history, 0.0f);
             check(hipMemcpy(before.data(), plan.states[1], before.size() * 4, hipMemcpyDeviceToHost));
             for (size_t column = 0; column < 128; ++column)
                 std::copy_n(before.data() + column * old_pool, std::min(old_pool, valid / 4 + 1), after.data() + column * pool);
             std::copy_n(before.data() + 128 * old_pool, history, after.data() + 128 * pool);
-            if (index->second < after.size() * 4) grown_index = allocate(d, after.size() * 4);
+            if (index->second < after.size() * 4) grown_index = vram(after.size() * 4);
             check(hipMemcpy(grown_index ? grown_index : plan.states[1], after.data(), after.size() * 4, hipMemcpyHostToDevice));
             // The layers' one scratch, once: it holds nothing between uses.
-            if (plan.states[2] && d.allocations.at(plan.states[2]) < 256 * pool * 4) grown_scratch = allocate(d, 256 * pool * 4);
+            if (plan.states[2] && d.allocations.at(plan.states[2]) < 256 * pool * 4) grown_scratch = vram(256 * pool * 4);
         } catch (const std::bad_alloc&) {
             // (the indexer's blocks go through host memory: a few tens of MB a layer; the growth is refused as when the K/V found none)
-            cleanup(hipHostFree(grown));
+            discard_new();
             throw std::runtime_error(kv_no_memory);
-        } catch (...) { cleanup(hipHostFree(grown)); throw; }
+        } catch (...) { discard_new(); throw; }
         // Every captured graph holds the old K/V or the old pitches.
         kv_clear_graphs(d);
-        check(hipHostFree(host->second));
-        d.host_states.erase(host); d.allocations.erase(plan.states[0]); d.kv_mirrors.erase(plan.states[0]);
-        d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, to * 4 * d.kv_row);
-        std::replace(plan.dependencies.begin(), plan.dependencies.end(), plan.states[0], pointer);
+        void* old_kv = plan.states[0];
+        if (on_host) {
+            check(hipHostFree(host->second));
+            d.host_states.erase(host); d.allocations.erase(old_kv); d.kv_mirrors.erase(old_kv);
+            d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, kv_bytes);
+        }
+        std::replace(plan.dependencies.begin(), plan.dependencies.end(), old_kv, pointer);
         plan.states[0] = pointer; plan.context = to;
+        if (!on_host && sd_release(handle, old_kv)) throw std::runtime_error(last_error);
         if (grown_index) {
             void* old_index = plan.states[1];
             std::replace(plan.dependencies.begin(), plan.dependencies.end(), old_index, grown_index);
@@ -3776,7 +4218,11 @@ int sd_prompt_options(void* handle, int flags) {
     try {
         auto& value = device(handle);
         if (flags & ~3) throw std::runtime_error("invalid Straydog prompt options");
+#if defined(__HIPCC__)
         value.gdn_chunked = (flags & 1) && value.rdna4;
+#else
+        value.gdn_chunked = (flags & 1) != 0;   // (CUDA: gdn_chunk_scan_f32)
+#endif
         value.hc_fused = (flags & 2) && value.rdna4;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

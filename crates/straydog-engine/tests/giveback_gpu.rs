@@ -7,8 +7,8 @@
 //! has memory enough: a refusal is made by the test hook of the GPU library (`refuse_host_allocations`), which answers the next host allocations of a
 //! request as a machine short of memory does.
 //!
-//! The context is 65536, so that the K/V (3 GiB) is in host memory at this budget and starts at 32768 positions, and the growth the test asks for is
-//! the one to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses.
+//! The context is 131072, so that even Q8 K/V is in host memory at this budget and starts at 32768 positions. The growth the test asks for is
+//! to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
@@ -45,7 +45,7 @@ fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
     let weights = Weights::open(&PathBuf::from(root), bundle, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     let prompt = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap()
         .encode("The history of the printing press begins in the fifteenth century, when").unwrap();
-    let settings = Settings { context: 65536, state_budget_bytes: 6 << 30, prefill_batch_size: 256, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
+    let settings = Settings { context: 131072, state_budget_bytes: 6 << 30, prefill_batch_size: 256, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial && model.host_kv, "partial {} host K/V {}: the K/V must be on the host at this budget", model.partial, model.host_kv);
     model.prompt_share(false).unwrap();
