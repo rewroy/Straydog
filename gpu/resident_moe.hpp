@@ -719,7 +719,16 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     const char* phase_gate="res_gate_up",*phase_down="res_down";
     // Banks have one format per role. Separate the final shared-expert
     // tiles so its format cannot inflate the routed Q2 kernel's registers.
-    auto cuda_launch=[&](const MoeTile* list,size_t start,size_t finish,size_t group,const unsigned* built=nullptr) {
+    // Whether the resident launch can have a group in the native layout, the gate/up kernel that stages those in shared memory then paying for what
+    // it holds (88 registers and 34 KB a block, where the kernel without the staging has 77 and 18 KB): a routed group in a slot or a bank that has
+    // data and a gate or up that the SoA packing did not take (hybrid_slots.hpp set_expert, finalize_resident_experts: the plan's mirror of the
+    // device table, as the launch will read it). The streamed and prestaged experts are always native (their bytes are the banks' or the staging
+    // region's, outside the slots), and so is the shared expert.
+    bool resident_native=false;
+    for (size_t e=0;e<experts && !resident_native;++e)
+        for (size_t role=0;role<2;++role)
+            if (plan.weights[e*3+role].data && !plan.weights[e*3+role].layout) resident_native=true;
+    auto cuda_launch=[&](const MoeTile* list,size_t start,size_t finish,size_t group,bool native,const unsigned* built=nullptr) {
         if (finish<=start) return;
         const dim3 gate_grid(10,unsigned(finish-start),moe_block_m/moe_cuda_m);
         const dim3 down_grid(20,unsigned(finish-start),moe_block_m/moe_cuda_m);
@@ -729,8 +738,13 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         const int gate_mode=gate_kind==up_kind ? moe_cuda_gate_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
         const int gate_only=moe_cuda_gate_mode(gate_kind), up_only=moe_cuda_gate_mode(up_kind);
         const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
-        #define SD_CUDA_GATE(mode) case mode: moe_gate_up_mma<mode,mode,true><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
-            groups,list+start,positions,steps,half_input,product,built); break;
+        // (the staging kernel only for the formats that have it, and only where a group can be native: any other launch is the one kernel)
+        #define SD_CUDA_STAGED(mode) (mode==18 || mode==21 || mode==22)
+        #define SD_CUDA_GATE(mode) case mode: \
+            if (native && SD_CUDA_STAGED(mode)) moe_gate_up_mma<mode,mode,true,SD_CUDA_STAGED(mode)><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,list+start,positions,steps,half_input,product,built); \
+            else moe_gate_up_mma<mode,mode,true,false><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,list+start,positions,steps,half_input,product,built); break;
         #define SD_CUDA_DOWN(mode) case mode: moe_down_mma<mode><<<mode==42 ? down_grid : down_generic,256,0,d.stream>>>( \
             groups,list+start,positions,product,outputs,built); break;
         // (a shared expert's gate and up of two formats, each one with a compiled decode: the pair's kernel; any other pair the generic)
@@ -751,6 +765,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         #undef SD_CUDA_MODES
         #undef SD_CUDA_DOWN
         #undef SD_CUDA_GATE
+        #undef SD_CUDA_STAGED
         check(hipGetLastError());
     };
     if (eager) {
@@ -760,8 +775,8 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
         resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
         moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
-        cuda_launch(tiles+shared_tiles,0,routed_most,0,built_count);
-        cuda_launch(tiles,0,shared_tiles,experts);
+        cuda_launch(tiles+shared_tiles,0,routed_most,0,resident_native,built_count);
+        cuda_launch(tiles,0,shared_tiles,experts,true);
     }
 #endif
 #if defined(__HIPCC__)
@@ -923,9 +938,9 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
 #else
         if (begin==0 && end==resident_tiles) {
             const size_t shared_begin=end-(host_counts[experts]+moe_block_m-1)/moe_block_m;
-            cuda_launch(tiles+host_base,begin,shared_begin,0);
-            cuda_launch(tiles+host_base,shared_begin,end,experts);
-        } else cuda_launch(tiles+host_base,begin,end,0);
+            cuda_launch(tiles+host_base,begin,shared_begin,0,resident_native);
+            cuda_launch(tiles+host_base,shared_begin,end,experts,true);
+        } else cuda_launch(tiles+host_base,begin,end,0,true);
 #endif
         check(hipGetLastError());
     };

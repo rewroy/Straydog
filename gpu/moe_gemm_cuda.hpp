@@ -442,7 +442,9 @@ __device__ __forceinline__ void moe_store16(const Matrix& m, size_t row, size_t 
 
 // One block: 32 (Q2) or 64 (generic) routed rows x 64 gate/up product columns. Mode: moe_cuda_gate_mode of
 // gate's format, UpMode of up's (the same unless a shared expert's two differ; 0: the decode that switches on the kind).
-template<int Mode, int UpMode = Mode, bool allow_soa = false>
+// Stage: the native layout's super-blocks are staged in shared memory (see Staging below); a launch that has no group in the native layout
+// takes the kernel without it, which holds fewer registers and a smaller block (the engine's resident_moe.hpp picks it).
+template<int Mode, int UpMode = Mode, bool allow_soa = false, bool Stage = false>
 __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, const MoeTile* tiles,
                                                        const int32_t* positions, size_t steps,
                                                        const __half* input, __half* product, const unsigned* tile_count = nullptr) {
@@ -465,10 +467,10 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
     // cp.async over each row's window, aligned down to 16 bytes, so that a warp's sixteen rows are not sixteen cache lines a field; a slot is the
     // window's chunks, padded to an odd number of 16 bytes so that rows a slot apart fall in eight banks, not one. 29.7 KB of shared memory in all
     // for IQ3_XXS, 32.8 KB IQ2_S and 33.8 KB IQ3_S)
-    constexpr bool Stage = allow_soa && UpMode == Mode && (Mode == 18 || Mode == 21 || Mode == 22);
+    constexpr bool Staging = Stage && allow_soa && UpMode == Mode && (Mode == 18 || Mode == 21 || Mode == 22);
     constexpr int NB = int(iq_block_bytes(Mode)), CHUNKS = (NB + 14 + 15) / 16, SLOT = (CHUNKS % 2 ? CHUNKS : CHUNKS + 1) * 16;
     __shared__ SD_ALIGN(32) union {
-        struct { __half x[M * L]; __half w[128 * L]; uint8_t native[Stage ? 128 * SLOT : 16];
+        struct { __half x[M * L]; __half w[128 * L]; uint8_t native[Staging ? 128 * SLOT : 16];
                  uint16_t grid[moe_grid_rows<Mode> > 0 ? moe_grid_rows<Mode> : 1];
                  uint32_t pairs[moe_grid_rows<Mode> > 0 ? 256 : 1]; } in;
         float out[M * 68];
@@ -477,7 +479,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
     const bool staged = moe_stage_grid16<Mode>(lds.in.grid, lds.in.pairs, &odd);
     // (a block stages only banks in the native layout whose rows start at 16-byte multiples: the windows then never start before a matrix)
     bool natstage = false;
-    if constexpr (Stage)
+    if constexpr (Staging)
         natstage = group.weights[0].layout == 0 && group.weights[1].layout == 0 &&
                    ((reinterpret_cast<uintptr_t>(group.weights[0].data) | reinterpret_cast<uintptr_t>(group.weights[1].data)) & 15) == 0;
     const int arow = t / (LOAD_K / 8), acol = (t % (LOAD_K / 8)) * 8;
@@ -494,7 +496,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
     // in the layer-ordered prefill a tile holds 10 to 20 of an expert's routes, so two or three of its four row groups are empty.
     const bool rows = tile.first + size_t(wm) * 16 < count;
     for (size_t k = 0; k < 2560; k += K) {
-        if constexpr (Stage) {
+        if constexpr (Staging) {
             if (natstage && k % 256 == 0) {
                 // (the last step of the super-block before ended with a barrier: nothing reads the slots now)
                 const size_t blk = k / 256;
@@ -517,7 +519,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_mma(const MoeGroup* groups, c
             moe_copy8(&lds.in.x[arow * L + chunk + acol], source ? source + k + chunk : nullptr, input);
             #pragma unroll
             for (int row = brow; row < 128; row += 256 / (LOAD_K / 16)) {
-                if constexpr (Stage) {
+                if constexpr (Staging) {
                     if (natstage) {
                         // (decoded from the staged super-block: the row's window starts at its slot, the block `off` bytes in)
                         const Matrix& wmat = group.weights[row / 64];
