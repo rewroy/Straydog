@@ -5445,6 +5445,11 @@ impl Model {
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
+        // The PLE rows of the first two batches are asked for as soon as the new tokens are known: their reads run behind what comes
+        // before the first layer (the parked positions' copies, a K/V growth), where the first batch waited for them after it.
+        if reused < tokens.len() {
+            self.prefetch_ple(&tokens[..reused], &tokens[reused..(reused + 2 * 4096).min(tokens.len())])?;
+        }
         // (the sequence a start was handed, and this prompt began with)
         let resumed = match parked {
             Some(origin @ ("prefix" | "kept")) => origin,
