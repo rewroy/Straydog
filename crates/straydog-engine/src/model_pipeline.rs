@@ -18,8 +18,11 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use super::*;
 use crate::gpu::{Backend, SpanAbort, SPAN_ABORTED};
 
-/// STRAYDOG_PIPELINE: 1 (the pipeline, with the expert slots and the assist level held as they are), `freeze` (the ordinary loop with them held:
-/// the other side of a comparison of the two), else off. STRAYDOG_PIPELINE_DRAFTS: the drafts of a pipelined pass (the width in force
+/// STRAYDOG_PIPELINE: unset or 1, the pipeline where it applies (a partially resident model on two NVIDIA GPUs: the first runs the next pass's
+/// layers while the second has this one's; the assist level held at [`PIPELINE_ASSIST`]); 0, off (the ordinary loop, as on one GPU and on AMD
+/// GPUs); `freeze`, the ordinary loop with the slots and the assist level held (the other side of a comparison of the two). On two RTX 3090
+/// (IQ3_S, context 262144) the pipeline decodes 146 tok/s where the ordinary loop has 122, a new conversation's code 123-143 against
+/// 87-113, reasoning 117-129 against 84-101. STRAYDOG_PIPELINE_DRAFTS: the drafts of a pipelined pass (the width in force
 /// by default). STRAYDOG_PIPELINE_FORCE_MISS=N: the guess of the next pass's first token made wrong in every Nth pass (a test). STRAYDOG_PIPELINE_CPU_THREADS: the
 /// threads of each device's CPU engine. STRAYDOG_PIPELINE_GATE: the hit rate of the last guesses under which no pass is guessed ahead for a while, whatever the passes cost (the gate chooses by cost, see Gate).
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +40,8 @@ pub(super) struct PipelineConfig {
     /// (temperature 0.7, top_p 0.8) the target's cut distribution is mostly one candidate and the two guessed alike (80.5% against
     /// 80.3% to 82.1% right); a reasoning request's sampling (temperature 1.0, top_p 0.95) draws past the most likely token far more often.
     keyed_guesses: bool,
-    /// STRAYDOG_PIPELINE_SWAPS=free: the expert slots swap as in the ordinary loop, not held while passes are run ahead (to measure what holding costs).
+    /// STRAYDOG_PIPELINE_SWAPS=held: the expert slots are held as they are while passes are run ahead (to measure; by default they swap as
+    /// in the ordinary loop: a new conversation's code was 128-143 tok/s with the swaps and 110-119 held, the steady state 146 and 143).
     free_slots: bool,
     /// STRAYDOG_PIPELINE_RECOVER=0: a pass given up behind one whose only miss was its bonus is put back by the forced replay, not by the snapshots.
     recover: bool,
@@ -72,6 +76,10 @@ fn head_share_eligible(enabled: bool, idle: bool, lower_head: bool, extras: u64,
     enabled && idle && lower_head && extras == 0 && read_rows >= 2
 }
 
+/// The distinct missed experts of a layer's pass that a pipelined request stages to the GPU (the most a CUDA device takes). New
+/// conversations on two RTX 3090: code 126-134 tok/s at 8 and 110-119 at 4, reasoning 88-94 and 80-82; the steady state 143 and 138.
+const PIPELINE_ASSIST: u32 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Off,
@@ -82,17 +90,13 @@ enum Mode {
 impl PipelineConfig {
     pub(super) fn from_env() -> PipelineConfig {
         let number = |name: &str| std::env::var(name).ok().and_then(|value| value.parse::<usize>().ok());
-        let mode = match std::env::var("STRAYDOG_PIPELINE").as_deref() {
-            Ok("1") => Mode::On,
-            Ok("freeze") => Mode::Frozen,
-            _ => Mode::Off,
-        };
+        let mode = Self::mode_named(std::env::var("STRAYDOG_PIPELINE").ok().as_deref());
         PipelineConfig { mode, drafts: number("STRAYDOG_PIPELINE_DRAFTS"), force_miss: number("STRAYDOG_PIPELINE_FORCE_MISS").unwrap_or(0),
                          cpu_threads: number("STRAYDOG_PIPELINE_CPU_THREADS").filter(|threads| (1..=256).contains(threads)),
                          gate: std::env::var("STRAYDOG_PIPELINE_GATE").ok().and_then(|value| value.parse::<f32>().ok()).unwrap_or(0.3),
                          assist: std::env::var("STRAYDOG_PIPELINE_ASSIST").ok().and_then(|value| value.parse::<u32>().ok()),
                          lone: std::env::var("STRAYDOG_PIPELINE_LONE").map_or(true, |value| value != "0"),
-                         free_slots: std::env::var("STRAYDOG_PIPELINE_SWAPS").is_ok_and(|value| value == "free"),
+                         free_slots: std::env::var("STRAYDOG_PIPELINE_SWAPS").map_or(true, |value| value != "held"),
                          recover: std::env::var("STRAYDOG_PIPELINE_RECOVER").map_or(true, |value| value.trim() != "0"),
                          batch: std::env::var("STRAYDOG_PIPELINE_MTP_BATCH").is_ok_and(|value| value == "1"),
                          handover: std::env::var("STRAYDOG_PIPELINE_HANDOVER").map_or(true, |value| value != "0"),
@@ -102,6 +106,15 @@ impl PipelineConfig {
                          pass_log: std::env::var("STRAYDOG_PIPELINE_PASS_LOG").is_ok_and(|value| value == "1"),
                          head_share: head_share_named(std::env::var("STRAYDOG_PIPELINE_HEAD_SHARE").ok().as_deref()),
                          keyed_guesses: std::env::var("STRAYDOG_PIPELINE_DRAWN_GUESSES").is_ok_and(|value| value == "1") }
+    }
+
+    /// STRAYDOG_PIPELINE's mode: the pipeline unless it is named off (`for_devices` leaves it off where it does not apply).
+    fn mode_named(value: Option<&str>) -> Mode {
+        match value.map(str::trim) {
+            None | Some("1") => Mode::On,
+            Some("freeze") => Mode::Frozen,
+            Some(_) => Mode::Off,
+        }
     }
 
     /// The expert slots and the assist level held as they are.
@@ -117,9 +130,10 @@ impl PipelineConfig {
         self.pass_log
     }
 
-    /// STRAYDOG_PIPELINE_ASSIST: the assist level the tuner is not there to choose (the pipeline and `freeze` hold it).
+    /// The assist level the tuner is not there to choose (the pipeline and `freeze` hold it): STRAYDOG_PIPELINE_ASSIST, else the
+    /// pipeline's [`PIPELINE_ASSIST`] (`freeze` then leaves it to STRAYDOG_ASSIST or the tuner's start).
     pub(super) fn assist(&self) -> Option<u32> {
-        self.assist
+        self.assist.or((self.mode == Mode::On).then_some(PIPELINE_ASSIST))
     }
 
     /// STRAYDOG_PIPELINE_DRAFTS: the drafts of every pass, held.
@@ -2033,6 +2047,18 @@ mod config_tests {
         }
         // (and the two-GPU NVIDIA case is the one that applies)
         assert_eq!(on().enabled(2), !cfg!(feature = "hip"));
+    }
+
+    #[test]
+    fn the_pipeline_is_the_default_and_is_named_off_or_frozen() {
+        assert!(PipelineConfig::mode_named(None) == Mode::On && PipelineConfig::mode_named(Some("1")) == Mode::On);
+        assert!(PipelineConfig::mode_named(Some("0")) == Mode::Off && PipelineConfig::mode_named(Some("off")) == Mode::Off);
+        assert!(PipelineConfig::mode_named(Some("freeze")) == Mode::Frozen);
+        // (unnamed, the pipeline holds its own assist level; `freeze` and the ordinary loop leave it to the tuner)
+        assert_eq!(on().assist(), Some(PIPELINE_ASSIST));
+        assert_eq!(PipelineConfig { assist: Some(4), ..on() }.assist(), Some(4));
+        assert_eq!(PipelineConfig { mode: Mode::Frozen, ..on() }.assist(), None);
+        assert_eq!(on().for_devices(1).assist(), None);
     }
 
     #[test]
