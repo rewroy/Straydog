@@ -1977,32 +1977,68 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let max_new = max_new.min(context - agreed.len());
     // (a conversation an earlier run kept, which this prompt goes on from)
     let kept_seconds = take_kept(engine, output, id, cancel, &agreed);
-    let result = engine.model.generate_constrained(
-        &agreed, max_new, &sampling, seed, &cancelled,
-        &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
-        turn, checkpoint,
-        &mut |token| {
-            generated += 1;
-            match stream.push(token) {
-                Ok(delta) => {
-                    let ended = think_close == Some(token);
-                    let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
-                    if !delta.is_empty() {
-                        first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                        output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+    // A token's text and frame are made on a thread of their own, which the thread that drives the GPUs hands each token to and goes
+    // on: a token is two decodes of the detokenizer's window, a frame's serialization and a write to the server's pipe, and they stood
+    // between two passes (a tenth of the tokens-out and bookkeeping share of a pass on a host whose cores are shared and slow: 0.8 ms of
+    // an 11.4 ms pass of two RTX 3090). Off Windows the emitter looks for tokens rather than sleeping on the channel, so that handing one
+    // over is no wake-up call either. The frames keep their order: this thread sends none between the first token and the emitter's end.
+    let (tokens_out, tokens_in) = std::sync::mpsc::channel::<u32>();
+    let result = std::thread::scope(|scope| {
+        let (stream, generated, first_text, decode_error, think_close) =
+            (&mut stream, &mut generated, &mut first_text, &mut decode_error, &mut think_close);
+        let emitter = scope.spawn(move || {
+            loop {
+                // (Windows' sleep is no finer than its timer, 15.6 ms unless raised: there the emitter waits on the channel)
+                #[cfg(windows)]
+                let token = match tokens_in.recv() {
+                    Ok(token) => token,
+                    Err(_) => break,
+                };
+                #[cfg(not(windows))]
+                let token = match tokens_in.try_recv() {
+                    Ok(token) => token,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        continue;
                     }
-                    if ended {
-                        think_close = None;
-                        output.send(&json!({"id": id, "event": "reasoning_end", "tokens": generated}));
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                };
+                *generated += 1;
+                match stream.push(token) {
+                    Ok(delta) => {
+                        let ended = *think_close == Some(token);
+                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        if !delta.is_empty() {
+                            first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                            output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": *generated}));
+                        }
+                        if ended {
+                            *think_close = None;
+                            output.send(&json!({"id": id, "event": "reasoning_end", "tokens": *generated}));
+                        }
                     }
-                }
-                Err(exc) => {
-                    decode_error.get_or_insert_with(|| exc.into());
+                    Err(exc) => {
+                        decode_error.get_or_insert_with(|| exc.into());
+                    }
                 }
             }
-        },
-        constraint.as_mut(),
-    );
+        });
+        let result = engine.model.generate_constrained(
+            &agreed, max_new, &sampling, seed, &cancelled,
+            &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
+            turn, checkpoint,
+            &mut |token| {
+                let _ = tokens_out.send(token);
+            },
+            constraint.as_mut(),
+        );
+        // (every token handed over is out before anything after the generation is sent)
+        drop(tokens_out);
+        if emitter.join().is_err() {
+            return Err("Straydog token emitter ended unexpectedly".to_string());
+        }
+        result
+    });
     result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
     if let Some(failure) = decode_error {
         return Err(failure);
