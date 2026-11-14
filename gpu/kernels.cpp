@@ -3265,7 +3265,7 @@ int sd_bench_resident(void* handle, const int* kinds, uint32_t experts, const in
         using bench_clock = std::chrono::steady_clock;
         const auto since = [](bench_clock::time_point from) { return std::chrono::duration<double, std::micro>(bench_clock::now() - from).count(); };
         hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop, d.ordinal));
-        expert_q8_scratch_make(d);
+        expert_q8_scratch_make(d, true);
         ResidentBenchScope scope(d);
         const auto allocate = [&](size_t bytes) {
             void* pointer = nullptr;
