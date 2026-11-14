@@ -141,6 +141,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>   // (before the namespace below: a header in it that includes this first would declare a `std` inside it)
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -764,6 +765,7 @@ struct Device {
     void* cpu=nullptr;
     float* exchange=nullptr;      // pinned host: selected, probabilities, activation, CPU result
     float* cpu_partial=nullptr;   // device copy of the CPU expert result
+    uint8_t* expert_q8_scratch=nullptr;   // what a pass's INT8 routed gate and up read (resident_expert_q8.hpp), made with the device
     float* exchange_device=nullptr;   // the pinned exchange as seen by kernels
     uint64_t cpu_experts=0, gpu_experts=0, assisted_experts=0, streamed_experts=0, swapped_experts=0, hybrid_tokens=0;
     // A prompt batch's experts beyond the slots that the CPU took (prompt_cpu_share), and what a streamed expert and a CPU route
@@ -847,6 +849,7 @@ struct Device {
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (parts_read) cleanup(hipEventDestroy(parts_read));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
+        if (expert_q8_scratch) cleanup(hipFree(expert_q8_scratch));
         if (draft_extras) cleanup(hipFree(draft_extras));
         if (draft_extra_tokens) cleanup(hipFree(draft_extra_tokens));
         if (copy_stream) cleanup(hipStreamDestroy(copy_stream));
@@ -3140,6 +3143,340 @@ int sd_hybrid_route_check(void* handle, const void* router, int router_kind, con
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+extern "C++" {
+#if !defined(__HIPCC__)
+// What sd_bench_resident releases when it ends, however it ends: its device buffers and events.
+struct ResidentBenchScope {
+    Device& device;
+    std::vector<void*> buffers; std::vector<hipEvent_t> events;
+    explicit ResidentBenchScope(Device& d) : device(d) {}
+    ResidentBenchScope(const ResidentBenchScope&) = delete;
+    ResidentBenchScope& operator=(const ResidentBenchScope&) = delete;
+    ~ResidentBenchScope() {
+        cleanup(hipStreamSynchronize(device.stream));
+        for (hipEvent_t event : events) cleanup(hipEventDestroy(event));
+        for (void* pointer : buffers) cleanup(hipFree(pointer));
+    }
+};
+// The value at `fraction` of the sorted samples (0.5 the median), 0 for none.
+inline double resident_bench_percentile(std::vector<double> samples, double fraction) {
+    if (samples.empty()) return 0;
+    std::sort(samples.begin(), samples.end());
+    size_t at = size_t(std::ceil(fraction * double(samples.size())));
+    at = at ? at - 1 : 0;
+    return samples[std::min(at, samples.size() - 1)];
+}
+// Pseudo-random bytes (a hash of each word's index): the grid indices a decoder looks up are spread as a model's are, not one entry for every lane.
+__global__ void resident_bench_fill(uint64_t* words, size_t count, uint64_t seed) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x) {
+        uint64_t x = (uint64_t(i) + seed) * 0x9e3779b97f4a7c15ull;
+        x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27; x *= 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        words[i] = x;
+    }
+}
+// The shared expert's gate and up of a group's entry, pointed at another copy of their bytes.
+__global__ void resident_bench_point(MoeGroup* entry, const uint8_t* gate, const uint8_t* up) {
+    entry->weights[0].data = gate; entry->weights[1].data = up;
+}
+// A plain streaming read of `count` 16-byte words (the figure a GB/s of the expert kernel is read against); `sink` keeps the loads alive.
+// Holds the stream for some tens of milliseconds, so that the launches recorded behind it wait in the queue and then run back to back: their
+// events then time the GPU alone, not the pace at which the host issues them (19 us a launch on a slow rented host, which every figure had as a
+// floor).
+__global__ void resident_bench_hold(unsigned* sink, uint64_t turns) {
+    volatile uint64_t at = 0;
+    for (uint64_t i = 0; i < turns; ++i) at = at + 1;
+    sink[0] = unsigned(at);
+}
+__global__ void resident_bench_read(const uint4* words, size_t count, unsigned* sink) {
+    unsigned sum = 0;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x) * blockDim.x) {
+        const uint4 word = words[i];
+        sum ^= word.x ^ word.y ^ word.z ^ word.w;
+    }
+    if (sum == 0x9e3779b9u) atomicAdd(sink, 1u);
+}
+#endif
+} // extern "C++"
+// Development, one-off (crates/straydog-gpu/tests/resident_cost.rs): what the decode gate and up launch of a partially resident Qwen3.8 layer costs
+// on CUDA, resident_expert_launch as hybrid_resident_experts calls it (generic resident_expert_gemv, the shared expert's waves in the launch), on
+// a plan formed by hand as create_hybrid_moe forms it: `experts` routed groups of 640 x 2560 gate and up and a 2560 x 640 down, in the engine's slots
+// (a slot holds an expert's gate, up and down one after another, rounded to 256 bytes; `slot_of[e]` is expert e's slot, or -1: absent, null data)
+// and the shared expert's 640 x 2560 gate and up, on synthetic pseudo-random bytes. Routed gate and up of kind 18, 21 or 22 in a slot are in the
+// capacity-preserving SoA layout (layout 1), as the engine's cache slots have it; any other kind stays native. Nothing here changes the engine's
+// behaviour and nothing else calls it. `kinds` is gate, up and down of the routed experts, then the shared expert's gate, up and down (GGML kinds).
+// `selected` holds `warmup + reps` reps of `rows` rows of 10 routes: the expert of each. The shared expert's bytes rotate through enough copies that
+// no rep finds the last one's in the L2 (a table entry pointed at the rep's copy before its events).
+//   mode 0: the launch as the engine makes it: the routed routes' waves and the shared expert's gate and up waves;
+//   mode 1: routed only (the plan has no shared expert: its waves are not in the grid);
+//   mode 2: the shared expert only (the plan's routed matrices have no rows: only its waves are in the grid; `selected` is read by no wave);
+//   mode 3: empty: no shared expert, and every route absent (checked): the waves return at once, the launch's fixed cost;
+//   mode 4: the device and the kernels (no plan): out[0..5] SMs, L2 bytes, threads, registers and shared bytes of an SM, compute capability; then
+//           out[8..13] for resident_expert_gemv and out[16..21] for resident_expert_gemv_kind<22>: registers, static shared bytes, local bytes,
+//           largest block, blocks an SM holds at 256 threads, constant bytes;
+//   mode 5: a plain 512 MiB read kernel, for a reference: out[0] median and out[1] least microseconds, out[17] its bytes.
+// `only` is ExpertGemv::only (0 all routes, 1 the resident ones alone, as the overlapped layer's launch beside the staging copy has it). Of modes 0
+// to 3 `out` (32 doubles) takes: [0] median GPU microseconds of a launch (events around it), [1] least, [2] most, [3] 10th and [4] 90th percentile,
+// [5] median microseconds the host spent issuing it, [6] blocks along x and [7] along y (rows), [8] waves, [9] and [10] the routed gate and up lanes,
+// [11] and [12] the shared gate and up lanes, [13] routed waves of a route's gate, [14] shared waves, [15] resident and [16] absent routes of a launch
+// (mean), [17] bytes of resident routed gate and up a launch reads, each row's route counted, [18] the same, a distinct expert once, [19] the shared
+// expert's gate and up bytes (0 where the launch has none), [20] to [25] the six matrices' bytes, [26] slot bytes, [27] resident experts, [28] shared
+// copies, [29] the slots' bytes, [30] 1 where the resident routed gate and up are SoA. The first `warmup` launches are left out of every figure.
+int sd_bench_resident(void* handle, const int* kinds, uint32_t experts, const int32_t* slot_of, uint32_t rows, const int32_t* selected,
+                      uint32_t mode, uint32_t only, uint32_t warmup, uint32_t reps, double* out) {
+    try {
+#if defined(__HIPCC__)
+        (void)handle; (void)kinds; (void)experts; (void)slot_of; (void)rows; (void)selected; (void)mode; (void)only; (void)warmup; (void)reps; (void)out;
+        throw std::runtime_error("the resident expert benchmark is CUDA's");
+#else
+        auto& d = device(handle);
+        if (!out || mode > 5 || !reps) throw std::runtime_error("invalid resident expert benchmark");
+        for (size_t i = 0; i < 32; ++i) out[i] = 0;
+        using bench_clock = std::chrono::steady_clock;
+        const auto since = [](bench_clock::time_point from) { return std::chrono::duration<double, std::micro>(bench_clock::now() - from).count(); };
+        hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop, d.ordinal));
+        expert_q8_scratch_make(d);
+        ResidentBenchScope scope(d);
+        const auto allocate = [&](size_t bytes) {
+            void* pointer = nullptr;
+            check(hipMalloc(&pointer, bytes));
+            scope.buffers.push_back(pointer);
+            check(hipMemset(pointer, 0, bytes));
+            return pointer;
+        };
+        // (`bytes` a multiple of 8)
+        const auto fill = [&](void* pointer, size_t bytes, uint64_t seed) {
+            const size_t words = bytes / 8;
+            resident_bench_fill<<<unsigned(std::min<size_t>((words + 255) / 256, size_t(d.compute_units) * 16)), 256, 0, d.stream>>>(
+                static_cast<uint64_t*>(pointer), words, seed);
+            check(hipGetLastError());
+        };
+        const auto make_events = [&](size_t count) {
+            std::vector<hipEvent_t> made(count);
+            for (auto& event : made) { check(hipEventCreate(&event)); scope.events.push_back(event); }
+            return made;
+        };
+        const auto elapsed = [](hipEvent_t from, hipEvent_t to) { float ms = 0; check(hipEventElapsedTime(&ms, from, to)); return double(ms) * 1000.0; };
+        const size_t total = size_t(warmup) + reps;
+
+        if (mode == 4) {
+            out[0] = prop.multiProcessorCount; out[1] = double(prop.l2CacheSize); out[2] = prop.maxThreadsPerMultiProcessor;
+            out[3] = prop.regsPerMultiprocessor; out[4] = double(prop.sharedMemPerMultiprocessor); out[5] = prop.major * 10 + prop.minor;
+            const auto describe = [&](const void* kernel, size_t at) {
+                hipFuncAttributes attributes{}; check(hipFuncGetAttributes(&attributes, kernel));
+                int blocks = 0; check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, 256, 0));
+                out[at] = attributes.numRegs; out[at + 1] = double(attributes.sharedSizeBytes); out[at + 2] = double(attributes.localSizeBytes);
+                out[at + 3] = attributes.maxThreadsPerBlock; out[at + 4] = blocks; out[at + 5] = double(attributes.constSizeBytes);
+            };
+            describe(reinterpret_cast<const void*>(&resident_expert_gemv), 8);
+            describe(reinterpret_cast<const void*>(&resident_expert_gemv_kind<22>), 16);
+            return 0;
+        }
+        if (mode == 5) {
+            const size_t bytes = size_t(512) << 20;
+            void* buffer = allocate(bytes + 256);
+            fill(buffer, bytes, 7);
+            auto* sink = static_cast<unsigned*>(allocate(256));
+            int per_sm = 0;
+            check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, reinterpret_cast<const void*>(&resident_bench_read), 256, 0));
+            const unsigned blocks = unsigned(std::max(1, per_sm) * prop.multiProcessorCount);
+            const auto start = make_events(total), stop = make_events(total);
+            check(hipStreamSynchronize(d.stream));
+            for (size_t rep = 0; rep < total; ++rep) {
+                check(hipEventRecord(start[rep], d.stream));
+                resident_bench_read<<<blocks, 256, 0, d.stream>>>(static_cast<const uint4*>(buffer), bytes / 16, sink);
+                check(hipGetLastError());
+                check(hipEventRecord(stop[rep], d.stream));
+            }
+            check(hipStreamSynchronize(d.stream));
+            std::vector<double> times;
+            for (size_t rep = warmup; rep < total; ++rep) times.push_back(elapsed(start[rep], stop[rep]));
+            out[0] = resident_bench_percentile(times, 0.5); out[1] = *std::min_element(times.begin(), times.end()); out[17] = double(bytes);
+            return 0;
+        }
+
+        // Modes 0 to 3.
+        if (!kinds || !slot_of || !selected || experts < 10 || experts > 512 || rows < 1 || rows > 4 || only > 1)
+            throw std::runtime_error("invalid resident expert benchmark");
+        size_t resident = 0;
+        for (size_t e = 0; e < experts; ++e) resident += slot_of[e] >= 0;
+        {
+            std::vector<char> taken(resident, 0);
+            for (size_t e = 0; e < experts; ++e) {
+                if (slot_of[e] < 0) continue;
+                if (size_t(slot_of[e]) >= resident || taken[size_t(slot_of[e])]) throw std::runtime_error("the resident expert benchmark's slots are not one to an expert");
+                taken[size_t(slot_of[e])] = 1;
+            }
+        }
+        // (a route that names no expert would read beyond the table; mode 3 is the launch of routes that are all absent)
+        for (size_t i = 0; i < total * rows * 10; ++i) {
+            if (selected[i] < 0 || size_t(selected[i]) >= experts) throw std::runtime_error("the resident expert benchmark's route names no expert");
+            if (mode == 3 && slot_of[selected[i]] >= 0) throw std::runtime_error("the resident expert benchmark's empty launch has a resident route");
+        }
+        const size_t shape_rows[6] = {640, 640, 2560, 640, 640, 2560}, shape_cols[6] = {2560, 2560, 640, 2560, 2560, 640};
+        size_t row_bytes[6], bytes[6];
+        for (size_t m = 0; m < 6; ++m) {
+            row_bytes[m] = matrix_row_bytes(kinds[m], shape_cols[m]);
+            bytes[m] = shape_rows[m] * row_bytes[m];
+        }
+        const size_t slot_bytes = (bytes[0] + bytes[1] + bytes[2] + 255) / 256 * 256;
+        // (the engine's rule, slot_soa_plan: gate and up of one SoA-eligible kind)
+        const bool soa = kinds[0] == kinds[1] && expert_soa_eligible(kinds[0], 640, 2560) && expert_soa_eligible(kinds[1], 640, 2560);
+        // (the slots as the engine's arena: `resident` of them one after another, and a tail for the aligned word loads of a last block)
+        const size_t arena_bytes = std::max<size_t>(resident, 1) * slot_bytes + 256;
+        auto* arena = static_cast<uint8_t*>(allocate(arena_bytes));
+        fill(arena, arena_bytes, 1);
+        // (the shared expert's gate and up, copy after copy: enough to be twice the L2 and one over)
+        const size_t shared_gate_at = 0, shared_up_at = (bytes[3] + 255) / 256 * 256, shared_pair = shared_up_at + (bytes[4] + 255) / 256 * 256;
+        const size_t copies = std::min<size_t>(std::max<size_t>(2 * size_t(prop.l2CacheSize) / shared_pair + 1, 2), 64);
+        auto* shared = static_cast<uint8_t*>(allocate(copies * shared_pair + 256));
+        fill(shared, copies * shared_pair + 256, 2);
+
+        Matrix routed_matrix[3]{}, shared_matrix[3]{};
+        for (size_t role = 0; role < 3; ++role) {
+            routed_matrix[role] = {nullptr, row_bytes[role], shape_rows[role], shape_cols[role], 0, 0, 0, kinds[role]};
+            shared_matrix[role] = {nullptr, row_bytes[3 + role], shape_rows[3 + role], shape_cols[3 + role], 0, 0, 0, kinds[3 + role]};
+        }
+        shared_matrix[0].data = shared + shared_gate_at; shared_matrix[1].data = shared + shared_up_at;
+        // (the shared expert's down, index 2, has no data: a gate and up launch does not read it)
+        std::vector<MoeGroup> groups(size_t(experts) + 1);
+        for (size_t e = 0; e < experts; ++e) {
+            size_t offset = 0;
+            for (size_t role = 0; role < 3; ++role) {
+                Matrix matrix = routed_matrix[role];
+                if (slot_of[e] >= 0) {
+                    matrix.data = arena + size_t(slot_of[e]) * slot_bytes + offset;
+                    matrix.layout = soa && role < 2 ? 1 : 0;
+                }
+                groups[e].weights[role] = matrix;
+                offset += bytes[role];
+            }
+        }
+        for (size_t role = 0; role < 3; ++role) groups[experts].weights[role] = shared_matrix[role];
+        // The plan's host side (create_hybrid_moe): a routed matrix of each expert and role, then the shared expert's three and two more.
+        ResidentMoe plan;
+        plan.experts = experts; plan.hybrid = true; plan.shared = mode == 0 || mode == 2;
+        plan.weights.assign(size_t(experts) * 3 + 5, Matrix{});
+        for (size_t e = 0; e < experts; ++e)
+            for (size_t role = 0; role < 3; ++role) {
+                plan.weights[e * 3 + role] = groups[e].weights[role];
+                if (mode == 2) plan.weights[e * 3 + role].rows = 0;   // (no routed waves in the grid)
+            }
+        for (size_t role = 0; role < 3; ++role) plan.weights[size_t(experts) * 3 + role] = shared_matrix[role];
+        auto* table = static_cast<MoeGroup*>(allocate(groups.size() * sizeof(MoeGroup)));
+        check(hipMemcpy(table, groups.data(), groups.size() * sizeof(MoeGroup), hipMemcpyHostToDevice));
+        plan.table = table;
+        auto* input = static_cast<float*>(allocate(size_t(rows) * 2564 * 4));
+        {
+            std::vector<float> values(size_t(rows) * 2564);
+            for (size_t i = 0; i < values.size(); ++i) values[i] = float(int(i * 7 % 13) - 6) / 16.0f;
+            check(hipMemcpy(input, values.data(), values.size() * 4, hipMemcpyHostToDevice));
+        }
+        auto* gate_up = static_cast<float*>(allocate(size_t(rows) * 11 * 1280 * 4));
+        auto* routes = static_cast<int32_t*>(allocate(total * rows * 10 * 4));
+        check(hipMemcpy(routes, selected, total * rows * 10 * 4, hipMemcpyHostToDevice));
+        check(hipStreamSynchronize(d.stream));
+
+        // The launch's geometry, by the arithmetic resident_expert_launch does it with on CUDA (the generic kernel: 20 concurrent matrices).
+        size_t waves = 0;
+        unsigned lanes[2], shared_lanes[2];
+        size_t routed_waves[2], shared_waves = 0;
+        for (size_t r = 0; r < 2; ++r) {
+            lanes[r] = resident_lanes(plan.weights, r, input, 20);
+            routed_waves[r] = gemv_waves(plan.weights[r], lanes[r]);
+            const Matrix& pair = plan.weights[size_t(experts) * 3 + r];
+            shared_lanes[r] = gemv_lanes(pair, input, 20);
+            const size_t own = plan.shared ? gemv_waves(pair, shared_lanes[r]) : 0;
+            shared_waves += own;
+            waves += 10 * routed_waves[r] + own;
+        }
+        const double grid_x = double((waves + 7) / 8);
+
+        const auto start = make_events(total), stop = make_events(total);
+        std::vector<double> issue;
+        auto* held = static_cast<unsigned*>(allocate(256));
+        check(hipStreamSynchronize(d.stream));
+        resident_bench_hold<<<1, 1, 0, d.stream>>>(held, 20000000ull);
+        check(hipGetLastError());
+        for (size_t rep = 0; rep < total; ++rep) {
+            const size_t copy = rep % copies;
+            resident_bench_point<<<1, 1, 0, d.stream>>>(table + experts, shared + copy * shared_pair + shared_gate_at, shared + copy * shared_pair + shared_up_at);
+            check(hipGetLastError());
+            const auto begin = bench_clock::now();
+            check(hipEventRecord(start[rep], d.stream));
+            resident_expert_launch(d, plan, table, routes + rep * rows * 10, false, input, gate_up, rows, 2564, 11 * 1280, false, nullptr, 0, nullptr, only);
+            check(hipEventRecord(stop[rep], d.stream));
+            if (rep >= warmup) issue.push_back(since(begin));
+        }
+        check(hipStreamSynchronize(d.stream));
+        std::vector<double> times;
+        for (size_t rep = warmup; rep < total; ++rep) times.push_back(elapsed(start[rep], stop[rep]));
+        // The bytes a launch reads of resident routed gate and up, each row's routes and then each distinct expert once.
+        double resident_routes = 0, absent_routes = 0, route_bytes = 0, unique_bytes = 0;
+        for (size_t rep = warmup; rep < total; ++rep) {
+            std::set<int32_t> distinct;
+            for (size_t row = 0; row < rows; ++row)
+                for (size_t route = 0; route < 10; ++route) {
+                    const int32_t expert = selected[(rep * rows + row) * 10 + route];
+                    if (slot_of[expert] < 0) { absent_routes += 1; continue; }
+                    resident_routes += 1; route_bytes += double(bytes[0] + bytes[1]); distinct.insert(expert);
+                }
+            unique_bytes += double(distinct.size()) * double(bytes[0] + bytes[1]);
+        }
+        // With the INT8 routed kernel on (STRAYDOG_EXPERT_Q8): the last rep's routes once more with every row reading alone, with the rows
+        // sharing, and on the F32 kernel; out[31] takes the floats of resident routed routes that differ between the first two, bit for bit
+        // (it must be 0), and a line says how far the INT8 sums are from the F32 ones.
+        if (expert_q8_level() && mode <= 1) {
+            const size_t floats = size_t(rows) * 11 * 1280;
+            std::vector<float> alone(floats), together(floats), exact(floats);
+            const int32_t* last = routes + (total - 1) * rows * 10;
+            const auto run = [&](int level, std::vector<float>& to) {
+                expert_q8_forced = level;
+                check(hipMemset(gate_up, 0, floats * 4));
+                resident_expert_launch(d, plan, table, last, false, input, gate_up, rows, 2564, 11 * 1280, false, nullptr, 0, nullptr, only);
+                check(hipStreamSynchronize(d.stream));
+                check(hipMemcpy(to.data(), gate_up, floats * 4, hipMemcpyDeviceToHost));
+            };
+            run(2, alone); run(1, together); run(0, exact);
+            expert_q8_forced = -1;
+            // (The synthetic bytes make a block's scale any half, one in 32 of them an infinity or a NaN: a sum that is not finite in either
+            // kernel is left out of the error and counted, and the error is the median of |INT8 - F32| / |F32| over the rest, which the few
+            // sums of huge scales do not decide as they would an rms.)
+            double differing = 0, compared = 0, unfinite = 0;
+            std::vector<double> errors;
+            for (size_t row = 0; row < rows; ++row)
+                for (size_t route = 0; route < 10; ++route) {
+                    if (slot_of[selected[((total - 1) * rows + row) * 10 + route]] < 0) continue;
+                    for (size_t i = 0; i < 1280; ++i) {
+                        const size_t at = (row * 11 + route) * 1280 + i;
+                        differing += std::memcmp(&alone[at], &together[at], 4) != 0;
+                        compared += 1;
+                        if (!std::isfinite(together[at]) || !std::isfinite(exact[at]) || exact[at] == 0.0f) { unfinite += 1; continue; }
+                        errors.push_back(std::fabs(double(together[at]) - exact[at]) / std::fabs(double(exact[at])));
+                    }
+                }
+            out[31] = differing;
+            std::sort(errors.begin(), errors.end());
+            const auto at_share = [&](double share) { return errors.empty() ? 0.0 : errors[std::min(errors.size() - 1, size_t(share * double(errors.size())))]; };
+            std::fprintf(stderr, "resident bench check: %u rows, %.0f floats of resident routed routes; sharing against alone: %.0f differ; INT8 against F32: "
+                         "|difference| / |F32 sum| median %.5f, 90th percentile %.5f, 99th %.5f over %zu finite sums (%.0f not finite or zero)\n", rows,
+                         compared, differing, at_share(0.5), at_share(0.9), at_share(0.99), errors.size(), unfinite);
+        }
+        const double launches = double(reps);
+        out[0] = resident_bench_percentile(times, 0.5); out[1] = *std::min_element(times.begin(), times.end()); out[2] = *std::max_element(times.begin(), times.end());
+        out[3] = resident_bench_percentile(times, 0.1); out[4] = resident_bench_percentile(times, 0.9); out[5] = resident_bench_percentile(issue, 0.5);
+        out[6] = grid_x; out[7] = double(rows); out[8] = double(waves);
+        out[9] = lanes[0]; out[10] = lanes[1]; out[11] = shared_lanes[0]; out[12] = shared_lanes[1];
+        out[13] = double(routed_waves[0]); out[14] = double(shared_waves);
+        out[15] = resident_routes / launches; out[16] = absent_routes / launches; out[17] = route_bytes / launches; out[18] = unique_bytes / launches;
+        out[19] = plan.shared ? double(bytes[3] + bytes[4]) : 0;
+        for (size_t m = 0; m < 6; ++m) out[20 + m] = double(bytes[m]);
+        out[26] = double(slot_bytes); out[27] = double(resident); out[28] = double(copies); out[29] = double(arena_bytes); out[30] = soa ? 1 : 0;
+        return 0;
+#endif
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
 int sd_transfer(void* handle,int stream,void* pointer,uint64_t offset,void* host,uint64_t bytes) {
     try {
         auto& d=device(handle);
@@ -4210,6 +4547,7 @@ int sd_decode_options(void* handle, int flags) {
         value.q8_wide = (flags & 4) != 0;
 #endif
         value.half_decode = (flags & 2) && value.rdna4;
+        expert_q8_scratch_make(value);
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }

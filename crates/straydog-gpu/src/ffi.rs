@@ -221,6 +221,21 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_bench_resident(
+        handle: *mut ::std::os::raw::c_void,
+        kinds: *const ::std::os::raw::c_int,
+        experts: u32,
+        slot_of: *const i32,
+        rows: u32,
+        selected: *const i32,
+        mode: u32,
+        only: u32,
+        warmup: u32,
+        reps: u32,
+        out: *mut f64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_host_state(
         handle: *mut ::std::os::raw::c_void,
         bytes: u64,

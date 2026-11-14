@@ -79,23 +79,34 @@ struct ExpertGemv {
     // CUDA: the pass's staging plan (hybrid_tick_plan): of each row's ten routes the staging slot its expert was given, or -1 (resident, or left to
     // the CPU). One slot to a distinct missed expert of the pass, whatever rows route to it. A kernel moves it to its row (expert_row_stage).
     const int32_t* assign;
-    // CUDA: which of the GPU's routes a launch evaluates: 0 all, 1 the resident ones alone, 2 the staged ones alone. A layer whose staging copy runs beside its
+    // CUDA: which of the GPU's routes a launch evaluates: 0 all, 1 the resident ones alone, 2 the staged ones alone (3: all but the experts whose
+    // gate and up are in SoA slots, which the INT8 kernels took). A layer whose staging copy runs beside its
     // resident experts (hybrid_resident_experts) launches the resident ones first and the staged ones after the copy; each route's tiles are the same tiles
     // in either launch, so the sums are those of one launch for all.
     uint32_t only;
 };
 // Whether the GPU evaluates `route`: resident, or among the first assisted absent routes.
+// (No array of the plan is read at an index the thread computes, here or in expert_wave: with one such read nvcc keeps the whole plan, a
+// kernel's argument, in every thread's stack and writes it there at the kernel's entry -- 17 stores of local memory before the first branch
+// of resident_expert_gemv_kind, 136 bytes a thread, some 30 MB a launch of a four-row down, as much as the weights it reads.)
 __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
                                                         size_t role,const ExpertGemv& plan) {
     const size_t expert=size_t(selected[route]);
     const uint8_t* data=groups[expert].weights[role].data;
-    if (data) return plan.only==2 ? nullptr : data;
-    if (plan.only==1 || !plan.assist || !plan.mapped[role]) return nullptr;
+    const uint8_t* mapped=role==0 ? plan.mapped[0] : role==1 ? plan.mapped[1] : plan.mapped[2];
+    const uint64_t bytes=role==0 ? plan.bytes[0] : role==1 ? plan.bytes[1] : plan.bytes[2];
+    if (data) {
+        if (plan.only==2) return nullptr;
+        // (3: the INT8 kernels took the experts whose gate and up are in SoA slots, resident_expert_q8.hpp)
+        if (plan.only==3 && groups[expert].weights[0].layout && groups[expert].weights[1].layout) return nullptr;
+        return data;
+    }
+    if (plan.only==1 || !plan.assist || !mapped) return nullptr;
     if (plan.assign) {
         const int32_t slot=plan.assign[route];
         if (slot<0) return nullptr;
         if (plan.stage) return plan.stage+size_t(slot)*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
-        return plan.mapped[role]+expert*plan.bytes[role];
+        return mapped+expert*bytes;
     }
     // Balance the PCIe-bound GPU share against the CPU: about 5 of every 12 absent routes.
     uint32_t earlier=0,absent=0;
@@ -106,7 +117,7 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
     const uint32_t share=min(plan.assist,(5*absent+4)/12);
     if (earlier>=share) return nullptr;
     if (plan.stage) return plan.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
-    return plan.mapped[role]+expert*plan.bytes[role];
+    return mapped+expert*bytes;
 }
 // A row's assisted experts stage after the earlier rows' (hybrid_stage_assist).
 __device__ __forceinline__ void expert_row_stage(ExpertGemv& plan) {
@@ -114,17 +125,20 @@ __device__ __forceinline__ void expert_row_stage(ExpertGemv& plan) {
     else if (plan.stage) plan.stage+=size_t(blockIdx.y)*plan.assist*plan.slot_bytes;
 }
 // A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
+// (The roles one after another, written out: a loop over them would read the plan's arrays at its counter, see expert_source.)
 __device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGemv& plan,size_t& route,size_t& role,size_t& local,
                                             unsigned& lanes) {
-    const size_t roles=down ? 1 : 2;
-    for (size_t r=0;r<roles;++r) {
-        const size_t span=10*size_t(plan.routed_waves[r]);
-        if (wave<span) { route=wave/plan.routed_waves[r]; local=wave%plan.routed_waves[r]; role=down ? 2 : r; lanes=plan.routed_lanes[r]; return true; }
-        wave-=span;
+    const size_t first=plan.routed_waves[0], second=down ? 0 : plan.routed_waves[1];
+    if (wave<10*first) { route=wave/first; local=wave%first; role=down ? 2 : 0; lanes=plan.routed_lanes[0]; return true; }
+    wave-=10*first;
+    if (!down) {
+        if (wave<10*second) { route=wave/second; local=wave%second; role=1; lanes=plan.routed_lanes[1]; return true; }
+        wave-=10*second;
     }
-    for (size_t r=0;r<roles;++r) {
-        if (wave<plan.shared_waves[r]) { route=10; local=wave; role=down ? 2 : r; lanes=plan.shared_lanes[r]; return true; }
-        wave-=plan.shared_waves[r];
+    if (wave<plan.shared_waves[0]) { route=10; local=wave; role=down ? 2 : 0; lanes=plan.shared_lanes[0]; return true; }
+    wave-=plan.shared_waves[0];
+    if (!down) {
+        if (wave<plan.shared_waves[1]) { route=10; local=wave; role=1; lanes=plan.shared_lanes[1]; return true; }
     }
     return false;
 }
@@ -230,6 +244,7 @@ inline size_t hybrid_level(const Device& d,const ResidentMoe& plan) {
 #endif
     return d.assist;
 }
+#include "resident_expert_q8.hpp"
 // shared_done: the shared expert's gate and up are in `output` already (moe_tokens_experts' router launch).
 void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* groups,const int32_t* selected,
                             bool down,const float* input,float* output,
@@ -242,6 +257,40 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     for (size_t role=0;role<3;++role) { geometry.mapped[role]=plan.mapped[role]; geometry.bytes[role]=plan.host_bytes[role]; }
     geometry.assist=plan.mapped[0] ? hybrid_level(d,plan) : 0;
     geometry.stage=assist_stage; geometry.slot_bytes=assist_slot_bytes; geometry.assign=assist_assign; geometry.only=only;
+    // The routed gate and up of the experts in SoA slots on INT8 activations (resident_expert_q8.hpp). The shared expert's gate and up go to the
+    // dense GEMV on the side stream, forked before the routed launches and joined after them, so that the two run together: behind them on the
+    // device's stream they added 11 to 33 us a launch (RTX 3090, 1 to 4 rows). What else the GPU evaluates of the launch -- a staged expert,
+    // whose image is the host's native layout -- stays with the kernels below, which then take those routes alone (ExpertGemv::only 3) and no
+    // shared expert.
+    bool q8=false;
+    if (!down && only!=2 && resident_gate_up_q8_takes(d,plan,input,tokens,input_stride)) {
+        if (with_shared) {
+            check(hipEventRecord(d.side_fork,d.stream));
+            check(hipStreamWaitEvent(d.side_stream,d.side_fork,0));
+            {
+                StreamScope side(d,d.side_stream);
+                Matrix pair[2]={weights[shared],weights[shared+1]};
+                pair[1].output_offset=640;
+                gemv(d,pair,2,input,output+10*1280,tokens,input_stride ? input_stride : 2560,output_stride ? output_stride : 11*1280);
+            }
+            check(hipEventRecord(d.side_join,d.side_stream));
+        }
+        resident_gate_up_q8_launch(d,plan,groups,selected,geometry,input,output,tokens,input_stride,output_stride);
+        if (with_shared) check(hipStreamWaitEvent(d.stream,d.side_join,0));
+        // (a partially resident plan's resident experts are all in slots: a launch of them alone has nothing left, nor has any launch while
+        // the GPU takes no expert over the bus -- the F32 kernel launched for nothing took 28 to 41 us of an RTX 3090's four-row pass)
+        if (plan.hybrid && (only==1 || !geometry.assist)) return;
+        q8=true;
+        geometry.only=3;
+    }
+    // The routed down on INT8 products (resident_expert_q8.hpp): every route the GPU evaluates, a resident expert's or a staged one's, so that
+    // the kernels below are left the shared expert's down alone (no routed wave in their grid).
+    bool q8_down=false;
+    if (down && resident_down_q8_takes(d,plan,input,tokens,input_stride)) {
+        resident_down_q8_launch(d,plan,groups,selected,geometry,input,output,tokens,input_stride,output_stride);
+        if (!with_shared || only==2) return;
+        q8_down=true;
+    }
     // The kernel of the stage's routed format (resident_expert_gemv_kind) when it has one: its shared down rows of a light
     // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
     const int routed=weights[down ? 2 : 0].kind;
@@ -252,7 +301,7 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     for (size_t r=0;r<roles;++r) {
         const size_t role=down ? 2 : r;
         geometry.routed_lanes[r]=resident_lanes(weights,role,input,kind && !down ? 4 : 10*roles);
-        geometry.routed_waves[r]=uint32_t(gemv_waves(weights[role],geometry.routed_lanes[r]));
+        geometry.routed_waves[r]=q8_down ? 0 : uint32_t(gemv_waves(weights[role],geometry.routed_lanes[r]));
         Matrix matrix=weights[shared+role];
         if (down) matrix.input_offset=10*640;
         geometry.shared_lanes[r]=gemv_lanes(matrix,input,10*roles);
@@ -262,11 +311,11 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
         kind&=geometry.routed_lanes[r]!=0;
     }
     // (the staged routes alone: no shared expert in the launch, and the routed tiles as they are in the launch for all)
-    if (only==2) {
+    if (only==2 || q8) {
         waves=0;
         for (size_t r=0;r<roles;++r) { geometry.shared_waves[r]=0; waves+=10*size_t(geometry.routed_waves[r]); }
     }
-    const bool beside=kind && !down && with_shared && only!=2;
+    const bool beside=kind && !down && with_shared && only!=2 && !q8;
     // (Layers in parts, qwen_parts.hpp, run it first on the device's stream: on the side stream, every pass of three or
     // four rows took 7.5 ms more at 20K.)
     // (Past four rows, not on it either: such a pass left every pass after it ~4.3 ms longer, whatever its rows.)
