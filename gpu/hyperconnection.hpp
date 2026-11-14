@@ -1,3 +1,4 @@
+#include "hyperconnection_common.hpp"
 // Independently authored fused HyperConnection execution. Included in the GPU TU.
 
 __global__ void hc_normalize(const float* input, const float* norm, float* output) {

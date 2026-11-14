@@ -410,6 +410,9 @@ inline void check_at(hipError_t error, const char* file, int line) {
                              ", code " + std::to_string(int(error)) + ")");
 }
 #define check(error) check_at((error), __FILE__, __LINE__)
+// An op of the API: the device the handle names, and the failure as the error text.
+#define SD_OP_BEGIN try { auto& value = device(handle);
+#define SD_OP_END check(hipGetLastError()); return 0; } catch (const std::exception& e) { last_error = e.what(); return -1; }
 
 inline void blas_check(hipblasStatus_t status) {
     if (status != HIPBLAS_STATUS_SUCCESS)
@@ -977,6 +980,11 @@ __device__ inline int nonlinear(unsigned code) {
     // {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113}
     return table16_s8(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u, code);
 }
+// Both signs' logistic without overflow (the HyperConnection's gates; the experts' products).
+inline __device__ float hc_sigmoid(float x) {
+    const float e = expf(-fabsf(x));
+    return x >= 0 ? 1.0f / (1.0f + e) : e / (1.0f + e);
+}
 
 // IQ1/IQ2/IQ3 lattice grids, one byte per value: the gguf reference tables, uploaded to
 // every device at creation (sd_iq_tables). A grid row is 8 (IQ1, IQ2) or 4 (IQ3) values;
@@ -1006,6 +1014,7 @@ SD_IQ_GRID_STORAGE SD_ALIGN(16) uint8_t iq_grid3xxs[256 * 4], iq_grid3s[512 * 4]
     }
 void iq_grids_upload_gemv_a(const uint8_t* const* grids, const size_t* bytes);
 void iq_grids_upload_gemv_b(const uint8_t* const* grids, const size_t* bytes);
+void iq_grids_upload_moe(const uint8_t* const* grids, const size_t* bytes);
 extern "C" const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 inline std::atomic<bool> iq_uploaded{false};
 __host__ __device__ inline bool iq_kind(int kind) {

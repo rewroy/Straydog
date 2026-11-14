@@ -3,7 +3,7 @@ project(straydog_gpu LANGUAGES CXX)
 
 # The device code is compiled as several translation units, so that an edit recompiles one of them and the units compile side by side: kernels.cpp
 # (the rest and the extern "C" API) and the units that hold the kernels of gemv.hpp (gemv_a.cu, gemv_b.cu). Each is compiled as the backend's language.
-set(STRAYDOG_GPU_UNITS kernels.cpp gemv_a.cu gemv_b.cu)
+set(STRAYDOG_GPU_UNITS kernels.cpp gemv_a.cu gemv_b.cu moe.cu)
 set(STRAYDOG_BACKEND "HIP" CACHE STRING "HIP or CUDA")
 set_property(CACHE STRAYDOG_BACKEND PROPERTY STRINGS HIP CUDA)
 if(STRAYDOG_BACKEND STREQUAL "HIP")
@@ -56,12 +56,12 @@ endif()
 
 option(STRAYDOG_GPU_TESTS "Build the standalone GPU kernel regressions (HIP, RDNA4)" OFF)
 if(STRAYDOG_GPU_TESTS AND STRAYDOG_BACKEND STREQUAL "HIP")
-  add_executable(straydog_qsa_interval_test tests/qsa_interval_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu)
+  add_executable(straydog_qsa_interval_test tests/qsa_interval_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu moe.cu)
   set_source_files_properties(tests/qsa_interval_test.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(straydog_qsa_interval_test PRIVATE hip::host roc::hipblas Threads::Threads)
   target_compile_options(straydog_qsa_interval_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-scalarize-global-loads=false>")
   set_target_properties(straydog_qsa_interval_test PROPERTIES HIP_STANDARD 17)
-  add_executable(straydog_hc_fused_test tests/hc_fused_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu)
+  add_executable(straydog_hc_fused_test tests/hc_fused_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu moe.cu)
   set_source_files_properties(tests/hc_fused_test.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(straydog_hc_fused_test PRIVATE hip::host roc::hipblas Threads::Threads)
   target_compile_options(straydog_hc_fused_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-scalarize-global-loads=false>")
