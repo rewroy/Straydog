@@ -11,6 +11,11 @@
 //! 0.71, 1.0 and 0, and O, the share of a row's routes that repeat an expert of the row before it (0.19 of 2 rows, 0.24 of 4: the engine's figures).
 //! The medians are of REPS launches after WARMUP, each launch on a different set of experts (a deck of the resident experts, dealt a launch's share at
 //! a time, comes round only after far more bytes than the L2 holds), the shared expert's bytes rotating through copies for the same reason.
+//! The down launch (resident_expert_launch with down = true, the ten routes' down and the shared expert's, on rows of 11 x 640 products) is run
+//! for the routed down of kind 42 (the Qwen bundles'), 20 and the layer 1 plan, rows 1 to 4 and F of 0.71 and 1.0, on the F32 kernels (down F32:
+//! resident_expert_gemv_kind of the down's kind, the engine's default) and with the routed down on INT8 products (down Q8; the shared down stays on
+//! the F32 kernel). Every case prints a digest of its output (every launch once more into zeros, the bits folded in): the same lists and the same
+//! digests in two builds say their kernels gave the same bits.
 //! Settings: RESIDENT_COST_DEVICE (the GPU's ordinal), RESIDENT_COST_RESIDENT (how many of the 512 experts are resident, default 384),
 //! RESIDENT_COST_ONLY (ExpertGemv::only, 1 the engine's launch beside the staging copy, 0 one launch for all routes; default 1) and
 //! RESIDENT_COST_KINDS (gate,up,down GGML kinds of the routed experts and then the shared expert's gate,up,down, for one layer of your own, e.g.
@@ -30,6 +35,8 @@ const SHARED: u32 = 2;
 const EMPTY: u32 = 3;
 const ATTRIBUTES: u32 = 4;
 const READ: u32 = 5;
+const DOWN_F32: u32 = 6;
+const DOWN_Q8: u32 = 7;
 
 /// A layer of the IQ2_XS bundle, from the GGUF's header: gate, up and down of the routed experts, then the shared expert's gate, up and down.
 /// Layer 0: IQ2_S (22) gate and up, Q2_0 (42) down; IQ3_S (21) and IQ4_XS (23) shared gate and up, Q4_0 (20) down. Layer 1: IQ2_XXS (16) gate and up
@@ -37,6 +44,9 @@ const READ: u32 = 5;
 const LAYERS: [(&str, [i32; 6]); 2] = [("layer 0", [22, 22, 42, 21, 23, 20]), ("layer 1", [16, 16, 42, 14, 23, 20])];
 /// F: the share of routes that are resident.
 const RESIDENT_SHARES: [f64; 3] = [0.71, 1.0, 0.0];
+/// The down launches' cases (gate, up, down of the routed experts, then the shared expert's gate, up, down): the routed down of kind 42 as the
+/// Qwen bundles have it and of kind 20 (Q4_0), which no layer above has; the shared down is Q4_0 (20) in all.
+const DOWN_LAYERS: [(&str, [i32; 6]); 3] = [("down 42", [22, 22, 42, 21, 23, 20]), ("down 42 l1", [16, 16, 42, 14, 23, 20]), ("down 20", [22, 22, 20, 21, 23, 20])];
 
 /// O by rows: the engine's 0.19 (2 rows) and 0.24 (4), and between them for 3; none for one row.
 fn overlap(rows: usize) -> f64 {
@@ -194,11 +204,11 @@ impl Bench {
         lists
     }
 
-    fn call(&self, kinds: &[i32; 6], rows: usize, selected: &[i32], mode: u32, warmup: u32, reps: u32) -> [f64; 32] {
+    fn call(&self, kinds: &[i32; 6], rows: usize, selected: &[i32], mode: u32, warmup: u32, reps: u32) -> [f64; 48] {
         assert_eq!(selected.len(), (warmup + reps) as usize * rows * 10, "the routes of every launch");
-        let mut out = [0f64; 32];
+        let mut out = [0f64; 48];
         // SAFETY: a live device; `kinds` holds six kinds, `slot_of` one slot an expert, `selected` the routes of `warmup + reps` launches of
-        // `rows` rows, `out` the 32 doubles the export writes.
+        // `rows` rows, `out` the 48 doubles the export writes.
         let status = unsafe {
             ffi::sd_bench_resident(
                 self.device.handle(),
@@ -219,8 +229,8 @@ impl Bench {
     }
 
     /// The device and the kernels (mode 4): no plan, so no routes.
-    fn attributes(&self) -> [f64; 32] {
-        let mut out = [0f64; 32];
+    fn attributes(&self) -> [f64; 48] {
+        let mut out = [0f64; 48];
         // SAFETY: a live device; modes 4 and 5 read no plan.
         let status = unsafe {
             ffi::sd_bench_resident(self.device.handle(), std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), ATTRIBUTES, self.only, 0, 1, out.as_mut_ptr())
@@ -230,8 +240,8 @@ impl Bench {
     }
 
     /// A plain read kernel over 512 MiB (mode 5).
-    fn read(&self) -> [f64; 32] {
-        let mut out = [0f64; 32];
+    fn read(&self) -> [f64; 48] {
+        let mut out = [0f64; 48];
         // SAFETY: as in `attributes`.
         let status = unsafe {
             ffi::sd_bench_resident(self.device.handle(), std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), READ, self.only, 10, 50, out.as_mut_ptr())
@@ -266,7 +276,7 @@ struct Line {
     rows: usize,
     f: f64,
     mode: &'static str,
-    out: [f64; 32],
+    out: [f64; 48],
     real_f: f64,
     real_o: f64,
 }
@@ -448,4 +458,87 @@ fn resident_gate_up_costs() {
             }
         }
     }
+
+    // The digests of the gate and up launches' outputs, and whether each series was queued whole behind the hold.
+    println!();
+    println!("Digests of the gate and up launches' outputs (every launch once more into zeros, the bits folded in), and H where the stream's hold was still");
+    println!("running when the last launch of the series was queued, with the host's milliseconds queueing it:");
+    for line in &lines {
+        let o = &line.out;
+        println!(
+            "{:<8} {:>4} {:>5.2} {:<7} {:08x}{:08x} {} {:>6.2} ms",
+            line.layer, line.rows, line.f, line.mode, o[33] as u64, o[32] as u64, if o[35] > 0.0 { "H" } else { "-" }, o[36]
+        );
+    }
+
+    // The down launches: resident_expert_launch with down = true on rows of 11 x 640 products, on the F32 kernels and with the routed down on INT8.
+    let down_layers: Vec<(String, [i32; 6])> = match std::env::var("RESIDENT_COST_KINDS") {
+        Ok(_) => layers(),
+        Err(_) => DOWN_LAYERS.iter().map(|(name, kinds)| (name.to_string(), *kinds)).collect(),
+    };
+    let mut down_lines: Vec<Line> = Vec::new();
+    for (layer, kinds) in &down_layers {
+        for rows in 1..=4usize {
+            let o = overlap(rows);
+            for &f in &[0.71, 1.0] {
+                let lists = bench.lists((WARMUP + REPS) as usize, rows, f, o);
+                let real_f = lists.resident_routes as f64 / lists.routes as f64;
+                let real_o = if lists.pairs > 0 { lists.overlapped / lists.pairs as f64 } else { 0.0 };
+                for (mode, label) in [(DOWN_F32, "down F32"), (DOWN_Q8, "down Q8")] {
+                    let out = bench.call(kinds, rows, &lists.selected, mode, WARMUP, REPS);
+                    eprintln!("{layer} rows {rows} F {f:.2} {label}: median {:.1} us", out[0]);
+                    down_lines.push(Line { layer: layer.clone(), rows, f, mode: label, out, real_f, real_o });
+                }
+            }
+        }
+    }
+    println!();
+    println!("Down launches, GPU microseconds of a launch (events round it, behind the hold): the routed down of the kind in the layer's name, the shared down Q4_0;");
+    println!("down F32 on resident_expert_gemv_kind, down Q8 with the routed down on INT8 products. blocks and lanes are the F32 launch's; GB/s as above, over");
+    println!("the resident routed down's bytes and the shared down's; digest: the output's, as above; H: the hold outlasted the queueing of the series.");
+    println!(
+        "{:<11} {:>4} {:>5} {:>5} {:<8} {:>6} {:>5} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9} {:>7} {:>8} {:>16} {:>2}",
+        "case", "rows", "F", "F re", "mode", "blocks", "waves", "lanes", "median", "p10", "p90", "least", "host", "res/abs", "MB routed", "MB shr", "GB/s all", "digest", "H"
+    );
+    let mut combined: u64 = 0xcbf2_9ce4_8422_2325;
+    for line in &down_lines {
+        let o = &line.out;
+        let digest = ((o[33] as u64) << 32) | (o[32] as u64);
+        combined = (combined ^ digest).wrapping_mul(0x0000_0100_0000_01b3);
+        println!(
+            "{:<11} {:>4} {:>5.2} {:>5.3} {:<8} {:>6.0} {:>5.0} {:>3.0}/{:<3.0} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>7.1} {:>4.1}/{:<4.1} {:>9.2} {:>7.2} {:>8.1} {:016x} {:>2}",
+            line.layer,
+            line.rows,
+            line.f,
+            line.real_f,
+            line.mode,
+            o[6] * o[7],
+            o[8],
+            o[9],
+            o[11],
+            o[0],
+            o[3],
+            o[4],
+            o[1],
+            o[5],
+            o[15],
+            o[16],
+            o[17] / 1e6,
+            o[19] / 1e6,
+            gbs(o[17] + o[19], o[0]),
+            digest,
+            if o[35] > 0.0 { "H" } else { "-" }
+        );
+    }
+    println!();
+    println!("Down F32 against Down Q8, median microseconds (the F32 launch is resident_expert_gemv_kind<routed down kind> over all the routes):");
+    for chunk in down_lines.chunks(2) {
+        if let [f32_line, q8_line] = chunk {
+            println!(
+                "{:<11} rows {} F {:.2}: F32 {:>8.1} (p10 {:>8.1}, p90 {:>8.1}), Q8 {:>8.1} (p10 {:>8.1}, p90 {:>8.1})",
+                f32_line.layer, f32_line.rows, f32_line.f, f32_line.out[0], f32_line.out[3], f32_line.out[4], q8_line.out[0], q8_line.out[3], q8_line.out[4]
+            );
+        }
+    }
+    println!("combined digest of the down cases: {combined:016x}");
 }
