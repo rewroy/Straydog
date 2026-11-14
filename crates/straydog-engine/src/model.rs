@@ -3865,7 +3865,10 @@ impl Model {
         self.draft_vocabulary_update()?;
         let embedded = self.token_embeddings(tokens)?;
         self.phase("draft: embeddings", &mut clock);
-        // (a pipelined request's drafts are point proposals in its ordinary stretches too: its tokens are keyed by position throughout)
+        // (while a pipelined request holds what the pipeline holds, its drafts are point proposals and its tokens the target's draws keyed
+        // by position, here as in its pipelined passes. A stretch handed over to the ordinary loop with the hold released draws its drafts
+        // and its tokens with the request's own generator again, as a request that was never pipelined does: either way a token is a draw
+        // from the target's distribution at its position.)
         let top = if self.frozen_now() { 0 } else { sampling.top_candidates().unwrap_or(0) };
         let mut proposed = Vec::new();
         let mut take = |mut draft: crate::gpu::Draft, rng: &mut Rng| -> Result<Option<(u32, f32)>> {
