@@ -800,13 +800,26 @@ private:
 
 // `source` rows on the device (rather than `input`'s on the host) come back in `rows` when asked, with the tokens.
 // `allocated` (a draft's vocabulary on one device, draft_head): the head's rows the allocation holds, where `vocabulary` rows of it are read.
+// `extras` (a draft's vocabulary on one device as well): `extra_count` more rows, of the tokens `extra_tokens`, read after the head's first
+// `vocabulary` rows; the tokens and the top pairs that fall among them come back as those tokens. No logits with them.
+__global__ void __launch_bounds__(64) head_extra_tokens(int32_t* chosen, float* ranked, uint32_t steps, uint32_t rows, const int32_t* extra_tokens,
+                                                        unsigned top) {
+    const uint32_t row = blockIdx.x;
+    if (row >= steps) return;
+    if (threadIdx.x == 0 && uint32_t(chosen[row]) >= rows) chosen[row] = extra_tokens[uint32_t(chosen[row]) - rows];
+    if (threadIdx.x < top) {
+        uint32_t* at = reinterpret_cast<uint32_t*>(ranked + size_t(row) * 2 * top + top) + threadIdx.x;
+        if (*at != ~0u && *at >= rows) *at = uint32_t(extra_tokens[*at - rows]);
+    }
+}
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
                  const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr,
                  unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr, size_t allocated = 0,
-                 bool draft_timing = false) {
-    if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
+                 bool draft_timing = false, const uint8_t* extras = nullptr, size_t extra_count = 0, const int32_t* extra_tokens = nullptr) {
+    const size_t read = vocabulary + extra_count;
+    if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * read > d.output_capacity ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max + head_top_floats > d.input_capacity ||
-        top_count > head_top_max || (top_count && !best))
+        top_count > head_top_max || (top_count && !best) || (extra_count && (!extras || !extra_tokens || logits)))
         throw std::runtime_error("invalid Straydog output head");
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
@@ -826,16 +839,19 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
     total_time.begin(); projection_time.begin();
-    gemv(d, &head, 1, mixed, d.output, steps, 2564, vocabulary);
+    const Matrix own[2] = {head, {extras, head.row_bytes, extra_count, 2560, 0, vocabulary, 0, kinds[3]}};
+    gemv(d, own, extra_count ? 2 : 1, mixed, d.output, steps, 2564, read);
     projection_time.end();
-    row_argmax(d, d.output, steps, vocabulary, vocabulary, partial, chosen);
+    row_argmax(d, d.output, steps, read, read, partial, chosen);
     float* top = reinterpret_cast<float*>(chosen + verify_max);
     if (confidence) {
-        row_exp_sum(d, d.output, steps, vocabulary, vocabulary, chosen, partial, top);
+        row_exp_sum(d, d.output, steps, read, read, chosen, partial, top);
         head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
     }
     float* ranked = top + 4 * verify_max;
-    if (top_count) row_top(d, d.output, steps, vocabulary, vocabulary, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+    if (top_count) row_top(d, d.output, steps, read, read, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+    // (after the probability, which is read at the chosen row: the rows past the head's become their tokens)
+    if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens, top_count);
     check(hipGetLastError());
     total_time.end();
     Piece pieces[5]; size_t count = 0;
@@ -1165,9 +1181,11 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     }
     return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
 }
+// The head's rows a draft reads on this device alone (pipelined verification): the first rows of a draft's vocabulary, to which draft_head
+// adds the rows of the tokens noted past them; the head of every row where there is no such vocabulary.
 size_t draft_read_rows(const Device& d, size_t vocabulary, unsigned top) {
-    return d.pipelined_chain && !top && d.draft_rows && d.draft_rows < vocabulary && !d.draft_extra_count
-        ? d.draft_rows : vocabulary;
+    (void)top;
+    return d.pipelined_chain && d.draft_rows && d.draft_rows < vocabulary ? d.draft_rows : vocabulary;
 }
 // The vocabulary head on a draft's row `last` (on this device), its token and probability back; with `top`, instead of the
 // probability, the row's `top` greatest logits and their tokens for the host to draw the draft from (sampling::accept_top_drawn).
@@ -1188,11 +1206,15 @@ void draft_head(Device& d, void* const* head, const int* head_kinds, size_t voca
     if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, probability, last,
                                  top, best, nullptr, rows_of, true);
     else {
-        // (pipelined verification: the other device is busy, so the draft's vocabulary is read on this one alone: its first rows, where no
-        // token past them was noted for it; the head of every row otherwise. The probability is under those rows' softmax, as in the split head.)
+        // (pipelined verification: the other device is busy, so the draft's vocabulary is read on this one alone: its first rows and the rows
+        // of the tokens noted past them, as the split head reads them between the two devices -- with the greatest logits for a drawn
+        // draft as well. A head of every row took 825 us of an RTX 3090 a draft, twice a pass. The probability, or the pairs a draft is
+        // drawn from, are under those rows' softmax, as in the split head.)
         const size_t read = draft_read_rows(d, vocabulary, top);
+        const bool reduced = read < vocabulary;
         output_head(d, head, head_kinds, 1, read, nullptr, token_row, nullptr, probability, last, top, best, nullptr,
-                    read < vocabulary ? vocabulary : 0, true);
+                    reduced ? vocabulary : 0, true, reduced ? d.draft_extras : nullptr, reduced ? d.draft_extra_count : 0,
+                    reduced ? d.draft_extra_tokens : nullptr);
         if (parts) finish_with_helper(d);
     }
     *token = token_row[0]; *confidence = confidence_row[0];
