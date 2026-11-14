@@ -3832,7 +3832,8 @@ impl Model {
         self.draft_vocabulary_update()?;
         let embedded = self.token_embeddings(tokens)?;
         self.phase("draft: embeddings", &mut clock);
-        let top = sampling.top_candidates().unwrap_or(0);
+        // (a pipelined request's drafts are point proposals in its ordinary stretches too: its tokens are keyed by position throughout)
+        let top = if self.frozen_now() { 0 } else { sampling.top_candidates().unwrap_or(0) };
         let mut proposed = Vec::new();
         let mut take = |mut draft: crate::gpu::Draft, rng: &mut Rng| -> Result<Option<(u32, f32)>> {
             if let Some(suppression) = &suppression {
@@ -5062,7 +5063,8 @@ impl Model {
                       else { sampling.target_read_top().unwrap_or(0) };
             let (first, embeddings, hidden, targets, mut scores) = self.verify(&rows, sampling.needs_logits() || held.is_some() || read_logits, top)?;
             let mut clock = Instant::now();
-            let penalty_top = sampling.presence_penalty != 0.0 && matches!(scores.as_ref(), Some(Scores::Top(_)));
+            let penalty_top = (sampling.presence_penalty != 0.0 || (self.frozen_now() && proposed.is_empty()))
+                && matches!(scores.as_ref(), Some(Scores::Top(_)));
             let certified = if let Some(Scores::Top(top)) = scores.as_ref().filter(|_| penalty_top) {
                 let keyed = self.frozen_now() && proposed.is_empty();
                 self.try_penalty_top(&drafts, &proposed, top, sampling, &mut generated, rng, position, keyed)

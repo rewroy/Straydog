@@ -963,6 +963,13 @@ struct Chain {
     position: u64,
 }
 
+/// STRAYDOG_PIPELINE_DRAWS=0 (development): a request whose draw reads a row's greatest logits alone (a temperature, a small top_k, no
+/// presence penalty: the model card's sampling for reasoning) keeps the ordinary loop and its drawn drafts, as before the pipeline took it.
+fn pipeline_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STRAYDOG_PIPELINE_DRAWS").map_or(true, |value| value.trim() != "0"))
+}
+
 impl Model {
     /// `work` with the first device in the group: it has been the worker's, by value, while the loop runs (a vacant backend stands in its place),
     /// so the loop asks for it back at a drain, uses it, and lends it to the worker again, whatever `work` returned.
@@ -993,15 +1000,16 @@ impl Model {
         Ok(())
     }
 
-    /// Whether this request's passes are pipelined: greedy or sampled from the whole rows' logits (drafts that are point proposals), nothing constraining it, no image, the layers split
-    /// between two devices with a CPU engine for each.
+    /// Whether this request's passes are pipelined: greedy or sampled (its drafts point proposals and its tokens the target's draws keyed by
+    /// position, from the whole rows' logits or from the rows' greatest where the draw reads only those), nothing constraining it, no image,
+    /// the layers split between two devices with a CPU engine for each.
     pub(super) fn pipeline_applies(&self, sampling: &Sampling, constraint: Option<&Constraint>) -> bool {
         self.pipeline.enabled(self.group.backends.len())
             && self.partial
             && self.speculative > 0
             && self.cpu_second.is_some()
             && constraint.is_none()
-            && sampling.top_candidates().is_none()
+            && (sampling.top_candidates().is_none() || pipeline_draws())
             && self.forced_rows.is_none()
             && self.images.is_empty()
             && self.rope_delta == 0
@@ -1505,7 +1513,9 @@ impl Model {
                 [after[0] - before[0], after[1] - before[1], after[2] - before[2], after[3] - before[3]]
             });
             self.phase("verify: layers (second device)", &mut clock);
-            let top = if sampling.presence_penalty != 0.0 { sampling.target_read_top().unwrap_or(0) } else { 0 };
+            // (a draw that reads a row's greatest logits alone has them from the device, penalized or not: a temperature with a small top_k
+            // and no penalty read the whole rows here, 1 MB a row to the host and a softmax over the vocabulary)
+            let top = if sampling.presence_penalty != 0.0 || sampling.top_candidates().is_some() { sampling.target_read_top().unwrap_or(0) } else { 0 };
             let ((targets, mut scores, _), hidden) = self.group.backends[last].output_head_rows(&tools.head, crate::gpu::Rows::Layer(47), rows, sampling.needs_logits(),
                                                                                                top, false, None)?;
             let mut head_wall = clock.elapsed().as_secs_f64();
