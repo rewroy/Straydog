@@ -526,8 +526,15 @@ inline void expert_q8_read_environment() {
 // The device's scratch: made with the device (a launch may be recorded into a graph, where nothing can be allocated), for rows of
 // expert_q8_scratch_cols values at the most.
 constexpr size_t expert_q8_scratch_cols = 2560;
-inline void expert_q8_scratch_make(Device& d) {
+inline void expert_q8_scratch_make(Device& d, bool always = false) {
     expert_q8_read_environment();
+#if defined(__HIPCC__)
+    // (a HIP build takes these kernels only when asked, or for the benchmark: otherwise nothing is allocated and the device is as it was
+    // without them)
+    if (!always && !expert_q8_asked) return;
+#else
+    (void)always;
+#endif
     if (!d.expert_q8_scratch) {
         void* pointer = nullptr;
         check(hipMalloc(&pointer, expert_q8_scratch_bytes(expert_q8_scratch_cols)));
