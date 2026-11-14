@@ -284,9 +284,19 @@ const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
-/// CUDA starts with missed routes on the CPU. Its tuner changes this level only after
-/// the same candidate saves at least 3% in two consecutive rounds. STRAYDOG_ASSIST=N holds N instead.
+/// CUDA starts with missed routes on the CPU. Where its tuner runs ([`assist_tuned`]) it changes this level only after the level in force
+/// loses two consecutive rounds by at least 3%. STRAYDOG_ASSIST=N holds N instead.
 const CUDA_ASSIST: u32 = 0;
+
+/// Whether a level no one named is left to the tuner: on an AMD build, on a CUDA build with two devices, and where STRAYDOG_ASSIST=tune
+/// asks. One NVIDIA GPU holds [`CUDA_ASSIST`] otherwise: the CUDA tuner times a level by the layers' time per emitted token, which
+/// follows the drafts' acceptance (the text's: 10% from one window to the next), and on an RTX 5070 Ti (UD-IQ2_XS, code prompt, 900
+/// tokens, eight requests of one server), where 0 is the fastest level (84.9 tok/s against 77.6 at 4), one server in four moved from
+/// 0 to 8 at its sixth request and decoded 67-71 tok/s where it had 76; the rounds' passes cost the others up to 3%. Two RTX 3090 on
+/// a slow host (the ordinary loop) gain from 58.8-68.4 to 112-124 tok/s by the tuner, and a wrong step between 4 and 8 costs them little.
+fn assist_tuned(cuda: bool, devices: usize, named: Option<&str>) -> bool {
+    !cuda || devices > 1 || named == Some("tune")
+}
 
 /// The staging slots a wide partial read (batches of [`PRESTAGE_BATCH`] rows and more, on two NVIDIA GPUs) adds for the experts of the layer under
 /// way that its slots do not hold: they come over the bus beside the layer's own work (gpu/hybrid_slots.hpp, prestage). STRAYDOG_PRESTAGE
@@ -2108,9 +2118,12 @@ impl Model {
         // layer takes none of it (hybrid_level in gpu/resident_moe.hpp).
         // (STRAYDOG_PIPELINE_ASSIST: the level the pipeline and `freeze` hold, which no tuner chooses there)
         let held = if self.pipeline.frozen_slots() { self.pipeline.assist() } else { None };
-        let forced = held.or_else(|| std::env::var("STRAYDOG_ASSIST").ok().and_then(|value| value.parse::<u32>().ok())).map(|value| value.min(cap));
-        // STRAYDOG_ASSIST=tune remains the automatic policy, as is an unset value.
-        let fixed = forced;
+        let named = std::env::var("STRAYDOG_ASSIST").ok();
+        let forced = held.or_else(|| named.as_deref().and_then(|value| value.parse::<u32>().ok())).map(|value| value.min(cap));
+        // An unset STRAYDOG_ASSIST leaves the level to the tuner on an AMD build and on two NVIDIA GPUs; one NVIDIA GPU holds CUDA_ASSIST
+        // unless STRAYDOG_ASSIST=tune asks for the tuner ([`assist_tuned`]).
+        let devices = if self.group.split().is_some() { 2 } else { 1 };
+        let fixed = forced.or_else(|| (!assist_tuned(cfg!(feature = "cuda"), devices, named.as_deref())).then_some(CUDA_ASSIST.min(cap)));
         let first = fixed.unwrap_or(if cfg!(feature = "cuda") { CUDA_ASSIST.min(cap) } else { cap });
         let level = self.assist.as_ref().map_or(first, assist::Tuner::level);
         let mapped = self.group.enable_assist(level)?;
@@ -6572,6 +6585,18 @@ mod layer_prefill_tests {
         assert_eq!(starting_kv_named(Some("0"), 262_144), 262_144);
         assert_eq!(starting_kv_named(Some("999999"), 262_144), 262_144);
         assert_eq!(starting_kv_named(Some("many"), 262_144), STARTING_KV);
+    }
+
+    /// Decides: a level no one named is the tuner's on an AMD build and on two NVIDIA GPUs; one NVIDIA GPU holds its start unless
+    /// STRAYDOG_ASSIST=tune asks for the tuner (a number is not this function's: it holds that level on any build).
+    #[test]
+    fn one_nvidia_gpu_holds_its_assist_level_unless_the_tuner_is_asked_for() {
+        use super::assist_tuned;
+        assert!(assist_tuned(false, 1, None) && assist_tuned(false, 2, None) && assist_tuned(false, 1, Some("tune")));
+        assert!(assist_tuned(true, 2, None) && assist_tuned(true, 2, Some("tune")));
+        assert!(!assist_tuned(true, 1, None));
+        assert!(assist_tuned(true, 1, Some("tune")));
+        assert!(!assist_tuned(true, 1, Some("auto")) && !assist_tuned(true, 1, Some("")));
     }
 
     /// Decides: STRAYDOG_LAYER_ROWS_VRAM=0 keeps a pass's rows on the host; unset or anything else holds them in VRAM where they fit.
