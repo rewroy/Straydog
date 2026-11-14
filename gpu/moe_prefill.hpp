@@ -8,7 +8,7 @@
 // matter: a row's sums are its own. Included in the GPU TU after moe_gemm.hpp.
 
 #if defined(__HIPCC__)
-namespace {
+namespace sdgpu {
 
 __global__ void moe_prefill_clear(MoeGroup* groups, unsigned* cursors, size_t count) {
     const size_t index = size_t(blockIdx.x) * 256 + threadIdx.x;
@@ -70,7 +70,7 @@ MoePrefillScratch moe_prefill_scratch(uint8_t* base, size_t experts, size_t rows
     return s;
 }
 
-} // namespace
+} // namespace sdgpu
 #endif
 
 uint64_t sd_moe_group_bytes() { return sizeof(MoeGroup); }
