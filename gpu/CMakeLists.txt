@@ -38,6 +38,9 @@ else()
   # one after another unless told otherwise. --threads 0 compiles them side by side, a thread each. nvcc's own times for 0.1.12's
   # kernels.cpp and the four default architectures: 15 minutes of cicc and ptxas in all, 4 minutes on the clock side by side.
   target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--threads=0>)
+  # fatbinary compresses a unit's machine code only when it judges that worth it, and leaves some of the smaller units' code as it is:
+  # with sm_120 alone the executable's device code took 15.0 MB as one unit and 27.3 MB as four. Compress every image.
+  target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
 endif()
 # Drafter quantization must produce the pinned bytes on every compiler.
 set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
