@@ -263,7 +263,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     if (begin < 48 && (end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4 &&
         !d.frozen_slots) {
         d.hybrid_verify_balanced = d.hybrid_tokens;
-        hybrid_rebalance(d, 32, false);
+        if (hybrid_refresh_due(d)) hybrid_rebalance(d, 32, false);
     }
 }
 
