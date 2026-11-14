@@ -644,27 +644,36 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     for (const uint8_t group : d.slots.group) group_count = std::max(group_count, size_t(group) + 1);
     std::vector<std::vector<Entry>> residents(group_count), waiting(group_count);
     std::vector<std::vector<size_t>> free_slots(group_count);
+    // Bounded refreshes only need each group's strongest candidates and weakest residents: the `max_swaps` first of each order are kept as
+    // the experts are scanned, in that order (the orders are total, so they are the ones a sort of every expert would put first). Every
+    // expert listed and then partially sorted took the host 0.15 ms a refresh, and 1.85 ms where its cores are shared and slow (27 plans,
+    // 9,720 slots: a verification pass of a pair of RTX 3090 there spent that between a span's end and the next device's start).
+    const auto keep = [max_swaps](std::vector<Entry>& kept, const Entry& entry, const auto& before, bool strongest) {
+        if (!max_swaps) { kept.push_back(entry); return; }
+        if (kept.size() == max_swaps) {
+            // (most experts fall here, at one comparison of scores: the order's other keys only part equal scores)
+            const double last = kept.back().score;
+            if (strongest ? entry.score < last : entry.score > last) return;
+            if (!before(entry, kept.back())) return;
+            kept.pop_back();
+        }
+        kept.insert(std::upper_bound(kept.begin(), kept.end(), entry, before), entry);
+    };
+    if (max_swaps) for (size_t g = 0; g < group_count; ++g) { residents[g].reserve(max_swaps + 1); waiting[g].reserve(max_swaps + 1); }
     for (auto& item : d.resident) {
         if (!item.second->hybrid) continue;
         ResidentMoe& plan = *item.second;
         for (size_t expert = 0; expert < plan.experts; ++expert) {
-            if (plan.slot_of[expert] >= 0) residents[plan.slot_group].push_back({&plan, expert, plan.usage[expert]});
-            else if (plan.slot_of[expert] == -1 && plan.usage[expert] > 0) waiting[plan.slot_group].push_back({&plan, expert, plan.usage[expert]});
+            if (plan.slot_of[expert] >= 0) keep(residents[plan.slot_group], {&plan, expert, plan.usage[expert]}, weakest, false);
+            else if (plan.slot_of[expert] == -1 && plan.usage[expert] > 0) keep(waiting[plan.slot_group], {&plan, expert, plan.usage[expert]}, order, true);
         }
     }
     for (size_t slot = 0; slot < d.slots.cache; ++slot) if (!d.slots.owner[slot].first) free_slots[d.slots.group[slot]].push_back(slot);
-    // Bounded refreshes only need each group's strongest candidates and weakest residents.
     std::vector<Entry> candidates;
     for (size_t g = 0; g < group_count; ++g) {
-        if (max_swaps && waiting[g].size() > max_swaps) {
-            std::partial_sort(waiting[g].begin(), waiting[g].begin() + max_swaps, waiting[g].end(), order);
-            waiting[g].resize(max_swaps);
-        }
         candidates.insert(candidates.end(), waiting[g].begin(), waiting[g].end());
-        if (max_swaps && residents[g].size() > max_swaps) {
-            std::partial_sort(residents[g].begin(), residents[g].begin() + max_swaps, residents[g].end(), weakest);
-            residents[g].resize(max_swaps);
-        } else std::sort(residents[g].begin(), residents[g].end(), weakest);
+        // (an unbounded refresh ranks every resident)
+        if (!max_swaps) std::sort(residents[g].begin(), residents[g].end(), weakest);
     }
     std::sort(candidates.begin(), candidates.end(), order);
     std::unordered_map<ResidentMoe*, std::vector<std::pair<size_t, const uint8_t*>>> released;
