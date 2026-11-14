@@ -47,6 +47,12 @@ const PROMPT_ROWS: usize = 4;
 /// Longest fully resident prompt that runs as verification passes (about 27 ms per four rows)
 /// rather than as a batched prefill, whose fixed cost is about 110 ms on two R9700s.
 const VERIFIED_PREFILL: usize = 16;
+/// Longest prompt batch of a partially resident model on two devices that runs as passes of [`PROMPT_ROWS`] rows, the first device on
+/// the next pass while the second has this one. Two RTX 3090 (IQ3_S, context 262144) read a 23-token prompt in 441 ms as two batches,
+/// 143 ms as passes one device after the other and 105 ms with the two at once (0.54, 0.24 and 0.16 s to the first token); a batch of
+/// 32 rows costs about what its eight passes do. One GPU whose passes wait for the CPU's experts (RTX 5070 Ti, 16 of 48 layers
+/// page-locked) read 60 tokens in 520 ms as batches and 630 ms as passes: it keeps the batches.
+const PARTIAL_PROMPT_PASSES: usize = 32;
 /// The tokens that end a reply.
 pub const END_TOKENS: [u32; 2] = [248044, 248046];
 const IM_START: u32 = 248045;
@@ -397,12 +403,14 @@ fn front_chain_mode() -> Option<&'static str> {
     MODE.get_or_init(|| std::env::var("STRAYDOG_FRONT_CHAIN").ok()).as_deref()
 }
 
-/// STRAYDOG_PROMPT_PASSES (development): the longest prompt batch a partially resident model reads as passes of PROMPT_ROWS rows, as its
-/// decoding verifies, rather than as a batch (unset or 0: none, every batch of two rows or more is a batch). A batch's expert kernels expand
-/// each expert its rows touch, which for a few rows is most of the bank for a handful of routes.
-fn prompt_passes() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
+/// The longest prompt batch a partially resident model reads as passes of PROMPT_ROWS rows, as its decoding verifies, rather than as a
+/// batch: [`PARTIAL_PROMPT_PASSES`] where the passes run on two devices at once (`overlapped`), none elsewhere (every batch of two rows or
+/// more is a batch); STRAYDOG_PROMPT_PASSES (development) names it for both. A batch's expert kernels expand each expert its rows touch,
+/// which for a few rows is most of the bank for a handful of routes.
+fn prompt_passes(overlapped: bool) -> usize {
+    static ROWS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES").ok().and_then(|rows| rows.parse().ok()))
+        .unwrap_or(if overlapped { PARTIAL_PROMPT_PASSES } else { 0 })
 }
 
 /// STRAYDOG_PROMPT_PASSES_OVERLAP=0 (development): a prompt batch's passes run through the two devices one after the other, where the two
@@ -3264,7 +3272,7 @@ impl Model {
         // Inside a pipelined prompt the last batch's rows stayed on the GPUs: a batch on the
         // verified or the one-token path pairs its first token with that batch's last row, read
         // back from where the MTP layer's device kept it (the next batch pairs from this one's).
-        let passes = if self.resident { VERIFIED_PREFILL } else if self.partial { prompt_passes() } else { 0 };
+        let passes = if self.resident { VERIFIED_PREFILL } else if self.partial { prompt_passes(self.prompt_passes_overlap()) } else { 0 };
         let verified = tokens.len() > 1 && tokens.len() <= passes && !touches_image;
         let previous = match previous {
             None if verified || tokens.len() == 1 => {

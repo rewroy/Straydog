@@ -844,14 +844,20 @@ inline void output_head_forget(Device& d, size_t variant) {
 // `allocated` (a draft's vocabulary on one device, draft_head): the head's rows the allocation holds, where `vocabulary` rows of it are read.
 // `extras` (a draft's vocabulary on one device as well): `extra_count` more rows, of the tokens `extra_tokens`, read after the head's first
 // `vocabulary` rows; the tokens and the top pairs that fall among them come back as those tokens. No logits with them.
+// (An index past the rows read is no row's: the choice of a step whose scores are all NaN, and a top pair that was not filled, stay as they
+// are. Equal scores among the extras fall to the one added first, where the whole head's fall to the lower token, and an extra's score is
+// summed in the lanes its few rows give it: this head's tokens are a draft's guesses, which the verification's whole head decides.)
 __global__ void __launch_bounds__(64) head_extra_tokens(int32_t* chosen, float* ranked, uint32_t steps, uint32_t rows, const int32_t* extra_tokens,
-                                                        unsigned top) {
+                                                        uint32_t extra_count, unsigned top) {
     const uint32_t row = blockIdx.x;
     if (row >= steps) return;
-    if (threadIdx.x == 0 && uint32_t(chosen[row]) >= rows) chosen[row] = extra_tokens[uint32_t(chosen[row]) - rows];
+    if (threadIdx.x == 0) {
+        const uint32_t pick = uint32_t(chosen[row]);
+        if (pick >= rows && pick - rows < extra_count) chosen[row] = extra_tokens[pick - rows];
+    }
     if (threadIdx.x < top) {
         uint32_t* at = reinterpret_cast<uint32_t*>(ranked + size_t(row) * 2 * top + top) + threadIdx.x;
-        if (*at != ~0u && *at >= rows) *at = uint32_t(extra_tokens[*at - rows]);
+        if (*at >= rows && *at - rows < extra_count) *at = uint32_t(extra_tokens[*at - rows]);
     }
 }
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
@@ -894,7 +900,8 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
         }
         if (top_count) row_top(d, d.output, steps, read, read, top_count, ranked + verify_max * 2 * head_top_max, ranked);
         // (after the probability, which is read at the chosen row: the rows past the head's become their tokens)
-        if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens, top_count);
+        if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens,
+                                                                                    uint32_t(extra_count), top_count);
         check(hipGetLastError());
     };
     if (timed) launches();   // (the timers' events are this call's own)
