@@ -19,6 +19,10 @@ int sd_device_count(void);
 /* Load the first Qwen prompt-prefill GEMM's GPU code without reading model weights. */
 int sd_prime_qwen_prefill_gemm(int ordinal, uint64_t tokens);
 int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_bytes, uint64_t* total_bytes);
+/* Log device memory at startup (ready=0) or before ready (ready=1). */
+int sd_device_memory_diagnostic(int ordinal, int ready);
+/* Signed bytes until the process's memory budget; process_budget is 1 for DXGI, 0 for reported free. */
+int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget);
 /* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
 int sd_host_register_read_only_supported(int ordinal);
 /* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
@@ -63,15 +67,35 @@ int sd_host_free(int ordinal, void* pointer);
 /* Development: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are
    refused as a machine short of memory refuses them; 0 ends it. */
 int sd_test_refuse_host(uint64_t count);
+/* Development (tests/stream_fault_gpu.rs): the `count`-th streamed chunk of a prompt batch's layers from now fails (after its GEMMs are queued, its
+   experts' table entries pointing at its buffer), once; 0 ends it. The answer is the count that was left of the one before (0: it fired). */
+int sd_test_fail_streamed(uint64_t count);
+/* Development: fail the next `count` checked hybrid waits with a software timeout; 0 ends it. */
+int sd_test_hybrid_timeout(uint64_t count);
+/* Development: the text a failed GPU call with `code` carries when the runtime answers NULL (runtime_null != 0) or text of its own, copied into
+   `out` (NUL-terminated, cut to `capacity`); its length, or -1 for a bad buffer. Touches no device and no driver. */
+int sd_test_gpu_error_text(int code, int runtime_null, char* out, size_t capacity);
+/* Development: on a fresh device, exercise an expired hybrid wait, recovery and a subsequent successful handshake. */
+int sd_hybrid_wait_check(void* handle);
 /* Development (tests/router_gpu.rs): a partially resident layer's router (`experts` rows of 2560 values of kind 30 or 0, and a one-row gate) run
    by the separate kernels and by the one kernel, for `rows` input rows; the results hold both, the separate kernels' first. See kernels.cpp. */
 int sd_hybrid_route_check(void* handle, const void* router, int router_kind, const void* gate, int gate_kind, uint64_t experts, uint64_t rows,
                           const float* input, uint32_t repeats, uint32_t assist, int* fused, float* scores, int32_t* selected,
                           float* probabilities, float* exported);
+/* Development, one-off (tests/resident_cost.rs): what the decode gate and up launch of a partially resident layer costs on CUDA, run with the engine's own
+   kernels on a plan formed by hand over synthetic bytes. The modes, `selected`, `slot_of` and the 32 `out` doubles are described at the function in
+   kernels.cpp; HIP has none. */
+int sd_bench_resident(void* handle, const int* kinds, uint32_t experts, const int32_t* slot_of, uint32_t rows, const int32_t* selected,
+                      uint32_t mode, uint32_t only, uint32_t warmup, uint32_t reps, double* out);
 void* sd_host_state(void* handle, uint64_t bytes);
 int sd_host_states_prefetch(void* handle, const uint64_t* sizes, uint64_t count);
-// A decoder layer's host K/V grown to `capacity` positions, its `valid` positions kept, and its indexer laid out for them in
-// its allocation; the new K/V's pointer in `state`. Its plans and captured graphs follow.
+// The row stagings of batches of `floats` floats (the MTP layer's, the first layer's and the PLE layer's rows, two page-locked buffers each) pinned on a
+// thread of their own, for the first batch that stages rows to take, where a wide read would otherwise pin them in its first batch.
+int sd_row_staging_prefetch(void* handle, uint64_t floats);
+// A decoder layer's K/V grown to `capacity` positions, in host memory (its `valid` positions kept) or in VRAM (every position it had, copied on
+// the device; the VRAM it takes is the new K/V and, for the length of the copy, the old one), and its indexer laid out for them in its
+// allocation; the new K/V's pointer in `state`. Its plans and captured graphs follow. A device with no room for it answers with an error that
+// ends in "not enough VRAM for the K/V of this sequence", every state as it was (a host K/V's: "not enough host memory for the K/V of this sequence").
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state);
 int sd_prefill_buffers(void* handle, uint64_t capacity, uint64_t moe_bytes, uint64_t decoder_bytes, void** moe, void** decoder);
 int sd_kv_scratch(void* handle, void** scratch);
@@ -102,6 +126,12 @@ int sd_gemm_options(void* handle, uint64_t minimum_batch, int half_precision);
 // Decode options (RDNA4 only), flags: 1 a decode row's Q5_K/Q8_0 GEMVs and IQ2 experts' gate/up on the Q8
 // kernels; 2 a decode or verify pass's index scores and attention scores through WMMA (FP16 operands, F32 sums).
 int sd_decode_options(void* handle, int flags);
+// Prompt-read options (RDNA4 only), flags: 1 a prompt pass's DeltaNet layers scan in chunks of 16 tokens (the same recurrence, its sums
+// in another order, the products against the state on the matrix cores in bf16 pieces that carry F32's bits), for a read long enough
+// to be worth it; 2 a prompt pass's HyperConnection up projection and finish as one kernel (the projection's sums on the matrix cores in
+// their own order, the rest hc_finish_hidden's arithmetic), for a read long enough to be worth it. Set before the read's batches,
+// cleared after.
+int sd_prompt_options(void* handle, int flags);
 int sd_gemm_counts(void* handle, uint64_t* calls, uint64_t* vectors);
 int sd_matvec(void* handle, void* pointer, int kind, uint64_t rows, uint64_t cols, const float* input, float* output);
 int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds, const uint64_t* rows, const uint64_t* cols, uint64_t count, const float* input, uint64_t input_count, float* output, uint64_t output_count);
@@ -546,6 +576,21 @@ int sd_mtp_prompt_kept(void* handle, void* const* pointers, const int* kinds, vo
 int sd_verify_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output);
 int sd_verify_reserve(void* handle);
 int sd_verify_commit(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
+int sd_verify_commit_forced(void* handle, uint64_t begin, uint64_t end, uint64_t kept);
+int sd_pipeline_setup(void* handle, uint64_t flags);
+int sd_freeze_slots(void* handle, uint64_t frozen);
+int sd_set_window(void* handle, uint64_t window);
+/* A fresh front generation in a snapshot window. Zero rows closes tracking after the worker joins. */
+int sd_verify_window_begin(void* handle, uint64_t window, uint64_t position, uint64_t rows, uint64_t* epoch);
+/* Restore issued layers after a checked drain. 1 requests replay without changing model states; 0 returns a touched-layer mask. */
+int sd_verify_window_restore(void* handle, uint64_t begin, uint64_t end, uint64_t epoch, uint64_t position, uint64_t rows, uint64_t* touched);
+/* A device's stop flag for its running span, with a reference for the caller (release it): raised from another thread it stops the
+   span at its next layer; the flag outlives the device while a caller holds it. */
+void* sd_abort_flag(void* handle);
+void sd_abort_flag_retain(void* flag);
+void sd_abort_flag_release(void* flag);
+void sd_abort_flag_set(void* flag, uint64_t raised);
+int sd_hybrid_usage(void* handle, uint64_t restore);
 // top: each row's `top` (at most 64) greatest logits into best (top values, then top token indices as int32 bits), most likely first.
 // input null: the rows of layer `layer`'s decoder workspace, handed back in `rows`.
 int sd_output_head(void* handle, void* const* pointers, const int* kinds, uint64_t steps, uint64_t vocabulary, const float* input, int32_t* tokens, float* logits, float* confidence, uint64_t top, float* best, uint64_t layer, float* rows);
@@ -561,14 +606,33 @@ int sd_draft_step(void* handle, void* const* mtp, const int* mtp_kinds, uint64_t
 // A drafting step's MTP layer queued with nothing waited for (sd_draft_step without its head): on each device of a layer in
 // parts, the host queueing both before sd_draft_head.
 int sd_draft_queue(void* handle, void* const* mtp, const int* mtp_kinds, uint64_t layer, uint64_t position, uint64_t steps, const float* embeddings, const float* hidden, uint64_t previous);
+// Checked drain after a queued drafting step is abandoned before its head. The caller exclusively owns this device.
+int sd_draft_drain(void* handle);
+// Rows [first, first + count) of the rows a drafting step left in `layer`'s workspace, to the host (10240 floats a row).
+int sd_draft_rows(void* handle, uint64_t layer, uint64_t first, uint64_t count, float* out);
 // sd_draft_step's head on row `row` of the rows sd_draft_queue left in `layer`'s workspace.
+// A split head also mutates the peer's scratch, staging and link state: the caller exclusively owns both devices.
+// Split confidence uses separately reduced sums and can round differently from a single-device head; argmax ties keep the same token.
 int sd_draft_head(void* handle, void* const* head, const int* head_kinds, uint64_t layer, uint64_t row, uint64_t vocabulary, uint64_t split, void* peer_head, int32_t* token, float* confidence, uint64_t top, float* best);
 // A draft's vocabulary when the head is split (sd_draft_step): rows [0, rows) of `head` (vocabulary rows of `kind`) and the rows of
 // `count` more tokens (each at least `rows`), appended to the ones before unless `reset`. rows 0: drafts read the whole head.
 int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary, uint64_t rows, const int32_t* tokens, uint64_t count, int reset);
+// Configured prefix/extra rows and the rows a single-device draft head reads for this top count.
+int sd_draft_vocabulary_info(void* handle, uint64_t vocabulary, uint64_t top, uint64_t* rows, uint64_t* extra_count, uint64_t* read_rows);
+// Explicit DS41_PROFILE diagnostics, outside capture. Toggling preserves cumulative counters. Target heads are excluded.
+int sd_head_timing_enable(void* handle, int enabled);
+// calls[2]: single/split draft heads. milliseconds[6]: single projection/device total, split local/peer projection,
+// split device total, and sum(total - max(local projection, peer projection)). Totals run from mixed rows ready through
+// choice/confidence/merge before download, including dispatch, reduction and link waits. Each interval stays on one GPU.
+int sd_head_timing_read(void* handle, uint64_t* calls, double* milliseconds);
 int sd_execution_counts(void* handle, uint64_t* graphs, uint64_t* replays, uint64_t* resident);
 
 /* Resident experts and two-GPU links */
+/* After all weight writes/fills complete, finalize routed bank layouts and tables.
+ * Call before any inference, with no concurrent device users; do not write finalized banks again.
+ * A failed in-place conversion requires discarding the device.
+ * Existing create calls alone retain native layouts. */
+int sd_experts_finalize(void* handle);
 void* sd_resident_moe_create(void* handle, void* const* pointers, const int* kinds, uint64_t experts, void* workspace, uint64_t capacity);
 void* sd_resident_moe_part(void* handle, void* const* pointers, const int* kinds, uint64_t experts, uint64_t first, uint64_t count, int shared, void* workspace, uint64_t capacity);
 int sd_resident_moe(void* handle, void* plan, uint64_t steps, const float* input, float* output);
@@ -629,7 +693,9 @@ int sd_hybrid_cache_bytes(void* handle, uint64_t* bytes);
 
 /* CPU experts and formats */
 const char* sd_cpu_error(void);
-void* sd_cpu_experts_create(uint32_t threads);
+/* `first_core`: the core of the physical cores' list the pool's workers start on (a second engine takes the first's threads on). */
+void* sd_cpu_experts_create(uint32_t threads, uint32_t first_core);
+int sd_cpu_default_threads(uint32_t* threads);
 void sd_cpu_experts_destroy(void* handle);
 const char* sd_cpu_experts_isa(void* handle);
 int sd_cpu_experts_stats(void* handle, uint64_t* values);

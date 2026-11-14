@@ -4,6 +4,7 @@
 //! stdin; events leave as JSON lines on stdout. One generation runs at a time on its own
 //! thread, so a cancellation is read while it runs. Every model byte is authenticated first.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings, WarmStart, END_TOKENS, ROUTED_EXPERTS, ROUTED_LAYERS};
 use straydog_engine::pyjson;
 use straydog_engine::qwen_vision::{Encoder, ImageSpan};
-use straydog_engine::routes::Routes;
+use straydog_engine::routes::{self, Routes};
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
@@ -139,12 +140,27 @@ struct Engine {
     encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
     /// The route counts of the runs before this one, from the warm-up state it started with (a partially resident model's: [`straydog_engine::routes`]).
     earlier: Option<Routes>,
+    /// The draft widths that state kept, by placement, which the next state keeps beside this placement's own ([`routes::with_drafts`]).
+    earlier_drafts: BTreeMap<String, u64>,
+    /// This placement's key in those ([`placement_key`]).
+    placement: String,
     /// The requests this run has begun: a warm start's slot fill ends with the first ([`fill_slots`]).
     requests: u64,
     /// The handle the request loop shares, for a locking that memory freed since the start allows ([`Engine::lock_more`]).
     me: Weak<Mutex<Engine>>,
     /// The GPUs' budgets were `auto`: GPU memory freed since the start is taken too ([`Engine::more_vram`]).
+    #[cfg(not(windows))]
     vram_auto: bool,
+    #[cfg(windows)]
+    vram_limits: Vec<Option<VramLimit>>,
+    /// Original per-device ceilings for explicit budgets, independent of pressure cooldowns.
+    #[cfg(windows)]
+    vram_caps: Option<Vec<u64>>,
+    /// Failed explicit growth attempts keep their measured headroom requirement across budget cooldowns.
+    #[cfg(windows)]
+    vram_growth_holds: Vec<Option<VramGrowthHold>>,
+    #[cfg(windows)]
+    vram_poison: ExplicitVramPoison,
 }
 
 /// Bytes of image rows kept for the turns after ([`Engine::encoded`]): about 40 full screens (1440x900 is 1260 rows of 2560 values).
@@ -206,37 +222,65 @@ pub(crate) trait Served: Send {
 impl Served for Engine {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure> {
+        self.vram_ready().map_err(|message| Failure { message: format!("{message}. Restart the worker before retrying."), fatal: true })?;
         self.requests += 1;
-        run(self, text, output, id, body, cancel, started)
+        self.more_vram(false, "request").map_err(|message| engine_failed(message, "adjusting the GPU memory budget"))?;
+        let result = run(self, text, output, id, body, cancel, started);
+        #[cfg(windows)]
+        if let Err(error) = &result {
+            if !error.fatal && error.message.ends_with(straydog_engine::gpu::HYBRID_WAIT_RECOVERED) {
+                let lowered = self.backoff_vram().map_err(|message| engine_failed(message, "reducing the GPU memory budget after a wait timeout"))?;
+                return Err(refused(if lowered {
+                    "The GPU wait exceeded its limit. The memory budget was lowered and this request was stopped. You can retry with the next request."
+                } else {
+                    "The GPU wait exceeded its limit and this request was stopped. The GPU state was reset; you can retry with the next request."
+                }));
+            }
+        }
+        result
     }
 
     fn reset(&mut self) -> Result<(), String> {
+        self.vram_ready()?;
         self.model.reset()
     }
 
     /// Memory freed since the start: GPU memory to the expert slots, host memory to more page-locked layers.
     fn after_request(&mut self) {
-        self.more_vram();
+        if self.vram_ready().is_err() { return; }
+        let adjusted = self.more_vram(true, "after_request");
+        #[cfg(windows)]
+        let permitted = self.vram_poison.after_request(self.vram_caps.is_some(), &adjusted, || ());
+        if let Err(error) = adjusted { eprintln!("WARN Straydog VRAM: {error}"); }
+        #[cfg(windows)]
+        if permitted.is_err() { return; }
         self.lock_more();
     }
 
-    /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own. Null for a model that holds all its experts,
-    /// and before any route was counted.
+    /// A partially resident model's route counts: the earlier runs' aged by what this one adds, and its own; and the draft widths by placement: the
+    /// earlier state's, with this placement's set to the width in force once the passes have chosen it (before, its earlier one stays). Null for a model
+    /// that holds all its experts, and before any route was counted.
     fn warm_state(&mut self) -> Result<Value, String> {
+        self.vram_ready()?;
         if !self.model.partial {
             return Ok(Value::Null);
         }
         let run = self.model.route_counts()?;
         let earlier = self.earlier.clone().unwrap_or_else(|| Routes::new(ROUTED_LAYERS, ROUTED_EXPERTS));
         let kept = earlier.aged_with(&run);
-        Ok(if kept.total() == 0 { Value::Null } else { kept.to_state() })
+        if kept.total() == 0 {
+            return Ok(Value::Null);
+        }
+        Ok(routes::with_drafts(kept.to_state(), &self.earlier_drafts, &self.placement, self.model.chosen_drafts()))
     }
 
     fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
+        self.vram_ready()?;
         Ok(self.model.export_prefix()?.map(|prefix| (json!({"tokens": prefix.tokens, "digest": prefix.digest}), prefix.bytes)))
     }
 
     fn conversation_state(&mut self, limit: u64) -> Result<Option<(Value, Vec<u8>)>, String> {
+        self.vram_ready()?;
         let Some((tokens, size)) = self.model.conversation_size() else { return Ok(None) };
         if size > limit {
             return Err(format!("the state of {tokens} tokens is {} MB, and there is room for {} MB", size >> 20, limit >> 20));
@@ -292,32 +336,71 @@ const WARM_PATIENCE: Duration = Duration::from_millis(100);
 const WARM_LONGEST: Duration = Duration::from_secs(120);
 
 impl Engine {
-    /// GPU memory that other programs freed since the start goes to the expert slots, under `auto`: the budget `auto` would take now, counting
-    /// this worker's own allocations back as free ([`auto_budget`]), where it is at least 512 MiB over the budget held. Asked after each
-    /// request's last frame ([`Served::after_request`]), with the slots placed again then ([`Model::raise_vram`]); a line in the log says what it took.
-    fn more_vram(&mut self) {
-        if !self.vram_auto || !self.model.partial {
-            return;
+    fn vram_ready(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        return self.vram_poison.guard(|| ());
+        #[cfg(not(windows))]
+        Ok(())
+    }
+
+    /// Reconcile a partial model's budget with current headroom. Only the pause after a completed request may grow it.
+    fn more_vram(&mut self, allow_grow: bool, phase: &str) -> Result<(), String> {
+        self.vram_ready()?;
+        if !self.model.partial {
+            return Ok(());
         }
-        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-        for (index, (ordinal, used, budget)) in self.model.vram_budgets().unwrap_or_default().into_iter().enumerate() {
-            let Ok(free) = self.model.vram_free(index) else { continue };
-            let Ok((_, _, total)) = straydog_gpu::device_info(ordinal) else { continue };
-            let wanted = auto_budget(cfg!(windows), free + used, total);
-            if wanted < budget + (512 << 20) {
-                continue;
+        #[cfg(windows)]
+        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, &mut self.vram_growth_holds, self.vram_caps.as_deref(),
+                                   self.requests, allow_grow, phase);
+        #[cfg(not(windows))]
+        {
+            let _ = phase;
+            if !self.vram_auto || !allow_grow { return Ok(()); }
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            for (index, (ordinal, used, budget)) in self.model.vram_budgets().unwrap_or_default().into_iter().enumerate() {
+                let Ok(free) = self.model.vram_free(index) else { continue };
+                let Ok((_, _, total)) = straydog_gpu::device_info(ordinal) else { continue };
+                let wanted = auto_budget(cfg!(windows), free + used, total);
+                if wanted < budget + (512 << 20) {
+                    continue;
+                }
+                match self.model.raise_vram(index, wanted) {
+                    Ok((before, after)) => eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.1} -> {:.1} GiB, memory other programs freed since the start \
+                                                      ({:.1} GiB free); expert slots {before} -> {after}", gib(budget), gib(wanted), gib(free)),
+                    Err(error) => eprintln!("WARN Straydog VRAM: GPU {ordinal}'s budget stays {:.1} GiB: {error}", gib(budget)),
+                }
             }
-            match self.model.raise_vram(index, wanted) {
-                Ok((before, after)) => eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.1} -> {:.1} GiB, memory other programs freed since the start \
-                                                  ({:.1} GiB free); expert slots {before} -> {after}", gib(budget), gib(wanted), gib(free)),
-                Err(error) => eprintln!("WARN Straydog VRAM: GPU {ordinal}'s budget stays {:.1} GiB: {error}", gib(budget)),
-            }
+            Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    fn backoff_vram(&mut self) -> Result<bool, String> {
+        self.vram_ready()?;
+        if !self.model.partial { return Ok(false); }
+        let devices = self.model.vram_budgets()?;
+        validate_vram_caps(self.vram_caps.as_deref(), devices.len())?;
+        self.vram_limits.resize(devices.len(), None);
+        let mut lowered = false;
+        for (index, (ordinal, _, budget)) in devices.into_iter().enumerate() {
+            let cap = self.vram_caps.as_ref().map(|caps| caps[index]);
+            let wanted = budget.saturating_sub(VRAM_GROWTH).min(cap.unwrap_or(u64::MAX));
+            let (before, after) = self.model.resize_vram(index, wanted)?;
+            let actual = self.model.vram_budgets()?[index].2;
+            if actual >= budget {
+                return Err(vram_refused(ordinal, "the memory budget could not be reduced after the wait timeout"));
+            }
+            self.vram_limits[index] = Some(VramLimit::new(actual, self.requests));
+            eprintln!("Straydog VRAM: GPU {ordinal}'s budget {budget} -> {actual} bytes after a wait timeout; expert slots {before} -> {after}");
+            lowered = true;
+        }
+        Ok(lowered)
     }
 
     /// Memory freed since the start page-locks more layers ([`Model::more_bank_locks`]), on a thread of its own behind the requests as the start's
     /// locking is ([`lock_banks_behind`]): asked after each request's last frame ([`Served::after_request`]).
     fn lock_more(&mut self) {
+        if self.vram_ready().is_err() { return; }
         if !self.model.partial {
             return;
         }
@@ -335,15 +418,23 @@ impl Engine {
     }
 
     /// The first step of a warm start with `state`, under the engine's lock ([`straydog_engine::model::Model::warm_start`]): the earlier counts it keeps
-    /// to save with the next state, the scores it sets, and what it plans. None for a model that holds all its experts. A state of another kind, format or
-    /// model is refused and the model starts as it would without.
+    /// to save with the next state, the scores it sets, and what it plans; and the draft width the last run on this placement chose, which the model's
+    /// passes begin at ([`straydog_engine::model::Model::start_drafts_at`]), the state's other widths kept to save beside it. None for a model that holds
+    /// all its experts. A state of another kind, format or model is refused and the model starts as it would without.
     fn warm_begin(&mut self, state: &Value) -> Result<Option<WarmStart>, String> {
+        self.vram_ready()?;
         if !self.model.partial {
             return Ok(None);
         }
         let prior = Routes::from_state(state, ROUTED_LAYERS, ROUTED_EXPERTS)?;
         let start = self.model.warm_start(&prior)?;
         self.earlier = Some(prior);
+        self.earlier_drafts = routes::drafts_in(state);
+        if let Some(width) = routes::saved_drafts(state, &self.placement, self.model.speculative) {
+            if self.model.start_drafts_at(width) {
+                eprintln!("Straydog drafts: starting at {width}, as the last run on this placement chose");
+            }
+        }
         Ok(Some(start))
     }
 }
@@ -416,6 +507,7 @@ fn warm_start(engine: &Weak<Mutex<Engine>>, start: WarmStart, requests: u64, beg
             (asked, refused, began.elapsed())
         });
         let filled = fill_slots(engine, requests, |engine: &Engine| engine.requests, |engine: &mut Engine| {
+            engine.vram_ready()?;
             let step = engine.model.warm_fill(WARM_SWAPS)?;
             fill = Some(step);
             Ok(step.pending > 0)
@@ -443,7 +535,7 @@ fn engine_for_prefix(engine: &Mutex<Engine>) -> Option<std::sync::MutexGuard<'_,
     let mut asked = Instant::now();
     loop {
         match engine.try_lock() {
-            Ok(guard) => return (guard.requests == 0).then_some(guard),
+            Ok(guard) => return (guard.requests == 0 && guard.vram_ready().is_ok()).then_some(guard),
             Err(std::sync::TryLockError::Poisoned(_)) => return None,
             Err(std::sync::TryLockError::WouldBlock) => {
                 // (the warm-up behind "ready" holds the engine for seconds, and is not a request: a restore waits for it, for it ends at once
@@ -641,8 +733,42 @@ const VRAM_PATIENCE: Duration = Duration::from_secs(60);
 /// and the split.
 pub(crate) struct Plan {
     pub budgets: Vec<u64>,
+    /// Original explicit ceilings, before Windows chose smaller startup budgets.
+    #[cfg(windows)]
+    pub original_vram_caps: Option<Vec<u64>>,
     pub batch: usize,
+    /// The batch was not given (`auto`): the engine's placement may narrow it.
+    pub derived: bool,
     pub split: SplitMode,
+}
+
+impl Plan {
+    pub(crate) fn startup_error(&self, error: String) -> String {
+        #[cfg(windows)]
+        return startup_vram_error(error, self.original_vram_caps.as_deref(), &self.budgets);
+        #[cfg(not(windows))]
+        error
+    }
+
+    pub(crate) fn startup_vram_reduced(&self) -> bool {
+        #[cfg(windows)]
+        return self.original_vram_caps.as_ref().is_some_and(|caps| caps.iter().zip(&self.budgets).any(|(given, actual)| actual < given));
+        #[cfg(not(windows))]
+        false
+    }
+
+    pub(crate) fn report_startup_vram(&self, actual: &[(usize, u64)]) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(caps) = self.original_vram_caps.as_deref() {
+            validate_vram_caps(Some(caps), actual.len())?;
+            for (index, &(ordinal, budget)) in actual.iter().enumerate() {
+                if let Some(line) = explicit_startup_line(ordinal, caps[index], budget) { eprintln!("{line}"); }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = actual;
+        Ok(())
+    }
 }
 
 /// The margin `auto` leaves free on a GPU: 512 MiB or 3% of it, whichever is more; on Windows, where the
@@ -670,6 +796,219 @@ pub(crate) fn auto_budget(windows: bool, free: u64, total: u64) -> u64 {
     free.saturating_sub(margin_on(windows, total)) / step * step
 }
 
+#[cfg(any(windows, test))]
+const VRAM_GROWTH: u64 = 512 << 20;
+
+/// A budget reduced under pressure is retried gradually, after two further requests.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VramLimit {
+    bytes: u64,
+    retry_after: u64,
+}
+
+#[cfg(any(windows, test))]
+impl VramLimit {
+    fn new(bytes: u64, requests: u64) -> Self {
+        Self { bytes, retry_after: requests.saturating_add(2) }
+    }
+}
+
+/// An explicit budget's fatal adjustment failure makes this worker unavailable.
+/// Host-only work may finish, but every later model/GPU entry must pass the guard.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct ExplicitVramPoison {
+    failure: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+impl ExplicitVramPoison {
+    fn guard<T>(&self, work: impl FnOnce() -> T) -> Result<T, String> {
+        match &self.failure { Some(error) => Err(error.clone()), None => Ok(work()) }
+    }
+
+    fn after_request<T>(&mut self, explicit: bool, adjusted: &Result<(), String>, work: impl FnOnce() -> T) -> Result<T, String> {
+        if explicit {
+            if let Err(error) = adjusted {
+                if engine_failed(error.clone(), "adjusting the GPU memory budget").fatal {
+                    self.failure.get_or_insert_with(|| error.clone());
+                }
+            }
+        }
+        self.guard(work)
+    }
+}
+
+/// A rejected explicit growth must see both more headroom and eight further requests.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VramGrowthHold {
+    needed: i64,
+    retry_after: u64,
+}
+
+#[cfg(any(windows, test))]
+impl VramGrowthHold {
+    fn failed(previous: Option<Self>, before: i64, after: Option<i64>, delta: u64, total: u64, requests: u64) -> Self {
+        let required = i128::from(margin_on(false, total)) + i128::from(delta);
+        let needed = (i128::from(before) + required - i128::from(after.unwrap_or(0))).clamp(0, i128::from(i64::MAX)) as i64;
+        Self { needed: needed.max(previous.map_or(0, |hold| hold.needed)), retry_after: requests.saturating_add(8) }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn growth_headroom_sufficient(headroom: i64, delta: u64, total: u64) -> bool {
+    i128::from(headroom) >= i128::from(margin_on(false, total)) + i128::from(delta)
+}
+
+#[cfg(any(windows, test))]
+fn explicit_growth_allowed(headroom: i64, delta: u64, total: u64, requests: u64, hold: Option<VramGrowthHold>) -> bool {
+    growth_headroom_sufficient(headroom, delta, total)
+        && hold.is_none_or(|hold| requests > hold.retry_after && headroom > hold.needed)
+}
+
+/// The rollback callback owns the actual resize and re-read. Even a failed post-growth
+/// query must run it, and rollback failure takes precedence over that query's error.
+#[cfg(any(windows, test))]
+fn verify_explicit_growth(before: u64, actual: u64, total: u64, post: Result<i64, String>,
+                          restore: impl FnOnce() -> Result<u64, String>) -> Result<Option<(u64, Result<i64, String>)>, String> {
+    if post.as_ref().is_ok_and(|&headroom| growth_headroom_sufficient(headroom, actual.saturating_sub(before), total)) {
+        return Ok(None);
+    }
+    let cause = match &post {
+        Ok(headroom) => format!("post-growth headroom is {headroom} bytes"),
+        Err(error) => format!("the post-growth headroom query failed: {error}"),
+    };
+    let restored = restore().map_err(|error| format!("could not restore the prior GPU budget after growth ({cause}): {error}; GPU memory state is unusable"))?;
+    if restored > before {
+        return Err(format!("could not restore the prior GPU budget after growth ({cause}): {restored} bytes exceeds {before}; GPU memory state is unusable"));
+    }
+    Ok(Some((restored, post)))
+}
+
+/// DXGI's headroom already excludes other allocations and may be negative. Leave a runtime margin
+/// within that allowance; the larger desktop margin is still used when only runtime free bytes exist.
+#[cfg(any(windows, test))]
+fn headroom_budget(used: u64, headroom: i64, process_budget: bool, total: u64, cap: Option<u64>) -> u64 {
+    let wanted = if !process_budget {
+        auto_budget(true, used.saturating_add(headroom.max(0) as u64), total)
+    } else {
+        let available = (i128::from(used) + i128::from(headroom)).clamp(0, i128::from(total)) as u64;
+        usable_windows_vram(available, total)
+    };
+    wanted.min(cap.unwrap_or(u64::MAX))
+}
+
+#[cfg(any(windows, test))]
+fn usable_windows_vram(available: u64, total: u64) -> u64 {
+    let step = if total < 12 << 30 { 64 << 20 } else { 256 << 20 };
+    available.min(total).saturating_sub(margin_on(false, total)) / step * step
+}
+
+#[cfg(any(windows, test))]
+fn vram_target(budget: u64, wanted: u64, requests: u64, allow_grow: bool, limit: Option<VramLimit>, cap: Option<u64>) -> u64 {
+    let ceiling = cap.unwrap_or(u64::MAX);
+    let (budget, wanted) = (budget.min(ceiling), wanted.min(ceiling));
+    if wanted < budget { return wanted; }
+    // Only reaching the original ceiling may use a smaller final growth step.
+    let reaches_cap = cap.is_some_and(|cap| wanted == cap && budget < cap);
+    if !allow_grow || (wanted < budget.saturating_add(VRAM_GROWTH) && !reaches_cap) { return budget; }
+    if let Some(limit) = limit {
+        if requests <= limit.retry_after { return budget; }
+        return wanted.min(budget.saturating_add(VRAM_GROWTH)).min(limit.bytes.saturating_add(VRAM_GROWTH)).max(budget).min(ceiling);
+    }
+    wanted.min(budget.saturating_add(VRAM_GROWTH)).min(ceiling)
+}
+
+#[cfg(any(windows, test))]
+fn validate_vram_caps(caps: Option<&[u64]>, devices: usize) -> Result<(), String> {
+    if let Some(caps) = caps {
+        if caps.len() != devices {
+            return Err(format!("{} explicit GPU memory ceilings do not match {devices} devices", caps.len()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn vram_refused(ordinal: usize, why: &str) -> String {
+    format!("GPU {ordinal}: {why}; {}", straydog_engine::model::VRAM_NO_MEMORY)
+}
+
+/// Runs between passes with the model exclusively held. Every reduction is followed by a fresh
+/// measurement: releasing the pool may change Windows' process budget as well as its usage.
+#[cfg(windows)]
+fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, growth_holds: &mut Vec<Option<VramGrowthHold>>,
+                       caps: Option<&[u64]>, requests: u64, allow_grow: bool, phase: &str) -> Result<(), String> {
+    let devices = model.vram_budgets()?;
+    validate_vram_caps(caps, devices.len())?;
+    limits.resize(devices.len(), None);
+    growth_holds.resize(devices.len(), None);
+    let explicit_startup = caps.is_some() && phase == "ready";
+    for (index, (ordinal, _, _)) in devices.into_iter().enumerate() {
+        let cap = caps.map(|caps| caps[index]);
+        loop {
+            let (_, used, budget) = model.vram_budgets()?[index];
+            let (headroom, process_budget) = model.vram_headroom(index)?;
+            let (_, _, total) = straydog_gpu::device_info(ordinal).map_err(|error| error.to_string())?;
+            let wanted = headroom_budget(used, headroom, process_budget, total, cap);
+            let mut target = vram_target(budget, wanted, requests, allow_grow, limits[index], cap);
+            if cap.is_some() && target > budget
+                && !explicit_growth_allowed(headroom, target - budget, total, requests, growth_holds[index]) {
+                target = budget;
+            }
+            if std::env::var("STRAYDOG_VRAM_DIAGNOSTIC").as_deref() == Ok("1") {
+                eprintln!("Straydog VRAM diagnostic: phase={phase} GPU={ordinal} used={used} budget={budget} headroom={headroom} \
+                           process_budget={} wanted={wanted} target={target}", u8::from(process_budget));
+            }
+            if target == budget { break; }
+            let shrinking = target < budget;
+            let (before, after) = model.resize_vram(index, target)?;
+            let changed = model.vram_budgets().map(|budgets| budgets[index].2);
+            let (actual, post) = match changed {
+                Ok(actual) if cap.is_some() && actual > budget => (actual, Some(model.vram_headroom(index).map(|(headroom, _)| headroom))),
+                Ok(actual) => (actual, None),
+                Err(error) if cap.is_some() && target > budget =>
+                    (target, Some(Err(format!("could not read the GPU budget after growth: {error}")))),
+                Err(error) => return Err(error),
+            };
+            if let Some(post) = post {
+                let rolled_back = verify_explicit_growth(budget, actual, total, post, || {
+                    model.resize_vram(index, budget)?;
+                    Ok(model.vram_budgets()?[index].2)
+                })?;
+                if let Some((restored, observed)) = rolled_back {
+                    growth_holds[index] = Some(VramGrowthHold::failed(growth_holds[index], headroom, observed.as_ref().ok().copied(),
+                                                                    actual - budget, total, requests));
+                    limits[index] = Some(VramLimit::new(restored, requests));
+                    let observation = match &observed {
+                        Ok(headroom) => format!("{headroom} bytes"),
+                        Err(error) => format!("unavailable ({error})"),
+                    };
+                    eprintln!("Straydog VRAM: GPU {ordinal}'s attempted growth to {:.2} GiB was rolled back to {:.2} GiB; observed post-growth headroom {observation}",
+                              actual as f64 / (1u64 << 30) as f64, restored as f64 / (1u64 << 30) as f64);
+                    observed?;
+                    // Re-measure after rollback: pressure may require an additional ordinary shrink.
+                    continue;
+                }
+            }
+            if shrinking && actual >= budget {
+                return Err(vram_refused(ordinal, &format!("observed headroom is {headroom} bytes; requested {target} bytes from a {budget} byte budget, but the actual budget remains {actual} bytes and cannot be reduced further")));
+            }
+            if actual != budget {
+                if shrinking || limits[index].is_some() { limits[index] = Some(VramLimit::new(actual, requests)); }
+                if !explicit_startup {
+                    eprintln!("Straydog VRAM: GPU {ordinal}'s budget {:.2} -> {:.2} GiB; observed headroom {headroom} bytes; expert slots {before} -> {after}",
+                              budget as f64 / (1u64 << 30) as f64, actual as f64 / (1u64 << 30) as f64);
+                }
+            }
+            if !shrinking { break; }
+        }
+    }
+    Ok(())
+}
+
 /// How long `auto` waits for a GPU's free memory to stop growing (a previous worker releasing it).
 const SETTLE: Duration = Duration::from_secs(5);
 /// The same with more than a quarter of the GPU held. On Windows the desktop's programs hold that as often as not and keep it, so a start
@@ -679,7 +1018,66 @@ const SETTLE_HELD: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const SETTLE_HELD: Duration = VRAM_PATIENCE;
 
-/// Each GPU's budget. Given ones wait until the GPU has them free: memory a previous worker still
+#[cfg(any(windows, test))]
+const WINDOWS_EXPLICIT_WAIT: Duration = Duration::from_secs(10);
+
+#[cfg(any(windows, test))]
+fn parse_explicit_vram_caps(given: &str, devices: usize) -> Result<Vec<u64>, String> {
+    let caps = given.split(',').map(|part| part.parse::<u64>().map_err(|_| format!("invalid Straydog VRAM budget {given:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if caps.len() != devices { return Err("one Straydog VRAM budget per GPU".into()); }
+    Ok(caps)
+}
+
+/// A prior worker has one shared grace period; the eventual choice keeps the
+/// runtime reserve and original ceiling, even when that ceiling exceeds the card.
+#[cfg(any(windows, test))]
+fn explicit_startup_budget(given: u64, free: u64, total: u64, elapsed: Duration) -> Option<u64> {
+    if free < given && elapsed < WINDOWS_EXPLICIT_WAIT { return None; }
+    Some(usable_windows_vram(free, total).min(given))
+}
+
+#[cfg(windows)]
+fn windows_explicit_budgets(devices: &[usize], caps: &[u64], report: &dyn Fn(&str, u64, u64)) -> Result<Vec<u64>, String> {
+    validate_vram_caps(Some(caps), devices.len())?;
+    let started = Instant::now();
+    let mut chosen = Vec::new();
+    for (index, &device) in devices.iter().enumerate() {
+        loop {
+            let (_, free, total) = straydog_gpu::device_info(device).map_err(|error| error.to_string())?;
+            if let Some(budget) = explicit_startup_budget(caps[index], free, total, started.elapsed()) {
+                chosen.push(budget);
+                break;
+            }
+            report("vram", free, caps[index]);
+            std::thread::sleep(Duration::from_millis(250).min(WINDOWS_EXPLICIT_WAIT.saturating_sub(started.elapsed())));
+        }
+    }
+    // Placement owns the minimum: do not reject this route using the legacy generic 1 GiB check.
+    Ok(chosen)
+}
+
+#[cfg(any(windows, test))]
+fn explicit_startup_line(ordinal: usize, given: u64, actual: u64) -> Option<String> {
+    (actual < given).then(|| format!("Straydog VRAM: GPU {ordinal}'s given {:.2} GiB is above the usable Windows budget after leaving its safety margin; using {:.2} GiB at startup",
+                                   given as f64 / (1u64 << 30) as f64, actual as f64 / (1u64 << 30) as f64))
+}
+
+/// Retain the actual allocation/placement error, with the budgets Windows used.
+/// Only known capacity failures say the smaller budget still could not fit.
+#[cfg(any(windows, test))]
+fn startup_vram_error(error: String, caps: Option<&[u64]>, budgets: &[u64]) -> String {
+    let Some(caps) = caps else { return error };
+    if let Err(shape) = validate_vram_caps(Some(caps), budgets.len()) { return format!("{shape}: {error}"); }
+    if !caps.iter().zip(budgets).any(|(given, actual)| actual < given) { return error; }
+    let gib = |values: &[u64]| values.iter().map(|&value| format!("{:.2}", value as f64 / (1u64 << 30) as f64)).collect::<Vec<_>>().join(", ");
+    let capacity = error.contains("VRAM budget") || error.ends_with("; raise --vram") || error.starts_with("out of memory");
+    let note = if capacity { "the reduced startup budget is still too small for this placement; " } else { "" };
+    format!("Windows startup reduced the given GPU budgets [{}] GiB to [{}] GiB after leaving its safety margin; {note}{error}", gib(caps), gib(budgets))
+}
+
+/// Each GPU's budget. Windows explicit budgets use a ten-second grace period and the available safe budget.
+/// The legacy selection below waits for given budgets until the GPU has them free: memory a previous worker still
 /// holds is released after it exits, while memory another process keeps fails the start after
 /// [`VRAM_PATIENCE`] (a GPU smaller than its budget is left to fail as it does). `auto` waits
 /// until nine tenths of each GPU are free, or until its free memory has stopped growing for
@@ -688,6 +1086,11 @@ const SETTLE_HELD: Duration = VRAM_PATIENCE;
 /// left to it, but a job holding more of the GPU (a test or benchmark about to end) is waited
 /// for, not placed around in the memory it leaves.
 fn budgets(devices: &[usize], given: &str, report: &dyn Fn(&str, u64, u64)) -> Result<Vec<u64>, String> {
+    #[cfg(windows)]
+    if given != "auto" {
+        let caps = parse_explicit_vram_caps(given, devices.len())?;
+        return windows_explicit_budgets(devices, &caps, report);
+    }
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     let wanted: Option<Vec<u64>> = if given == "auto" {
         None
@@ -751,17 +1154,55 @@ impl WorkerArgs {
 /// layer across the GPUs (each would take the smaller share): the layers are split instead, in
 /// proportion to the budgets.
 pub(crate) fn plan(args: &WorkerArgs, report: &dyn Fn(&str, u64, u64)) -> Result<Plan, String> {
+    #[cfg(windows)]
+    let original_vram_caps = if args.vram_bytes == "auto" { None } else { Some(parse_explicit_vram_caps(&args.vram_bytes, args.devices.len())?) };
     let budgets = budgets(&args.devices, &args.vram_bytes, report)?;
     let on_demand = args.bundle()?.is_on_demand();
     let batch = match args.prefill_batch_size.as_str() {
-        // (as the configuration derives it from given budgets: 2048 for the resident models, see config::resolve)
+        // (as the configuration derives it from given budgets: 4096 for the resident models from 48 GiB, narrowed by the placement, see config::resolve)
         "auto" if on_demand => if budgets.iter().sum::<u64>() >= 48 << 30 { 4096 } else { 1024 },
-        "auto" => crate::config::resident_batch(budgets.iter().sum()) as usize,
+        "auto" => straydog_engine::model::resident_batch(budgets.iter().sum()),
         given => given.parse().map_err(|_| format!("invalid Straydog prefill batch {given:?}"))?,
     };
     let (least, most) = (*budgets.iter().min().unwrap(), *budgets.iter().max().unwrap());
     let split = if args.split_mode == "layer" || most - least > most / 10 { SplitMode::Layer } else { SplitMode::Experts };
-    Ok(Plan { budgets, batch, split })
+    Ok(Plan { budgets, batch, derived: args.prefill_batch_size == "auto", split,
+              #[cfg(windows)] original_vram_caps })
+}
+
+#[cfg(all(windows, feature = "cuda"))]
+fn memory_diagnostic(devices: &[usize], ready: bool) {
+    if std::env::var("STRAYDOG_VRAM_DIAGNOSTIC").as_deref() != Ok("1") {
+        return;
+    }
+    for &ordinal in devices {
+        if let Err(error) = straydog_gpu::memory_diagnostic(ordinal, ready) {
+            let phase = if ready { "ready" } else { "startup" };
+            eprintln!("WARN Straydog VRAM diagnostic: GPU {ordinal} {phase}: {error}");
+        }
+    }
+}
+
+/// A VRAM budget as the key of a placement names it: its size in GiB, to hundredths, without the zeros the hundredths leave (`12G`, `11.5G`).
+fn budget_label(bytes: u64) -> String {
+    let gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64);
+    format!("{}G", gib.trim_end_matches('0').trim_end_matches('.'))
+}
+
+/// The key of this placement in the warm-up state's draft widths ([`routes::saved_drafts`]), so that another placement of the same model does not take this
+/// one's width: each GPU used (its ordinal and name) with its VRAM budget as it was given (`vram`, as the worker takes it: `auto`, or each GPU's bytes; not
+/// what `auto` took, which moves with what other programs hold), the context size, and whether a drafter is loaded: `0:NVIDIA GeForce RTX 5090@12G; ctx
+/// 32768; drafter` for one GPU given 12 GiB, `0:NVIDIA GeForce RTX 5090@auto,1:NVIDIA GeForce RTX 3090@auto; ctx 32768; drafter` for two left to `auto`.
+fn placement_key(gpus: &[(usize, String)], vram: &str, context: usize, drafter: bool) -> String {
+    let budgets: Vec<String> = if vram == "auto" {
+        vec!["auto".into(); gpus.len()]
+    } else {
+        vram.split(',').map(|part| part.parse::<u64>().map_or_else(|_| part.to_string(), budget_label)).collect()
+    };
+    let gpus: Vec<String> = gpus.iter().enumerate()
+        .map(|(index, (ordinal, name))| format!("{ordinal}:{name}@{}", budgets.get(index).map_or("?", String::as_str)))
+        .collect();
+    format!("{}; ctx {context}; {}", gpus.join(","), if drafter { "drafter" } else { "no drafter" })
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
@@ -772,6 +1213,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     }
     let output = Output(Arc::new(Mutex::new(std::io::stdout())));
     let loading = Loading { output: output.clone(), last: Mutex::new((String::new(), Instant::now())) };
+    #[cfg(all(windows, feature = "cuda"))]
+    memory_diagnostic(&args.devices, false);
     let plan = plan(&args, &|stage, done, total| loading.report(stage, done, total))?;
     #[cfg(feature = "cuda")]
     {
@@ -826,7 +1269,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
             .and_then(|mut group| group.configure_gemm(args.gemm_min_batch, args.gemm == "fp16").map(|()| group));
         (group, weights.join().unwrap(), vision.join().unwrap())
     });
-    let (group, mut weights) = (group?, weights?);
+    let (group, mut weights) = (group.map_err(|error| plan.startup_error(error))?, weights?);
     // (the model serves text all the same)
     if let (Err(reason), Some(_)) = (&vision, &args.mmproj) {
         eprintln!("WARN Straydog reads no images: {reason}");
@@ -844,7 +1287,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let settings = Settings {
         context: args.context,
         state_budget_bytes: args.state_ram_bytes,
-        prefill_batch_size: plan.batch,
+        // (a derived batch is the engine's to derive and narrow; `plan.batch` is what it will derive, for warming the GEMM code)
+        prefill_batch_size: if plan.derived { straydog_engine::model::DERIVED_BATCH } else { plan.batch },
         speculative: args.speculative,
         cpu_threads: 0,
         row_cache_bytes: args.row_cache_bytes,
@@ -863,8 +1307,34 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
             Err(_) => eprintln!("WARN Straydog warm code: GPU {ordinal} prefill GEMM priming panicked"),
         }
     }
-    let model = model.map_err(|error| auto_too_small(error, &args.vram_bytes, &plan.budgets));
+    let model = model.map_err(|error| plan.startup_error(auto_too_small(error, &args.vram_bytes, &plan.budgets)));
     let (text, model) = (Arc::new(text?), model?);
+    #[cfg(windows)]
+    let (model, vram_limits, vram_growth_holds, vram_caps, ready_budgets) = {
+        let mut model = model;
+        let caps = plan.original_vram_caps.clone();
+        let devices = model.vram_budgets()?;
+        validate_vram_caps(caps.as_deref(), devices.len())?;
+        let mut limits = vec![None; devices.len()];
+        let mut growth_holds = vec![None; devices.len()];
+        if model.partial {
+            adjust_windows_vram(&mut model, &mut limits, &mut growth_holds, caps.as_deref(), 0, false, "ready")
+                .map_err(|error| plan.startup_error(error))?;
+        }
+        let (actual, adjusted) = if model.partial {
+            let actual = model.vram_budgets()?;
+            let adjusted = actual.iter().zip(&devices).any(|(after, before)| after.2 != before.2);
+            (actual, adjusted)
+        } else { (devices, false) };
+        validate_vram_caps(caps.as_deref(), actual.len())?;
+        if plan.startup_vram_reduced() || adjusted {
+            plan.report_startup_vram(&actual.iter().map(|&(ordinal, _, budget)| (ordinal, budget)).collect::<Vec<_>>())?;
+        }
+        let budgets = actual.into_iter().map(|(_, _, budget)| budget).collect::<Vec<_>>();
+        (model, limits, growth_holds, caps, budgets)
+    };
+    #[cfg(not(windows))]
+    let ready_budgets = &plan.budgets;
     // The GPU code's warm-up and the page-locking of the banks come behind "ready" ([`behind`]): "plans" and "warm" are what they cost before it.
     let warming = Instant::now();
     behind::WARMING.store(true, Ordering::SeqCst);
@@ -887,14 +1357,28 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
             .map(|(table, path)| json!({"precision": table.precision, "file": path.file_name().map(|name| name.to_string_lossy().into_owned())})),
         "vision_refusal": vision.as_ref().err(),
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
-                      "prefill_batch_size": model.prefill_batch_size, "vram_budgets": plan.budgets,
+                      "prefill_batch_size": model.prefill_batch_size, "vram_budgets": ready_budgets,
+                      // (a long read's wider batches: their rows, from how many new tokens, and what they lacked when they were not made)
+                      "prefill_wide_rows": model.wide_batch_size, "prefill_wide_from": straydog_engine::model::WIDE_READ_TOKENS,
+                      "prefill_wide_note": model.wide_note,
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" },
                       "note": model.placement_note},
         "load_seconds": seconds,
         "gpu": model.info()?,
     });
-    let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, requests: 0, me: me.clone(),
-                                                       vram_auto: args.vram_bytes == "auto" }));
+    let gpus: Vec<(usize, String)> = args.devices.iter()
+        .map(|&ordinal| (ordinal, straydog_gpu::device_info(ordinal).map_or_else(|_| "unknown GPU".into(), |(name, _, _)| name)))
+        .collect();
+    let placement = placement_key(&gpus, &args.vram_bytes, model.context, model.weights.drafter);
+    let engine = Arc::new_cyclic(|me| Mutex::new(Engine { model, template, vision, encoded: Vec::new(), earlier: None, earlier_drafts: BTreeMap::new(), placement,
+                                                       requests: 0, me: me.clone(),
+                                                       #[cfg(not(windows))] vram_auto: args.vram_bytes == "auto",
+                                                       #[cfg(windows)] vram_limits,
+                                                       #[cfg(windows)] vram_caps,
+                                                       #[cfg(windows)] vram_growth_holds,
+                                                       #[cfg(windows)] vram_poison: ExplicitVramPoison::default() }));
+    #[cfg(all(windows, feature = "cuda"))]
+    memory_diagnostic(&args.devices, true);
     output.send(&ready);
     let ready_at = Instant::now();
     behind_ready(&engine, ready_at);
@@ -911,6 +1395,7 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         // are locked first, and the locking is planned. Both are done under the lock the warm-up holds, so that no request takes the engine first
         // and the locking, which a request would otherwise keep waiting for the plan, begins as soon as the warm-up ends.
         let plan = |engine: &mut Engine, state: Option<Value>| {
+            if engine.vram_ready().is_err() { return (None, None); }
             let started = state.and_then(|state| match engine.warm_begin(&state) {
                 Ok(start) => start.map(|start| (start, engine.requests)),
                 Err(message) => {
@@ -922,7 +1407,7 @@ fn behind_ready(engine: &Arc<Mutex<Engine>>, ready_at: Instant) {
         };
         let mut planned = (None, None);
         let outcome = behind::warm_up_behind(&weak, &behind::ARRIVED, |engine: &mut Engine, cancelled| {
-            let result = warm_up(&mut engine.model, cancelled, &behind::ARRIVED);
+            let result = engine.vram_ready().and_then(|()| warm_up(&mut engine.model, cancelled, &behind::ARRIVED));
             planned = plan(engine, behind::warm_up_over());
             result
         });
@@ -995,7 +1480,14 @@ fn lock_banks_behind(weak: &Weak<Mutex<Engine>>, job: Option<(straydog_engine::b
                 }),
             })
         },
-        |engine: &mut Engine, locked| engine.model.banks_locked(locked).map(drop),
+        |engine: &mut Engine, locked: straydog_engine::banks::Locked| {
+            if let Err(error) = engine.vram_ready() {
+                // SAFETY: the engine still owns the mappings; these new locks never reached a GPU plan.
+                unsafe { locked.unlock() };
+                return Err(error);
+            }
+            engine.model.banks_locked(locked).map(drop)
+        },
         |locked| {
             // SAFETY: as above, the engine is held while a layer that was locked is given up.
             unsafe { locked.unlock() }
@@ -1297,11 +1789,14 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let message = message.into();
     // A void pass leaves the devices sound: the request fails and the engine resets, so the next
     // request restores from the checkpoints instead of waiting for a server restart. So does a
-    // K/V that found no memory to grow into: only sequences that long are refused. Nor does a copy of the conversation's state that found none.
+    // K/V that found no memory (host or VRAM) to grow into: only sequences that long are refused. Nor does a copy of the conversation's state that found none.
     // Nor does a prompt found too long before anything ran.
     let fatal = !message.ends_with(straydog_engine::arch::deepseek41::engine::VOID_PASS)
         && !message.ends_with(straydog_engine::model::KV_NO_MEMORY)
+        && !message.ends_with(straydog_engine::model::KV_NO_VRAM)
+        && !message.ends_with(straydog_engine::model::VRAM_NO_MEMORY)
         && !message.ends_with(straydog_engine::gpu::HOST_NO_MEMORY)
+        && !message.ends_with(straydog_engine::gpu::HYBRID_WAIT_RECOVERED)
         && !message.ends_with(straydog_engine::rows::ROW_READ_REFUSED)
         && !message.ends_with(straydog_engine::model::IMAGE_REFUSED)
         && !message.ends_with("exceeds the allocated context");
@@ -1333,12 +1828,14 @@ fn generate<S: Served>(engine: &Mutex<S>, text: &Arc<Text>, output: &Output, id:
         Ok(done) => done,
         Err(failure) => {
             let mut fatal = failure.fatal;
+            let mut message = failure.message;
             // A failed device (an illegal memory access) cannot be reset; the request still ends.
             if let Err(exc) = engine.reset() {
-                eprintln!("Straydog could not reset after a failed generation: {exc}");
+                eprintln!("Straydog could not reset after a failed generation: {exc}; original failure: {message}");
                 fatal = true;
+                message = format!("The engine could not reset after this request failed: {exc}. Restart it before retrying.");
             }
-            json!({"id": id, "event": "error", "message": failure.message.chars().take(500).collect::<String>(),
+            json!({"id": id, "event": "error", "message": message.chars().take(500).collect::<String>(),
                    "fatal": fatal})
         }
     }
@@ -1480,32 +1977,68 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let max_new = max_new.min(context - agreed.len());
     // (a conversation an earlier run kept, which this prompt goes on from)
     let kept_seconds = take_kept(engine, output, id, cancel, &agreed);
-    let result = engine.model.generate_constrained(
-        &agreed, max_new, &sampling, seed, &cancelled,
-        &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
-        turn, checkpoint,
-        &mut |token| {
-            generated += 1;
-            match stream.push(token) {
-                Ok(delta) => {
-                    let ended = think_close == Some(token);
-                    let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
-                    if !delta.is_empty() {
-                        first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                        output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));
+    // A token's text and frame are made on a thread of their own, which the thread that drives the GPUs hands each token to and goes
+    // on: a token is two decodes of the detokenizer's window, a frame's serialization and a write to the server's pipe, and they stood
+    // between two passes (a tenth of the tokens-out and bookkeeping share of a pass on a host whose cores are shared and slow: 0.8 ms of
+    // an 11.4 ms pass of two RTX 3090). Off Windows the emitter looks for tokens rather than sleeping on the channel, so that handing one
+    // over is no wake-up call either. The frames keep their order: this thread sends none between the first token and the emitter's end.
+    let (tokens_out, tokens_in) = std::sync::mpsc::channel::<u32>();
+    let result = std::thread::scope(|scope| {
+        let (stream, generated, first_text, decode_error, think_close) =
+            (&mut stream, &mut generated, &mut first_text, &mut decode_error, &mut think_close);
+        let emitter = scope.spawn(move || {
+            loop {
+                // (Windows' sleep is no finer than its timer, 15.6 ms unless raised: there the emitter waits on the channel)
+                #[cfg(windows)]
+                let token = match tokens_in.recv() {
+                    Ok(token) => token,
+                    Err(_) => break,
+                };
+                #[cfg(not(windows))]
+                let token = match tokens_in.try_recv() {
+                    Ok(token) => token,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        continue;
                     }
-                    if ended {
-                        think_close = None;
-                        output.send(&json!({"id": id, "event": "reasoning_end", "tokens": generated}));
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                };
+                *generated += 1;
+                match stream.push(token) {
+                    Ok(delta) => {
+                        let ended = *think_close == Some(token);
+                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        if !delta.is_empty() {
+                            first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                            output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": *generated}));
+                        }
+                        if ended {
+                            *think_close = None;
+                            output.send(&json!({"id": id, "event": "reasoning_end", "tokens": *generated}));
+                        }
                     }
-                }
-                Err(exc) => {
-                    decode_error.get_or_insert_with(|| exc.into());
+                    Err(exc) => {
+                        decode_error.get_or_insert_with(|| exc.into());
+                    }
                 }
             }
-        },
-        constraint.as_mut(),
-    );
+        });
+        let result = engine.model.generate_constrained(
+            &agreed, max_new, &sampling, seed, &cancelled,
+            &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
+            turn, checkpoint,
+            &mut |token| {
+                let _ = tokens_out.send(token);
+            },
+            constraint.as_mut(),
+        );
+        // (every token handed over is out before anything after the generation is sent)
+        drop(tokens_out);
+        if emitter.join().is_err() {
+            return Err("Straydog token emitter ended unexpectedly".to_string());
+        }
+        result
+    });
     result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
     if let Some(failure) = decode_error {
         return Err(failure);
@@ -1567,6 +2100,220 @@ mod tests {
         assert_eq!(auto_budget(false, 6000 * MIB, 6144 * MIB), 5376 * MIB);
         assert_eq!(auto_budget(true, 5344 * MIB, 6144 * MIB), 4288 * MIB);
         assert_eq!(auto_budget(true, 500 * MIB, 6144 * MIB), 0);
+    }
+
+    #[test]
+    fn signed_headroom_counts_over_budget_usage_and_keeps_the_runtime_margin() {
+        let total = 16 << 30;
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, None), 10 * (1 << 30) + 512 * MIB);
+        assert_eq!(headroom_budget(1 << 30, -(2 << 30), true, total, None), 0);
+        assert_eq!(headroom_budget(u64::MAX, i64::MAX, true, total, None), total - 512 * MIB);
+        assert_eq!(headroom_budget(8 << 30, 3 << 30, false, total, None), auto_budget(true, 11 << 30, total));
+        assert_eq!(headroom_budget(8 << 30, -1, false, total, None), auto_budget(true, 8 << 30, total));
+        // Small cards keep 64 MiB granularity; larger ones keep 256 MiB and a 3% margin when greater.
+        assert_eq!(headroom_budget(2000 * MIB, 0, true, 8 << 30, None), 1472 * MIB);
+        assert_eq!(headroom_budget(2000 * MIB, 0, true, total, None), 1280 * MIB);
+        let large = 80 << 30;
+        assert_eq!(headroom_budget(70 << 30, 0, true, large, None), ((70 << 30) - margin_on(false, large)) / (256 * MIB) * (256 * MIB));
+    }
+
+    #[test]
+    fn budget_reductions_ignore_cooldown_but_growth_waits_two_more_requests() {
+        let budget = 8 << 30;
+        let limit = VramLimit::new(budget, 0);
+        assert_eq!(vram_target(budget, budget - MIB, 1, false, Some(limit), None), budget - MIB);
+        assert_eq!(vram_target(budget, budget + (2 << 30), 3, false, Some(limit), None), budget);
+        for requests in [0, 1, 2] {
+            assert_eq!(vram_target(budget, budget + (2 << 30), requests, true, Some(limit), None), budget);
+        }
+        let grown = vram_target(budget, budget + (2 << 30), 3, true, Some(limit), None);
+        assert_eq!(grown, budget + VRAM_GROWTH);
+        // The retry limit follows the actual resulting budget, even if it was less than requested.
+        let actual = grown - 64 * MIB;
+        let next = VramLimit::new(actual, 3);
+        assert_eq!(next.retry_after, 5);
+        assert_eq!(vram_target(actual, budget + (2 << 30), 5, true, Some(next), None), actual);
+        assert_eq!(vram_target(actual, budget + (2 << 30), 6, true, Some(next), None), actual + VRAM_GROWTH);
+        assert_eq!(vram_target(budget, budget + VRAM_GROWTH - 1, 10, true, None, None), budget);
+        assert_eq!(vram_target(budget, budget + (4 << 30), 10, true, None, None), budget + VRAM_GROWTH);
+        assert_eq!(VramLimit::new(0, u64::MAX).retry_after, u64::MAX);
+    }
+
+    #[test]
+    fn explicit_vram_caps_bound_signed_headroom_and_keep_the_safety_margin() {
+        let total = 16 << 30;
+        assert_eq!(headroom_budget(8 << 30, 4 << 30, true, total, Some(10 << 30)), 10 << 30);
+        assert_eq!(headroom_budget(8 << 30, 4 << 30, true, total, Some(12 << 30)), (11 << 30) + 512 * MIB);
+        // Positive raw headroom can still leave too little room after the runtime reserve.
+        assert_eq!(headroom_budget(8 << 30, 256 * MIB as i64, true, total, Some(8 << 30)), (7 << 30) + 768 * MIB);
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, Some(12 << 30)), (10 << 30) + 512 * MIB);
+        assert_eq!(headroom_budget(13 << 30, -(2 << 30), true, total, Some(8 << 30)), 8 << 30);
+        assert_eq!(headroom_budget(1 << 30, -(2 << 30), true, total, Some(8 << 30)), 0);
+    }
+
+    #[test]
+    fn explicit_vram_caps_keep_cooldowns_and_allow_only_the_final_small_growth() {
+        let (budget, cap) = (8 << 30, 10 << 30);
+        let limit = VramLimit::new(budget, 0);
+        assert_eq!(vram_target(budget, 7 << 30, 1, false, Some(limit), Some(cap)), 7 << 30);
+        for requests in [0, 1, 2] {
+            assert_eq!(vram_target(budget, 20 << 30, requests, true, Some(limit), Some(cap)), budget);
+        }
+        assert_eq!(vram_target(budget, 20 << 30, 3, false, Some(limit), Some(cap)), budget);
+        assert_eq!(vram_target(budget, 20 << 30, 3, true, Some(limit), Some(cap)), budget + VRAM_GROWTH);
+        assert_eq!(vram_target(12 << 30, 20 << 30, 0, false, None, Some(cap)), cap);
+        let near = cap - 128 * MIB;
+        let last = VramLimit::new(near, 0);
+        assert_eq!(vram_target(near, cap, 2, true, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap, 3, false, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap - 1, 3, true, Some(last), Some(cap)), near);
+        assert_eq!(vram_target(near, cap, 3, true, Some(last), Some(cap)), cap);
+        assert_eq!(vram_target(near, cap, 3, true, Some(last), None), near);
+        assert_eq!(vram_target(cap, 20 << 30, 3, true, None, Some(cap)), cap);
+    }
+
+    #[test]
+    fn explicit_vram_caps_stay_per_device_and_bound_every_target_path() {
+        let caps = [6 << 30, 10 << 30];
+        assert!(validate_vram_caps(Some(&caps), 2).is_ok());
+        assert!(validate_vram_caps(None, 2).is_ok());
+        for devices in [0, 1, 3] { assert!(validate_vram_caps(Some(&caps), devices).is_err()); }
+        // Runtime free-memory fallback retains the larger desktop reserve, then each GPU's own ceiling.
+        let wanted = caps.map(|cap| headroom_budget(8 << 30, 3 << 30, false, 16 << 30, Some(cap)));
+        assert_eq!(wanted, [6 << 30, 9 << 30]);
+        assert_eq!(headroom_budget(8 << 30, -1, false, 16 << 30, Some(caps[1])), auto_budget(true, 8 << 30, 16 << 30));
+        for cap in [0, caps[0], caps[1]] {
+            for budget in [0, 5 << 30, 12 << 30] {
+                for wanted in [0, 9 << 30, 20 << 30] {
+                    for allow_grow in [false, true] {
+                        for limit in [None, Some(VramLimit::new(5 << 30, 0))] {
+                            assert!(vram_target(budget, wanted, 3, allow_grow, limit, Some(cap)) <= cap);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_startup_waits_at_most_ten_seconds_and_uses_the_available_budget() {
+        let total = 16 << 30;
+        assert_eq!(explicit_startup_budget(8 << 30, 9 << 30, total, Duration::ZERO), Some(8 << 30));
+        assert_eq!(explicit_startup_budget(8 << 30, 8 << 30, total, Duration::ZERO), Some((7 << 30) + 512 * MIB));
+        assert_eq!(explicit_startup_budget(8 << 30, 7 << 30, total, Duration::from_secs(9)), None);
+        assert_eq!(explicit_startup_budget(8 << 30, 7 << 30, total, WINDOWS_EXPLICIT_WAIT), Some((6 << 30) + 512 * MIB));
+        assert_eq!(explicit_startup_budget(20 << 30, total, total, WINDOWS_EXPLICIT_WAIT), Some((15 << 30) + 512 * MIB));
+        // Below the old generic minimum is still a candidate for actual placement to judge.
+        assert_eq!(explicit_startup_budget(8 << 30, 1 << 30, total, WINDOWS_EXPLICIT_WAIT), Some(512 * MIB));
+        assert_eq!(explicit_startup_budget(8 << 30, 2000 * MIB, 8 << 30, WINDOWS_EXPLICIT_WAIT), Some(1472 * MIB));
+    }
+
+    #[test]
+    fn explicit_startup_keeps_original_caps_and_reports_final_budgets_and_real_errors() {
+        let caps = parse_explicit_vram_caps(&format!("{},{}", 8u64 << 30, 12u64 << 30), 2).unwrap();
+        assert_eq!(caps, [8 << 30, 12 << 30]);
+        assert!(parse_explicit_vram_caps("1,2", 1).is_err());
+        let line = explicit_startup_line(3, caps[0], (6 << 30) + 256 * MIB).unwrap();
+        assert!(line.contains("GPU 3") && line.contains("8.00 GiB") && line.contains("6.25 GiB") && line.contains("safety margin"));
+        assert!(explicit_startup_line(3, caps[0], caps[0]).is_none());
+        let reason = "the GPU budget cannot hold the model's dense weights; raise --vram";
+        let error = startup_vram_error(reason.into(), Some(&caps[..1]), &[512 * MIB]);
+        assert!(error.contains("8.00") && error.contains("0.50") && error.contains("still too small") && error.ends_with(reason));
+        let fault = "an illegal memory access was encountered";
+        let error = startup_vram_error(fault.into(), Some(&caps[..1]), &[512 * MIB]);
+        assert!(error.ends_with(fault) && !error.contains("still too small"));
+        assert!(engine_failed(error, "initialization").fatal);
+        assert_eq!(startup_vram_error(reason.into(), None, &[512 * MIB]), reason);
+        assert_eq!(startup_vram_error(reason.into(), Some(&caps), &caps), reason);
+    }
+
+    #[test]
+    fn explicit_growth_requires_more_headroom_and_eight_further_requests_after_rollback() {
+        let (total, delta) = (16 << 30, VRAM_GROWTH);
+        let initial = 1_767_690_240;
+        let hold = VramGrowthHold::failed(None, initial, Some(254_649_958), delta, total, 10);
+        assert_eq!(hold, VramGrowthHold { needed: 2_586_782_106, retry_after: 18 });
+        for requests in [10, 11, 18] {
+            assert!(!explicit_growth_allowed(hold.needed + 1, delta, total, requests, Some(hold)));
+        }
+        assert!(!explicit_growth_allowed(initial, delta, total, 19, Some(hold)));
+        assert!(!explicit_growth_allowed(hold.needed, delta, total, 19, Some(hold)));
+        assert!(explicit_growth_allowed(hold.needed + 1, delta, total, 19, Some(hold)));
+        let smaller_gap = VramGrowthHold::failed(Some(hold), 1 << 30, Some((1 << 30) - 1), delta, total, 20);
+        assert_eq!(smaller_gap.needed, hold.needed);
+        let saturated = VramGrowthHold::failed(Some(hold), i64::MAX, Some(i64::MIN), u64::MAX, total, u64::MAX);
+        assert_eq!(saturated.needed, i64::MAX);
+        assert_eq!(saturated.retry_after, u64::MAX);
+        assert!(!explicit_growth_allowed(i64::MAX, delta, total, u64::MAX, Some(saturated)));
+    }
+
+    #[test]
+    fn explicit_growth_checks_actual_delta_and_accepts_the_exact_post_growth_reserve() {
+        let (total, before, delta) = (16 << 30, 8 << 30, 64 * MIB);
+        let required = (margin_on(false, total) + delta) as i64;
+        assert!(!explicit_growth_allowed(-1, delta, total, 0, None));
+        assert!(!explicit_growth_allowed(required - 1, delta, total, 0, None));
+        assert!(explicit_growth_allowed(required, delta, total, 0, None));
+        let restored = std::cell::Cell::new(0);
+        assert!(verify_explicit_growth(before, before + delta, total, Ok(required), || {
+            restored.set(restored.get() + 1);
+            Ok(before)
+        }).unwrap().is_none());
+        assert_eq!(restored.get(), 0);
+        for post in [required - 1, -1] {
+            let result = verify_explicit_growth(before, before + delta, total, Ok(post), || {
+                restored.set(restored.get() + 1);
+                Ok(before)
+            }).unwrap();
+            assert_eq!(result, Some((before, Ok(post))));
+        }
+        assert_eq!(restored.get(), 2);
+    }
+
+    #[test]
+    fn explicit_growth_query_failure_still_rolls_back_and_rollback_errors_stay_fatal() {
+        let (total, before) = (16 << 30, 8 << 30);
+        let fault = "headroom query: an illegal memory access was encountered";
+        let restored = std::cell::Cell::new(false);
+        let result = verify_explicit_growth(before, before + VRAM_GROWTH, total, Err(fault.into()), || {
+            restored.set(true);
+            Ok(before)
+        }).unwrap();
+        assert!(restored.get());
+        assert_eq!(result, Some((before, Err(fault.into()))));
+        let error = verify_explicit_growth(before, before + VRAM_GROWTH, total, Err(fault.into()), || Err("rollback device fault".into())).unwrap_err();
+        assert!(error.contains(fault) && error.contains("rollback device fault") && error.ends_with("unusable"));
+        assert!(engine_failed(error, "rollback").fatal);
+        let error = verify_explicit_growth(before, before + VRAM_GROWTH, total, Ok(0), || Ok(before + 1)).unwrap_err();
+        assert!(error.ends_with("unusable") && engine_failed(error, "rollback").fatal);
+    }
+
+    #[test]
+    fn an_after_request_rollback_fault_poison_blocks_all_later_gpu_callbacks() {
+        let fault = verify_explicit_growth(8 << 30, (8 << 30) + VRAM_GROWTH, 16 << 30, Ok(0), || Err("rollback device fault".into())).unwrap_err();
+        let mut poison = ExplicitVramPoison::default();
+        let work = std::cell::Cell::new(0);
+        let adjusted = Err(fault.clone());
+        assert_eq!(poison.after_request(true, &adjusted, || work.set(work.get() + 1)), Err(fault.clone()));
+        assert_eq!(work.get(), 0, "after_request must skip its remaining GPU work");
+        for _entry in ["request", "reset", "state export", "warm fill"] {
+            assert_eq!(poison.guard(|| work.set(work.get() + 1)), Err(fault.clone()));
+        }
+        assert!(poison.after_request(true, &Ok(()), || work.set(work.get() + 1)).is_err());
+        assert_eq!(work.get(), 0, "a later successful status must not clear the poison");
+    }
+
+    #[test]
+    fn the_after_request_poison_policy_preserves_auto_and_recoverable_explicit_work() {
+        let work = std::cell::Cell::new(0);
+        let mut auto = ExplicitVramPoison::default();
+        assert!(auto.after_request(false, &Err("GPU memory state is unusable".into()), || work.set(work.get() + 1)).is_ok());
+        assert!(auto.guard(|| work.set(work.get() + 1)).is_ok());
+        let mut explicit = ExplicitVramPoison::default();
+        let refusal = format!("minimum budget reached; {}", straydog_engine::model::VRAM_NO_MEMORY);
+        assert!(explicit.after_request(true, &Err(refusal), || work.set(work.get() + 1)).is_ok());
+        assert!(explicit.after_request(true, &Ok(()), || work.set(work.get() + 1)).is_ok());
+        assert_eq!(work.get(), 4);
     }
 
     /// A model's side of a warm start's slot fill: its request count, and the swaps it still wants.
@@ -1657,6 +2404,34 @@ mod tests {
         drop(held);
     }
 
+    /// Decides: a placement's key names each GPU with its budget as it was given, the context and the drafter, so that no other placement of the model
+    /// has it: another GPU, budget, `auto` against a size, context or drafter makes another key; the same placement makes the same.
+    #[test]
+    fn a_placements_key_names_what_the_placement_is() {
+        let gib = |gib: u64| (gib << 30).to_string();
+        let one = vec![(0, "NVIDIA GeForce RTX 5090".to_string())];
+        let key = placement_key(&one, &gib(12), 32768, true);
+        assert_eq!(key, "0:NVIDIA GeForce RTX 5090@12G; ctx 32768; drafter");
+        assert_eq!(placement_key(&one, &gib(12), 32768, true), key);
+        assert_eq!(placement_key(&one, "auto", 32768, true), "0:NVIDIA GeForce RTX 5090@auto; ctx 32768; drafter");
+        assert_eq!(placement_key(&one, &gib(12), 32768, false), "0:NVIDIA GeForce RTX 5090@12G; ctx 32768; no drafter");
+        let others = [placement_key(&one, &gib(11), 32768, true), placement_key(&one, "auto", 32768, true), placement_key(&one, &gib(12), 65536, true),
+                      placement_key(&one, &gib(12), 32768, false), placement_key(&[(1, "NVIDIA GeForce RTX 5090".into())], &gib(12), 32768, true),
+                      placement_key(&[(0, "NVIDIA GeForce RTX 3090".into())], &gib(12), 32768, true)];
+        assert!(others.iter().all(|other| *other != key) && (0..others.len()).all(|at| (0..at).all(|before| others[at] != others[before])), "{others:?}");
+        // (two GPUs, each with its own budget; a budget between whole GiB to hundredths; a budget that is not a number, or missing for a GPU, stays as it
+        // is given, or is a mark: the worker has refused those before it comes to a key)
+        let two = vec![(0, "NVIDIA GeForce RTX 5090".to_string()), (1, "NVIDIA GeForce RTX 3090".to_string())];
+        let given = format!("{},{}", gib(12), (11.5 * (1u64 << 30) as f64) as u64);
+        assert_eq!(placement_key(&two, &given, 8192, true), "0:NVIDIA GeForce RTX 5090@12G,1:NVIDIA GeForce RTX 3090@11.5G; ctx 8192; drafter");
+        assert_eq!(placement_key(&two, "auto", 8192, true), "0:NVIDIA GeForce RTX 5090@auto,1:NVIDIA GeForce RTX 3090@auto; ctx 8192; drafter");
+        assert_eq!(placement_key(&two, &gib(12), 8192, true), "0:NVIDIA GeForce RTX 5090@12G,1:NVIDIA GeForce RTX 3090@?; ctx 8192; drafter");
+        assert_eq!(budget_label(10 << 30), "10G");
+        assert_eq!(budget_label(0), "0G");
+        assert_eq!(budget_label((6.25 * (1u64 << 30) as f64) as u64), "6.25G");
+        assert_eq!(placement_key(&one, "lots", 1, true), "0:NVIDIA GeForce RTX 5090@lots; ctx 1; drafter");
+    }
+
     #[test]
     fn a_refusal_under_auto_says_what_it_took() {
         let reason = "the GPU budget cannot hold the model's dense weights";
@@ -1679,6 +2454,9 @@ mod tests {
             let prompt = body.as_str().unwrap();
             if prompt == "device-fault" {
                 return Err(engine_failed("an illegal memory access was encountered", concat!(file!(), ":", line!(), " device fault")));
+            }
+            if prompt == "recovered-wait" {
+                return Err(refused("The GPU wait exceeded its limit. The GPU state was reset; you can retry with the next request."));
             }
             if prompt == "gpu-info-error" {
                 return Ok(json!({"id": id, "event": "done", "gpu": gpu_info_or_null(Err("injected info error".into()), "test")}));
@@ -1727,6 +2505,17 @@ mod tests {
     }
 
     #[test]
+    fn reset_failure_replaces_a_recovered_waits_retry_message() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: true });
+        let failed = request(&engine, &tokenizer(), "recovered-wait", "reset-fails");
+        assert_eq!(failed["fatal"], true);
+        let message = failed["message"].as_str().unwrap();
+        assert!(message.contains("device reset failed") && message.contains("Restart it before retrying"));
+        assert!(!message.contains("next request"));
+        assert_eq!(engine.lock().unwrap().resets, 1);
+    }
+
+    #[test]
     fn device_failure_stays_fatal_after_a_successful_host_reset() {
         let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: false });
         let failed = request(&engine, &tokenizer(), "device-fault", "device-fails");
@@ -1744,7 +2533,10 @@ mod tests {
         assert!(engine_failed("an illegal memory access was encountered", "site").fatal);
         // (a K/V that found no memory to grow into, and a copy of the conversation that found none: the devices are sound)
         assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_MEMORY), "site").fatal);
+        assert!(!engine_failed(format!("site: {}", straydog_engine::model::KV_NO_VRAM), "site").fatal);
+        assert!(!engine_failed(format!("GPU 0 could not reduce its budget; {}", straydog_engine::model::VRAM_NO_MEMORY), "site").fatal);
         assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HOST_NO_MEMORY), "site").fatal);
+        assert!(!engine_failed(format!("site: {}", straydog_engine::gpu::HYBRID_WAIT_RECOVERED), "site").fatal);
         // (a row read the working-set quota refused, after the smaller and cached retries; a bare 1453 stays fatal)
         assert!(!engine_failed(format!("row table read failed: os error 1453; {}", straydog_engine::rows::ROW_READ_REFUSED), "site").fatal);
         assert!(engine_failed("row table read failed: os error 1453", "site").fatal);

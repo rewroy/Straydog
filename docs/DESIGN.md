@@ -348,7 +348,8 @@ conversation has met.
 
 There is no `-ngl`. Placement measures what fits, in this order:
 
-1. **Full residency.** Every weight in VRAM, the K/V too.
+1. **Full residency.** Every weight in VRAM, the K/V too (Qwen3.8: at the prefill batch derived, 4096 from 48 GiB of
+   budgets, then at 2048; a batch given is not narrowed to keep the K/V in VRAM).
 2. **Host K/V,** then a smaller prefill batch (Qwen3.8), with the MTP drafter, then without.
    The first choice that fits is taken; when it is not the first, the placement notes what the first
    would have needed, and with partial residency what full residency would (`resident_placement`),
@@ -437,6 +438,13 @@ The engine holds one sequence.
     it), and its recurrent state to a page-locked slot.
   - A later prompt that resumes further on the parked sequence than on the held one brings it
     back (`parked`: `saved` or `restored`, with `park_seconds`).
+  - On RDNA4 the copy into host memory is made by the CPU's threads (any other device keeps the
+    runtime's copy, which was not measured there): a K/V in host memory straight from
+    its page-locked memory, VRAM's indexer blocks through the page-locked arena (as a large
+    download), where the runtime's own copy into pageable memory pins its destination and ran
+    at 2 GB/s. A 242K read after a 95K conversation copies its 94027 positions (1.66 GB over
+    two R9700s) before its first batch: 0.79 s that way (`park_seconds`, "parking" on the
+    request line), 0.20 s now, the bytes the same (every part compared with the runtime's copy).
   - So a one-off request with another prefix (a title, a summary, a subagent) does not cost the
     conversation it interrupted its whole prompt again.
 - A request may mark itself one-off (`"straydog": {"checkpoint": false}`) so it saves no
@@ -1014,6 +1022,39 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     batch limits the group. A batch already at 4096 rows skips borrowing. Completion and
     cancellation run the same workspace/cache restoration path; the restored pool uses what
     fits at that point.
+  - Two NVIDIA GPUs with 40 to 48 GiB of budget in all (two 24 GB cards) read a partially resident model in batches of 4096 rows from the
+    start, not 1024 (a batch given is taken as it is, and 48 GiB and more keep 2048). Each batch streams again the experts the slots do not
+    hold, whatever its rows: a read of 32K tokens at 1024 rows brought some 95,000 experts over the bus and sent 196,000 routes to the CPU.
+    Borrowing the workspaces for the read (the paragraph above, from 65536 new tokens) frees and fills both devices' slots again at its start
+    and its end, 2.1 and 1.1 to 1.4 s on these cards (a 32K read from 1024-row batches that borrowed at 4096: 19.1 s, 15.9 of them reading).
+    The workspaces of 4096 rows take 0.8 GiB a GPU from the slots (3% fewer: 15,857 slots against 16,336); the code scenario decodes at
+    84 to 89 tok/s with them, 81 to 88 without. Two RTX 4090s, IQ3_S, 262144 context, a new prompt, first token: 8K 6.4 s -> 4.4, 32K 24.3 s
+    -> 15.3 (the server held to 40 CPUs).
+  - From a batch of 2048 rows, on NVIDIA GPUs, a layer asks for its prestaged experts before its router has run (`prestage_issue`,
+    gpu/hybrid_slots.hpp): of the experts its slots do not hold, those the last batch through the layer used (`ResidentMoe::last_counts`;
+    the cache's scores for the first batch), up to the device's prestage slots, are copied from the layer's page-locked bank on the copy
+    stream, beside the layer's dense work, which at 4096 rows takes 11 ms of a DeltaNet layer's 25 and the bus 13 ms of it (25 GB/s of its
+    32). The prestage slots are staging slots past the chunks' two buffers: 192, or a quarter more than the experts a device's layers
+    have beyond its slots, from 32 (the second GPU, whose 14 layers have a few each, takes 32); `STRAYDOG_PRESTAGE` names another count,
+    0 for none. The GEMMs of the experts the batch then needs among them wait for their copies and for nothing else, are queued after the
+    resident ones, and are the tiles of the same kernels over the same bytes; the rest stream in chunks as before and the CPU takes its
+    cheapest routes of those. A 32K read at 4096 rows on a RTX 4090 pair: a layer of the first GPU had 120 experts streamed over 17.2 ms
+    (14 GB/s, the chunks waiting for the GEMMs) and 277 routes on the CPU; it asks for 152 ahead, needs 146 of them, streams 15 and sends 93
+    routes to the CPU, and takes 25 ms instead of 29. The CPU's rows (42 MB at 4096 rows) are copied to the host on a stream of their own
+    on CUDA: ahead of the GEMMs on the device's stream they held them 2 ms a layer.
+  - A partially resident read on two NVIDIA GPUs takes different batches on the two at once (`Model::prefill_overlapped`; a CUDA build,
+    a text prompt, two or more batches between checkpoints; `STRAYDOG_PREFILL_OVERLAP=0` reads them one after the other). The first device runs
+    a batch's embeddings, PLE layer and layers up to the split on the main thread and returns the batch's rows to the host; a thread of
+    its own gives them to the second device (`Backend::prefill_layers` with the rows as input), which runs the rest of the layers and the
+    MTP layer's pairs from the rows it returns (`mtp_prompt_pairs`: the pairs and the batches of 512 of `mtp_prompt_batched`) while the first
+    device already has the next batch; one batch waits between them. The two devices share nothing: no peer copy and no stream, the
+    hand-off is host memory (168 MB a 4096-row batch each way), each device runs its layers in order one batch at a time, and each batch's
+    kernels, rows and sums are the serial path's. A checkpoint of the plan, the end of the read, a cancellation (taken between batches)
+    and a last batch of one row (the decode path's) drain it first: the second device finishes every batch given it, and the serial code
+    runs. The CPU's experts are one engine for both devices' threads, whose calls take turns (`Engine::call_lock`). Two RTX 4090s, split
+    0..26 | 26..48, a new 32K prompt: 12.4 s -> 8.6 and 8.5 (server, MTP, CPU routes on; 7.5 and 7.4 with the two reused buffers, the MTP layer's pairs
+    from the second device's own rows and the exact scan below), the read of 32,000 tokens in the example 11.7 ->
+    8.2 s with `STRAYDOG_PROMPT_CPU=0`, where its first logits, 8K and 32K prompts, are byte for byte those of the serial read.
   - An arriving request can interrupt startup before any expert slots are filled. When the
     selected devices have positive cache capacity but no occupied slots, prefill observes at
     least one batch of routing and fills the cache once if more tokens remain and the request
@@ -1023,6 +1064,22 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     page-locked at once, the whole 262144 would take 12 GiB from what the expert banks need. The
     indexers hold the whole context from the start and are laid out anew in place. A parked
     sequence does not survive a growth; the live one and its checkpoints do.
+  - A K/V in VRAM (the whole context's, in FP16 terms, fits a quarter of the budget) starts at the same 32768 positions after the placement's gates,
+    which count it at the whole context (so every placement that starts grows to the whole context), and grows by doubling the same way, on the
+    device: a layer's new K/V is allocated beside its old one, the old one's positions are copied on the device, and the old is released. What
+    the K/V does not use is expert slots: the pool is made after the K/V is placed, so a short conversation has them all, and a growth releases
+    the pool and makes it again at what fits (`Backend::grow_kv`), so the K/V takes its bytes from the slots for good (a slot is 1.95 MiB of IQ3_S
+    experts, and 125 positions of Qwen3.8-Flash-Next's thirteen layers in Q8_0, their indexers and scratch included, take one). The pool's experts are read again from their scores before the
+    request goes on: the growth's seconds are in the request's `kv_growth_seconds` and in one log line, with the slots before and after. A device that
+    has no VRAM for the longer K/V refuses the request (`KV_NO_VRAM`, not fatal) with every layer sound at the size it has. `STRAYDOG_KV_START=N` starts
+    at N positions (0: the whole context, no growth), to measure a growth against a K/V that has its room. Qwen3.8-Flash-Next UD-IQ3_XXS with
+    its MTP drafter on one R9700 at `--vram 26` (the thirteen layers' K/V of 262144 positions, counted in FP16, fit a quarter of the budget from
+    26 GiB up), context 262144: 10,996 slots at the start against 9,185 with the whole context's K/V; the same 900-token request five times to
+    one server, two servers each, requests 2 to 5: 92.3 tok/s (89.1-95.5) against 85.7 (80.3-90.0), 32-37 routes a token on the CPU against 55-69;
+    a growth with the slots filled took 1.19 s from 32768 to 65536 positions (265 slots), 1.17 s to 131072 (515) and 1.26 s to 262144 (1,035),
+    twice over, and the K/V and the first logits are the same bytes as the whole context's (`STRAYDOG_PROMPT_CPU=0`, which makes a prompt's read
+    deterministic: 8K and 95K prompts, a conversation of five turns to 140K tokens through the three growths, the state digests of
+    tests/kv_growth_vram_gpu.rs, two R9700s with their layers split as well).
   - The page locks give way to the K/V: they are an optimisation of the CPU's experts, and a conversation's K/V is not. A growth that
     the memory refuses (`KV_NO_MEMORY`) ends the locking behind ready if it is under way, takes locked layers back newest first
     (`Model::give_back`: as many as their bytes cover what the memory available lacks, and at least one), and asks again; only with
@@ -1038,6 +1095,13 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     (`hybrid_stage_assist`), two a layer: read in place they outlast the CPU's. At
     --vram 5 on 62 GiB with 41 layers locked (RTX 5070 Ti): 38.1 tokens/s with none, 35.2 with two
     read in place, 42.8 with two staged.
+    The copy runs on a stream of its own, forked after the layer's tick (an event pair joins it back, inside the layer's graph), beside the
+    launch of the resident routes' gate and up and the shared expert's; once it is joined a second launch does the staged routes' gate and up
+    (`ExpertGemv::only`, 1 resident, 2 staged: each route's tiles are the same in either launch), and the products and down follow for all
+    the routes. The layer then takes the longer of the copy and the resident gate and up, plus the staged experts' compute, where the copy
+    came first and the resident experts after it. DS41_PROFILE containing `so0` keeps the copy first in the device's stream, `so2` runs the
+    resident routes' down beside the copy too (two launches more a layer); DS41_PROFILE=hc holds the overlapped layer's outputs against one
+    launch for all its routes, in the same pass.
     How many a layer is given (the level: 0 to 2 on CUDA, 0 to 4 on HIP) is the engine's to choose by
     measuring (`assist.rs`), since it depends on the machine's PCIe link, CPU and VRAM. A round times
     32 decode passes of one row at the level in force and 16 at each other (0, 1, 2 on CUDA; 0, 2, 4
@@ -1070,8 +1134,110 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - Every fourth layer attends sparsely: an indexer scores the prompt's 4-token blocks, and each
   token attends the keys of its 512 best complete blocks and of its own incomplete block.
 - A prompt is prefilled in batches, split into 256-row chunks for the indexer.
-- With FP16 GEMM on RDNA4, a batch's attention runs at once. Groups of 16 tokens walk the union of
-  their selected blocks, so each key and value is read once per group.
+- With FP16 GEMM on RDNA4, a batch's attention runs at once. In a span that starts below 8192
+  tokens, groups of 16 tokens walk the union of their selected blocks, so each key and value is
+  read once per group (`qsa_flash_wmma`). From there each token attends its own selection
+  (`qsa_prompt_attention`, K/V in the device's memory): a workgroup is a token and a K/V head, its
+  four waves take every fourth tile of 16 keys with an online softmax each (merged at the end),
+  the K rows go from memory into the WMMA operands and the V rows through the wave's own LDS, so
+  no wave waits for another. The union saved less than its walk cost: 16 tokens' 8.2K selected
+  blocks are a union of 1.6K (32K tokens), 2.1K (95K) or 2.3K (242K) blocks, 40% of them selected
+  by one token at 242K, and a group's tiles of loads, staging and barriers took 71 us a token (both
+  GPUs, 13 layers) at 242K, a quarter of it the global loads. The same FP16 keys, values, queries
+  and probabilities, F32 sums in another order. Two R9700s, UD-IQ3_XXS, MTP, 262144 context, batch
+  2048: the attention 75 us a token (flash 71, union 3, marks 1) to 19.6; a fresh 242K read 64.7 s
+  to 58.8 s, 95K 22.3 s to 20.6 s, 32K 8.07 s to 7.82 s. The pinned generations' prompts end
+  before 5.3K, so they keep their bits.
+- On CUDA from sm_80, over Q8_0 K/V, each token attends its own selection on the tensor cores (`qsa_flash_mma`,
+  `gpu/sparse_attention_compute.hpp`; `STRAYDOG_QSA_MMA=0` keeps `qsa_flash_wide`, as do FP16 K/V and HIP). It is
+  `qsa_prompt_attention`'s design with mma.sync m16n8k16:
+  - A block is a token and a K/V head. Each of its four warps takes every fourth tile of 16 selected keys, all 256 dimensions,
+    with its own online softmax, and the warps merge at the end in warp order, so the result does not depend on timing.
+  - The twelve query heads are the M = 16 rows, four of them zeros.
+  - For S = Q K^T a lane reads 64 consecutive bytes of a key row, its B operand for all 16 k-steps. The dimensions of k-step s
+    are 64 q + 4 s + 0..3 for the lane quad's q, and the queries are permuted the same way.
+  - For O += P V, S's C fragments are P's A fragment. A lane reads 32 consecutive bytes of each of its four key rows, so n-tile j
+    of the output holds the dimensions 32 n + j.
+  - Q8_0 becomes FP16 as on RDNA4: the int8 + 128 behind 0x64 is the half 1024 + b + 128, minus 1152 exactly, times the scale.
+  - 230 registers on sm_120, no stack; the K/V rows go from memory straight into the operands, with no staging in shared memory.
+
+  Numerics: the same FP16 keys, values, queries and probabilities as RDNA4's, with F32 softmax and sums, so not
+  `qsa_flash_wide`'s bits.
+  - A layer's output against the F32 kernel's: RMS 2.7-3.2e-4, the worst head's row 4.0-4.8e-4, FP16's rounding.
+  - The first logits after 8192- and 32768-token prompts (GSQ IQ2_XS, RTX 5070 Ti, the prefill example, each kernel in a process of
+    its own) against the F32 kernel: KL 1.27e-3 and 2.16e-3, the largest logit difference 0.58 and 0.83, the same first token. Two
+    runs of either kernel are bit for bit the same.
+  - The FP16 operands widen what reaches them a few F32 bits apart. The chunked DeltaNet scan's first logits against the token scan's
+    (3001 tokens, UD-IQ1_S, one GPU) are KL 1.73e-3 apart under this kernel and 8.6e-4 under the F32 one, while the token scan under
+    the two kernels differs by 2.8e-5 (tests/chunked_scan_gpu.rs holds the first to four times the second).
+  - On Windows the switch must be set before the process starts. A Rust `std::env::set_var` inside the process does not reach the
+    engine's `std::getenv` (the C runtime reads its own copy of the environment), and an earlier measurement that flipped it in the
+    process compared the kernel with itself.
+
+  Why the F32 kernel was slow: it ran F32 SIMT at 10-11 TFLOP/s on an RTX 5070 Ti, with 128 registers (two blocks an SM) and
+  three block barriers per 64 keys. With its reads and its products both left out it still took 2.45 ms of 10.1.
+
+  Measured:
+  - One layer of 4096 rows at position 98304, P = 2: RTX 5070 Ti 9.3-10.2 ms -> 2.5-2.7 ms; RTX 3090 16.0-17.1 -> 3.0-4.4
+    (selections shared by 16 tokens, random, or the most recent).
+  - An RTX 5070 Ti's 32K read: the attention phase 1943.9 ms -> 503.8 ms.
+  - Two RTX 3090 served, the switch alone: a 32K read 1.7-1.9 s shorter, a 100K read 4.1-4.6 s shorter.
+
+  What did not help: prefetching the next tile's rows to L2 made it slower (2.55 -> 3.49 ms).
+- In parts the two devices share the indexer (a span's chunks of 256 rows in turn), and from 8192
+  tokens a device attends its own chunks' tokens in the chunk loop, from the selection it made, and
+  sends the selected blocks (`qsa_send_blocks`) into the other's inbox. The other's chunks it
+  normalizes the queries of into the place of their attended values (`write_attention_kv` reads only
+  the keys and values) and attends after the span's one signal and wait, from the block numbers it
+  received, in one launch of the span's chunks of the other (`qsa_prompt_attention<..., Received>`):
+  the selection list is rebuilt in the order the indexer wrote it (the selected blocks in block order,
+  four positions each, then the incomplete block's), so every sum is the one the device's own kernel
+  makes and the two paths give the same bits as one device selecting every chunk. The attended
+  values replace the queries in place: a workgroup reads its token's queries before it writes its
+  values, and no two share a token and K/V head.
+- From 6144 complete blocks (24576 tokens), in a span where each token attends its own selection, an
+  RDNA4 chunk's indexer makes its selection from FP16 matrix products with a provable bound
+  (`qsa_interval.hpp`) and selects the very blocks the exact kernels do, in the same order and with
+  the same ties. The exact scores (128 columns of F32 fused multiply-adds for each block and head,
+  `qsa_block_scores_tiled`) took 27.7 us a prompt token of a 242K read (both GPUs, 13 layers) and
+  the selection of the best 512 (`qsa_select_rows`) 13.3: 41.0 in all, 11.1 now.
+  - A block's four heads are WMMA products of the keys and queries rounded to FP16 (F32 sums), their
+    positive parts added. With h the rounding and r its residual (exact in F32), the exact score of
+    a head differs from the product of the rounded operands by at most |h(k)||r(q)| + |r(k)||h(q)| +
+    |r(k)||r(q)| (Cauchy-Schwarz) and by 2^-15 |h(k)||h(q)| for the F32 sums (the matrix unit's
+    accumulation measured at 4e-8 to 8e-8 of it), and the positive part is 1-Lipschitz, so a score
+    lies within d = |h(k)| (M + 2^-15 N) + |r(k)| (N + M) of the matrix unit's (N and M the heads'
+    norms of the rounded queries and their residuals; norms taken up, the whole 2% over). No
+    distribution is assumed: elements under FP16's smallest normal count as zero, and an element
+    beyond FP16 or not a number leaves its row to the exact kernels. On a 242K prompt's indexer |a -
+    e| reaches 0.10 to 0.16 of d, and d is some 2e-4 of the product of the norms.
+  - With L = a - d and U = a + d, the 512th largest L is at most the 512th best exact score T and
+    the 512th largest U at least it: blocks with L above the second are certainly selected, those
+    with U below the first certainly not, and the rest (the band, 45 blocks a row on average and 96
+    at most, in 3066 sampled rows of the 95K and 242K reads past 48K tokens) are scored exactly from
+    an F32 copy of the keys in the exact kernel's order of operations. T is the (512 - certain)th of
+    the band, ties take the earliest blocks and the selection is listed in block order, as
+    `qsa_select_rows` lists it.
+  - The 512th largest bounds need every block's interval, which would be as large as the exact
+    scores to keep. A sample of one block in 32 (scored the same way) gives a threshold at about the
+    1000th best score instead; the scan (`qsa_iv_scan`: a workgroup of 8 waves, 128 rows, tiles of
+    64 blocks staged as FP16, the keys' loads in flight) keeps as a bit and a score the blocks whose
+    upper bound reaches it with the chunk's largest interval taken off (1135 a row on average, 1770
+    at most of the sampled rows), and the selection (`qsa_iv_select`: a workgroup a row) checks that
+    512 blocks certainly reach the threshold. A row where that fails or that has more than 2048
+    candidates (203 of the 3.8 million rows scored in the 32K, 95K and 242K reads, 190 of them with
+    2049 to 2332), a band over 512 or an operand beyond FP16 is left to the exact kernels, which run
+    for the chunk and leave all but those rows: the time of the exact kernels, not another result.
+    Nothing waits for the host.
+  - The F32 copy of the keys and their norms (`qsa_iv_keys`) live in the attention scratch, which
+    nothing else holds while the tokens attend their own selections, and a layer's chunks in a row
+    take up from the blocks the one before left there.
+  - Two Radeon AI PRO R9700, UD-IQ3_XXS, MTP, 262144 context, in one session, the old and the new
+    kernels alternating: a fresh 242K read at batch 2048 53.53 s to 49.87 s, at batch 4096 50.02 s
+    to 46.34 s, 95K 19.73 s to 19.27 s (batch 2048), 32K unchanged; the bits are the same in every
+    arm. The scan runs at about 105 TFLOPS of FP16 where the matrix unit gives 170 in a loop of its
+    own: its 235 registers leave one workgroup of 8 waves to a workgroup processor, and a micro-
+    benchmark finds a SIMD's vector work not overlapping its matrix products.
 - With host K/V, a layer's prefix is staged in VRAM for its batch, copied on a stream of its own
   while the layers before it compute.
 - Past the stage's positions (a 64th of the budget, grown into what the slots leave: some 45K at 6 GiB),
@@ -1090,6 +1256,115 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
   and a block 32 columns, four blocks a head (the columns are independent), and stages 16 tokens'
   q, k, v, decay and beta in LDS a barrier at a time; its sums are explicit FMAs in the order the
   one-block-a-head scan compiled to, the same bits at 1.9x its speed.
+- A partially resident layer's prompt batch on CUDA queues its resident experts' and its shared expert's GEMMs before the host knows the routing
+  (`grouped_expert_prefill`, `STRAYDOG_MOE_EAGER=0` keeps the old order): the device builds their tile list and the groups' first rows from the counts
+  (`moe_device_tiles_cuda`: the groups that have weights, which are the layer's resident experts, the shared expert's tiles its own), the GEMMs run over
+  the most tiles there can be and the blocks past the built count leave, and the host reads the counts (and the routes' tail and a CPU share's choices) on
+  a stream that waits for an event after the counts alone, not for the GEMMs, then plans the experts beyond the slots (prestaged, streamed, the CPU's)
+  while the GEMMs run. Before, the host's read waited for the counts with the stream idle behind them, planned, and uploaded the tile list and first
+  rows, which queued behind the prestage copies on the bus: a gap of 1.2 ms a layer (31 ms a 4096-row batch on the first device of two RTX 4090s,
+  34 on the second). The device's list is read back after the layer's wait and must be the one the plan implies (the resident groups' tiles), else the
+  layer fails; the products are the same kernels' over the same tiles in another order of blocks, so the same bits.
+- `STRAYDOG_PREFILL_PHASES=1` (development; 2 also lists each stream phase over 4 ms) times a prompt read's layers on each device's stream with
+  events between their phases (`gpu/phase_profile.hpp`: the hyperconnections' four steps, the DeltaNet layer's five, the attention's, the MoE layer's
+  router, routing, the host's planning gap, the resident, prestaged and streamed GEMMs and the shared expert's, the wait for a streamed chunk and
+  for the CPU's routes), the stream's time since the last event added to a phase's name, and prints the sums per 4096-row batch with the experts
+  streamed over the bus when the device goes (the example does at its end). A wait of the host's shows as the phase queued after it
+  (`gap_batch_start`, `gap_span_start`: the stream idle between two spans), so the idle time of a stage is its gaps and its waits. Two RTX 4090,
+  IQ3_S, a 32K read before this work, the first device per batch of 4096 rows: attention 155 ms (6 layers), DeltaNet 150 (20 layers: projections
+  48 + 20, scan 63, convolution, normalization and gate 19), the MoE layers' GEMMs 215 (resident gate/up 78 and down 48, the shared expert's gate
+  and up 55), hyperconnections 85, idle between spans and batches about 135 (the host's rows for the batch and the PLE layer's, 65 and 70) and
+  the planning gap 33, the wait for streamed experts 22; 6.2 GB of experts over the bus a batch.
+- On CUDA a prompt batch's DeltaNet scan (a launch of up to 512 tokens a head) is `delta_register_sequence_ahead`: the register scan's
+  expressions on the same values in the same order (a column of a head's state in 128 registers of a thread, the keys' sums in key order),
+  with the next token's q, k, v, decay and strength fetched a token ahead into three shared buffers (one barrier a token) and the next token's
+  prediction summed in the loop that updates the state, beside the result's sum, which are independent chains. Outputs and state are the
+  register scan's bit for bit (random inputs of 4096 and 1024 tokens: none of 25 M outputs and 786 K state values differ; the first logits of
+  an 8K and a 32K read are the same), 1.5x faster on an RTX 4090 (4096 tokens, 48 heads: 6.17 -> 4.09 ms; in a layer's 8.4 ms at 4096 rows
+  the scan was 4.07). A decode step's one token keeps `delta_register_sequence`. The sums cannot be split over lanes without changing the bits
+  on CUDA (the split scan of RDNA4, run there, gave a scan of 2.4 ms a layer and a first-logits KL against the token scan of 2.2e-3 at 8K
+  and 1.9e-5 at 32K).
+- A read of 16384 new tokens or more (`CHUNKED_SCAN_READ`; `STRAYDOG_DELTA_SCAN=token` keeps the scan above)
+  runs those layers' recurrence in chunks of 16 tokens (`gpu/gated_delta_chunk.hpp`, RDNA4). With g the chunk's
+  decay products, its corrections solve a 16 x 16 unit lower-triangular system, (I + L) C = beta v - diag(beta g) M0^T k,
+  its outputs are g M0^T q + B C and its state g M0 + K^T diag(e) C, so only the products against the state wait
+  for the chunk before. The rest (`gdn_chunk_prep`: the convolution, the q and k norms, the Gram products and the
+  solves) is free of the state and runs for all chunks of a 512-token launch at once, in place of gdn_conv_edges,
+  gdn_conv_runs, gdn_normalize_qk and gdn_pack_values. `gdn_chunk_scan` keeps the state in WMMA accumulators and does
+  every product against it in bf16 pieces: a value is three bf16 (each the leading 8 bits of what the ones before
+  leave), a product is six of the nine pieces' products with F32 sums, which carries about F32's bits (FP16 operands
+  would round every product to 11). The F32 FMA form of the same algebra measured 1.3x slower than delta_split_sequence
+  on an R9700: its operands stream through LDS a float an FMA, and a chunk's products are too small to tile (24 heads x
+  128 columns of state).
+  The layer's output norm after it (`gdn_post_rows`) is `gdn_post`'s tree of sums with five of its seven barriers replaced by shuffles:
+  the same bits (the logits of a 95K and a 242K read are the same), 35.6 -> 28.6 us a 512-token launch. A wave a row, which sums
+  the 128 channels in another association, takes 14.4 us and changes one value in 25 by a last bit, which every read's bits
+  would show.
+  One R9700, 512 tokens, QwenHeads<2> shapes, random q/k/v: convolution, normalization, packing and scan 340-385 us,
+  the two kernels 187-228 us; against an F64 scan the outputs' largest error is 2.3e-7 to 4.8e-7 of the largest output
+  (the token scan's: 1.0e-7 to 2.0e-7). On the activations of a 95K read (4 heads of 12 layers against an F64 scan) the
+  chunked outputs are 4e-7 to 3.6e-6 of the largest output off, the token scan's 5e-7 to 1.6e-4: within twice the token scan's
+  in every layer, and 10x to 100x below it where the state forgets little. A first version was 2e-6 to 7e-4 off, growing
+  linearly with the tokens read, from two coherent losses a chunk: a matrix core's accumulate of a product sum into a large
+  accumulator (the state, which the update's six chained products were added into) drops the sum's low bits toward zero
+  (measured on an R9700: half an F32 spacing a WMMA, with errors of up to three spacings, so six a chunk shrank the state by
+  1e-7 of itself), and g_end rounded to F32 lost 3e-8 a chunk. The products now start from a zero accumulator, the decay is
+  F32 fused multiply-adds with g_end as two floats, and the real kernel's error matches a staged F64 emulation of the same
+  algorithm (every stage rounded as the GPU rounds it, run on the same activations). The first logits after a 95K read differ
+  from the token scan's by KL 6.7e-4 (242K: 1.6e-5), where the token scan at another batch width differs by 4.4e-2 (1.6e-5).
+  On CUDA the same chunked recurrence is scanned by `gdn_chunk_scan_f32` (`gpu/gated_delta_chunk.hpp`, `gdn_chunk_prep` shared, writing the
+  normalized keys and queries as floats where RDNA4 writes bf16 pieces): the products against the state in F32 fused multiply-adds. A block of two
+  warps takes 32 columns of one value head, a warp 16 of them, two lanes a column, each lane holding its column's state for 64 of the 128 keys in
+  registers (255 registers, no stack). Per chunk P = M0^T k and S = M0^T q are 32 independent sums a lane over its keys in ascending order, the
+  two lanes' halves added through a shuffle (the token scan's sums are one chain a token with a barrier between tokens); C = U - W P, the outputs
+  g S + B C, and the state g_end M0 + sum_t k_t (x) (e_t C_t) with g_end as two floats in fused multiply-adds, as on RDNA4. The chunk's keys,
+  queries, W, B, g and e (18 KB) come to shared memory for both warps by cp.async, double buffered, the next chunk's while this one's products
+  are formed, and U is fetched a chunk ahead into registers. One RTX 4090, 512 tokens, 48 heads, random inputs, standalone: 0.206 ms a launch
+  where the lookahead token scan above takes 0.40 (the chunked path also runs `gdn_chunk_prep` in place of the convolution, normalization and
+  packing kernels of the token path; its time was not measured apart). The first versions were slower: one lane a column (128 keys in registers) used 255 registers and a stack; four and eight
+  lanes a column loaded the keys' tile a warp from L2 (0.99 and 1.74 ms a launch against 0.37 for two); the tile shared by both warps and
+  prefetched halves the two lanes' version again, 0.37 -> 0.21 ms (that version with its chunk loads left out measured 0.17); and a fully unrolled version failed
+  to run (out of memory for its 8 KB of local memory a thread, with VRAM full). Vectorized shared loads in the exact scan changed its bits
+  (another contraction of a*b + c*d), so the exact scan keeps its scalar loads. In a read (2 x RTX 4090, Qwen3.8 IQ3_S, the prefill example,
+  chunked against `STRAYDOG_DELTA_SCAN=token`, two runs each, alternated): a 32K read 5.60 -> 5.26 s, a 95K read 15.39 -> 14.62 s, an 8K read
+  the same bits and time; served (`p2` set, two runs each, alternated, against the same build without the scan): first token of a new 32K prompt
+  5.76, 5.71 -> 5.63, 5.36 s, of a 95K prompt 16.39, 16.08 -> 15.17, 15.28 s. First logits against the token-by-token scan's: KL 4.1e-6 (32K)
+  and 3.0e-7 (95K), the same top token, where the token scan against itself at batch widths of 1024, 2048 and 3072 differs by 3.9e-6, 2.9e-6 and
+  7.5e-6 at 32K (a 95K read at a narrower batch than the default fails in the example, as it does before this change: "invalid Straydog MTP
+  rows", so that noise is not measured). The kernel's outputs have not been compared with an F64 scan on CUDA, as the RDNA4 kernel's were.
+  Since then the tile is read without bank conflicts, and a block has four warps (64 columns).
+  - The conflict: the two lanes of a column read the rows `own + key` (own 0 or 64) as float4. Rows 64 apart are 4096 bytes apart and
+    fall in the same banks, a 2-way conflict on every LDS.128 of the scan.
+  - The fix: the tile puts key (and query) row r at r * 16 + (r / 64) * 4 floats, the second half's rows 16 bytes further.
+  - The sums and their order are unchanged, so the outputs and states have the same bits. A standalone benchmark compares the old
+    text with the new one by digest.
+  - One layer of 4096 rows, P = 2: RTX 5070 Ti 1.42-1.47 -> 0.95 ms (0.99 with two warps); RTX 3090 2.28 -> 1.87 ms (1.97 with two).
+    The scan phase of an RTX 5070 Ti's 32K read: 883 -> 521 ms.
+  - Four, eight or sixteen lanes a column stayed slower, shifted too: 1.6-2.1 ms on the RTX 5070 Ti, 2.2-2.8 on the RTX 3090.
+- A read of 16384 new tokens or more (`STRAYDOG_HC=blas` keeps the pair below) runs each HyperConnection's up projection and
+  its finish as one kernel (`hc_up_finish`, `gpu/hc_fused.hpp`, RDNA4 with FP16 projections). The pair was hipblasGemmEx for the
+  10240 x 320 projection, which wrote its F32 rows (168 MB for a part's 4096 rows), and `hc_finish_hidden`, which read them again with
+  the rows' hidden values (168 MB more) and wrote the mixed rows (42 MB): 0.97 ms for 4096 rows on an R9700 (0.35 and 0.62), bound by
+  memory. A block takes 32 columns of each of the four residual streams (128 rows of the weights, laid out so that a wave's accumulator
+  fragments are the four streams of the same 16 columns: a lane holds a token's eight columns of all four streams) and 128 tokens, sums
+  K = 320 in five steps of 64 through LDS, and finishes in registers with `hc_finish_hidden`'s expressions in its order: the F32
+  projection is never written, and the block reads only its hidden values (the rows' F32 values it needs) and the denominators. 0.48-0.50 ms
+  for the pair's 0.97 ms, on both GPUs at once as on one. The products are summed in the order of a plain WMMA kernel's (the sum a lane's
+  fragment holds over K in steps of 16 from a zero accumulator), which is not rocBLAS's, so the projection's last bits move; the
+  rest is bit for bit the finish's (`gpu/tests/hc_fused_test.cpp` compares the kernel with `hc_finish_hidden` on a plain kernel's
+  projection: no bit of 10.5M differs, the injections included), and the error against an F64 sum is the pair's (README, Numerics).
+- On CUDA from sm_80, every prompt batch with FP16 projections takes the same fusion, `hc_up_finish_mma` (`gpu/hc_fused.hpp`).
+  `STRAYDOG_HC_FUSED=0` keeps the pair there; `STRAYDOG_HC=blas` is RDNA4's switch.
+  - Its blocks are hc_up_finish's, on mma.sync m16n8k16: 128 weight rows (32 columns of each stream) by 128 tokens, eight warps,
+    and K = 320 in five steps of 64 through shared memory.
+  - The block's sigmoid(sums) go through shared memory 64 tokens at a time, so the finish reads and writes 16 bytes at a time.
+    A finish straight from the accumulators wrote 4 bytes a lane and was slower than the pair: 1.36 ms on an RTX 5070 Ti, 1.41 on
+    an RTX 3090.
+  - It runs two blocks an SM, at 128 registers and 96 bytes of stack on sm_120.
+  - 4096 rows: RTX 5070 Ti 0.85 ms (cublasGemmEx 0.34 + hc_finish_hidden 0.50) -> 0.48; RTX 3090 1.05 -> 0.66.
+  - The mixed rows are the pair's bit for bit on both: cuBLAS sums K in steps of 16 from zero, ascending, at this shape. Checked by
+    digests in a standalone benchmark.
+  - An RTX 5070 Ti's 32K read: hc_up + hc_finish 705 ms -> hc_up_finish 442 ms.
 - Measured at IQ3_S on two R9700s at 262144 context: 131072 tokens prefill in 34.3-34.8 s, and
   4096 in 1.23 s.
 
@@ -1107,8 +1382,11 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
     prompt's grouped experts run without it and the half beside them as FP16 GEMMs;
   - their rows of the projections and columns of the output projection (`Model::part_operands`,
     gathered at load: a piece of the mapped matrix a run of rows, or a run of every row's columns).
-- **Whole on both:** the residual streams, the HyperConnections, the router and the attention's
-  indexer, so both select the same experts and K/V blocks. The PLE layer runs on both as well.
+- **Whole on both:** the residual streams, the HyperConnections and the router, so both select the same
+  experts; and the attention's indexer, so both select the same K/V blocks (a pass's rows alike; a
+  prompt's chunks of 256 rows go to the devices in turn, and the blocks each selected are sent as 16-bit
+  block numbers, 1 KiB a row, into the other's inbox, so both hold every row's selection). The PLE layer
+  runs on both as well.
 - **Sums.** A layer's attention output and its experts' are each a part of a sum (the SumLink of
   `gpu/device_link.hpp`): a pass's rows in one single-block kernel that sends this device's part,
   raises the other's flag, waits for its own and adds the two parts into the four streams (both add
@@ -1179,7 +1457,12 @@ pass or a prompt batch at once, each its part, a half-size Qwen3.8 layer (`QwenH
   of the text before it). A draft step reads 40% of the head's rows: the same drafts and 141.5 to
   146.6 tok/s on English at 20K, 127.9 to 132.0 at 60K; on Japanese 125.9 to 126.8 (fewer drafts
   accepted, 73.5 to 69.5%, outweighed by shorter passes). Verification reads the whole head.
-  `STRAYDOG_DRAFT_VOCABULARY=0` drafts over the whole head. With the launches above, served at real
+  `STRAYDOG_DRAFT_VOCABULARY=0` drafts over the whole head. A partially resident model on CUDA uses it too
+  (its head is split across the two GPUs the same way, and the 34 MB are taken before the expert slots
+  are sized): on two RTX 4090 at IQ3_S, 900 tokens of code, a draft step took 2.26 ms of which the head
+  1.90 ms of GPU time, and 1.07 ms with the head's 0.72 (50000 rows: 0.72 ms and 0.37); the draft's share of a
+  generated token 1.1-1.5 to 0.65-0.72 ms, and the share of drafts accepted 0.875-0.929 (7 runs) to
+  0.877-0.924 (7 runs). With the launches above, served at real
   use a pass of 1 / 2 / 3 / 4 rows at 20K 12.95 / 16.07 / 19.26 / 21.45 to 12.24 / 15.05 / 17.90 /
   19.87 ms, at 60K 13.91 / 17.28 / 20.98 / 23.15 to 13.14 / 16.22 / 19.67 / 21.50.
 - **Measured** greedy in-process at IQ3_S, 20K tokens: a pass of 1 / 2 / 3 / 4 rows 14.83 / 17.28 /
@@ -1319,9 +1602,60 @@ layer (§6.2).
   two calls' bits (`decode_head_gpu`). The rest is the launches' and the two copies' latency under WDDM, about 150 us, and the copy of
   the logits out of the staging memory into the vector, 50 us; the vector is the step before's, given back by the draw. HIP keeps
   the two calls. `examples/head_bench.rs` times the GEMV alone.
-- **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 2048:
-  4096 rows took the first token of a 20K and a 60K prompt 7-12% longer (5.7 to 6.5 s, 15.8 to
-  17.2 s), so the derived batch for the resident models is 2048 where it was 4096.
+- **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 4096, from 48 GiB of
+  budgets in all (`resident_batch`). On 2026-10-29 4096 rows took the first token of a 20K and a 60K prompt
+  7-12% longer than 2048 (5.7 to 6.5 s, 15.8 to 17.2 s), and the derived batch was 2048 until
+  2026-11-12, when served runs (one each, two R9700s, UD-IQ3_XXS, 262144 context) read 8K in 1.75 s
+  instead of 1.95, 32K 6.81 instead of 7.10, 95K 21.63 instead of 22.83 and 242K 62.6 instead of 66.1,
+  decode the same. The derived batch is the placement's to narrow: K/V in VRAM at 4096, then at 2048, then K/V
+  in host memory at 4096, 2048 and 1024 (`placement_candidates`), so a model that fit with its K/V in
+  VRAM at 2048 still has it there; a model that is not fully resident, on 48 GiB of budgets or more,
+  keeps 2048 for its expert slots' room. A batch given with `--batch-size` is never narrowed that way:
+  the server sends the worker `auto` for the derived batch (`Settings::batch_derived`), and the engine
+  takes `DERIVED_BATCH` (0) as the batch to derive and narrow, any other as asked, which is tried at
+  its rows with the K/V in VRAM, then in host memory at the rows halved to 1024 (as before 4096 was the
+  default; the `one-gpu-partial` golden's 4096 on a 24 GiB card stays 4096).
+- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (16384) new tokens or more is read in batches of up to
+  `Model::wide_batch_size` rows when the batch was derived, the layers are in parts (§8 above) and the VRAM left holds the
+  workspaces of more (`wide_placement`; the ready line says the rows, or what they lack, and the request line the batches it
+  ran in; `STRAYDOG_PREFILL_WIDE=off` or N rows). What a batch pays once, whatever its rows, is the FP16 expansion of every
+  dense weight (`expand_matrix`, 25.4 us a token at 2048 rows in the 242K kernel table, halving with each doubling), the
+  exchanges of the two devices (a wait of 56-89 us each) and the launches. What grows with the rows is the decoder's workspace
+  (hidden, mixed and branch rows, 15364 floats), the MTP layer's kept rows and embeddings (12800) and the sums' inbox; the
+  experts' workspace (11 routes of 4480 floats a row) does not, because a layer part runs the experts of a wide batch in
+  chunks of 4096 rows (`moe_chunk_rows`; a batch of no more is one chunk, as ever, and its bits are as they were) and the
+  workspace holds only the other stages' row scratch (13000 floats a row of a part) beyond a chunk. A chunk reads every expert
+  of the layer once, so a width between two chunks gains nothing and costs the experts' second read over fewer rows: two
+  R9700s, `--vram 30`, a fresh 242K read, 50.0 s at 4096 rows, 50.97 s at 5120 (2 x 2560), 50.05 s at 6144 (2 x 3072),
+  49.1 s at 8192 (2 x 4096; 48.9 after a pause, three reads in a row 50.5, 49.12, 49.13), 95K 18.4 and 18.1 s (4096, 8192),
+  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096: 12288 and 8192.
+  What a row of a batch cost in VRAM on each device was 350908 bytes: the experts' workspace 197208 (49302 floats), the decoder's
+  61456, the MTP rows 40960 and embeddings 10240, the sums' inbox 20480 (two slots of a row's 2560 floats) and the peer link's
+  20564 (inputs, partials and routes), 1.34 GiB at 4096 rows and 2.68 at 8192. Beside the weights, with the drafter and K/V in
+  host memory, the placement had 145 MB left at 4096 rows (6144 rows lacked 0.08 GiB, 8192 0.33, 12288 1.16, 16384 1.98): the
+  K/V stage, which grows into what is left and decode reads its prefixes from, took it. Three workspaces were larger than
+  what they hold. The sums' inbox needs the halves of a batch's rows (2568 FP16 values a row, half of them each: 5136 bytes a
+  row, `sums_capacity`) and the shared indexer's selections of a span (a 2048-row span's 512 blocks of 16 bits): 21 MB at 4096
+  rows, not 84. The peer link of layers in parts carries only a decode pass's rows (its split output head's half of the
+  vocabulary for eight rows is 388 rows of the inbox): 1024 rows, 21 MB, not 84. The experts' workspace of a layer in parts
+  needs 32982 floats a row (`moe_compact_row`): its prompt batches run the grouped FP16 path, whose products and inputs are halves
+  in 4800 of the gate and up scratch's 14080 floats, with no F32 product rows (7040), so 16320 floats a row were never
+  read: 515 MiB at 4096 rows, not 771. The same bits (every digest of a batch up to 4096 rows is as it was, layer split included)
+  and 0.54 GiB left at 4096 rows instead of 145 MB: the stage grows into it (decode of 200 tokens after a 95K read, 22.21 ms a
+  pass with the stage at 625 MB, 21.81 with 1059; the passes after shorter prompts the same). 8192 rows take 482 MB of it (the
+  decoder's 252, the MTP's 210, the sums' 21), which leaves the stage 97 MB beyond its start (decode at 95K 22.09 ms a pass, as
+  it was); 12288 rows lack 0.49 GiB and 16384 rows 1.14. A short read, an image, the warm-up pass, a batch given, partial
+  residency, one GPU, the layer split and DeepSeek are not widened. The staging buffers of the rows (two page-locked buffers each
+  for the MTP layer's, the first layer's and the PLE layer's embeddings, 84 MB each at 8192 rows, a GiB over the two devices) are
+  pinned on a thread of each device from the end of the load (`sd_row_staging_prefetch`), at the size of the widest batch, and the
+  first batch that stages rows takes them. The first wide read otherwise grew them as its batches asked: 0.06-0.08 s for each of
+  the six pairs, and the MTP layer's asked 8191 rows in its first batch and 8192 in the next, so it grew once more: device 0's
+  growths of it took 1.34 s each, with a batch queued on that device (device 1's 0.07-0.08 s). A 32K read after an 8K one in the example
+  took 6.30 s the first time and 5.62 the second, now 5.64 and 5.62; a served 32K read 6.47 s, now 5.77. Pinned beside the
+  weights' reading (the first try) it held the load up by 0.3 s, so it starts once they are read, and the warm-up's first batch
+  waits for it. A 242K read ran in 49.1 s. Of the kernels' time of a 242K read (400.8 us a token at 4096 rows, both
+  devices, 394.3 at 8192) the weights' expansion went from 14.4 to 9.0 us, the devices' signals from 15.3 to 11.3 and the large
+  GEMMs from 71.1 to 68.8; the casts took 1.5 more, the experts' kernels 0.9, the residual updates 1.1.
 - **Fewer, fuller launches in a pass** (from a kernel trace at 20K). Every Q8 unit of Q4_K, Q6_K and IQ4_XS is
   staged with Q5_K's pad: a row's lanes read its units 128 or 64 bytes apart, on the same LDS banks, so four
   vectors took twice one's time (a 2560 x 6144 Q6_K out projection 50 to 29 us at four rows). The shared

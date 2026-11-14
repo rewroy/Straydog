@@ -76,13 +76,42 @@ struct ExpertGemv {
     // Zero-copy assist: the first `assist` absent routes read page-locked host banks.
     const uint8_t* mapped[3]; uint64_t bytes[3]; uint32_t assist;
     const uint8_t* stage; uint64_t slot_bytes;   // CUDA: assisted experts are read from VRAM's staging slots (hybrid_stage_assist)
+    // CUDA: the pass's staging plan (hybrid_tick_plan): of each row's ten routes the staging slot its expert was given, or -1 (resident, or left to
+    // the CPU). One slot to a distinct missed expert of the pass, whatever rows route to it. A kernel moves it to its row (expert_row_stage).
+    const int32_t* assign;
+    // CUDA: which of the GPU's routes a launch evaluates: 0 all, 1 the resident ones alone, 2 the staged ones alone (3: all but the experts whose
+    // gate and up are in SoA slots, which the INT8 kernels took). A layer whose staging copy runs beside its
+    // resident experts (hybrid_resident_experts) launches the resident ones first and the staged ones after the copy; each route's tiles are the same tiles
+    // in either launch, so the sums are those of one launch for all.
+    uint32_t only;
 };
+// A row's staging: where its assisted experts are staged (`stage`, after the earlier rows') or its slice of the pass's staging plan
+// (`assign`), each null where the plan has none (expert_row_stage). A value the helpers are passed: the plan itself, a kernel's by-value
+// argument, is never written.
+struct ExpertRow { const uint8_t* stage; const int32_t* assign; };
 // Whether the GPU evaluates `route`: resident, or among the first assisted absent routes.
+// (No array of the plan is read at an index the thread computes, here or in expert_wave, and the plan is not written: with either nvcc keeps
+// the whole plan, a kernel's argument, in every thread's stack and writes it there at the kernel's entry -- 17 stores of local memory before
+// the first branch of resident_expert_gemv_kind, 136 bytes a thread, some 30 MB a launch of a four-row down, as much as the weights it reads.)
 __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
-                                                        size_t role,const ExpertGemv& plan) {
+                                                        size_t role,const ExpertGemv& plan,const ExpertRow& row) {
     const size_t expert=size_t(selected[route]);
     const uint8_t* data=groups[expert].weights[role].data;
-    if (data || !plan.assist || !plan.mapped[role]) return data;
+    const uint8_t* mapped=role==0 ? plan.mapped[0] : role==1 ? plan.mapped[1] : plan.mapped[2];
+    const uint64_t bytes=role==0 ? plan.bytes[0] : role==1 ? plan.bytes[1] : plan.bytes[2];
+    if (data) {
+        if (plan.only==2) return nullptr;
+        // (3: the INT8 kernels took the experts whose gate and up are in SoA slots, resident_expert_q8.hpp)
+        if (plan.only==3 && groups[expert].weights[0].layout && groups[expert].weights[1].layout) return nullptr;
+        return data;
+    }
+    if (plan.only==1 || !plan.assist || !mapped) return nullptr;
+    if (row.assign) {
+        const int32_t slot=row.assign[route];
+        if (slot<0) return nullptr;
+        if (row.stage) return row.stage+size_t(slot)*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
+        return mapped+expert*bytes;
+    }
     // Balance the PCIe-bound GPU share against the CPU: about 5 of every 12 absent routes.
     uint32_t earlier=0,absent=0;
     for (size_t r=0;r<10;++r) {
@@ -91,34 +120,48 @@ __device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,c
     }
     const uint32_t share=min(plan.assist,(5*absent+4)/12);
     if (earlier>=share) return nullptr;
-    if (plan.stage) return plan.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
-    return plan.mapped[role]+expert*plan.bytes[role];
+    if (row.stage) return row.stage+earlier*plan.slot_bytes+(role>0 ? plan.bytes[0] : 0)+(role>1 ? plan.bytes[1] : 0);
+    return mapped+expert*bytes;
 }
-// A row's assisted experts stage after the earlier rows' (hybrid_stage_assist).
-__device__ __forceinline__ void expert_row_stage(ExpertGemv& plan) {
-    if (plan.stage) plan.stage+=size_t(blockIdx.y)*plan.assist*plan.slot_bytes;
+// The plan's own staging, for a caller whose rows are not offset.
+__device__ __forceinline__ const uint8_t* expert_source(const MoeGroup* groups,const int32_t* selected,size_t route,
+                                                        size_t role,const ExpertGemv& plan) {
+    return expert_source(groups,selected,route,role,plan,ExpertRow{plan.stage,plan.assign});
+}
+// A row's assisted experts stage after the earlier rows' (hybrid_stage_assist): the row's staging, the plan's moved to blockIdx.y.
+__device__ __forceinline__ ExpertRow expert_row_stage(const ExpertGemv& plan) {
+    if (plan.assign) return ExpertRow{plan.stage,plan.assign+size_t(blockIdx.y)*10};
+    if (plan.stage) return ExpertRow{plan.stage+size_t(blockIdx.y)*plan.assist*plan.slot_bytes,plan.assign};
+    return ExpertRow{plan.stage,plan.assign};
 }
 // A stage's wave: its route (10: the shared expert), role, wave within the matrix and lanes; false past the stage's waves.
+// (The roles one after another, written out: a loop over them would read the plan's arrays at its counter, see expert_source.)
 __device__ __forceinline__ bool expert_wave(size_t wave,bool down,const ExpertGemv& plan,size_t& route,size_t& role,size_t& local,
                                             unsigned& lanes) {
-    const size_t roles=down ? 1 : 2;
-    for (size_t r=0;r<roles;++r) {
-        const size_t span=10*size_t(plan.routed_waves[r]);
-        if (wave<span) { route=wave/plan.routed_waves[r]; local=wave%plan.routed_waves[r]; role=down ? 2 : r; lanes=plan.routed_lanes[r]; return true; }
-        wave-=span;
+    const size_t first=plan.routed_waves[0], second=down ? 0 : plan.routed_waves[1];
+    if (wave<10*first) { route=wave/first; local=wave%first; role=down ? 2 : 0; lanes=plan.routed_lanes[0]; return true; }
+    wave-=10*first;
+    if (!down) {
+        if (wave<10*second) { route=wave/second; local=wave%second; role=1; lanes=plan.routed_lanes[1]; return true; }
+        wave-=10*second;
     }
-    for (size_t r=0;r<roles;++r) {
-        if (wave<plan.shared_waves[r]) { route=10; local=wave; role=down ? 2 : r; lanes=plan.shared_lanes[r]; return true; }
-        wave-=plan.shared_waves[r];
+    if (wave<plan.shared_waves[0]) { route=10; local=wave; role=down ? 2 : 0; lanes=plan.shared_lanes[0]; return true; }
+    wave-=plan.shared_waves[0];
+    if (!down) {
+        if (wave<plan.shared_waves[1]) { route=10; local=wave; role=1; lanes=plan.shared_lanes[1]; return true; }
     }
     return false;
 }
 // The wave's matrix (null data: a partially resident expert the host evaluates) at its input and output places.
 __device__ __forceinline__ Matrix expert_matrix(const MoeGroup* groups,const int32_t* selected,size_t experts,bool down,
-                                                const ExpertGemv& plan,size_t route,size_t role) {
+                                                const ExpertGemv& plan,const ExpertRow& row,size_t route,size_t role) {
     const size_t expert=route<10 ? size_t(selected[route]) : experts;
     Matrix matrix=groups[expert].weights[role];
-    if (route<10) matrix.data=expert_source(groups,selected,route,role,plan);
+    if (route<10) {
+        matrix.data=expert_source(groups,selected,route,role,plan,row);
+        // An absent route's mapped or staging image is still the host's native layout.
+        if (!groups[expert].weights[role].data) matrix.layout=0;
+    }
     matrix.input_offset=down ? route*640 : 0;
     matrix.output_offset=down ? route*2560 : route*1280+role*640;
     return matrix;
@@ -129,12 +172,12 @@ __global__ void resident_expert_gemv(const MoeGroup* groups,const int32_t* selec
                                      size_t input_stride=0,size_t output_stride=0) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
-    expert_row_stage(plan);
+    const ExpertRow row=expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
-    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,row,route,role);
     if (!matrix.data) return;
-    gemv_wave<1>(matrix,local,lanes,input,0,output,0);
+    resident_wave<1>(matrix,local,lanes,input,0,output,0);
 }
 // resident_expert_gemv of a stage whose routed slices take one format, `routed` (gate and up alike): only that format's F32
 // rows are compiled, and the shared expert's down rows of a light format, so the kernel keeps few registers (the kernel of
@@ -149,13 +192,13 @@ __global__ void __launch_bounds__(256) resident_expert_gemv_kind(const MoeGroup*
                                                                  size_t input_stride,size_t output_stride) { SD_KERNEL_ACQUIRE;
     const size_t wave=size_t(blockIdx.x)*(blockDim.x/32)+threadIdx.x/32;
     selected+=size_t(blockIdx.y)*10; input+=size_t(blockIdx.y)*input_stride; output+=size_t(blockIdx.y)*output_stride;
-    expert_row_stage(plan);
+    const ExpertRow row=expert_row_stage(plan);
     size_t route=0,role=0,local=0; unsigned lanes=0;
     if (!expert_wave(wave,down,plan,route,role,local,lanes)) return;
-    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,route,role);
+    const Matrix matrix=expert_matrix(groups,selected,experts,down,plan,row,route,role);
     if (!matrix.data) return;
     const size_t first=local*(32/lanes);
-    if (route<10) { gemv_rows<routed,1>(matrix,first,lanes,input,0,output,0,{}); return; }
+    if (route<10) { resident_rows<routed,1>(matrix,first,lanes,input,0,output,0,{}); return; }
     #define SD_EXPERT_DOWN(format) case format: gemv_rows<format,1>(matrix,first,lanes,input,0,output,0,{}); break;
     switch (matrix.kind) { SD_EXPERT_SHARED_DOWN(SD_EXPERT_DOWN) }
     #undef SD_EXPERT_DOWN
@@ -183,16 +226,11 @@ __global__ void __launch_bounds__(256) resident_expert_pairs(const MoeGroup* gro
     const size_t route=wave/waves_per_route, row=(wave%waves_per_route)*half+group%half;
     const Matrix& matrix=groups[selected[route]].weights[group<half ? 0 : 1];
     if (!matrix.data) return;
-    float sum=0;
-    const size_t units=matrix.cols/GemvFormat<routed>::elements;
-    #pragma unroll 2
-    for (size_t unit=sub;unit<units;unit+=lanes) {
-        if (row<matrix.rows) {
-            float r[1];
-            GemvFormat<routed>::template dots<1>(matrix.data+row*matrix.row_bytes,unit,input,0,r);
-            sum+=r[0];
-        }
-    }
+    float sum;
+    if constexpr (routed==16 || routed==18 || routed==21 || routed==22) {
+        if (matrix.layout) sum=resident_pair_sum<routed,true>(matrix,row,sub,lanes,input);
+        else sum=resident_pair_sum<routed,false>(matrix,row,sub,lanes,input);
+    } else sum=resident_pair_sum<routed,false>(matrix,row,sub,lanes,input);
     for (unsigned offset=lanes/2;offset;offset/=2) sum+=__shfl_xor(sum,offset,32);
     const float up=__shfl(sum,int((lane+half*lanes)%32),32);
     if (group<half && sub==0 && row<matrix.rows) products[route*640+row]=sum*hc_sigmoid(sum)*up;
@@ -203,18 +241,64 @@ unsigned resident_lanes(const std::vector<Matrix>& weights,size_t role,const flo
     const unsigned first=gemv_lanes(weights[role],input,concurrent), second=gemv_lanes(weights[3+role],input,concurrent);
     return first==second ? first : 0;
 }
+// The assist level a layer's routes run at (the experts a pass may take over the bus, ExpertGemv::assist). On CUDA the MTP draft layer's missed experts go
+// to the CPU whatever the level: they cost the step nothing there (the layer has few CPU routes and the hand-off overlaps the GPU's own experts), where a
+// staged one costs the GPU about 95 us in series inside the step, and a draft step is a few of those on every hit. DS41_PROFILE containing "dg" gives the
+// draft layer the level as any other (the measurement of the difference).
+inline size_t hybrid_level(const Device& d,const ResidentMoe& plan) {
+#if !defined(__HIPCC__)
+    static const bool drafter_takes=[] { const char* p=std::getenv("DS41_PROFILE"); return p && std::strstr(p,"dg"); }();
+    if (plan.drafter && !drafter_takes) return 0;
+#else
+    (void)plan;
+#endif
+    return d.assist;
+}
+#include "resident_expert_q8.hpp"
 // shared_done: the shared expert's gate and up are in `output` already (moe_tokens_experts' router launch).
 void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* groups,const int32_t* selected,
                             bool down,const float* input,float* output,
                             size_t tokens=1,size_t input_stride=0,size_t output_stride=0,bool shared_done=false,
-                            const uint8_t* assist_stage=nullptr,uint64_t assist_slot_bytes=0) {
+                            const uint8_t* assist_stage=nullptr,uint64_t assist_slot_bytes=0,const int32_t* assist_assign=nullptr,unsigned only=0) {
     const auto& weights=plan.weights;
     const size_t shared=plan.experts*3, roles=down ? 1 : 2;
     const bool with_shared=plan.shared && !(shared_done && !down);
     ExpertGemv geometry{};
     for (size_t role=0;role<3;++role) { geometry.mapped[role]=plan.mapped[role]; geometry.bytes[role]=plan.host_bytes[role]; }
-    geometry.assist=plan.mapped[0] ? d.assist : 0;
-    geometry.stage=assist_stage; geometry.slot_bytes=assist_slot_bytes;
+    geometry.assist=plan.mapped[0] ? hybrid_level(d,plan) : 0;
+    geometry.stage=assist_stage; geometry.slot_bytes=assist_slot_bytes; geometry.assign=assist_assign; geometry.only=only;
+    // The routed gate and up of the experts in SoA slots on INT8 activations (resident_expert_q8.hpp). The shared expert's gate and up go to the
+    // dense GEMV on the side stream, forked before the routed launches and joined after them, so that the two run together: behind them on the
+    // device's stream they added 11 to 33 us a launch (RTX 3090, 1 to 4 rows). What else the GPU evaluates of the launch -- a staged expert,
+    // whose image is the host's native layout -- stays with the kernels below, which then take those routes alone (ExpertGemv::only 3) and no
+    // shared expert.
+    bool q8=false;
+    if (!down && only!=2 && resident_gate_up_q8_takes(d,plan,input,tokens,input_stride)) {
+        if (with_shared) {
+            // (a HIP build's development switch: the stream made at its first use, as the layers in parts make it)
+            if (!d.side_stream) {
+                check(hipStreamCreate(&d.side_stream));
+                check(hipEventCreateWithFlags(&d.side_fork,hipEventDisableTiming));
+                check(hipEventCreateWithFlags(&d.side_join,hipEventDisableTiming));
+            }
+            check(hipEventRecord(d.side_fork,d.stream));
+            check(hipStreamWaitEvent(d.side_stream,d.side_fork,0));
+            {
+                StreamScope side(d,d.side_stream);
+                Matrix pair[2]={weights[shared],weights[shared+1]};
+                pair[1].output_offset=640;
+                gemv(d,pair,2,input,output+10*1280,tokens,input_stride ? input_stride : 2560,output_stride ? output_stride : 11*1280);
+            }
+            check(hipEventRecord(d.side_join,d.side_stream));
+        }
+        resident_gate_up_q8_launch(d,plan,groups,selected,geometry,input,output,tokens,input_stride,output_stride);
+        if (with_shared) check(hipStreamWaitEvent(d.stream,d.side_join,0));
+        // (a partially resident plan's resident experts are all in slots: a launch of them alone has nothing left, nor has any launch while
+        // the GPU takes no expert over the bus -- the F32 kernel launched for nothing took 28 to 41 us of an RTX 3090's four-row pass)
+        if (plan.hybrid && (only==1 || !geometry.assist)) return;
+        q8=true;
+        geometry.only=3;
+    }
     // The kernel of the stage's routed format (resident_expert_gemv_kind) when it has one: its shared down rows of a light
     // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
     const int routed=weights[down ? 2 : 0].kind;
@@ -234,7 +318,12 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
         waves+=10*size_t(geometry.routed_waves[r])+geometry.shared_waves[r];
         kind&=geometry.routed_lanes[r]!=0;
     }
-    const bool beside=kind && !down && with_shared;
+    // (the staged routes alone: no shared expert in the launch, and the routed tiles as they are in the launch for all)
+    if (only==2 || q8) {
+        waves=0;
+        for (size_t r=0;r<roles;++r) { geometry.shared_waves[r]=0; waves+=10*size_t(geometry.routed_waves[r]); }
+    }
+    const bool beside=kind && !down && with_shared && only!=2 && !q8;
     // (Layers in parts, qwen_parts.hpp, run it first on the device's stream: on the side stream, every pass of three or
     // four rows took 7.5 ms more at 20K.)
     // (Past four rows, not on it either: such a pass left every pass after it ~4.3 ms longer, whatever its rows.)
@@ -316,7 +405,7 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
         first>experts || count>experts-first)
         throw std::runtime_error("invalid resident MoE plan");
     auto storage=d.allocations.find(workspace);
-    if (storage==d.allocations.end() || storage->second<(capacity*49302+65536)*4)
+    if (storage==d.allocations.end() || storage->second<moe_workspace_floats(capacity,d.qwen_parts==2 && (count<experts || !shared))*4)
         throw std::runtime_error("invalid resident MoE workspace");
     auto plan=std::make_unique<ResidentMoe>(); plan->experts=experts; plan->capacity=capacity;
     plan->part=count<experts || !shared; plan->shared=shared;
@@ -336,6 +425,16 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
         }
         matrices[i]={static_cast<const uint8_t*>(pointers[i]),row_bytes,rows[i],cols[i],0,0,0,kinds[i]};
     }
+    // The allocation may still be empty: the verified load fills it after placement.
+    // Existing direct callers retain native banks unless they explicitly finalize.
+    for (size_t role=0;role<2;++role) {
+        const auto layout=d.expert_layouts.find(matrices[role].data);
+        if (layout!=d.expert_layouts.end() && (layout->second.layout || layout->second.packing))
+            throw std::runtime_error("cannot create a native expert plan from an already converted bank");
+        plan->routed_banks[role]=matrices[role];
+    }
+    plan->routed_count=count;
+    plan->pack_routed=kinds[0]==kinds[1];
     for (size_t expert=0;expert<experts;++expert)
         for (size_t role=0;role<3;++role) {
             Matrix matrix=matrices[role];
@@ -357,6 +456,65 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
     d.allocations.emplace(table,bytes); d.used+=bytes; plan->table=table;
     void* handle=plan.get(); d.resident.emplace(handle,std::move(plan));
     return handle;
+}
+
+// All deferred writes/fills must have completed before this explicit load boundary.
+void finalize_resident_experts(Device& d) {
+    check(hipStreamSynchronize(d.stream));
+    struct Bank { Matrix matrix; size_t count; bool blocked; };
+    std::unordered_map<const uint8_t*,Bank> banks;
+    for (const auto& item:d.resident) {
+        const ResidentMoe& plan=*item.second;
+        if (plan.hybrid || !plan.routed_count) continue;
+        for (const Matrix& matrix:plan.routed_banks) {
+            const auto scratch=d.allocations.find(plan.workspace);
+            const bool allowed=plan.pack_routed && expert_soa_eligible(matrix.kind,matrix.rows,matrix.cols) &&
+                scratch!=d.allocations.end() && scratch->second>=matrix.rows*matrix.row_bytes;
+            const auto inserted=banks.emplace(matrix.data,Bank{matrix,plan.routed_count,!allowed});
+            Bank& bank=inserted.first->second;
+            bank.blocked|=!allowed || bank.matrix.kind!=matrix.kind || bank.matrix.rows!=matrix.rows ||
+                bank.matrix.cols!=matrix.cols || bank.matrix.row_bytes!=matrix.row_bytes || bank.count!=plan.routed_count;
+        }
+    }
+    // Down and shared weights keep their native readers, even if a direct caller
+    // reused an allocation as both a routed bank and one of these matrices.
+    for (const auto& item:d.resident) {
+        const ResidentMoe& plan=*item.second;
+        for (size_t index=0;index<plan.weights.size();++index) {
+            if (index<plan.experts*3 && index%3!=2) continue;
+            const auto bank=banks.find(plan.weights[index].data);
+            if (bank!=banks.end()) bank->second.blocked=true;
+        }
+    }
+    // An incompatible or native-only alias prevents conversion, independent of plan order.
+    for (const auto& item:banks) if (item.second.blocked) {
+        const Bank& bank=item.second;
+        const auto old=d.expert_layouts.find(item.first);
+        if (old!=d.expert_layouts.end() && (old->second.layout || old->second.packing))
+            throw std::runtime_error("an already converted expert bank has a native-only alias");
+        d.expert_layouts.emplace(item.first,ExpertBankLayout{bank.matrix.kind,bank.matrix.rows,bank.matrix.cols,bank.count,0});
+    }
+    for (auto& item:d.resident) {
+        ResidentMoe& plan=*item.second;
+        if (plan.hybrid || !plan.routed_count) continue;
+        for (size_t role=0;role<2;++role) {
+            Matrix bank=plan.routed_banks[role];
+            resident_pack_bank(d,bank,plan.routed_count,plan.workspace,plan.pack_routed);
+            for (size_t expert=0;expert<plan.experts;++expert) {
+                Matrix& matrix=plan.weights[expert*3+role];
+                matrix.layout=matrix.data ? bank.layout : 0;
+            }
+        }
+        // The shared group can hold a half expert in table and remain absent in
+        // batch_table. Update routed groups alone, preserving both shared meanings.
+        std::vector<MoeGroup> groups(plan.experts);
+        for (size_t expert=0;expert<plan.experts;++expert)
+            groups[expert]={{plan.weights[expert*3],plan.weights[expert*3+1],plan.weights[expert*3+2]},0,0,0};
+        const size_t bytes=groups.size()*sizeof(MoeGroup);
+        upload(d,plan.table,groups.data(),bytes);
+        if (plan.batch_table) upload(d,plan.batch_table,groups.data(),bytes);
+    }
+    check(hipStreamSynchronize(d.stream));
 }
 
 // Prefill experts on RDNA4: device grouping, one host read of the expert counts,
@@ -474,6 +632,51 @@ inline float* prompt_host(Device& d,size_t floats) {
     d.prompt_host_floats=floats;
     return d.prompt_host;
 }
+#if !defined(__HIPCC__)
+// moe_device_tiles' lists for the CUDA kernels, the shared expert's group `skip` left out of the tiles (its own list: its format is not the routed
+// experts'), the groups' first rows made all the same. The tiles of the groups that have weights now, which are the layer's resident experts: those
+// beyond the slots have none until a copy is pointed at.
+constexpr unsigned moe_tile_threads_cuda=256;
+__global__ void __launch_bounds__(moe_tile_threads_cuda) moe_device_tiles_cuda(const MoeGroup* groups,size_t groups_count,const unsigned* counts,
+                                                                              uint32_t* firsts,MoeTile* tiles,unsigned* count,size_t skip) {
+    __shared__ unsigned rows[moe_tile_threads_cuda],blocks[moe_tile_threads_cuda];
+    const unsigned t=threadIdx.x,per=unsigned((groups_count+moe_tile_threads_cuda-1)/moe_tile_threads_cuda);
+    const size_t begin=std::min(groups_count,size_t(t)*per),end=std::min(groups_count,begin+per);
+    unsigned own_rows=0,own_blocks=0;
+    for (size_t group=begin;group<end;++group) {
+        own_rows+=counts[group];
+        if (group!=skip && groups[group].weights[0].data) own_blocks+=(counts[group]+moe_block_m-1)/moe_block_m;
+    }
+    rows[t]=own_rows; blocks[t]=own_blocks;
+    __syncthreads();
+    for (unsigned offset=1;offset<moe_tile_threads_cuda;offset*=2) {
+        const unsigned r=t>=offset ? rows[t-offset] : 0,b=t>=offset ? blocks[t-offset] : 0;
+        __syncthreads();
+        rows[t]+=r; blocks[t]+=b;
+        __syncthreads();
+    }
+    unsigned first=rows[t]-own_rows,tile=blocks[t]-own_blocks;
+    for (size_t group=begin;group<end;++group) {
+        firsts[group]=first; first+=counts[group];
+        if (group==skip || !groups[group].weights[0].data) continue;
+        for (unsigned row=0;row<counts[group];row+=moe_block_m) tiles[tile++]=MoeTile{uint32_t(group),row};
+    }
+    if (t==moe_tile_threads_cuda-1) *count=blocks[t];
+}
+// The shared expert's tiles: its rows are all of the batch's, in blocks of moe_block_m.
+__global__ void moe_shared_tiles(MoeTile* tiles,size_t group,size_t steps) {
+    const size_t tile=size_t(blockIdx.x)*256+threadIdx.x;
+    if (tile*moe_block_m<steps) tiles[tile]=MoeTile{uint32_t(group),uint32_t(tile*moe_block_m)};
+}
+// `download` on a stream of its own: the host waits for the copy, not for what the device's stream has queued since (the stream must have been made
+// to wait for the event the bytes follow).
+inline void download_side(Device& d,hipStream_t stream,void* host,const void* device,size_t bytes) {
+    uint8_t* slot=io_slot(d,bytes);
+    check(hipMemcpyAsync(slot,device,bytes,hipMemcpyDeviceToHost,stream));
+    check(hipStreamSynchronize(stream));
+    std::memcpy(host,slot,bytes);
+}
+#endif
 void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t experts,size_t steps,const int32_t* selected,
                             int32_t* positions,unsigned* cursors,const float* input,float* scratch,float* outputs) {
     const size_t routes=steps*11, groups_count=experts+1;
@@ -486,6 +689,96 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     resident_clear<<<unsigned((experts+256)/256),256,0,d.stream>>>(groups,cursors,groups_count);
     resident_histogram<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,selected,steps,experts);
     moe_counts<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,counts);
+#if !defined(__HIPCC__)
+    // A hybrid layer's resident experts (and its shared expert) are queued before the host knows the counts: the device builds their tile list, and the
+    // host reads the counts, plans the experts beyond the slots and builds their tiles while the GEMMs run, where it waited for the counts with the
+    // stream idle after them, then planned and uploaded (a 1.2 ms gap a layer on the first device of two RTX 4090s).
+    const bool eager=d.moe_eager && plan.hybrid && !plan.part && !plan.batch_table && plan.weights[experts*3].data && steps>1;
+    if (eager) {
+        if (!d.counts_event) check(hipEventCreateWithFlags(&d.counts_event,hipEventDisableTiming));
+        check(hipEventRecord(d.counts_event,d.stream));
+    }
+    // (CUDA, a wide batch: the layer's experts beyond the slots that its last batch used most start over the bus now, beside the layer's
+    // own work that is still queued ahead of this)
+    const bool prestaging=prestage_wanted(d,plan,steps);
+    PrestageUse prestage(d,plan,prestaging);   // (undone on every way out: an error leaves no table entry at the region, nor the layer as the prestaged one)
+    if (prestaging) prestage_issue(d,plan);
+#endif
+    phase(d,"moe_group");
+#if !defined(__HIPCC__)
+    // FP16 product uses routes*1280 bytes, then the converted token inputs use steps*5120. Both fit before outputs (routes*7680 bytes from scratch).
+    auto* product=reinterpret_cast<__half*>(scratch);
+    auto* half_input=product+routes*640;
+    // (the tile lists: the device's from 0, the shared expert's first and the routed experts' after it, the host's from host_base)
+    const size_t routed_most=(steps*10+moe_block_m-1)/moe_block_m+experts;
+    const size_t shared_tiles=eager ? (steps+moe_block_m-1)/moe_block_m : 0;
+    const size_t host_base=eager ? (shared_tiles+routed_most+63)/64*64 : 0;
+    auto* built_count=reinterpret_cast<unsigned*>(tiles+host_base+routed_most);   // (the host's list, as long as the routed one at most, then the count)
+    if (eager && (host_base+routed_most+2)*sizeof(MoeTile)+steps*10*4+(((experts+2)&~size_t(1))+2*groups_count+2)*4>65536*4)
+        throw std::runtime_error("resident MoE grouping scratch overflow");
+    const char* phase_gate="res_gate_up",*phase_down="res_down";
+    // Banks have one format per role. Separate the final shared-expert
+    // tiles so its format cannot inflate the routed Q2 kernel's registers.
+    // Whether the resident launch can have a group in the native layout, the gate/up kernel that stages those in shared memory then paying for what
+    // it holds (88 registers and 34 KB a block, where the kernel without the staging has 77 and 18 KB): a routed group in a slot or a bank that has
+    // data and a gate or up that the SoA packing did not take (hybrid_slots.hpp set_expert, finalize_resident_experts: the plan's mirror of the
+    // device table, as the launch will read it). The streamed and prestaged experts are always native (their bytes are the banks' or the staging
+    // region's, outside the slots), and so is the shared expert.
+    bool resident_native=false;
+    for (size_t e=0;e<experts && !resident_native;++e)
+        for (size_t role=0;role<2;++role)
+            if (plan.weights[e*3+role].data && !plan.weights[e*3+role].layout) resident_native=true;
+    auto cuda_launch=[&](const MoeTile* list,size_t start,size_t finish,size_t group,bool native,const unsigned* built=nullptr) {
+        if (finish<=start) return;
+        const dim3 gate_grid(10,unsigned(finish-start),moe_block_m/moe_cuda_m);
+        const dim3 down_grid(20,unsigned(finish-start),moe_block_m/moe_cuda_m);
+        // Each format with a compiled decode has its own kernel (moe_cuda_mode): a switch on the kind for every
+        // sixteen weights made the generic kernel's prefill about ten times the RDNA4 kernels' a routed row.
+        const int gate_kind=plan.weights[group*3].kind, up_kind=plan.weights[group*3+1].kind;
+        const int gate_mode=gate_kind==up_kind ? moe_cuda_gate_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
+        const int gate_only=moe_cuda_gate_mode(gate_kind), up_only=moe_cuda_gate_mode(up_kind);
+        const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
+        // (the staging kernel only for the formats that have it, and only where a group can be native: any other launch is the one kernel)
+        #define SD_CUDA_STAGED(mode) (mode==18 || mode==21 || mode==22)
+        #define SD_CUDA_GATE(mode) case mode: \
+            if (native && SD_CUDA_STAGED(mode)) moe_gate_up_mma<mode,mode,true,SD_CUDA_STAGED(mode)><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,list+start,positions,steps,half_input,product,built); \
+            else moe_gate_up_mma<mode,mode,true,false><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
+                groups,list+start,positions,steps,half_input,product,built); break;
+        #define SD_CUDA_DOWN(mode) case mode: moe_down_mma<mode><<<mode==42 ? down_grid : down_generic,256,0,d.stream>>>( \
+            groups,list+start,positions,product,outputs,built); break;
+        // (a shared expert's gate and up of two formats, each one with a compiled decode: the pair's kernel; any other pair the generic)
+        bool paired=false;
+        #define SD_CUDA_PAIR(g,u) if (!paired && gate_only==g && up_only==u) { paired=true; \
+            moe_gate_up_mma<g,u,true><<<gate_generic,256,0,d.stream>>>(groups,list+start,positions,steps,half_input,product,built); }
+        #define SD_CUDA_PAIRS(g) SD_CUDA_PAIR(g,12) SD_CUDA_PAIR(g,13) SD_CUDA_PAIR(g,14) SD_CUDA_PAIR(g,23)
+        if (gate_kind!=up_kind && gate_only && up_only) { SD_CUDA_PAIRS(12) SD_CUDA_PAIRS(13) SD_CUDA_PAIRS(14) SD_CUDA_PAIRS(23) }
+        #undef SD_CUDA_PAIRS
+        #undef SD_CUDA_PAIR
+        #define SD_CUDA_MODES(X) X(0) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
+        #define SD_CUDA_GATE_MODES(X) SD_CUDA_MODES(X) X(12) X(13) X(14)
+        if (!paired) switch (gate_mode) { SD_CUDA_GATE_MODES(SD_CUDA_GATE) }
+        phase(d,group==0 ? phase_gate : "shared_gate_up");
+        switch (down_mode) { SD_CUDA_MODES(SD_CUDA_DOWN) }
+        phase(d,group==0 ? phase_down : "shared_down");
+        #undef SD_CUDA_GATE_MODES
+        #undef SD_CUDA_MODES
+        #undef SD_CUDA_DOWN
+        #undef SD_CUDA_GATE
+        #undef SD_CUDA_STAGED
+        check(hipGetLastError());
+    };
+    if (eager) {
+        // The layer's resident experts and its shared expert: their lists, the groups' first rows and places, the FP16 rows, and the GEMMs, queued.
+        moe_device_tiles_cuda<<<1,moe_tile_threads_cuda,0,d.stream>>>(groups,groups_count,counts,firsts,tiles+shared_tiles,built_count,experts);
+        moe_shared_tiles<<<unsigned((shared_tiles+255)/256),256,0,d.stream>>>(tiles,experts,steps);
+        moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
+        resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
+        moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
+        cuda_launch(tiles+shared_tiles,0,routed_most,0,resident_native,built_count);
+        cuda_launch(tiles,0,shared_tiles,experts,true);
+    }
+#endif
 #if defined(__HIPCC__)
     if (!plan.hybrid) {
         // All on the device: the host queues the experts (and then the peer's half, the next
@@ -500,19 +793,31 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         auto* product=reinterpret_cast<_Float16*>(scratch);
         auto* half_input=product+routes*640;
         moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
-        moe_expert_launch<2560,640,10>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,resident_shape,half_input,
+        moe_expert_launch<2560,640,10,true>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,resident_shape,half_input,
                           product,outputs,tile_count,unsigned(max_tiles),shared);
         check(hipGetLastError());
         return;
     }
 #endif
+    // (the host's reads of the device: eagerly queued layers read on a stream of their own that waits for the counts alone)
+#if defined(__HIPCC__)
+    auto read_back=[&](void* host,const void* device,size_t bytes) { download(d,host,device,bytes); };
+#else
+    if (eager) {
+        if (!d.rows_stream) check(hipStreamCreate(&d.rows_stream));
+        check(hipStreamWaitEvent(d.rows_stream,d.counts_event,0));
+    }
+    auto read_back=[&](void* host,const void* device,size_t bytes) {
+        if (eager) download_side(d,d.rows_stream,host,device,bytes); else download(d,host,device,bytes);
+    };
+#endif
     std::vector<unsigned> host_counts(groups_count);
-    download(d,host_counts.data(),counts,groups_count*4);
+    read_back(host_counts.data(),counts,groups_count*4);
     const size_t tail=plan.hybrid ? std::min(steps,hybrid_prompt_tail) : 0;
     std::vector<int32_t> host_tail(tail*10);
-    if (tail) download(d,host_tail.data(),selected+(steps-tail)*10,tail*10*4);
+    if (tail) read_back(host_tail.data(),selected+(steps-tail)*10,tail*10*4);
     std::vector<uint32_t> host_firsts(groups_count);
-    std::vector<size_t> missing;
+    std::vector<size_t> missing, prestaged;
     std::vector<bool> absent(groups_count,false);
     if (plan.part)
         for (size_t group=0;group<groups_count;++group) absent[group]=plan.weights[group*3].data==nullptr;
@@ -522,6 +827,15 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
         for (size_t expert=0;expert<experts;++expert)
             if (!plan.layer_prefill && host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
+#if !defined(__HIPCC__)
+        // Those prestaged (and still beyond the slots) are computed beside the resident ones: they leave the experts to stream.
+        if (prestaging && d.prestage.plan==&plan) {
+            std::vector<size_t> rest;
+            for (size_t expert : missing) (d.prestage.position[expert]>=0 ? prestaged : rest).push_back(expert);
+            missing.swap(rest);
+        }
+        if (prestaging) plan.last_counts.assign(host_counts.begin(),host_counts.begin()+plan.experts);
+#endif
         on_cpu=prompt_cpu_share(d,plan,host_counts.data(),missing);
     }
     // The CPU's routes, expert by expert (before the GPU's work is queued: a download waits for it), and the rows of their tokens
@@ -532,7 +846,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     float* cpu_results=nullptr;
     if (!on_cpu.empty()) {
         std::vector<int32_t> chosen(steps*10);
-        download(d,chosen.data(),selected,steps*10*4);
+        read_back(chosen.data(),selected,steps*10*4);
         std::vector<std::vector<int32_t>> by_expert(experts);
         std::vector<bool> taken(experts,false);
         for (size_t expert : on_cpu) taken[expert]=true;
@@ -547,8 +861,16 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         if (cpu_rows) {
             cpu_results=cpu_rows+steps*2560;
             std::memcpy(cpu_results+n*2560,cpu_routes.data(),n*4);
+#if defined(__HIPCC__)
             check(hipMemcpyAsync(cpu_rows,input,steps*2560*4,hipMemcpyDeviceToHost,d.stream));
             check(hipEventRecord(d.prompt_rows,d.stream));
+#else
+            // (the rows are final: the counts' download above waited for the work that made them. Their copy on a stream of its own leaves the
+            // GEMMs, which are queued on the device's stream next, to start at once: a wide batch's rows are 42 MB, 2 ms of the bus)
+            if (!d.rows_stream) check(hipStreamCreate(&d.rows_stream));
+            check(hipMemcpyAsync(cpu_rows,input,steps*2560*4,hipMemcpyDeviceToHost,d.rows_stream));
+            check(hipEventRecord(d.prompt_rows,d.rows_stream));
+#endif
         } else {
             // (no host memory for the rows: the CPU's experts are streamed with the rest)
             missing.insert(missing.end(),on_cpu.begin(),on_cpu.end());
@@ -565,64 +887,76 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     auto add=[&](size_t group) {
         for (size_t row=0;row<host_counts[group];row+=moe_block_m) host_tiles.push_back({uint32_t(group),uint32_t(row)});
     };
+#if !defined(__HIPCC__)
+    if (!eager)   // (an eagerly queued layer's resident experts have their tiles from the device)
+#endif
     for (size_t group=0;group<groups_count;++group) if (!absent[group]) add(group);
     const size_t resident_tiles=host_tiles.size();
-    std::vector<size_t> offsets{resident_tiles};
+    for (size_t expert : prestaged) add(expert);
+    const size_t prestaged_end=host_tiles.size();
+    std::vector<size_t> offsets{prestaged_end};
     for (size_t expert : missing) { add(expert); offsets.push_back(host_tiles.size()); }
     if (host_tiles.size()>max_tiles) throw std::runtime_error("inconsistent Straydog expert grouping");
+#if defined(__HIPCC__)
     upload(d,firsts,host_firsts.data(),groups_count*4);
     if (!host_tiles.empty()) upload(d,tiles,host_tiles.data(),host_tiles.size()*sizeof(MoeTile));
     moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
     resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
-#if defined(__HIPCC__)
     auto* product=reinterpret_cast<_Float16*>(scratch);
-#else
-    auto* product=reinterpret_cast<__half*>(scratch);
-#endif
     // FP16 product uses routes*1280 bytes, then the converted token inputs use
     // steps*5120. Both fit before outputs (routes*7680 bytes from scratch).
     auto* half_input=product+routes*640;
     moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
+#else
+    if (host_tiles.size()>(eager ? routed_most : max_tiles)) throw std::runtime_error("inconsistent Straydog expert grouping");
+    if (!host_tiles.empty()) upload(d,tiles+host_base,host_tiles.data(),host_tiles.size()*sizeof(MoeTile));
+    if (!eager) {
+        upload(d,firsts,host_firsts.data(),groups_count*4);
+        moe_set_groups<<<unsigned((groups_count+255)/256),256,0,d.stream>>>(groups,groups_count,firsts);
+        resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,cursors,selected,steps,experts,positions);
+        moe_input_half<<<unsigned((steps*2560+1023)/1024),256,0,d.stream>>>(steps*2560,input,half_input);
+    }
+#endif
+    phase(d,"moe_hostgap");
+    if (d.phase_on) { d.phase_prestage_used+=prestaged.size(); d.phase_streamed+=missing.size(); d.phase_missing_layers+=missing.empty() ? 0 : 1;
+                      d.phase_cpu_routes+=cpu_routes.size(); d.phase_bus_bytes+=(missing.size()+prestaged.size()*0)*expert_slot_bytes(plan);
+                      for (size_t group=0;group<experts;++group) if (!absent[group]) d.phase_routes[0]+=host_counts[group];
+                      for (size_t expert : prestaged) d.phase_routes[1]+=host_counts[expert];
+                      for (size_t expert : missing) d.phase_routes[2]+=host_counts[expert];
+                      d.phase_routes[3]+=cpu_routes.size(); }
+#if defined(__HIPCC__)
+    const char* phase_gate="res_gate_up",*phase_down="res_down";
+#endif
     auto launch=[&](size_t begin,size_t end) {
         if (end<=begin) return;
 #if defined(__HIPCC__)
         // The resident list ends with the shared expert's tiles.
         const unsigned shared=begin==0 && end==resident_tiles && !absent[experts] ?
             unsigned((host_counts[experts]+moe_block_m-1)/moe_block_m) : 0;
-        moe_expert_launch<2560,640,10>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles+begin,positions,steps,resident_shape,half_input,
+        moe_expert_launch<2560,640,10,true>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles+begin,positions,steps,resident_shape,half_input,
                           product,outputs,nullptr,unsigned(end-begin),shared);
 #else
-        // Banks have one format per role. Separate the final shared-expert
-        // tiles so its format cannot inflate the routed Q2 kernel's registers.
-        auto cuda_launch=[&](size_t start,size_t finish,size_t group) {
-            if (finish<=start) return;
-            const dim3 gate_grid(10,unsigned(finish-start),moe_block_m/moe_cuda_m);
-            const dim3 down_grid(20,unsigned(finish-start),moe_block_m/moe_cuda_m);
-            // Each format with a compiled decode has its own kernel (moe_cuda_mode): a switch on the kind for every
-            // sixteen weights made the generic kernel's prefill about ten times the RDNA4 kernels' a routed row.
-            const int gate_kind=plan.weights[group*3].kind, up_kind=plan.weights[group*3+1].kind;
-            const int gate_mode=gate_kind==up_kind ? moe_cuda_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
-            const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
-            #define SD_CUDA_GATE(mode) case mode: moe_gate_up_mma<mode><<<mode==42 ? gate_grid : gate_generic,256,0,d.stream>>>( \
-                groups,tiles+start,positions,steps,half_input,product); break;
-            #define SD_CUDA_DOWN(mode) case mode: moe_down_mma<mode><<<mode==42 ? down_grid : down_generic,256,0,d.stream>>>( \
-                groups,tiles+start,positions,product,outputs); break;
-            #define SD_CUDA_MODES(X) X(0) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(29) X(42)
-            switch (gate_mode) { SD_CUDA_MODES(SD_CUDA_GATE) }
-            switch (down_mode) { SD_CUDA_MODES(SD_CUDA_DOWN) }
-            #undef SD_CUDA_MODES
-            #undef SD_CUDA_DOWN
-            #undef SD_CUDA_GATE
-        };
         if (begin==0 && end==resident_tiles) {
             const size_t shared_begin=end-(host_counts[experts]+moe_block_m-1)/moe_block_m;
-            cuda_launch(begin,shared_begin,0);
-            cuda_launch(shared_begin,end,experts);
-        } else cuda_launch(begin,end,0);
+            cuda_launch(tiles+host_base,begin,shared_begin,0,resident_native);
+            cuda_launch(tiles+host_base,shared_begin,end,experts,true);
+        } else cuda_launch(tiles+host_base,begin,end,0,true);
 #endif
         check(hipGetLastError());
     };
     launch(0,resident_tiles);
+    phase(d,"moe_resident");
+#if !defined(__HIPCC__)
+    if (!prestaged.empty()) {
+        // (the copies are asked for ahead on the copy stream: the GEMMs of the experts they hold wait for them, and for nothing else)
+        check(hipStreamWaitEvent(d.stream,d.prestage.event,0));
+        phase(d,"pre_wait");
+        prestage.point(prestaged);
+        phase_gate="pre_gate_up"; phase_down="pre_down";
+        launch(resident_tiles,prestaged_end);
+        phase(d,"moe_prestaged");
+    }
+#endif
     // Meanwhile the CPU computes its routes (one row a route, weight 1: the combine weighs them) and they go to their output rows
     // through the gate/up scratch, after the GPU's GEMMs (stream order).
     uint64_t cpu_ns=0,compute_ns=0;
@@ -665,9 +999,14 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             prompt_cpu_scatter<<<unsigned(part),256,0,d.stream>>>(scratch,staged_routes,outputs);
             check(hipGetLastError());
         }
+        phase(d,"moe_cpu_scatter");
     };
+    phase_gate="str_gate_up"; phase_down="str_down";
     const uint64_t stream_ns=hybrid_stream_missing(d,plan,missing,[&](size_t begin,size_t count) { launch(offsets[begin],offsets[begin+count]); },
                                                    meanwhile);
+#if !defined(__HIPCC__)
+    prestage.end();
+#endif
     if (missing.size()>=16) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
     if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
     // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last); a gathered
@@ -680,6 +1019,16 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // Host vectors reach the device through the staging arena, so resident experts need no wait
     // here and the caller can queue the next work (the peer's half, the next layer) at once.
     if (plan.hybrid) check(hipStreamSynchronize(d.stream));
+#if !defined(__HIPCC__)
+    if (eager) {
+        // (the stream is idle: the device's tile list is read back and must be the one the plan implies, the resident groups' tiles)
+        unsigned built=0;
+        download(d,&built,built_count,4);
+        size_t expected=0;
+        for (size_t group=0;group<experts;++group) if (!absent[group]) expected+=(host_counts[group]+moe_block_m-1)/moe_block_m;
+        if (built!=expected) throw std::runtime_error("inconsistent Straydog expert grouping: the device's tiles are not the resident experts'");
+    }
+#endif
 }
 
 // moe_combine for per-token blocks of 11 expert outputs (10 routed, then shared).
@@ -723,7 +1072,8 @@ void moe_tokens_experts(Device& d,const TokenMoe& moe,size_t tokens,const float*
     // Layers in parts (qwen_parts.hpp): the shared expert's half, gate and up, runs in the router's launch (the same row read;
     // one launch a layer less), the scores after the decode workspace with the gate and up rows' stride.
     const size_t room=tokens<=4 ? 4 : size_t(gemv_wide_vectors), scores=room*11*4480+512;
-    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && plan.capacity*49302+65536>=scores+room*11*1280;
+    const auto scratch=d.allocations.find(plan.workspace);
+    const bool together=d.qwen_parts==2 && plan.shared && plan.half[0].data && scratch!=d.allocations.end() && scratch->second/4>=scores+room*11*1280;
     if (together) {
         Matrix list[4]={projections[0],projections[1],plan.weights[experts*3],plan.weights[experts*3+1]};
         list[0].output_offset=scores; list[1].output_offset=scores+experts;
@@ -909,8 +1259,10 @@ StepMoe step_moe(Device& d,void* handle,size_t steps) {
     const size_t experts=plan.experts,routes=steps*11;
     StepMoe moe{};
     moe.plan=&plan; moe.groups=static_cast<MoeGroup*>(plan.batch_table ? plan.batch_table : plan.table);
-    moe.gate_up=plan.workspace; float* product=moe.gate_up+routes*1280;
-    moe.outputs=product+routes*640; moe.probabilities=moe.outputs+routes*2560;
+    // (a layer in parts' prompt batch: the grouped FP16 path's halves in a gate and up scratch of 4800 floats a row, and no F32 product rows)
+    const bool compact=plan.part && d.qwen_parts==2 && steps>1;
+    moe.gate_up=plan.workspace; float* product=moe.gate_up+(compact ? steps*moe_compact_gate_up_row : routes*1280);
+    moe.outputs=compact ? product : product+routes*640; moe.probabilities=moe.outputs+routes*2560;
     moe.positions=reinterpret_cast<int32_t*>(moe.probabilities+steps*11);
     moe.selected=moe.positions+routes;
     moe.cursors=reinterpret_cast<unsigned*>(moe.selected+steps*10);
@@ -938,6 +1290,7 @@ void moe_steps_route(Device& d,const StepMoe& moe,size_t steps,const float* sour
         resident_mix<<<unsigned(steps),256,0,d.stream>>>(mix,source,d.output+steps*experts);
     }
     resident_route<<<unsigned(steps),256,0,d.stream>>>(d.output,d.output+steps*experts,experts,moe.selected,moe.probabilities);
+    phase(d,"moe_router");
 }
 // Every routed row whose expert this device holds, from moe.selected. Only the plan's own
 // workspace and table: a helper stream can run it beside the device's other work.
@@ -958,10 +1311,10 @@ void moe_steps_compute(Device& d,const StepMoe& moe,size_t steps,const float* so
         resident_prefix<<<1,1,0,d.stream>>>(groups,experts+1,d.half_gemm,d.gemm_min_batch,tiles,max_tiles,d.rdna4,total);
         resident_scatter<<<unsigned((routes+255)/256),256,0,d.stream>>>(groups,moe.cursors,moe.selected,steps,experts,moe.positions);
         if (d.rdna4 && d.half_gemm) {
-            grouped_moe_wmma<16><<<dim3(10,unsigned(max_tiles),2),128,0,d.stream>>>(groups,tiles,moe.positions,steps,false,source,gate_up,total,2);
-            grouped_moe_wmma<32><<<dim3(10,unsigned(max_tiles),2),256,0,d.stream>>>(groups,tiles,moe.positions,steps,false,source,gate_up,total);
+            grouped_moe_wmma<16,true><<<dim3(10,unsigned(max_tiles),2),128,0,d.stream>>>(groups,tiles,moe.positions,steps,false,source,gate_up,total,2);
+            grouped_moe_wmma<32,true><<<dim3(10,unsigned(max_tiles),2),256,0,d.stream>>>(groups,tiles,moe.positions,steps,false,source,gate_up,total);
         }
-        grouped_moe<<<dim3(10,unsigned(max_tiles),2),256,0,d.stream>>>(groups,tiles+max_tiles,moe.positions,steps,false,source,gate_up,total+1);
+        grouped_moe<true><<<dim3(10,unsigned(max_tiles),2),256,0,d.stream>>>(groups,tiles+max_tiles,moe.positions,steps,false,source,gate_up,total+1);
         moe_product<<<unsigned((routes*640+255)/256),256,0,d.stream>>>(gate_up,routes,product);
         if (d.rdna4 && d.half_gemm) {
             grouped_moe_wmma<16><<<dim3(40,unsigned(max_tiles),1),128,0,d.stream>>>(groups,tiles,moe.positions,steps,true,product,outputs,total,2);

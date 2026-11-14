@@ -7,8 +7,8 @@
 //! has memory enough: a refusal is made by the test hook of the GPU library (`refuse_host_allocations`), which answers the next host allocations of a
 //! request as a machine short of memory does.
 //!
-//! The context is 65536, so that the K/V (3 GiB) is in host memory at this budget and starts at 32768 positions, and the growth the test asks for is
-//! the one to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses.
+//! The context is 131072, so that even Q8 K/V is in host memory at this budget and starts at 32768 positions. The growth the test asks for is
+//! to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
@@ -30,9 +30,13 @@ static GPUS: Mutex<()> = Mutex::new(());
 const LOCKED: [usize; 4] = [44, 45, 46, 47];
 /// The decode passes a run compares.
 const PASSES: usize = 12;
-/// As in `behind_gpu.rs`: the least relative difference of logits that two runs of one configuration are allowed (which experts the slots hold
-/// at a moment depends on timing, and where a route goes moves a pass's logits by that much).
-const NOISE_FLOOR: f64 = 0.15;
+/// The least relative difference of logits that two runs of one configuration are allowed (which experts the slots hold at a moment depends
+/// on timing, and where a route goes moves a pass's logits by that much). Two runs of one start differed by 0, by 0.05 to 0.08 or by 0.12
+/// to 0.16 on an R9700 (eighteen differences measured, the largest 0.163; of ten of the runs, six had the logits of some earlier run bit
+/// for bit and four for the first eight rows: a route in a slot a pass sooner or later). One pair is measured for the tolerance and can be
+/// a pair that agreed, and the floor is then all there is: 0.15 failed a run whose next request differed by 0.160 from a reference that
+/// had differed by 0 from its twin. A bank read wrongly moves the logits past 1 and parts the tokens at once (`behind_gpu.rs`).
+const NOISE_FLOOR: f64 = 0.30;
 /// The positions the growth is asked for: past the first capacity, within the context.
 const GROWN: usize = 40000;
 
@@ -45,7 +49,7 @@ fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
     let weights = Weights::open(&PathBuf::from(root), bundle, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     let prompt = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap()
         .encode("The history of the printing press begins in the fifteenth century, when").unwrap();
-    let settings = Settings { context: 65536, state_budget_bytes: 6 << 30, prefill_batch_size: 256, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
+    let settings = Settings { context: 131072, state_budget_bytes: 6 << 30, prefill_batch_size: 256, speculative: 0, cpu_threads: 0, row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial && model.host_kv, "partial {} host K/V {}: the K/V must be on the host at this budget", model.partial, model.host_kv);
     model.prompt_share(false).unwrap();
@@ -154,6 +158,17 @@ fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_ne
     let (mut never, prompt) = open(&root);
     let reference = decode(&mut never, &prompt);
     drop(never);
+    // (the same start once more, for what two runs of one configuration differ by: the comparisons below are held to the tolerance the test
+    // above uses. The flat floor of 0.15 was at what two such runs differ by here: 0.12, 0.16, 0.12, 0.06 and 0.15 on an R9700, where the
+    // slots' swaps are packed after their copies and land a pass later than they did (0, 0, 0.06, 0.05 and 0 before that). Six of those
+    // ten runs had the logits of a run of the build before bit for bit, the other four its first eight rows: the same sums, with a route
+    // in a slot a pass sooner or later.)
+    let (mut again, _) = open(&root);
+    let (compared, noise) = compare(&decode(&mut again, &prompt), &reference);
+    drop(again);
+    let tolerance = (4.0 * noise).max(NOISE_FLOOR);
+    eprintln!("never locked, twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
+    assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
 
     let (mut model, prompt) = open(&root);
     model.lock_layers_for_test(&LOCKED).unwrap();
@@ -173,13 +188,13 @@ fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_ne
     assert_eq!(assist_level(&model), None, "no layer is locked: nothing is assisted or tuned");
     let (compared, worst) = compare(&run, &reference);
     eprintln!("the next request, against a model that never locked: {compared} passes compared, the worst relative difference {worst:.2e}");
-    assert!(compared >= 6 && worst < NOISE_FLOOR, "{compared} passes, {worst}");
+    assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
     // and a growth that is not refused
     model.ensure_kv_for_test(GROWN).unwrap();
     assert!(model.kv_positions() >= GROWN, "the K/V grew to {}", model.kv_positions());
     let run = decode(&mut model, &prompt);
     let (compared, worst) = compare(&run, &reference);
-    assert!(compared >= 6 && worst < NOISE_FLOOR, "{compared} passes, {worst}");
+    assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
 }
 
 /// A give-back ends the locking behind "ready": its plan has no layer left, and a layer its thread locked meanwhile is let go when the model is handed it,

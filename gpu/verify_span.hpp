@@ -38,17 +38,47 @@ size_t verify_projection_floats(const DecoderLayer& plan) {
     return plan.parts == 2 ? QwenHeads<2>::projection : QwenHeads<1>::projection;
 }
 void verify_buffers(Device& d, DecoderLayer& plan) {
-    if (plan.snapshot) return;
+    if (plan.snapshot && (!d.pipelined || plan.snapshot_alt)) return;
     // (a partially resident layer's rows are at most hybrid_rows: a low VRAM budget's expert slots keep the rest)
     const size_t rows = d.resident.find(plan.moe)->second->hybrid ? hybrid_rows : verify_max;
     const size_t bytes = (verify_snapshot_floats(plan) + rows * verify_projection_floats(plan)) * 4;
-    if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes)
-        throw std::runtime_error("speculative verification state exceeds the Straydog VRAM budget");
-    float* buffer = nullptr;
-    check(hipMalloc(reinterpret_cast<void**>(&buffer), bytes + allocation_tail));
-    d.allocations.emplace(buffer, bytes); d.used += bytes + allocation_tail;
-    plan.snapshot = buffer; plan.projections = buffer + verify_snapshot_floats(plan);
+    // (a pipelined device holds a second window beside the first: the pass behind one in flight saves its own)
+    for (int copy = plan.snapshot ? 1 : 0; copy < (d.pipelined ? 2 : 1); ++copy) {
+        if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes)
+            throw std::runtime_error("speculative verification state exceeds the Straydog VRAM budget");
+        float* buffer = nullptr;
+        check(hipMalloc(reinterpret_cast<void**>(&buffer), bytes + allocation_tail));
+        d.allocations.emplace(buffer, bytes); d.used += bytes + allocation_tail;
+        (copy ? plan.snapshot_alt : plan.snapshot) = buffer;
+        (copy ? plan.projections_alt : plan.projections) = buffer + verify_snapshot_floats(plan);
+    }
 }
+
+// Pipelined verification (the first device runs the next pass's layers while the second finishes this one's): each pass of a
+// device is in a window, 0 or 1 by turns, that holds its DeltaNet snapshots, projections, verified marks and replay lists. The
+// window in force is the one `plan.snapshot` and the rest name (the pairs swap), so nothing else reads a window.
+void set_window(Device& d, size_t window) {
+    if (window > 1) throw std::runtime_error("invalid verification window");
+    if (window == d.window) return;
+    if (window && !d.pipelined) throw std::runtime_error("a second verification window needs the pipelined setup");
+    for (auto& entry : d.decoder) {
+        DecoderLayer& plan = entry.second;
+        std::swap(plan.snapshot, plan.snapshot_alt); std::swap(plan.projections, plan.projections_alt);
+        std::swap(plan.verified, plan.verified_alt);
+        std::swap(plan.touched_epoch, plan.touched_epoch_alt);
+    }
+    d.gdn_replays.swap(d.gdn_replays_alt);
+    d.window = window;
+}
+// The graphs of a layer capture its window's buffers: another window, another graph.
+#if defined(__HIPCC__)
+constexpr size_t window_variant(const Device&) { return 0; }
+#else
+size_t window_variant(const Device& d) { return d.window << 24; }
+#endif
+// A span the other thread has told to stop (sd_abort_span) unwinds as an exception does: HybridAwait publishes what the graphs
+// launched ahead still wait for and drains the stream.
+struct SpanAborted : std::runtime_error { SpanAborted() : std::runtime_error("Straydog span aborted") {} };
 
 // steps tokens of a DeltaNet layer; a replay reads the states from the snapshot.
 void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, float* post) {
@@ -113,6 +143,9 @@ void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayou
 void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output,
                         const float* source = nullptr) {
     if ((!input && !source) || !steps || steps > verify_max || steps > hybrid_rows) throw std::runtime_error("invalid hybrid verification");
+#if !defined(__HIPCC__)
+    if (end > hybrid_layer_slots) throw std::runtime_error("invalid hybrid verification");   // (a layer a slot of the exchange)
+#endif
     float* workspace = nullptr;
     for (size_t layer = begin; layer < end; ++layer) {
         auto found = d.decoder.find(layer);
@@ -124,6 +157,12 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     }
     if (d.allocations.find(workspace)->second / 4 < verify_extent)
         throw std::runtime_error("speculative verification needs a larger decoder workspace");
+#if !defined(__HIPCC__)
+    if (d.aborted()) throw SpanAborted();
+#endif
+    const uint64_t epoch=d.front_active ? d.front_epoch[d.window] : 0;
+    if (epoch && (d.front_position[d.window]!=position || d.front_rows[d.window]!=steps))
+        throw std::runtime_error("verification front differs from its generation");
     kv_prepare_span(d, begin, end, position, steps);
     const VerifyLayout v = verify_layout(workspace);
     if (input) upload(d, v.hidden, input, steps * 10240 * 4);
@@ -144,37 +183,44 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
 #else
     const bool stage = ahead;
 #endif
-    auto finish_previous = [&]() {
-        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0), stage ? d.cpu_partial : nullptr, d.await_timeout);
+    // The previous layer's CPU result: its exchange is the one of its parity.
+    auto finish_previous = [&](size_t previous) {
+        const size_t slot = hybrid_slot_of(previous);
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0, slot), stage ? d.cpu_partial : nullptr, d.await_timeout, hybrid_need(d),
+                                                      HYBRID_AWAITED(d), d.flags + hybrid_await_device_failed);
 #if !defined(__HIPCC__)
         if (stage && steps > 1)
-            hybrid_stage<<<dim3(1,unsigned(steps - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1), d.cpu_partial + 2560);
+            hybrid_stage<<<dim3(1,unsigned(steps - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1, slot), d.cpu_partial + 2560, hybrid_need(d));
 #endif
-        hybrid_finish<<<dim3(40,unsigned(steps)),256,0,d.stream>>>(v.hidden, v.mixed, 2564, v.branch, stage ? d.cpu_partial : d.exchange_device + hybrid_result_at(0),
+        hybrid_finish<<<dim3(40,unsigned(steps)),256,0,d.stream>>>(v.hidden, v.mixed, 2564, v.branch, stage ? d.cpu_partial : d.exchange_device + hybrid_result_at(0, slot),
                                                                    stage ? 2560 : hybrid_row_floats, hybrid_clock(d));
     };
     auto launch = [&](size_t layer) {
         DecoderLayer& plan = d.decoder.find(layer)->second;
         ResidentMoe& experts = *d.resident.find(plan.moe)->second;
         const bool finish = layer > begin;
+        if (epoch && plan.touched_epoch==epoch) throw std::runtime_error("a verification front overwrote its snapshot");
         auto submit = [&]() {
-            if (finish) finish_previous();
+            if (finish) finish_previous(layer - 1);
             verify_layer_front(d, plan, steps, v);
-            hybrid_route_export(d, experts, v.mixed, steps);
-            hybrid_tick<<<1,1,0,d.stream>>>(d.flags + 1, reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot), hybrid_clock(d), finish);
+            const bool deferred = hybrid_route_export(d, experts, v.mixed, steps, 2564, hybrid_slot_of(layer));
+            hybrid_publish(d, experts, steps, finish, hybrid_slot_of(layer), deferred ? v.mixed : nullptr, 2564);
             hybrid_resident_experts(d, experts, v.mixed, v.branch, steps);
             check(hipGetLastError());
         };
         if (ahead && finish) ++await.launched;
         run_graph(d, ahead ? "hybrid-verify-await" : "hybrid-verify", plan.dependencies.data(), plan.dependencies.size(),
-                  (layer * 2 + finish) * 8 + steps, submit);
+                  (layer * 2 + finish) * 8 + steps + window_variant(d), submit);
         flush_launches(d);
+        // CUDA gdn_tokens saves every state before its token loop and has no abort path.
+        // A successful issue plus the checked drain proves this generation's snapshot was written.
+        if (epoch) plan.touched_epoch=epoch;
     };
     auto launch_after = [&](size_t layer) {
         if (layer + 1 < end) launch(layer + 1);
         else {
             ++await.launched;
-            finish_previous();
+            finish_previous(end - 1);
             check(hipGetLastError());
             flush_launches(d);
         }
@@ -188,12 +234,15 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         const auto waited = std::chrono::steady_clock::now();
         hybrid_wait_export(d, ++d.hybrid_sequence);
         if (ahead) await.check_failed();
+#if !defined(__HIPCC__)
+        if (d.aborted()) throw SpanAborted();
+#endif
         const auto computed = std::chrono::steady_clock::now();
         {
             const float* rows_exported[16]; float* rows_result[16];
             for (size_t row = 0; row < steps; ++row) {
-                rows_exported[row] = d.exchange + hybrid_export_at(row);
-                rows_result[row] = d.exchange + hybrid_result_at(row);
+                rows_exported[row] = d.exchange + hybrid_export_at(row, hybrid_slot_of(layer));
+                rows_result[row] = d.exchange + hybrid_result_at(row, hybrid_slot_of(layer));
             }
             hybrid_host_experts_rows(d, experts, steps, rows_exported, rows_result);
         }
@@ -203,16 +252,18 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
         d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
         if (ahead && !before) launch_after(layer);
     }
-    if (!ahead) finish_previous();
+    if (!ahead) finish_previous(end - 1);
     d.hybrid_layers += end - begin; d.hybrid_timed_layers += end - begin - 1;
     check(hipGetLastError());
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;
     if (output) download(d, output, v.hidden, steps * 10240 * 4);
     else check(hipStreamSynchronize(d.stream));
     if (ahead) await.check_failed();
-    if (begin < 48 && (end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4) {
+    hybrid_check_report(d);
+    if (begin < 48 && (end == 48 || d.decoder.find(end) == d.decoder.end()) && d.hybrid_verify_balanced / 4 != d.hybrid_tokens / 4 &&
+        !d.frozen_slots) {
         d.hybrid_verify_balanced = d.hybrid_tokens;
-        hybrid_rebalance(d, 32, false);
+        if (hybrid_refresh_due(d)) hybrid_rebalance(d, 32, false);
     }
 }
 
@@ -285,7 +336,8 @@ float* verify_span_queue(Device& d, size_t begin, size_t end, size_t position, s
 void verify_span(Device& d, size_t begin, size_t end, size_t position, size_t steps, const float* input, float* output) {
     auto first = d.decoder.find(begin);
     if (begin < end && first != d.decoder.end() && d.resident.find(first->second.moe)->second->hybrid) {
-        hybrid_verify_span(d, begin, end, position, steps, input, output);
+        // (no rows given: they are in the span's workspace, where the layers before it left them)
+        hybrid_verify_span(d, begin, end, position, steps, input, output, input ? nullptr : verify_layout(first->second.workspace).hidden);
         return;
     }
     bool parts = false;
@@ -345,7 +397,7 @@ void verify_reserve(Device& d) {
 
 // Keep the first `kept` verified tokens: DeltaNet layers restore their snapshot and
 // replay those tokens; everything else already holds causal state.
-void verify_commit(Device& d, size_t begin, size_t end, size_t kept) {
+void verify_commit(Device& d, size_t begin, size_t end, size_t kept, bool force = false) {
     if (begin >= end || !kept) throw std::runtime_error("invalid speculative commit");
     size_t steps = 0;
     for (size_t layer = begin; layer < end; ++layer) {
@@ -355,12 +407,56 @@ void verify_commit(Device& d, size_t begin, size_t end, size_t kept) {
         steps = found->second.verified;
     }
     if (kept > steps) throw std::runtime_error("invalid speculative commit");
-    if (kept < steps) {
+    // (`force`: the states went on past the kept rows, with a pass behind this one that is given up, and are put back to them
+    // even where every row was kept)
+    if (kept < steps || force) {
         gdn_replay_span(d, begin, end, kept);
         // (queued, not waited for: the stream orders the replay before every later use of the state, and nothing reads it here)
         check(hipGetLastError());
     }
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = 0;
+}
+
+// Restore only graphs issued in this front. Validate the whole set before copying any state.
+// Aborted CUDA fronts drain all issued graphs, whose DeltaNet snapshots are unconditional
+// (gdn_tokens_head, before the token loop). A new generation never reuses its own snapshot.
+int verify_window_restore(Device& d,size_t begin,size_t end,uint64_t epoch,size_t position,size_t rows,uint64_t* touched) {
+    if (!touched || begin>=end || end>48) throw std::runtime_error("invalid snapshot recovery span");
+    *touched=0;
+    check(d.span_drain_error);
+    check(hipStreamSynchronize(d.stream));
+    if (!d.pipelined || !d.front_active || !epoch || d.front_epoch[d.window]!=epoch || d.front_position[d.window]!=position ||
+        d.front_rows[d.window]!=rows || d.usage_epoch!=epoch) return 1;
+    uint64_t mask=0;
+    for (size_t layer=begin;layer<end;++layer) {
+        auto found=d.decoder.find(layer);
+        if (found==d.decoder.end()) return 1;
+        const DecoderLayer& plan=found->second;
+        const auto resident=d.resident.find(plan.moe);
+        // Only hybrid_verify_span stamps successful issues into this window.
+        if (resident==d.resident.end() || !resident->second->hybrid || plan.parts!=1) return 1;
+        if (plan.touched_epoch!=epoch) continue;
+        if (decoder_linear(layer) && (!plan.snapshot || plan.parts!=1)) return 1;
+        mask|=uint64_t(1)<<layer;
+    }
+    kv_stage_settle(d);
+    for (size_t layer=begin;layer<end;++layer) {
+        DecoderLayer& plan=d.decoder.find(layer)->second;
+        // Span preparation advances these views before individual graphs are issued.
+        // The real K/V and QSA pools remain causal: future slots are rewritten before selection.
+        if (!decoder_linear(layer)) kv_invalidate_write(d,plan.states[0],position);
+        if (!(mask&(uint64_t(1)<<layer))) continue;
+        if (decoder_linear(layer)) {
+            constexpr size_t history=4*10240;
+            check(hipMemcpyAsync(plan.states[0],plan.snapshot,history*sizeof(float),hipMemcpyDeviceToDevice,d.stream));
+            check(hipMemcpyAsync(plan.states[1],plan.snapshot+history,(verify_snapshot-history)*sizeof(float),hipMemcpyDeviceToDevice,d.stream));
+        }
+        plan.verified=0;
+    }
+    check(hipStreamSynchronize(d.stream));
+    d.front_epoch[d.window]=0;
+    *touched=mask;
+    return 0;
 }
 
 // Row argmax in two passes (64 chunks per row, then one block per row); ties keep
@@ -626,13 +722,152 @@ __global__ void head_confidence(const float* own, const float* other, size_t ste
 // The rows come from the host (`input`) or, when that is null, from device memory (`source`).
 // With `top` (at most head_top_max), each row's `top` greatest logits and their tokens (row_top) come back in `best`.
 constexpr size_t head_top_floats = verify_max * 2 * head_top_max + verify_max * argmax_chunks * head_top_max * 2;
+// Diagnostics and their cleanup restore the caller's device with checked errors.
+template <class Function>
+void head_on_device(int ordinal, Function&& work) {
+    int current = 0;
+    check(hipGetDevice(&current));
+    if (current != ordinal) check(hipSetDevice(ordinal));
+    std::exception_ptr failure;
+    try { work(); } catch (...) { failure = std::current_exception(); }
+    if (current != ordinal) check(hipSetDevice(current));
+    if (failure) std::rethrow_exception(failure);
+}
+
+// Events exist only for explicit diagnostics, outside capture, on their owning GPU.
+class HeadEventTimer {
+public:
+    HeadEventTimer(Device& d, bool enabled) : d_(d), stream_(d.stream) {
+        if (!enabled) return;
+        try {
+            head_on_device(d_.ordinal, [&]() {
+                check(d_.head_timing_error);
+                hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+                check(hipStreamIsCapturing(stream_, &capture));
+                if (d_.op_recording || capture != hipStreamCaptureStatusNone)
+                    throw std::runtime_error("head timing requires an uncaptured stream");
+                check(hipEventCreate(&start_));
+                check(hipEventCreate(&stop_));
+            });
+        } catch (...) { release(); throw; }
+    }
+    ~HeadEventTimer() { release(); }
+    HeadEventTimer(const HeadEventTimer&) = delete;
+    HeadEventTimer& operator=(const HeadEventTimer&) = delete;
+    void begin() {
+        if (start_) head_on_device(d_.ordinal, [&]() { check(hipEventRecord(start_, stream_)); });
+    }
+    void end() {
+        if (stop_) head_on_device(d_.ordinal, [&]() { check(hipEventRecord(stop_, stream_)); });
+    }
+    double milliseconds() {
+        if (!stop_) return 0;
+        float elapsed = 0;
+        head_on_device(d_.ordinal, [&]() {
+            check(hipEventSynchronize(stop_));
+            check(hipEventElapsedTime(&elapsed, start_, stop_));
+        });
+        return double(elapsed);
+    }
+    void close() { check(release()); }
+private:
+    Device& d_;
+    hipStream_t stream_;
+    hipEvent_t start_ = nullptr, stop_ = nullptr;
+    hipError_t release() noexcept {
+        if (!start_ && !stop_) return hipSuccess;
+        hipError_t first = hipSuccess;
+        auto note = [&](hipError_t error) {
+            if (error != hipSuccess) {
+                if (first == hipSuccess) first = error;
+                if (d_.head_timing_error == hipSuccess) d_.head_timing_error = error;
+            }
+        };
+        int previous = -1;
+        const hipError_t current = hipGetDevice(&previous);
+        note(current);
+        const hipError_t selected = hipSetDevice(d_.ordinal);
+        note(selected);
+        if (selected == hipSuccess) {
+            if (start_) note(hipEventDestroy(start_));
+            if (stop_) note(hipEventDestroy(stop_));
+        }
+        if (current == hipSuccess && previous != d_.ordinal) note(hipSetDevice(previous));
+        start_ = stop_ = nullptr;
+        return first;
+    }
+};
+
+// The launches of a head or of a drafter's prologue as one cached graph where that is cheaper to issue: a CUDA build's, outside a capture
+// and with no phase marks in them (a mark is an event of the profile's own). Each is eight to twelve launches of small kernels between two
+// waits of the host: on a host whose cores are shared and slow a launch costs 12 us to issue and a graph's replay 10 us whatever it holds
+// (two RTX 3090: about fifty such launches a pass of the pipeline). A HIP build issues them as it did.
+template<class Function>
+void run_small_graph(Device& d, const char* tag, void* const* dependencies, size_t count, size_t variant, Function&& submit) {
+#if !defined(__HIPCC__)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    check(cudaStreamIsCapturing(d.stream, &capture));
+    if (capture == cudaStreamCaptureStatusNone && !d.phase_on) { run_graph(d, tag, dependencies, count, variant, submit); return; }
+#else
+    (void)tag; (void)dependencies; (void)count; (void)variant;
+#endif
+    submit();
+}
+
+// A head's graph holds the count of a draft vocabulary's extra rows: when that count has changed, the graphs of the same head at the counts
+// before are dropped, so that a long conversation's heads (a token past the vocabulary's first rows noted now and then) do not fill the
+// device's graph cache, which the layers' graphs share.
+constexpr size_t output_head_extras_at = 8192, output_head_extras_bits = size_t(0x7fff) * output_head_extras_at;
+inline void output_head_forget(Device& d, size_t variant) {
+#if !defined(__HIPCC__)
+    const std::string tag = "output-head";
+    for (auto graph = d.graphs.begin(); graph != d.graphs.end();) {
+        size_t held = 0;
+        if (graph->first.size() >= tag.size() + sizeof(held) && graph->first.compare(0, tag.size(), tag) == 0) {
+            std::memcpy(&held, graph->first.data() + tag.size(), sizeof(held));
+            if (held != variant && (held & ~output_head_extras_bits) == (variant & ~output_head_extras_bits)) {
+                check(hipStreamSynchronize(d.stream));
+                check(hipGraphExecDestroy(graph->second.executable));
+                check(hipGraphDestroy(graph->second.graph));
+                graph = d.graphs.erase(graph);
+                continue;
+            }
+        }
+        ++graph;
+    }
+#else
+    (void)d; (void)variant;
+#endif
+}
+
 // `source` rows on the device (rather than `input`'s on the host) come back in `rows` when asked, with the tokens.
+// `allocated` (a draft's vocabulary on one device, draft_head): the head's rows the allocation holds, where `vocabulary` rows of it are read.
+// `extras` (a draft's vocabulary on one device as well): `extra_count` more rows, of the tokens `extra_tokens`, read after the head's first
+// `vocabulary` rows; the tokens and the top pairs that fall among them come back as those tokens. No logits with them.
+// (An index past the rows read is no row's: the choice of a step whose scores are all NaN, and a top pair that was not filled, stay as they
+// are. Equal scores among the extras fall to the one added first, where the whole head's fall to the lower token, and an extra's score is
+// summed in the lanes its few rows give it: this head's tokens are a draft's guesses, which the verification's whole head decides.)
+__global__ void __launch_bounds__(64) head_extra_tokens(int32_t* chosen, float* ranked, uint32_t steps, uint32_t rows, const int32_t* extra_tokens,
+                                                        uint32_t extra_count, unsigned top) {
+    const uint32_t row = blockIdx.x;
+    if (row >= steps) return;
+    if (threadIdx.x == 0) {
+        const uint32_t pick = uint32_t(chosen[row]);
+        if (pick >= rows && pick - rows < extra_count) chosen[row] = extra_tokens[pick - rows];
+    }
+    if (threadIdx.x < top) {
+        uint32_t* at = reinterpret_cast<uint32_t*>(ranked + size_t(row) * 2 * top + top) + threadIdx.x;
+        if (*at >= rows && *at - rows < extra_count) *at = uint32_t(extra_tokens[*at - rows]);
+    }
+}
 void output_head(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary,
                  const float* input, int32_t* tokens, float* logits, float* confidence, const float* source = nullptr,
-                 unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr) {
-    if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * vocabulary > d.output_capacity ||
+                 unsigned top_count = 0, float* best = nullptr, float* rows_out = nullptr, size_t allocated = 0,
+                 bool draft_timing = false, const uint8_t* extras = nullptr, size_t extra_count = 0, const int32_t* extra_tokens = nullptr) {
+    const size_t read = vocabulary + extra_count;
+    if (!steps || steps > verify_max || (!input && !source) || !tokens || !vocabulary || steps * read > d.output_capacity ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 4 * verify_max + head_top_floats > d.input_capacity ||
-        top_count > head_top_max || (top_count && !best))
+        top_count > head_top_max || (top_count && !best) || (extra_count && (!extras || !extra_tokens || logits)))
         throw std::runtime_error("invalid Straydog output head");
     Matrix hc[4];
     hc_operands(pointers, kinds, hc);
@@ -642,23 +877,47 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
         if (found == d.allocations.end() || found->second != hc[i].rows * hc[i].row_bytes) throw std::runtime_error("invalid head operand");
     }
     auto found = d.allocations.find(pointers[3]);
-    if (found == d.allocations.end() || found->second != vocabulary * head.row_bytes) throw std::runtime_error("invalid head operand");
+    if (found == d.allocations.end() || found->second != (allocated ? allocated : vocabulary) * head.row_bytes) throw std::runtime_error("invalid head operand");
+    const bool timed = draft_timing && d.head_timing_enabled;
+    HeadEventTimer total_time(d, timed), projection_time(d, timed);
     float* rows = d.input; float* mixed = rows + steps * 10240;
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
     if (input) upload(d, rows, input, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
-    hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
-    gemv(d, &head, 1, mixed, d.output, steps, 2564, vocabulary);
-    row_argmax(d, d.output, steps, vocabulary, vocabulary, partial, chosen);
     float* top = reinterpret_cast<float*>(chosen + verify_max);
-    if (confidence) {
-        row_exp_sum(d, d.output, steps, vocabulary, vocabulary, chosen, partial, top);
-        head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
-    }
     float* ranked = top + 4 * verify_max;
-    if (top_count) row_top(d, d.output, steps, vocabulary, vocabulary, top_count, ranked + verify_max * 2 * head_top_max, ranked);
-    check(hipGetLastError());
+    const Matrix own[2] = {head, {extras, head.row_bytes, extra_count, 2560, 0, vocabulary, 0, kinds[3]}};
+    auto launches = [&]() {
+        hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
+        total_time.begin(); projection_time.begin();
+        gemv(d, own, extra_count ? 2 : 1, mixed, d.output, steps, 2564, read);
+        projection_time.end();
+        row_argmax(d, d.output, steps, read, read, partial, chosen);
+        if (confidence) {
+            row_exp_sum(d, d.output, steps, read, read, chosen, partial, top);
+            head_confidence<<<1, 32, 0, d.stream>>>(top, nullptr, steps, top + 2 * verify_max);
+        }
+        if (top_count) row_top(d, d.output, steps, read, read, top_count, ranked + verify_max * 2 * head_top_max, ranked);
+        // (after the probability, which is read at the chosen row: the rows past the head's become their tokens)
+        if (extra_count) head_extra_tokens<<<unsigned(steps), 64, 0, d.stream>>>(chosen, ranked, uint32_t(steps), uint32_t(vocabulary), extra_tokens,
+                                                                                    uint32_t(extra_count), top_count);
+        check(hipGetLastError());
+    };
+    if (timed) launches();   // (the timers' events are this call's own)
+    else {
+        // (what the launches hold beside the operands: the rows read, the extra rows, the rows of the pass, the pairs asked for)
+        void* dependencies[8] = {pointers[0], pointers[1], pointers[2], pointers[3], const_cast<uint8_t*>(extras), const_cast<int32_t*>(extra_tokens),
+                                 d.input, d.output};
+        const size_t variant = steps + 32 * top_count + 32 * 128 * size_t(confidence != nullptr) + output_head_extras_at * extra_count +
+                               (vocabulary << 32);
+        if (extra_count && extra_count != d.head_graph_extras) {
+            output_head_forget(d, variant);
+            d.head_graph_extras = extra_count;
+        }
+        run_small_graph(d, "output-head", dependencies, 8, variant, launches);
+    }
+    total_time.end();
     Piece pieces[5]; size_t count = 0;
     if (rows_out) pieces[count++] = {rows_out, rows, steps * 10240 * 4};
     pieces[count++] = {tokens, chosen, steps * 4};
@@ -666,6 +925,12 @@ void output_head(Device& d, void* const* pointers, const int* kinds, size_t step
     if (logits) pieces[count++] = {logits, d.output, steps * vocabulary * 4};
     if (top_count) pieces[count++] = {best, ranked, steps * 2 * top_count * 4};
     download_pieces(d, pieces, count);
+    if (timed) {
+        const double projection = projection_time.milliseconds(), total = total_time.milliseconds();
+        projection_time.close(); total_time.close();
+        ++d.head_timing_calls[0];
+        d.head_timing_ms[0] += projection; d.head_timing_ms[1] += total;
+    }
 }
 
 // The non-finite values among `count` floats: each block's verdict into flags[block].
@@ -736,7 +1001,7 @@ struct HeadRows { size_t low = 0, first = 0, end = 0, extra_count = 0; const uin
 void output_head_split(Device& d, void* const* pointers, const int* kinds, size_t steps, size_t vocabulary, size_t split,
                        void* peer_head, const float* input, int32_t* tokens, float* logits, float* confidence,
                        const float* source = nullptr, unsigned top_count = 0, float* best_out = nullptr, float* rows_out = nullptr,
-                       HeadRows rows_of = {}) {
+                       HeadRows rows_of = {}, bool draft_timing = false) {
     Device* peer = d.link.peer;
     if (!rows_of.end) rows_of = {split, split, vocabulary};
     if (rows_of.low > split || !rows_of.low || rows_of.first >= rows_of.end || rows_of.end > vocabulary ||
@@ -749,7 +1014,7 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
         steps * vocabulary > d.output_capacity || steps * split > peer->output_capacity ||
         64 + steps * split > d.link.rows * 2560 || 2560 * steps > peer->link.rows * 2560 ||
         steps * (10240 + 2564) + 2 * verify_max * argmax_chunks + 5 * verify_max + 2 * head_top_floats > d.input_capacity ||
-        2 * verify_max * argmax_chunks + verify_max + head_top_floats > peer->input_capacity ||
+        2 * verify_max * argmax_chunks + verify_max + head_top_floats + (peer->link.direct ? 0 : steps * 2560) > peer->input_capacity ||
         top_count > head_top_max || (top_count && (!best_out || logits)))
         throw std::runtime_error("invalid Straydog split output head");
     Matrix hc[4];
@@ -764,6 +1029,8 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     if (found == d.allocations.end() || found->second != vocabulary * row_bytes ||
         lower == peer->allocations.end() || lower->second != split * row_bytes)
         throw std::runtime_error("invalid head operand");
+    const bool timed = draft_timing && d.head_timing_enabled;
+    HeadEventTimer total_time(d, timed), local_time(d, timed), peer_time(*peer, timed);
     float* rows = d.input; float* mixed = rows + steps * 10240;
     float* partial = mixed + steps * 2564;
     auto* chosen = reinterpret_cast<int32_t*>(partial + 2 * verify_max * argmax_chunks);
@@ -771,23 +1038,38 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     if (input) upload(d, rows, input, steps * 10240 * 4);
     else check(hipMemcpyAsync(rows, source, steps * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
     hc_decode(d, hc, false, rows, d.output, mixed, steps, 2564);
+    total_time.begin();
     peer_send(d, mixed, steps, 2560, 2564, 0);
     // (WDDM holds what is queued until the stream is asked about: the peer's half waits for these rows, and this device's
     // kernels below wait for the peer's half, so each stream is asked as soon as its part is queued)
     flush_launches(d);
     float* received = peer_partials(d.link);
-    on_device(peer->ordinal, [&]() {
+    // The logits of the lower half reach the host through this device's inbox only over a direct link (the inbox in its VRAM).
+    const bool host_logits = logits && !d.link.direct;
+    uint8_t* helper_slots[verify_max] = {};
+    head_on_device(peer->ordinal, [&]() {
         Device& h = *peer;
         const Matrix low{static_cast<const uint8_t*>(peer_head), row_bytes, low_rows, 2560, 0, 0, 0, kinds[3]};
         float* scratch = h.input;
         auto* best = reinterpret_cast<int32_t*>(scratch + 2 * verify_max * argmax_chunks);
         peer_receive_rows(h);
-        gemv(h, &low, 1, peer_inputs(h.link), h.output, steps, 2560, low_rows);
+        // (linked through page-locked host memory, as two GPUs without peer access are: every block of the product stages the rows into
+        // its shared memory, and 3,900 blocks reading them over the bus took 2.5 ms of the half's 0.3. They are copied into this device's
+        // memory first, behind the head's other scratch, and the product reads them there: the same values, the same sums.)
+        const float* mixed_rows = peer_inputs(h.link);
+        if (!h.link.direct) {
+            float* local = scratch + 2 * verify_max * argmax_chunks + verify_max + head_top_floats;
+            peer_copy<<<unsigned((steps * 2560 + 255) / 256), 256, 0, h.stream>>>(local, mixed_rows, steps, 2560, 2560);
+            mixed_rows = local;
+        }
+        peer_time.begin();
+        gemv(h, &low, 1, mixed_rows, h.output, steps, 2560, low_rows);
+        peer_time.end();
         row_argmax(h, h.output, steps, low_rows, low_rows, scratch, best);
         head_part<<<1, 32, 0, h.stream>>>(h.output, low_rows, best, steps, peer_remote_partials(h.link));
         // The lower half's (logit, sum) pairs follow its choices, before the logits at 64.
         if (confidence) row_exp_sum(h, h.output, steps, low_rows, low_rows, best, scratch, peer_remote_partials(h.link) + 16);
-        if (logits) peer_copy<<<1024, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, h.output, steps, split, split);
+        if (logits && !host_logits) peer_copy<<<1024, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, h.output, steps, split, split);
         // (its rows' tops at 64 instead of its logits: a few pairs a row over the link)
         if (top_count) {
             float* ranked = scratch + 2 * verify_max * argmax_chunks + verify_max;
@@ -795,12 +1077,22 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
             peer_copy<<<1, 256, 0, h.stream>>>(peer_remote_partials(h.link) + 64, ranked, 1, steps * 2 * top_count, 0);
         }
         peer_signal_peer(h);
+        // (the lower half's logits, over a link through host memory: this device reads them back itself, into its own page-locked staging, beside
+        // the owner's read-back of its half. Through the owner's inbox they took a kernel of 409 us writing over the bus and then, on the owner's
+        // stream, a host-to-host copy of 392 us a row, where a read-back of a row's half is 30 us)
+        if (host_logits)
+            for (size_t row = 0; row < steps; ++row) {
+                helper_slots[row] = io_slot(h, split * 4);
+                check(hipMemcpyAsync(helper_slots[row], h.output + row * split, split * 4, hipMemcpyDeviceToHost, h.stream));
+            }
         check(hipGetLastError());
         flush_launches(h);
     });
     const Matrix own[2] = {{static_cast<const uint8_t*>(pointers[3]) + rows_of.first * row_bytes, row_bytes, high_rows, 2560, 0, 0, 0, kinds[3]},
                            {rows_of.extras, row_bytes, rows_of.extra_count, 2560, 0, high_rows, 0, kinds[3]}};
+    local_time.begin();
     gemv(d, own, rows_of.extra_count ? 2 : 1, mixed, d.output, steps, 2564, own_rows);
+    local_time.end();
     row_argmax(d, d.output, steps, own_rows, own_rows, partial, chosen);
     peer_receive(d);
     head_choose<<<1, 32, 0, d.stream>>>(d.output, own_rows, rows_of.first, chosen, received, steps, final_tokens, high_rows,
@@ -818,12 +1110,13 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
                                                              top_count, merged);
     }
     check(hipGetLastError());
+    total_time.end();
     // (finish_with_helper's waits with the read-back's: both links' counters ride along, the peer's queued after its part, where
     // peer_settle read each with a blocking copy after the streams' waits: a draft step's head ended 0.13 ms after its last
     // kernel, now 0.06)
     uint32_t counters[2][8] = {};
     uint8_t* peer_counters = nullptr;
-    on_device(peer->ordinal, [&]() {
+    head_on_device(peer->ordinal, [&]() {
         peer_counters = io_slot(*peer, 32);
         check(hipMemcpyAsync(peer_counters, peer->link.counters, 32, hipMemcpyDeviceToHost, peer->stream));
     });
@@ -835,17 +1128,29 @@ void output_head_split(Device& d, void* const* pointers, const int* kinds, size_
     if (top_count) pieces[count++] = {best_out, merged, steps * 2 * top_count * 4};
     if (logits)
         for (size_t row = 0; row < steps; ++row) {
-            pieces[count++] = {logits + row * vocabulary, received + 64 + row * split, split * 4};
+            if (!host_logits) pieces[count++] = {logits + row * vocabulary, received + 64 + row * split, split * 4};
             pieces[count++] = {logits + row * vocabulary + split, d.output + row * (vocabulary - split), (vocabulary - split) * 4};
         }
     download_pieces(d, pieces, count);
     check(hipStreamSynchronize(d.helper_stream));
-    on_device(peer->ordinal, [&]() {
+    head_on_device(peer->ordinal, [&]() {
         check(hipStreamSynchronize(peer->stream)); check(hipStreamSynchronize(peer->helper_stream));
         std::memcpy(counters[1], peer_counters, 32);
-        peer->io_used = 0;   // (its stream is idle: download's)
     });
+    if (host_logits) {
+        StagingCopier::Item items[verify_max];
+        for (size_t row = 0; row < steps; ++row) items[row] = {logits + row * vocabulary, helper_slots[row], split * 4};
+        StagingCopier::instance().copy_items(items, steps);
+    }
+    peer->io_used = 0;   // (its stream is idle: download's, and its read-backs are copied out)
     peer_counters_check(d, counters);
+    if (timed) {
+        const double local = local_time.milliseconds(), remote = peer_time.milliseconds(), total = total_time.milliseconds();
+        local_time.close(); peer_time.close(); total_time.close();
+        ++d.head_timing_calls[1];
+        d.head_timing_ms[2] += local; d.head_timing_ms[3] += remote; d.head_timing_ms[4] += total;
+        d.head_timing_ms[5] += total - std::max(local, remote);
+    }
 }
 
 __global__ void mtp_norm(const float* input, size_t width, const float* weight, float* output) {
@@ -888,21 +1193,32 @@ void mtp_prologue_device(Device& d, void* const* pointers, const int* kinds, siz
     mtp_prologue_check(d, pointers, kinds, steps);
     float* e = mtp_prologue_embeddings(d); float* h = mtp_prologue_hidden(d, steps);
     float* ne = h + steps * 10240; float* nh = ne + steps * 2560;
-    mtp_norm<<<unsigned(steps),256,0,d.stream>>>(e, 2560, static_cast<const float*>(pointers[0]), ne);
-    mtp_norm<<<unsigned(steps),256,0,d.stream>>>(h, 10240, static_cast<const float*>(pointers[2]), nh);
-    const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
-    const Matrix fh{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),2560,2560,0,0,0,kinds[3]};
-    float* projected = d.output;   // steps x 10240 streams, then steps x 2560 embeddings
-    if (exact || steps <= size_t(gemv_max_vectors)) {
-        gemv(d, &fe, 1, ne, projected + steps * 10240, steps, 2560, 2560);
-        for (size_t b = 0; b < steps; ++b) gemv(d, &fh, 1, nh + b * 10240, projected + b * 10240, 4, 2560, 2560);
-    } else {   // prompt rows: drafter numerics never change verified tokens
-        Matrix descriptors[max_batch]{};
-        hc_project(d, fe, steps, ne, projected + steps * 10240, descriptors);
-        hc_project(d, fh, steps * 4, nh, projected, descriptors);
-    }
-    mtp_combine<<<dim3(40, unsigned(steps)),256,0,d.stream>>>(projected, projected + steps * 10240, h);
-    check(hipGetLastError());
+    const bool rows_exact = exact || steps <= size_t(gemv_max_vectors);
+    auto launches = [&]() {
+        mtp_norm<<<unsigned(steps),256,0,d.stream>>>(e, 2560, static_cast<const float*>(pointers[0]), ne);
+        mtp_norm<<<unsigned(steps),256,0,d.stream>>>(h, 10240, static_cast<const float*>(pointers[2]), nh);
+        phase(d, "pro_norm");
+        const Matrix fe{static_cast<const uint8_t*>(pointers[1]),matrix_row_bytes(kinds[1],2560),2560,2560,0,0,0,kinds[1]};
+        const Matrix fh{static_cast<const uint8_t*>(pointers[3]),matrix_row_bytes(kinds[3],2560),2560,2560,0,0,0,kinds[3]};
+        float* projected = d.output;   // steps x 10240 streams, then steps x 2560 embeddings
+        if (rows_exact) {
+            gemv(d, &fe, 1, ne, projected + steps * 10240, steps, 2560, 2560);
+            for (size_t b = 0; b < steps; ++b) gemv(d, &fh, 1, nh + b * 10240, projected + b * 10240, 4, 2560, 2560);
+        } else {   // prompt rows: drafter numerics never change verified tokens
+            Matrix descriptors[max_batch]{};
+            hc_project(d, fe, steps, ne, projected + steps * 10240, descriptors);
+            hc_project(d, fh, steps * 4, nh, projected, descriptors);
+        }
+        phase(d, "pro_gemm");
+        mtp_combine<<<dim3(40, unsigned(steps)),256,0,d.stream>>>(projected, projected + steps * 10240, h);
+        phase(d, "pro_combine");
+        check(hipGetLastError());
+    };
+    // (a drafting step's rows: one graph. A prompt's rows keep their launches: their count varies and they are not a pass's.)
+    if (rows_exact) {
+        void* dependencies[6] = {pointers[0], pointers[1], pointers[2], pointers[3], d.input, d.output};
+        run_small_graph(d, "mtp-prologue", dependencies, 6, steps, launches);
+    } else launches();
 }
 void mtp_prologue(Device& d, void* const* pointers, const int* kinds, size_t steps, const float* embeddings,
                   const float* hidden, float* output) {
@@ -937,6 +1253,12 @@ float* draft_queue(Device& d, void* const* mtp, const int* mtp_kinds, size_t lay
     }
     return verify_span_queue(d, layer, layer + 1, position, steps, nullptr, rows, parts);
 }
+// The head's rows a draft reads on this device alone (pipelined verification): the first rows of a draft's vocabulary, to which draft_head
+// adds the rows of the tokens noted past them; the head of every row where there is no such vocabulary.
+size_t draft_read_rows(const Device& d, size_t vocabulary, unsigned top) {
+    (void)top;
+    return d.pipelined_chain && d.draft_rows && d.draft_rows < vocabulary ? d.draft_rows : vocabulary;
+}
 // The vocabulary head on a draft's row `last` (on this device), its token and probability back; with `top`, instead of the
 // probability, the row's `top` greatest logits and their tokens for the host to draw the draft from (sampling::accept_top_drawn).
 void draft_head(Device& d, void* const* head, const int* head_kinds, size_t vocabulary, size_t split, void* peer_head,
@@ -954,9 +1276,17 @@ void draft_head(Device& d, void* const* head, const int* head_kinds, size_t voca
     float* probability = top ? nullptr : confidence_row;
     confidence_row[0] = 1;
     if (split) output_head_split(d, head, head_kinds, 1, vocabulary, split, peer_head, nullptr, token_row, nullptr, probability, last,
-                                 top, best, nullptr, rows_of);
+                                 top, best, nullptr, rows_of, true);
     else {
-        output_head(d, head, head_kinds, 1, vocabulary, nullptr, token_row, nullptr, probability, last, top, best);
+        // (pipelined verification: the other device is busy, so the draft's vocabulary is read on this one alone: its first rows and the rows
+        // of the tokens noted past them, as the split head reads them between the two devices -- with the greatest logits for a drawn
+        // draft as well. A head of every row took 825 us of an RTX 3090 a draft, twice a pass. The probability, or the pairs a draft is
+        // drawn from, are under those rows' softmax, as in the split head.)
+        const size_t read = draft_read_rows(d, vocabulary, top);
+        const bool reduced = read < vocabulary;
+        output_head(d, head, head_kinds, 1, read, nullptr, token_row, nullptr, probability, last, top, best, nullptr,
+                    reduced ? vocabulary : 0, true, reduced ? d.draft_extras : nullptr, reduced ? d.draft_extra_count : 0,
+                    reduced ? d.draft_extra_tokens : nullptr);
         if (parts) finish_with_helper(d);
     }
     *token = token_row[0]; *confidence = confidence_row[0];

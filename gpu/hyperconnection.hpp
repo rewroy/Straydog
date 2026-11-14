@@ -71,6 +71,38 @@ __global__ void hc_normalize_half(const float* input, const float* norm, __half*
     for (size_t col = threadIdx.x; col < 2560; col += 256)
         output[base + col] = __float2half(hc_f32(input[base + col] / denominator * norm[(base + col) % 10240]));
 }
+// decoder_batch_residual's update of one token's one stream (a block of 256 threads, the stream's 2560 values) and hc_normalize_half of the updated
+// values, in one kernel (CUDA, FP16 projections): the same expressions in the same order, so the stored hidden values, the denominators and the
+// halves are those of the two kernels, and the updated values are read once.
+__global__ void hc_residual_normalize_half(float* hidden, const float* mixed, const float* branch, size_t steps, const float* norm, __half* output,
+                                           float* denominators) {
+    const size_t token = blockIdx.x / 4, stream = blockIdx.x % 4, base = size_t(blockIdx.x) * 2560;
+    __shared__ float sum[256];
+    float values[10], total = 0;
+    const float factor = mixed[steps * 2560 + token * 4 + stream];
+    #pragma unroll
+    for (unsigned j = 0; j < 10; ++j) {
+        const size_t col = threadIdx.x + 256 * j;
+        float x = hidden[base + col];
+        x += factor * branch[token * 2560 + col];
+        hidden[base + col] = x;
+        values[j] = x;
+        total = fmaf(x, x, total);
+    }
+    sum[threadIdx.x] = total;
+    __syncthreads();
+    for (unsigned stride = 128; stride; stride /= 2) {
+        if (threadIdx.x < stride) sum[threadIdx.x] += sum[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float denominator = sqrtf(sum[0] / 2560.0f + 1e-6f);
+    if (threadIdx.x == 0) denominators[blockIdx.x] = denominator;
+    #pragma unroll
+    for (unsigned j = 0; j < 10; ++j) {
+        const size_t col = threadIdx.x + 256 * j;
+        output[base + col] = __float2half(hc_f32(values[j] / denominator * norm[(base + col) % 10240]));
+    }
+}
 __global__ void hc_finish_hidden(const float* input, const float* norm, const float* denominators, const float* up,
                                  const float* injection, size_t steps, float* output) {
     const size_t index = size_t(blockIdx.x) * 256 + threadIdx.x;

@@ -40,8 +40,8 @@ fn open(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>) -> (Model, Te
     let drafter = drafter.map(PathBuf::from);
     let weights = Weights::open(&PathBuf::from(root), bundle, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
     let text = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
-    // (64K of context: the K/V of that is over a quarter of the budget, so it stays in host memory, and it starts at 32K positions)
-    let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256, speculative: if drafter.is_some() { 3 } else { 0 },
+    // (128K of context: Q8 K/V is over a quarter of this budget, so it stays in host memory and starts at 32K positions)
+    let settings = Settings { context: 131072, state_budget_bytes: 8 << 30, prefill_batch_size: 256, speculative: if drafter.is_some() { 3 } else { 0 },
                               cpu_threads: 0, row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial, "the model must be partially resident at this budget");

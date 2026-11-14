@@ -207,7 +207,11 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
     if let Some(mib) = settings.row_cache {
         push("row-cache-bytes", (u64::from(mib) << 20).to_string());
     }
-    push("prefill-batch-size", settings.batch_size.map_or_else(|| "auto".into(), |batch| batch.to_string()));
+    // (a batch the budgets derived goes as auto, so that the worker and the engine can tell it from one given: only the derived is narrowed)
+    push("prefill-batch-size", match settings.batch_size {
+        Some(batch) if !settings.batch_derived => batch.to_string(),
+        _ => "auto".into(),
+    });
     push("gemm", if settings.gemm == Gemm::Fp16 { "fp16" } else { "fp32" }.into());
     push("gemm-min-batch", settings.gemm_min_batch.to_string());
     // Isolation hides the worker's cgroup limits from it; host-memory policies (page-locking
@@ -447,8 +451,13 @@ pub fn ready_summary(ready: &Value) -> String {
         .map_or_else(String::new, |precision| format!(", engram {precision} ({})", ready["engram"]["file"].as_str().unwrap_or("-")));
     // (what the placement's first choice would have needed: a little more VRAM, a faster start)
     let note = placement["note"].as_str().map_or_else(String::new, |note| format!(" ({note})"));
+    // (a read of enough new tokens is read in wider batches than the ones asked for, where the workspaces hold them)
+    let wide = match (placement["prefill_wide_rows"].as_u64(), placement["prefill_wide_from"].as_u64()) {
+        (Some(rows), Some(from)) if rows > 0 => format!(", up to {rows} rows from a read of {from} new tokens"),
+        _ => placement["prefill_wide_note"].as_str().map_or_else(String::new, |note| format!(" ({note})")),
+    };
     format!(
-        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}{note}; {devices} using {:.1} of {:.1} GiB",
+        "Straydog ready: {}{engram}, context {}, {residency}, {}, K/V in {}, prefill batch {}{wide}{note}; {devices} using {:.1} of {:.1} GiB",
         ready["quantization"].as_str().unwrap_or("-"),
         ready["context"],
         if drafts > 0 { format!("MTP {drafts}") } else { "no speculation".into() },
@@ -530,7 +539,8 @@ fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
-     "Straydog row proofs:"]
+     "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
+     "Straydog assist profile:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -677,12 +687,13 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         prefill_summary(usage, timings),
         number(&timings["ttft_seconds"], 2),
         // (of which restoring a checkpoint and saving the request's: copies of the whole state; and what is neither the prompt's reading
-        // nor that: encoding the rendered conversation, growing the K/V, putting the expert slots back)
+        // nor that: encoding the rendered conversation, copying out the earlier conversation's positions this prompt overwrites, growing the K/V,
+        // putting the expert slots back)
         match (timings["resume_seconds"].as_f64().unwrap_or(0.0), timings["checkpoint_seconds"].as_f64().unwrap_or(0.0)) {
             (restore, save) if restore + save >= 0.05 => format!(" (checkpoints: restore {restore:.2} s, save {save:.2} s)"),
             _ => String::new(),
         } + &{
-            let parts: Vec<String> = [("encode", "encode_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
+            let parts: Vec<String> = [("encode", "encode_seconds"), ("parking", "park_seconds"), ("K/V growth", "kv_growth_seconds"), ("slots back", "rebalance_seconds")]
                 .into_iter().filter_map(|(name, key)| timings[key].as_f64().filter(|seconds| *seconds >= 0.05).map(|seconds| format!("{name} {seconds:.2} s")))
                 .collect();
             if parts.is_empty() { String::new() } else { format!(" (besides reading: {})", parts.join(", ")) }
@@ -700,6 +711,9 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                            widths.iter().map(&count).collect::<Vec<_>>().join("/")),
                                                        _ => String::new(),
                                                    }),
+            _ => String::new(),
+        } + &match (timings["penalty_top_passes"].as_u64(), timings["penalty_top_fallback_passes"].as_u64()) {
+            (Some(passes), Some(retries)) => format!("; penalized top: {passes} passes, {retries} full-logit retries"),
             _ => String::new(),
         },
         // (an engine that streams experts says where the prefill's came from: what the first token waited on)
@@ -1964,6 +1978,12 @@ mod tests {
         let line = request_summary(&event, None);
         assert!(line.contains("new 399 in 5657 ms (71 tok/s) in 2 batches of up to 256 rows"), "{line}");
         assert!(line.contains("first token 6.08 s (besides reading: encode 0.34 s, slots back 0.42 s)"), "{line}");
+        // (the earlier conversation's positions a long prompt overwrites are copied out before it is read: 0.59 s at 94027 positions)
+        let mut parked = event.clone();
+        parked["timings"]["park_seconds"] = json!(0.59);
+        assert!(request_summary(&parked, None).contains("(besides reading: encode 0.34 s, parking 0.59 s, slots back 0.42 s)"));
+        parked["timings"]["park_seconds"] = json!(0.004);
+        assert!(request_summary(&parked, None).contains("(besides reading: encode 0.34 s, slots back 0.42 s)"));
         assert!(line.contains("; layer order not taken: 128 rows a batch, banks 39.4 GiB, room 46.1 GiB"), "{line}");
         assert!(line.contains("; assist round: 63 passes timed"), "{line}");
     }
@@ -2053,6 +2073,8 @@ mod tests {
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
         assert!(!stays_in_the_log("Straydog host paging: 4.5 GiB available; the CPU's experts are read ahead from now"));
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
+        assert!(stays_in_the_log("Straydog assist profile: decision round=2 held=0 qualified=4 chosen=4"));
+        assert!(stays_in_the_log("Straydog assist profile: setter_succeeded from=0 to=4"));
         assert!(!stays_in_the_log("some other line"));
     }
 
@@ -2156,6 +2178,21 @@ mod tests {
         let mut first = ready.clone();
         first["placement"]["note"] = Value::Null;
         assert!(ready_summary(&first).contains("prefill batch 2048; "), "{}", ready_summary(&first));
+    }
+
+    /// The ready line says how wide a long read's batches are where the workspaces hold more than the batch asked for, or what they lacked.
+    #[test]
+    fn the_ready_line_says_how_wide_a_long_reads_batches_are() {
+        let ready = json!({"quantization": "q", "context": 1, "gpu": {"name": "g"}, "speculative_drafts": 3,
+                           "placement": {"resident": true, "host_kv": true, "prefill_batch_size": 4096, "prefill_wide_rows": 8192, "prefill_wide_from": 16384}});
+        assert!(ready_summary(&ready).contains("prefill batch 4096, up to 8192 rows from a read of 16384 new tokens; "), "{}", ready_summary(&ready));
+        let mut lacking = ready.clone();
+        lacking["placement"]["prefill_wide_rows"] = json!(0);
+        lacking["placement"]["prefill_wide_note"] = json!("a long read's batches of 8192 rows would need 0.40 GiB more VRAM");
+        assert!(ready_summary(&lacking).contains("prefill batch 4096 (a long read's batches of 8192 rows would need 0.40 GiB more VRAM); "), "{}", ready_summary(&lacking));
+        let mut plain = ready.clone();
+        plain["placement"]["prefill_wide_rows"] = json!(0);
+        assert!(ready_summary(&plain).contains("prefill batch 4096; "), "{}", ready_summary(&plain));
     }
 
     /// `/props` counts DSpark's drafts as it counts MTP's: a model that drafts is not reported as one that does not.

@@ -163,7 +163,7 @@ void run_graph(Device& d, const char* tag, void* const* dependencies, size_t cou
         ++d.graph_replays;
         return;
     }
-    if (d.graphs.size()>=256) { submit(); return; }
+    if (d.graphs.size()>=(d.pipelined ? 1024 : 256)) { submit(); return; }
     CachedGraph cached{};
     cached.dependencies.assign(dependencies,dependencies+count);
     bool capturing=false;

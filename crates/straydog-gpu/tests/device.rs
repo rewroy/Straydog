@@ -4,6 +4,14 @@
 use straydog_gpu::{device_count, device_info, Device};
 
 #[test]
+fn an_expired_hybrid_wait_rebases_the_next_handshake() {
+    assert!(device_count().unwrap() > 0, "this regression test requires a GPU");
+    let device = Device::new(0, 64 << 20).unwrap();
+    // SAFETY: the development check requires and receives a fresh, exclusive device.
+    straydog_gpu::check(unsafe { straydog_gpu::ffi::sd_hybrid_wait_check(device.handle()) }).unwrap();
+}
+
+#[test]
 fn f32_matvec_on_every_device_matches_the_cpu() {
     let count = device_count().expect("the GPU runtime loads");
     if count == 0 {

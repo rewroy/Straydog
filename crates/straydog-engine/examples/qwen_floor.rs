@@ -8,6 +8,12 @@
 //!
 //! A floor may end in @f32 or @q8 (after a q): that run takes the GPU projections on the F32 kernels (STRAYDOG_Q8=0) or the Q8 kernels
 //! (INT8 activations), whatever the environment says. `0.04@f32,0.04@q8` is the KL of the Q8 kernels against the F32 ones, at one floor.
+//! @e0, @e1 and @e2 set the routed experts' gate and up the same way (STRAYDOG_EXPERT_Q8 unset, 1, 2).
+//! @mma leaves the prompt's sparse attention on tensor cores (a CUDA build's default from sm_80); a run without it sets STRAYDOG_QSA_MMA=0
+//! (the F32 kernel), so `0,0@mma` is the KL of the tensor-core kernel against the F32 one.
+//!
+//! QWEN_FLOOR_PROMPT_FILE and QWEN_FLOOR_PROMPT_TOKENS (a comma list such as 8192,32768): the prompts are the file's first N tokens each
+//! instead of the six short ones (the context grows to hold the longest and its continuation).
 
 use std::path::PathBuf;
 
@@ -34,29 +40,47 @@ fn run(model_dir: &PathBuf, id: bundle::Id, devices: &[usize], budget: u64, floo
     let (floor, int8) = floor.strip_suffix('q').map_or((floor, "0"), |floor| (floor, "1"));
     std::env::set_var("STRAYDOG_EXPERT_FLOOR", floor);
     std::env::set_var("STRAYDOG_CPU_INT8", int8);
+    std::env::set_var("STRAYDOG_QSA_MMA", "0");
     match mode {
         Some("f32") => std::env::set_var("STRAYDOG_Q8", "0"),
         Some("q8") => std::env::remove_var("STRAYDOG_Q8"),
-        Some(other) => return Err(format!("no mode {other}: @f32 or @q8")),
+        Some("e0") => std::env::remove_var("STRAYDOG_EXPERT_Q8"),
+        Some("e1") => std::env::set_var("STRAYDOG_EXPERT_Q8", "1"),
+        Some("e2") => std::env::set_var("STRAYDOG_EXPERT_Q8", "2"),
+        Some("mma") => std::env::remove_var("STRAYDOG_QSA_MMA"),
+        Some(other) => return Err(format!("no mode {other}: @f32, @q8, @e0, @e1, @e2 or @mma")),
         None => {}
     }
     let mut group = Group::new(devices, &vec![budget; devices.len()], SplitMode::Experts)?;
     group.configure_gemm(2, true)?;
-    let weights = Weights::open(model_dir, id, None, straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    // (QWEN_FLOOR_DRAFTER=<MTP drafter file>: the continuations by speculative decoding, three drafts, its verification passes of several rows)
+    let drafter = std::env::var_os("QWEN_FLOOR_DRAFTER").map(PathBuf::from);
+    let weights = Weights::open(model_dir, id, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let text = Text::new(weights.resources.get("tokenizer.json").ok_or("no tokenizer")?).map_err(|exc| exc.0)?;
-    let settings = Settings { context: 32_768, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: 0, cpu_threads: 0,
+    let prompts: Vec<Vec<u32>> = match (std::env::var_os("QWEN_FLOOR_PROMPT_FILE"), std::env::var("QWEN_FLOOR_PROMPT_TOKENS")) {
+        (Some(file), Ok(counts)) => {
+            let long = text.encode(&std::fs::read_to_string(&file).map_err(|exc| format!("{}: {exc}", PathBuf::from(&file).display()))?).map_err(|exc| exc.0)?;
+            counts.split(',').map(|count| {
+                let count: usize = count.trim().parse().map_err(|_| format!("QWEN_FLOOR_PROMPT_TOKENS: {count}"))?;
+                if count > long.len() { return Err(format!("the prompt file has {} tokens, {count} asked", long.len())); }
+                Ok(long[..count].to_vec())
+            }).collect::<Result<_, String>>()?
+        }
+        _ => PROMPTS.iter().map(|prompt| text.encode(prompt).map_err(|exc| exc.0)).collect::<Result<_, String>>()?,
+    };
+    let context = prompts.iter().map(|prompt| prompt.len() + steps + 64).max().unwrap_or(0).max(32_768);
+    let settings = Settings { context, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
     model.lock_banks_now()?;
     eprintln!("floor {floor}: loaded");
     let mut out = Vec::new();
     let (mut seconds, mut made) = (0.0, 0usize);
-    for prompt in PROMPTS {
-        let tokens = text.encode(prompt).map_err(|exc| exc.0)?;
+    for tokens in &prompts {
         model.logits_capture = Some(Vec::new());
         let mut generated = Vec::new();
         let started = std::time::Instant::now();
-        model.generate(&tokens, steps, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, false, false, &mut |token| generated.push(token))?;
+        model.generate(tokens, steps, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, false, false, &mut |token| generated.push(token))?;
         seconds += started.elapsed().as_secs_f64();
         made += generated.len();
         out.push((generated, model.logits_capture.take().unwrap_or_default()));

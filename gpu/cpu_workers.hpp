@@ -142,7 +142,9 @@ struct RowDispatch {
 // the calling thread.
 class Workers {
 public:
-    explicit Workers(size_t count) : count_(count),
+    // `first_core`: where this pool's workers start in the list of physical cores (two engines divide the cores: the second takes the first's
+    // `count`-th core on, as the workers of both are pinned to the core of their index).
+    explicit Workers(size_t count, size_t first_core = 0) : count_(count), first_core_(first_core),
         slots_(new RowDispatch[count + 1]), hazards_(new Hazard[count]) {
 #if defined(__linux__) || defined(_WIN32)
         cores_ = physical_cores();
@@ -217,7 +219,7 @@ private:
         // and a busy core held its worker (Qwen3.6 Q8_0 experts, Ryzen 7500F: 50 GB/s on six
         // unbound threads).
 #if defined(_WIN32)
-        if (!cores_.empty()) SetThreadGroupAffinity(GetCurrentThread(), &cores_[index % cores_.size()], nullptr);
+        if (!cores_.empty()) SetThreadGroupAffinity(GetCurrentThread(), &cores_[(first_core_ + index) % cores_.size()], nullptr);
 #else
         (void)index;
 #endif
@@ -256,6 +258,7 @@ private:
     }
     struct alignas(64) Hazard { std::atomic<RowDispatch*> value{nullptr}; };
     size_t count_;
+    size_t first_core_;
     std::unique_ptr<RowDispatch[]> slots_;
     std::unique_ptr<Hazard[]> hazards_;
     size_t next_slot_ = 0;

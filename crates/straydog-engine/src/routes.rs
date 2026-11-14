@@ -8,12 +8,18 @@
 //!
 //! A prompt's routes are not counted: a prefill takes nearly every expert whatever the prompt says.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 /// What a state of this kind says of itself, and its format: a start reads no state of another (the expert stores'
 /// state of a model read on demand has lists of experts, no counts by side).
 pub const KIND: &str = "routes";
 pub const VERSION: u64 = 1;
+
+/// The field of a state that keeps the draft width a partially resident model's passes chose, by placement (an object of placement key to width). It
+/// is not part of the format: a state without it is read as it always was, and a build that does not know it leaves it where it is.
+const DRAFTS: &str = "drafts";
 
 /// The routed experts a token takes in a layer (Qwen3.8's top 10).
 pub const ROUTES: f64 = 10.0;
@@ -141,6 +147,31 @@ impl Routes {
         }
         Ok(routes)
     }
+}
+
+/// The draft widths a state keeps, by placement key: those that are whole numbers (a state without the field, or with it of another shape, keeps none).
+pub fn drafts_in(state: &Value) -> BTreeMap<String, u64> {
+    let Some(widths) = state.get(DRAFTS).and_then(Value::as_object) else { return BTreeMap::new() };
+    widths.iter().filter_map(|(key, width)| Some((key.clone(), width.as_u64()?))).collect()
+}
+
+/// The width a state keeps for the placement `key`, if a model that offers `most` drafts at most can start at it: a whole number from 1 to `most`.
+pub fn saved_drafts(state: &Value, key: &str, most: usize) -> Option<usize> {
+    let width = usize::try_from(state.get(DRAFTS)?.as_object()?.get(key)?.as_u64()?).ok()?;
+    (1..=most).contains(&width).then_some(width)
+}
+
+/// `state` with the draft widths of `earlier` (an earlier state's, [`drafts_in`]) and, for the placement `key`, `chosen` (None: its earlier width stays,
+/// if it had one). The other placements' widths stay as they were, and a state that has none has no field.
+pub fn with_drafts(mut state: Value, earlier: &BTreeMap<String, u64>, key: &str, chosen: Option<usize>) -> Value {
+    let mut widths = earlier.clone();
+    if let Some(width) = chosen {
+        widths.insert(key.to_string(), width as u64);
+    }
+    if let (Some(object), false) = (state.as_object_mut(), widths.is_empty()) {
+        object.insert(DRAFTS.into(), json!(widths));
+    }
+    state
 }
 
 /// A layer's three expert banks as mapped: where each starts (an address, as a number: the ranges cross to the thread that asks the OS) and
@@ -346,5 +377,75 @@ mod tests {
     fn ranges_that_touch_or_overlap_are_one() {
         assert_eq!(join(vec![(100, 10), (110, 10), (130, 5), (90, 15), (500, 1)]), vec![(90, 30), (130, 5), (500, 1)]);
         assert_eq!(join(Vec::new()), Vec::new());
+    }
+
+    fn with_widths(widths: Value) -> Value {
+        let mut state = counted(3, 8, &[(0, 1, 5, 0)]).to_state();
+        state["drafts"] = widths;
+        state
+    }
+
+    /// Decides: a saved width is read for its own placement when it is a whole number from 1 to the most a model offers, and is none where the
+    /// field or the key is missing, the value is not a whole number, is 0, or is more than the model offers.
+    #[test]
+    fn a_saved_width_is_read_only_where_a_model_can_start_at_it() {
+        let state = with_widths(json!({"a": 2, "b": 3, "zero": 0, "wide": 4, "text": "2", "float": 2.5, "whole float": 2.0, "negative": -1, "list": [2]}));
+        assert_eq!(saved_drafts(&state, "a", 3), Some(2));
+        assert_eq!(saved_drafts(&state, "b", 3), Some(3), "as many as the model offers");
+        assert_eq!(saved_drafts(&state, "b", 2), None, "more than a model offers");
+        assert_eq!(saved_drafts(&state, "wide", 3), None);
+        assert_eq!(saved_drafts(&state, "wide", 4), Some(4));
+        for key in ["zero", "text", "float", "whole float", "negative", "list", "missing"] {
+            assert_eq!(saved_drafts(&state, key, 3), None, "{key}");
+        }
+        assert_eq!(saved_drafts(&state, "a", 0), None, "a model that offers none");
+        let plain = counted(3, 8, &[(0, 1, 5, 0)]).to_state();
+        assert_eq!(saved_drafts(&plain, "a", 3), None, "a state without the field");
+        for other in [json!([2]), json!("a"), json!(2), Value::Null] {
+            assert_eq!(saved_drafts(&with_widths(other), "a", 3), None, "the field of another shape");
+        }
+        assert_eq!(saved_drafts(&Value::Null, "a", 3), None);
+    }
+
+    /// Decides: setting a placement's width keeps the other placements' and the counts, leaves a placement's earlier width where nothing was chosen, and
+    /// adds no field to a state that has no widths; the widths read back through the file as they were set.
+    #[test]
+    fn setting_a_placements_width_keeps_the_others() {
+        let routes = counted(3, 8, &[(0, 1, 5, 0), (2, 7, 0, 9)]);
+        let earlier = drafts_in(&with_widths(json!({"a": 1, "b": 3, "text": "2", "float": 2.5})));
+        assert_eq!(earlier, BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 3)]), "the whole numbers");
+        let state = with_drafts(routes.to_state(), &earlier, "a", Some(2));
+        assert_eq!(state["drafts"], json!({"a": 2, "b": 3}));
+        assert_eq!(state["counts"], routes.to_state()["counts"], "the counts are as they were");
+        let reread: Value = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!((saved_drafts(&reread, "a", 3), saved_drafts(&reread, "b", 3), saved_drafts(&reread, "c", 3)), (Some(2), Some(3), None));
+        // (a placement that had none gets its own, the others stay)
+        assert_eq!(with_drafts(routes.to_state(), &earlier, "c", Some(1))["drafts"], json!({"a": 1, "b": 3, "c": 1}));
+        // (nothing chosen: what was kept stays, and a placement that never had one has none)
+        let kept = with_drafts(routes.to_state(), &earlier, "a", None);
+        assert_eq!((saved_drafts(&kept, "a", 3), saved_drafts(&kept, "b", 3), saved_drafts(&kept, "c", 3)), (Some(1), Some(3), None));
+        let none = with_drafts(routes.to_state(), &BTreeMap::new(), "a", None);
+        assert_eq!(none, routes.to_state(), "no field where there are no widths");
+        assert!(none.get("drafts").is_none());
+        assert_eq!(drafts_in(&none), BTreeMap::new());
+        assert_eq!(drafts_in(&with_widths(json!([1]))), BTreeMap::new());
+    }
+
+    /// Decides: the format is not changed by the widths: a state with the field is read as the same counts as one without it, a state without it is
+    /// read as before, and a state with the field of another shape is read too.
+    #[test]
+    fn a_state_with_widths_is_read_as_the_counts_it_holds() {
+        let routes = counted(3, 8, &[(0, 1, 5, 0), (2, 7, 0, 9), (1, 3, 4, 4)]);
+        let plain = routes.to_state();
+        assert_eq!(plain["version"], json!(VERSION));
+        assert_eq!(Routes::from_state(&plain, 3, 8).unwrap(), routes, "without the field, as before");
+        let with = with_drafts(plain.clone(), &BTreeMap::new(), "a", Some(2));
+        assert_eq!(with["kind"], plain["kind"]);
+        assert_eq!(with["version"], plain["version"], "the format is the same");
+        assert_eq!(Routes::from_state(&with, 3, 8).unwrap(), routes, "with it");
+        for odd in [json!([1, 2]), json!("a"), Value::Null, json!({"a": "x"})] {
+            assert_eq!(Routes::from_state(&with_widths(odd), 3, 8).unwrap(), counted(3, 8, &[(0, 1, 5, 0)]));
+        }
+        assert!(Routes::from_state(&with, 3, 16).unwrap_err().contains("another model"), "the field does not make it another model's");
     }
 }

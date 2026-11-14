@@ -24,6 +24,7 @@ fn settings() -> Settings {
         draft_max: 0,
         ctx_size: 8192,
         batch_size: Some(1024),
+        batch_derived: true,
         gpu: vec![0],
         split_mode: SplitMode::Experts,
         vram: Vram::Gib(vec![6.0]),
