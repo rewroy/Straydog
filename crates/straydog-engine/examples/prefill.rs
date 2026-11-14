@@ -2,7 +2,9 @@
 //!
 //! cargo run --release --example prefill --features hip -- MODEL QUANT DEVICES VRAM_GIB CONTEXT TOKENS... [--drafter DIR] [--batch N]
 //!     [--dump DIR] [--generate N] [--corpus FILE] [--gemm-min-batch N] [--gemm f32] [--split layer] [--row-cache MIB]
-//!     [--pause SECONDS] [--sampled] [--drafts N] [--chat] [--force-rows W,W,... --force-tokens FILE [--force-logits] [--force-reject N]] [--copy-drafts N]
+//!     [--pause SECONDS] [--trace-batches] [--sampled] [--drafts N] [--chat] [--force-rows W,W,... --force-tokens FILE [--force-logits] [--force-reject N]] [--copy-drafts N]
+//!
+//! Without --batch the batch is derived from the budgets as the server derives it (and a placement may narrow it); --batch N asks for N, which is kept.
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, "+N"
@@ -41,6 +43,8 @@ fn main() -> Result<(), String> {
     let force_logits = args.iter().position(|arg| arg == "--force-logits").map(|at| args.remove(at)).is_some();
     let chat = args.iter().position(|arg| arg == "--chat").map(|at| args.remove(at)).is_some();
     let sampled = args.iter().position(|arg| arg == "--sampled").map(|at| args.remove(at)).is_some();
+    // --trace-batches: the time since the run began after each of its batches, and the metrics of each run, on stderr.
+    let trace = args.iter().position(|arg| arg == "--trace-batches").map(|at| args.remove(at)).is_some();
     let mut option = |name: &str| args.iter().position(|arg| arg == name).map(|at| {
         let value = args[at + 1].clone();
         args.drain(at..at + 2);
@@ -79,7 +83,7 @@ fn main() -> Result<(), String> {
     let root = PathBuf::from(model);
     let weights = Weights::open(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
     let open_seconds = started.elapsed().as_secs_f64();
-    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(4096),
+    let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(straydog_engine::model::DERIVED_BATCH),
                               speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,
                               row_cache_bytes: row_cache };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {})?;
@@ -118,12 +122,20 @@ fn main() -> Result<(), String> {
     if let Some(note) = &model.placement_note {
         eprintln!("placement: {note}");
     }
+    eprintln!("wide batch {} rows from {} new tokens{}", model.wide_batch_size, straydog_engine::model::WIDE_READ_TOKENS,
+              model.wide_note.as_deref().map_or_else(String::new, |note| format!(" ({note})")));
+    for (index, device) in model.info()?["devices"].as_array().into_iter().flatten().enumerate() {
+        let (used, budget) = (device["allocated_bytes"].as_u64().unwrap_or(0), device["budget_bytes"].as_u64().unwrap_or(0));
+        eprintln!("device {index}: {:.3} GiB allocated of a budget of {:.3} GiB ({:.3} GiB left)", used as f64 / (1u64 << 30) as f64,
+                  budget as f64 / (1u64 << 30) as f64, budget.saturating_sub(used) as f64 / (1u64 << 30) as f64);
+    }
     for &device in &devices {
         if let Ok((_, free, total)) = straydog_gpu::device_info(device) {
             eprintln!("GPU {device}: {:.2} GiB free of {:.2} GiB after loading (budget {:.2} GiB)", free as f64 / (1u64 << 30) as f64,
                       total as f64 / (1u64 << 30) as f64, budget as f64 / (1u64 << 30) as f64);
         }
     }
+    eprintln!("K/V {} positions of {}, {} expert slots", model.kv_positions(), settings.context, model.slot_counts().0);
     // "+N" appends N tokens to the previous prompt (the conversation cache resumes it).
     let mut previous: Vec<u32> = Vec::new();
     let mut row_counts = (0, 0, 0);
@@ -170,8 +182,16 @@ fn main() -> Result<(), String> {
             model.forced_rows = Some(straydog_engine::model::ForcedRows { tokens: serde_json::from_str(&replies).unwrap(), widths: widths.clone(),
                                                                           read_logits: force_logits, reject: force_reject, ..Default::default() });
         }
-        model.generate(&prompt, generate, &sampling, run as u64 + 1, &|| false, &mut |_, _| {}, true, false,
+        let mut batch_trace = |end: usize, total: usize| {
+            if trace {
+                eprintln!("run {run}: {end} of {total} tokens at {:.2} s", started.elapsed().as_secs_f64());
+            }
+        };
+        model.generate(&prompt, generate, &sampling, run as u64 + 1, &|| false, &mut batch_trace, true, false,
                        &mut |token| tokens.push(token))?;
+        if trace {
+            eprintln!("run {run}: {}", serde_json::Value::Object(model.last_metrics.clone()));
+        }
         let digest = model.logits_digests.take().unwrap_or_default().first().cloned().unwrap_or_default();
         let logits = model.logits_capture.take().unwrap_or_default().into_iter().next().unwrap_or_default();
         if let Some(dump) = &dump {
@@ -216,6 +236,11 @@ fn main() -> Result<(), String> {
                 println!("GPU {device}: {:.3} GiB free after the run", free as f64 / (1u64 << 30) as f64);
             }
         }
+        println!("  K/V {} positions, {} expert slots, growth {} s, slots by growth {}", model.kv_positions(), model.slot_counts().0,
+                 model.last_metrics.get("kv_growth_seconds").map_or("none".to_string(), |seconds| seconds.to_string()),
+                 model.last_metrics.get("kv_growth_slots").map_or("none".to_string(), |slots| slots.to_string()));
+        println!("  batches: {} of up to {} rows", model.last_metrics["prefill_batches"].as_u64().unwrap_or(0),
+                 model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0));
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
         if let Some(now) = model.weights.row_counts("per_layer_token_embd.weight") {

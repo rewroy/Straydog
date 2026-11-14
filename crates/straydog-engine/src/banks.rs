@@ -171,7 +171,7 @@ pub trait HostMemory: Send + Sync {
     unsafe fn free(&self, pointer: *mut u8);
 }
 
-/// The GPU runtime's page-locked memory, portable and mapped (`hipHostMalloc`), allocated under the context of the device `ordinal`.
+/// Portable, mapped page-locked host memory, allocated or registered under the context of the device `ordinal`.
 pub struct PinnedMemory {
     pub ordinal: usize,
 }
@@ -239,6 +239,7 @@ impl LayerCopy {
             files.push(bank.file.as_deref().ok_or_else(|| format!("a bank with no file to copy from (role {role})"))?);
         }
         let mut block = CopyBlock { memory: memory.clone(), layer, parts: [Part::NONE, Part::NONE, Part::NONE] };
+        let profile = cfg!(feature = "cuda") && std::env::var_os("DS41_PROFILE").is_some();
         for (role, (bank, file)) in banks.iter().zip(files).enumerate() {
             if bank.bytes == 0 {
                 return Err(format!("a bank of no bytes (role {role})"));
@@ -246,11 +247,18 @@ impl LayerCopy {
             let (start, end) = verity::covering_blocks(bank.map_len as u64, bank.offset, bank.bytes).ok_or("a bank past its file's end")?;
             let bytes = (end - start) as usize;
             let capacity = bytes.next_multiple_of(ALIGN);
+            let started = std::time::Instant::now();
             let base = memory.allocate(capacity as u64)?;
+            let allocation = started.elapsed();
             block.parts[role] = Part { base, bytes, start, at: (bank.offset - start) as usize, len: bank.bytes as usize };
             // SAFETY: `base` is a new allocation of `capacity` bytes, which nothing else reads or writes before the copy is made.
             let target = unsafe { std::slice::from_raw_parts_mut(base, capacity) };
+            let started = std::time::Instant::now();
             read_copy(file, start, target, bytes).map_err(|error| format!("reading layer {layer}'s bank {role} from its file: {error}"))?;
+            if profile {
+                eprintln!("Straydog host banks copy: layer {layer}, role {role}, {bytes} bytes, allocation {:.3} s, read {:.3} s",
+                          allocation.as_secs_f64(), started.elapsed().as_secs_f64());
+            }
         }
         Ok(LayerCopy(Arc::new(block)))
     }
@@ -857,8 +865,12 @@ impl BankLocks {
     fn copy_turn(memory: &Arc<dyn HostMemory>, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
         let copy = LayerCopy::make(memory, layer, &banks).map_err(|error| Stop::NotCopied { layer, error })?;
         // Copied, the bytes are the copy's own and cannot change: with the shards' verity trees, check THEM, not the file they came from.
+        let started = std::time::Instant::now();
         if let Err(error) = copy.verify(&banks, priority) {
             return Err(Stop::Unverified { layer, error });
+        }
+        if cfg!(feature = "cuda") && std::env::var_os("DS41_PROFILE").is_some() {
+            eprintln!("Straydog host banks check: layer {layer}, verification {:.3} s", started.elapsed().as_secs_f64());
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
         Ok(Locked { layer, bytes, banks, copy: Some(copy), registrar: None, registered: None })

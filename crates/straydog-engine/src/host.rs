@@ -365,6 +365,15 @@ pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
     wanted.min(held.saturating_add(available.saturating_sub(left_free(memory))))
 }
 
+/// The most a working set is to take before what is free bounds it ([`working_set_limit`]): the process's share of memory (`share`: [`HOST_SHARE`] of it)
+/// beside `pinned` bytes of page-locked state, and no more than it has a use for: the banks, that state and `other`. But never less than what it cannot
+/// give up cheaply: the banks page-locked in place (`in_place`: mapped pages no limit trims) and its own memory as the system counts it (`own`: private
+/// bytes, the page-locked copies of banks among them), which a hard maximum under them sends to the page file.
+#[cfg(any(windows, test))]
+fn working_set_share(share: u64, pinned: u64, banks: u64, in_place: u64, own: u64, other: u64) -> u64 {
+    share.saturating_sub(pinned + other).min((banks + pinned + other).max(in_place + own + other))
+}
+
 /// The marks of `memory` that the working set's limit follows: the lower under which it gives back, the upper over which it may take more.
 #[cfg(any(windows, test))]
 fn working_set_marks(memory: u64) -> (u64, u64) {
@@ -427,9 +436,9 @@ impl WorkingSetWatch {
 }
 
 /// Observe paging before ready, then four times a second independently of requests and bank locks. The working-set quota waits for
-/// [`WorkingSetWatch::allow_quota`]. `pinned` follows the K/V. Dropping the model ends its watcher.
+/// [`WorkingSetWatch::allow_quota`]. `pinned` follows the K/V and `in_place` the banks page-locked in place. Dropping the model ends its watcher.
 pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::AtomicU64>, banks: u64,
-                         watch: &std::sync::Arc<WorkingSetWatch>) {
+                         in_place: std::sync::Arc<std::sync::atomic::AtomicU64>, watch: &std::sync::Arc<WorkingSetWatch>) {
     #[cfg(windows)]
     {
         let mut paging = PagingObserver::default();
@@ -440,13 +449,13 @@ pub fn watch_working_set(memory: u64, pinned: std::sync::Arc<std::sync::atomic::
         if let Err(error) = std::thread::Builder::new().name("working set".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
             let Some(watch) = watch.upgrade() else { break };
-            watch.tick(|| paging.observe(memory, profile, watch.quota.load(std::sync::atomic::Ordering::Acquire)), || keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks));
+            watch.tick(|| paging.observe(memory, profile, watch.quota.load(std::sync::atomic::Ordering::Acquire)), || keep_resident(memory, pinned.load(std::sync::atomic::Ordering::Relaxed), banks, in_place.load(std::sync::atomic::Ordering::Relaxed)));
         }) {
             eprintln!("WARN Straydog host paging: cannot start the observer: {error}");
         }
     }
     #[cfg(not(windows))]
-    let _ = (memory, pinned, banks, watch);
+    let _ = (memory, pinned, banks, in_place, watch);
 }
 
 /// What takes commit after the banks are locked besides the expert slots, which CUDA charges 1 to 1 and
@@ -495,13 +504,20 @@ fn refusal_changed(share: u64, taken: u64) -> bool {
 /// grants, it keeps from everything else. It is also the most the working set takes: mapped bank pages touched later would otherwise
 /// go on joining it with no limit, past [`left_free`] (RTX 5070 Ti, 62 GiB of memory: 3.8 GiB available within a minute of serving, the
 /// desktop stalling); past the limit they wait in the standby list, a soft fault away. Best effort: only speed depends on it.
-pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
+///
+/// The limit is never under what the process cannot give up cheaply ([`working_set_share`]): the banks page-locked in place (`in_place`) and its own
+/// (private) memory, which a hard maximum under it sends to the page file. The page-locked copies of banks that a GPU unable to register host memory
+/// read-only holds are such memory, inside the working set (RTX 5070 Ti, 62 GiB, 14.2 GiB of copies: private bytes 13.6 -> 29.0 GiB, and the system's
+/// memory in use up by the working set's 4.8 GiB, not by the copies on top of it). With banks + pinned + [`HOST_OTHER`] alone, two RTX 3090s on 128 GiB
+/// held all 46.8 GiB of banks as copies under a limit of 49.5 GiB with 53 GiB of memory free: 1.0M to 4.2M page faults a request where 0.1M to 0.6M
+/// were before the locking ended, up to 5.9 GB read back from the drive in one, and 10.5 GiB in the page file.
+pub fn keep_resident(memory: u64, pinned: u64, banks: u64, in_place: u64) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
-        let share = ((memory as f64 * HOST_SHARE) as u64).saturating_sub(pinned + HOST_OTHER).min(banks + pinned + HOST_OTHER);
+        let share = working_set_share((memory as f64 * HOST_SHARE) as u64, pinned, banks, in_place, windows_private(), HOST_OTHER);
         let available = windows_available().0;
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
         let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
@@ -522,7 +538,7 @@ pub fn keep_resident(memory: u64, pinned: u64, banks: u64) {
         }
     }
     #[cfg(not(windows))]
-    let _ = (memory, pinned, banks);
+    let _ = (memory, pinned, banks, in_place);
 }
 
 /// `physical` bounded by the memory limits of this process's cgroup and every one above it, up
@@ -799,6 +815,20 @@ mod tests {
         // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
         assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
         assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
+    }
+
+    /// Decides: the working set's share is what it was while the process's own memory fits it, and is never under the banks locked in place and that
+    /// memory (two RTX 3090s on 128 GiB held 46.8 GiB of page-locked copies under a limit of 49.5 GiB, and paged), within its share of the memory.
+    #[test]
+    fn the_working_set_is_never_held_under_the_process_s_own_memory() {
+        const GIB: u64 = 1 << 30;
+        // The share: as it was while the process's own memory is within it (62 GiB: banks 31 GiB, 18 GiB of them locked in place, 13 GiB of its own) ...
+        assert_eq!(super::working_set_share(52 * GIB, GIB, 31 * GIB, 18 * GIB, 13 * GIB, 2 * GIB), 34 * GIB);
+        // ... and never under it: 128 GiB with every bank a page-locked copy (47 GiB of banks, none in place, 60 GiB of its own) is not held at 50 GiB,
+        assert_eq!(super::working_set_share(108 * GIB, GIB, 47 * GIB, 0, 60 * GIB, 2 * GIB), 62 * GIB);
+        // nor with every bank locked in place beside 13 GiB of its own; the share of memory still bounds it.
+        assert_eq!(super::working_set_share(108 * GIB, GIB, 47 * GIB, 47 * GIB, 13 * GIB, 2 * GIB), 62 * GIB);
+        assert_eq!(super::working_set_share(52 * GIB, GIB, 31 * GIB, 0, 60 * GIB, 2 * GIB), 49 * GIB);
     }
 
     use super::linux_memory;
@@ -1115,6 +1145,17 @@ fn windows_working_set() -> u64 {
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
     // SAFETY: the pseudo handle of this process and an initialized structure with its size set.
     if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0 { counters.WorkingSetSize as u64 } else { 0 }
+}
+
+/// This process's own memory as the system counts it (private bytes: its commit charge), 0 where the system does not say.
+#[cfg(windows)]
+fn windows_private() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process and an initialized structure with its size set.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0 { counters.PagefileUsage as u64 } else { 0 }
 }
 
 #[cfg(windows)]

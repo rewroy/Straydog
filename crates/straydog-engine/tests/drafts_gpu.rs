@@ -35,8 +35,8 @@ fn open(root: &std::ffi::OsStr, drafter: &std::ffi::OsStr) -> (Model, Vec<u32>) 
     let prompt = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap()
         .encode("<|im_start|>user\nExplain how a hash map gives average constant time lookups, and when that breaks down.<|im_end|>\n<|im_start|>assistant\n")
         .unwrap();
-    // (64K of context: the K/V of that stays in host memory at this budget, and starts at 32K positions)
-    let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256, speculative: 3, cpu_threads: 0, row_cache_bytes: None };
+    // (128K of context: Q8 K/V stays in host memory at this budget and starts at 32K positions)
+    let settings = Settings { context: 131072, state_budget_bytes: 8 << 30, prefill_batch_size: 256, speculative: 3, cpu_threads: 0, row_cache_bytes: None };
     let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
     assert!(model.partial, "the model must be partially resident at this budget");
     assert!(model.host_kv, "its K/V must be in host memory");
